@@ -114,7 +114,10 @@
 //   steal       decide()->Steal + replace(steal) + on_acquire(trans) +
 //               seed_generation_from() + claim_generation() collapsed
 //               into one atomic step (sound: recovery_complete gates
-//               dispatch until the seed AND the claim have both run)
+//               dispatch until the seed AND the claim have both run,
+//               and a seed above the entry generation additionally
+//               requires a post-claim Leading round --
+//               sched.recovery.bump-confirm; see the steal action doc)
 //   renewLease  decide()->Renew + replace(renew) + the acquire arm's
 //               on_acquire(trans) with the UN-bumped count: restores
 //               Leading after a self-fence false alarm or a crash at the
@@ -189,7 +192,11 @@
 // staleLeaderHasStaleGeneration as an assumption); a second deletion per
 // trace; model-based testing of the Deletion/PgFaults regimes (the
 // mbt-rio-lease check drives leaderElectionBase only -- the fault
-// regimes need the claims-ledger mock and genHW in the projection).
+// regimes need the claims-ledger mock and genHW in the projection);
+// splitting acquisition from seed/claim so the deposed-unaware
+// recovery interleaving (the window sched.recovery.bump-confirm closes
+// at the implementation level) is modeled directly instead of being
+// collapsed into one atomic step.
 module leaderElection {
   // --- 1. types ---------------------------------------------------------
   type Node = str
@@ -793,13 +800,25 @@ module leaderElection {
   /// window the pre-fix counterexample exploited (see the FIXED note at
   /// staleLeaderHasStaleGeneration).
   ///
-  /// A holder change that lands while a recovery is still in flight is
+  /// Why the collapse stays sound against the real, non-atomic
+  /// implementation: a holder change the local lease loop OBSERVED is
   /// caught by the actor's recovery discard gate (the generation +
   /// recorded acquire-transitions + is_leader re-check in
   /// handle_leader_acquired), which keeps recovery_complete false until
-  /// a recovery that observed the post-change state completes -- so the
-  /// atomic-step collapse above remains justified even when the
-  /// PG-seeded generation makes on_acquire's fetch_max a no-op.
+  /// a recovery that observed the post-change state completes -- even
+  /// when the PG-seeded generation makes on_acquire's fetch_max a
+  /// no-op. A holder change the loop has NOT yet observed moves none of
+  /// those signals; for that case a target above the entry generation
+  /// is additionally not seeded without a post-claim round-trip that
+  /// ended with this replica as the Lease holder
+  /// (sched.recovery.bump-confirm), so a deposed-but-unaware believer
+  /// cannot COMPLETE recovery above a live successor. Residuals, all
+  /// priced where they are accepted: the deletion ABA documented at the
+  /// gate's entry-snapshot comment in handle_leader_acquired (it adds
+  /// no dispatch interleaving beyond what that acceptance already
+  /// covers); the multi-deletion variant where a foreign tenure begins
+  /// and is erased entirely inside the observation gap; and the
+  /// claim-failure conjunction documented with the PgFaults regime.
   action steal(n: Node): bool = {
     val target = if (lease.gen + 2 > genHW + 1) lease.gen + 2 else genHW + 1
     val seeded = if (gen.get(n) > target) gen.get(n) else target

@@ -1586,6 +1586,43 @@ read counts as "not shown" and is likewise exceeded; the conservative cost is
 one burned generation and an idempotent re-dispatch of the holder's own
 in-flight work.
 
+#r("sched.recovery.bump-confirm")[
+  A claim target that exceeds the generation the recovery entered with MUST
+  NOT be seeded into the in-memory generation, and dispatch MUST NOT be
+  ungated at it, until this replica has completed an apiserver round-trip ---
+  initiated after the write-ahead claim step completed --- that ended with
+  this replica as the Lease holder; absent that confirmation the recovery
+  MUST be discarded.
+]
+
+The PG floor cannot distinguish a dead predecessor's claim from a live
+successor's. Without the confirmation, a deposed-but-unaware leader whose
+recovery outlives its deposal --- a Lease deletion lands mid-recovery, a
+standby re-creates the Lease, claims one past the old floor, and starts
+dispatching, all before the old leader's lease loop observes anything ---
+would compute a target one past the _live_ leader's
+(#rref("sched.recovery.fetch-max-seed")), seed it, and answer heartbeats with
+it, inverting the executor fence (#rref("sched.lease.generation-fence")):
+every worker that heard the stale believer latches the higher generation and
+silently rejects the live leader's assignments for the rest of its term. The
+confirmation keeps apiserver I/O in the lease loop --- the recovery only
+observes the renew-round counters the loop publishes. It does not contradict
+the proceed-on-PG-failure rationale of #rref("sched.lease.generation-claim"):
+the wait applies only to bump-target (post-deletion) recoveries, ordinary
+failovers retain their entry generation and never wait, the wait is bounded by
+the lease loop's own renew/fence machinery, and a discarded recovery re-runs
+on the next acquire edge --- it does not reintroduce the
+indefinite-block-on-PG failure mode that rationale rejects. Residuals that
+remain: the deletion-ABA case documented at the recovery gate's entry-snapshot
+comment (a deletion plus enough in-window holder changes to return the
+recorded transition count to its entry value), the multi-deletion cousin where
+a foreign tenure both begins and is erased inside this replica's observation
+gap, and the below-entry variant that is reachable only as part of the
+claim-failure conjunction priced with the claim machinery above. Non-K8s
+single-scheduler deployments construct their leader state with recovery
+already complete and never run the lease loop, so no confirmation is ever
+required there.
+
 #r("sched.reconcile.leader-gate")[
   The post-recovery reconcile pass (`ReconcileAssignments`) MUST early-return
   when `is_leader()` is false. The 45s reconcile timer is fire-and-forget and

@@ -290,7 +290,11 @@ in
     # boundsOK ceiling tripwire. The fetch-max-seed marker covers the
     # seeding-and-claiming encoding inside steal (the generation derives
     # from the lease's transition count and the PG floor advances at
-    # acquisition time).
+    # acquisition time). The model collapses acquire/seed/claim into one
+    # atomic step; the unobserved-holder-change window that collapse
+    # hides is discharged at the implementation level by
+    # sched.recovery.bump-confirm (a seed above the entry generation
+    # requires a post-claim Leading round) -- see the steal action doc.
     #
     # The state count, depth, and wall-clock are in this check's output
     # transcript and in the commit that introduced (or last re-measured)

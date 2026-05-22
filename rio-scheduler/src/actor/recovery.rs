@@ -51,10 +51,42 @@
 //! stale floor and reuses its generation. The claim bounds the
 //! post-deletion damage; it cannot prevent it under a PG
 //! point-in-time restore (which regresses both floor arms together).
+//!
+//! A claim target ABOVE the entry generation is additionally seeded
+//! only after a post-claim apiserver round-trip that ended with this
+//! replica holding the Lease (`sched.recovery.bump-confirm`): the PG
+//! floor cannot distinguish a dead predecessor's claim from a live
+//! successor's, so a deposed-but-unaware leader whose recovery outlives
+//! its deposal would otherwise claim one past the live leader and
+//! invert the executor fence. Unconfirmed bump recoveries are discarded
+//! and re-run by the next acquire edge.
+
+use std::time::Duration;
 
 use super::*;
 use crate::db::RecoveryBuildRow;
 use crate::state::{DerivationState, verifiable_wanted_paths};
+
+/// How long a bump-target recovery waits for the lease loop to complete
+/// a post-claim Leading round before discarding
+/// (`sched.recovery.bump-confirm`). Derived from the lease constants:
+/// the backstop only has to outlive one self-fence detection (at most
+/// [`crate::lease::SELF_FENCE_AFTER`] plus one
+/// [`crate::lease::RENEW_INTERVAL`] of fence-check latency); the second
+/// `RENEW_INTERVAL` is slack. This cap is a pure backstop for a
+/// wedged-but-believing lease loop — the normal exits are a
+/// confirmation within about one renew interval, or a lose/self-fence
+/// within the fence deadline.
+const BUMP_CONFIRMATION_CAP: Duration = Duration::from_secs(
+    crate::lease::SELF_FENCE_AFTER.as_secs() + 2 * crate::lease::RENEW_INTERVAL.as_secs(),
+);
+
+/// Poll cadence of
+/// [`DagActor::await_post_claim_leadership_confirmation`]: the lease
+/// loop publishes confirmations at renew-tick granularity (seconds), so
+/// a 100ms poll adds negligible latency while keeping the actor task
+/// responsive to the early-exit conditions.
+const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Cross-phase carrier for [`DagActor::recover_from_pg`]: PG row sets
 /// loaded by [`DagActor::load_dag_from_rows`] that the later phases
@@ -1201,7 +1233,13 @@ impl DagActor {
         // it would look like a flap otherwise.) A claim row left
         // behind by a recovery the gate then discards is a harmless
         // over-claim: the next term's floor reads a value ≥ anything
-        // it would have read anyway.
+        // it would have read anyway. When the target this block lands
+        // on EXCEEDS the entry generation, an additional wait between
+        // here and the gate requires a post-claim Leading round before
+        // the seed (sched.recovery.bump-confirm, below) — the floor
+        // cannot distinguish a dead predecessor's claim from a live
+        // successor's; unconfirmed bump recoveries are discarded and
+        // re-run by the next acquire edge.
         //
         // Same-epoch re-acquire (a self-fence false alarm followed by
         // a successful renew, or a discarded-and-requeued recovery):
@@ -1374,6 +1412,13 @@ impl DagActor {
                 }
             }
         };
+        // Snapshot the lease loop's round counter AFTER the claim
+        // attempt: the claim-attempt→snapshot ordering is load-bearing
+        // for the bump confirmation below — a Leading round whose id
+        // exceeds this snapshot began after the claim row (when there
+        // is one) became durable, so any replica that acquires later
+        // reads a floor that covers our claim and exceeds it.
+        let rounds_at_claim = self.leader.renew_rounds_started();
 
         // Test-only interleave gate: lets a test bump `generation`
         // between the awaits above and the gen re-check below,
@@ -1399,6 +1444,31 @@ impl DagActor {
         metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
+        // r[impl sched.recovery.bump-confirm]
+        // A claim target ABOVE the entry generation (the floor-above,
+        // foreign-row-at-our-gen, conflict-retry, and proceed-unclaimed
+        // paths) is only seeded after positive, post-claim evidence
+        // from the apiserver that this replica holds the Lease. PG
+        // alone cannot distinguish "the floor's excess belongs to a
+        // dead previous term" (the routine post-deletion case — must
+        // bump) from "the excess belongs to a live successor" (must not
+        // leapfrog); only the Lease can. Ordinary failovers
+        // (claim_target == gen_at_entry) skip this entirely. The Err
+        // arm never bumps (claim_target = gen_at_entry), so it never
+        // waits.
+        let needs_confirmation = result.is_ok() && claim_target > gen_at_entry;
+        let confirm_started = Instant::now();
+        let confirmed = if needs_confirmation {
+            self.await_post_claim_leadership_confirmation(
+                rounds_at_claim,
+                gen_at_entry,
+                transitions_at_entry,
+            )
+            .await
+        } else {
+            true
+        };
+
         // TOCTOU re-check: did leadership change hands (or lapse)
         // during recovery? Trips on any of:
         // - the generation moved (a lease-loop write — recover_from_pg
@@ -1407,7 +1477,9 @@ impl DagActor {
         //   whose generation fetch_max was a no-op in the saturated
         //   regime),
         // - is_leader is false (a lose landed and we have not
-        //   re-acquired).
+        //   re-acquired),
+        // - a bump-target recovery that never got its post-claim
+        //   leadership confirmation (above).
         // In every discard case the lease loop has already queued the
         // follow-up commands in our mpsc — discard this recovery, let
         // the next LeaderAcquired re-run it.
@@ -1418,25 +1490,47 @@ impl DagActor {
         // recovery_complete and is then clobbered by our store(true),
         // ungating dispatch with a DAG loaded under a lost epoch — see
         // the comment at the gen_at_entry/transitions_at_entry
-        // snapshot. New PG round-trips belong ABOVE, with
-        // recover_from_pg, the sweep_stale_* calls, and the
-        // generation-claim loop. (The reads below are atomic loads, not
-        // awaits — the invariant holds as written.)
+        // snapshot. New PG round-trips — and any new wait like the
+        // bump confirmation — belong ABOVE, with recover_from_pg, the
+        // sweep_stale_* calls, and the generation-claim loop. (The
+        // reads below are atomic loads, not awaits — the invariant
+        // holds as written.)
         let gen_now = self.leader.generation();
         let transitions_now = self.leader.acquired_transitions();
         let still_leader = self.leader.is_leader();
-        if gen_now != gen_at_entry || transitions_now != transitions_at_entry || !still_leader {
+        if gen_now != gen_at_entry
+            || transitions_now != transitions_at_entry
+            || !still_leader
+            // r[impl sched.recovery.bump-confirm]
+            || !confirmed
+        {
+            // Distinguish "the lease state moved" from "the lease state
+            // never moved but the bump confirmation did not arrive" —
+            // operationally very different signals.
+            let discard_outcome = if !confirmed
+                && gen_now == gen_at_entry
+                && transitions_now == transitions_at_entry
+                && still_leader
+            {
+                "discarded_unconfirmed"
+            } else {
+                "discarded_flap"
+            };
             warn!(
                 gen_at_entry,
                 gen_now,
                 transitions_at_entry,
                 transitions_now,
                 still_leader,
+                confirmed,
+                confirm_wait_ms = confirm_started.elapsed().as_millis(),
                 recovery_ok = result.is_ok(),
-                "leadership changed during recovery \u{2014} lease flapped or lapsed; \
-                 DISCARDING this recovery (next LeaderAcquired will retry)"
+                outcome = discard_outcome,
+                "leadership changed during recovery \u{2014} lease flapped, lapsed, or the \
+                 bump-target confirmation never arrived; DISCARDING this recovery \
+                 (next LeaderAcquired will retry)"
             );
-            metrics::counter!("rio_scheduler_recovery_total", "outcome" => "discarded_flap")
+            metrics::counter!("rio_scheduler_recovery_total", "outcome" => discard_outcome)
                 .increment(1);
             // Clear the partial state we loaded. The next
             // LeaderAcquired's recover_from_pg() will do this
@@ -1482,6 +1576,7 @@ impl DagActor {
                         prev_gen = prev,
                         pg_high_water = ?pg_max_gen,
                         new_gen = claim_target,
+                        confirm_wait_ms = confirm_started.elapsed().as_millis(),
                         "seeded generation from PG floor (assignments ∪ claims)"
                     );
                 }
@@ -1511,6 +1606,70 @@ impl DagActor {
                 self.clear_persisted_state();
                 self.leader.set_recovery_complete();
             }
+        }
+    }
+
+    /// Wait for a post-claim apiserver round-trip that ended with this
+    /// replica as the Lease holder, before a claim target above the
+    /// recovery-entry generation is seeded
+    /// (`sched.recovery.bump-confirm`).
+    ///
+    /// What a confirming round establishes — and what it does not:
+    ///
+    /// - leg (i): a round that resolved `Leading` after
+    ///   `rounds_at_claim` was snapshotted shows that at that
+    ///   observation no other replica held the Lease, so a successor
+    ///   that acquired after our acquire edge is no longer the holder —
+    ///   we are not completing recovery above a *live* successor.
+    /// - leg (ii): on the claimed path our claim row was durable before
+    ///   that round began, so any replica that acquires later reads a
+    ///   floor at or above our claim and exceeds it — its generation
+    ///   lands above ours, the correct direction. (On the
+    ///   proceed-unclaimed arm leg (ii) does not hold; that is the
+    ///   pre-existing claim-failure residual, unchanged here.)
+    ///
+    /// Residuals that remain: the deletion-ABA case documented at the
+    /// gate's entry-snapshot comment; the multi-deletion cousin where a
+    /// foreign tenure begins and is erased entirely inside this
+    /// replica's observation gap (no local edge fires, our next round
+    /// re-creates and confirms, yet workers that heard the erased
+    /// tenant may have latched a higher generation); and the
+    /// below-entry variant that requires the claim-failure conjunction.
+    ///
+    /// Exits early (`false`) when the lease loop observed a loss or a
+    /// holder change — the TOCTOU gate would discard the recovery
+    /// anyway. The cap is a pure backstop for a wedged-but-believing
+    /// loop; such a loop also cannot renew, so the lease is lost
+    /// shortly after. The wait runs on the actor task — a bounded stall
+    /// on bump paths only (dispatch is gated during recovery anyway,
+    /// and heartbeat replies read the shared atomics in the gRPC layer,
+    /// not through the actor). The cap path is intentionally untested:
+    /// it requires a wedged-but-believing loop, and the loop-level
+    /// wiring that matters is covered by rio-lease's round tests.
+    // r[impl sched.recovery.bump-confirm]
+    async fn await_post_claim_leadership_confirmation(
+        &self,
+        rounds_at_claim: u64,
+        gen_at_entry: u64,
+        transitions_at_entry: u64,
+    ) -> bool {
+        let deadline = Instant::now() + BUMP_CONFIRMATION_CAP;
+        loop {
+            if self.leader.last_leading_round() > rounds_at_claim {
+                return true;
+            }
+            if !self.leader.is_leader()
+                || self.leader.generation() != gen_at_entry
+                || self.leader.acquired_transitions() != transitions_at_entry
+            {
+                // The lease loop observed a loss or a holder change —
+                // the TOCTOU gate below will discard this recovery.
+                return false;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(CONFIRMATION_POLL_INTERVAL).await;
         }
     }
 

@@ -112,7 +112,11 @@ pub trait LeaseHooks: Clone + Send + 'static {
 const LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// Renewal interval. LEASE_TTL / 3 per K8s convention.
-const RENEW_INTERVAL: Duration = Duration::from_secs(5);
+///
+/// `pub` so rio-scheduler can derive its bump-confirmation cap from the
+/// same constants the loop runs on (`sched.recovery.bump-confirm`); the
+/// compile-time asserts below keep the constants coupled.
+pub const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Slack between renew timeout and RENEW_INTERVAL. Each renew
 /// attempt must return BEFORE the next interval tick would fire;
@@ -169,7 +173,9 @@ const FENCE_MARGIN: Duration = Duration::from_secs(4);
 /// (r\[sched.lease.generation-claim\]) is what makes the more frequent
 /// false alarms free: a self-fence followed by a successful renew
 /// re-acquires at the SAME generation and in-flight work survives.
-const SELF_FENCE_AFTER: Duration = Duration::from_secs(11);
+///
+/// `pub` for the same reason as [`RENEW_INTERVAL`].
+pub const SELF_FENCE_AFTER: Duration = Duration::from_secs(11);
 
 /// A follower steals after observing the same resourceVersion for this
 /// long: LEASE_TTL + FENCE_MARGIN. Failover after a real leader death
@@ -342,6 +348,23 @@ pub struct LeaderState {
     /// then fire-and-forgets LeaderAcquired. Recovery may take
     /// seconds; dispatch waits.
     recovery_complete: Arc<AtomicBool>,
+    /// Renew rounds started: incremented by the lease loop immediately
+    /// before each `try_acquire_or_renew()` attempt
+    /// ([`begin_renew_round`](Self::begin_renew_round)). Paired with
+    /// `last_leading_round` so the actor's recovery can require a
+    /// post-claim apiserver round-trip that ended with this replica as
+    /// the Lease holder before seeding a generation above its entry
+    /// value (`sched.recovery.bump-confirm`). A confirmed round began
+    /// strictly after every event that preceded its `begin_renew_round`
+    /// call. Non-K8s/`always_leader` deployments never run the lease
+    /// loop, so both counters legitimately stay 0 there — the actor's
+    /// bump-confirmation consumer only runs off `LeaderAcquired`, which
+    /// only the lease hooks send.
+    renew_rounds_started: Arc<AtomicU64>,
+    /// The highest round id whose attempt completed with
+    /// `ElectionResult::Leading{..}` — see `renew_rounds_started`.
+    /// 0 = no round has ever ended with this replica as the holder.
+    last_leading_round: Arc<AtomicU64>,
     /// `Instant` of the last [`on_acquire`](Self::on_acquire). `None`
     /// when not leading. Exposed via [`leader_for`](Self::leader_for)
     /// and surfaced as `ListExecutorsResponse.leader_for_secs` so the
@@ -420,6 +443,40 @@ impl LeaderState {
         self.recovery_complete.store(true, Ordering::SeqCst);
     }
 
+    /// Allocate the id of a renew round that is about to start. Called
+    /// by the lease loop immediately before each
+    /// `try_acquire_or_renew()` attempt; returns this round's id (ids
+    /// start at 1). `SeqCst` — same discipline as the neighbouring
+    /// atomics, and the round id must be taken before the attempt's
+    /// apiserver I/O begins for the post-claim ordering argument in
+    /// `sched.recovery.bump-confirm` to hold.
+    pub fn begin_renew_round(&self) -> u64 {
+        self.renew_rounds_started.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Number of renew rounds the lease loop has started. A reader that
+    /// snapshots this before an event and later observes
+    /// [`last_leading_round`](Self::last_leading_round) above the
+    /// snapshot knows an apiserver round-trip that began after the
+    /// snapshot ended with this replica as the Lease holder.
+    pub fn renew_rounds_started(&self) -> u64 {
+        self.renew_rounds_started.load(Ordering::SeqCst)
+    }
+
+    /// Record that round `round` completed with this replica as the
+    /// Lease holder. `fetch_max` so a stale completion can never
+    /// regress the recorded round.
+    pub fn confirm_leading_round(&self, round: u64) {
+        self.last_leading_round.fetch_max(round, Ordering::SeqCst);
+    }
+
+    /// The highest round id whose attempt completed with this replica
+    /// as the Lease holder (0 = never). See
+    /// [`renew_rounds_started`](Self::renew_rounds_started).
+    pub fn last_leading_round(&self) -> u64 {
+        self.last_leading_round.load(Ordering::SeqCst)
+    }
+
     /// Elapsed since this replica acquired leadership, or `None` when
     /// not leading. Populates `ListExecutorsResponse.leader_for_secs`.
     // r[impl sched.admin.list-executors-leader-age]
@@ -453,6 +510,8 @@ impl LeaderState {
             acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader,
             recovery_complete,
+            renew_rounds_started: Arc::new(AtomicU64::new(0)),
+            last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
         }
     }
@@ -470,6 +529,8 @@ impl LeaderState {
             acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader: Arc::new(AtomicBool::new(true)),
             recovery_complete: Arc::new(AtomicBool::new(true)),
+            renew_rounds_started: Arc::new(AtomicU64::new(0)),
+            last_leading_round: Arc::new(AtomicU64::new(0)),
             // Non-K8s/test mode reports a real (small but growing) age
             // so consumers reading `leader_for_secs` don't see 0
             // forever (which the controller treats as "young leader,
@@ -490,6 +551,8 @@ impl LeaderState {
             acquired_transitions: Arc::new(AtomicU64::new(0)),
             is_leader: Arc::new(AtomicBool::new(false)),
             recovery_complete: Arc::new(AtomicBool::new(false)),
+            renew_rounds_started: Arc::new(AtomicU64::new(0)),
+            last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
@@ -705,6 +768,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         }
 
         let renew_deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+        // Round id BEFORE the attempt starts: a consumer that snapshots
+        // `renew_rounds_started` and later sees `last_leading_round`
+        // above it knows the confirming round began after the snapshot
+        // (sched.recovery.bump-confirm).
+        let round = state.begin_renew_round();
         match tokio::time::timeout(renew_deadline, election.try_acquire_or_renew()).await {
             Ok(Ok(result)) => {
                 // Successful round-trip (apiserver answered). Even
@@ -851,6 +919,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 }
 
                 was_leading = now_leading;
+                // r[impl sched.recovery.bump-confirm]
+                // Confirm AFTER the edge-detection match: when an
+                // acquire edge and a confirmation land in the same
+                // round, on_acquire's stores are already visible by
+                // the time the confirmation is observable. Standby/
+                // Conflict rounds (and the error/timeout arm below)
+                // are never confirmed.
+                if now_leading {
+                    state.confirm_leading_round(round);
+                }
             }
             outcome @ (Ok(Err(_)) | Err(_)) => {
                 // Either apiserver returned an error (Ok(Err)) or
@@ -1175,6 +1253,32 @@ mod tests {
             recovered.on_acquire(0),
             8,
             "PG seed past the (reset) transition count wins"
+        );
+    }
+
+    /// Confirmation-round bookkeeping: round ids increase per
+    /// `begin_renew_round`, confirming records the round, and a stale
+    /// (lower) confirmation never regresses `last_leading_round`.
+    // r[verify sched.recovery.bump-confirm]
+    #[test]
+    fn confirmation_rounds_are_monotone() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        assert_eq!(state.renew_rounds_started(), 0, "no rounds yet");
+        assert_eq!(state.last_leading_round(), 0, "nothing confirmed yet");
+
+        let r1 = state.begin_renew_round();
+        let r2 = state.begin_renew_round();
+        assert!(r2 > r1, "round ids must increase");
+        assert_eq!(state.renew_rounds_started(), 2);
+
+        state.confirm_leading_round(r2);
+        assert_eq!(state.last_leading_round(), r2);
+        // A late confirmation of an earlier round must not regress.
+        state.confirm_leading_round(r1);
+        assert_eq!(
+            state.last_leading_round(),
+            r2,
+            "confirming an old round never regresses the recorded round"
         );
     }
 
@@ -1563,5 +1667,145 @@ mod tests {
         // inside this paused-clock test — harmless here because the node
         // under test is the lease's creator/holder and never exercises
         // the steal-aging path that clock feeds.
+    }
+
+    /// The bump-confirmation wiring (`sched.recovery.bump-confirm`)
+    /// rests on two loop-level properties: the round id is taken BEFORE
+    /// the attempt's apiserver I/O starts, and only rounds that resolve
+    /// `Leading` are confirmed. A regression on either turns the
+    /// scheduler-side confirmation vacuous (it could observe a
+    /// confirmation from a round that began before its claim, or from a
+    /// round that did not end with us holding the Lease). Drives the
+    /// real loop against the mock apiserver under a paused clock.
+    // r[verify sched.recovery.bump-confirm]
+    #[tokio::test(start_paused = true)]
+    async fn leading_rounds_confirm_failed_rounds_do_not() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+        ));
+
+        // t=0: the immediate first tick creates the Lease and acquires;
+        // that round must be confirmed.
+        settle().await;
+        assert!(state.is_leader(), "healthy first tick acquires");
+        let confirmed_at_acquire = state.last_leading_round();
+        assert!(
+            confirmed_at_acquire >= 1,
+            "the acquiring round must be confirmed"
+        );
+
+        // A snapshot taken between ticks is only ever exceeded by a
+        // strictly later Leading round: the next healthy renew's round
+        // id is above the snapshot and becomes the confirmed round.
+        let snapshot = state.renew_rounds_started();
+        tokio::time::advance(RENEW_INTERVAL).await; // healthy renew at +5s
+        settle().await;
+        assert!(
+            state.renew_rounds_started() > snapshot,
+            "the renew tick consumed a round id"
+        );
+        assert!(
+            state.last_leading_round() > snapshot,
+            "a Leading round that began after the snapshot confirms above it"
+        );
+
+        // Failed and hung rounds consume round ids but never confirm.
+        let confirmed_before_failures = state.last_leading_round();
+        mock.set_behavior(MockBehavior::FailFast);
+        tokio::time::advance(RENEW_INTERVAL).await; // FailFast at +10s
+        settle().await;
+        mock.set_behavior(MockBehavior::Hang);
+        tokio::time::advance(RENEW_INTERVAL).await; // Hang at +15s
+        settle().await;
+        // Let the hung attempt's deadline expire.
+        tokio::time::advance(RENEW_INTERVAL - RENEW_SLOP).await;
+        settle().await;
+        assert!(
+            state.renew_rounds_started() >= confirmed_before_failures + 2,
+            "failed/hung rounds still consume round ids"
+        );
+        assert_eq!(
+            state.last_leading_round(),
+            confirmed_before_failures,
+            "failed/hung rounds must never be confirmed"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// Rounds that resolve `Standby` (another replica holds the Lease)
+    /// are never confirmed: `last_leading_round` only ever names rounds
+    /// in which WE were the holder, which is exactly the evidence the
+    /// scheduler's bump-confirmation consumes.
+    // r[verify sched.recovery.bump-confirm]
+    #[tokio::test(start_paused = true)]
+    async fn standby_rounds_never_confirm() {
+        let (client, mock) = MockApiServer::new();
+        // A live foreign holder: freshly observed, so decide() stays
+        // Standby for every tick this test advances through (well under
+        // STEAL_AFTER).
+        mock.seed(json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "rio-sched",
+                "namespace": "default",
+                "resourceVersion": "100",
+            },
+            "spec": {
+                "holderIdentity": "other-replica",
+                "leaseTransitions": 3,
+                "leaseDurationSeconds": 15,
+            },
+        }));
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+        ));
+
+        settle().await; // tick at t=0
+        tokio::time::advance(RENEW_INTERVAL).await; // +5s
+        settle().await;
+        tokio::time::advance(RENEW_INTERVAL).await; // +10s
+        settle().await;
+
+        assert!(!state.is_leader(), "foreign holder: we stay standby");
+        assert!(
+            state.renew_rounds_started() >= 3,
+            "standby rounds still consume round ids"
+        );
+        assert_eq!(
+            state.last_leading_round(),
+            0,
+            "standby rounds must never be confirmed"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
     }
 }

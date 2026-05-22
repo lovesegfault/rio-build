@@ -526,8 +526,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_recovery_total",
-        "Scheduler state recoveries from PG after LeaderAcquired \
-         (labeled by outcome=success|failure|discarded_flap)"
+        "Scheduler state recoveries from PG after LeaderAcquired (labeled by \
+         outcome=success|failure|discarded_flap|discarded_unconfirmed)"
     );
     describe_counter!(
         "rio_scheduler_generation_claim_failed_total",

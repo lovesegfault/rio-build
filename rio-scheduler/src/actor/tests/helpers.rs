@@ -1090,6 +1090,34 @@ pub(crate) async fn setup_with_big_ceilings() -> (TestDb, ActorHandle, tokio::ta
     (db, handle, task)
 }
 
+/// Background driver for `LeaderState` confirmation rounds:
+/// `begin_renew_round` + `confirm_leading_round` every ~50ms, simulating
+/// a healthy lease loop that keeps completing Leading rounds. Recoveries
+/// whose claim target exceeds the entry generation wait for one
+/// post-claim confirmed round before seeding
+/// (`sched.recovery.bump-confirm`); tests that drive `LeaderAcquired` by
+/// hand on a bump-shaped PG state need this running or they would wait
+/// out the confirmation cap and discard. The returned guard aborts the
+/// task on drop.
+pub(crate) struct ConfirmationLoop(tokio::task::JoinHandle<()>);
+
+impl Drop for ConfirmationLoop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn a [`ConfirmationLoop`] driving `leader`. See the struct doc.
+pub(crate) fn spawn_leading_confirmations(leader: crate::lease::LeaderState) -> ConfirmationLoop {
+    ConfirmationLoop(tokio::spawn(async move {
+        loop {
+            let round = leader.begin_renew_round();
+            leader.confirm_leading_round(round);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }))
+}
+
 /// Recovery test fixture. Absorbs the 19× phase-1/phase-2 boilerplate
 /// in `recovery.rs`: `TestDb::new` → spawn first actor → seed via
 /// closure → `drop(handle)` + join → spawn fresh actor →
@@ -1101,6 +1129,15 @@ pub(crate) async fn setup_with_big_ceilings() -> (TestDb, ActorHandle, tokio::ta
 pub(crate) struct RecoveryFixture {
     pub db: TestDb,
     pub handle: ActorHandle,
+    /// Phase-2 `LeaderState` — exposed so tests can drive lease-side
+    /// transitions against the same instance the actor holds.
+    pub leader: crate::lease::LeaderState,
+    /// Keeps the phase-2 confirmation loop alive for the fixture's
+    /// lifetime (aborts on drop). Phase-1 dispatches leave assignment
+    /// rows at the entry generation with no claim row, which makes the
+    /// phase-2 recovery a bump target that waits for a post-claim
+    /// Leading round (`sched.recovery.bump-confirm`).
+    pub _confirmations: ConfirmationLoop,
     pub _task: tokio::task::JoinHandle<()>,
 }
 
@@ -1135,13 +1172,24 @@ impl RecoveryFixture {
             // the task so PG writes are flushed.
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }
-        // Phase 2: fresh actor recovers.
-        let (handle, task) = setup_actor_with_store(db.pool.clone(), store);
+        // Phase 2: fresh actor recovers. The LeaderState mirrors the
+        // always-leader default but is constructed explicitly so the
+        // confirmation loop can drive its renew-round counters.
+        let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(1),
+        ));
+        let confirmations = spawn_leading_confirmations(leader.clone());
+        let phase2_leader = leader.clone();
+        let (handle, task) = setup_actor_configured(db.pool.clone(), store, move |_, p| {
+            p.leader = phase2_leader;
+        });
         handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
         barrier(&handle).await;
         Ok(Self {
             db,
             handle,
+            leader,
+            _confirmations: confirmations,
             _task: task,
         })
     }

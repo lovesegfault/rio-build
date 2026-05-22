@@ -1247,13 +1247,17 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     .await?;
 
     let generation = Arc::new(AtomicU64::new(5));
-    let g = Arc::clone(&generation);
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    // Bump target (5 → 6): the recovery waits for a post-claim Leading
+    // round, so simulate a healthy lease loop.
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            g,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        p.leader = l;
         p.holder_id = "pod-us".into();
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -1310,13 +1314,17 @@ async fn test_recovery_assignments_only_floor_at_our_generation_bumps() -> TestR
     .await?;
 
     let generation = Arc::new(AtomicU64::new(5));
-    let g = Arc::clone(&generation);
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    // Bump target (5 → 6): the recovery waits for a post-claim Leading
+    // round, so simulate a healthy lease loop.
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            g,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        p.leader = l;
         p.holder_id = "pod-us".into();
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -1396,6 +1404,143 @@ async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> T
         rows,
         vec![(5, "pod-us".to_string())],
         "the ledger must not grow a new row when our own claim already covers the floor"
+    );
+    Ok(())
+}
+
+/// A deposed-but-unaware leader's recovery must not complete above a
+/// live successor: a claim target above the entry generation is seeded
+/// only after a post-claim apiserver round-trip that ended with this
+/// replica as the Lease holder. Here the ledger already holds a live
+/// successor's claim at our entry generation (it claimed before our
+/// claim path ran) and no confirmation ever arrives — the recovery must
+/// be discarded, never seeded. The leftover (13, 'pod-us') claim row is
+/// the documented harmless over-claim and is deliberately not asserted.
+// r[verify sched.recovery.bump-confirm]
+#[tokio::test]
+async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // The dead prior term's claim and the LIVE successor's claim.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (11, 'old-term'), (12, 'pod-live')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(12));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    release_tx.send(()).expect("actor still listening");
+
+    // No lease loop is running, so no confirmation can ever arrive. The
+    // seed to 13 must never land — on the unconfirmed-seed regression
+    // it lands within the first few polls.
+    for _ in 0..20 {
+        assert!(
+            generation.load(Ordering::Acquire) <= 12,
+            "an unconfirmed bump recovery must never seed above the entry generation"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The deposal observation that in production arrives within a renew
+    // interval: the lose edge ends the wait and the gate discards.
+    leader.on_lose();
+    barrier(&handle).await;
+
+    assert!(
+        !leader.recovery_complete(),
+        "an unconfirmed bump recovery must be discarded, not completed"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        12,
+        "the generation must still be the entry generation after the discard"
+    );
+    Ok(())
+}
+
+/// The legitimate post-deletion bump still works: when the floor's
+/// excess belongs to a dead predecessor and the lease loop completes a
+/// post-claim Leading round, the recovery seeds the bumped target and
+/// completes. Pairs with
+/// `test_recovery_unconfirmed_bump_above_live_holder_is_discarded` to
+/// pin both directions of the confirmation gate.
+// r[verify sched.recovery.bump-confirm]
+#[tokio::test]
+async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Only a dead predecessor's claim sits at our entry generation.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (12, 'dead-previous')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(12));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    // Parked after the claim INSERT and the rounds_at_claim snapshot:
+    // simulate the lease loop completing one post-claim Leading round.
+    let round = leader.begin_renew_round();
+    leader.confirm_leading_round(round);
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        13,
+        "a confirmed bump must exceed the dead predecessor's floor"
+    );
+    assert!(
+        leader.recovery_complete(),
+        "a confirmed bump recovery completes"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            (12, "dead-previous".to_string()),
+            (13, "pod-us".to_string())
+        ],
+        "the bump is claimed; the predecessor's row stays"
     );
     Ok(())
 }
