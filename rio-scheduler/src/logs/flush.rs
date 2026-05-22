@@ -1520,7 +1520,17 @@ impl LogFlusher {
     /// `status`/`finished_at` (`obs.log.finalize-immutable`).
     ///
     /// On failure the row keeps whatever it had (still `is_complete=false`,
-    /// `status` possibly NULL) until the TTL sweep — content is intact either way.
+    /// `status` possibly NULL) until the TTL sweep — content is intact either
+    /// way. The failure is reported at `warn!` on
+    /// `rio_scheduler_log_empty_drain_finalize_failures_total`, NOT through
+    /// [`flush_failure`]: that chokepoint's `is_final=true` arm is the
+    /// post-drain data-loss alert, and nothing here was drained or lost
+    /// (round-13 bug_008 made the same split for the pre-drain lookup sites).
+    /// The stamp is deliberately not retried: the entry is already drained
+    /// (a re-enqueued FlushRequest would look like a stale duplicate and be
+    /// dropped at the drain-miss arm), nothing in production reads
+    /// `status`/`finished_at`, and the served behavior — `.partial` content
+    /// with the incomplete indicator — is identical with or without it.
     // r[impl obs.log.finalize-immutable]
     async fn finalize_empty_drain(&self, req: &FlushRequest) {
         match sqlx::query(
@@ -1546,8 +1556,27 @@ impl LogFlusher {
                 );
             }
             Err(e) => {
+                // Zero lines drained; any prior `.partial` blob / `drv_logs`
+                // row is untouched and still served (`is_complete=false`).
+                // Deliberately NOT `flush_failure()`: its `is_final=true` arm
+                // is the post-drain data-loss alert and its `is_final=false`
+                // arm promises a next-tick retry — neither is true here. Same
+                // split as `prefix_fetch_failure` (round-13 bug_008); no-retry
+                // rationale in the fn doc.
                 let partial_key = log_s3_key(&req.drv_path, &req.exec_id, true);
-                flush_failure(true, "pg", &partial_key, &e, &req.drv_path);
+                warn!(
+                    exec_id = %req.exec_id,
+                    drv_path = %req.drv_path,
+                    status = ?req.status,
+                    partial_key = %partial_key,
+                    error = %e,
+                    "empty final drain: status/finished_at stamp failed; nothing \
+                     drained or lost — the prior .partial row (if any) keeps its \
+                     content and stays is_complete=false; not retried (the row \
+                     ages out at the TTL sweep)"
+                );
+                metrics::counter!("rio_scheduler_log_empty_drain_finalize_failures_total")
+                    .increment(1);
             }
         }
     }
@@ -1742,7 +1771,10 @@ impl LogFlusher {
 /// `error!`s every 30s when nothing was lost. Pre-drain stored-coverage
 /// lookup failures are reported by [`prefix_fetch_failure`] instead — keep
 /// them separate: this fn's `is_final=true` arm is the data-loss alert
-/// signal.
+/// signal. The empty-drain finalization stamp failure
+/// ([`LogFlusher::finalize_empty_drain`]'s `Err` arm — zero lines drained,
+/// nothing lost) is likewise kept off this chokepoint, on
+/// `rio_scheduler_log_empty_drain_finalize_failures_total`.
 fn flush_failure(
     is_final: bool,
     phase: &'static str,
@@ -3725,6 +3757,117 @@ mod tests {
             "an empty stale drain must not restamp status on a finalized row"
         );
         assert!(row.1);
+        Ok(())
+    }
+
+    /// Reporting contract for a PG failure on the empty-drain finalization
+    /// stamp: warn (not error), no false "is lost" claim, counted on the
+    /// dedicated empty-drain counter — never on the alert-keyed
+    /// flush-failures counter (nothing was drained; the .partial blob and
+    /// its row are intact and still served). Direct call: through
+    /// `flush_final` a whole-pool outage trips the already-finalized
+    /// guard's deferral arm first and never reaches the stamp.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn finalize_empty_drain_pg_failure_warns_without_loss_alert() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r14b002a-emptydrain-pgfail.drv";
+
+        // Ex-leader half of the failover-restamp shape: one streamed line,
+        // one periodic snapshot → .partial blob + incomplete row.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"streamed to the ex-leader"]);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher.flush_periodic().await;
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "fixture: periodic PUT happened"
+        );
+
+        // PG outage at the moment of the stamp.
+        db.pool.close().await;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            flusher
+                .finalize_empty_drain(&FlushRequest {
+                    drv_path: drv_path.into(),
+                    exec_id,
+                    status: Some("failed".into()),
+                })
+                .await;
+        }
+
+        // Reporting: warn-level, accurate message, no false loss claim.
+        assert!(!logs_contain("is lost"));
+        assert!(logs_contain("status/finished_at stamp failed"));
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .find(|l| l.contains("status/finished_at stamp failed"))
+            {
+                Some(line) if line.contains("WARN") && !line.contains("ERROR") => Ok(()),
+                Some(line) => Err(format!("expected WARN-level line, got: {line}")),
+                None => Err("missing stamp-failure line".to_string()),
+            }
+        });
+
+        // Routing: dedicated counter moved; the alert-keyed counter did not.
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .all(|(n, _, _)| n != "rio_scheduler_log_flush_failures_total"),
+            "empty-drain stamp failure must not hit the loss-alert counter: {counters:?}"
+        );
+        let stamp: Vec<_> = counters
+            .iter()
+            .filter(|(n, _, _)| n == "rio_scheduler_log_empty_drain_finalize_failures_total")
+            .collect();
+        assert_eq!(
+            stamp.len(),
+            1,
+            "exactly one stamp-failure series: {counters:?}"
+        );
+        assert_eq!(stamp[0].2, 1);
+
+        // Nothing lost or touched: no new S3 traffic, and the row still
+        // describes the periodic snapshot, unstamped and incomplete.
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "no new PUT from the failure path"
+        );
+        assert!(deletes.lock().unwrap().is_empty(), "no .partial delete");
+        let pool2 = db.reopen().await;
+        let row: (bool, Option<String>, String, i64, Option<f64>) = sqlx::query_as(
+            "SELECT is_complete, status, s3_key, line_count, \
+                    EXTRACT(EPOCH FROM finished_at)::float8 \
+             FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&pool2)
+        .await?;
+        assert!(!row.0, "row stays is_complete=false");
+        assert_eq!(row.1, None, "status not stamped (the UPDATE failed)");
+        assert!(
+            row.2.ends_with(".partial.log.zst"),
+            "s3_key still points at the .partial blob: {}",
+            row.2
+        );
+        assert_eq!(row.3, 1, "periodic snapshot's line_count preserved");
+        assert!(row.4.is_none(), "finished_at not stamped");
         Ok(())
     }
 

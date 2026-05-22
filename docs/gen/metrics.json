@@ -533,6 +533,11 @@
         "name": "rio_scheduler_log_batches_rejected_total"
       },
       {
+        "help": "Empty final drains (zero lines drained — failover restamp where the worker never reconnected, or an execution that never streamed a line) whose metadata-only status/finished_at stamp UPDATE on the drv_logs row failed (transient PG error). Not data loss: nothing was drained, and any prior .partial blob and its row stay intact and served with is_complete=false. The stamp is not retried; the row (if any) ages out at the TTL sweep. The data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true.",
+        "kind": "counter",
+        "name": "rio_scheduler_log_empty_drain_finalize_failures_total"
+      },
+      {
         "help": "Final-flush requests dropped because the execution's drv_logs row is already is_complete=true (an interim leader finalized it across a lease flap); the retained ring-buffer entry was stale pre-failover residue and was discarded instead of re-finalizing. Alert if rate is sustained — it implies repeated lease flapping.",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_already_finalized_total"
@@ -543,7 +548,7 @@
         "name": "rio_scheduler_log_flush_dropped_total"
       },
       {
-        "help": "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). is_final=true fires after the final drain (the drained data cannot be re-flushed); alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here.",
+        "help": "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). is_final=true fires after the final drain (the drained data cannot be re-flushed); alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here. Empty-drain finalization stamp failures (zero lines drained) are counted by rio_scheduler_log_empty_drain_finalize_failures_total, not here.",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_failures_total"
       },
@@ -1142,6 +1147,7 @@
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_log_batches_rejected_total",
+    "rio_scheduler_log_empty_drain_finalize_failures_total",
     "rio_scheduler_log_flush_already_finalized_total",
     "rio_scheduler_log_flush_dropped_total",
     "rio_scheduler_log_flush_failures_total",

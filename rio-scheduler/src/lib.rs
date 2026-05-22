@@ -304,7 +304,9 @@ pub fn describe_metrics() {
         "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). \
          is_final=true fires after the final drain (the drained data cannot be re-flushed); \
          alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup \
-         failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here."
+         failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here. \
+         Empty-drain finalization stamp failures (zero lines drained) are counted by \
+         rio_scheduler_log_empty_drain_finalize_failures_total, not here."
     );
     describe_counter!(
         "rio_scheduler_log_prefix_recovered_total",
@@ -350,6 +352,16 @@ pub fn describe_metrics() {
          attempt, so retries during one outage keep incrementing it. Sustained rate indicates \
          PG trouble on the flush path; loss requires the retry retention cap to overflow or \
          the process to exit before PG recovers."
+    );
+    describe_counter!(
+        "rio_scheduler_log_empty_drain_finalize_failures_total",
+        "Empty final drains (zero lines drained — failover restamp where the worker never \
+         reconnected, or an execution that never streamed a line) whose metadata-only \
+         status/finished_at stamp UPDATE on the drv_logs row failed (transient PG error). \
+         Not data loss: nothing was drained, and any prior .partial blob and its row stay \
+         intact and served with is_complete=false. The stamp is not retried; the row (if \
+         any) ages out at the TTL sweep. The data-loss alert stays on \
+         rio_scheduler_log_flush_failures_total is_final=true."
     );
     describe_counter!(
         "rio_scheduler_log_forward_dropped_total",
