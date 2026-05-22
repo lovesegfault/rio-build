@@ -341,6 +341,15 @@ pub fn describe_metrics() {
          lease flapping."
     );
     describe_counter!(
+        "rio_scheduler_log_flush_finalize_deferred_total",
+        "Final flushes deferred because the already-finalized guard could not read the \
+         execution's drv_logs row (transient PG error): nothing is uploaded, the buffer is \
+         left undrained for the periodic snapshotter and terminal cleanup, and the row may \
+         stay is_complete=false. Counted per deferred FlushRequest, including requests that \
+         would have turned out stale or no-op. Sustained rate indicates PG trouble on the \
+         flush path, not data loss by itself."
+    );
+    describe_counter!(
         "rio_scheduler_log_forward_dropped_total",
         "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer."
     );

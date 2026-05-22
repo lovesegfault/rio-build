@@ -54,7 +54,9 @@
 //!
 //! The flusher NEVER blocks the actor. It's mpsc-fed (`try_send`, bounded
 //! channel); if the channel is full, the actor's completion flush is
-//! dropped. The buffer stays in `LogBuffers.buffers` (sealed) and the next
+//! dropped. A final flush deferred because the already-finalized guard could
+//! not read `drv_logs` lands in the same shape. The buffer stays in
+//! `LogBuffers.buffers` (sealed) and the next
 //! periodic tick still snapshots it — so the content survives at the
 //! `.partial` key with an `is_complete=false` PG row. `CleanupTerminalBuild`
 //! (after `TERMINAL_CLEANUP_DELAY`, ~60s) reaps the DAG node and
@@ -383,7 +385,112 @@ impl LogFlusher {
 
     /// On-completion flush: drain the buffer (derivation is done, no more
     /// writes coming) and upload with `is_complete=true`.
+    ///
+    /// Consults the execution's stored `drv_logs` row FIRST: an execution
+    /// another leader already finalized is refused (residue reaped if still
+    /// stamped with it, nothing uploaded), and a row that cannot be read
+    /// defers the flush entirely (fail closed — see the guard below).
     async fn flush_final(&self, req: FlushRequest) {
+        // r[impl obs.log.finalize-immutable]
+        // Refuse to re-finalize an execution another leader already
+        // finalized — consulted FIRST, before the prefix reconcile, the
+        // drain, and any S3 work. Across an A→B→A lease flap the
+        // re-acquired ex-leader can retain a ring entry stamped with an
+        // exec_id whose final flush already happened on the interim leader
+        // (the drv was reset out of terminal afterwards, so the acquisition
+        // sweep keeps the entry for the cancel-sweep finalization, and the
+        // actor-side gate cannot see PG). Uploading that residue would
+        // overwrite the finalized `.log.zst` with a stale pre-failover
+        // snapshot; the frozen UPSERT clause would keep the row, which
+        // would then describe content the stale PUT replaced. The refusal
+        // makes no S3 calls at all: a `.partial` re-created by this
+        // replica's periodic churn is left for the GC to sweep at TTL.
+        //
+        // On a final that passes this guard and still reaches the
+        // reconcile with an Unchecked, non-empty ring (its execution had
+        // no prior non-empty flush this tenure — the common fast-build
+        // case), this point-SELECT duplicates the one inside
+        // `lookup_stored_prefix` — accepted, to keep the guard independent
+        // of the prefix-state machine.
+        match self.fetch_stored_drv_log(req.exec_id).await {
+            Ok(Some(stored)) if stored.is_complete => {
+                // Reap the retained residue iff it is still stamped with
+                // this execution (atomic with the staleness check, exactly
+                // like the upload path's drain). The durable record is
+                // authoritative — any retained lines it lacks fall within
+                // the accepted ≤30s periodic-flush failover-loss bound.
+                match self.buffers.drain_if_exec(&req.drv_path, req.exec_id) {
+                    Some((_, line_count, _, _)) => {
+                        self.buffers.unseal(&req.drv_path);
+                        warn!(
+                            drv = %req.drv_path,
+                            exec_id = %req.exec_id,
+                            dropped_lines = line_count,
+                            "dropping final flush: execution already finalized \
+                             by another leader; retained buffer was stale \
+                             pre-failover residue"
+                        );
+                        metrics::counter!("rio_scheduler_log_flush_already_finalized_total")
+                            .increment(1);
+                    }
+                    // No retained entry stamped with this exec (duplicate
+                    // final, or the entry was restamped to a newer
+                    // execution): nothing to reap, nothing at risk — the
+                    // blob/row are already final and we make no S3/PG
+                    // writes. Not the flap signal the counter above tracks,
+                    // so log-only at debug, no metric. No defensive unseal:
+                    // flush_final never seals (the terminal handler seals
+                    // before enqueueing), a duplicate's seal was already
+                    // cleared by the first request's drain, a restamped
+                    // entry's seal belongs to the live execution (mirrors
+                    // the stale-request arm below), and orphan seals are
+                    // bounded by `CleanupTerminalBuild`'s discard.
+                    None => {
+                        debug!(
+                            drv = %req.drv_path,
+                            exec_id = %req.exec_id,
+                            "final flush for an already-finalized execution \
+                             with no retained residue (duplicate request or \
+                             restamped entry); nothing to drop"
+                        );
+                    }
+                }
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Fail closed (`obs.log.finalize-immutable`): without the
+                // row we cannot tell "first finalization" from "another
+                // leader already finalized this exec", and proceeding is a
+                // destructive PUT at the finalized key. Defer instead: the
+                // request is consumed, but the entry is left undrained and
+                // sealed, so the periodic snapshotter keeps the lines
+                // durable at the `.partial` key (re-running its own row
+                // lookup every tick) and `CleanupTerminalBuild` reaps the
+                // entry at build cleanup (~60s after build terminal). The
+                // row — if any — stays `is_complete=false`, surfaced by the
+                // incomplete indicator (`obs.log.incomplete-surfaced`);
+                // `status`/`finished_at` may never be stamped for this
+                // execution, and a PG outage that outlasts both the
+                // periodic snapshotter and build cleanup loses the
+                // un-snapshotted tail (the old fall-through kept those
+                // bytes only as a blind PUT that may have just replaced a
+                // finalized log). That bounded loss is preferred over
+                // letting a transient PG blip on this one SELECT destroy
+                // an interim leader's finalized log in exactly the
+                // scenario this guard exists for.
+                warn!(
+                    drv = %req.drv_path,
+                    exec_id = %req.exec_id,
+                    error = %e,
+                    "deferring final flush: could not consult drv_logs to \
+                     rule out an existing finalization; nothing uploaded, \
+                     buffer left for the periodic snapshotter / terminal cleanup"
+                );
+                metrics::counter!("rio_scheduler_log_flush_finalize_deferred_total").increment(1);
+                return;
+            }
+        }
         // Stale-request guard, atomic with the drain. The flusher's mpsc
         // is 1000-deep and a GC sweep or S3 burst can let requests queue
         // for seconds. In that window the actor can re-dispatch the same
@@ -430,63 +537,6 @@ impl LogFlusher {
             self.buffers.drain_if_exec(&req.drv_path, req.exec_id)
         {
             self.buffers.unseal(&req.drv_path);
-            // r[impl obs.log.finalize-immutable]
-            // Refuse to re-finalize an execution another leader already
-            // finalized. Across an A→B→A lease flap the re-acquired
-            // ex-leader can retain a ring entry stamped with an exec_id
-            // whose final flush already happened on the interim leader
-            // (the drv was reset out of terminal afterwards, so the
-            // acquisition sweep keeps the entry for the cancel-sweep
-            // finalization, and the actor-side gate cannot see PG).
-            // Uploading that residue would overwrite the finalized
-            // `.log.zst` with a stale pre-failover snapshot and rewrite
-            // the row's content columns (before this guard the UPSERT
-            // latch admitted true→true rewrites, and the S3 PUT precedes
-            // the row write entirely). The drained entry is dropped: the
-            // durable record is authoritative — any retained lines it
-            // lacks fall within the accepted ≤30s periodic-flush
-            // failover-loss bound. The refusal path makes no S3 calls at
-            // all: a `.partial` re-created by this replica's periodic
-            // churn is left for the GC to sweep at TTL (do not move this
-            // return below the `.partial` delete). On the rare
-            // prefix-rescue final (`Unchecked` and `first_line > 0`) this
-            // point-SELECT duplicates the one inside
-            // `lookup_stored_prefix` — accepted, to keep the guard
-            // independent of the prefix-state machine.
-            //
-            // A lookup error falls through to the existing behavior:
-            // refusing on error would turn every PG blip into a lost
-            // final flush for the common (legitimate) case, while the
-            // destructive shape additionally requires the rare
-            // double-flap conjunction. In that conjunction the frozen
-            // UPSERT clause still protects the row; only the blob is
-            // exposed, and the row then describes content the stale PUT
-            // replaced (bounded by log retention).
-            match self.fetch_stored_drv_log(req.exec_id).await {
-                Ok(Some(stored)) if stored.is_complete => {
-                    warn!(
-                        drv = %req.drv_path,
-                        exec_id = %req.exec_id,
-                        dropped_lines = line_count,
-                        "dropping final flush: execution already finalized \
-                         by another leader; retained buffer was stale \
-                         pre-failover residue"
-                    );
-                    metrics::counter!("rio_scheduler_log_flush_already_finalized_total")
-                        .increment(1);
-                    return;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    debug!(
-                        drv = %req.drv_path,
-                        exec_id = %req.exec_id,
-                        error = %e,
-                        "could not consult drv_logs before final flush; \
-                         proceeding (upsert latch still protects the row)"
-                    );
-                }
-            }
             let (recovered_prefix, preserve_partial) = match pre_drain_prefix_state {
                 PrefixState::Cached(p) => (Some(p), false),
                 // Looked (or nothing stored): final behaves exactly as
@@ -1631,8 +1681,10 @@ async fn upsert_drv_log(
     // execution (an ex-leader's sweep landing after the new leader
     // finalized the drv, or a queued periodic landing after a final), or a
     // stale "final" for an exec another leader already finalized that got
-    // past `flush_final`'s already-finalized guard (e.g. its lookup
-    // errored). Working as designed; any blob this write uploaded is
+    // past `flush_final`'s already-finalized guard (a concurrent
+    // finalization landing after the guard's lookup read the row as
+    // unfinalized — the lookup-error case now defers instead of
+    // proceeding). Working as designed; any blob this write uploaded is
     // orphaned and the TTL GC sweeps it at expiry.
     if result.rows_affected() == 0 {
         debug!(
@@ -2766,11 +2818,199 @@ mod tests {
         Ok(())
     }
 
+    /// The already-finalized guard's lookup-error arm must fail closed: a
+    /// transient PG error on the guard's point-SELECT defers the final
+    /// flush (nothing drained, nothing uploaded) instead of falling through
+    /// to a destructive PUT over another leader's finalized blob — the
+    /// A→B→A flap shape with one extra ingredient (PG turbulence at
+    /// cancel-sweep time).
+    /// r[verify obs.log.finalize-immutable]
+    #[tokio::test]
+    async fn flush_final_guard_lookup_error_defers_and_preserves_finalized_blob()
+    -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r13grd1-guard-defer.drv";
+
+        // (1) Interim leader B's tenure: the worker streamed three lines and
+        // the build finished there — B's final flush PUTs the `.log.zst`,
+        // finalizes the row, and deletes the `.partial`.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"line0", b"line1", b"line2"]);
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        assert_eq!(puts.lock().unwrap().len(), 1, "fixture: B's final PUT");
+        assert_eq!(
+            deletes.lock().unwrap().len(),
+            1,
+            "fixture: B's .partial delete"
+        );
+
+        // (2) The re-acquired ex-leader A's retained residue: same exec_id,
+        // one stale pre-failover line, sealed by the terminal epilogue
+        // (production order: lines arrive, the epilogue seals, the request
+        // follows).
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        buffers.push(&mk_batch(drv_path, 0, &[b"stale pre-failover line"]));
+        buffers.seal(drv_path);
+
+        // (3) PG turbulence exactly at cancel-sweep time: the guard's
+        // point-SELECT fails. `close()` closes all clones, including the
+        // flusher's.
+        db.pool.close().await;
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("cancelled".into()),
+            })
+            .await;
+
+        // THE assertion: the stale residue did not overwrite B's finalized
+        // blob (the old fall-through PUT a second body at the same key).
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "deferred final must not PUT over the finalized blob"
+        );
+        assert_eq!(
+            deletes.lock().unwrap().len(),
+            1,
+            "deferred final must make no S3 calls"
+        );
+        // Deferred, not consumed: the entry stays stamped and sealed for the
+        // periodic snapshotter / CleanupTerminalBuild.
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "entry left undrained"
+        );
+        assert!(buffers.is_sealed(drv_path), "seal left in place");
+        // B's record untouched (fresh pool: `close()` killed the original).
+        let pool = db.reopen().await;
+        let row: (bool, String, i64) = sqlx::query_as(
+            "SELECT is_complete, s3_key, line_count FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(row.0, "row still finalized");
+        assert!(
+            row.1.ends_with(".log.zst") && !row.1.contains(".partial"),
+            "finalized s3_key untouched: {}",
+            row.1
+        );
+        assert_eq!(row.2, 3, "B's line_count untouched");
+        Ok(())
+    }
+
+    /// Common-case cost of failing closed: a final deferred because the
+    /// guard's lookup failed must not lose the log — once PG recovers the
+    /// periodic snapshotter (which does not filter sealed entries) lands
+    /// the full content at the `.partial` key with an `is_complete=false`
+    /// row.
+    /// r[verify obs.log.finalize-immutable]
+    #[tokio::test]
+    async fn flush_final_guard_lookup_error_no_row_defers_to_periodic() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r13grd2-guard-defer-norow.drv";
+
+        // Fast build: this final would have been the first-ever flush — no
+        // drv_logs row exists yet. Lines arrive, the epilogue seals, the
+        // FlushRequest follows.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"only-flush-line0", b"line1"]);
+        buffers.seal(drv_path);
+
+        // The flusher whose pool is down at final-flush time (a separate
+        // reopened pool, so the outage doesn't take `db.pool` down with it).
+        let bad_pool = db.reopen().await;
+        bad_pool.close().await;
+        let flusher_bad = LogFlusher::new(
+            s3.clone(),
+            "test-bucket".into(),
+            bad_pool,
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher_bad
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "deferred final uploads nothing"
+        );
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "deferred final makes no S3 calls"
+        );
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "entry left undrained for the periodic snapshotter"
+        );
+
+        // PG recovers; the periodic loop (same buffers, healthy pool) is the
+        // existing degraded mode that keeps the content durable.
+        let flusher_ok = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher_ok.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "exactly the periodic snapshot PUT");
+        let (key, body) = &captured[0];
+        assert!(
+            key.ends_with(".partial.log.zst"),
+            "content lands at the .partial key: {key}"
+        );
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "only-flush-line0\nline1\n",
+            "no content lost to the deferred final"
+        );
+        let row: (bool, Option<String>) =
+            sqlx::query_as("SELECT is_complete, status FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert!(!row.0, "row stays is_complete=false (incomplete indicator)");
+        assert!(
+            row.1.is_none(),
+            "status never stamped for the deferred final"
+        );
+        Ok(())
+    }
+
     /// Defense-in-depth: even if a final-flush write reaches the UPSERT for
-    /// an already-finalized row (the consult-the-row guard errored, or a
-    /// future caller bypasses it), the conflict clause refuses ANY update
-    /// to a finalized row — not just the `is_complete` true→false
-    /// downgrade.
+    /// an already-finalized row (a concurrent finalization landing after the
+    /// guard's lookup read the row as unfinalized, or a future caller
+    /// bypasses it), the conflict clause refuses ANY update to a finalized
+    /// row — not just the `is_complete` true→false downgrade.
     /// r[verify obs.log.finalize-immutable]
     #[tokio::test]
     async fn upsert_refuses_second_finalization_of_completed_row() -> anyhow::Result<()> {

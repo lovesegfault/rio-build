@@ -104,6 +104,11 @@ retained lines it lacks fall within the accepted periodic-flush failover-loss
 bound. The UPSERT monotonicity latch alone is not sufficient --- it only
 refuses `is_complete` downgrades, and the S3 PUT precedes the row write
 entirely.
+When the row cannot be consulted at all (the lookup itself fails), the flusher
+fails closed: the final flush is deferred --- the buffer is left to the periodic
+snapshotter and the terminal-cleanup reaper rather than uploaded blind ---
+accepting that the execution's row may remain `is_complete = false` (surfaced
+per `obs.log.incomplete-surfaced`) over risking an overwrite of a finalized log.
 
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries
@@ -114,7 +119,8 @@ entirely.
 ]
 
 A `.partial`-only row (leader failover before the final flush, a dropped
-completion `FlushRequest`, an abandoned execution) serves the periodic
+completion `FlushRequest`, a final flush deferred because its `drv_logs`
+lookup failed, an abandoned execution) serves the periodic
 snapshot --- strictly more useful than `NotFound`, but the missing tail is
 usually the most interesting part of the log: the build error. Without an
 explicit indicator the user reads a truncated log as the whole thing.

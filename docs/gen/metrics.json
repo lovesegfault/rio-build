@@ -548,6 +548,11 @@
         "name": "rio_scheduler_log_flush_failures_total"
       },
       {
+        "help": "Final flushes deferred because the already-finalized guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded, the buffer is left undrained for the periodic snapshotter and terminal cleanup, and the row may stay is_complete=false. Counted per deferred FlushRequest, including requests that would have turned out stale or no-op. Sustained rate indicates PG trouble on the flush path, not data loss by itself.",
+        "kind": "counter",
+        "name": "rio_scheduler_log_flush_finalize_deferred_total"
+      },
+      {
         "help": "Final-flush requests dropped because the drv was re-dispatched while the request was queued (the live ring-buffer exec_id no longer matches the request's). The re-dispatched execution's log is preserved; the stale request's exec was already lost when assign_to_worker discarded its buffer.",
         "kind": "counter",
         "name": "rio_scheduler_log_flush_stale_total"
@@ -1135,6 +1140,7 @@
     "rio_scheduler_log_flush_already_finalized_total",
     "rio_scheduler_log_flush_dropped_total",
     "rio_scheduler_log_flush_failures_total",
+    "rio_scheduler_log_flush_finalize_deferred_total",
     "rio_scheduler_log_flush_stale_total",
     "rio_scheduler_log_flush_total",
     "rio_scheduler_log_forward_dropped_total",
