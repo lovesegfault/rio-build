@@ -718,9 +718,11 @@ impl LogFlusher {
     /// `ring_span` is `(first_line, last_line, line_count)` of the stamped
     /// ring entry, as returned by [`LogBuffers::span`]; `line_count > 0`.
     ///
-    /// `is_final` is the caller's flush kind, threaded into the
-    /// `flush_failure` chokepoint so fetch failures carry the real
-    /// `is_final` label.
+    /// `is_final` is the caller's flush kind, threaded into
+    /// [`prefix_fetch_failure`] so the metric label and message reflect
+    /// whether the degraded merge affects a final upload or a periodic
+    /// snapshot (fetch failures here are pre-drain and are NOT flush
+    /// failures — see that helper's doc).
     async fn lookup_stored_prefix(
         &self,
         drv_path: &str,
@@ -737,7 +739,7 @@ impl LogFlusher {
             Ok(row) => row,
             Err(e) => {
                 // Treat as FetchFailed: don't clobber what we can't see.
-                flush_failure(is_final, "prefix_fetch", &partial_key, &e, drv_path);
+                prefix_fetch_failure(is_final, "pg", &partial_key, &e, drv_path);
                 return StoredPrefixLookup::FetchFailed;
             }
         };
@@ -806,12 +808,12 @@ impl LogFlusher {
                     }))
                 }
                 Err(e) => {
-                    flush_failure(is_final, "prefix_fetch", &s3_key, &e, drv_path);
+                    prefix_fetch_failure(is_final, "s3", &s3_key, &e, drv_path);
                     StoredPrefixLookup::FetchFailed
                 }
             },
             Err(e) => {
-                flush_failure(is_final, "prefix_fetch", &s3_key, &e, drv_path);
+                prefix_fetch_failure(is_final, "s3", &s3_key, &e, drv_path);
                 StoredPrefixLookup::FetchFailed
             }
         }
@@ -1421,7 +1423,10 @@ impl LogFlusher {
 /// final flushes already drained the buffer (data is gone → `error!`);
 /// periodic flushes snapshotted (buffer intact, next tick retries →
 /// `warn!`). Prevents an S3 blip from emitting N false "log is lost"
-/// `error!`s every 30s when nothing was lost.
+/// `error!`s every 30s when nothing was lost. Pre-drain stored-coverage
+/// lookup failures are reported by [`prefix_fetch_failure`] instead — keep
+/// them separate: this fn's `is_final=true` arm is the data-loss alert
+/// signal.
 fn flush_failure(
     is_final: bool,
     phase: &'static str,
@@ -1444,6 +1449,48 @@ fn flush_failure(
         warn!(
             s3_key = %s3_key, error = %error, is_final, phase,
             "log flush failed; periodic snapshot for {drv_path} will retry next tick"
+        );
+    }
+}
+
+/// Log + metric for a stored-coverage lookup failure inside
+/// [`LogFlusher::lookup_stored_prefix`] (the `drv_logs` point-SELECT, or the
+/// S3 GET of a prior tenure's `.partial` blob). Deliberately NOT routed
+/// through [`flush_failure`]: that chokepoint's `is_final=true` arm means
+/// "the buffer was already drained and its data is gone" and feeds the
+/// data-loss alert (`rio_scheduler_log_flush_failures_total`), while this
+/// lookup runs BEFORE any drain or delete and the caller degrades without
+/// losing anything (`obs.log.stored-coverage-preserved`): the periodic
+/// snapshot is skipped and retried next tick; the final flush uploads the
+/// drained ring without the stored prefix and skips the `.partial` delete.
+/// Routing these through `flush_failure` emitted a false "log is lost"
+/// error and tripped the loss alert for flushes that fully succeeded
+/// (round-13 bug_008).
+fn prefix_fetch_failure(
+    is_final: bool,
+    phase: &'static str,
+    s3_key: &str,
+    error: &dyn std::fmt::Display,
+    drv_path: &str,
+) {
+    metrics::counter!(
+        "rio_scheduler_log_prefix_fetch_failures_total",
+        "phase" => phase,
+        "is_final" => if is_final { "true" } else { "false" },
+    )
+    .increment(1);
+    if is_final {
+        warn!(
+            s3_key = %s3_key, error = %error, is_final, phase,
+            "stored-coverage lookup failed; final flush for {drv_path} \
+             continues without the stored prefix and the .partial delete is \
+             skipped (pre-drain failure — nothing drained or lost by this step)"
+        );
+    } else {
+        warn!(
+            s3_key = %s3_key, error = %error, is_final, phase,
+            "stored-coverage lookup failed; periodic snapshot for {drv_path} \
+             skipped this tick, retried next tick (nothing overwritten)"
         );
     }
 }
@@ -1707,6 +1754,32 @@ mod tests {
     /// `spawn`-loop tests.
     fn always_leader() -> Arc<std::sync::atomic::AtomicBool> {
         Arc::new(std::sync::atomic::AtomicBool::new(true))
+    }
+
+    /// One captured counter series: `(metric name, sorted label pairs, value)`.
+    type CounterSeries = (String, Vec<(String, String)>, u64);
+
+    /// Capture-once dump of every counter the local recorder saw:
+    /// `(metric name, sorted label pairs, value)`. Snapshotting drains the
+    /// recorder (see `sla::metrics::counter_map_by`'s doc) — call this once
+    /// per test and assert against the returned Vec.
+    fn all_counters(snap: &metrics_util::debugging::Snapshotter) -> Vec<CounterSeries> {
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(k, _, _, v)| {
+                let metrics_util::debugging::DebugValue::Counter(c) = v else {
+                    return None;
+                };
+                let mut labels: Vec<(String, String)> = k
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                Some((k.key().name().to_string(), labels, c))
+            })
+            .collect()
     }
 
     #[test]
@@ -4028,7 +4101,14 @@ mod tests {
         assert_eq!(puts.lock().unwrap().len(), 1, "fixture: prefix PUT");
 
         buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
-        flusher.flush_periodic().await;
+        // Recorder around the flush under test only, so the fixture's
+        // periodic flush doesn't pollute the capture.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            flusher.flush_periodic().await;
+        }
 
         assert_eq!(
             puts.lock().unwrap().len(),
@@ -4047,6 +4127,28 @@ mod tests {
             "row keeps describing the stored prefix"
         );
         assert!(gets.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        // Reporting routing: a pre-drain lookup failure lands on the
+        // dedicated prefix-fetch counter, never on the alert-keyed
+        // flush-failures counter (nothing was lost; next tick retries).
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .all(|(n, _, _)| n != "rio_scheduler_log_flush_failures_total"),
+            "pre-drain lookup failure must not hit the loss-alert counter: {counters:?}"
+        );
+        let pfx: Vec<_> = counters
+            .iter()
+            .filter(|(n, _, _)| n == "rio_scheduler_log_prefix_fetch_failures_total")
+            .collect();
+        assert_eq!(pfx.len(), 1, "exactly one prefix-fetch failure series");
+        assert_eq!(pfx[0].2, 1);
+        assert!(pfx[0].1.contains(&("phase".to_string(), "s3".to_string())));
+        assert!(
+            pfx[0]
+                .1
+                .contains(&("is_final".to_string(), "false".to_string()))
+        );
         Ok(())
     }
 
@@ -4099,6 +4201,154 @@ mod tests {
         assert!(
             deletes.lock().unwrap().is_empty(),
             "the .partial (only copy of the prefix) must NOT be deleted"
+        );
+        Ok(())
+    }
+
+    /// Reporting contract for a pre-drain stored-coverage lookup failure on
+    /// the FINAL path: warn (not error), no false "is lost" claim, counted
+    /// on the dedicated prefix-fetch counter — never on the alert-keyed
+    /// flush-failures counter (the flush proceeds and nothing is drained or
+    /// lost by the lookup step). The data path for the identical trace
+    /// (suffix-only upload, `.partial` preserved) is pinned by
+    /// `prefix_fetch_failure_final_uploads_suffix_but_keeps_partial`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn prefix_fetch_failure_final_warns_without_loss_alert() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let prefix: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2"];
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Err(()));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r13pfx1-getfail-final-obs.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &prefix).await;
+        buffers.push(&mk_batch(drv_path, 5, &[b"sfx-5", b"sfx-6"]));
+
+        // Recorder around the flush under test only, so the fixture's
+        // periodic flush doesn't pollute the capture.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            flusher
+                .flush_final(FlushRequest {
+                    drv_path: drv_path.into(),
+                    exec_id,
+                    status: Some("failed".into()),
+                })
+                .await;
+        }
+
+        // Vacuity guards: the lookup ran and hit the failing GET, and the
+        // flush still proceeded to the final upload (data path pinned by
+        // the sibling test — not re-asserted here).
+        assert!(gets.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, _body) = captured.last().expect("final PUT");
+        assert!(key.ends_with(".log.zst") && !key.ends_with(".partial.log.zst"));
+
+        // Reporting: warn-level, accurate message, no false loss claim.
+        assert!(!logs_contain("is lost (buffer already drained)"));
+        assert!(logs_contain("stored-coverage lookup failed"));
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .find(|l| l.contains("stored-coverage lookup failed"))
+            {
+                Some(line) if line.contains("WARN") && !line.contains("ERROR") => Ok(()),
+                Some(line) => Err(format!("expected WARN-level line, got: {line}")),
+                None => Err("missing 'stored-coverage lookup failed' line".to_string()),
+            }
+        });
+
+        // Routing: dedicated counter with the real labels; the alert-keyed
+        // flush-failures counter did not move.
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .all(|(n, _, _)| n != "rio_scheduler_log_flush_failures_total"),
+            "pre-drain lookup failure must not hit the loss-alert counter: {counters:?}"
+        );
+        let pfx: Vec<_> = counters
+            .iter()
+            .filter(|(n, _, _)| n == "rio_scheduler_log_prefix_fetch_failures_total")
+            .collect();
+        assert_eq!(pfx.len(), 1, "exactly one prefix-fetch failure series");
+        assert_eq!(pfx[0].2, 1);
+        assert!(pfx[0].1.contains(&("phase".to_string(), "s3".to_string())));
+        assert!(
+            pfx[0]
+                .1
+                .contains(&("is_final".to_string(), "true".to_string()))
+        );
+        Ok(())
+    }
+
+    /// PG outage during the pre-drain reconcile: the periodic snapshot is
+    /// skipped (nothing drained, nothing overwritten), reported at warn on
+    /// the dedicated prefix-fetch counter with phase="pg" — never on the
+    /// alert-keyed flush-failures counter.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn prefix_fetch_pg_failure_periodic_warns_on_dedicated_counter() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r13pfx2-pgfail-periodic.drv";
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // Stamped entry, non-empty ring, PrefixState::Unchecked.
+        let _exec_id = stamp_and_push(&buffers, drv_path, &[b"line-0"]);
+        // Outage: closes all clones of the pool, including the flusher's.
+        db.pool.close().await;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            flusher.flush_periodic().await;
+        }
+
+        // Snapshot skipped, buffer intact (retried next tick).
+        assert!(puts.lock().unwrap().is_empty(), "no PUT on fetch failure");
+        assert_eq!(buffers.active_count(), 1, "buffer intact for next tick");
+        // Reporting: warn-level new message, no false loss claim.
+        assert!(logs_contain("stored-coverage lookup failed"));
+        assert!(!logs_contain("is lost"));
+        // Routing: dedicated counter with phase="pg", alert counter untouched.
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .all(|(n, _, _)| n != "rio_scheduler_log_flush_failures_total"),
+            "pre-drain lookup failure must not hit the loss-alert counter: {counters:?}"
+        );
+        let pfx: Vec<_> = counters
+            .iter()
+            .filter(|(n, _, _)| n == "rio_scheduler_log_prefix_fetch_failures_total")
+            .collect();
+        assert_eq!(pfx.len(), 1, "exactly one prefix-fetch failure series");
+        assert_eq!(pfx[0].2, 1);
+        assert!(pfx[0].1.contains(&("phase".to_string(), "pg".to_string())));
+        assert!(
+            pfx[0]
+                .1
+                .contains(&("is_final".to_string(), "false".to_string()))
         );
         Ok(())
     }

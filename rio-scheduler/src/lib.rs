@@ -301,13 +301,25 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_flush_failures_total",
-        "Failed log flushes (labeled by phase: compress/s3/pg/prefix_fetch, is_final: true/false); \
-         alert on is_final=true rate > 0 sustained"
+        "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). \
+         is_final=true fires after the final drain (the drained data cannot be re-flushed); \
+         alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup \
+         failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here."
     );
     describe_counter!(
         "rio_scheduler_log_prefix_recovered_total",
         "Stored pre-failover log prefixes fetched from the prior leader's .partial blob and \
          re-folded into this leader's flushes (failover with a reconnecting worker)."
+    );
+    describe_counter!(
+        "rio_scheduler_log_prefix_fetch_failures_total",
+        "Stored-coverage lookups that failed during a flush's pre-drain reconciliation \
+         (labeled by phase: pg = drv_logs point-SELECT, s3 = prior .partial GET; \
+         is_final: true/false). Not data loss: the periodic snapshot skips the tick and \
+         retries next tick; the final flush uploads the drained ring without the stored \
+         prefix and preserves the .partial blob. Investigate if sustained (degraded log \
+         merges); the data-loss alert stays on rio_scheduler_log_flush_failures_total \
+         is_final=true."
     );
     describe_counter!(
         "rio_scheduler_log_flush_dropped_total",
