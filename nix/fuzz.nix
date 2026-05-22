@@ -206,4 +206,14 @@ in
       value = mkFuzzCheck t;
     }) fuzzTargets
   );
+
+  # The sancov workspace builds every `runs.*` entry wraps (one per
+  # fuzz workspace). This is the fuzz matrix's shared trunk: on a
+  # cold cache every run entry would otherwise rebuild one of these
+  # from scratch on its own runner. ciMatrix.warm.fuzz aggregates
+  # them so CI builds each once before the run matrix fans out.
+  builds = {
+    inherit (rio-nix-fuzz-build.members) rio-nix-fuzz;
+    inherit (rio-store-fuzz-build.members) rio-store-fuzz;
+  };
 }

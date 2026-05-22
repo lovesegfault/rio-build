@@ -533,6 +533,15 @@
                 });
               dockerImages = mkDockerImages { inherit rio-crates; };
 
+              # Instrumented-image set for the coverage VM tests. Hoisted
+              # out of the vmTestsCov call below so ciMatrix.warm.coverage
+              # can aggregate it without a second mkDockerImages call
+              # (which would be a distinct, never-cached derivation set).
+              dockerImagesCov = mkDockerImages {
+                rio-crates = rio-crates-cov;
+                coverage = true;
+              };
+
               # NixOS EKS node AMI builder (ADR-021, see nix/node-ami.nix).
               # Exposed below as packages.<system>.ami (and
               # packages.x86_64-linux.ami-bios for legacy BIOS boot).
@@ -592,10 +601,7 @@
                 removeAttrs
                   (vmWiring.mkVmTests {
                     rio-workspace = rio-workspace-cov;
-                    dockerImages = mkDockerImages {
-                      rio-crates = rio-crates-cov;
-                      coverage = true;
-                    };
+                    dockerImages = dockerImagesCov;
                     coverage = true;
                   })
                   # prod-parity asserts readOnlyRootFilesystem=true (PSA-restricted);
@@ -753,6 +759,74 @@
                     )
                   ) crateChecks.covLcovs
                   // coverage.perTestLcov;
+
+                # Per-kind shared-trunk aggregates for the CI warm stage.
+                # Each is a linkFarm whose closure is (approximately) the
+                # set of derivations needed by >=2 entries of the matching
+                # matrix. ci.yml builds warm.<kind> in a single job before
+                # fanning out kind <kind>, so the trunk is built once
+                # instead of once per matrix entry. gen-matrix drops a
+                # warm entry when it is already substitutable, so a
+                # cached trunk adds zero latency.
+                #
+                # A linkFarm is "cached" iff its whole closure is
+                # substitutable, and an uncached one only builds the
+                # constituents that are actually missing — so these
+                # aggregates never over-build. They CAN over-warm
+                # (force a derivation no uncached leaf needs); that is
+                # the accepted cost of keeping them static instead of
+                # computing the exact shared set from neededBuilds
+                # (deferred — see the v2 note in nix/gen_matrix.py).
+                #
+                # The kinds' trunks are nearly disjoint (check-profile
+                # rustc vs -Cinstrument-coverage vs nightly+sancov vs
+                # release bins -> docker images), which is why this is
+                # four aggregates and not one.
+                warm = {
+                  # Every workspace member's base buildRustCrate drv.
+                  # Transitively forces every third-party dep crate (the
+                  # "dep crates (cached once)" layer in nix/checks.nix's
+                  # diagram) and every member rlib that downstream
+                  # members' check drvs link against. The leaf check
+                  # drvs (one clippy/doc/nextest invocation per member)
+                  # are all that remains for the fan-out jobs.
+                  checks = pkgs.linkFarm "rio-warm-checks" (
+                    pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) crateBuild.members
+                  );
+                  # The sancov workspace builds (one per fuzz
+                  # workspace) behind every fuzz-run entry.
+                  fuzz = pkgs.linkFarm "rio-warm-fuzz" (
+                    pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) fuzz.builds
+                  );
+                  # Docker images (incl. the oci-archive k3s/AMI seeds)
+                  # plus the release bin set. Every VM scenario embeds
+                  # the same images; building them is the expensive
+                  # shared step, and it does NOT need /dev/kvm — only
+                  # booting the VMs does. The warm job runs on spot.
+                  "vm-test" = pkgs.linkFarm "rio-warm-vm-test" (
+                    [
+                      {
+                        name = "rio-workspace";
+                        path = rio-workspace;
+                      }
+                    ]
+                    ++ pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) (
+                      pkgs.lib.filterAttrs (_: pkgs.lib.isDerivation) dockerImages
+                    )
+                  );
+                  # Instrumented member builds (unit-* lcov trunk) plus
+                  # the instrumented image set (vm-* lcov trunk).
+                  coverage = pkgs.linkFarm "rio-warm-coverage" (
+                    pkgs.lib.mapAttrsToList (name: path: {
+                      name = "cov-${name}";
+                      inherit path;
+                    }) crateBuildCov.members
+                    ++ pkgs.lib.mapAttrsToList (name: path: {
+                      name = "img-${name}";
+                      inherit path;
+                    }) (pkgs.lib.filterAttrs (_: pkgs.lib.isDerivation) dockerImagesCov)
+                  );
+                };
               };
             in
             {
