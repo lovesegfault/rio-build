@@ -309,6 +309,14 @@ module leaderElection {
   /// generation-claim mandate). Model-only bookkeeping read by the
   /// noRetainAfterDeletion witness; never read by an action guard.
   var stealRetained: bool
+  /// History flag: a steal's claim target had to exceed a tied foreign
+  /// floor (genHW equal to the entry generation under another holder's
+  /// row; the not-equal form also covers the ownerless tie, unreachable
+  /// at a tie in practice -- "not our row => bump" is the intended
+  /// claim-target semantics, so the breadth is deliberate). Model-only
+  /// bookkeeping read by the noForeignTieBumpAfterDeletion witness;
+  /// never read by an action guard.
+  var stealBumpedForeignTie: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -465,6 +473,21 @@ module leaderElection {
   /// Checked against the deletion regime, where the divergence between
   /// the lease-derived and ledger-derived epoch sources arises.
   val noRetainAfterDeletion = not(deletes > 0 and stealRetained)
+
+  /// Violated when a steal's claim target had to exceed a tied foreign
+  /// floor after a Lease deletion: the surviving floor (owned by the
+  /// deletion victim) ties the stealer's restarted entry and must be
+  /// exceeded -- the bump that keeps staleLeaderHasStaleGeneration true
+  /// while the victim still believes. stealBumpedForeignTie is set only
+  /// inside that branch of steal, so unlike a state-shape predicate this
+  /// cannot be satisfied by an ordinary bump-and-claim acquisition.
+  /// Checked against the deletion regime by
+  /// quint-leader-election-witness-deletion-foreign-tie (nix/quint.nix);
+  /// the other regimes cannot reach the branch (without a deletion the
+  /// lease's transition count never regresses, so a stealer's entry
+  /// strictly exceeds every recorded floor and a renew-edge tie is
+  /// always the holder's own row).
+  val noForeignTieBumpAfterDeletion = not(deletes > 0 and stealBumpedForeignTie)
 
   /// Violated when a write-ahead claim INSERT has failed: proves the
   /// PgFaults regime actually explores the proceed-on-failure path
@@ -730,6 +753,7 @@ module leaderElection {
     casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
     restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// GET the lease. The obs[n] update follows decide_pure()'s
@@ -776,6 +800,7 @@ module leaderElection {
     casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
@@ -951,6 +976,14 @@ module leaderElection {
       // disjunction, leaving the variable unassigned on one branch.
       stealRetained' = (stealRetained or
         (genHW == entry and genHWHolder == Held(n))),
+      // The bump-event discriminator for the noForeignTieBumpAfterDeletion
+      // witness: records that this acquisition had to exceed a tied
+      // FOREIGN floor (same pre-state values seedFor reads, same
+      // load-bearing parentheses as the conjunct above; the not-equal
+      // form deliberately covers the ownerless tie too -- "not our row
+      // => bump" is the claim-target semantics).
+      stealBumpedForeignTie' = (stealBumpedForeignTie or
+        (genHW == entry and genHWHolder != Held(n))),
       // The claim disjunction: the INSERT into the claims ledger either
       // lands (claimOk -- the floor advances when seeded exceeds it; on
       // seedFor's own-row-tie retain path seeded equals genHW, so claimOk
@@ -995,12 +1028,24 @@ module leaderElection {
   ///            own pre-crash incarnation -- claimed higher); a floor
   ///            tying it is retained only when the ledger row at it is
   ///            our own (genHWHolder), else exceeded. The foreign-tie
-  ///            bump branch is reachable only through the pg-faults
-  ///            regime's claim-failure interleavings (a foreign row can
-  ///            sit at our entry generation only after someone else's
-  ///            claim landed where ours failed); base/deletion traces
-  ///            never reach it, which is expected, not evidence the
-  ///            branch is dead.
+  ///            bump branch belongs to the shared seedFor rule but never
+  ///            fires via renewLease in any regime: a renewing node holds
+  ///            the lease, and a floor tying its entry is its own claim
+  ///            row (the retain arm). Its reachable instances are
+  ///            steal-side and deletion-only -- after a deleteLease the
+  ///            surviving floor (owned by the deletion victim) ties a
+  ///            foreign stealer's restarted entry and must be exceeded;
+  ///            that bump is what keeps staleLeaderHasStaleGeneration
+  ///            true while the victim still believes, and the
+  ///            quint-leader-election-witness-deletion-foreign-tie check
+  ///            (nix/quint.nix) pins that the deletion regime actually
+  ///            explores it. Without a deletion the lease's transition
+  ///            count never regresses, so a stealer's entry strictly
+  ///            exceeds every recorded floor and a tied floor at a renew
+  ///            edge is always the holder's own row -- base, asymmetric,
+  ///            and pg-faults cannot reach the branch (claim failures
+  ///            only lower the floor; they cannot manufacture a foreign
+  ///            tie).
   ///
   /// The collapse is GATED ON THE ACQUIRE EDGE (not(leading.get(n)) in
   /// the pre-state): production's claim loop lives in
@@ -1082,6 +1127,7 @@ module leaderElection {
       acquiredAt' = acquiredAt, deletes' = deletes,
       delVictims' = delVictims, restores' = restores,
       stealRetained' = stealRetained,
+      stealBumpedForeignTie' = stealBumpedForeignTie,
       // The same claim disjunction as steal's, restricted to the edge
       // branch via claimTarget -- a steady-state renew never claims, so
       // it cannot fail to claim. The retry-on-the-next-acquire-edge
@@ -1113,6 +1159,7 @@ module leaderElection {
     casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1132,6 +1179,7 @@ module leaderElection {
     casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
     restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// Pod crash. Loses ALL in-memory state: the belief, the snapshot, the
@@ -1154,6 +1202,7 @@ module leaderElection {
     deletes' = deletes, delVictims' = delVictims,
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// Pod restart. The recovered process has no observation (its first
@@ -1170,6 +1219,7 @@ module leaderElection {
     casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
     restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// Operator fault: `kubectl delete lease` destroys the Lease object and
@@ -1222,6 +1272,7 @@ module leaderElection {
     casRace' = casRace,
     claimFailures' = claimFailures, restores' = restores,
     stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   /// Operator/infrastructure fault: a PostgreSQL point-in-time restore
@@ -1248,6 +1299,7 @@ module leaderElection {
     acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
     stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
   }
 
   // --- 7. init ----------------------------------------------------------
@@ -1273,6 +1325,7 @@ module leaderElection {
     claimFailures' = 0,
     restores' = 0,
     stealRetained' = false,
+    stealBumpedForeignTie' = false,
   }
 
   // --- 8. step ----------------------------------------------------------

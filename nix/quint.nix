@@ -481,6 +481,20 @@ in
       witness = "noRetainAfterDeletion";
     };
 
+    # The foreign-tie bump is explored in the deletion regime: after a
+    # deleteLease the surviving claims-ledger floor (owned by the deletion
+    # victim) ties a foreign stealer's restarted entry generation and must
+    # be exceeded -- the bump that keeps staleLeaderHasStaleGeneration
+    # true past the deletion. A ceiling or guard change that silently
+    # stranded that arm of seedFor would leave the regime check green
+    # while the tie case went unexplored; this check pins it.
+    quint-leader-election-witness-deletion-foreign-tie = mkQuintWitnessCheck {
+      name = "leader-election-witness-deletion-foreign-tie";
+      spec = "leaderElection";
+      main = "leaderElectionDeletion";
+      witness = "noForeignTieBumpAfterDeletion";
+    };
+
     # The claim-INSERT failure is explored in the pg-faults regime: its
     # "each PG fault alone is survivable" verdict is about a state space
     # in which the proceed-on-failure path actually fires, not one where
