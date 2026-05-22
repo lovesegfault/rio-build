@@ -1259,7 +1259,7 @@ mod tests {
             })
             .collect();
         let cfg = NodeClaimPoolConfig {
-            min_consolidation_time: HashMap::new(),
+            min_consolidation_time: std::collections::BTreeMap::new(),
             ..Default::default()
         };
         let admits = |_: &str, _: Option<&str>, _: &[String]| true;

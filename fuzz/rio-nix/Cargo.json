@@ -9612,6 +9612,10 @@
       },
       "dependencies": [
         {
+          "name": "indexmap",
+          "packageId": "indexmap"
+        },
+        {
           "name": "itoa",
           "packageId": "itoa"
         },
@@ -9636,6 +9640,8 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "indexmap",
+        "preserve_order",
         "raw_value",
         "std"
       ],

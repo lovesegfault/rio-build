@@ -300,7 +300,11 @@ pub struct NodeClaimPoolConfig {
     /// supposed to amortize — reaping there is strictly dominated; see
     /// [`Self::default`]). Helm:
     /// `karpenter.nodeclaimPool.minConsolidationTime`.
-    pub min_consolidation_time: HashMap<String, f64>,
+    ///
+    /// `BTreeMap` (not `HashMap`) so the default serializes in a stable
+    /// key order into the frozen config-schema snapshot; the lookup in
+    /// [`Self::min_consolidation_time_for`] is order-independent.
+    pub min_consolidation_time: BTreeMap<String, f64>,
     /// `(hw_class:cap)` → seed lead-time seconds, written by
     /// `xtask k8s probe-boot`. Seeds the lead-time sketch on cold start.
     /// Helm: `sla.leadTimeSeed`.
@@ -554,7 +558,7 @@ impl Default for NodeClaimPoolConfig {
             //
             // Lookup precedence: longest prefix glob wins, so `fetcher-*`
             // (len 8) overrides `*` (len 0) for fetcher cells.
-            min_consolidation_time: HashMap::from([
+            min_consolidation_time: BTreeMap::from([
                 ("fetcher-*".into(), 600.0),
                 ("*".into(), 300.0),
             ]),
@@ -2033,7 +2037,7 @@ mod tests {
     #[test]
     fn min_consolidation_time_lookup_precedence() {
         let cfg = NodeClaimPoolConfig {
-            min_consolidation_time: HashMap::from([
+            min_consolidation_time: BTreeMap::from([
                 ("fetcher-x86".into(), 100.0), // exact
                 ("fetcher-*".into(), 200.0),   // glob, prefix len 8
                 ("fetcher*".into(), 300.0),    // glob, prefix len 7

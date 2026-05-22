@@ -60,8 +60,8 @@
           "max_lead_time": 600.0,
           "max_consolidation_time": null,
           "min_consolidation_time": {
-            "fetcher-*": 600.0,
-            "*": 300.0
+            "*": 300.0,
+            "fetcher-*": 600.0
           },
           "lead_time_seed": {},
           "default_lead_time_seed": 30.0,
@@ -176,15 +176,15 @@
             "default": null
           },
           "min_consolidation_time": {
-            "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor\n(seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,\nsilently dropping Karpenter's `consolidateAfter: 10m` to the\nNA-model floor `boot_median/2` (~15s) — a fetcher node burns a\nboot every 15s of lull instead of holding 10min. The NA model is\ncorrect (it observed the right λ); the *policy floor* was lost\nin the migration. Keys are class names or `<prefix>*` globs\nmatched against `cell.0` (most-specific exact match wins, then\nlongest prefix). Default `{\"fetcher-*\": 600.0, \"*\": 300.0}`:\nfetchers restore the pre-§13e Karpenter behavior; builders get a\n300s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's\nsupposed to amortize — reaping there is strictly dominated; see\n[`Self::default`]). Helm:\n`karpenter.nodeclaimPool.minConsolidationTime`.",
+            "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor\n(seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,\nsilently dropping Karpenter's `consolidateAfter: 10m` to the\nNA-model floor `boot_median/2` (~15s) — a fetcher node burns a\nboot every 15s of lull instead of holding 10min. The NA model is\ncorrect (it observed the right λ); the *policy floor* was lost\nin the migration. Keys are class names or `<prefix>*` globs\nmatched against `cell.0` (most-specific exact match wins, then\nlongest prefix). Default `{\"fetcher-*\": 600.0, \"*\": 300.0}`:\nfetchers restore the pre-§13e Karpenter behavior; builders get a\n300s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's\nsupposed to amortize — reaping there is strictly dominated; see\n[`Self::default`]). Helm:\n`karpenter.nodeclaimPool.minConsolidationTime`.\n\n`BTreeMap` (not `HashMap`) so the default serializes in a stable\nkey order into the frozen config-schema snapshot; the lookup in\n[`Self::min_consolidation_time_for`] is order-independent.",
             "type": "object",
             "additionalProperties": {
               "type": "number",
               "format": "double"
             },
             "default": {
-              "fetcher-*": 600.0,
-              "*": 300.0
+              "*": 300.0,
+              "fetcher-*": 600.0
             }
           },
           "lead_time_seed": {
@@ -265,8 +265,8 @@
       "max_lead_time": 600.0,
       "max_consolidation_time": null,
       "min_consolidation_time": {
-        "fetcher-*": 600.0,
-        "*": 300.0
+        "*": 300.0,
+        "fetcher-*": 600.0
       },
       "lead_time_seed": {},
       "default_lead_time_seed": 30.0,
