@@ -460,6 +460,7 @@ impl LeaderState {
     /// `acquired_transitions`. Two `SeqCst` loads (stamp first, then
     /// count) — pairs with
     /// [`set_recovery_complete`](Self::set_recovery_complete),
+    /// [`invalidate_recovery_completion`](Self::invalidate_recovery_completion),
     /// [`on_lose`](Self::on_lose) and [`on_rebound`](Self::on_rebound).
     /// A stamp from an epoch a later transition has already replaced
     /// can never compare equal; a stamp loaded just before a concurrent
@@ -499,6 +500,32 @@ impl LeaderState {
     pub fn set_recovery_complete(&self, transitions_at_entry: u64) {
         self.recovery_completed_for
             .store(transitions_at_entry, Ordering::SeqCst);
+    }
+
+    /// Invalidate any recorded recovery completion: store
+    /// [`RECOVERY_NOT_COMPLETE`] into the stamp, touching nothing else.
+    /// Called by the scheduler actor when it processes a `LeaderLost`
+    /// and destroys the persisted state a previously-recorded
+    /// completion certified — the stamp must not outlive the state it
+    /// certifies ("state wiped ⇒ recovery not complete"). Deliberately
+    /// does NOT touch `is_leader` or `acquired_transitions`: the lease
+    /// loop owns those, and a same-count re-acquire may already be live
+    /// by the time the queued loss is drained. Idempotent with the
+    /// lease loop's own clears in [`on_lose`](Self::on_lose) /
+    /// [`on_rebound`](Self::on_rebound); the follow-up
+    /// `LeaderAcquired`'s recovery records a fresh completion. Why
+    /// `on_lose`'s clear is not sufficient: a kept same-epoch recovery
+    /// can re-stamp the completion after `on_lose` ran but before the
+    /// actor processes the queued `LeaderLost` — this is the
+    /// invalidation for exactly that orphaned stamp. No-clobber
+    /// argument: within the scheduler the actor is the sole writer of
+    /// completions, so this call can only ever kill a completion that
+    /// certified the state being wiped — a newer legitimate completion
+    /// is necessarily written later, by the same actor task, in the
+    /// follow-up `LeaderAcquired`'s recovery.
+    pub fn invalidate_recovery_completion(&self) {
+        self.recovery_completed_for
+            .store(RECOVERY_NOT_COMPLETE, Ordering::SeqCst);
     }
 
     /// Allocate the id of a renew round that is about to start. Called

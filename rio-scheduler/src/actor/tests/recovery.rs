@@ -6019,3 +6019,99 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
     );
     Ok(())
 }
+
+// r[verify sched.recovery.gate-dispatch]
+/// A self-fence false alarm during a long recovery queues `LeaderLost`
+/// then a second `LeaderAcquired`; the same-epoch keep stamps the
+/// in-flight recovery's completion after the re-acquire, so when the
+/// actor later processes that queued `LeaderLost` it wipes the very
+/// persisted state the completion certified. The lost handler must
+/// invalidate the kept completion together with the wipe — otherwise
+/// `is_leader=true` + `recovery_complete()=true` over an empty DAG
+/// ungates dispatch and the heartbeat advertisement until the follow-up
+/// recovery re-stamps. The follow-up `LeaderAcquired` must then
+/// re-establish completion (the invalidation can never gate dispatch
+/// permanently).
+#[tokio::test]
+async fn test_leader_lost_invalidates_kept_recovery_completion() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Leading at transition count 5 with a completed recovery — the
+    // state an in-flight same-epoch keep starts from. The claims floor
+    // is empty, so the green leg's re-recovery claims and then waits
+    // for a post-claim Leading round; keep the confirmation loop
+    // running for the whole test.
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(6)),
+        Arc::new(AtomicBool::new(false)),
+        false,
+    );
+    leader.on_acquire(5);
+    leader.set_recovery_complete(5);
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+    });
+
+    // Populate some persisted state so the LeaderLost wipe is not a
+    // no-op. The wipe itself is long-standing handle_leader_lost
+    // behavior; this test pins what happens to the completion stamp
+    // and to the worker-visible advertisement.
+    merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "lost-keep-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The self-fence false alarm, via the production transition
+    // functions: lose, then a same-count re-acquire. The kept in-flight
+    // recovery stamps its completion AFTER the re-acquire (production
+    // ordering: the actor finishes handle_leader_acquired before the
+    // queued LeaderLost is processed).
+    leader.on_lose();
+    leader.on_acquire(5);
+    leader.set_recovery_complete(5);
+    assert!(
+        leader.recovery_complete() && leader.is_leader(),
+        "precondition: kept completion + leadership before the queued \
+         LeaderLost is processed"
+    );
+
+    // The actor now processes the queued LeaderLost from the false
+    // alarm and wipes the persisted state that completion certified.
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    barrier(&handle).await;
+
+    assert!(
+        !leader.recovery_complete(),
+        "processing LeaderLost must invalidate the kept completion: the \
+         state it certified is gone, so dispatch must stay recovery-gated \
+         until the follow-up LeaderAcquired re-runs recovery"
+    );
+    assert_eq!(
+        handle.generation.advertised(),
+        0,
+        "heartbeats must advertise 0 (not the stale generation) over the \
+         wiped DAG"
+    );
+    assert!(
+        leader.is_leader(),
+        "invalidation must not touch leadership — the lease loop owns it \
+         and the same-count re-acquire is still live"
+    );
+
+    // Green leg: the follow-up LeaderAcquired re-runs recovery and
+    // re-establishes completion — the invalidation cannot gate dispatch
+    // permanently.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    assert!(
+        leader.recovery_complete(),
+        "the follow-up LeaderAcquired's recovery must re-establish completion"
+    );
+    Ok(())
+}

@@ -1069,6 +1069,17 @@ impl DagActor {
     // r[impl sched.lease.standby-tick-noop+2]
     // r[impl obs.metric.scheduler-leader-gate+2]
     pub(super) fn handle_leader_lost(&mut self) {
+        // A same-count re-acquire's kept recovery may have re-stamped
+        // the completion after `on_lose` cleared it (the same-epoch
+        // keep). The state that completion certified is about to be
+        // wiped, so the stamp goes with it — `dispatch_ready` and
+        // `advertised()` must not treat the wiped DAG as recovered. The
+        // `LeaderAcquired` queued behind this command (hook order is
+        // preserved by the forwarder) re-runs recovery and re-stamps;
+        // on a real loss `is_leader` is already false and the next
+        // acquire re-runs recovery anyway — so this can never gate
+        // dispatch permanently.
+        self.leader.invalidate_recovery_completion();
         info!("leader lost: clearing persisted actor state");
         self.clear_persisted_state();
         // workers_active is NOT zeroed: `executors` is retained
@@ -1161,9 +1172,13 @@ impl DagActor {
         // unchanged): none of the signals move and this recovery is
         // KEPT. Its result is valid (no foreign PG writes happened) and
         // is used by the inline post-recovery dispatch and by any
-        // commands queued ahead of the already-queued LeaderLost; the
-        // queued LeaderLost + second LeaderAcquired will clear and
-        // re-run recovery regardless.
+        // commands queued ahead of the already-queued LeaderLost.
+        // Processing that LeaderLost invalidates the kept completion
+        // together with the wipe (handle_leader_lost calls
+        // invalidate_recovery_completion before clear_persisted_state),
+        // and the second LeaderAcquired's recovery re-establishes it —
+        // so the stretch between the wipe and the re-run stays
+        // dispatch-gated.
         //
         // Documented residual: a foreign term inside the recovery
         // window whose observed transition count lands back exactly on
