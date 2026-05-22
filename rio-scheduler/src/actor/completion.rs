@@ -2269,8 +2269,9 @@ impl DagActor {
             // match the FINAL in-mem state. Crash in the backoff
             // window (up to 300s) with PG=Failed → recovery loads it
             // (Failed not in TERMINAL_STATUS_SQL filter) but only
-            // pushes Ready-status drvs to the queue (recovery.rs:225)
-            // → Failed drv sits in DAG forever, never dispatched.
+            // pushes Ready-status drvs to the queue (seed_ready_queue's
+            // Ready-only filter) → Failed drv sits in DAG forever,
+            // never dispatched.
             self.persist_status(drv_hash, DerivationStatus::Ready, None)
                 .await;
             // C2c: dashboard's WatchBuild showed stale running_count

@@ -814,10 +814,10 @@ let
           new_leader = leader_pod()
           tx_after = lease_transitions()
           delta = tx_after - tx_before
-          # delta=0: same pod resumed via Renew (holder==our_id branch,
-          #   election.rs:119-124). Production OOM-kill path.
-          # delta=1: standby stole (observed-record expiry,
-          #   election.rs:128-138). Restart took longer than STEAL_AFTER (19s).
+          # delta=0: same pod resumed via Renew (decide_pure's
+          #   HolderKind::Us arm). Production OOM-kill path.
+          # delta=1: standby stole (decide_pure's HolderKind::Other
+          #   staleness arm). Restart took longer than STEAL_AFTER (19s).
           assert delta in (0, 1), (
               f"leaseTransitions {tx_before}→{tx_after} (delta={delta}). "
               f">1 = leadership bounced; <0 = impossible."
@@ -830,7 +830,7 @@ let
           if delta == 0:
               assert new_leader == old_leader, (
                   f"tx unchanged but holder moved {old_leader}→{new_leader}? "
-                  f"Steal without leaseTransitions++ — election.rs:310 broken?"
+                  f"Steal without leaseTransitions++ — replace(steal)'s transitions bump broken?"
               )
           print(f"sigkill: recovered via {path}, leader={new_leader}")
 

@@ -744,9 +744,10 @@ module leaderElection {
   ///
   /// fence[n] is UNCHANGED: a bare read does not reset the self-fence
   /// clock. Production resets `last_successful_renew` at exactly two
-  /// sites -- the loop init (lib.rs:501, before the node has ever led)
-  /// and the `Ok(Ok(result))` arm of the COMPLETE try_acquire_or_renew()
-  /// round-trip (lib.rs:525). Every path through that function which
+  /// sites -- run_lease_loop's loop init (before the node has ever
+  /// led) and its `Ok(Ok(result))` arm after a COMPLETE
+  /// try_acquire_or_renew() round-trip. Every path through that
+  /// function which
   /// returns Leading ends in an rv-bumping write (create()'s POST or
   /// replace()'s PUT); the paths that complete without a write return
   /// Standby or Conflict, both of which set now_leading=false -- the node

@@ -1570,7 +1570,8 @@ mod tests {
 
         let mut was_leading = true;
         let mut owe_cost_clear = false;
-        // 20s ago > SELF_FENCE_AFTER (11s). Pattern matches election.rs:535.
+        // 20s ago > SELF_FENCE_AFTER (11s). Same back-dated Observed
+        // pre-seeding as election.rs's steal-test fixtures.
         let last_renew = Instant::now() - Duration::from_secs(20);
 
         let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);

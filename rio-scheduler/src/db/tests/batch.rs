@@ -207,7 +207,8 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
     let t_bd = t0.elapsed();
 
-    // ~4× edges (matches typical fanout per recovery.rs:242 commentary).
+    // ~4× edges (matches the typical-fanout note in db/recovery.rs's
+    // load_build_graph).
     let ids: Vec<Uuid> = (0..N)
         .map(|i| id_map.get(&format!("fk{i:030x}")).unwrap().0)
         .collect();

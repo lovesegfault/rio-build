@@ -363,10 +363,17 @@ impl SchedulerDb {
 
     /// PG's generation high-water mark: the max over every generation
     /// ever *persisted on an assignment* and every generation ever
-    /// *claimed by a leader*. recover_from_pg() seeds its generation
-    /// counter from this + 1 — the durable floor that survives the
+    /// *claimed by a leader* — the durable floor that survives the
     /// Lease object (the primary generation source, via
     /// `leaseTransitions`) being deleted and recreated at zero.
+    /// `handle_leader_acquired` raises its claim/seed target past this
+    /// floor only when the floor exceeds the recovery-entry generation,
+    /// or ties it without this holder's own claim row in the ledger; in
+    /// every other case (floor below the entry generation, no floor at
+    /// all, or our own claim row at the tie) the entry generation is
+    /// retained — a same-epoch re-acquire does not burn a generation
+    /// (the `sched.recovery.fetch-max-seed` rule in the scheduler spec
+    /// is the normative statement).
     ///
     /// Two arms because neither alone is a reliable floor:
     /// - `assignments.generation` covers pre-claim history and
@@ -385,7 +392,8 @@ impl SchedulerDb {
     /// Workers with a stale generation reject assignments; if a
     /// generation were reused, workers that received old assignments
     /// would ALSO accept new ones from that generation —
-    /// dual-processing. Seeding from this floor bounds that damage
+    /// dual-processing. Exceeding the floor unless the claims ledger
+    /// proves it is this holder's own current epoch bounds that damage
     /// regardless of Lease state (it cannot *prevent* it under a PG
     /// point-in-time restore, which regresses both arms together).
     ///
