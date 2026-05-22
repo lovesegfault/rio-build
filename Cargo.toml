@@ -139,12 +139,6 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 
-# Configuration (phase2b: TOML + RIO_ env overlay). `test` enables
-# figment::Jail (env/cwd isolation under a global mutex) for the per-
-# binary config standing-guard tests; workspace-hack already unifies it
-# into every build, so listing it here costs nothing extra and lets
-# six crates' dev-deps say `figment.workspace = true` without overrides.
-figment = { version = "0.10", features = ["toml", "env", "test"] }
 # Configuration loading (TOML file + RIO_ env + CLI overlay layering) — see
 # rio_common::config::load. Replaces figment (dormant upstream: no release
 # since 2024-05). default-features off: the defaults pull json/yaml/ron/
