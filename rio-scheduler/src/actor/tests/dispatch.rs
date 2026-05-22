@@ -320,9 +320,11 @@ async fn test_interactive_priority_boost() -> TestResult {
 // -----------------------------------------------------------------------------
 
 /// The generation in a WorkAssignment must equal the generation a
-/// heartbeat would return at the same moment. Both read from the same
-/// `Arc<AtomicU64>`. With no lease task running (no writer), both see
-/// the init value.
+/// heartbeat would return at the same moment. The heartbeat payload is
+/// `advertised_generation()` (gated on recovery completion); this
+/// always-leader fixture has recovery complete, so it equals the raw
+/// `leader_generation()`. All read the same `Arc<AtomicU64>`, and with
+/// no lease task running (no writer) every read sees the init value.
 ///
 /// This catches the previous design's hardcoded-1 bug: if
 /// `HeartbeatResponse` and `WorkAssignment` used DIFFERENT generation
@@ -340,7 +342,13 @@ async fn test_generation_consistent_between_heartbeat_and_assignment() -> TestRe
     assert_eq!(
         assignment.generation,
         handle.leader_generation(),
-        "WorkAssignment and HeartbeatResponse read the same atomic"
+        "WorkAssignment and the raw acquire-edge generation read the same atomic"
+    );
+    assert_eq!(
+        assignment.generation,
+        handle.advertised_generation(),
+        "WorkAssignment.generation and the HeartbeatResponse payload (advertised_generation) \
+         must agree when recovery is complete"
     );
 
     // The assignment_token embeds the generation too (format string).
@@ -367,11 +375,19 @@ async fn test_generation_starts_at_one_not_zero() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Not dispatching anything — just reading the reader directly.
-    // This IS the value HeartbeatResponse.generation would carry.
+    // leader_generation() is the raw acquire-edge value; the heartbeat
+    // carries advertised_generation(), which equals it here because the
+    // always-leader fixture constructs recovery_complete = true.
     assert_eq!(
         handle.leader_generation(),
         1,
         "gen=0 is proto-default (unset); gen=1 is the real first generation"
+    );
+    assert_eq!(
+        handle.advertised_generation(),
+        1,
+        "always-leader fixture has recovery complete, so the heartbeat advertises the real \
+         first generation, not the 0 unset sentinel"
     );
     Ok(())
 }

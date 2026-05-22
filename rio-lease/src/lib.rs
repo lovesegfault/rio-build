@@ -2,11 +2,12 @@
 //!
 //! When `lease_name` is configured, a background task acquires and
 //! renews a `coordination.k8s.io/v1` Lease. On acquire, it derives
-//! the generation from the lease's transition count (workers see the
+//! the generation from the lease's transition count (workers reject
 // r[impl sched.lease.k8s-lease+2]
 // r[impl sched.lease.generation-fence+2]
-//! new gen in heartbeat, reject stale-gen assignments from the old
-//! leader) and sets `is_leader=true` (dispatch_ready checks this).
+//! the old leader's stale-gen assignments once the post-recovery
+//! generation reaches them via heartbeat) and sets `is_leader=true`
+//! (dispatch_ready checks this).
 //!
 //! When NOT set (VM tests, single-scheduler deployments): no kube
 //! dependency at runtime, `is_leader` defaults to `true`,

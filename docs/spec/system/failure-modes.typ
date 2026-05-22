@@ -49,8 +49,12 @@ executor-side generation fence for the clock-pause residual:
   `Arc<AtomicU64>`), floored during recovery by the durable PG history
   (`assignments` plus the `leader_generation_claims` ledger); a same-epoch
   re-acquire keeps its generation
-- The generation flows into `WorkAssignment.generation`; executors reject
-  stale-generation assignments after their next heartbeat sync
+- The generation flows into `WorkAssignment.generation`; the new leader's
+  heartbeat replies advertise 0 (the proto-unset sentinel) until its recovery
+  completes (#rref("sched.lease.claim-before-advertise")), so executors begin
+  rejecting the old leader's stale-generation assignments once the
+  post-recovery generation reaches them via heartbeat; the pre-arming interim
+  is the same dual-leader window priced by the idempotent-writes bullet below
 - *No PostgreSQL-level write fencing exists* --- a deposed leader's in-flight
   PG writes will succeed. PG writes are idempotent (INSERT ON CONFLICT,
   status-check UPDATEs), which limits the damage
