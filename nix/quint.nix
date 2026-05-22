@@ -468,6 +468,19 @@ in
       witness = "noReacquisitionAfterDeletion";
     };
 
+    # The retain-on-own-claim re-acquisition is explored in the deletion
+    # regime: a deposed-by-deletion holder re-steals its recreated lease
+    # and retains its entry generation because the claims-ledger row at
+    # the floor is its own -- the fetch-max-seed / generation-claim
+    # retain clause the regime checks claim to verify, exercised rather
+    # than merely expressible.
+    quint-leader-election-witness-deletion-retain = mkQuintWitnessCheck {
+      name = "leader-election-witness-deletion-retain";
+      spec = "leaderElection";
+      main = "leaderElectionDeletion";
+      witness = "noRetainAfterDeletion";
+    };
+
     # The claim-INSERT failure is explored in the pg-faults regime: its
     # "each PG fault alone is survivable" verdict is about a state space
     # in which the proceed-on-failure path actually fires, not one where

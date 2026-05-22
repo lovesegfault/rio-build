@@ -48,7 +48,14 @@
 // any class. The PG-side faults (skipped claim writes, point-in-time
 // restores) are each survivable alone -- the Lease's transition count is
 // an independent epoch source -- and only collide in conjunction with a
-// deletion. See each regime module's header for its coverage-vs-cost
+// deletion. The claim-target rule is modeled with ledger-row ownership
+// (seedFor / genHWHolder), so the retain-on-own-claim re-acquisition the
+// fetch-max-seed and generation-claim rules mandate is INSIDE the
+// verified space (the noRetainAfterDeletion witness check is the
+// standing evidence); the post-claim leadership confirmation that gates
+// an under-vouched target (sched.recovery.bump-confirm) is
+// implementation-side sequencing, tested in Rust, not modeled here. See
+// each regime module's header for its coverage-vs-cost
 // argument and non-vacuity evidence.
 //
 // INVARIANTS, and which half of sched.lease.at-most-one-leader+3 each
@@ -274,6 +281,12 @@ module leaderElection {
   /// PG generation high-water mark: GREATEST(assignments, claims).
   /// Persistent across crashes; regressed only by pgRestore.
   var genHW: int
+  /// Owner of the claims-ledger row at genHW (NoHolder when the ledger
+  /// is empty). What the implementation reads as own_claim_at_our_gen:
+  /// the retain-on-tie decision is conditioned on the floor row being
+  /// OURS, not merely on the floor value. Regressed to NoHolder by
+  /// pgRestore together with genHW.
+  var genHWHolder: Holder
   /// The rv at which this node's last ACQUISITION (steal) succeeded.
   /// What the CAS race detector compares against. NO_ACQ = never.
   var acquiredAt: Node -> int
@@ -291,6 +304,11 @@ module leaderElection {
   var claimFailures: int
   /// PG point-in-time restores so far (0..MAX_RESTORES).
   var restores: int
+  /// History flag: steal's own-row-tie retain branch has fired (the
+  /// post-deletion same-epoch re-acquire that fetch-max-seed /
+  /// generation-claim mandate). Model-only bookkeeping read by the
+  /// noRetainAfterDeletion witness; never read by an action guard.
+  var stealRetained: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -436,6 +454,17 @@ module leaderElection {
   /// staleLeaderHasStaleGeneration verdict is about a state space
   /// containing the fault sequence, not one where the fault never bites.
   val noReacquisitionAfterDeletion = not(deletes > 0 and lease.gen > 0)
+
+  /// Violated when steal's own-row-tie retain branch has actually fired
+  /// after a Lease deletion: the post-deletion same-epoch re-acquire that
+  /// fetch-max-seed / generation-claim mandate (retain the entry
+  /// generation when the claims-ledger row at the floor is this holder's
+  /// own) is explored, not merely expressible. stealRetained is set only
+  /// inside that branch of steal, so unlike a state-shape predicate this
+  /// cannot be satisfied by an ordinary bump-and-claim acquisition.
+  /// Checked against the deletion regime, where the divergence between
+  /// the lease-derived and ledger-derived epoch sources arises.
+  val noRetainAfterDeletion = not(deletes > 0 and stealRetained)
 
   /// Violated when a write-ahead claim INSERT has failed: proves the
   /// PgFaults regime actually explores the proceed-on-failure path
@@ -597,8 +626,10 @@ module leaderElection {
   /// strictly greater than the stale believer's. The production
   /// mechanism is on_acquire(transitions)'s fetch_max(leaseTransitions
   /// + 1) plus the write-ahead claim (sched.lease.generation-claim); the
-  /// model encodes both in steal: gen[n]' = max(gen[n], lease.gen+2,
-  /// genHW+1) and genHW' = that same value.
+  /// model encodes both in steal: gen[n]' = seedFor over the entry
+  /// max(gen[n], lease.gen+2) -- exceeding the PG floor unless the
+  /// ledger row at it is the stealer's own -- and genHW' advancing to
+  /// that value whenever it exceeds the floor.
   ///
   /// FIXED -- this invariant was FALSIFIED by the pre-fix protocol (an
   /// in-memory fetch_add(1) seeded from a PG high-water mark that only
@@ -612,7 +643,7 @@ module leaderElection {
   ///
   /// Two protocol changes closed it, and the model encodes both:
   ///   (a) The generation derives from the lease's transition count
-  ///       (lease.gen+2 in steal's target) -- the apiserver bumps
+  ///       (lease.gen+2 in steal's entry) -- the apiserver bumps
   ///       leaseTransitions atomically with the holder change, so two
   ///       distinct holders can never derive the same generation from
   ///       it. In the counterexample trace, lease.gen was already 1 vs 2
@@ -650,8 +681,10 @@ module leaderElection {
   ///     authorized, so there is no "right" believer for the fence to
   ///     prefer. The property degrades to DISTINCTNESS: the fence can
   ///     still order them, the lower one is rejected, and the higher one
-  ///     keeps acting until the next real acquisition seeds from genHW+1
-  ///     and exceeds both. Distinctness is not a weakening that can hide
+  ///     keeps acting until the next real acquisition seeds at or above
+  ///     the floor -- a foreign acquirer exceeds both; the higher
+  ///     believer itself re-acquiring retains its own epoch, preserving
+  ///     the same ordering. Distinctness is not a weakening that can hide
   ///     a collision: gen[m] = gen[n] fails both branches. And the
   ///     holderless branch cannot hide a wrong ORDERING either -- the
   ///     deletion does not change any generation, so the holderless
@@ -693,9 +726,10 @@ module leaderElection {
     clocks' = clocks.put(n, clocks.get(n) + 1),
     lease' = lease, alive' = alive, leading' = leading, snap' = snap,
     obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
-    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
-    restores' = restores,
+    restores' = restores, stealRetained' = stealRetained,
   }
 
   /// GET the lease. The obs[n] update follows decide_pure()'s
@@ -736,16 +770,20 @@ module leaderElection {
       else if (hasObs(n) and obsRvOf(n) == lease.rv) obs.get(n)
       else Observed({ rv: lease.rv, since: clocks.get(n) })),
     clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
-    fence' = fence, gen' = gen, genHW' = genHW, acquiredAt' = acquiredAt,
+    fence' = fence, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt,
     casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
     claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
-  /// claimed generation. fetch_max in shape, though every caller passes a
-  /// `claimed >= genHW` value when the update is meant to apply (steal's
-  /// seeded is always >= genHW + 1; renewLease passes genHW itself off
-  /// the acquire edge, a provable no-op).
+  /// claimed generation and the ledger row's owner is recorded. fetch_max
+  /// in shape: a `claimed` at or below the current floor leaves both the
+  /// floor and its owner unchanged -- the retain path (seedFor's own-row
+  /// tie) and the steady-state renew (claimed = genHW) are exactly such
+  /// provable no-ops, mirroring the implementation's "own row already at
+  /// the target, nothing to INSERT" arm.
   ///
   /// A NAMED action (not an anonymous `all` block inside the claim
   /// disjunction) for the same reason every disjunct of `step` is named:
@@ -755,8 +793,9 @@ module leaderElection {
   /// by the model-based tests (rio-lease/src/mbt_tests.rs). The
   /// flattening discipline is recursive: no anonymous `any` disjunct
   /// anywhere reachable from `step`.
-  action claimOk(claimed: int): bool = all {
+  action claimOk(owner: Holder, claimed: int): bool = all {
     genHW' = if (claimed > genHW) claimed else genHW,
+    genHWHolder' = if (claimed > genHW) owner else genHWHolder,
     claimFailures' = claimFailures,
   }
 
@@ -772,8 +811,23 @@ module leaderElection {
     claimFailures < MAX_CLAIM_FAILURES,
     claimed > genHW,
     genHW' = genHW,
+    genHWHolder' = genHWHolder,
     claimFailures' = claimFailures + 1,
   }
+
+  /// The implementation's claim-target rule (sched.recovery.fetch-max-seed /
+  /// sched.lease.generation-claim): exceed every floor generation the
+  /// claims ledger does not prove is this holder's own current epoch --
+  /// retain the entry generation only when the floor ties it AND the
+  /// ledger row at that floor is our own (own_claim_at_our_gen in
+  /// handle_leader_acquired). A floor above the entry is someone else's
+  /// (or our own pre-crash) higher claim and must be exceeded; a tied
+  /// floor under a foreign row likewise; a floor below the entry cannot
+  /// vouch for anything higher than what the lease already gave us.
+  def seedFor(n: Node, entry: int): int =
+    if (genHW > entry) genHW + 1
+    else if (genHW == entry and genHWHolder != Held(n)) genHW + 1
+    else entry
 
   /// The decide()->Steal path: empty-holder OR stale-observed (the
   /// deposed-leader path). gen[n] and genHW are set per
@@ -790,7 +844,9 @@ module leaderElection {
   /// into the atomic (the apiserver bumps the count atomically with the
   /// holder change inside the rv-guarded PUT, so two distinct holders can
   /// never derive the same value from it). The PG floor contributes
-  /// genHW+1 (seed_generation_from). Both are fetch_max against the
+  /// genHW+1 via seedFor unless the ledger row at the floor is this
+  /// holder's own (seed_generation_from plus the claims-ledger ownership
+  /// check). Both are fetch_max against the
   /// atomic's current value gen[n] -- nothing unconditionally increments.
   ///
   /// genHW' is the write-ahead claim (sched.lease.generation-claim): the
@@ -835,8 +891,12 @@ module leaderElection {
   /// believer's entry generation minus one lands before the believer's
   /// floor read and the floor looks contiguous.
   action steal(n: Node): bool = {
-    val target = if (lease.gen + 2 > genHW + 1) lease.gen + 2 else genHW + 1
-    val seeded = if (gen.get(n) > target) gen.get(n) else target
+    // entry = on_acquire's fetch_max(transitions + 1) with the steal
+    // PUT's post-bump count (lease.gen + 2), against the Arc's current
+    // value gen[n] -- the recovery-entry generation the claim target is
+    // baselined on.
+    val entry = if (gen.get(n) > lease.gen + 2) gen.get(n) else lease.gen + 2
+    val seeded = seedFor(n, entry)
     all {
       alive.get(n),
       hasSnap(n),
@@ -880,14 +940,27 @@ module leaderElection {
       alive' = alive,
       deletes' = deletes,
       restores' = restores,
+      // The retain-event discriminator for the noRetainAfterDeletion
+      // witness: records that this acquisition kept its entry generation
+      // because the ledger row at the floor is its own (evaluated on the
+      // same pre-state values seedFor reads). The parentheses around the
+      // whole right-hand side are load-bearing: `or` binds looser than
+      // `=`, so without them this conjunct would parse as a disjunction
+      // containing an assignment instead of an assignment of a
+      // disjunction, leaving the variable unassigned on one branch.
+      stealRetained' = (stealRetained or
+        (genHW == entry and genHWHolder == Held(n))),
       // The claim disjunction: the INSERT into the claims ledger either
-      // lands (claimOk -- the floor advances; seeded >= genHW+1 always
-      // holds here since target's else arm is genHW+1 and seeded >=
-      // target) or errors (claimFails -- the ClaimFails fault). Both
-      // disjuncts are NAMED actions; see claimOk's doc for why an
-      // anonymous block here breaks the model-based tests.
+      // lands (claimOk -- the floor advances when seeded exceeds it; on
+      // seedFor's own-row-tie retain path seeded equals genHW, so claimOk
+      // is a provable no-op and claimFails is disabled by its
+      // `claimed > genHW` guard, exactly the implementation's "own row
+      // already at the target, nothing to INSERT" arm) or errors
+      // (claimFails -- the ClaimFails fault). Both disjuncts are NAMED
+      // actions; see claimOk's doc for why an anonymous block here
+      // breaks the model-based tests.
       any {
-        claimOk(seeded),
+        claimOk(Held(n), seeded),
         claimFails(seeded),
       },
     }
@@ -914,12 +987,19 @@ module leaderElection {
   /// UN-bumped transition count:
   ///
   ///   entry  = fetch_max(transitions + 1)      = max(gen[n], lease.gen+1)
-  ///            (steal's target is lease.gen+2 because the steal PUT
+  ///            (steal's entry uses lease.gen+2 because the steal PUT
   ///            bumps the count first; a renew does not)
-  ///   seeded = the claim path's floor comparison: a floor ABOVE what the
-  ///            lease + the Arc gave us must be exceeded (someone --
-  ///            possibly our own pre-crash incarnation -- claimed
-  ///            higher); a floor AT it is our own row and is retained.
+  ///   seeded = seedFor(n, entry), the shared claim-target rule: a floor
+  ///            ABOVE the entry must be exceeded (someone -- possibly our
+  ///            own pre-crash incarnation -- claimed higher); a floor
+  ///            tying it is retained only when the ledger row at it is
+  ///            our own (genHWHolder), else exceeded. The foreign-tie
+  ///            bump branch is reachable only through the pg-faults
+  ///            regime's claim-failure interleavings (a foreign row can
+  ///            sit at our entry generation only after someone else's
+  ///            claim landed where ours failed); base/deletion traces
+  ///            never reach it, which is expected, not evidence the
+  ///            branch is dead.
   ///
   /// The collapse is GATED ON THE ACQUIRE EDGE (not(leading.get(n)) in
   /// the pre-state): production's claim loop lives in
@@ -972,7 +1052,7 @@ module leaderElection {
   /// rv and cannot flip casRace.
   action renewLease(n: Node): bool = {
     val entry = if (gen.get(n) > lease.gen + 1) gen.get(n) else lease.gen + 1
-    val seeded = if (genHW > entry) genHW + 1 else entry
+    val seeded = seedFor(n, entry)
     val isEdge = not(leading.get(n))
     // What the claim disjunction is offered: the seeded generation on
     // the acquire edge, genHW itself (a provable no-op for claimOk and
@@ -1000,6 +1080,7 @@ module leaderElection {
       clocks' = clocks, alive' = alive, obs' = obs,
       acquiredAt' = acquiredAt, deletes' = deletes,
       delVictims' = delVictims, restores' = restores,
+      stealRetained' = stealRetained,
       // The same claim disjunction as steal's, restricted to the edge
       // branch via claimTarget -- a steady-state renew never claims, so
       // it cannot fail to claim. The retry-on-the-next-acquire-edge
@@ -1007,7 +1088,7 @@ module leaderElection {
       // the NEXT edge renew (or steal) recomputes seeded and offers the
       // ledger the claim again.
       any {
-        claimOk(claimTarget),
+        claimOk(Held(n), claimTarget),
         claimFails(claimTarget),
       },
     }
@@ -1026,9 +1107,11 @@ module leaderElection {
     leading' = leading.put(n, false),
     snap' = snap.put(n, NoSnap),
     clocks' = clocks, lease' = lease, alive' = alive, obs' = obs,
-    gen' = gen, genHW' = genHW, acquiredAt' = acquiredAt,
+    gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt,
     casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
     claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1044,9 +1127,10 @@ module leaderElection {
     leading' = leading.put(n, false),
     clocks' = clocks, lease' = lease, alive' = alive, snap' = snap,
     obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
-    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
-    restores' = restores,
+    restores' = restores, stealRetained' = stealRetained,
   }
 
   /// Pod crash. Loses ALL in-memory state: the belief, the snapshot, the
@@ -1064,9 +1148,11 @@ module leaderElection {
     fence' = fence.put(n, 0),
     gen' = gen.put(n, 1),
     acquiredAt' = acquiredAt.put(n, NO_ACQ),
-    clocks' = clocks, lease' = lease, genHW' = genHW, casRace' = casRace,
+    clocks' = clocks, lease' = lease, genHW' = genHW,
+    genHWHolder' = genHWHolder, casRace' = casRace,
     deletes' = deletes, delVictims' = delVictims,
     claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
   }
 
   /// Pod restart. The recovered process has no observation (its first
@@ -1079,9 +1165,10 @@ module leaderElection {
     alive' = alive.put(n, true),
     clocks' = clocks, lease' = lease, leading' = leading, snap' = snap,
     obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
-    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
-    restores' = restores,
+    restores' = restores, stealRetained' = stealRetained,
   }
 
   /// Operator fault: `kubectl delete lease` destroys the Lease object and
@@ -1101,9 +1188,12 @@ module leaderElection {
   /// (genHW) survives. That asymmetry -- the Lease's epoch source resets
   /// while PG's does not -- is the fault this action injects, and the
   /// write-ahead claim (genHW advancing inside steal) is what survives
-  /// it: the next steal of the recreated lease seeds from genHW+1, which
-  /// exceeds every generation ever acquired, even one whose holder never
-  /// dispatched anything.
+  /// it: the next steal of the recreated lease seeds past the floor
+  /// (genHW+1) unless the ledger row at the floor is the stealer's own,
+  /// so a foreign or fresh stealer exceeds every generation ever
+  /// acquired, even one whose holder never dispatched anything, while
+  /// the deposed holder itself re-acquires its own epoch (the retain arm
+  /// the noRetainAfterDeletion witness pins).
   ///
   /// The current holder is recorded in delVictims: it was deposed by an
   /// environmental fault rather than by a thief that observed it as
@@ -1127,8 +1217,10 @@ module leaderElection {
     },
     clocks' = clocks, alive' = alive, leading' = leading, snap' = snap,
     obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
-    acquiredAt' = acquiredAt, casRace' = casRace,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace,
     claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
   }
 
   /// Operator/infrastructure fault: a PostgreSQL point-in-time restore
@@ -1148,11 +1240,13 @@ module leaderElection {
     restores < MAX_RESTORES,
     genHW > 0,
     genHW' = 0,
+    genHWHolder' = NoHolder,
     restores' = restores + 1,
     clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
     snap' = snap, obs' = obs, fence' = fence, gen' = gen,
     acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
     delVictims' = delVictims, claimFailures' = claimFailures,
+    stealRetained' = stealRetained,
   }
 
   // --- 7. init ----------------------------------------------------------
@@ -1170,12 +1264,14 @@ module leaderElection {
     fence' = NODES.mapBy(n => 0),
     gen' = NODES.mapBy(n => 1),
     genHW' = 0,
+    genHWHolder' = NoHolder,
     acquiredAt' = NODES.mapBy(n => NO_ACQ),
     casRace' = false,
     deletes' = 0,
     delVictims' = NODES.filter(n => false),
     claimFailures' = 0,
     restores' = 0,
+    stealRetained' = false,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -1521,12 +1617,18 @@ module leaderElectionBase {
 //     second node acquire immediately (no STEAL_AFTER observation
 //     wait) -- a dual with none of the steal-path discovery mechanisms
 //     armed. Removing the fourth disjunct falsifies the invariant.
-//   - renewLease's claim-path arm (seeded = genHW + 1 when the floor
-//     exceeds what the lease and the Arc gave us) is LOAD-BEARING here
+//   - renewLease's claim-path arm (seedFor bumping to genHW + 1 when the
+//     floor exceeds the entry) is LOAD-BEARING here
 //     and only here: after a deletion the recreated lease's transition
 //     count no longer encodes a recovered holder's generation, so the
 //     entry half alone under-restores it to the deletion victim's
 //     generation. See renewLease's doc comment, case 3.
+//   - steal's own-row-tie retain arm (seedFor returning the entry when
+//     the ledger row at the floor is the stealer's own) fires in this
+//     regime and only this regime -- the noRetainAfterDeletion witness
+//     check is the standing evidence -- so the fetch-max-seed /
+//     generation-claim retain clause is verified against an explored
+//     path, not assumed.
 //   - staleLeaderHasStaleGeneration's holder-exists/holderless split
 //     exists for this regime: deleting the Lease out from under an
 //     existing dual produces a state where NEITHER believer holds it.
@@ -1657,11 +1759,12 @@ module leaderElectionAsymmetric {
 //
 // What this regime proves -- THE LEASE AND THE PG LEDGER ARE REDUNDANT
 // EPOCH SOURCES: every invariant holds with both PG faults injected.
-// steal's generation target is max(lease.gen + 2, genHW + 1); when the
-// floor term lies (a failed claim left it behind, a restore zeroed it),
-// the lease-derived term still increases strictly across successive
-// stealers, because only a steal bumps the transition count and nothing
-// in the PG fault set resets it. Each PG fault alone is survivable. A
+// steal's claim target is seedFor over the entry max(gen[n],
+// lease.gen + 2): it exceeds the PG floor unless the ledger row at the
+// floor is the stealer's own; when the floor term lies (a failed claim
+// left it behind, a restore zeroed it), the lease-derived entry still
+// increases strictly across successive stealers, because only a steal
+// bumps the transition count and nothing in the PG fault set resets it. Each PG fault alone is survivable. A
 // generation collision requires destroying BOTH epoch sources -- a PG
 // fault in conjunction with a Lease deletion -- and those conjunctions
 // are exactly the documented, accepted residuals of the
