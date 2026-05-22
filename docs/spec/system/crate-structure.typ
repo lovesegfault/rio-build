@@ -374,7 +374,7 @@ directory, so a new proto file cannot ship without one.
   [`kube` + `kube-runtime`],
   [K8s client, CRDs, operator framework],
   [3],
-  [`features = ["runtime", "derive", "client"]` (kube 3.x)],
+  [`default-features = false`, `features = ["runtime", "derive", "client", "rustls-tls", "aws-lc-rs"]` (kube 3.x) — the defaults would select the `ring` rustls provider; the explicit set keeps the workspace on a single `aws-lc-rs` `CryptoProvider`. xtask adds `ws` for port-forward/exec.],
 
   [`k8s-openapi`],
   [K8s API types],

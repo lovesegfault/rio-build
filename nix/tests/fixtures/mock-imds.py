@@ -3,9 +3,9 @@
 
 Serves just enough of the EC2 instance-metadata API for `nodeadm init
 --skip run --daemon kubelet` to complete without AWS. Endpoints derived
-from awslabs/amazon-eks-ami nodeadm at the rev pinned in nix/pins.nix
-(aws-sdk-go-v2/feature/ec2/imds path constants + nodeadm/internal/aws/
-imds/imds.go IMDSProperty values). The user-data NodeConfig sets
+from awslabs/amazon-eks-ami nodeadm at the rev pinned in nix/pins.toml
+[node.nodeadm] (aws-sdk-go-v2/feature/ec2/imds path constants +
+nodeadm/internal/aws/imds/imds.go IMDSProperty values). The user-data NodeConfig sets
 featureGates.InstanceIdNodeName=true so nodeadm skips the EC2
 DescribeInstances call for PrivateDnsName (which would need real AWS
 credentials and a real EC2 endpoint).
