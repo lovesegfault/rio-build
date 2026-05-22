@@ -17,7 +17,7 @@ resource "helm_release" "kube_prometheus_stack" {
   create_namespace = true
   repository       = "https://prometheus-community.github.io/helm-charts"
   chart            = "kube-prometheus-stack"
-  # Hardcoded (not nix/pins.nix) — same as external-secrets: not exercised
+  # Hardcoded (not nix/pins.toml) — same as external-secrets: not exercised
   # by VM tests, so no nix↔tofu pin to keep in sync. Bump alongside
   # kubernetes_version; check chart's kubeVersion constraint.
   version = "83.7.0"

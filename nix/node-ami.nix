@@ -3,9 +3,9 @@
 # nix-support/image-info.json (consumed by `xtask ami push`).
 #
 # `nodeSystem` is the TARGET arch, independent of the eval host — same
-# shape as the dockerImages multi-arch build. specialArgs threads
-# pins.nix through so module files can read kernel/nodeadm pins
-# without `import ../../pins.nix` scattershot.
+# shape as the dockerImages multi-arch build. specialArgs threads the
+# pins attrset (nix/pins.toml via the pins.nix shim) through so module
+# files can read kernel/nodeadm pins without importing it scattershot.
 #
 # Extracted from flake.nix's perSystem `let` block. The
 # `self.packages.${nodeSystem}` reference is a flake fixpoint —

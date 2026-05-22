@@ -231,8 +231,9 @@ resource "helm_release" "aws_lbc" {
   namespace  = "kube-system"
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  # Pinned via nix/pins.nix → generated.auto.tfvars.json. v3.0+ aligns
-  # chart with app version. v3 adds CRDs (ALBTargetControlConfig,
+  # Pinned via nix/pins.toml → `cargo xtask regen tfvars` →
+  # generated.auto.tfvars.json. v3.0+ aligns chart with app version.
+  # v3 adds CRDs (ALBTargetControlConfig,
   # GlobalAccelerator) that helm upgrade does NOT apply from crds/ —
   # apply manually before bumping:
   #   kubectl apply -k github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master
