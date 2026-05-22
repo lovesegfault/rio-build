@@ -1116,12 +1116,13 @@ impl DagActor {
         //   loop records the Lease's transition count on every acquire
         //   edge, and the apiserver bumps that count atomically with
         //   every holder change, so a foreign term that lands inside
-        //   our recovery window always moves it. The generation alone
-        //   cannot serve here: once the PG-floor seed has saturated the
-        //   generation above `leaseTransitions + 1` (the permanent
-        //   state after a `kubectl delete lease`), on_acquire's
-        //   fetch_max is a generation no-op on every subsequent holder
-        //   change.
+        //   our recovery window moves the recorded value the gate
+        //   compares (the one exception is the deletion ABA priced in
+        //   the residual note below). The generation alone cannot serve
+        //   here: once the PG-floor seed has saturated the generation
+        //   above `leaseTransitions + 1` (the permanent state after a
+        //   `kubectl delete lease`), on_acquire's fetch_max is a
+        //   generation no-op on every subsequent holder change.
         // - `is_leader` (re-read at the gate, no snapshot needed): a
         //   false there means a lose landed mid-recovery and we have
         //   not re-acquired — the foreign term may still be in
@@ -1141,13 +1142,37 @@ impl DagActor {
         // queued LeaderLost + second LeaderAcquired will clear and
         // re-run recovery regardless.
         //
-        // Documented residual: two lease deletions inside a single
-        // recovery window can return the transition count to its entry
-        // value (ABA) while a foreign term dispatched in between — the
-        // generation stays saturated and the holder has re-acquired by
-        // gate time, so the gate misses it. That needs two operator
-        // deletions plus a full foreign term inside one recovery
-        // window; accepted.
+        // Documented residual: a Lease deletion inside the recovery
+        // window can return the recorded transition count to its entry
+        // value (ABA) while a foreign term dispatched in between. The
+        // recreated Lease restarts at transitions=0, so when our
+        // re-steal is the `transitions_at_entry`-th holder change of
+        // the recreated object, on_acquire records the entry value
+        // again; the generation cannot flag it (gen_at_entry >=
+        // transitions_at_entry + 1 by construction, so the re-steal's
+        // fetch_max is a no-op — no PG-floor saturation needed); and we
+        // hold the lease again by gate time, so all three signals
+        // reproduce. Cheapest shape: the entry steal was the Lease's
+        // first holder change (transitions_at_entry=1), then one
+        // `kubectl delete lease`, a peer wins the recreate race and
+        // runs a full term (acquire, recover, dispatch, vacate), and
+        // our re-steal of the recreated Lease lands at transitions=1.
+        // A creator entry (transitions_at_entry=0) needs a second
+        // deletion; later-failover entries need correspondingly more
+        // in-window holder changes. Accepted: it takes an operator
+        // deletion plus a complete foreign term plus our re-steal all
+        // inside one recovery window; the gate cannot tell it from the
+        // same-epoch re-acquire it deliberately keeps (above) without a
+        // signal no apiserver-side reset can replay (e.g. the Lease
+        // object's identity); the bump confirmation does not close it
+        // either (when the foreign term raised the floor we do bump,
+        // but we hold the re-stolen Lease at confirmation time, so the
+        // confirmation legitimately succeeds); and the exposure window
+        // matches that kept case — the stale DAG feeds the inline
+        // post-recovery dispatch and any commands queued ahead of the
+        // already-queued LeaderLost — until that LeaderLost and the
+        // re-acquire's LeaderAcquired clear and re-run recovery against
+        // the post-term state.
         let gen_at_entry = self.leader.generation();
         let transitions_at_entry = self.leader.acquired_transitions();
 
