@@ -72,8 +72,11 @@ pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 /// bench-gate decision. `"true"` ⇒ the spawned builder runs the full
 /// K=3 microbench (STREAM/ioseq/alu) before accepting work. Read via
 /// downward-API → `RIO_HW_BENCH_NEEDED` (`rio_builder::Config.
-/// hw_bench_needed`). ADR-023 §13a: fail-closed on the BUILDER side
-/// (annotation absent → skip K=3, only the scalar `alu` probe runs).
+/// hw_bench_needed`). `build_job` always stamps it `"true"`/`"false"`;
+/// there is no absent-annotation fallback (an absent annotation would
+/// resolve the fieldRef to `""`, which the config loader rejects for a
+/// bool field — the pod fails at startup rather than silently running
+/// with a default).
 pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 
 /// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
@@ -1011,8 +1014,14 @@ fn apply_intent_resources(
     // the call stack), so the env-var form's resolve-once-at-container-
     // create is race-free here — unlike `rio.build/hw-class` which is
     // stamped after-bind by `run_pod_annotator` and so MUST use the
-    // volume form. Absent annotation (recovery path) → kubelet resolves
-    // to "" → the config loader → `hw_bench_needed: false` (fail-closed).
+    // volume form. There is no absent-annotation fallback: `build_job`
+    // always stamps the annotation as "true"/"false" on this same pod
+    // template. If the annotation were ever absent, the kubelet would
+    // resolve the fieldRef to "" and the config loader would reject the
+    // empty string for a bool field — the pod fails at startup (loud)
+    // rather than silently defaulting. Empty env values are deliberately
+    // NOT treated as unset: `RIO_CHUNK_BACKEND__PREFIX=""` and friends
+    // are legitimate empty-string values.
     env.push(pod::env_from_field(
         "RIO_HW_BENCH_NEEDED",
         &format!("metadata.annotations['{HW_BENCH_NEEDED_ANNOTATION}']"),
