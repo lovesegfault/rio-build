@@ -850,3 +850,292 @@ async fn s3_gap_merged_blob_resumes_from_start_and_caught_up_uses_true_end() -> 
     assert!(chunks[0].is_complete);
     Ok(())
 }
+
+/// The stored-coverage reconcile can empty an UNSEALED retained entry (an
+/// interim leader's `drv_logs` row covers past the retained ring's tail
+/// after an A→B→A flap and the drv was reset to Ready, so no reaper may
+/// remove the entry — it can still become the live carrier). A latest-mode
+/// read must NOT be answered with the ring's empty re-poll chunk while the
+/// same execution's stored `.partial` has content: the handler probes the
+/// stored side keyed to the entry's stamped exec and serves it.
+#[tokio::test]
+async fn empty_ring_entry_serves_stored_partial_for_stamped_exec() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/r20t1hash-reconciled.drv";
+    let drv_hash = drv_log_hash(drv_path);
+
+    // The interim leader's periodic flush wrote a `.partial` row + blob
+    // for exec E…
+    let compressed = compress_lines(&["configuring", "compiling foo.c"])?;
+    let exec_id = seed_drv_log(
+        &db.pool,
+        &drv_hash,
+        &format!("logs/{drv_hash}/reconciled.partial.log.zst"),
+        2,
+        false,
+    )
+    .await?;
+    // …and the re-acquired leader's ring entry for the SAME exec holds
+    // zero lines (the reconcile truncated every retained line away). An
+    // entry created by `set_exec` alone reproduces that shape.
+    let buffers = Arc::new(LogBuffers::new());
+    buffers.set_exec(drv_path, exec_id, "executor-1");
+
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_buffers_and_s3(&db, buffers, s3);
+
+    // Latest-mode request — the `rio-cli logs <drv>` / dashboard drawer shape.
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
+            derivation_path: drv_path.into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].lines,
+        vec![b"configuring".to_vec(), b"compiling foo.c".to_vec()],
+        "the stored .partial content must be served, not the empty ring entry"
+    );
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_id.to_string(),
+        "the chunk names the stamped execution"
+    );
+    assert!(
+        !chunks[0].is_complete,
+        ".partial row → the incomplete indicator survives the fallthrough"
+    );
+    Ok(())
+}
+
+/// Empty stamped entry with NOTHING stored for that execution (the
+/// just-dispatched window — overlay setup / FUSE warm before the worker's
+/// first batch): the answer stays exactly today's single empty
+/// `is_complete=false` re-poll chunk carrying the stamped exec — never
+/// `NotFound`, never an error.
+#[tokio::test]
+async fn empty_ring_entry_nothing_stored_returns_empty_repoll_chunk() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/r20t2hash-justdispatched.drv";
+
+    // Stamped at dispatch; no lines yet; no drv_logs row anywhere.
+    let buffers = Arc::new(LogBuffers::new());
+    let exec_live = uuid::Uuid::now_v7();
+    buffers.set_exec(drv_path, exec_live, "executor-1");
+
+    // Sentinel blob: if the handler reaches S3 at all and serves it, the
+    // line assertions below fail loudly.
+    let sentinel = compress_lines(&["must-not-be-served"])?;
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(sentinel.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_buffers_and_s3(&db, buffers, s3);
+
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
+            derivation_path: drv_path.into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+
+    assert_eq!(
+        chunks.len(),
+        1,
+        "single re-poll chunk — not NotFound, not an error"
+    );
+    assert!(chunks[0].lines.is_empty(), "no content yet");
+    assert!(!chunks[0].is_complete, "active build → re-poll signal");
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_live.to_string(),
+        "the re-poll chunk still names the live execution"
+    );
+    assert_eq!(chunks[0].first_line_number, 0);
+    Ok(())
+}
+
+/// A NON-empty ring entry keeps serving from the ring even when a stored
+/// row exists for the same execution — the empty-entry fallthrough must
+/// not widen into "stored side wins".
+#[tokio::test]
+async fn non_empty_ring_entry_still_serves_ring_over_stored() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/r20t3hash-active.drv";
+    let drv_hash = drv_log_hash(drv_path);
+
+    // An older periodic `.partial` snapshot exists for the execution…
+    let stale = compress_lines(&["stale-snapshot-line"])?;
+    let exec_id = seed_drv_log(
+        &db.pool,
+        &drv_hash,
+        &format!("logs/{drv_hash}/active.partial.log.zst"),
+        1,
+        false,
+    )
+    .await?;
+    // …and the live ring entry for the same exec holds fresher lines.
+    let buffers = Arc::new(LogBuffers::new());
+    buffers.set_exec(drv_path, exec_id, "executor-1");
+    buffers.push(&mk_batch(drv_path, 0, &[b"ring-0", b"ring-1", b"ring-2"]));
+
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(stale.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_buffers_and_s3(&db, buffers, s3);
+
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
+            derivation_path: drv_path.into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].lines,
+        vec![b"ring-0".to_vec(), b"ring-1".to_vec(), b"ring-2".to_vec()],
+        "a non-empty ring entry has the freshest lines and must keep winning"
+    );
+    assert_eq!(chunks[0].exec_id, exec_id.to_string());
+    assert!(!chunks[0].is_complete, "ring serve → still active");
+    Ok(())
+}
+
+/// Pinned variant of `empty_ring_entry_serves_stored_partial_for_stamped_exec`:
+/// the request pins the execution (the dashboard build-view shape) and the
+/// pin equals the entry's stamp, so `pin_matches_live` holds — the handler
+/// must still serve the pinned execution's stored blob instead of the
+/// empty ring entry.
+#[tokio::test]
+async fn empty_ring_entry_pinned_exec_serves_stored_blob() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/r20t4hash-pinned.drv";
+    let drv_hash = drv_log_hash(drv_path);
+
+    let compressed = compress_lines(&["pinned-0", "pinned-1", "pinned-2"])?;
+    let exec_id = seed_drv_log(
+        &db.pool,
+        &drv_hash,
+        &format!("logs/{drv_hash}/pinned.partial.log.zst"),
+        3,
+        false,
+    )
+    .await?;
+    let buffers = Arc::new(LogBuffers::new());
+    buffers.set_exec(drv_path, exec_id, "executor-1");
+
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_buffers_and_s3(&db, buffers, s3);
+
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: exec_id.to_string(),
+            derivation_path: drv_path.into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].lines,
+        vec![
+            b"pinned-0".to_vec(),
+            b"pinned-1".to_vec(),
+            b"pinned-2".to_vec()
+        ],
+        "the pinned execution's stored content must be served, not the empty ring entry"
+    );
+    assert_eq!(chunks[0].exec_id, exec_id.to_string());
+    assert!(!chunks[0].is_complete);
+    Ok(())
+}
+
+/// Re-dispatch window: a drv that was built before (exec₁'s blob is
+/// stored) is re-dispatched as exec₂; the fresh entry is stamped exec₂
+/// and empty, and exec₂ has no stored row yet. A latest-mode request must
+/// get the empty re-poll chunk for exec₂ — NOT exec₁'s blob, which a
+/// "resolve latest over stored rows" fallthrough would serve for the whole
+/// dispatch→first-batch window.
+#[tokio::test]
+async fn empty_ring_entry_redispatch_window_does_not_serve_prior_exec() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let drv_path = "/nix/store/r20t5hash-redispatch.drv";
+    let drv_hash = drv_log_hash(drv_path);
+
+    // exec₁: a finished prior execution with a final blob in S3.
+    let prior = compress_lines(&["prior-exec-line-0", "prior-exec-line-1"])?;
+    let exec_old = seed_drv_log(
+        &db.pool,
+        &drv_hash,
+        &format!("logs/{drv_hash}/old.log.zst"),
+        2,
+        true,
+    )
+    .await?;
+    // exec₂: the re-dispatch — stamped, no lines yet, no row yet.
+    let buffers = Arc::new(LogBuffers::new());
+    let exec_new = uuid::Uuid::now_v7();
+    assert!(
+        exec_new > exec_old,
+        "uuid 1.11+ monotonic counter must order the re-dispatch after the stored exec"
+    );
+    buffers.set_exec(drv_path, exec_new, "executor-2");
+
+    // If the handler wrongly resolves "latest" over stored rows it will
+    // fetch and serve this blob — the content assertions catch it.
+    let rule = mock!(S3Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(prior.clone()))
+            .build()
+    });
+    let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+    let (svc, _actor, _task) = svc_with_db_buffers_and_s3(&db, buffers, s3);
+
+    let resp = svc
+        .get_derivation_logs(Request::new(GetDerivationLogsRequest {
+            exec_id: String::new(),
+            derivation_path: drv_path.into(),
+            since_line: 0,
+        }))
+        .await?;
+    let chunks = collect_stream(resp.into_inner()).await;
+
+    assert_eq!(chunks.len(), 1);
+    assert!(
+        chunks[0].lines.is_empty(),
+        "the live (re-dispatched) execution has no output yet — the prior \
+         execution's blob must not be served under a latest-mode request"
+    );
+    assert_eq!(
+        chunks[0].exec_id,
+        exec_new.to_string(),
+        "the re-poll chunk names the LIVE execution, not the stored one"
+    );
+    assert!(!chunks[0].is_complete);
+    Ok(())
+}

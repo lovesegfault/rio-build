@@ -9,9 +9,15 @@
 //!
 //! We check the ring buffer FIRST: if the derivation is still active,
 //! the ring buffer has the freshest lines (the S3 blob, if any, is a
-//! 30s-stale periodic snapshot). Only if the ring buffer is empty do
-//! we fall back to S3 — which means the derivation finished and the
-//! flusher drained it.
+//! 30s-stale periodic snapshot). We fall back to S3 when no ring entry
+//! exists — the derivation finished and the flusher drained it (or it
+//! was never active on this replica). An entry that exists but holds
+//! ZERO lines also falls through, keyed to the entry's stamped
+//! execution: the stored-coverage reconcile can empty a retained entry
+//! whose `.partial` already has content (an empty ring can never offer
+//! more than the stored row), and when nothing is stored yet the
+//! handler answers with the same empty re-poll chunk the ring would
+//! have produced.
 //!
 //! Storage is keyed by `(drv_hash, exec_id)` — one row/blob per
 //! *derivation execution*, not per build (the scheduler dedups
@@ -30,7 +36,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
 use rio_common::grpc::StatusExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use rio_proto::types::{DerivationLogChunk, GetDerivationLogsRequest};
 
@@ -93,28 +99,72 @@ pub(super) async fn get_derivation_logs(
     // on `execId === ''` — would stay hidden because the request
     // carried a non-empty pin. Fall through to S3, which has the pinned
     // execution's blob.
+    //
+    // The live entry's stamp is read once and shared by the pin gate and
+    // the empty-entry fallthrough below, so both key off the same
+    // observation.
+    let live_exec = log_buffers.exec_id(&req.derivation_path);
     let pin_matches_live = req_exec_id
-        .map(|pin| log_buffers.exec_id(&req.derivation_path) == Some(pin))
+        .map(|pin| live_exec == Some(pin))
         .unwrap_or(true); // empty pin = "latest" = whatever's live
-    if pin_matches_live {
-        if let Some(chunks) = try_ring_buffer(log_buffers, &req.derivation_path, req.since_line) {
-            debug!(
-                drv_path = %req.derivation_path,
-                chunks = chunks.len(),
-                "serving from ring buffer"
-            );
-            return chunks_to_stream(chunks);
-        }
+
+    // Empty-entry fallthrough: a present-but-EMPTY stamped entry cannot
+    // answer the request — the only thing the ring path could produce is
+    // the empty re-poll chunk, even when the very same execution's stored
+    // row/blob already has content. That shape is real: the stored-coverage
+    // reconcile empties an unsealed retained entry after an A→B→A flap (an
+    // interim leader's row covers past the retained tail, `truncate_below`
+    // drops every retained line) and no reaper may remove it — the drv was
+    // reset to Ready, so the entry can still become the live carrier.
+    // Instead of answering from the ring, probe the stored side keyed to
+    // the entry's STAMPED exec; if nothing is stored for that execution
+    // (the just-dispatched window — no output uploaded yet), fall back to
+    // exactly the empty re-poll chunk the ring would have produced. The
+    // stamped-exec keying is what keeps a latest-mode request during a
+    // re-dispatched drv's no-output window from resolving `MAX(exec_id)`
+    // over stored rows and serving the PREVIOUS execution's blob.
+    //
+    // Emptiness is an entry-level probe (`span(..).line_count == 0`), NOT
+    // "`read_since` returned no lines" — the latter is also true for a
+    // caught-up poller on a non-empty entry, which must keep its re-poll
+    // answer (see `try_ring_buffer`). Only consulted when the pin gate
+    // passes: a mismatched pin already falls through with the pin, and its
+    // not-found semantics must not change.
+    let empty_entry_exec: Option<uuid::Uuid> = if pin_matches_live {
+        live_exec.filter(|exec| {
+            log_buffers
+                .span(&req.derivation_path, *exec)
+                .is_some_and(|(_, _, line_count)| line_count == 0)
+        })
     } else {
+        None
+    };
+
+    if !pin_matches_live {
         debug!(
             drv_path = %req.derivation_path,
             requested_exec = %req.exec_id,
             "pinned exec_id does not match live ring buffer; falling through to S3"
         );
+    } else if let Some(exec) = empty_entry_exec {
+        debug!(
+            drv_path = %req.derivation_path,
+            exec_id = %exec,
+            "ring entry holds zero lines; probing stored logs for its stamped execution"
+        );
+    } else if let Some(chunks) = try_ring_buffer(log_buffers, &req.derivation_path, req.since_line)
+    {
+        debug!(
+            drv_path = %req.derivation_path,
+            chunks = chunks.len(),
+            "serving from ring buffer"
+        );
+        return chunks_to_stream(chunks);
     }
 
-    // Step 2: S3 (completed, or pinned to an exec that isn't the live
-    // one). We need drv_hash, not drv_path. The S3 key is
+    // Step 2: S3 (completed, pinned to an exec that isn't the live one,
+    // or the empty-entry fallthrough above). We need drv_hash, not
+    // drv_path. The S3 key is
     // `logs/{drv_hash}/{exec_id}.log.zst`. The client typically has
     // drv_path (that's what the gateway speaks). We could resolve
     // drv_path→drv_hash via the actor, but the DAG entry is likely
@@ -126,7 +176,24 @@ pub(super) async fn get_derivation_logs(
     // so the lookup key can't drift from what was written.
     let drv_hash = crate::logs::drv_log_hash(&req.derivation_path);
 
-    match try_s3(s3, pool, req_exec_id.as_ref(), &drv_hash, req.since_line).await {
+    // Stored-lookup key: an explicit pin always wins (when the empty-entry
+    // fallthrough fired with a pin, the pin equals the stamp — the pin
+    // gate above is upstream); otherwise the empty entry's stamped exec;
+    // otherwise "latest", resolved over stored rows.
+    let exec_filter = req_exec_id.or(empty_entry_exec);
+
+    // The empty re-poll chunk the ring path would have produced for the
+    // empty entry — the byte-identical fallback when the stored side has
+    // nothing (or cannot be consulted) for the stamped execution.
+    let empty_repoll_chunk = |exec: uuid::Uuid| DerivationLogChunk {
+        derivation_path: req.derivation_path.clone(),
+        exec_id: exec.to_string(),
+        lines: vec![],
+        first_line_number: req.since_line,
+        is_complete: false,
+    };
+
+    match try_s3(s3, pool, exec_filter.as_ref(), &drv_hash, req.since_line).await {
         Ok(Some(chunks)) => {
             debug!(
                 drv_hash = %drv_hash,
@@ -135,22 +202,48 @@ pub(super) async fn get_derivation_logs(
             );
             chunks_to_stream(chunks)
         }
-        // Tailor the not-found message: a pinned exec_id that's missing
-        // is a different failure (typo, expired) from "this drv has
-        // never been built / all logs expired".
-        Ok(None) => err_stream(Status::not_found(match req_exec_id {
-            Some(exec_id) => format!(
-                "no log found for exec {exec_id} derivation {drv_hash:?} \
-                 (not in ring buffer or S3). Either the execution produced \
-                 no output, the flusher hasn't uploaded yet, or the log \
-                 has expired."
-            ),
-            None => format!(
-                "no log found for derivation {drv_hash:?} \
-                 (no execution recorded, or all expired)"
-            ),
-        })),
-        Err(status) => err_stream(status),
+        Ok(None) => match empty_entry_exec {
+            // The empty-entry fallthrough found nothing stored for the
+            // stamped execution: the entry's existence means the execution
+            // is dispatched/known but has produced no stored output yet
+            // (the just-dispatched window). Answer exactly like the ring
+            // path does today — empty, is_complete=false, re-poll — never
+            // NotFound, and never another execution's data.
+            Some(exec) => chunks_to_stream(vec![empty_repoll_chunk(exec)]),
+            // Tailor the not-found message: a pinned exec_id that's missing
+            // is a different failure (typo, expired) from "this drv has
+            // never been built / all logs expired".
+            None => err_stream(Status::not_found(match req_exec_id {
+                Some(exec_id) => format!(
+                    "no log found for exec {exec_id} derivation {drv_hash:?} \
+                     (not in ring buffer or S3). Either the execution produced \
+                     no output, the flusher hasn't uploaded yet, or the log \
+                     has expired."
+                ),
+                None => format!(
+                    "no log found for derivation {drv_hash:?} \
+                     (no execution recorded, or all expired)"
+                ),
+            })),
+        },
+        Err(status) => match empty_entry_exec {
+            // Same degraded answer when the stored side cannot be consulted
+            // (PG/S3 outage): before the fallthrough existed this read never
+            // touched PG or S3 at all, so an infra blip must not turn an
+            // active build's "nothing yet" poll into an error. The next poll
+            // retries; the outage is loud everywhere else.
+            Some(exec) => {
+                warn!(
+                    drv_path = %req.derivation_path,
+                    exec_id = %exec,
+                    error = %status,
+                    "stored-log probe for an empty ring entry failed; \
+                     serving the empty re-poll chunk instead"
+                );
+                chunks_to_stream(vec![empty_repoll_chunk(exec)])
+            }
+            None => err_stream(status),
+        },
     }
 }
 
@@ -169,6 +262,12 @@ const CHUNK_LINES: usize = 256;
 /// The previous `lines.is_empty() → None` conflated "no buffer" with
 /// "caught up" — a fast-polling dashboard on an active build fell
 /// through to S3 and got `NotFound`.
+///
+/// `get_derivation_logs` skips this probe entirely for a stamped entry
+/// that holds zero lines (the empty-entry fallthrough above), so the
+/// empty chunk produced here is only ever the caught-up answer for a
+/// non-empty entry — or the answer for an unstamped entry, which only
+/// test fixtures construct.
 ///
 /// Every chunk carries `exec_id` from the buffer entry's `set_exec`
 /// stamp — so a client polling an active build knows which execution

@@ -1261,7 +1261,9 @@ impl LogBuffers {
     /// whether the ring contiguously subsumes what a prior tenure already
     /// flushed for this execution — `snapshot()` deliberately drops
     /// per-line numbers, and an interior hole (lines delivered only to an
-    /// interim leader) is invisible without the span.
+    /// interim leader) is invisible without the span. Also used by the
+    /// admin read path's empty-entry fallthrough (`line_count == 0` ⇒ the
+    /// ring cannot answer; probe the stored side for the stamped exec).
     pub(crate) fn span(&self, drv_path: &str, exec_id: Uuid) -> Option<(u64, u64, u64)> {
         let buf = self.buffers.get(&drv_log_hash(drv_path))?;
         if buf.exec_id != Some(exec_id) {
