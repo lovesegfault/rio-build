@@ -937,7 +937,7 @@ in
       # r[verify sched.lease.deletion-cost]
       "graceful-release"
       "failover"
-      # r[verify sched.lease.generation-claim]
+      # r[verify sched.lease.generation-claim+2]
       #   kubectl delete lease destroys the epoch source
       #   (leaseTransitions resets to 0 on the recreated Lease); the
       #   next acquisition's generation must still exceed every

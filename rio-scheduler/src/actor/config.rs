@@ -98,9 +98,9 @@ pub struct DagActorPlumbing {
     /// This replica's lease holder identity (the pod name), recorded on
     /// `leader_generation_claims` rows. LOAD-BEARING for the
     /// same-epoch re-claim: recovery compares the claim row at the
-    /// lease-derived generation against this value to distinguish "our
-    /// own previous claim, retain it" from "another holder collided
-    /// onto our generation, exceed it". Empty in non-K8s/test mode
+    /// recovery-entry generation against this value to distinguish
+    /// "our own previous claim, retain it" from "anything the ledger
+    /// cannot prove is ours, exceed it". Empty in non-K8s/test mode
     /// (where the claim path either never runs or has no concurrent
     /// claimant to be distinguished from).
     pub holder_id: String,

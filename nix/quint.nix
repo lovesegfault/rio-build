@@ -300,7 +300,7 @@ in
     # evidence that the two state spaces are the same space.
     # r[verify sched.lease.at-most-one-leader+3]
     # r[verify sched.lease.k8s-lease+2]
-    # r[verify sched.recovery.fetch-max-seed+3]
+    # r[verify sched.recovery.fetch-max-seed+4]
     quint-leader-election = mkQuintCheck {
       name = "leader-election";
       spec = "leaderElection";
@@ -329,7 +329,7 @@ in
     # steal-delete-steal trace — two believers at the same generation.
     # See leaderElectionDeletion's module comment for the red-first
     # procedure and the rest of the regime's non-vacuity evidence.
-    # r[verify sched.lease.generation-claim]
+    # r[verify sched.lease.generation-claim+2]
     quint-leader-election-deletion = mkQuintCheck {
       name = "leader-election-deletion";
       spec = "leaderElection";
@@ -404,7 +404,7 @@ in
     # proceed-on-failure choice and of relying on PG as the
     # post-deletion backstop; this check pins the claim that they are
     # the ONLY ways a PG-side fault reaches a collision.
-    # r[verify sched.lease.generation-claim]
+    # r[verify sched.lease.generation-claim+2]
     quint-leader-election-pg-faults = mkQuintCheck {
       name = "leader-election-pg-faults";
       spec = "leaderElection";

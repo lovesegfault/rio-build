@@ -774,7 +774,7 @@ module leaderElection {
   /// claim_generation() collapsed: all three run before
   /// recovery_complete=true gates dispatch, so the model treats
   /// acquire/seed/claim as one atomic step.
-  /// r[sched.recovery.fetch-max-seed+3] (prose reference; the tracey
+  /// r[sched.recovery.fetch-max-seed] (prose reference; the tracey
   /// marker lives at the check wiring point in nix/quint.nix).
   ///
   /// The generation derives from the lease's POST-BUMP transition count:

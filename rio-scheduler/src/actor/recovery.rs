@@ -1166,7 +1166,7 @@ impl DagActor {
         }
 
         // --- Durably claim the generation this term will dispatch at ---
-        // r[impl sched.recovery.fetch-max-seed+3]
+        // r[impl sched.recovery.fetch-max-seed+4]
         //
         // The PRIMARY generation source is the Lease's transition count
         // (the lease loop's fetch_max in on_acquire — the apiserver
@@ -1206,16 +1206,17 @@ impl DagActor {
         // Same-epoch re-acquire (a self-fence false alarm followed by
         // a successful renew, or a discarded-and-requeued recovery):
         // the floor now CONTAINS our own claim row from the previous
-        // run. The rule is "exceed every generation ever used by
-        // anyone ELSE; retain our own current epoch's" — bumping past
-        // our own row would burn a generation per connectivity blip
-        // and fence our own in-flight assignments, contradicting the
-        // lease-side semantics (same epoch ⇒ same generation ⇒
-        // in-flight work stays valid). `holder_id` is the pod
-        // identity: stable across a blip (same process), never reused
-        // across pod restarts (a new pod steals the lease, bumps
-        // leaseTransitions, derives a fresh generation, and never
-        // needs the self re-claim). Two replicas never share one.
+        // run. The rule is "exceed every floor generation the claims
+        // ledger does not prove is our own current epoch's; retain
+        // only on our own claim row" — bumping past our own row would
+        // burn a generation per connectivity blip and fence our own
+        // in-flight assignments, contradicting the lease-side
+        // semantics (same epoch ⇒ same generation ⇒ in-flight work
+        // stays valid). `holder_id` is the pod identity: stable across
+        // a blip (same process), never reused across pod restarts (a
+        // new pod steals the lease, bumps leaseTransitions, derives a
+        // fresh generation, and never needs the self re-claim). Two
+        // replicas never share one.
         //
         // Does the (max) claims-ledger row sit at exactly `gen` and
         // belong to `holder`? The read-back guards the i64→u64 edge:
@@ -1225,7 +1226,7 @@ impl DagActor {
             row.as_ref()
                 .is_some_and(|(g, h)| u64::try_from(*g).ok() == Some(at_gen) && h == holder)
         };
-        // r[impl sched.lease.generation-claim]
+        // r[impl sched.lease.generation-claim+2]
         let claim_target = match &result {
             // The Err arm of the match below never seeds — this value
             // is never read on that path.
@@ -1255,33 +1256,34 @@ impl DagActor {
                 } else {
                     None
                 };
-                let another_holder_at_our_gen = max_claim.as_ref().is_some_and(|(g, h)| {
-                    u64::try_from(*g).ok() == Some(gen_at_entry) && *h != self.holder_id
-                });
+                let own_claim_at_our_gen =
+                    claim_row_matches(&max_claim, gen_at_entry, &self.holder_id);
                 let initial = match pg_floor {
                     // Someone's generation exceeds our epoch (the
                     // post-deletion case: PG remembers a higher world
                     // than the recreated Lease derives to). Exceed it.
                     Some(f) if f > gen_at_entry => f.saturating_add(1),
-                    // The floor lands exactly on our epoch AND another
-                    // holder claimed it — the post-deletion collision
-                    // the PK-CAS exists for. Exceed it.
-                    Some(f) if f == gen_at_entry && another_holder_at_our_gen => {
-                        f.saturating_add(1)
-                    }
-                    // Everything in PG is at or below our epoch and
-                    // nothing at our epoch belongs to anyone else:
-                    // retain the lease-derived generation. This covers
-                    // max(assignments) == gen_at_entry too. Two ways
-                    // someone could have dispatched at gen_at_entry:
-                    // the holder of the lease epoch that derives to it
-                    // (the Lease says that's us), or a previous-epoch
-                    // holder whose own floor logic bumped it here — but
-                    // any such holder also CLAIMED gen_at_entry first,
-                    // which flips another_holder_at_our_gen above. The
-                    // one exception is a holder that proceeded
-                    // unclaimed (a PG error during its own claim),
-                    // which is the documented one-term residual.
+                    // The floor lands exactly on our epoch but the
+                    // ledger cannot affirm it is ours: another holder's
+                    // claim row, an assignments-only floor with no
+                    // claim row at all (pre-claim-ledger assignment
+                    // history from before migration 061, or a
+                    // predecessor that proceeded unclaimed), or a
+                    // failed ledger read. Treat it as foreign and
+                    // exceed it.
+                    Some(f) if f == gen_at_entry && !own_claim_at_our_gen => f.saturating_add(1),
+                    // Everything in PG is at or below our epoch, or the
+                    // floor ties it and the ledger shows OUR OWN claim
+                    // row there (the same-epoch re-acquire): retain the
+                    // entry generation. The rule is "exceed every floor
+                    // generation the claims ledger does not prove is
+                    // our own current epoch's; retain only on our own
+                    // claim row". Assignment rows carry no scheduler-
+                    // holder identity (only builder_id), so the ledger
+                    // is the only acceptable witness — and a failed
+                    // ledger read counts as no proof. Bumping past our
+                    // own row would burn a generation per connectivity
+                    // blip and fence our own in-flight assignments.
                     _ => gen_at_entry,
                 };
                 if claim_row_matches(&max_claim, initial, &self.holder_id) {

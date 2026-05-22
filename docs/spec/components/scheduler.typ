@@ -1541,22 +1541,25 @@ tables) during state recovery.
 
 = State Recovery
 
-#r("sched.recovery.fetch-max-seed+3")[
+#r("sched.recovery.fetch-max-seed+4")[
   During recovery the scheduler MUST raise its generation to the claimed
-  generation target via `fetch_max`, not `store`. The target is the
-  Lease-derived generation (#rref("sched.lease.generation-fence")) unless
-  the durable PG floor --- `GREATEST(MAX(assignments.generation),
+  generation target via `fetch_max`, not `store`. The comparison baseline
+  is the generation at recovery entry --- the value the lease loop's
+  acquire-edge `fetch_max` left, which is the Lease-derived generation
+  (#rref("sched.lease.generation-fence")) unless an earlier recovery's
+  PG-floor seed already raised it; the target is therefore never below
+  the Lease-derived generation. The target is that entry generation
+  unless the durable PG floor --- `GREATEST(MAX(assignments.generation),
   MAX(leader_generation_claims.generation))` --- demands more: one past
-  the floor when the floor exceeds the Lease-derived generation, or when
-  it equals it and the claims ledger holds another holder's row at that
-  generation. In every other case (floor below the Lease-derived
-  generation, no floor at all, or a floor equal to it without another
-  holder's claim row there) the target is the Lease-derived generation
-  itself --- in particular a holder whose own claim row already sits at
-  that generation retains it rather than claiming a new one
-  (#rref("sched.lease.generation-claim")). The lease loop writes the same
-  `Arc<AtomicU64>` on acquire; both writers only ever raise it, and
-  `store` could regress the generation.
+  the floor when the floor exceeds the entry generation, or when it
+  equals it and the claims ledger does not show this holder's own claim
+  row at that generation. In every other case (floor below the entry
+  generation, no floor at all, or a floor equal to it where this
+  holder's own claim row already sits) the target is the entry
+  generation itself --- the same-epoch re-acquire retains its generation
+  rather than claiming a new one (#rref("sched.lease.generation-claim")).
+  The lease loop writes the same `Arc<AtomicU64>` on acquire; both
+  writers only ever raise it, and `store` could regress the generation.
 ]
 
 The PRIMARY generation source is the Lease's `leaseTransitions` count. The PG
@@ -1572,6 +1575,16 @@ assignment rows away, so `MAX(generation) FROM assignments` regresses toward
 `NULL` on a quiescent cluster --- and because a leader deposed before
 persisting any assignment leaves no trace in `assignments` at all
 (#rref("sched.lease.generation-claim")).
+
+A floor that _ties_ the entry generation is exceeded unless the claims ledger
+shows this holder's own row there, because assignment rows carry no
+scheduler-holder identity and the assignment history written before the claims
+ledger existed (migration 061 ships no backfill) has no claim rows at all ---
+so on the first post-upgrade acquisition, and after a predecessor that
+proceeded unclaimed, the floor cannot be assumed to be ours. A failed ledger
+read counts as "not shown" and is likewise exceeded; the conservative cost is
+one burned generation and an idempotent re-dispatch of the holder's own
+in-flight work.
 
 #r("sched.reconcile.leader-gate")[
   The post-recovery reconcile pass (`ReconcileAssignments`) MUST early-return
@@ -2292,14 +2305,15 @@ across Lease-object deletion.
   correctness.
 ]
 
-#r("sched.lease.generation-claim")[
+#r("sched.lease.generation-claim+2")[
   Before completing recovery and ungating dispatch, a newly-acquired leader
   MUST durably record the generation it will dispatch at as a row in the
   `leader_generation_claims` ledger, and the recovery generation floor
   (#rref("sched.recovery.fetch-max-seed")) MUST be computed over both the
   assignment history and that ledger. A holder whose own claim row already
-  sits at its lease-derived generation MUST retain that generation rather
-  than claim a new one.
+  sits at the claim target defined there MUST retain that generation rather
+  than claim a new one --- the ledger gains no new row on a same-epoch
+  re-acquire.
 ]
 
 This is the Chubby-sequencer discipline: a fencing token is only as durable as
@@ -2317,11 +2331,12 @@ CONFLICT DO NOTHING` --- the loser re-targets past the claims high-water and
 retries, bounded. The `holder_id` column is the load-bearing same-epoch
 discriminator: a holder re-acquiring its own epoch (a self-fence false alarm
 followed by a successful renew --- the Lease's transition count did not move,
-so the epoch did not change) finds its own row at its lease-derived generation
+so the epoch did not change) finds its own row at its current generation
 and retains it, rather than burning a generation --- and fencing its own
 in-flight work --- on every connectivity blip. A row at our generation with a
 _different_ `holder_id` is unambiguously a cross-incarnation collision and
-forces the bump. A claim-write failure degrades to a logged, counted
+forces the bump --- as does the absence of any claim row at a floor that ties
+it. A claim-write failure degrades to a logged, counted
 (#(refs.metric)("rio_scheduler_generation_claim_failed_total")) proceed-without-claim: blocking
 recovery on the claim would turn a PG blip at failover time into a leader that
 holds the Lease but never dispatches.

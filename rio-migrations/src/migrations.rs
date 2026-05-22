@@ -1196,6 +1196,19 @@ pub const M_064: () = ();
 /// and deleting rows would re-open the decay problem the table exists
 /// to close.
 ///
+/// The table starts EMPTY: there is no backfill of the assignment
+/// history that predates it. The recovery claim logic therefore treats
+/// an assignments-only floor that ties the recovery-entry generation as
+/// foreign and exceeds it (`sched.recovery.fetch-max-seed`) — assignment
+/// rows carry no scheduler-holder identity, so a silent ledger cannot
+/// affirm the floor is ours; this is what fences the deposed pre-upgrade
+/// leader's term on the first post-upgrade handover. The one
+/// upgrade-boundary residual that cannot close: a final pre-upgrade term
+/// that dispatched nothing leaves no floor at all, so its generation can
+/// be reused for one term by the first post-upgrade leader — the same
+/// class as the documented unclaimed-proceed residual, in its fault-free
+/// variant.
+///
 /// Read/written by **rio-scheduler** only.
 pub const M_065: () = ();
 

@@ -426,7 +426,7 @@ impl SchedulerDb {
     /// ever share a `holder_id` — a container restart within the same
     /// pod reuses `HOSTNAME`, but the predecessor is dead before the
     /// successor starts.
-    // r[impl sched.lease.generation-claim]
+    // r[impl sched.lease.generation-claim+2]
     pub async fn claim_generation(
         &self,
         generation: i64,
@@ -448,11 +448,13 @@ impl SchedulerDb {
     /// `handle_leader_acquired`'s claim path:
     ///
     /// - the pre-INSERT check — when the PG floor lands exactly on the
-    ///   lease-derived generation, the holder of the row at that
+    ///   recovery-entry generation, the holder of the row at that
     ///   generation decides between "our own previous claim for this
     ///   same epoch; retain it, the claim is already durable" and
-    ///   "another holder collided onto our generation
-    ///   (post-lease-deletion race); exceed it";
+    ///   "anything else; exceed it" (another holder's row is a
+    ///   post-lease-deletion collision, and an absent row at that
+    ///   generation reads as foreign too — an assignments-only floor
+    ///   has no holder identity to affirm);
     /// - the conflict-retry path — a `false` return from
     ///   [`Self::claim_generation`] means someone owns that exact
     ///   generation; if it is us the claim is idempotent, otherwise the

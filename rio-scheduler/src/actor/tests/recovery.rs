@@ -1076,7 +1076,7 @@ async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.recovery.fetch-max-seed+3]
+// r[verify sched.recovery.fetch-max-seed+4]
 /// Recovery must seed generation from PG's floor (assignments ∪ claims)
 /// via fetch_max, and must durably CLAIM the generation it lands on
 /// before ungating dispatch. Defensive monotonicity: if the k8s Lease
@@ -1147,7 +1147,7 @@ async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
 /// see 200 and seed past it. Without the claims arm of
 /// `max_known_generation`, the floor here is NULL and the new leader
 /// would re-use a generation a live believer may still hold.
-// r[verify sched.lease.generation-claim]
+// r[verify sched.lease.generation-claim+2]
 #[tokio::test]
 async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
     let f = RecoveryFixture::run(async |_handle, pool| {
@@ -1182,7 +1182,8 @@ async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
 /// blip and fence the leader's own in-flight assignments, contradicting
 /// the lease-side same-epoch semantics. The ledger must not grow a new
 /// row either.
-// r[verify sched.lease.generation-claim]
+// r[verify sched.lease.generation-claim+2]
+// r[verify sched.recovery.fetch-max-seed+4]
 #[tokio::test]
 async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1193,9 +1194,10 @@ async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    // gen_at_entry = 5: the lease-derived generation for the epoch we
-    // are re-acquiring (leaseTransitions never bumped — no holder
-    // change happened during the blip).
+    // gen_at_entry = 5: the generation at recovery entry. The claim
+    // path never reads the transition count, so this fixture covers
+    // the fresh shape (entry == leaseTransitions + 1) and the
+    // saturated post-deletion shape (entry seeded above it) alike.
     let generation = Arc::new(AtomicU64::new(5));
     let g = Arc::clone(&generation);
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
@@ -1228,11 +1230,12 @@ async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
 }
 
 /// The contrast case to the same-holder re-claim: the claim row at our
-/// lease-derived generation belongs to a DIFFERENT holder. That is the
+/// entry generation belongs to a DIFFERENT holder. That is the
 /// post-lease-deletion collision the PK-CAS exists for — two replicas
 /// raced through fresh acquisitions onto the same floor — and it MUST
 /// bump, not retain. Distinct holders must never share a generation.
-// r[verify sched.lease.generation-claim]
+// r[verify sched.lease.generation-claim+2]
+// r[verify sched.recovery.fetch-max-seed+4]
 #[tokio::test]
 async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1274,23 +1277,148 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     Ok(())
 }
 
-/// The lease-derived-above-floor arm of the claim target: when the PG
-/// floor is NULL (fresh cluster) or below the Lease-derived generation,
-/// recovery must claim exactly the Lease-derived generation -- not "one
-/// past the floor", which here would be a different (lower) value. Pins
+/// An assignments-only floor that ties the entry generation, with NO
+/// claim row at all, must be exceeded — the ledger cannot affirm the
+/// floor is ours. This is the first post-upgrade handover (assignment
+/// history written before the claims ledger existed, migration 061
+/// ships no backfill) and the unclaimed-proceed-predecessor case:
+/// assignment rows carry no scheduler-holder identity, so a silent
+/// ledger at our generation reads as foreign. Retaining here would let
+/// a deposed pre-claim-ledger leader's in-flight term share the new
+/// leader's generation, suspending the executor fence for that term.
+// r[verify sched.recovery.fetch-max-seed+4]
+#[tokio::test]
+async fn test_recovery_assignments_only_floor_at_our_generation_bumps() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Pre-claim-ledger history: an assignment at exactly the entry
+    // generation, claims ledger empty. Terminal status + parseable
+    // drv_path so recovery neither loads the row nor logs a skip (the
+    // floor query has no status filter, so terminal rows still set it).
+    let (drv_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+         VALUES ('z-pre-upgrade', $1, 'x86_64-linux', 'completed') RETURNING derivation_id",
+    )
+    .bind(format!("/nix/store/{}-pre-upgrade.drv", "a".repeat(32)))
+    .fetch_one(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status) \
+         VALUES ($1, 'pre-upgrade-worker', 5, 'completed')",
+    )
+    .bind(drv_id)
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(5));
+    let g = Arc::clone(&generation);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            g,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        6,
+        "an assignments-only floor at our generation cannot be proven ours; exceed it"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(6, "pod-us".to_string())],
+        "the bumped generation must be claimed; the silent floor gains no row"
+    );
+    Ok(())
+}
+
+/// Companion row to the assignments-only bump: the same assignment-row
+/// evidence at our generation PLUS our own claim row there. The
+/// predicate keys on the own-claim witness, not on "claims table
+/// empty", so this retains — it is the steady state of every same-epoch
+/// re-acquire after the first post-upgrade term claimed its generation.
+// r[verify sched.lease.generation-claim+2]
+#[tokio::test]
+async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (drv_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+         VALUES ('z-own-claim', $1, 'x86_64-linux', 'completed') RETURNING derivation_id",
+    )
+    .bind(format!("/nix/store/{}-own-claim.drv", "a".repeat(32)))
+    .fetch_one(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status) \
+         VALUES ($1, 'own-claim-worker', 5, 'completed')",
+    )
+    .bind(drv_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'pod-us')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(5));
+    let g = Arc::clone(&generation);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            g,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        p.holder_id = "pod-us".into();
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        5,
+        "our own claim row at the tied floor proves it is ours; retain"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![(5, "pod-us".to_string())],
+        "the ledger must not grow a new row when our own claim already covers the floor"
+    );
+    Ok(())
+}
+
+/// The entry-generation-above-floor arm of the claim target: when the
+/// PG floor is NULL (fresh cluster) or below the generation at recovery
+/// entry, recovery must claim exactly the entry generation -- not "one
+/// past the floor", which here would be a different (lower) value. In
+/// this fresh shape the entry generation IS the Lease-derived one. Pins
 /// the arm of the decision table where the Lease, not the PG floor,
 /// decides the generation, and guards against regressing the code
 /// toward a floor-only reading of the rule.
-// r[verify sched.recovery.fetch-max-seed+3]
+// r[verify sched.recovery.fetch-max-seed+4]
 #[tokio::test]
 async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     // No assignments, no claims: the PG floor is NULL.
 
-    // gen_at_entry = 7: the lease-derived generation for this epoch
-    // (prior holder changes bumped leaseTransitions while PG stayed
-    // empty -- e.g. every prior term was deposed before persisting, or
-    // proceeded unclaimed).
+    // gen_at_entry = 7: the generation at recovery entry. In the story
+    // this fixture stages, that is the Lease-derived generation for
+    // this epoch (prior holder changes bumped leaseTransitions while
+    // PG stayed empty -- e.g. every prior term was deposed before
+    // persisting, or proceeded unclaimed).
     let generation = Arc::new(AtomicU64::new(7));
     let g = Arc::clone(&generation);
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
@@ -1307,7 +1435,7 @@ async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestR
     assert_eq!(
         generation.load(Ordering::Acquire),
         7,
-        "an empty PG floor demands nothing; the lease-derived generation is retained"
+        "an empty PG floor demands nothing; the entry generation is retained"
     );
     let rows: Vec<(i64, String)> = sqlx::query_as(
         "SELECT generation, holder_id FROM leader_generation_claims ORDER BY generation",
@@ -1317,7 +1445,7 @@ async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestR
     assert_eq!(
         rows,
         vec![(7, "pod-us".to_string())],
-        "the claims ledger must record the lease-derived generation, not a floor-derived one"
+        "the claims ledger must record the entry generation, not a floor-derived one"
     );
     Ok(())
 }
