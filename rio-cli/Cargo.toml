@@ -23,10 +23,6 @@ rio-crds = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
-# Direct rustls for CryptoProvider::install_default(). Without it,
-# dual ring+aws-lc-rs feature activation → rustls panic on first TLS
-# use. Same rationale as every other rio binary.
-rustls = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
@@ -36,10 +32,12 @@ uuid = { workspace = true }
 # kube::Client + Api<T> for `wps` subcommand (talks to K8s apiserver,
 # not gRPC). Workspace dep already has `client` feature enabled.
 kube = { workspace = true }
-# Version-feature activation. Moved from dev-deps: now that kube is
-# a regular dep (via the wps subcommand), k8s-openapi's build.rs
-# feature check fires on `cargo build -p rio-cli` too, not just
-# `cargo test`. See the original dev-deps comment below for detail.
+# Version-feature activation only — no code references it, and
+# cargo-machete will flag it as unused. k8s-openapi's build.rs requires
+# exactly one v1_NN feature to be enabled by SOME crate in the build
+# graph; kube deliberately enables none. The workspace dep carries
+# v1_35, so this edge is what makes `cargo build -p rio-cli` (the
+# per-member CI builds) compile.
 k8s-openapi = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

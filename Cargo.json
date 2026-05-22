@@ -13272,9 +13272,9 @@
     },
     "js-sys": {
       "crateName": "js-sys",
-      "version": "0.3.98",
+      "version": "0.3.99",
       "edition": "2021",
-      "sha256": "024zjwpxp6fri4j79bh1686q1x4nw4a06fh1a28zv2rzc4973pv7",
+      "sha256": "04azrzsz91gr5s3z0ij36lz0kj9ry4lw3jz0mmbiwb251rsc8aql",
       "source": {
         "type": "crates-io"
       },
@@ -19245,10 +19245,6 @@
           "packageId": "rio-proto"
         },
         {
-          "name": "rustls",
-          "packageId": "rustls"
-        },
-        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -20026,10 +20022,6 @@
           "packageId": "prost-types"
         },
         {
-          "name": "rand",
-          "packageId": "rand 0.10.1"
-        },
-        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -20163,14 +20155,6 @@
           "packageId": "http 1.4.0"
         },
         {
-          "name": "k8s-openapi",
-          "packageId": "k8s-openapi"
-        },
-        {
-          "name": "kube",
-          "packageId": "kube"
-        },
-        {
           "name": "lru",
           "packageId": "lru 0.18.0"
         },
@@ -20209,10 +20193,6 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
-        },
-        {
-          "name": "rio-crds",
-          "packageId": "rio-crds"
         },
         {
           "name": "rio-lease",
@@ -27011,9 +26991,9 @@
     },
     "wasm-bindgen": {
       "crateName": "wasm-bindgen",
-      "version": "0.2.121",
+      "version": "0.2.122",
       "edition": "2021",
-      "sha256": "14375vc40l67lk9rxp59my4r6s64h2an3vjfh9j0hnqngk8f3b29",
+      "sha256": "02flix96brsb2r1i3grnikii302iqpdm337kl3xv5lklz5v4bl1y",
       "source": {
         "type": "crates-io"
       },
@@ -27055,9 +27035,9 @@
     },
     "wasm-bindgen-futures": {
       "crateName": "wasm-bindgen-futures",
-      "version": "0.4.71",
+      "version": "0.4.72",
       "edition": "2021",
-      "sha256": "1f3k8r13nqshrlxwq0naxpbh250b4l6p526wlw2m78pv7w6jsjcn",
+      "sha256": "03qb24gfr072rk8hb69glfdc8yhqqqq2rhy3j5i0ps8sk79dnwwl",
       "source": {
         "type": "crates-io"
       },
@@ -27084,9 +27064,9 @@
     },
     "wasm-bindgen-macro": {
       "crateName": "wasm-bindgen-macro",
-      "version": "0.2.121",
+      "version": "0.2.122",
       "edition": "2021",
-      "sha256": "0y45ghbkvs5rmxvdyhqrx8nzyy45rdx6619c01iaarykmzsfcs4f",
+      "sha256": "1inyl55bvdifx7l60q9wl0ivmw7236jg7jqmcqpxhsx3knq52qci",
       "source": {
         "type": "crates-io"
       },
@@ -27107,9 +27087,9 @@
     },
     "wasm-bindgen-macro-support": {
       "crateName": "wasm-bindgen-macro-support",
-      "version": "0.2.121",
+      "version": "0.2.122",
       "edition": "2021",
-      "sha256": "1wjr69qa8rwmk4v7243dr100k393qi0avznk6p5sgck4bk1rwnnr",
+      "sha256": "0pjw5kc2mbfz59agk5l21kh4hxzp94rygdvsnr4f3z6b5hv4g419",
       "source": {
         "type": "crates-io"
       },
@@ -27144,9 +27124,9 @@
     },
     "wasm-bindgen-shared": {
       "crateName": "wasm-bindgen-shared",
-      "version": "0.2.121",
+      "version": "0.2.122",
       "edition": "2021",
-      "sha256": "0h9la4176j5bvgbr64cqkmirif8z59vrcax9i4qx1w79045i1q64",
+      "sha256": "0ds4mmfqvxwc5fp33hn0jblf0f6b4lghrd9mpkls66zic4n9p4ls",
       "source": {
         "type": "crates-io"
       },
@@ -27305,9 +27285,9 @@
     },
     "web-sys": {
       "crateName": "web-sys",
-      "version": "0.3.98",
+      "version": "0.3.99",
       "edition": "2021",
-      "sha256": "1aijiwx7wsfzj37p1gnqn6wv4j2ppf4rqwhrzb8blf6gigzjsmsb",
+      "sha256": "0dilfvl9jnyhi4skl6cry9wc300r693j0w82jjbq8yy3rx0i8qkd",
       "source": {
         "type": "crates-io"
       },

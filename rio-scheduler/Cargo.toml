@@ -53,20 +53,11 @@ futures-util = { workspace = true }
 # grpc.health.v1.Health for K8s readiness probes. C3 gates SERVING on
 # is_leader so the K8s Service routes only to the leader replica.
 tonic-health = { workspace = true }
-# coordination.k8s.io/v1 Lease for leader election. In-house
-# implementation (src/lease/election.rs) using kube::Api::replace()
-# for resourceVersion-guarded optimistic concurrency + local-
-# monotonic observed-record expiry (client-go's model). Gated on
-# RIO_LEASE_NAME env — unset means non-K8s mode (generation stays
-# at 1, VM tests unaffected).
-kube = { workspace = true }
-k8s-openapi = { workspace = true }
-# KubeErrorExt::is_conflict for the lease election 409 branches.
-# rio-crds is type-defs + a tiny kube::Error helper — no runtime deps.
-rio-crds = { workspace = true }
 # Leader election + LeaderState (extracted from src/lease/; B1).
 # `pub use rio_lease as lease` in lib.rs keeps the `crate::lease::*`
-# path stable for actor/admin/sla consumers.
+# path stable for actor/admin/sla consumers. kube/k8s-openapi/rio-crds
+# moved with the extraction — rio-lease owns the apiserver surface; the
+# scheduler only consumes its Rust API.
 rio-lease = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }

@@ -164,7 +164,6 @@
       "prod": [
         "rio-auth",
         "rio-common",
-        "rio-crds",
         "rio-lease",
         "rio-migrations",
         "rio-nix",

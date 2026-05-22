@@ -10,6 +10,11 @@ publish = false
 
 [dependencies]
 tonic = { workspace = true }
+# NOTE: tonic-prost, prost-types, and serde are referenced by the
+# build.rs-generated code in OUT_DIR (tonic_prost::ProstCodec in every
+# service stub, prost_types::Timestamp fields, the serde::Serialize
+# derives injected via type_attribute) — cargo-machete cannot see
+# generated code and will flag all three as unused. They are not.
 tonic-prost = { workspace = true }
 # Health-aware balanced channel (client/balance.rs) probes
 # grpc.health.v1/Check on each pod IP to find the leader.
@@ -23,8 +28,6 @@ tokio-stream = { workspace = true }
 tokio = { workspace = true }
 # CancellationToken for connect_with_retry's shutdown-aware sleep.
 tokio-util = { workspace = true }
-# ±25% jitter in connect_with_retry's backoff.
-rand = { workspace = true }
 futures-util = { workspace = true }
 rio-common = { workspace = true }
 rio-nix = { workspace = true }

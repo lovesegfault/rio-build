@@ -4030,7 +4030,6 @@ dependencies = [
  "opentelemetry",
  "prost",
  "prost-types",
- "rand 0.10.1",
  "rio-common",
  "rio-nix",
  "serde",

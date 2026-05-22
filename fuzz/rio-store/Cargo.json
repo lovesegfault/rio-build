@@ -12770,10 +12770,6 @@
           "packageId": "prost-types"
         },
         {
-          "name": "rand",
-          "packageId": "rand 0.10.1"
-        },
-        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
