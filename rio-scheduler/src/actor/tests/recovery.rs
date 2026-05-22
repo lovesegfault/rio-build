@@ -3104,7 +3104,9 @@ async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
 }
 
 /// bug_012 (r11) + bug_002 (r12): acquisition-time reconciliation of an
-/// ex-leader's retained `LogBuffers` is two-part — the restamp loop covers
+/// ex-leader's retained `LogBuffers` is three-part — the pre-load prefix
+/// re-arm clears per-tenure stored-coverage bookkeeping on every retained
+/// entry (bug_001 r13, tested separately); the restamp loop covers
 /// PG-`Assigned|Running` drvs; the post-load sweep covers everything else.
 /// A retained entry for a drv that went terminal under an interim leader is
 /// either not loaded at all (most terminal statuses) or loaded only as a
@@ -3320,6 +3322,104 @@ async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
     assert!(
         flush_rx.try_recv().is_err(),
         "acquisition-time sweep must not enqueue flush requests"
+    );
+
+    Ok(())
+}
+
+/// bug_001 (r13): the acquisition-time re-arm must cover retained entries
+/// the restamp loop does NOT touch. Across an A→B→A flap where the worker
+/// migrated to the interim leader and disconnected before re-dispatch, the
+/// drv recovers as Ready (reset_to_ready under B) — the sweep deliberately
+/// spares the retained entry (the cancel-sweep finalization needs its
+/// stamp), but the prefix_checked=true latch from A's previous tenure must
+/// not survive the flap: B may have extended the stored .partial past what
+/// A's ring holds, and a trusted stale latch makes the flusher skip
+/// reconcile_stored_prefix — overwriting that durable coverage on the next
+/// periodic tick, or freezing a truncated .log.zst as complete and
+/// deleting the .partial on the cancel-sweep final.
+///
+/// r[verify obs.log.stored-coverage-preserved]
+#[tokio::test]
+async fn test_recovery_rearms_prefix_state_for_spared_ready_entry() -> TestResult {
+    use crate::logs::PrefixState;
+
+    let exec_id = Uuid::now_v7();
+    let drv_tag = "rearm-ready-drv";
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: seed PG. merge_single_node leaves the drv `ready` with
+    // no assignment — the post-reset shape an interim leader leaves after
+    // the worker disconnects from it and before any re-dispatch. ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_single_node(&handle, Uuid::new_v4(), drv_tag, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // --- Phase 2: the EX-LEADER re-acquires. Its retained LogBuffers
+    // still holds the execution's entry, lines, and — crucially — the
+    // prefix latch its flusher set during the previous tenure. ---
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let drv_path = test_drv_path(drv_tag);
+    log_buffers.set_exec(&drv_path, exec_id, "old-worker");
+    assert!(
+        log_buffers.push_for(
+            &drv_path,
+            &rio_proto::types::BuildLogBatch {
+                derivation_path: drv_path.clone(),
+                lines: vec![b"retained pre-flap line".to_vec()],
+                first_line_number: 0,
+                executor_id: "old-worker".into(),
+            },
+            "old-worker",
+        ),
+        "fixture premise: retained entry holds the previous tenure's lines"
+    );
+    log_buffers.mark_prefix_checked(&drv_path, exec_id);
+    assert!(
+        matches!(
+            log_buffers.prefix_state(&drv_path, exec_id),
+            PrefixState::Checked
+        ),
+        "fixture premise: previous tenure latched the stored-coverage check"
+    );
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
+        plumbing.log_buffers = Some(log_buffers.clone());
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Fixture premise: recovered as Ready ⇒ the restamp loop did not run
+    // for it and the sweep spared its entry.
+    assert_eq!(
+        expect_drv(&handle, drv_tag).await.status,
+        DerivationStatus::Ready,
+        "fixture premise: drv recovers as Ready (not restamped, not swept)"
+    );
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        Some(exec_id),
+        "spared entry must keep its exec stamp (cancel-sweep finalization reads it)"
+    );
+    assert_eq!(
+        log_buffers.read_since(&drv_path, 0).map(|l| l.len()),
+        Some(1),
+        "spared entry must keep its lines"
+    );
+    // The fix: the previous tenure's latch must NOT survive re-acquisition
+    // — the flusher re-consults the stored drv_logs row before its next
+    // flush of this execution instead of overwriting what an interim
+    // leader stored.
+    assert!(
+        matches!(
+            log_buffers.prefix_state(&drv_path, exec_id),
+            PrefixState::Unchecked
+        ),
+        "prefix bookkeeping must be re-armed at acquisition for entries the restamp loop does not cover"
     );
 
     Ok(())

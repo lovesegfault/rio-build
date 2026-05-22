@@ -100,6 +100,37 @@ impl DagActor {
         // worker connected to the standby is still connected.
         self.clear_persisted_state();
 
+        // Acquisition-time LogBuffers reconciliation, part 1 of 3 (part 2
+        // is the restamp loop inside load_dag_from_rows; part 3 is
+        // sweep_stale_log_buffers below): re-arm the stored-coverage
+        // reconciliation on every retained entry. The prefix bookkeeping
+        // (prefix_checked / recovered_prefix) encodes conclusions reached
+        // under a previous tenure; an interim leader may have extended the
+        // stored drv_logs row past what this ring holds, so the flusher
+        // must re-consult the row once per execution this tenure. This
+        // clears every retained entry; the restamp loop later performs a
+        // redundant second clear for the PG-`Assigned|Running` drvs it
+        // touches (set_exec's same-exec arm — the general restamp
+        // contract). The entries that depend on THIS step are the ones
+        // recovery does not restamp: entries the sweep spares because
+        // their drv is non-terminal in some other state (Ready/Queued/
+        // Substituting after an interim leader's reset) and sealed
+        // entries with a queued final flush. Runs before the PG loads so
+        // recovery's round-trips don't extend the window in which a
+        // concurrently ticking flusher could still trust a stale latch,
+        // and still runs when the load below fails (the degraded
+        // empty-DAG tenure retains the entries).
+        // r[impl obs.log.stored-coverage-preserved]
+        if let Some(bufs) = &self.log_buffers {
+            let rearmed = bufs.rearm_prefix_reconciliation();
+            if rearmed > 0 {
+                info!(
+                    count = rearmed,
+                    "re-armed stored-coverage reconciliation on retained log buffers"
+                );
+            }
+        }
+
         let RecoveryLoad {
             build_rows,
             build_ids,
@@ -108,8 +139,9 @@ impl DagActor {
             failed_dep_parents,
         } = self.load_dag_from_rows().await?;
 
-        // Acquisition-time LogBuffers reconciliation, part 2 of 2 (part 1
-        // is the restamp loop inside load_dag_from_rows): discard retained
+        // Acquisition-time LogBuffers reconciliation, part 3 of 3 (part 1 is
+        // the prefix re-arm above, part 2 is the restamp loop inside
+        // load_dag_from_rows): discard retained
         // entries for derivations the rebuilt DAG does not track in a
         // non-terminal state — they went terminal (or vanished) under an
         // interim leader and no other reaper covers them (Poisoned: none
@@ -200,7 +232,10 @@ impl DagActor {
             // Retained entries whose drv is not loaded here as a live
             // assignment (terminal under an interim leader — including
             // Poisoned rows loaded only for TTL tracking) are reconciled
-            // by `sweep_stale_log_buffers` right after this load.
+            // by `sweep_stale_log_buffers` right after this load; entries
+            // this loop does not touch had their per-tenure prefix
+            // bookkeeping re-armed by `rearm_prefix_reconciliation`
+            // before this load (part 1 of the acquisition reconciliation).
             if let Some((exec_id, executor_id)) = restamp {
                 self.set_log_exec(&hash, exec_id, &executor_id);
                 restamped_buffers += 1;
@@ -371,7 +406,11 @@ impl DagActor {
     /// which the cancel-sweep finalization (`finalize_buffered_exec_log`)
     /// needs — survive, while Poisoned TTL-tracking nodes do not keep an
     /// entry alive. Sealed entries are the flusher's to drain and are
-    /// skipped (see `LogBuffers::discard_unsealed_not_in`).
+    /// skipped (see `LogBuffers::discard_unsealed_not_in`). Spared
+    /// entries' per-tenure prefix bookkeeping was already re-armed by
+    /// `LogBuffers::rearm_prefix_reconciliation` (part 1 of the
+    /// acquisition reconciliation), so they cannot carry a previous
+    /// tenure's stored-coverage conclusions into this one.
     ///
     /// The unflushed tail of a discarded entry is accepted loss: it was
     /// never durable, and it is within the ≤30s failover bound of

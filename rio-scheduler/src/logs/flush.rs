@@ -21,11 +21,15 @@
 //!      place for operator recovery / TTL sweep.
 //!
 //! A third behavior kicks in on any later tenure of an execution after a
-//! leader failover with a reconnecting worker: recovery restamps the same
-//! `exec_id` (onto a fresh standby's empty buffer, or onto a re-acquired
-//! ex-leader's retained one — even one whose ring still starts at line 0),
-//! and the worker only re-streams undelivered batches, so the ring no
-//! longer covers everything a prior tenure already flushed. On the first
+//! leader failover: either recovery restamps the same `exec_id` (onto a
+//! fresh standby's empty buffer, or onto a re-acquired ex-leader's
+//! retained one — even one whose ring still starts at line 0) and the
+//! reconnecting worker only re-streams undelivered batches, or the
+//! acquisition-time re-arm ([`LogBuffers::rearm_prefix_reconciliation`])
+//! clears the per-tenure latch on a retained entry recovery did not
+//! restamp (e.g. spared Ready after an interim leader's reset). Either
+//! way the ring no longer necessarily covers everything a prior tenure
+//! already flushed. On the first
 //! non-empty flush of the tenure the flusher reconciles the ring against
 //! the stored `drv_logs` row ([`LogFlusher::reconcile_stored_prefix`]):
 //! when the ring does not contiguously subsume the stored range it fetches
@@ -759,11 +763,14 @@ impl LogFlusher {
     /// contiguously subsume the row's stated range. A prior tenure is the
     /// only writer that can have produced such a row — exec_ids are minted
     /// fresh per dispatch and the same-tenure first flush sees no row — so
-    /// this fires only after a recovery restamp: a fresh standby holding
-    /// the re-streamed suffix, or a re-acquired ex-leader whose retained
-    /// ring overlaps / has interior holes relative to what an interim
-    /// leader stored. Overlap handling (yielding the ring's head to the
-    /// stored copy) is the caller's job.
+    /// this fires only after the per-tenure re-arm of the entry's prefix
+    /// bookkeeping (a recovery restamp, or
+    /// [`LogBuffers::rearm_prefix_reconciliation`] for retained entries
+    /// recovery does not restamp): a fresh standby holding the re-streamed
+    /// suffix, or a re-acquired ex-leader whose retained ring overlaps /
+    /// has interior holes relative to what an interim leader stored.
+    /// Overlap handling (yielding the ring's head to the stored copy) is
+    /// the caller's job.
     ///
     /// `ring_span` is `(first_line, last_line, line_count)` of the stamped
     /// ring entry, as returned by [`LogBuffers::span`]; `line_count > 0`.

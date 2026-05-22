@@ -165,12 +165,16 @@ struct RingBuf {
     /// See [`RecoveredPrefix`]. Set at most once per execution **per
     /// tenure** by the flusher's stored-coverage reconciliation; cleared by
     /// **any** restamp (cross-exec, or the same-exec restamp recovery
-    /// performs at lease re-acquisition). Ignored by `push_into`/eviction —
-    /// never counted against the ring's line/byte caps.
+    /// performs at lease re-acquisition) and by the acquisition-time
+    /// re-arm ([`LogBuffers::rearm_prefix_reconciliation`]), which clears
+    /// every retained entry at lease acquisition. Ignored by
+    /// `push_into`/eviction — never counted against the ring's line/byte
+    /// caps.
     recovered_prefix: Option<std::sync::Arc<RecoveredPrefix>>,
     /// The flusher already looked for a stored prefix **this tenure**
     /// (whatever the outcome) — avoids a per-tick SELECT for evicted long
-    /// logs. Cleared by any restamp, like `recovered_prefix`. Once latched,
+    /// logs. Cleared by any restamp and by the acquisition-time re-arm,
+    /// like `recovered_prefix`. Once latched,
     /// same-tenure ring eviction past the stored row keeps the pre-existing
     /// accepted head-loss behavior (the row in that shape was produced by
     /// this tenure from this very ring after its reconcile); prior-tenure
@@ -817,6 +821,57 @@ impl LogBuffers {
             self.discard(key);
         }
         stale.len()
+    }
+
+    /// Re-arm the once-per-tenure stored-coverage reconciliation on every
+    /// retained entry: clear `recovered_prefix` and the `prefix_checked`
+    /// latch so the flusher re-consults the stored `drv_logs` row on each
+    /// execution's next non-empty flush (`reconcile_stored_prefix`).
+    ///
+    /// Recovery-only, called from `recover_from_pg` at lease acquisition,
+    /// before the PG loads. Clears EVERY retained entry — including the
+    /// PG-`Assigned|Running` ones recovery subsequently restamps, for
+    /// which the same-exec arm of [`Self::set_exec`] performs a redundant
+    /// second clear (that arm remains the general contract for any
+    /// restamp, recovery-driven or not). The entries that NEED this call
+    /// are the ones recovery does not restamp: entries the acquisition
+    /// sweep spares because their drv is non-terminal in some other state
+    /// (Ready/Queued/Substituting after an interim leader's reset), and
+    /// sealed entries whose final `FlushRequest` is still queued. Their
+    /// latches encode conclusions reached under a previous tenure; an
+    /// interim leader may have extended the stored row past what this
+    /// ring holds, and trusting the stale latch would let the next flush
+    /// overwrite that durable coverage — or freeze a truncated final and
+    /// delete the `.partial` that is its only copy.
+    ///
+    /// Lines, exec stamps, executor bindings, and seal tombstones are
+    /// untouched — only the per-tenure reconciliation state is cleared.
+    /// Cost: at most one point-SELECT (plus one S3 GET when stored
+    /// coverage is not subsumed) per retained entry on its next non-empty
+    /// flush — the same once-per-tenure cost the restamp arm already
+    /// imposes on Assigned/Running entries. Idempotent.
+    ///
+    /// Benign race: a final flush already in flight from the prior
+    /// tenure's queue may have its just-set latch/cached prefix cleared
+    /// between its reconcile and its pre-drain read; for sealed entries
+    /// no interim leader can have extended the stored row, so that
+    /// collapses to the accepted same-tenure `Checked` head-loss shape
+    /// (or a conservatively preserved `.partial`) — never an overwrite
+    /// of stored coverage.
+    ///
+    /// Returns how many entries had a latch or cached prefix to clear
+    /// (for the acquisition log line).
+    // r[impl obs.log.stored-coverage-preserved]
+    pub(crate) fn rearm_prefix_reconciliation(&self) -> usize {
+        let mut rearmed = 0usize;
+        for mut entry in self.buffers.iter_mut() {
+            if entry.prefix_checked || entry.recovered_prefix.is_some() {
+                entry.prefix_checked = false;
+                entry.recovered_prefix = None;
+                rearmed += 1;
+            }
+        }
+        rearmed
     }
 
     /// Mark `drv_path` terminal: subsequent [`Self::push`] calls drop.
@@ -1615,6 +1670,70 @@ mod tests {
             bufs.read_since("drv-a", 0),
             Some(vec![(0, b"line-0".to_vec())])
         );
+    }
+
+    /// bug_001 (r13): the acquisition-time re-arm — third leg of the
+    /// per-tenure discipline next to set_exec's cross-exec and same-exec
+    /// arms. It must clear the Checked latch and any cached prefix on
+    /// EVERY entry (sealed ones included) while leaving lines, exec
+    /// stamps, executor bindings, and seals untouched; entries with
+    /// nothing latched are not counted.
+    // r[verify obs.log.stored-coverage-preserved]
+    #[test]
+    fn rearm_prefix_reconciliation_clears_latches_keeps_lines() {
+        let bufs = LogBuffers::new();
+        let (exec_a, exec_b, exec_c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        // Distinct hash parts -> distinct LogBuffers keys (drv_log_hash
+        // keys on the 32-char hash; reusing one hash would collide).
+        let drv_a = format!("/nix/store/{}-rearm-a.drv", "a".repeat(32));
+        let drv_b = format!("/nix/store/{}-rearm-b.drv", "b".repeat(32));
+        let drv_c = format!("/nix/store/{}-rearm-c.drv", "c".repeat(32));
+
+        // (a) Checked latch from a prior tenure.
+        bufs.set_exec(&drv_a, exec_a, "w-a");
+        assert!(bufs.push_for(&drv_a, &mk_batch(&drv_a, 0, &[b"a0"]), "w-a"));
+        bufs.mark_prefix_checked(&drv_a, exec_a);
+        // (b) Cached prefix + sealed (queued-final shape).
+        bufs.set_exec(&drv_b, exec_b, "w-b");
+        assert!(bufs.push_for(&drv_b, &mk_batch(&drv_b, 5, &[b"b5"]), "w-b"));
+        assert!(bufs.set_recovered_prefix(
+            &drv_b,
+            exec_b,
+            std::sync::Arc::new(RecoveredPrefix {
+                first_line: 0,
+                line_count: 5,
+                total_bytes: 10,
+                compressed: vec![1, 2, 3],
+            })
+        ));
+        bufs.seal(&drv_b);
+        // (c) Already Unchecked — must not be counted.
+        bufs.set_exec(&drv_c, exec_c, "w-c");
+        assert!(bufs.push_for(&drv_c, &mk_batch(&drv_c, 0, &[b"c0"]), "w-c"));
+
+        assert_eq!(
+            bufs.rearm_prefix_reconciliation(),
+            2,
+            "only latched entries count"
+        );
+
+        for (drv, exec) in [(&drv_a, exec_a), (&drv_b, exec_b), (&drv_c, exec_c)] {
+            assert!(
+                matches!(bufs.prefix_state(drv, exec), PrefixState::Unchecked),
+                "{drv}: must be Unchecked after the re-arm"
+            );
+            assert_eq!(bufs.exec_id(drv), Some(exec), "{drv}: exec stamp untouched");
+            assert_eq!(
+                bufs.read_since(drv, 0).map(|l| l.len()),
+                Some(1),
+                "{drv}: lines untouched"
+            );
+        }
+        assert!(
+            bufs.is_sealed(&drv_b),
+            "seal tombstones are not the re-arm's to clear"
+        );
+        assert_eq!(bufs.rearm_prefix_reconciliation(), 0, "idempotent");
     }
 
     /// `truncate_below` drops exactly the ring lines below the threshold

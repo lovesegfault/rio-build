@@ -863,9 +863,13 @@ impl DagActor {
         // - `executors`: live connections, not persisted (doc above).
         // - `log_buffers`: retained so a still-streaming worker's in-flight
         //   execution keeps its lines across a lease flap. Reconciled at the
-        //   next acquisition: recovery restamps PG-`Assigned|Running` entries
-        //   and `sweep_stale_log_buffers` discards the rest, so retention
-        //   here cannot leak terminal drvs' buffers across generations.
+        //   next acquisition (three parts): `rearm_prefix_reconciliation`
+        //   clears every retained entry's per-tenure stored-coverage
+        //   bookkeeping, recovery restamps PG-`Assigned|Running` entries,
+        //   and `sweep_stale_log_buffers` discards entries whose drv is no
+        //   longer non-terminal in the rebuilt DAG — so retention cannot
+        //   leak terminal drvs' buffers across generations, and spared
+        //   entries cannot carry a previous tenure's prefix conclusions.
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
         // - `cache_breaker`: store availability is generation-independent.
         // - `sla_estimator`: cluster-wide fitted curves.
