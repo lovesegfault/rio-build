@@ -211,7 +211,7 @@ impl Scenario for ChunkVerify {
             } else {
                 Ok(Verdict::Fail(format!(
                     "verify-chunks did not report deleted chunk {hex}. Output (first 500B): {}",
-                    &out.chars().take(500).collect::<String>()
+                    out.chars().take(500).collect::<String>()
                 )))
             }
         }
