@@ -32,11 +32,11 @@
   # removes a root-socket attack surface. (ADR-021 Q2.)
   nix.enable = false;
 
-  # Pinned kernel minor (ADR-021 Q3). pins.node_kernel_minor is a string
-  # like "6_18" → resolves pkgs.linuxPackages_6_18. A nixpkgs flake-input
-  # bump can't surprise-rebuild the kernel; bump pins.nix deliberately.
+  # Pinned kernel minor (ADR-021 Q3). pins.node.kernel_minor is a string
+  # like "7_0" → resolves pkgs.linuxPackages_7_0. A nixpkgs flake-input
+  # bump can't surprise-rebuild the kernel; bump pins.toml deliberately.
   boot = {
-    kernelPackages = lib.mkDefault pkgs."linuxPackages_${pins.node_kernel_minor}";
+    kernelPackages = lib.mkDefault pkgs."linuxPackages_${pins.node.kernel_minor}";
 
     # systemd-in-initrd: parallel device probe + structured stage-1
     # logging (journalctl -b shows initrd). amazon-image.nix's NVMe-

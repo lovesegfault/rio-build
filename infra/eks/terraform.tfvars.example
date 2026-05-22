@@ -12,10 +12,10 @@
 #                               # second rio cluster in the same
 #                               # account.
 
-# kubernetes_version and the addon chart versions (cert_manager_version,
-# aws_lbc_version, karpenter_version) are sourced from
-# generated.auto.tfvars.json — regenerate with:
-#   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
+# The version pins (the `cluster`, `addons`, and `node` objects) are
+# sourced from nix/pins.toml via generated.auto.tfvars.json — regenerate
+# with:
+#   cargo xtask regen tfvars
 # Override here only for a hotfix; *.auto.tfvars.json loads AFTER
 # terraform.tfvars so the generated values win unless you delete that file.
 

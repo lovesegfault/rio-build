@@ -17,45 +17,45 @@ variable "cluster_name" {
   }
 }
 
-variable "kubernetes_version" {
-  description = "K8s version for the EKS control plane. 1.33+ required for hostUsers: false (user namespace isolation per ADR-012). Sourced from nix/pins.nix via generated.auto.tfvars.json."
-  type        = string
+variable "cluster" {
+  description = "Cluster-level pins from nix/pins.toml via generated.auto.tfvars.json. kubernetes_version: 1.33+ required for hostUsers: false (user namespace isolation per ADR-012)."
+  type = object({
+    kubernetes_version = string
+  })
 }
 
-# Addon chart versions — sourced from nix/pins.nix via
-# generated.auto.tfvars.json so nix/tests/ and infra/eks/ agree. No
-# default: if the generated file is missing, `tofu plan` fails loudly
-# instead of silently diverging from the flake's pins.
+# Addon pins — sourced from nix/pins.toml via generated.auto.tfvars.json
+# so nix/tests/ and infra/eks/ agree. No default: if the generated file
+# is missing, `tofu plan` fails loudly instead of silently diverging
+# from the flake's pins. A new field in pins.toml must also be added to
+# the object type here (plan errors on unexpected attributes), which
+# keeps the two in sync deliberately.
 
-variable "cilium_version" {
-  description = "cilium chart version (helm.cilium.io). Same pin as nix/cilium-render.nix."
-  type        = string
+variable "addons" {
+  description = "Cluster addon pins (helm chart versions + Gateway API CRDs)."
+  type = object({
+    # cilium chart version (helm.cilium.io). Same pin as nix/cilium-render.nix.
+    cilium = object({ version = string })
+    # Gateway API CRD release tag; crds_hash is the fetchurl hash for the
+    # standard-install.yaml bundle (consumed by nix/cilium-render.nix, not
+    # terraform — it rides along because the whole pins tree lands here).
+    gateway_api = object({
+      version   = string
+      crds_hash = string
+    })
+    # aws-load-balancer-controller chart version (eks-charts repo).
+    aws_load_balancer_controller = object({ version = string })
+    # Karpenter chart version (OCI public.ecr.aws/karpenter).
+    karpenter = object({ version = string })
+    # external-dns chart version (kubernetes-sigs.github.io/external-dns).
+    external_dns = object({ version = string })
+  })
 }
 
 variable "hubble_ui_enabled" {
   description = "Deploy the Hubble web UI. Off by default; xtask up sets this true for dev/QA clusters."
   type        = bool
   default     = false
-}
-
-variable "gateway_api_version" {
-  description = "Gateway API CRD release tag (kubernetes-sigs/gateway-api)."
-  type        = string
-}
-
-variable "aws_lbc_version" {
-  description = "aws-load-balancer-controller chart version (eks-charts repo)."
-  type        = string
-}
-
-variable "karpenter_version" {
-  description = "Karpenter chart version (OCI public.ecr.aws/karpenter)."
-  type        = string
-}
-
-variable "external_dns_version" {
-  description = "external-dns chart version (kubernetes-sigs.github.io/external-dns). Sourced from nix/pins.nix via generated.auto.tfvars.json."
-  type        = string
 }
 
 variable "gateway_dns" {
@@ -112,45 +112,14 @@ variable "system_instance_type" {
 
 # ──────────────────────────────────────────────────────────────────────
 # NixOS-node AMI build pins. NOT terraform inputs — consumed by
-# nix/nixos-node/ directly from nix/pins.nix. Declared here only to
-# silence tofu's "Value for undeclared variable" warning ×6 on every
-# plan/apply: generated.auto.tfvars.json is the JSON-serialized pins
-# file and carries every key, terraform-relevant or not, so a key
-# added to pins.nix lands in tfvars automatically (no mapping layer
-# to forget). Unused in *.tf — `tofu validate` is fine with that.
+# nix/nixos-node/ directly from nix/pins.toml. Declared (loosely typed)
+# only because generated.auto.tfvars.json carries the whole pins tree
+# and an undeclared key would warn on every plan/apply. `any` so new
+# node pins flow through without touching variables.tf. Unused in
+# *.tf — `tofu validate` is fine with that.
 # ──────────────────────────────────────────────────────────────────────
 
-variable "node_kernel_minor" {
-  description = "NixOS-node kernel minor (consumed by nix/nixos-node/, not terraform)."
-  type        = string
-}
-
-variable "nodeadm_rev" {
-  description = "amazon-eks-ami nodeadm release tag (consumed by nix/nixos-node/, not terraform)."
-  type        = string
-}
-
-variable "nodeadm_src_hash" {
-  description = "nodeadm source hash (consumed by nix/nixos-node/, not terraform)."
-  type        = string
-}
-
-variable "ecr_credential_provider_rev" {
-  description = "cloud-provider-aws ecr-credential-provider tag (consumed by nix/nixos-node/, not terraform)."
-  type        = string
-}
-
-variable "ecr_credential_provider_src_hash" {
-  description = "ecr-credential-provider source hash (consumed by nix/nixos-node/, not terraform)."
-  type        = string
-}
-
-variable "ecr_credential_provider_vendor_hash" {
-  description = "ecr-credential-provider Go vendor hash (consumed by nix/nixos-node/, not terraform)."
-  type        = string
-}
-
-variable "gateway_api_crds_hash" {
-  description = "Gateway API CRD bundle hash (consumed by nix/cilium-render.nix, not terraform)."
-  type        = string
+variable "node" {
+  description = "NixOS-node AMI pins (kernel, nodeadm, ecr-credential-provider) — consumed by nix/nixos-node/, not terraform."
+  type        = any
 }

@@ -21,7 +21,7 @@
 # these as `000-cilium-*` to sort before everything.
 #
 # Airgap: image.useDigest=false makes the chart render bare tags
-# (quay.io/cilium/cilium:v<pins.cilium_version>) so containerd's
+# (quay.io/cilium/cilium:v<pins.addons.cilium.version>) so containerd's
 # exact-string image lookup matches the pullImage finalImageName/Tag
 # in docker-pulled.nix.
 #
@@ -65,7 +65,7 @@ let
   pins = import ./pins.nix;
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
   # Eval-time guard for the airgap invariant: the chart nixhelm ships and
-  # the image pins (pins.cilium_version → docker-pulled.nix tags) must
+  # the image pins (pins.addons.cilium.version → docker-pulled.nix tags) must
   # agree, or the rendered manifests reference image tags that are not in
   # the airgapped store and every k3s VM test dies in ImagePullBackOff at
   # its global timeout. nixhelm's chartsMetadata is pure data (no IFD), so
@@ -73,11 +73,11 @@ let
   # instead.
   chartVersion = nixhelm.chartsMetadata.cilium.cilium.version;
   chart =
-    assert pkgs.lib.assertMsg (chartVersion == pins.cilium_version) ''
-      cilium chart from nixhelm is ${chartVersion} but nix/pins.nix pins ${pins.cilium_version}.
-      Bump pins.nix cilium_version, the cilium image digests/tags in
-      nix/docker-pulled.nix, and the infra/eks tfvars together with the
-      nixhelm flake input.'';
+    assert pkgs.lib.assertMsg (chartVersion == pins.addons.cilium.version) ''
+      cilium chart from nixhelm is ${chartVersion} but nix/pins.toml pins ${pins.addons.cilium.version}.
+      Bump pins.toml addons.cilium.version, the cilium image digests/tags
+      in nix/docker-pulled.nix, and the infra/eks tfvars together with
+      the nixhelm flake input.'';
     subcharts.cilium;
   split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
 
@@ -86,8 +86,8 @@ let
   # GatewayClass, HTTPRoute, GRPCRoute, ReferenceGrant — exactly what
   # dashboard-gateway.yaml uses; no experimental/TLSRoute needed.
   gatewayApiCrds = pkgs.fetchurl {
-    url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${pins.gateway_api_version}/standard-install.yaml";
-    sha256 = pins.gateway_api_crds_hash;
+    url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${pins.addons.gateway_api.version}/standard-install.yaml";
+    sha256 = pins.addons.gateway_api.crds_hash;
   };
 
   # Cilium creates per-Gateway Services as type:LoadBalancer. With k3s

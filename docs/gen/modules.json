@@ -1884,6 +1884,11 @@
       "doc": "Regenerate `.sqlx/` offline query cache."
     },
     {
+      "path": "regen/tfvars.rs",
+      "depth": 1,
+      "doc": "Regenerate infra/eks/generated.auto.tfvars.json from nix/pins.toml."
+    },
+    {
       "path": "sh.rs",
       "depth": 0,
       "doc": "Shell-out helpers. Verbosity-aware command execution with"

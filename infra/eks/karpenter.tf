@@ -111,7 +111,7 @@ resource "helm_release" "karpenter_crd" {
   namespace  = "kube-system"
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter-crd"
-  version    = var.karpenter_version
+  version    = var.addons.karpenter.version
 
   # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.
   # cilium dep: CNI must be up or pods Pending → wait=true times out.
@@ -128,7 +128,7 @@ resource "helm_release" "karpenter" {
   # by a prior run) instead of the fresh one terraform fetches.
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter"
-  version    = var.karpenter_version
+  version    = var.addons.karpenter.version
 
   # CRDs come from helm_release.karpenter_crd — skip the baked-in
   # crds/ dir to avoid dual ownership.

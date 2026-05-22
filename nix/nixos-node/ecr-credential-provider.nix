@@ -16,16 +16,16 @@
 }:
 buildGoModule rec {
   pname = "ecr-credential-provider";
-  version = pins.ecr_credential_provider_rev;
+  version = pins.node.ecr_credential_provider.rev;
 
   src = fetchFromGitHub {
     owner = "kubernetes";
     repo = "cloud-provider-aws";
     rev = version;
-    hash = pins.ecr_credential_provider_src_hash;
+    hash = pins.node.ecr_credential_provider.src_hash;
   };
 
-  vendorHash = pins.ecr_credential_provider_vendor_hash;
+  vendorHash = pins.node.ecr_credential_provider.vendor_hash;
 
   subPackages = [ "cmd/ecr-credential-provider" ];
 

@@ -12,6 +12,7 @@ mod fuzz_lock;
 mod hakari;
 pub(crate) mod seccomp;
 mod sqlx;
+mod tfvars;
 
 #[derive(Subcommand)]
 pub enum RegenCmd {
@@ -27,6 +28,8 @@ pub enum RegenCmd {
     FuzzLock,
     /// Regenerate docs/gen/*.json (metric/alert/error/config refs for typst).
     DocsData,
+    /// Regenerate infra/eks/generated.auto.tfvars.json from nix/pins.toml.
+    Tfvars,
     /// Diff the worker seccomp profile against upstream moby (human review).
     Seccomp {
         /// moby git tag to fetch default.json from.
@@ -43,6 +46,7 @@ pub async fn run(which: Option<RegenCmd>) -> Result<()> {
         Some(RegenCmd::Hakari) => hakari::run().await,
         Some(RegenCmd::FuzzLock) => fuzz_lock::run().await,
         Some(RegenCmd::DocsData) => docs_data::run().await,
+        Some(RegenCmd::Tfvars) => tfvars::run().await,
         Some(RegenCmd::Seccomp { tag }) => seccomp::run(&tag).await,
         None => {
             // Umbrella: run the idempotent regenerators (not seccomp —
@@ -52,6 +56,7 @@ pub async fn run(which: Option<RegenCmd>) -> Result<()> {
                 ui::step("sqlx", sqlx::run).await?;
                 ui::step("crds", crds::run).await?;
                 ui::step("docs-data", docs_data::run).await?;
+                ui::step("tfvars", tfvars::run).await?;
                 ui::step("fuzz-lock", fuzz_lock::run).await?;
                 ui::step("cargo-json", cargo_json::run).await
             })

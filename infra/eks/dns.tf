@@ -97,7 +97,7 @@ resource "helm_release" "external_dns" {
   namespace  = "kube-system"
   repository = "https://kubernetes-sigs.github.io/external-dns/"
   chart      = "external-dns"
-  version    = var.external_dns_version
+  version    = var.addons.external_dns.version
 
   # values is a list of YAML docs helm merges in order. Separate docs
   # per provider sidesteps terraform's `cond ? {a,b} : {}` type-unify

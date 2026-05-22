@@ -34,7 +34,7 @@ let
     arch = "amd64";
   };
 
-  # Upstream kube-scheduler matching `pins.kubernetes_version`. The
+  # Upstream kube-scheduler matching `pins.cluster.kubernetes_version`. The
   # kube-build-scheduler Deployment (templates/kube-build-scheduler.yaml)
   # `image:` is set via `buildScheduler.image` in extraValues by the
   # consumer. v1.35.x latest patch — k3s-full pins the SAME minor so
@@ -59,12 +59,12 @@ let
   karpenterCRDs = pkgs.runCommand "karpenter-crds.yaml" { } ''
     cat ${
       pkgs.fetchurl {
-        url = "https://raw.githubusercontent.com/kubernetes-sigs/karpenter/v${pins.karpenter_version}/pkg/apis/crds/karpenter.sh_nodeclaims.yaml";
+        url = "https://raw.githubusercontent.com/kubernetes-sigs/karpenter/v${pins.addons.karpenter.version}/pkg/apis/crds/karpenter.sh_nodeclaims.yaml";
         sha256 = "0kb4z10l83fn0rj2drydzsciq6yck0a42g2llm5qlrxz0bhnn525";
       }
     } ${
       pkgs.fetchurl {
-        url = "https://raw.githubusercontent.com/kubernetes-sigs/karpenter/v${pins.karpenter_version}/pkg/apis/crds/karpenter.sh_nodepools.yaml";
+        url = "https://raw.githubusercontent.com/kubernetes-sigs/karpenter/v${pins.addons.karpenter.version}/pkg/apis/crds/karpenter.sh_nodepools.yaml";
         sha256 = "0nxhxk65wia17v85mcsni1djz38d5303brkkx0wbrzjyapi4q7lf";
       }
     } > $out

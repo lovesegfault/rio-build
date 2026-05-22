@@ -1,0 +1,92 @@
+# Version pins that must agree between nix/tests/ (VM tests) and
+# infra/eks/ (reference deploy). Drift = deploying an untested combination.
+#
+# The whole tree passes through to infra/eks/generated.auto.tfvars.json
+# unchanged (terraform declares matching object variables `cluster`,
+# `addons`, `node`), so a key added here lands in the tfvars
+# automatically — no mapping layer to forget to update.
+#
+# Read by:
+#   - Nix via the ./pins.nix shim (builtins.fromTOML): VM tests, the node
+#     AMI, cilium-render, and the .#tfvars package
+#   - `cargo xtask regen tfvars` (the toml crate): regenerates
+#     infra/eks/generated.auto.tfvars.json without a nix build
+#
+# Bump: edit here, run `cargo xtask regen tfvars`, commit both. The
+# tfvars-fresh check fails CI on drift.
+
+[cluster]
+# EKS control-plane version. 1.33+ required (ADR-012: hostUsers: false).
+# k8s-openapi (Cargo.toml) tracks this via the v1_NN feature, and the k3s
+# VM tests derive `k3s_1_NN` from it so they exercise the same API
+# surface as the reference deploy.
+kubernetes_version = "1.35"
+
+# ── Cluster addons (helm charts / manifests applied to the cluster) ────
+
+[addons.cilium]
+# Chart version == app version. 1.19+ required (IPv6 tunnel underlay
+# first-class only since PR #40324). Same pin as nix/cilium-render.nix
+# (k3s VM tests) and infra/eks/addons.tf.
+version = "1.19.4"
+
+[addons.gateway_api]
+# Gateway API CRDs (standard channel). Cilium chart's gatewayAPI.enabled
+# gates on `.Capabilities.APIVersions.Has` — must be installed before
+# cilium or the feature silently no-ops. crds_hash is the fetchurl hash
+# for the standard-install.yaml bundle (consumed by nix/cilium-render.nix,
+# not terraform).
+version = "v1.4.0"
+crds_hash = "sha256:1wc1njnw1andqlabcykpd2dj250cqk6hx836v2nn8va4c7k2jh3a"
+
+[addons.aws_load_balancer_controller]
+# v3.0+ aligns chart with app version.
+version = "3.2.2"
+
+[addons.karpenter]
+# Karpenter chart (AWS provider, OCI-published). Must stay within the
+# EKS module's karpenter submodule compat range (~> 21.0).
+version = "1.11.1"
+
+[addons.external_dns]
+# external-dns chart (kubernetes-sigs.github.io/external-dns). Chart
+# version, NOT app version (chart 1.N.0 ships app 0.N.0). Only used by
+# infra/eks/dns.tf — no VM-test consumer yet.
+version = "1.20.0"
+
+# ── NixOS node AMI (ADR-021) — consumed by nix/nixos-node/, not TF ─────
+
+[node]
+# Kernel minor for the node AMI. String form ("7_0") so minimal.nix can
+# do `pkgs."linuxPackages_${kernel_minor}"`. Pinned (not
+# linuxPackages_latest) so a nixpkgs flake-input bump can't
+# surprise-rebuild the ~40min kernel derivation.
+# 6.19 was dropped from nixpkgs at upstream EOL → 7.0. The e1b849cfa6b6
+# cgwb WARN-then-free is still unfixed in 7.0.x stable (the fix,
+# 6689f01d6740 "writeback: Fix use after free in
+# inode_switch_wbs_work_fn()", is mainline post-7.0 and not in 7.0.8
+# yet) — the panic/kdump mitigations and NodeRepair recovery stay; see
+# Q-CGWB.
+kernel_minor = "7_0"
+
+[node.nodeadm]
+# awslabs/amazon-eks-ami release tag for the packaged `nodeadm`
+# (nix/nixos-node/nodeadm.nix). Track cluster.kubernetes_version's minor
+# — nodeadm emits a KubeletConfiguration matching the control plane.
+# Hashes: build once with lib.fakeHash, copy "got:" lines.
+#
+# nix/tests/fixtures/mock-imds.py sets featureGates.InstanceIdNodeName
+# =true so nodeadm-init skips the EC2 DescribeInstances call (only
+# IMDS is mocked). If a bump removes that gate, vm-nixos-node will
+# hang ~10min on a DescribeInstances retry loop — check there first.
+rev = "v20260415"
+src_hash = "sha256-RsxQVcOfiRSO+/X6WCcj5XJTL5P5GToZUwnT0LbiPiw="
+
+[node.ecr_credential_provider]
+# kubernetes/cloud-provider-aws → ecr-credential-provider binary.
+# nodeadm REQUIRES this on disk before it will finish kubelet config
+# (stat()s the path; no skip flag). Tracks cluster.kubernetes_version's
+# minor.
+rev = "v1.35.1"
+src_hash = "sha256-kCDhkwcxYNDAmYrrk+dnHkVG2Qzcw8USPcaxHKZwxzs="
+vendor_hash = "sha256-eW9vsuhDaudnq34onV5LH1hY9S7Zt2jkzhL5UhbUlHY="

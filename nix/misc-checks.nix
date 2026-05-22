@@ -363,9 +363,13 @@ in
     regenHint = "cargo xtask regen crds";
   };
 
-  # infra/eks/generated.auto.tfvars.json must match nix/pins.nix.
+  # infra/eks/generated.auto.tfvars.json must match nix/pins.toml.
   # jq -S on both sides so key-order and whitespace don't matter
   # (committed file is pretty-printed, writeText output is compact).
+  # The generate side goes through the nix path (pins.nix shim →
+  # builtins.fromTOML → toJSON) while `cargo xtask regen tfvars` writes
+  # the committed side from the toml crate — so this check also catches
+  # the two parsers ever disagreeing about pins.toml.
   tfvars-fresh = mkDriftCheck {
     name = "tfvars-fresh";
     nativeBuildInputs = [ pkgs.jq ];
@@ -374,8 +378,8 @@ in
       jq -S . ${../infra/eks/generated.auto.tfvars.json} > $TMPDIR/committed
     '';
     committed = "$TMPDIR/committed";
-    what = "nix/pins.nix drifted from infra/eks/generated.auto.tfvars.json";
-    regenHint = "nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json";
+    what = "nix/pins.toml drifted from infra/eks/generated.auto.tfvars.json";
+    regenHint = "cargo xtask regen tfvars";
   };
 
   # docs/gen/*.json are committed (nextest + dev-shell typst read them

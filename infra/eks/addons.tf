@@ -21,10 +21,10 @@
 # these CRDs itself.
 #
 # Standard-channel install (GatewayClass, Gateway, HTTPRoute,
-# GRPCRoute, ReferenceGrant). Pinned via nix/pins.nix → tfvars.
+# GRPCRoute, ReferenceGrant). Pinned via nix/pins.toml → tfvars.
 
 data "http" "gateway_api_crds" {
-  url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${var.gateway_api_version}/standard-install.yaml"
+  url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${var.addons.gateway_api.version}/standard-install.yaml"
 }
 
 data "kubectl_file_documents" "gateway_api_crds" {
@@ -60,10 +60,10 @@ resource "helm_release" "cilium" {
   namespace  = "kube-system"
   repository = "https://helm.cilium.io"
   chart      = "cilium"
-  # Pinned via nix/pins.nix → generated.auto.tfvars.json. Same pin as
+  # Pinned via nix/pins.toml → generated.auto.tfvars.json. Same pin as
   # nix/cilium-render.nix (k3s VM tests). 1.19+ required: IPv6 tunnel
   # underlay first-class only since PR #40324.
-  version = var.cilium_version
+  version = var.addons.cilium.version
 
   values = [
     yamlencode({
@@ -238,7 +238,7 @@ resource "helm_release" "aws_lbc" {
   #   kubectl apply -k github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master
   # GlobalAccelerator needs IAM perms not in terraform-aws-modules iam v6's
   # attach_load_balancer_controller_policy (NLB-only here, not a blocker).
-  version = var.aws_lbc_version
+  version = var.addons.aws_load_balancer_controller.version
 
   set = [
     {

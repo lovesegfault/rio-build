@@ -103,7 +103,7 @@ Pre-commit hooks run treefmt automatically on commit.
 
 ### Generated files (`cargo xtask regen`)
 
-Several committed files are derived from source (`Cargo.json`, `workspace-hack/Cargo.toml`, `.sqlx/`, `infra/helm/crds/`, `docs/gen/`, `fuzz/*/Cargo.{json,lock}`, `rio-*/tests/fixtures/config-schema.json`, …). Each has a `cargo xtask regen <subcommand>`; **`cargo xtask regen` with no subcommand runs all the idempotent regenerators in dependency order.** Run `cargo xtask regen --help` for the current subcommand list and what each owns.
+Several committed files are derived from source (`Cargo.json`, `workspace-hack/Cargo.toml`, `.sqlx/`, `infra/helm/crds/`, `docs/gen/`, `fuzz/*/Cargo.{json,lock}`, `rio-*/tests/fixtures/config-schema.json`, `infra/eks/generated.auto.tfvars.json`, …). Each has a `cargo xtask regen <subcommand>`; **`cargo xtask regen` with no subcommand runs all the idempotent regenerators in dependency order.** Run `cargo xtask regen --help` for the current subcommand list and what each owns.
 
 CI catches stale files via per-file drift checks (`hakari-drift`, `crds-drift`, `docs-data-fresh`, the `crate2nix-check` / `hakari-check` / `sqlx-prepare-check` pre-commit hooks, …). A failing drift check names the regen command in its error message — when in doubt, run the no-subcommand umbrella before committing.
 

@@ -183,7 +183,7 @@ module "eks" {
   # `module.eks.cluster_name` etc. are unchanged. See
   # terraform-aws-eks/docs/UPGRADE-21.0.md.
   name               = var.cluster_name
-  kubernetes_version = var.kubernetes_version
+  kubernetes_version = var.cluster.kubernetes_version
 
   vpc_id = module.vpc.vpc_id
   # Both control-plane ENIs and the AL2023 system nodegroup land on

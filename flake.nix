@@ -896,10 +896,10 @@
                 default = rio-workspace;
                 workspace = rio-workspace;
                 dashboard = rioDashboard;
-                # nix/pins.nix rendered as *.auto.tfvars.json. snake_case
-                # keys in pins.nix → direct toJSON passthrough, no mapping
+                # nix/pins.toml rendered as *.auto.tfvars.json. snake_case
+                # keys in pins.toml → direct toJSON passthrough, no mapping
                 # layer. Regenerate the committed copy:
-                #   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
+                #   cargo xtask regen tfvars
                 tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
                 # Typst design book outputs.
                 inherit (docsLib) docs docs-pdf;

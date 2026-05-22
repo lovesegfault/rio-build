@@ -16,13 +16,13 @@
 }:
 buildGoModule rec {
   pname = "nodeadm";
-  version = pins.nodeadm_rev;
+  version = pins.node.nodeadm.rev;
 
   src = fetchFromGitHub {
     owner = "awslabs";
     repo = "amazon-eks-ami";
     rev = version;
-    hash = pins.nodeadm_src_hash;
+    hash = pins.node.nodeadm.src_hash;
   };
 
   # nodeadm is a sub-module of the amazon-eks-ami repo. It vendors its
