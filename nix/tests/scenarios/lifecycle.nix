@@ -183,7 +183,8 @@ let
 
   # Post-recovery build. DIFFERENT marker than pinDrv so this is NOT a
   # cache hit — proves dispatch actually unblocked after LeaderAcquired →
-  # recover_from_pg → recovery_complete.store(true). Also becomes the
+  # recover_from_pg → recovery completion recorded for the acquire-epoch
+  # (LeaderState::set_recovery_complete). Also becomes the
   # backdate target for gc-sweep (unpinned, so sweep can delete it).
   recoveryDrv = drvs.mkTrivial { marker = "lifecycle-recovery"; };
 

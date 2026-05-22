@@ -1015,10 +1015,17 @@ impl GenerationReader {
     /// them inconsistently for one heartbeat; that exposure is no worse
     /// than the pre-gating default for every heartbeat. A
     /// TOCTOU-discarded recovery never stamps a completion — and a
-    /// completion racing a lease transition is stamped with an epoch
-    /// the recorded count no longer matches — so a flapped or rebounded
-    /// recovery keeps advertising 0 until the re-run completes —
-    /// desired.
+    /// completion racing a rebound or a re-acquire at a different count
+    /// is stamped with an epoch the recorded count no longer matches —
+    /// so those re-runs keep advertising 0 until they complete. A
+    /// completion racing a bare lose is the one shape the stamp does
+    /// not catch (the count never moved): the deposed replica may
+    /// briefly advertise that generation, which is harmless — it was
+    /// already claimed in the ledger so a successor seeds above it, the
+    /// executor fence latch is `fetch_max`, and dispatch stays gated by
+    /// `is_leader` — until a rebound or different-count re-acquire
+    /// moves the count, or a same-count re-acquire makes it valid again
+    /// (the deliberate keep).
     // r[impl sched.lease.claim-before-advertise]
     pub fn advertised(&self) -> u64 {
         if self.leader.recovery_complete() {

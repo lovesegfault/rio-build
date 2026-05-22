@@ -1658,10 +1658,18 @@ impl DagActor {
             // before the next LeaderAcquired sees a consistent
             // (empty) DAG.
             self.clear_persisted_state();
-            // DON'T set recovery_complete — the lease loop's clear
-            // at the lose-transition stays in effect. dispatch_ready
-            // gates on this (dispatch.rs:27); early-return here
-            // makes the post-LeaderAcquired dispatch a no-op.
+            // DON'T set recovery_complete — no completion was ever
+            // recorded for this entry epoch, and that absence is what
+            // keeps dispatch gated on every discard path: a lose-flap
+            // leaves on_lose's clear in effect; a rebound-flap leaves
+            // on_rebound's clear and new count (no lose ever fires on
+            // a still-leading round); a !still_leader lapse is also
+            // covered by dispatch_ready's is_leader check; and
+            // discarded_unconfirmed has no lease-loop clear at all —
+            // the never-recorded completion alone keeps it gated.
+            // dispatch_ready re-checks is_leader and
+            // recovery_complete(); early-return here makes the
+            // post-LeaderAcquired dispatch a no-op.
             return;
         }
 

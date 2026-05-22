@@ -478,12 +478,21 @@ impl LeaderState {
     /// actor calls this AFTER `recover_from_pg` returns (success or
     /// fail-empty); pairs with the `SeqCst` loads in `dispatch_ready` so
     /// dispatch sees all recovery writes before proceeding. The store is
-    /// unconditional but stale-safe by construction: if a lease
-    /// transition (lose, rebound, re-acquire at a different count)
-    /// landed after the snapshot, the recorded `acquired_transitions` no
-    /// longer equals the stamp and `recovery_complete()` stays false —
-    /// the completion writers (the actor, serially; the controller once
-    /// at startup) never race each other, so no compare-and-set is
+    /// unconditional but stale-safe by construction against the
+    /// transitions that move the count: if a rebound or a re-acquire at
+    /// a different count landed after the snapshot, the recorded
+    /// `acquired_transitions` no longer equals the stamp and
+    /// `recovery_complete()` stays false. A bare lose does NOT move the
+    /// count — `on_lose` clears the stamp but leaves
+    /// `acquired_transitions` alone — so a completion stored after it
+    /// compares equal again: dispatch stays gated by `dispatch_ready`'s
+    /// independent `is_leader` check, the heartbeat may briefly
+    /// advertise that raced completion's generation (already claimed in
+    /// the ledger, so a successor seeds above it and the executor fence
+    /// is a `fetch_max` floor — see `GenerationReader::advertised`), and
+    /// a later re-acquire at the SAME count is the deliberate same-epoch
+    /// keep. The completion writers (the actor, serially; the controller
+    /// once at startup) never race each other, so no compare-and-set is
     /// needed. The one shape the stamp cannot distinguish is an epoch
     /// that left and came back to the SAME count (the count-coincidence
     /// ABA) — the same residual the recovery TOCTOU gate already prices.

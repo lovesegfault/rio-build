@@ -1481,14 +1481,20 @@ leadership transitions:
   generation. Each `WorkAssignment` carries this generation number. Executors
   compare it against the generation seen in `HeartbeatResponse` and reject
   stale-generation assignments.
-+ *Recovery flag cleared*: The lease acquire transition clears
-  `recovery_complete` and fires a `LeaderAcquired` command to the actor
-  (delivered asynchronously and in order --- lease renewal MUST NOT block on
-  recovery completing). A still-leading renew round that observes a
-  `leaseTransitions` count different from the one recorded at the last
-  acquire edge or rebound is a holder change observed late: it re-records the
-  count, re-derives the generation, clears `recovery_complete`, and re-fires
-  `LeaderAcquired` without an acquire edge (#rref("sched.lease.rebound")).
++ *Recovery completion keyed to the acquire-epoch*: The lease acquire
+  transition fires a `LeaderAcquired` command to the actor (delivered
+  asynchronously and in order --- lease renewal MUST NOT block on recovery
+  completing) and does not touch the recovery-completion stamp: completion
+  is recorded for the `leaseTransitions` count it was computed under, the
+  lose and rebound transitions clear it, and dispatch resumes only while the
+  recorded stamp matches the current count --- so a lose followed by a
+  re-acquire at the same count keeps an in-flight completion valid, while
+  any holder change forces recovery to re-run before dispatch. A
+  still-leading renew round that observes a `leaseTransitions` count
+  different from the one recorded at the last acquire edge or rebound is a
+  holder change observed late: it re-records the count, re-derives the
+  generation, clears the completion stamp, and re-fires `LeaderAcquired`
+  without an acquire edge (#rref("sched.lease.rebound")).
 
 #r("sched.lease.non-blocking-acquire+2")[
   The LeaderAcquired send MUST NOT block the renewal tick --- delivery to the
