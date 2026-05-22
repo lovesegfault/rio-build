@@ -439,9 +439,11 @@ pub enum ActorCommand {
     /// no later acquire edge to retry it.
     LeaderAcquired,
 
-    /// Lease lost (or self-fenced): clear in-memory builds/dag/events
-    /// and zero the leader-only state gauges. Symmetric with
-    /// `LeaderAcquired`. Fire-and-forget — the lease loop has already
+    /// Lease lost (or self-fenced): invalidate any recorded recovery
+    /// completion (a kept same-epoch completion must not outlive the
+    /// wiped DAG), clear in-memory builds/dag/events, and zero the
+    /// leader-only state gauges. Symmetric with `LeaderAcquired`.
+    /// Fire-and-forget — on a real loss the lease loop has already
     /// flipped `is_leader=false` via `on_lose()`; this command brings
     /// the actor's persisted state in line so a long-lived standby
     /// doesn't (a) hold a stale DAG indefinitely, (b) export frozen

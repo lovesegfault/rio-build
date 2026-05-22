@@ -366,8 +366,11 @@ pub struct LeaderState {
     /// is_leader AND that predicate. Set by handle_leader_acquired
     /// AFTER recover_from_pg finishes, with the transition count it
     /// snapshotted at recovery entry; reset to the sentinel by
-    /// [`on_lose`](Self::on_lose) / [`on_rebound`](Self::on_rebound) so
-    /// re-acquire (or the rebound's re-fired hook) re-triggers recovery.
+    /// [`on_lose`](Self::on_lose) / [`on_rebound`](Self::on_rebound) /
+    /// [`invalidate_recovery_completion`](Self::invalidate_recovery_completion)
+    /// (the actor's `LeaderLost` handler, clearing a kept same-epoch
+    /// completion whose DAG it is about to wipe) so re-acquire (or the
+    /// rebound's re-fired hook) re-triggers recovery.
     /// Keying the completion to the epoch — rather than a bare bool —
     /// means a completion racing a concurrent lease transition can never
     /// ungate dispatch for an epoch it was not computed under, with no

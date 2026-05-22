@@ -425,10 +425,12 @@ pub struct DagActor {
     /// Leader-election shared state: `generation` (assignment-token /
     /// stale-work nonce), `is_leader` (dispatch gate), `recovery_complete`
     /// (dispatch gate). Same Arcs as the lease task and `ActorHandle` —
-    /// the lease task writes `is_leader`/`generation` via
-    /// [`LeaderState::on_acquire`]/[`LeaderState::on_lose`]; the actor
-    /// writes `recovery_complete` via
-    /// [`LeaderState::set_recovery_complete`]; everything else is
+    /// the lease task writes `is_leader`/`generation`/
+    /// `acquired_transitions` via [`LeaderState::on_acquire`]/
+    /// [`LeaderState::on_rebound`]/[`LeaderState::on_lose`]; the actor
+    /// writes the epoch-keyed completion stamp via
+    /// [`LeaderState::set_recovery_complete`] /
+    /// [`LeaderState::invalidate_recovery_completion`]; everything else is
     /// `SeqCst`/`Acquire` reads. See [`LeaderState`] for the
     /// multi-field ordering rationale.
     ///

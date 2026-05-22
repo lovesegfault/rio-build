@@ -16,8 +16,11 @@
 //! re-fire `on_acquire` (false alarm), and the actor's same-epoch
 //! recovery reasoning assumes the pair arrives in that order; an inverted
 //! pair would let a late `LeaderLost` wipe the freshly re-recovered DAG
-//! with `is_leader`/`recovery_complete` left true. Per-call
-//! `tokio::spawn` (the previous shape) gives no such guarantee.
+//! and re-gate dispatch (the lost handler invalidates the completion it
+//! orphans), leaving a still-leading replica with an empty DAG and no
+//! follow-up `LeaderAcquired` to re-run recovery until the next lease
+//! transition. Per-call `tokio::spawn` (the previous shape) gives no such
+//! guarantee.
 //!
 //! The bounded actor channel remains the only backpressure stage. Lease
 //! transitions are control messages, not work submission, so the

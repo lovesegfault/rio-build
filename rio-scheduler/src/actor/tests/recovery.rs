@@ -2494,7 +2494,9 @@ async fn test_recovery_toctou_rebound_mid_recovery_discards_then_rerun_completes
 /// the leader ends recovered-and-dispatchable — DAG present,
 /// `recovery_complete = true`. The inverted order (what unordered
 /// per-spawn delivery allowed) would end with `is_leader = true`,
-/// `recovery_complete = true`, and an empty DAG. Not red-first: the
+/// `recovery_complete = false`, and an empty DAG — dispatch gated and
+/// every non-terminal build stalled until the next lease transition
+/// re-runs recovery. Not red-first: the
 /// ordering itself is pinned red-first by the `lease_hooks` unit test;
 /// this pins what the order buys at the actor level.
 // r[verify sched.lease.hook-order]

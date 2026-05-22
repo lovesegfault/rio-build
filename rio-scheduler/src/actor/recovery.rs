@@ -1042,23 +1042,23 @@ impl DagActor {
         }
     }
 
-    /// Handle `LeaderAcquired`: run recovery, then set the
-    /// completion flag (even on error — see module doc).
+    /// Handle `LeaderLost`: invalidate any kept recovery completion,
+    /// then wipe the actor's persisted in-memory state and zero the
+    /// leader-only gauges. Lose-transition counterpart to
+    /// [`Self::handle_leader_acquired`].
     ///
-    /// The lease loop fire-and-forgets this; no reply channel.
-    /// Recovery runs in the actor's command loop — blocks other
-    /// commands until done. That's CORRECT: we don't want to
-    /// dispatch a build while half-recovered (the DAG would be
-    /// inconsistent). MergeDag from a standby-period SubmitBuild
-    /// would queue in the mpsc channel and get processed after.
-    /// Lose-transition counterpart to [`Self::handle_leader_acquired`].
-    /// The lease loop has already flipped `is_leader=false` via
-    /// `on_lose()`; this clears the actor's stale in-memory view so a
-    /// long-lived standby doesn't hold the previous leadership's DAG.
-    /// `handle_tick` early-returns on `!is_leader`, so housekeeping
-    /// can't act on the stale state in the gap before this command
-    /// lands — but holding it indefinitely is wasted memory and would
-    /// be wrong if any future code path forgets the gate.
+    /// The lease loop fire-and-forgets this; no reply channel. On a
+    /// real loss it has already flipped `is_leader=false` via
+    /// `on_lose()`; on a same-tick false alarm (lose then re-acquire)
+    /// `is_leader` is already true again by the time this lands —
+    /// either way the completion stamp must not outlive the DAG it
+    /// certified, so it is cleared here before the wipe. Clearing the
+    /// stale in-memory view also means a long-lived standby doesn't
+    /// hold the previous leadership's DAG. `handle_tick` early-returns
+    /// on `!is_leader`, so housekeeping can't act on the stale state
+    /// in the gap before this command lands — but holding it
+    /// indefinitely is wasted memory and would be wrong if any future
+    /// code path forgets the gate.
     ///
     /// Also zeros the leader-only state gauges (one-shot). A fresh
     /// standby never sets them; a was-leader-now-standby would
@@ -1098,6 +1098,21 @@ impl DagActor {
         }
     }
 
+    /// Handle `LeaderAcquired`: snapshot the flap-detection signals,
+    /// run state recovery from PG, then run the claim /
+    /// bump-confirmation loop and the recovery TOCTOU gate, recording
+    /// the epoch-keyed completion (`set_recovery_complete` with the
+    /// transition count snapshotted at recovery entry) only when the
+    /// gate passes — completion is deliberately withheld on the
+    /// discard paths (lose-/rebound-flap, lapsed leadership, discarded
+    /// unconfirmed bump). See the inline comments for the details.
+    ///
+    /// The lease loop fire-and-forgets this; no reply channel.
+    /// Recovery runs in the actor's command loop — it blocks other
+    /// commands until done. That's CORRECT: we don't want to dispatch
+    /// a build while half-recovered (the DAG would be inconsistent).
+    /// MergeDag from a standby-period SubmitBuild would queue in the
+    /// mpsc channel and get processed after.
     pub(super) async fn handle_leader_acquired(&mut self) {
         // This tenure has not (re)proven its DAG against PG yet.
         // Redundant on the single-threaded actor — recover_from_pg's

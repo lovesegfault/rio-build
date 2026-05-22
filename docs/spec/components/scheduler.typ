@@ -1530,8 +1530,10 @@ The actor's same-epoch recovery reasoning and the false-alarm end state (the
 tick-time self-fence fires `LeaderLost`, the same tick's successful renew
 fires `LeaderAcquired`) rely on that order: the lost arm wipes, the acquired
 arm re-recovers. An inverted pair would leave the leader with
-`is_leader = true`, `recovery_complete = true`, and an empty DAG --- every
-non-terminal build silently orphaned until the next leadership change.
+`is_leader = true`, an empty DAG, and `recovery_complete = false` (the lost
+arm invalidates the completion it orphans) --- dispatch gated and every
+non-terminal build stalled until the next leadership transition re-runs
+recovery.
 Delivery is a single FIFO handoff drained by one forwarder task into the
 actor's command channel, so invocation order is preserved end-to-end.
 
