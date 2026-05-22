@@ -1017,15 +1017,27 @@ impl GenerationReader {
     /// TOCTOU-discarded recovery never stamps a completion — and a
     /// completion racing a rebound or a re-acquire at a different count
     /// is stamped with an epoch the recorded count no longer matches —
-    /// so those re-runs keep advertising 0 until they complete. A
-    /// completion racing a bare lose is the one shape the stamp does
-    /// not catch (the count never moved): the deposed replica may
-    /// briefly advertise that generation, which is harmless — it was
-    /// already claimed in the ledger so a successor seeds above it, the
-    /// executor fence latch is `fetch_max`, and dispatch stays gated by
-    /// `is_leader` — until a rebound or different-count re-acquire
-    /// moves the count, or a same-count re-acquire makes it valid again
-    /// (the deliberate keep).
+    /// so those re-runs keep advertising 0 until they complete.
+    /// A completion racing a bare lose is the one shape the stamp does
+    /// not catch (the count never moved): the deposed replica keeps
+    /// advertising that generation until the actor processes the
+    /// `LeaderLost` queued by that lose (`handle_leader_lost`
+    /// invalidates the orphaned completion — typically the next command
+    /// drained) or, at the latest, until its own next acquire edge.
+    /// Dispatch is still gated by `is_leader`, and the worker latch is
+    /// a `fetch_max` floor either way; the ledger bound, though, only
+    /// holds on the claimed path (a successor seeds above it via the PG
+    /// floor, GREATEST(MAX(assignments), MAX(claims))). On a term that
+    /// proceeded unclaimed — claim-INSERT failure, conflict exhaustion,
+    /// or the recover_from_pg error arm (which also skips the
+    /// confirmation wait) — that leg does not hold and the exposure is
+    /// the pre-existing claim-failure residual priced in
+    /// `await_post_claim_leadership_confirmation`'s doc
+    /// (`sched.recovery.bump-confirm`) in recovery.rs. The exits are
+    /// the queued-loss invalidation above, a re-acquire at a different
+    /// count (the stamp mismatches — the different-count case above),
+    /// or at the same count (the deliberate same-epoch keep); a rebound
+    /// only becomes possible again after re-acquiring.
     // r[impl sched.lease.claim-before-advertise]
     pub fn advertised(&self) -> u64 {
         if self.leader.recovery_complete() {

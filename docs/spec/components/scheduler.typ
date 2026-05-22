@@ -1488,8 +1488,16 @@ leadership transitions:
   is recorded for the `leaseTransitions` count it was computed under, the
   lose and rebound transitions clear it, and dispatch resumes only while the
   recorded stamp matches the current count --- so a lose followed by a
-  re-acquire at the same count keeps an in-flight completion valid, while
-  any holder change forces recovery to re-run before dispatch. A
+  re-acquire at the same count keeps an in-flight completion valid until the
+  actor processes the loss already queued behind it (the wipe and the stamp
+  invalidation land together --- a third invalidation site alongside the
+  lose/rebound clears --- and dispatch re-gates until the follow-up recovery
+  completes), while a holder change observed at a different count leaves any
+  in-flight completion mismatched --- the lose or rebound that delivered the
+  observation has already cleared the stamp --- so recovery re-runs before
+  dispatch; a holder-change sequence whose observed count lands back on the
+  recorded value is the count-coincidence ABA priced in the bump-confirm
+  residual list below. A
   still-leading renew round that observes a `leaseTransitions` count
   different from the one recorded at the last acquire edge or rebound is a
   holder change observed late: it re-records the count, re-derives the
@@ -1529,8 +1537,13 @@ actor's command channel, so invocation order is preserved end-to-end.
 
 #set enum(start: 3)
 + *State reconstruction*: The actor's `LeaderAcquired` handler invokes state
-  recovery (see §State Recovery below), then sets `recovery_complete = true`.
-  Dispatch is a no-op while `recovery_complete` is false.
+  recovery (see §State Recovery below), then records the completion for the
+  `leaseTransitions` count snapshotted at recovery entry; completion is
+  deliberately withheld on the discard paths (epoch moved mid-recovery via a
+  lose- or rebound-flap, lapsed leadership, or a discarded unconfirmed bump),
+  leaving dispatch gated until a later acquire edge or rebound re-runs
+  recovery. Dispatch is a no-op until the recorded completion matches the
+  current count.
 + *Executor reconnection*: Executors reconnect their `BuildExecution` streams
   to the new leader. Stale completion reports (carrying an old generation
   number) are verified against rio-store for output existence before

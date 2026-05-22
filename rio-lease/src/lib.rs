@@ -487,10 +487,13 @@ impl LeaderState {
     /// count — `on_lose` clears the stamp but leaves
     /// `acquired_transitions` alone — so a completion stored after it
     /// compares equal again: dispatch stays gated by `dispatch_ready`'s
-    /// independent `is_leader` check, the heartbeat may briefly
-    /// advertise that raced completion's generation (already claimed in
-    /// the ledger, so a successor seeds above it and the executor fence
-    /// is a `fetch_max` floor — see `GenerationReader::advertised`), and
+    /// independent `is_leader` check, the heartbeat keeps advertising
+    /// that raced completion's generation until the scheduler actor
+    /// processes the queued loss (invalidating the orphaned completion)
+    /// or, at the latest, until this replica's next acquire edge (see
+    /// `GenerationReader::advertised` for the duration bound and for
+    /// the claimed-path vs proceeded-unclaimed scoping of the ledger
+    /// guarantee), and
     /// a later re-acquire at the SAME count is the deliberate same-epoch
     /// keep. The completion writers (the actor, serially; the controller
     /// once at startup) never race each other, so no compare-and-set is
@@ -503,7 +506,7 @@ impl LeaderState {
     }
 
     /// Invalidate any recorded recovery completion: store
-    /// [`RECOVERY_NOT_COMPLETE`] into the stamp, touching nothing else.
+    /// `RECOVERY_NOT_COMPLETE` into the stamp, touching nothing else.
     /// Called by the scheduler actor when it processes a `LeaderLost`
     /// and destroys the persisted state a previously-recorded
     /// completion certified — the stamp must not outlive the state it
@@ -745,13 +748,25 @@ impl LeaderState {
     /// Store order differs from [`on_acquire`](Self::on_acquire), and it
     /// is load-bearing: the completion stamp is cleared FIRST, then the
     /// transition count is recorded, then the generation `fetch_max`
-    /// runs. Every path into an acquire edge already has
+    /// runs. Nearly every path into an acquire edge already has
     /// `recovery_complete()` false (`pending()`, the lose arm, the
-    /// self-fence), so `on_acquire` can never raise the generation while
-    /// the predicate is true — a rebound is the first writer that could.
-    /// Clearing the stamp first means a heartbeat reader cannot pair a
-    /// still-true predicate with the rebound-raised generation, except
-    /// in the already-accepted two-load-straddle case documented at the
+    /// self-fence). The exception is a completion that raced a bare
+    /// lose (see `set_recovery_complete`): the stamp still matches the
+    /// unmoved count, so a later re-steal at a different count enters
+    /// `on_acquire` with the predicate true and raises the generation
+    /// before its `acquired_transitions` store invalidates the stamp
+    /// (transient once the actor's lost-handler clears the orphaned
+    /// completion — see `handle_leader_lost`). That
+    /// raise-before-invalidate window is observable only as the
+    /// one-heartbeat lose→re-acquire straddle already priced at the
+    /// scheduler's `advertised()`, and the count store that ends it
+    /// happens-before `on_acquire`'s `is_leader` store, so dispatch
+    /// keeps its backstop. A rebound has neither shield: it runs on a
+    /// still-leading round, so without the clear-first order a reader
+    /// could pair a still-true predicate with the raised generation
+    /// while `is_leader` is true. Clearing the stamp first means a
+    /// heartbeat reader cannot make that pairing, except in the
+    /// already-accepted two-load-straddle case documented at the
     /// scheduler's `advertised()` — preserving
     /// `sched.lease.claim-before-advertise`. An in-flight recovery that
     /// completes AFTER this rebound stamps the PRE-rebound transition
