@@ -981,7 +981,7 @@ fn job_pod_env_vars() {
     );
 
     // Worker tuning knobs (plan 21 Batch E): NOT injected when None
-    // in the spec — figment layering means the worker's compiled-in
+    // in the spec — the config layering means the worker's compiled-in
     // default wins. Injecting would pin the default at controller-
     // build time instead of worker-build time.
     assert!(
@@ -995,7 +995,7 @@ fn job_pod_env_vars() {
     assert!(!envs.contains_key("RIO_DAEMON_TIMEOUT_SECS"));
 
     // RIO_EXECUTOR_ID uses fieldRef, not value — check separately.
-    // figment reads `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
+    // The RIO_ env layer reads `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
     let executor_id = container
         .env
         .as_ref()
@@ -1034,7 +1034,7 @@ fn job_pod_worker_knobs_injected_when_set() {
     assert_eq!(
         envs.get("RIO_FUSE_PASSTHROUGH"),
         Some(&"false"),
-        "figment bool parse accepts true/false (rio-common config.rs test)"
+        "the env layer's bool parse accepts true/false (rio-common config.rs test)"
     );
 }
 

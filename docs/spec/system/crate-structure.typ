@@ -124,7 +124,7 @@ Notable edges:
   "rio-common": [
     #r(
       "common.bootstrap",
-    )[`bootstrap<C, A>(component, cli, describe_metrics, histogram_buckets)` is the cold-start prologue every binary calls from `main()`: `init_tracing` (returns `OtelGuard`) → figment `load` → `ValidateConfig::validate` → `shutdown_signal` + `init_metrics` (with the per-crate `histogram_buckets` table) + `describe_metrics()` → enter root `component` span. Returns `Bootstrap<C>{ cfg, shutdown, serve_shutdown, otel_guard, root_span }` — `otel_guard` and `root_span` MUST be bound (not destructured with `..`) or OTel teardown / span exit happens immediately. `HasCommonConfig` projects each binary's `Config` to its flattened `CommonConfig` so `bootstrap` can read `metrics_addr`/`metric_labels` without knowing the concrete type. There is no application-level TLS --- transport encryption is mesh-level (see #rref("sec.transport.cilium-wireguard")).]
+    )[`bootstrap<C, A>(component, cli, describe_metrics, histogram_buckets)` is the cold-start prologue every binary calls from `main()`: `init_tracing` (returns `OtelGuard`) → config `load` → `ValidateConfig::validate` → `shutdown_signal` + `init_metrics` (with the per-crate `histogram_buckets` table) + `describe_metrics()` → enter root `component` span. Returns `Bootstrap<C>{ cfg, shutdown, serve_shutdown, otel_guard, root_span }` — `otel_guard` and `root_span` MUST be bound (not destructured with `..`) or OTel teardown / span exit happens immediately. `HasCommonConfig` projects each binary's `Config` to its flattened `CommonConfig` so `bootstrap` can read `metrics_addr`/`metric_labels` without knowing the concrete type. There is no application-level TLS --- transport encryption is mesh-level (see #rref("sec.transport.cilium-wireguard")).]
 
     #r(
       "common.signal.sighup-reload",
@@ -317,15 +317,15 @@ directory, so a new proto file cannot ship without one.
   [2],
   [`default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "macros", "migrate", "uuid"]`. SQLite feature is for the worker's synthetic per-build store DB.],
 
-  [`figment`],
+  [`config`],
   [Layered configuration],
   [2b],
-  [TOML + `RIO_*` env overlay + clap CLI args. `features = ["toml", "env"]`.],
+  [TOML + `RIO_*` env overlay + clap CLI args. `default-features = false, features = ["toml", "json"]`.],
 
   [`clap`],
   [CLI argument parsing],
   [2b],
-  [`features = ["derive", "env"]`. Used by all binaries (gateway, scheduler, store, worker, controller) via figment's `CliArgs` pattern.],
+  [`features = ["derive", "env"]`. Used by all binaries (gateway, scheduler, store, worker, controller) via the config loader's `CliArgs` pattern.],
 
   [`fastcdc`], [Content-defined chunking], [2], [For NAR deduplication],
   [`sha2`],

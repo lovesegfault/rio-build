@@ -61,7 +61,7 @@ pub fn should_chunk(
 /// rolls back and the rsb user sees `nix build` fail on a path that
 /// exists upstream. The 8 bound keeps throughput without the spike.
 ///
-/// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (figment env).
+/// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (`RIO_` env layer).
 // r[impl store.cas.upload-bounded]
 pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 8;
 

@@ -1012,7 +1012,7 @@ fn apply_intent_resources(
     // create is race-free here — unlike `rio.build/hw-class` which is
     // stamped after-bind by `run_pod_annotator` and so MUST use the
     // volume form. Absent annotation (recovery path) → kubelet resolves
-    // to "" → `figment` → `hw_bench_needed: false` (fail-closed).
+    // to "" → the config loader → `hw_bench_needed: false` (fail-closed).
     env.push(pod::env_from_field(
         "RIO_HW_BENCH_NEEDED",
         &format!("metadata.annotations['{HW_BENCH_NEEDED_ANNOTATION}']"),

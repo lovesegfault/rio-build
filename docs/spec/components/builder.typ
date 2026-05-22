@@ -1400,7 +1400,7 @@ is stable (post Phase 3).
     align: (left, left),
     table.header([File], [Responsibility]),
     src("rio-builder/src/config.rs"),
-    [`Config` + `CliArgs` (two-struct figment split) and `detect_system()`],
+    [`Config` + `CliArgs` (two-struct config split) and `detect_system()`],
 
     src("rio-builder/src/executor/"),
     [Build execution (spawns nix-daemon in mount namespace, drives protocol)],

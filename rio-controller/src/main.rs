@@ -424,9 +424,9 @@ mod tests {
         "#,
         |cfg: Config| {
             assert_eq!(cfg.gc_interval_hours, 0);
-            // B16: nested map/seq fields load from TOML (NOT env — figment
-            // Env yields bare strings). This is the same shape helm's
-            // rio-controller-config ConfigMap renders.
+            // B16: nested map/seq fields load from TOML (NOT env — the
+            // RIO_ env layer yields bare strings). This is the same shape
+            // helm's rio-controller-config ConfigMap renders.
             assert_eq!(cfg.nodeclaim_pool.max_fleet_cores, 64);
             // r40 bug_018: `kube_build_scheduler_enabled` is the gate
             // between "NodeClaim CRD present" and "stamp `schedulerName=
@@ -434,8 +434,8 @@ mod tests {
             // enabled`; this is the only test proving the rendered TOML
             // key actually deserializes into `NodeClaimPoolConfig` (the
             // `pool/jobs::build_job` AND-gate is not unit-testable, and
-            // figment baselines silently leak defaults — a config field
-            // that adds a deploy-hazard gate gets the strongest test).
+            // compiled-defaults baselines silently leak defaults — a config
+            // field that adds a deploy-hazard gate gets the strongest test).
             assert!(!cfg.nodeclaim_pool.kube_build_scheduler_enabled);
 
             assert_eq!(cfg.nodeclaim_pool.max_node_disk, 25769803776);

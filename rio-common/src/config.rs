@@ -101,9 +101,9 @@ pub mod secs {
 /// `#[serde(default)]` is required: `flatten` bypasses the outer
 /// struct's `#[serde(default)]`, so a TOML that sets only crate-
 /// specific fields would otherwise fail with a missing-field error.
-/// In production [`load`] always layers `Serialized::defaults`
-/// first so this never fires there, but tests that parse a bare
-/// TOML snippet (and figment's own internal re-deserialize during
+/// In production [`load`] always layers the compiled-defaults base
+/// layer first so this never fires there, but tests that parse a bare
+/// TOML snippet (and the loader's own internal re-deserialize during
 /// merge) need it.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -157,12 +157,12 @@ impl CommonConfig {
 /// }
 /// ```
 ///
-/// `#[serde(default)]` is required: figment merges per-field across
-/// layers, so a TOML `[scheduler]` table with only `addr` set must NOT
+/// `#[serde(default)]` is required: the config layers merge per-field,
+/// so a TOML `[scheduler]` table with only `addr` set must NOT
 /// fail with `MissingField("balance_port")` — the unspecified fields
-/// fall through to `Default` (which `Serialized::defaults` populates
-/// from `Config::default()` in production, but bare-TOML tests need
-/// the struct-level fallback).
+/// fall through to `Default` (which the compiled-defaults base layer
+/// populates from `Config::default()` in production, but bare-TOML
+/// tests need the struct-level fallback).
 ///
 /// `rio-proto::client::connect` takes this to do the balance-vs-single
 /// dispatch that was previously open-coded ~40L per binary.
@@ -213,7 +213,7 @@ impl UpstreamAddrs {
 /// the fallback was taken.
 ///
 /// Prefer a `Config` field over this for anything that can wait until
-/// after figment load — this exists only for the chicken-and-egg
+/// after the config load — this exists only for the chicken-and-egg
 /// cases (`RIO_LOG_FORMAT`, `RIO_OTEL_*`) and test hooks.
 pub fn env_or<T: FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
@@ -234,9 +234,9 @@ pub fn env_or<T: FromStr>(name: &str, default: T) -> T {
 /// which (a) rejects map keys that aren't bare identifiers (the
 /// controller's glob-keyed pool maps like `"fetcher-*"`), and (b) drops
 /// empty maps/vecs entirely (the scheduler's empty `sla.hw_classes`
-/// baseline), both of which figment's `Serialized::defaults` preserved.
-/// Parsing the serialized value back through the JSON format source builds
-/// the same value tree figment did. Integer defaults must fit in i64 — the
+/// baseline), both of which the compiled-defaults base layer must
+/// preserve. Parsing the serialized value back through the JSON format
+/// source keeps both intact. Integer defaults must fit in i64 — the
 /// JSON value path degrades larger integers to f64; none of our configs
 /// carry such values.
 pub fn serialized_layer<T: Serialize>(
@@ -246,7 +246,7 @@ pub fn serialized_layer<T: Serialize>(
     Ok(File::from_str(&json, FileFormat::Json))
 }
 
-/// TOML file layer with figment-parity availability semantics: a missing
+/// TOML file layer with strict availability semantics: a missing
 /// file is skipped, but a file that exists and cannot be read or parsed is
 /// a hard error (config-rs's `required(false)` alone would silently skip
 /// an existing-but-unreadable file, e.g. a root-owned 0600 /etc/rio file
@@ -292,7 +292,7 @@ where
         .add_source(file_layer(format!("{component}.toml")))
         // RIO_STORE__S3_BUCKET → store.s3_bucket: "RIO" + "_" prefix is
         // stripped, the key is lowercased, and "__" is the nesting
-        // separator — the same convention the figment Env provider used.
+        // separator — the established `RIO_` env convention.
         // try_parsing keeps env strings leniently typed (bool/int/float).
         .add_source(
             Environment::with_prefix("RIO")
@@ -350,8 +350,8 @@ pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Res
 /// the field name so a rename can't strand a string literal (bug_156:
 /// `worker_id`→`executor_id` rename left `--worker-id, RIO_WORKER_ID,
 /// or worker.toml` in `resolve_executor_identity`'s error; an operator
-/// following it set `RIO_WORKER_ID`, figment silently ignored it, same
-/// error looped).
+/// following it set `RIO_WORKER_ID`, the config loader silently ignored
+/// it, same error looped).
 ///
 /// `.` in `field` is the env nesting separator → `__` in env, `-` in
 /// flag. So `scheduler.addr` → `--scheduler-addr`, `RIO_SCHEDULER__ADDR`.
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn env_double_underscore_nesting() {
-        // RIO_NESTED__S3_BUCKET → nested.s3_bucket via Env::split("__").
+        // RIO_NESTED__S3_BUCKET → nested.s3_bucket via the `__` nesting separator.
         crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_NESTED__S3_BUCKET", "my-bucket");
             let cfg: TestConfig =
@@ -784,7 +784,7 @@ mod tests {
             let f = write_toml("this is not = = valid toml [[");
             let err = load_from_path::<TestConfig, _>(f.path(), TestCli::default()).unwrap_err();
             let msg = err.to_string();
-            // Figment puts the source (file path or provider name) in the error.
+            // The config loader puts the source (file path or provider name) in the error.
             assert!(
                 msg.contains("TOML") || msg.to_lowercase().contains("parse"),
                 "error should mention TOML/parse failure: {msg}"
@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn bool_env_var_true_and_false() {
-        // Figment's Env provider parses bool-ish strings. Guard: make sure
+        // The RIO_ env layer parses bool-ish strings. Guard: make sure
         // "true"/"false" actually work (important for RIO_FUSE_PASSTHROUGH).
         crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_DEBUG", "true");
@@ -990,7 +990,7 @@ mod tests {
     #[test]
     fn jwt_config_env_nesting() {
         // RIO_JWT__REQUIRED=true → jwt.required. Double-underscore
-        // nesting per the figment Env::split("__") convention.
+        // nesting per the RIO_ env layer's `__` separator convention.
         crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_JWT__REQUIRED", "true");
             jail.set_env("RIO_JWT__KEY_PATH", "/etc/rio/jwt/seed");
@@ -1128,7 +1128,7 @@ mod tests {
 
     /// serialized_layer must preserve glob map keys and empty maps — the
     /// two places config-rs's struct serializer (Config::try_from) loses
-    /// information that figment's Serialized::defaults kept. Regression
+    /// information that the compiled-defaults base layer must keep. Regression
     /// guard for the controller (glob-keyed min_consolidation_time) and
     /// scheduler (empty sla.hw_classes baseline) startup failures.
     #[test]
@@ -1202,8 +1202,8 @@ mod tests {
 
     /// Flag/env/toml filename derived from field + component by
     /// convention. All 10 production call-sites follow this
-    /// convention (clap's `#[arg(long)]` and figment's
-    /// `Env::prefixed("RIO_")` both derive identically).
+    /// convention (clap's `#[arg(long)]` and the `RIO_` env layer
+    /// both derive identically).
     #[test]
     fn ensure_required_derives_flag_and_env() {
         let err = ensure_required("", "database_url", "store")
@@ -1217,7 +1217,7 @@ mod tests {
     /// bug_156: factored out of `ensure_required` so error messages
     /// that name a config knob can't hand-type the three surfaces and
     /// drift on rename. Pins both the flat-field and dotted-field
-    /// (figment-nested) derivations.
+    /// (nested config key) derivations.
     #[test]
     fn config_hint_derives_names() {
         assert_eq!(

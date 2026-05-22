@@ -248,8 +248,8 @@ spec:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
             # ConfigMap carries the [sla] table + soft_features;
-            # everything else stays env-driven (figment merges TOML under
-            # env). subPath: tls/jwt mount at /etc/rio/{tls,jwt}; a
+            # everything else stays env-driven (the config loader merges
+            # TOML under env). subPath: tls/jwt mount at /etc/rio/{tls,jwt}; a
             # whole-dir CM mount here would race their visibility.
             # subPath puts just the one file. Tradeoff: subPath mounts
             # don't pick up CM updates — fine, the checksum annotation
@@ -298,8 +298,8 @@ spec:
 # retry, fine off the hot path.
 {{ include "rio.grpcServicePair" (dict "root" . "name" "rio-scheduler" "ns" .Values.namespaces.system.name "component" "scheduler" "port" 9001) }}
 ---
-# Mounted at /etc/rio/scheduler.toml. figment merges this UNDER env (RIO_*
-# wins). The [sla] table is mandatory — the SchedulerConfig has no
+# Mounted at /etc/rio/scheduler.toml. The config loader merges this UNDER
+# env (RIO_* wins). The [sla] table is mandatory — the SchedulerConfig has no
 # Option<SlaConfig> arm; an absent block falls back to the tiny
 # test_default ceilings, which under-spawn for any real workload.
 # checksum annotation on the pod template triggers rollout when [sla]/

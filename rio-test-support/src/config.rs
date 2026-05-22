@@ -17,7 +17,7 @@
 //! STRUCTURALLY BLIND to that — it only checks fields that ARE on
 //! Config, not fields that SHOULD be.
 //!
-//! The scaffolding (`$crate::Jail::expect_with`, TOML file write,
+//! The jail scaffolding (`Jail::expect_with`, TOML file write,
 //! config load, `Ok(())`) was 5×-duplicated. These macros keep the
 //! per-field asserts at the call site — the **ADD IT HERE** edit
 //! point is the entire purpose — and extract only the boilerplate
@@ -41,7 +41,7 @@
 //! - `rio-common` — for `rio_common::config::load`
 //!
 //! The jail itself resolves through `$crate` ([`crate::Jail`]), so
-//! callers no longer need a figment dev-dependency.
+//! callers no longer need a separate jail dev-dependency.
 //!
 //! All 5 binaries already satisfy this.
 

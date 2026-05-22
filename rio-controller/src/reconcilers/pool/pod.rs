@@ -138,7 +138,7 @@ pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
 /// headless-Service `balance_host` for health-aware p2c. Same shape
 /// for scheduler and store; the env-var prefix differs at the
 /// injection site below. Shared with each binary's `Config`
-/// (figment-deserialized) — see [`rio_common::config::UpstreamAddrs`].
+/// (config-loader-deserialized) — see [`rio_common::config::UpstreamAddrs`].
 pub use rio_common::config::UpstreamAddrs;
 
 // ── per-kind effective values ────────────────────────────────────
@@ -854,7 +854,7 @@ fn build_executor_container(
                 env("RIO_SYSTEMS", &pool.spec.systems.join(",")),
                 // Single source: `effective_features` (Fetcher → [fetcher]).
                 env("RIO_FEATURES", &effective_features(&pool.spec).join(",")),
-                // Executor self-identification. figment reads
+                // Executor self-identification. The RIO_ env layer reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
                 // Job pods are `<job-name>-<suffix>` — unique per
                 // pod (one build, one id).

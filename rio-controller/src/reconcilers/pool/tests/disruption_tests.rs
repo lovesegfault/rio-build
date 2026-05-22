@@ -94,7 +94,7 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
 //
 // rio_test_support::Jail serializes env access (global mutex) so
 // parallel tests don't see each other's set_env/remove_var. Same
-// pattern as rio-scheduler/src/lease.rs tests.
+// pattern as the rio-lease/src/lib.rs tests.
 // -------------------------------------------------------------------
 
 #[test]

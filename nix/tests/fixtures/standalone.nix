@@ -47,10 +47,10 @@ in
   extraSchedulerConfig ? { },
   extraStoreConfig ? { },
   extraPackages ? [ ],
-  # Scheduler-only systemd env (figment + fixture toggles like
+  # Scheduler-only systemd env (config knobs + fixture toggles like
   # RIO_ADMIN_TEST_FIXTURES). Merged on top of extraServiceEnv.
   extraSchedulerEnv ? { },
-  # Gateway-only env (figment RIO_FOO__BAR=... style). substitute.nix
+  # Gateway-only env (RIO_FOO__BAR=... config style). substitute.nix
   # uses this to set RIO_JWT__KEY_PATH for the gateway's signing seed
   # without also applying it to store/scheduler (extraServiceEnv goes
   # to all three, which would conflict — store wants the PUBKEY path,

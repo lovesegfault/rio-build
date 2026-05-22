@@ -5,7 +5,7 @@
 //!
 //! - `builders_tests` — Job pod-spec coverage + quantity parsing
 //!   (pure struct-to-struct, no K8s interaction)
-//! - `disruption_tests` — env-propagation via figment::Jail + the
+//! - `disruption_tests` — env-propagation via rio_test_support::Jail + the
 //!   `warn_on_spec_degrades` event-reason reachability tests
 
 use super::*;

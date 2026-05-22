@@ -365,7 +365,7 @@
   "rio-controller": [
     {
       "depth": 0,
-      "doc": "`rio-controller` binary configuration: figment-loaded `Config`",
+      "doc": "`rio-controller` binary configuration: layered-config-loaded `Config`",
       "path": "config.rs"
     },
     {

@@ -46,8 +46,8 @@ in
       type = lib.types.str;
       default = "";
       description = ''
-        Extra TOML appended to `/etc/rio/scheduler.toml`. figment reads
-        this with lower precedence than env vars and CLI. Use for nested
+        Extra TOML appended to `/etc/rio/scheduler.toml`. The config loader
+        reads this with lower precedence than env vars and CLI. Use for nested
         config that doesn't map to env vars (e.g. `[sla]` tables).
         Example:
 
@@ -100,7 +100,7 @@ in
 
   config = lib.mkIf cfg.enable {
     # TOML config for settings that don't map to flat env vars (nested
-    # arrays like [sla.tiers]). figment layers: compiled defaults <
+    # arrays like [sla.tiers]). The config layering: compiled defaults <
     # /etc/rio/scheduler.toml < RIO_* env < CLI. So env vars above
     # still override anything here.
     environment.etc."rio/scheduler.toml" = lib.mkIf (cfg.extraConfig != "") {
@@ -116,8 +116,8 @@ in
         # but starting after store is still the common-case ordering.
         "rio-store.service"
       ];
-      # Env var naming: figment strips `RIO_` then lowercases to match
-      # the Config field. `RIO_LISTEN_ADDR` -> `listen_addr`, etc.
+      # Env var naming: the config loader strips `RIO_` then lowercases to
+      # match the Config field. `RIO_LISTEN_ADDR` -> `listen_addr`, etc.
       environment = {
         RIO_LISTEN_ADDR = cfg.listenAddr;
         RIO_STORE__ADDR = cfg.storeAddr;

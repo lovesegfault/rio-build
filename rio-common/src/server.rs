@@ -81,9 +81,9 @@ pub fn tonic_builder() -> tonic::transport::Server {
 /// Projects the crate-local `Config` to its embedded
 /// [`CommonConfig`]. Every binary's `Config` carries
 /// `#[serde(flatten)] common: CommonConfig`; this trait names that
-/// field so [`bootstrap`] (which loads the full `Config` via figment)
-/// can read the shared `metrics_addr` / `drain_grace` without knowing
-/// the concrete type.
+/// field so [`bootstrap`] (which loads the full `Config` via the
+/// config loader) can read the shared `metrics_addr` / `drain_grace`
+/// without knowing the concrete type.
 ///
 /// `metric_labels` is a method (not a `CommonConfig` field) because
 /// it's derived at runtime from other config — rio-builder computes
@@ -160,10 +160,10 @@ pub struct Bootstrap<C> {
 ///    use by kube-rs/aws-sdk — dual ring+aws-lc-rs feature activation
 ///    panics otherwise)
 /// 2. tracing init (returns OtelGuard, held by `Bootstrap`). Runs BEFORE
-///    config load so figment errors land in structured logs — tracing
+///    config load so config-load errors land in structured logs — tracing
 ///    reads only env vars (`RUST_LOG`, `RIO_LOG_FORMAT`,
-///    `RIO_OTEL_ENDPOINT`), no dependency on the figment-loaded config.
-/// 3. figment config load (defaults → TOML → env → CLI)
+///    `RIO_OTEL_ENDPOINT`), no dependency on the layered-config-loaded config.
+/// 3. config load (defaults → TOML → env → CLI)
 /// 4. `ValidateConfig::validate` bounds check
 /// 5. shutdown signal + metrics exporter (with per-crate `histogram_buckets`
 ///    overrides) + `describe_metrics` callback

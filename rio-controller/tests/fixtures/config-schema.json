@@ -1,282 +1,282 @@
 {
-  "defaults": {
-    "drain_grace_secs": 6,
-    "gc_interval_hours": 24,
-    "health_addr": "[::]:9194",
-    "hw_bench_mem_floor": 8589934592,
-    "metrics_addr": "[::]:9094",
-    "nodeclaim_pool": {
-      "database_url": "",
-      "default_lead_time_seed": 30.0,
-      "fuse_cache_bytes": 8589934592,
-      "kube_build_scheduler_enabled": true,
-      "lead_time_seed": {},
-      "lease_name": null,
-      "lease_namespace": null,
-      "max_consolidation_time": null,
-      "max_fleet_cores": 10000,
-      "max_lead_time": 600.0,
-      "max_node_claims_per_cell_per_tick": 8,
-      "max_node_disk": 483183820800,
-      "metal_sizes": [],
-      "min_consolidation_time": {
-        "*": 300.0,
-        "fetcher-*": 600.0
-      },
-      "reference_hw_class": "",
-      "sketch_halflife_secs": 21600
-    },
-    "scheduler": {
-      "addr": "",
-      "balance_host": null,
-      "balance_port": 9001
-    },
-    "service_hmac_key_path": null,
-    "store": {
-      "addr": "",
-      "balance_host": null,
-      "balance_port": 9002
-    }
-  },
   "schema": {
-    "$defs": {
-      "NodeClaimPoolConfig": {
-        "description": "Figment-loaded config. Scalars via `RIO_NODECLAIM_POOL__*` env;\n`lead_time_seed` via the `[nodeclaim_pool]` table in\n`/etc/rio/controller.toml` (helm `rio-controller-config` ConfigMap) —\nfigment's Env provider yields bare strings, so nested map fields\ncannot load from env.",
-        "properties": {
-          "database_url": {
-            "default": "",
-            "description": "PostgreSQL URL for [`CellSketches`] persist/load. Same DB as\nstore/scheduler (migration 059 lives there). Required —\ncontroller doesn't otherwise hold a PG handle.",
-            "type": "string"
-          },
-          "default_lead_time_seed": {
-            "default": 30.0,
-            "description": "Seed lead-time (seconds) for cells absent from\n[`Self::lead_time_seed`]. The seed feeds [`Self::seed_for`] —\n`health::classify` uses it as a TIMEOUT, not just a floor, so\n0 would reap every NodeClaim before it can register (~18s\nreal boot). Helm: `sla.defaultLeadTimeSeed`.",
-            "format": "double",
-            "type": "number"
-          },
-          "fuse_cache_bytes": {
-            "default": 8589934592,
-            "description": "FUSE-cache budget added to every builder pod's\n`ephemeral-storage` request (the `fuse-cache` emptyDir). Single\nsource for ALL Builder-pool callers via\n[`pool::pod::BUILDER_FUSE_CACHE`] — the NodeClaim's\n`ephemeral-storage` floor and the pod's actual request both read\nthis so FFD/cover/stamp agree (§Simulator-shares-accounting).\nHelm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the\ncontroller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`\n(8Gi).",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "kube_build_scheduler_enabled": {
-            "default": true,
-            "description": "`true` ⟺ the `kube-build-scheduler` Deployment is rendered\n(`buildScheduler.enabled`). r40 bug_018: builder pods get\n`schedulerName=kube-build-scheduler` only when BOTH the\nNodeClaim CRD is present (Karpenter installed) AND this flag is\nset — otherwise the pod targets a scheduler that doesn't exist\nand the default kube-scheduler ignores it (permanent Pending,\nzero alerts: the `KubeBuildScheduler*` alerts are gated off by\nthe same `buildScheduler.enabled` toggle). Helm:\n`buildScheduler.enabled`. Default: `true` (matches the chart's\ndefault).",
-            "type": "boolean"
-          },
-          "lead_time_seed": {
-            "additionalProperties": {
-              "format": "double",
-              "type": "number"
-            },
-            "default": {},
-            "description": "`(hw_class:cap)` → seed lead-time seconds, written by\n`xtask k8s probe-boot`. Seeds the DDSketch on cold start.\nHelm: `sla.leadTimeSeed`.",
-            "type": "object"
-          },
-          "lease_name": {
-            "default": null,
-            "description": "Lease object name for leader election. `None` → non-K8s mode\n(always-leader, see [`rio_lease::LeaseConfig::from_parts`]).",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "lease_namespace": {
-            "default": null,
-            "description": "Lease namespace. `None` → in-cluster service-account mount.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "max_consolidation_time": {
-            "default": null,
-            "description": "§13b consolidator hold-open threshold (seconds) for\n`rio.build/hold-open`-annotated NodeClaims. `None` =\n2×`consolidate_after()` per ADR. NOT a ceiling: when set below\nthe NA break-even, `consolidate::hold_open_threshold` clamps\nto ≥ `na` (r38 merged_004 — annotation cannot lower the\nthreshold). Helm: `scheduler.sla.maxConsolidationTime`\n(rendered by `controller.yaml` and `scheduler.yaml`).\nr37 merged_010: the model floor `max(boot_median/2, min)` wins\nwhen this is set below it (`max_t.max(floor)` clamp in\n`consolidate_after`).",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "max_fleet_cores": {
-            "default": 10000,
-            "description": "§13b deficit-cover budget cap (sum of `allocatable.cpu` across\nall owned NodeClaims, Registered + in-flight). Helm:\n`sla.maxFleetCores`.",
-            "format": "uint32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "max_lead_time": {
-            "default": 600.0,
-            "description": "§13b lead-time Schmitt clamp ceiling (seconds). Helm:\n`sla.maxLeadTime`.",
-            "format": "double",
-            "type": "number"
-          },
-          "max_node_claims_per_cell_per_tick": {
-            "default": 8,
-            "description": "§13b per-cell-per-tick NodeClaim create cap. Prevents one cell's\nburst from monopolizing a tick's budget. Helm:\n`sla.maxNodeClaimsPerCellPerTick`.",
-            "format": "uint32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "max_node_disk": {
-            "default": 483183820800,
-            "description": "Per-NodeClaim `resources.requests.ephemeral-storage` ceiling.\nHelm: derived from `karpenter.dataVolumeSize` × allocatable\nfraction (kubelet reserve ≈10%). nvme cells get instance-store\n(much larger) so this only binds ebs cells.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "metal_sizes": {
-            "default": [],
-            "description": "`karpenter.k8s.aws/instance-size NotIn` values appended to\nevery NodeClaim's `spec.requirements` — the metal partition\n(I-205). Helm: `karpenter.metalSizes`. Empty (kwok/vmtest) → no\ninstance-size requirement emitted.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "min_consolidation_time": {
-            "additionalProperties": {
-              "format": "double",
-              "type": "number"
-            },
-            "default": {
-              "*": 300.0,
-              "fetcher-*": 600.0
-            },
-            "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor\n(seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,\nsilently dropping Karpenter's `consolidateAfter: 10m` to the\nNA-model floor `boot_median/2` (~15s) — a fetcher node burns a\nboot every 15s of lull instead of holding 10min. The NA model is\ncorrect (it observed the right λ); the *policy floor* was lost\nin the migration. Keys are class names or `<prefix>*` globs\nmatched against `cell.0` (most-specific exact match wins, then\nlongest prefix). Default `{\"fetcher-*\": 600.0, \"*\": 300.0}`:\nfetchers restore the pre-§13e Karpenter behavior; builders get a\n300s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's\nsupposed to amortize — reaping there is strictly dominated; see\n[`Self::default`]). Helm:\n`karpenter.nodeclaimPool.minConsolidationTime`.",
-            "type": "object"
-          },
-          "reference_hw_class": {
-            "default": "",
-            "description": "`[sla].referenceHwClass` — the cold-start fallback cell for\nhw-agnostic intents (`fit=None` → `hw_class_names=[]`). See\n[`Self::fallback_cell`]. Helm: `sla.referenceHwClass` (same key\nthe scheduler reads for ref-second normalization, so the\ncontroller's cold-start probes land on the normalization\nanchor).",
-            "type": "string"
-          },
-          "sketch_halflife_secs": {
-            "default": 21600,
-            "description": "DDSketch active→shadow rotation interval (seconds). After\n`2×halflife` a sample has aged out entirely. Helm: not surfaced;\n6h default per ADR §13b.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      },
-      "UpstreamAddrs": {
-        "description": "Upstream gRPC address triple: a ClusterIP `addr` for single-channel\nmode plus an optional headless-Service `balance_host` for health-\naware p2c. Same shape for scheduler and store; the per-upstream\ndefault `balance_port` differs (9001/9002), set via [`Self::with_port`].\n\nEmbed in each binary's `Config` as a nested field (NOT flattened):\n\n```ignore\nstruct Config {\n    scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT\n    store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...\n}\n```\n\n`#[serde(default)]` is required: figment merges per-field across\nlayers, so a TOML `[scheduler]` table with only `addr` set must NOT\nfail with `MissingField(\"balance_port\")` — the unspecified fields\nfall through to `Default` (which `Serialized::defaults` populates\nfrom `Config::default()` in production, but bare-TOML tests need\nthe struct-level fallback).\n\n`rio-proto::client::connect` takes this to do the balance-vs-single\ndispatch that was previously open-coded ~40L per binary.",
-        "properties": {
-          "addr": {
-            "default": "",
-            "description": "ClusterIP Service `host:port`. Required (no compiled default —\ndeployment-specific). Validated via [`Self::ensure_required`].\nAlso the TLS verify domain when `balance_host` is set (cert\nSAN is the Service name, not the pod IP).",
-            "type": "string"
-          },
-          "balance_host": {
-            "default": null,
-            "description": "Headless Service hostname for health-aware p2c. `None` (env\nunset) → single-channel via `addr`. `Some` → DNS-resolve,\nprobe `grpc.health.v1`, route to SERVING endpoints only.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "balance_port": {
-            "default": 0,
-            "description": "gRPC port for balanced-channel pod-IP connects. Only used when\n`balance_host` is `Some`.",
-            "format": "uint16",
-            "maximum": 65535,
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      }
-    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers `Serialized::defaults`\nfirst so this never fires there, but tests that parse a bare\nTOML snippet (and figment's own internal re-deserialize during\nmerge) need it.",
+    "title": "Config",
+    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers the compiled-defaults base\nlayer first so this never fires there, but tests that parse a bare\nTOML snippet (and the loader's own internal re-deserialize during\nmerge) need it.",
+    "type": "object",
     "properties": {
-      "drain_grace_secs": {
-        "default": 6,
-        "description": "SIGTERM → NOT_SERVING → exit drain window. Gives kubelet\nreadiness probe (periodSeconds: 5) + endpoint propagation time\nto observe before the listener stops. 0 = no drain. Only the\nthree tonic-serving binaries (scheduler/store/gateway) consume\nthis; controller and builder ignore it.",
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "gc_interval_hours": {
-        "default": 24,
-        "description": "GC cron interval (hours). 0 = disabled (reconciler not\nspawned). The cron calls StoreAdminService.TriggerGC with\ndefault params (dry_run=false, force=false, store's\n`DEFAULT_GC_GRACE_HOURS` grace). `store_addr` is the connect\ntarget — StoreAdminService\nis hosted on the store's gRPC port alongside StoreService.",
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "health_addr": {
-        "default": "[::]:9194",
-        "description": "HTTP /healthz listen address. K8s livenessProbe hits this.",
-        "type": "string"
-      },
-      "hw_bench_mem_floor": {
-        "default": 8589934592,
-        "description": "ADR-023 §13a: pod `requests.memory` floor for the\n`rio.build/hw-bench-needed` gate (STREAM triad working-set\nsafety). MUST match the scheduler's `[sla].hw_bench_mem_floor`;\nhelm renders both from `sla.hwBenchMemFloor`. Env:\n`RIO_HW_BENCH_MEM_FLOOR`.",
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "metrics_addr": {
-        "default": "[::]:0",
-        "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
-        "type": "string"
-      },
-      "nodeclaim_pool": {
-        "$ref": "#/$defs/NodeClaimPoolConfig",
-        "default": {
-          "database_url": "",
-          "default_lead_time_seed": 30.0,
-          "fuse_cache_bytes": 8589934592,
-          "kube_build_scheduler_enabled": true,
-          "lead_time_seed": {},
-          "lease_name": null,
-          "lease_namespace": null,
-          "max_consolidation_time": null,
-          "max_fleet_cores": 10000,
-          "max_lead_time": 600.0,
-          "max_node_claims_per_cell_per_tick": 8,
-          "max_node_disk": 483183820800,
-          "metal_sizes": [],
-          "min_consolidation_time": {
-            "*": 300.0,
-            "fetcher-*": 600.0
-          },
-          "reference_hw_class": "",
-          "sketch_halflife_secs": 21600
-        },
-        "description": "ADR-023 §13b NodeClaim pool reconciler. `enabled = false` =\nreconciler not spawned (legacy 12-NodePool mode). Env:\n`RIO_NODECLAIM_POOL__ENABLED` / `__DATABASE_URL` / `__LEASE_NAME`\n/ `__NODE_CLASS_REF` / `__MAX_FLEET_CORES` / etc."
-      },
       "scheduler": {
+        "description": "rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /\n`__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host` used two\nways: (1) injected into worker pods as\n`RIO_SCHEDULER__BALANCE_HOST`; (2) THIS process's autoscaler\nuses it for leader-aware ClusterStatus polling. `None` →\nsingle-channel via `addr` (ClusterIP — round-robins to the\nstandby ~50% of the time with replicas=2).",
         "$ref": "#/$defs/UpstreamAddrs",
         "default": {
           "addr": "",
           "balance_host": null,
           "balance_port": 9001
-        },
-        "description": "rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /\n`__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host` used two\nways: (1) injected into worker pods as\n`RIO_SCHEDULER__BALANCE_HOST`; (2) THIS process's autoscaler\nuses it for leader-aware ClusterStatus polling. `None` →\nsingle-channel via `addr` (ClusterIP — round-robins to the\nstandby ~50% of the time with replicas=2)."
-      },
-      "service_hmac_key_path": {
-        "default": null,
-        "description": "HMAC key for minting `x-rio-service-token` on AdminService\ncalls. SAME file as the gateway/scheduler/store\n`service_hmac_key_path` (one shared `rio-service-hmac` Secret).\n`None` = dev mode (no header attached; scheduler's verifier is\nalso `None` and passes through). Env:\n`RIO_SERVICE_HMAC_KEY_PATH`. See `r[sec.authz.service-token]`.",
-        "type": [
-          "string",
-          "null"
-        ]
+        }
       },
       "store": {
+        "description": "rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST`\n/ `__BALANCE_PORT`. Injected into worker pod containers by\nthe Pool reconciler. I-077: balance host needed so\nscaling rio-store 1→4 actually spreads load.",
         "$ref": "#/$defs/UpstreamAddrs",
         "default": {
           "addr": "",
           "balance_host": null,
           "balance_port": 9002
-        },
-        "description": "rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST`\n/ `__BALANCE_PORT`. Injected into worker pod containers by\nthe Pool reconciler. I-077: balance host needed so\nscaling rio-store 1→4 actually spreads load."
+        }
+      },
+      "metrics_addr": {
+        "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
+        "type": "string",
+        "default": "[::]:0"
+      },
+      "drain_grace_secs": {
+        "description": "SIGTERM → NOT_SERVING → exit drain window. Gives kubelet\nreadiness probe (periodSeconds: 5) + endpoint propagation time\nto observe before the listener stops. 0 = no drain. Only the\nthree tonic-serving binaries (scheduler/store/gateway) consume\nthis; controller and builder ignore it.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 6
+      },
+      "health_addr": {
+        "description": "HTTP /healthz listen address. K8s livenessProbe hits this.",
+        "type": "string",
+        "default": "[::]:9194"
+      },
+      "gc_interval_hours": {
+        "description": "GC cron interval (hours). 0 = disabled (reconciler not\nspawned). The cron calls StoreAdminService.TriggerGC with\ndefault params (dry_run=false, force=false, store's\n`DEFAULT_GC_GRACE_HOURS` grace). `store_addr` is the connect\ntarget — StoreAdminService\nis hosted on the store's gRPC port alongside StoreService.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 24
+      },
+      "nodeclaim_pool": {
+        "description": "ADR-023 §13b NodeClaim pool reconciler. `enabled = false` =\nreconciler not spawned (legacy 12-NodePool mode). Env:\n`RIO_NODECLAIM_POOL__ENABLED` / `__DATABASE_URL` / `__LEASE_NAME`\n/ `__NODE_CLASS_REF` / `__MAX_FLEET_CORES` / etc.",
+        "$ref": "#/$defs/NodeClaimPoolConfig",
+        "default": {
+          "database_url": "",
+          "lease_name": null,
+          "lease_namespace": null,
+          "reference_hw_class": "",
+          "max_fleet_cores": 10000,
+          "max_node_claims_per_cell_per_tick": 8,
+          "max_lead_time": 600.0,
+          "max_consolidation_time": null,
+          "min_consolidation_time": {
+            "fetcher-*": 600.0,
+            "*": 300.0
+          },
+          "lead_time_seed": {},
+          "default_lead_time_seed": 30.0,
+          "sketch_halflife_secs": 21600,
+          "max_node_disk": 483183820800,
+          "metal_sizes": [],
+          "fuse_cache_bytes": 8589934592,
+          "kube_build_scheduler_enabled": true
+        }
+      },
+      "service_hmac_key_path": {
+        "description": "HMAC key for minting `x-rio-service-token` on AdminService\ncalls. SAME file as the gateway/scheduler/store\n`service_hmac_key_path` (one shared `rio-service-hmac` Secret).\n`None` = dev mode (no header attached; scheduler's verifier is\nalso `None` and passes through). Env:\n`RIO_SERVICE_HMAC_KEY_PATH`. See `r[sec.authz.service-token]`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "hw_bench_mem_floor": {
+        "description": "ADR-023 §13a: pod `requests.memory` floor for the\n`rio.build/hw-bench-needed` gate (STREAM triad working-set\nsafety). MUST match the scheduler's `[sla].hw_bench_mem_floor`;\nhelm renders both from `sla.hwBenchMemFloor`. Env:\n`RIO_HW_BENCH_MEM_FLOOR`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 8589934592
       }
     },
-    "title": "Config",
-    "type": "object"
+    "$defs": {
+      "UpstreamAddrs": {
+        "description": "Upstream gRPC address triple: a ClusterIP `addr` for single-channel\nmode plus an optional headless-Service `balance_host` for health-\naware p2c. Same shape for scheduler and store; the per-upstream\ndefault `balance_port` differs (9001/9002), set via [`Self::with_port`].\n\nEmbed in each binary's `Config` as a nested field (NOT flattened):\n\n```ignore\nstruct Config {\n    scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT\n    store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...\n}\n```\n\n`#[serde(default)]` is required: the config layers merge per-field,\nso a TOML `[scheduler]` table with only `addr` set must NOT\nfail with `MissingField(\"balance_port\")` — the unspecified fields\nfall through to `Default` (which the compiled-defaults base layer\npopulates from `Config::default()` in production, but bare-TOML\ntests need the struct-level fallback).\n\n`rio-proto::client::connect` takes this to do the balance-vs-single\ndispatch that was previously open-coded ~40L per binary.",
+        "type": "object",
+        "properties": {
+          "addr": {
+            "description": "ClusterIP Service `host:port`. Required (no compiled default —\ndeployment-specific). Validated via [`Self::ensure_required`].\nAlso the TLS verify domain when `balance_host` is set (cert\nSAN is the Service name, not the pod IP).",
+            "type": "string",
+            "default": ""
+          },
+          "balance_host": {
+            "description": "Headless Service hostname for health-aware p2c. `None` (env\nunset) → single-channel via `addr`. `Some` → DNS-resolve,\nprobe `grpc.health.v1`, route to SERVING endpoints only.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "balance_port": {
+            "description": "gRPC port for balanced-channel pod-IP connects. Only used when\n`balance_host` is `Some`.",
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535,
+            "default": 0
+          }
+        }
+      },
+      "NodeClaimPoolConfig": {
+        "description": "Layered-config-loaded config. Scalars via `RIO_NODECLAIM_POOL__*` env;\n`lead_time_seed` via the `[nodeclaim_pool]` table in\n`/etc/rio/controller.toml` (helm `rio-controller-config` ConfigMap) —\nthe RIO_ env layer yields bare strings, so nested map fields\ncannot load from env.",
+        "type": "object",
+        "properties": {
+          "database_url": {
+            "description": "PostgreSQL URL for [`CellSketches`] persist/load. Same DB as\nstore/scheduler (migration 059 lives there). Required —\ncontroller doesn't otherwise hold a PG handle.",
+            "type": "string",
+            "default": ""
+          },
+          "lease_name": {
+            "description": "Lease object name for leader election. `None` → non-K8s mode\n(always-leader, see [`rio_lease::LeaseConfig::from_parts`]).",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "lease_namespace": {
+            "description": "Lease namespace. `None` → in-cluster service-account mount.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "reference_hw_class": {
+            "description": "`[sla].referenceHwClass` — the cold-start fallback cell for\nhw-agnostic intents (`fit=None` → `hw_class_names=[]`). See\n[`Self::fallback_cell`]. Helm: `sla.referenceHwClass` (same key\nthe scheduler reads for ref-second normalization, so the\ncontroller's cold-start probes land on the normalization\nanchor).",
+            "type": "string",
+            "default": ""
+          },
+          "max_fleet_cores": {
+            "description": "§13b deficit-cover budget cap (sum of `allocatable.cpu` across\nall owned NodeClaims, Registered + in-flight). Helm:\n`sla.maxFleetCores`.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 10000
+          },
+          "max_node_claims_per_cell_per_tick": {
+            "description": "§13b per-cell-per-tick NodeClaim create cap. Prevents one cell's\nburst from monopolizing a tick's budget. Helm:\n`sla.maxNodeClaimsPerCellPerTick`.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 8
+          },
+          "max_lead_time": {
+            "description": "§13b lead-time Schmitt clamp ceiling (seconds). Helm:\n`sla.maxLeadTime`.",
+            "type": "number",
+            "format": "double",
+            "default": 600.0
+          },
+          "max_consolidation_time": {
+            "description": "§13b consolidator hold-open threshold (seconds) for\n`rio.build/hold-open`-annotated NodeClaims. `None` =\n2×`consolidate_after()` per ADR. NOT a ceiling: when set below\nthe NA break-even, `consolidate::hold_open_threshold` clamps\nto ≥ `na` (r38 merged_004 — annotation cannot lower the\nthreshold). Helm: `scheduler.sla.maxConsolidationTime`\n(rendered by `controller.yaml` and `scheduler.yaml`).\nr37 merged_010: the model floor `max(boot_median/2, min)` wins\nwhen this is set below it (`max_t.max(floor)` clamp in\n`consolidate_after`).",
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "default": null
+          },
+          "min_consolidation_time": {
+            "description": "r35 bug_050: per-hw-class-prefix `consolidate_after` floor\n(seconds). §13e routed Fetcher Pools through `nodeclaim_pool`,\nsilently dropping Karpenter's `consolidateAfter: 10m` to the\nNA-model floor `boot_median/2` (~15s) — a fetcher node burns a\nboot every 15s of lull instead of holding 10min. The NA model is\ncorrect (it observed the right λ); the *policy floor* was lost\nin the migration. Keys are class names or `<prefix>*` globs\nmatched against `cell.0` (most-specific exact match wins, then\nlongest prefix). Default `{\"fetcher-*\": 600.0, \"*\": 300.0}`:\nfetchers restore the pre-§13e Karpenter behavior; builders get a\n300s floor (`boot_median/2 ≈ 9s` is below the ~18s boot cost it's\nsupposed to amortize — reaping there is strictly dominated; see\n[`Self::default`]). Helm:\n`karpenter.nodeclaimPool.minConsolidationTime`.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "default": {
+              "fetcher-*": 600.0,
+              "*": 300.0
+            }
+          },
+          "lead_time_seed": {
+            "description": "`(hw_class:cap)` → seed lead-time seconds, written by\n`xtask k8s probe-boot`. Seeds the DDSketch on cold start.\nHelm: `sla.leadTimeSeed`.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "default": {}
+          },
+          "default_lead_time_seed": {
+            "description": "Seed lead-time (seconds) for cells absent from\n[`Self::lead_time_seed`]. The seed feeds [`Self::seed_for`] —\n`health::classify` uses it as a TIMEOUT, not just a floor, so\n0 would reap every NodeClaim before it can register (~18s\nreal boot). Helm: `sla.defaultLeadTimeSeed`.",
+            "type": "number",
+            "format": "double",
+            "default": 30.0
+          },
+          "sketch_halflife_secs": {
+            "description": "DDSketch active→shadow rotation interval (seconds). After\n`2×halflife` a sample has aged out entirely. Helm: not surfaced;\n6h default per ADR §13b.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 21600
+          },
+          "max_node_disk": {
+            "description": "Per-NodeClaim `resources.requests.ephemeral-storage` ceiling.\nHelm: derived from `karpenter.dataVolumeSize` × allocatable\nfraction (kubelet reserve ≈10%). nvme cells get instance-store\n(much larger) so this only binds ebs cells.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 483183820800
+          },
+          "metal_sizes": {
+            "description": "`karpenter.k8s.aws/instance-size NotIn` values appended to\nevery NodeClaim's `spec.requirements` — the metal partition\n(I-205). Helm: `karpenter.metalSizes`. Empty (kwok/vmtest) → no\ninstance-size requirement emitted.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "fuse_cache_bytes": {
+            "description": "FUSE-cache budget added to every builder pod's\n`ephemeral-storage` request (the `fuse-cache` emptyDir). Single\nsource for ALL Builder-pool callers via\n[`pool::pod::BUILDER_FUSE_CACHE`] — the NodeClaim's\n`ephemeral-storage` floor and the pod's actual request both read\nthis so FFD/cover/stamp agree (§Simulator-shares-accounting).\nHelm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the\ncontroller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`\n(8Gi).",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 8589934592
+          },
+          "kube_build_scheduler_enabled": {
+            "description": "`true` ⟺ the `kube-build-scheduler` Deployment is rendered\n(`buildScheduler.enabled`). r40 bug_018: builder pods get\n`schedulerName=kube-build-scheduler` only when BOTH the\nNodeClaim CRD is present (Karpenter installed) AND this flag is\nset — otherwise the pod targets a scheduler that doesn't exist\nand the default kube-scheduler ignores it (permanent Pending,\nzero alerts: the `KubeBuildScheduler*` alerts are gated off by\nthe same `buildScheduler.enabled` toggle). Helm:\n`buildScheduler.enabled`. Default: `true` (matches the chart's\ndefault).",
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    }
+  },
+  "defaults": {
+    "scheduler": {
+      "addr": "",
+      "balance_host": null,
+      "balance_port": 9001
+    },
+    "store": {
+      "addr": "",
+      "balance_host": null,
+      "balance_port": 9002
+    },
+    "metrics_addr": "[::]:9094",
+    "drain_grace_secs": 6,
+    "health_addr": "[::]:9194",
+    "gc_interval_hours": 24,
+    "nodeclaim_pool": {
+      "database_url": "",
+      "lease_name": null,
+      "lease_namespace": null,
+      "reference_hw_class": "",
+      "max_fleet_cores": 10000,
+      "max_node_claims_per_cell_per_tick": 8,
+      "max_lead_time": 600.0,
+      "max_consolidation_time": null,
+      "min_consolidation_time": {
+        "fetcher-*": 600.0,
+        "*": 300.0
+      },
+      "lead_time_seed": {},
+      "default_lead_time_seed": 30.0,
+      "sketch_halflife_secs": 21600,
+      "max_node_disk": 483183820800,
+      "metal_sizes": [],
+      "fuse_cache_bytes": 8589934592,
+      "kube_build_scheduler_enabled": true
+    },
+    "service_hmac_key_path": null,
+    "hw_bench_mem_floor": 8589934592
   }
 }

@@ -374,7 +374,7 @@ pkgs.testers.runNixOSTest {
     # so the jwt-dual-mode subtests run unconstrained.
 
     with subtest("rate-limit: 4th rapid build from same tenant rejected"):
-        # Drop-in: figment's env layer reads RIO_RATE_LIMIT__PER_MINUTE
+        # Drop-in: the RIO_ env layer reads RIO_RATE_LIMIT__PER_MINUTE
         # → rate_limit.per_minute. Both fields must be set (no
         # compiled-in default — r[gw.rate.per-tenant] says
         # workload-dependent). per_minute=1 → one token every 60s

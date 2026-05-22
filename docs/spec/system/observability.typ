@@ -324,9 +324,9 @@ Build (gateway)
 
 == Configuration
 
-OTel config is read from environment variables (NOT figment) because
-`init_tracing()` runs before config parsing and must not depend on any
-crate's config layout.
+OTel config is read from environment variables (NOT the config loader)
+because `init_tracing()` runs before config parsing and must not depend on
+any crate's config layout.
 
 #table(
   columns: (auto, 1fr),
@@ -347,7 +347,7 @@ The OTel `service.name` resource attribute is set automatically per component
 
 == Concurrency tuning
 
-Figment env-vars (`RIO_<FIELD>`) that bound fan-out at known saturation
+Config-layer env vars (`RIO_<FIELD>`) that bound fan-out at known saturation
 points. These interact multiplicatively --- the defaults are tuned together.
 
 #table(

@@ -41,8 +41,8 @@ in
       type = lib.types.str;
       default = "";
       description = ''
-        Extra TOML appended to `/etc/rio/store.toml`. figment reads
-        this with lower precedence than env vars. Useful for nested
+        Extra TOML appended to `/etc/rio/store.toml`. The config loader
+        reads this with lower precedence than env vars. Useful for nested
         config — though the `[chunk_backend]` tagged enum also works
         via env vars (`RIO_CHUNK_BACKEND__KIND=s3` +
         `RIO_CHUNK_BACKEND__BUCKET=...`; the k8s overlays use that).
@@ -76,9 +76,9 @@ in
       binary = "rio-store";
       description = "rio-store NAR content-addressable store";
       extraAfter = [ "postgresql.service" ];
-      # Env var naming: figment strips `RIO_` prefix then lowercases to
-      # match the Config struct field name (e.g. RIO_LISTEN_ADDR ->
-      # `listen_addr`). Each rio binary runs as its own process with its
+      # Env var naming: the config loader strips the `RIO_` prefix then
+      # lowercases to match the Config struct field name (e.g.
+      # RIO_LISTEN_ADDR -> `listen_addr`). Each rio binary runs as its own process with its
       # own Config struct, so RIO_LISTEN_ADDR means "this binary's
       # listen_addr" — no cross-component collision.
       environment = {
@@ -87,7 +87,7 @@ in
         RIO_METRICS_ADDR = cfg.metricsAddr;
       }
       // lib.optionalAttrs (cfg.signingKeyFile != null) {
-        # toString: the option type is path but figment parses
+        # toString: the option type is path but the config loader parses
         # RIO_SIGNING_KEY_PATH as a string (which Rust turns into
         # PathBuf). If we passed the path unquoted, Nix would copy
         # it to the store — NOT what we want for a secret. toString

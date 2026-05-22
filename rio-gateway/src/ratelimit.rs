@@ -41,8 +41,8 @@ const ANON_KEY: &str = "__anon__";
 /// derivations then submits one build per root.
 ///
 /// Fields are [`NonZeroU32`] so a zero value is rejected at config
-/// deserialization (figment surfaces the serde error naming the
-/// field) rather than panicking inside [`TenantLimiter::new`].
+/// deserialization (the config loader surfaces the serde error naming
+/// the field) rather than panicking inside [`TenantLimiter::new`].
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct RateLimitConfig {
     pub per_minute: NonZeroU32,

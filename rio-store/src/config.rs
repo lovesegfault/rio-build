@@ -1,6 +1,6 @@
 //! rio-store binary configuration.
 //!
-//! Figment-loaded (TOML + `RIO_` env vars + CLI flags) via
+//! Layered-config-loaded (TOML + `RIO_` env vars + CLI flags) via
 //! [`rio_common::config::load`]. See `rio-common/src/config.rs` for the
 //! two-struct (Config + CliArgs) split rationale.
 
@@ -581,8 +581,8 @@ mod tests {
     }
 
     /// Env-var tagged-enum parsing via the real rio_common::config::load
-    /// path (Serialized::defaults → Env::prefixed("RIO_").split("__") →
-    /// extract). The deploy overlays set chunk_backend this way —
+    /// path (compiled defaults → `RIO_`-prefixed env with `__` nesting →
+    /// deserialize). The deploy overlays set chunk_backend this way —
     /// regression guard for kustomization.yaml.
     ///
     /// The defaults layer serializes Inline as {kind: "inline"}; the

@@ -452,7 +452,7 @@ mod tests {
         assert!(cfg.systems.is_empty());
         assert!(cfg.features.is_empty());
         // The critical non-serde-bool default: fuse_passthrough
-        // must survive the Serialized::defaults → TOML merge as
+        // must survive the compiled-defaults → TOML merge as
         // `true`. This is the load-bearing check — serde's bool
         // default is `false`, so if the loader's base-layer
         // serialization drops it, a pre-phase3a config silently
@@ -460,7 +460,7 @@ mod tests {
         assert!(
             cfg.fuse_passthrough,
             "near-empty TOML must preserve fuse_passthrough=true \
-             via Serialized::defaults base layer"
+             via the compiled-defaults base layer"
         );
         assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(60));
     });

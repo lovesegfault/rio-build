@@ -91,7 +91,7 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// while still giving 3 attempts before LEASE_TTL.
 const RENEW_SLOP: Duration = Duration::from_secs(2);
 
-/// Lease configuration, built from the scheduler's figment Config.
+/// Lease configuration, built from the scheduler's loaded `Config`.
 ///
 /// `Option` because it's entirely optional — `None` means non-K8s
 /// mode (the common case for VM tests and dev). `from_parts()`
@@ -113,9 +113,9 @@ pub struct LeaseConfig {
 }
 
 impl LeaseConfig {
-    /// Build from figment-merged config fields. Returns `None` if
+    /// Build from layer-merged config fields. Returns `None` if
     /// `lease_name` is unset — the signal for "not running under
-    /// K8s." Goes through figment like every other config knob
+    /// K8s." Goes through the config loader like every other config knob
     /// (previously read `std::env::var` directly, bypassing the
     /// TOML/CLI layers — plan 21 Batch E).
     ///
@@ -739,8 +739,8 @@ mod tests {
     /// from_parts returns None when lease_name unset — the signal
     /// for "non-K8s mode." This is how VM tests stay unaffected.
     /// Previously `from_env()` read `std::env::var("RIO_LEASE_NAME")`
-    /// directly (bypassing figment); now the scheduler's Config
-    /// passes the merged value through.
+    /// directly (bypassing the config loader); now the scheduler's
+    /// Config passes the merged value through.
     #[test]
     fn from_parts_none_when_unset() {
         assert!(

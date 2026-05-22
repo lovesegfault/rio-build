@@ -156,8 +156,9 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 /// Read the max message size from the `RIO_GRPC_MAX_MESSAGE_SIZE` environment
 /// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
 ///
-/// Single underscore (not `__`): this is a direct env read, not figment.
-/// The double underscore is figment's nesting separator — misleading here.
+/// Single underscore (not `__`): this is a direct env read, not the config
+/// loader. The double underscore is the RIO_ env layer's nesting separator
+/// — misleading here.
 pub fn max_message_size() -> usize {
     crate::config::env_or("RIO_GRPC_MAX_MESSAGE_SIZE", DEFAULT_MAX_MESSAGE_SIZE)
 }

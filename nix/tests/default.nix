@@ -762,7 +762,7 @@ in
   # `scheduler.sla.{hwClasses,leadTimeSeed,maxFleetCores,...}`
   # render into the rio-controller-config
   # ConfigMap's `[nodeclaim_pool]` TOML table (lead_time_seed is a nested
-  # map — figment's Env provider only yields strings, so the ConfigMap
+  # map — the RIO_ env layer only yields strings, so the ConfigMap
   # mount is the ONLY load path). The 12 prod hwClasses + 24-cell
   # leadTimeSeed are per-subkey-nulled in the fixture overlay so hwClasses
   # / leadTimeSeed key-sets all = {vmtest}.

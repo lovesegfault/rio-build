@@ -1,6 +1,7 @@
 //! Private test-only env/cwd sandbox for rio-common's own tests.
 //!
-//! This is a trimmed copy of `rio_test_support::Jail` (no `create_file`).
+//! This is a trimmed copy of `rio_test_support::Jail` (no
+//! `create_file`/`directory()`; self-tests live with the canonical copy).
 //! It exists because rio-common cannot dev-depend on rio-test-support:
 //! rio-test-support's `full` feature pulls rio-proto, which depends on
 //! rio-common — a dev-dependency cycle. Keep behavioral changes in sync
@@ -8,6 +9,9 @@
 //! lock only excludes other jailed tests; all env mutation in this
 //! crate's tests must go through this type, or be sound only under
 //! nextest's process-per-test isolation).
+//!
+//! Nested `Jail::expect_with` calls deadlock on the non-reentrant global
+//! lock — don't nest jails.
 
 use std::collections::HashMap;
 use std::ffi::OsString;

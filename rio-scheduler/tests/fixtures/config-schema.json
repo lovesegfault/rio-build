@@ -2,7 +2,7 @@
   "schema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "Config",
-    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers `Serialized::defaults`\nfirst so this never fires there, but tests that parse a bare\nTOML snippet (and figment's own internal re-deserialize during\nmerge) need it.",
+    "description": "Configuration fields shared by every rio-* binary's `Config`.\n\nEmbed via `#[serde(flatten)]` so the wire format stays flat:\n`metrics_addr` / `drain_grace_secs` are top-level TOML keys (env\n`RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`).\n\n```ignore\n#[derive(Serialize, Deserialize)]\n#[serde(default)]\nstruct Config {\n    listen_addr: String,\n    #[serde(flatten)]\n    common: rio_common::config::CommonConfig,\n    // ...\n}\n```\n\nReplaces the per-binary `metrics_addr` / `drain_grace_secs`\nfields and the byte-identical 8-line `HasCommonConfig` impl that\nprojected them. [`crate::server::bootstrap`] reads this via the\none-method [`crate::server::HasCommonConfig`] trait.\n\n`#[serde(default)]` is required: `flatten` bypasses the outer\nstruct's `#[serde(default)]`, so a TOML that sets only crate-\nspecific fields would otherwise fail with a missing-field error.\nIn production [`load`] always layers the compiled-defaults base\nlayer first so this never fires there, but tests that parse a bare\nTOML snippet (and the loader's own internal re-deserialize during\nmerge) need it.",
     "type": "object",
     "properties": {
       "listen_addr": {
@@ -76,7 +76,7 @@
         "default": null
       },
       "jwt": {
-        "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).\nThe gateway signs with the matching seed; scheduler verifies.\nUnset = interceptor inert (dev mode / pre-key-rotation-infra).\nSIGHUP reloads from the same path — kubelet remounts the\nConfigMap on rotation, operator SIGHUPs the pod. Set via\n`RIO_JWT__KEY_PATH` (nested figment key — double underscore).",
+        "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).\nThe gateway signs with the matching seed; scheduler verifies.\nUnset = interceptor inert (dev mode / pre-key-rotation-infra).\nSIGHUP reloads from the same path — kubelet remounts the\nConfigMap on rotation, operator SIGHUPs the pod. Set via\n`RIO_JWT__KEY_PATH` (nested config key — double underscore).",
         "$ref": "#/$defs/JwtConfig",
         "default": {
           "required": false,
@@ -144,7 +144,7 @@
     },
     "$defs": {
       "UpstreamAddrs": {
-        "description": "Upstream gRPC address triple: a ClusterIP `addr` for single-channel\nmode plus an optional headless-Service `balance_host` for health-\naware p2c. Same shape for scheduler and store; the per-upstream\ndefault `balance_port` differs (9001/9002), set via [`Self::with_port`].\n\nEmbed in each binary's `Config` as a nested field (NOT flattened):\n\n```ignore\nstruct Config {\n    scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT\n    store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...\n}\n```\n\n`#[serde(default)]` is required: figment merges per-field across\nlayers, so a TOML `[scheduler]` table with only `addr` set must NOT\nfail with `MissingField(\"balance_port\")` — the unspecified fields\nfall through to `Default` (which `Serialized::defaults` populates\nfrom `Config::default()` in production, but bare-TOML tests need\nthe struct-level fallback).\n\n`rio-proto::client::connect` takes this to do the balance-vs-single\ndispatch that was previously open-coded ~40L per binary.",
+        "description": "Upstream gRPC address triple: a ClusterIP `addr` for single-channel\nmode plus an optional headless-Service `balance_host` for health-\naware p2c. Same shape for scheduler and store; the per-upstream\ndefault `balance_port` differs (9001/9002), set via [`Self::with_port`].\n\nEmbed in each binary's `Config` as a nested field (NOT flattened):\n\n```ignore\nstruct Config {\n    scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT\n    store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...\n}\n```\n\n`#[serde(default)]` is required: the config layers merge per-field,\nso a TOML `[scheduler]` table with only `addr` set must NOT\nfail with `MissingField(\"balance_port\")` — the unspecified fields\nfall through to `Default` (which the compiled-defaults base layer\npopulates from `Config::default()` in production, but bare-TOML\ntests need the struct-level fallback).\n\n`rio-proto::client::connect` takes this to do the balance-vs-single\ndispatch that was previously open-coded ~40L per binary.",
         "type": "object",
         "properties": {
           "addr": {
@@ -276,7 +276,7 @@
         "type": "object",
         "properties": {
           "cors_allow_origins": {
-            "description": "Comma-separated CORS allowed origins for gRPC-Web requests.\nEnv: `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`. The dashboard nginx\nService is the only legitimate browser origin in-cluster;\nexternal access (Ingress/LoadBalancer) appends its public\nhostname via helm `dashboard.cors.allowOrigins`. Comma-joined\nstring (not `Vec<String>`) so figment's env provider works\nwithout a custom split — helm renders `| join \",\"`.",
+            "description": "Comma-separated CORS allowed origins for gRPC-Web requests.\nEnv: `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`. The dashboard nginx\nService is the only legitimate browser origin in-cluster;\nexternal access (Ingress/LoadBalancer) appends its public\nhostname via helm `dashboard.cors.allowOrigins`. Comma-joined\nstring (not `Vec<String>`) so the RIO_ env layer works\nwithout a custom split — helm renders `| join \",\"`.",
             "type": "string",
             "default": "http://rio-dashboard.rio-system.svc.cluster.local"
           }

@@ -280,8 +280,8 @@ rec {
       # Security scenario uses this to set RIO_HMAC_KEY_PATH +
       # RIO_SERVICE_HMAC_KEY_PATH without extending the NixOS modules.
       # NixOS attrsOf merge composes this with each module's own
-      # `environment = {...}` block — figment reads the union. Same env
-      # applied to all three services (unknown vars are ignored).
+      # `environment = {...}` block — the config loader reads the union.
+      # Same env applied to all three services (unknown vars are ignored).
       extraServiceEnv ? { },
       # Scheduler-only systemd env. Merged on top of extraServiceEnv so
       # scheduler-specific fixture toggles (RIO_ADMIN_TEST_FIXTURES)
@@ -321,8 +321,8 @@ rec {
           storeAddr = "localhost:9002";
           inherit databaseUrl;
           # `[sla]` is mandatory (ADR-023 §13a) — `validate_shape()`
-          # rejects an absent table at boot. The figment baseline
-          # (`SlaConfig::figment_baseline`, max_cores=None,
+          # rejects an absent table at boot. The defaults baseline
+          # (`SlaConfig::defaults_baseline`, max_cores=None,
           # hw_classes={}, hw_cost_source=static) is intentionally
           # not bootable on its own: §13c-3 made `(None,None) ∧ static`
           # a hard error so a helm chart that omits `sla.maxCores`

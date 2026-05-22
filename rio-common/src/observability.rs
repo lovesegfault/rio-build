@@ -14,8 +14,8 @@
 // r[impl obs.trace.w3c-traceparent]
 //!
 //! `RIO_LOG_FORMAT` and `RIO_OTEL_ENDPOINT` are read as direct env vars, NOT
-//! via figment — logging must initialize before figment could fail, and a
-//! figment error with no logging would be invisible.
+//! via the config loader — logging must initialize before config loading
+//! could fail, and a config-load error with no logging would be invisible.
 
 use std::fmt;
 use std::str::FromStr;
@@ -90,7 +90,7 @@ impl Drop for OtelGuard {
 /// Returns an [`OtelGuard`] which MUST be held for the lifetime of `main()`.
 /// Dropping it early stops span export.
 ///
-/// # Env vars read here (not figment — see module doc)
+/// # Env vars read here (not the config loader — see module doc)
 ///
 /// - `RUST_LOG`: log level filter (e.g., `info,rio_scheduler=debug`)
 /// - `RIO_LOG_FORMAT`: `json` or `pretty` (default: `json`)
@@ -338,8 +338,8 @@ mod tests {
     /// important invariant is "unset → None", and CI env is clean.
     #[test]
     fn build_otel_layer_unset_endpoint_returns_none() {
-        // crate::test_jail::Jail::expect_with takes a thunk, no arg. It jails cwd +
-        // env; we just want the mutex serialization, not the cwd jail.
+        // crate::test_jail::Jail::expect_with always jails cwd + env; we
+        // only need the mutex serialization here, not the cwd jail.
         crate::test_jail::Jail::expect_with(|_jail| {
             // build_otel_layer is generic over S; monomorphize to Registry
             // for the test (we're not layering it over anything here).

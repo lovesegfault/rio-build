@@ -1,4 +1,4 @@
-//! `rio-controller` binary configuration: figment-loaded `Config`
+//! `rio-controller` binary configuration: layered-config-loaded `Config`
 //! struct, clap `CliArgs` overlay, and the `ValidateConfig` bounds
 //! checks. Extracted from `main.rs` so `tests/config_schema.rs` can
 //! snapshot `schema_for!(Config)` into the committed

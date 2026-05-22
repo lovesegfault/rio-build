@@ -386,7 +386,7 @@ pub(super) fn resolve_executor_identity(
                 // bug_156: derive the hint — hand-typed `--worker-id,
                 // RIO_WORKER_ID, or worker.toml` here survived the
                 // worker_id→executor_id rename and sent operators to
-                // a knob figment silently ignores.
+                // a knob the config loader silently ignores.
                 anyhow::anyhow!(
                     "cannot determine executor_id: gethostname() failed and \
                      executor_id not set ({})",

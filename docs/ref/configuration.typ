@@ -155,8 +155,8 @@ main port directly.
 
 = Observability
 
-Observability is configured via *environment variables only* (not figment/TOML)
-because `init_tracing()` runs before config parsing:
+Observability is configured via *environment variables only* (not the layered
+config/TOML) because `init_tracing()` runs before config parsing:
 
 #table(
   columns: 4,

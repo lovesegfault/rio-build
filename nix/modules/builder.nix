@@ -78,8 +78,8 @@ in
       rioLib.mkRioService {
         binary = "rio-builder";
         description = "rio-builder build executor with FUSE store";
-        # Env var naming: figment strips `RIO_` then lowercases to match
-        # the Config field; `__` nests. `RIO_STORE__ADDR` -> `store.addr`.
+        # Env var naming: the config loader strips `RIO_` then lowercases to
+        # match the Config field; `__` nests. `RIO_STORE__ADDR` -> `store.addr`.
         environment = {
           RIO_SCHEDULER__ADDR = cfg.schedulerAddr;
           RIO_STORE__ADDR = cfg.storeAddr;

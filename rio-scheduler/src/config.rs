@@ -52,7 +52,7 @@ pub struct Config {
     /// Unset = interceptor inert (dev mode / pre-key-rotation-infra).
     /// SIGHUP reloads from the same path — kubelet remounts the
     /// ConfigMap on rotation, operator SIGHUPs the pod. Set via
-    /// `RIO_JWT__KEY_PATH` (nested figment key — double underscore).
+    /// `RIO_JWT__KEY_PATH` (nested config key — double underscore).
     pub jwt: rio_common::config::JwtConfig,
     /// Kubernetes Lease name for leader election. `None` = non-K8s
     /// mode (single-scheduler; is_leader=true immediately, generation
@@ -85,11 +85,12 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml —
     /// mandatory (helm always renders it). No env override — structured
-    /// config only. The figment baseline (`Default for Config`) is
+    /// config only. The defaults baseline (`Default for Config`) is
     /// [`crate::sla::config::SlaConfig::defaults_baseline`],
     /// which leaves `maxCores`/`maxMem`/`hwClasses` empty so a TOML
-    /// that omits them is read as "unset" — figment merges per-key,
-    /// so a populated baseline would mask the §13c-3 catalog derive.
+    /// that omits them is read as "unset" — the config layers merge
+    /// per-key, so a populated baseline would mask the §13c-3 catalog
+    /// derive.
     /// Validated via
     /// [`crate::sla::config::SlaConfig::validate_shape`] +
     /// [`crate::sla::config::SlaConfig::validate_resolved`].
@@ -119,7 +120,7 @@ pub struct DashboardConfig {
     /// Service is the only legitimate browser origin in-cluster;
     /// external access (Ingress/LoadBalancer) appends its public
     /// hostname via helm `dashboard.cors.allowOrigins`. Comma-joined
-    /// string (not `Vec<String>`) so figment's env provider works
+    /// string (not `Vec<String>`) so the RIO_ env layer works
     /// without a custom split — helm renders `| join ","`.
     pub cors_allow_origins: String,
 }

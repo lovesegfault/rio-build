@@ -153,7 +153,7 @@ spec:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/controller.toml. The
             # ConfigMap carries [nodeclaim_pool] (lead_time_seed is a
-            # nested map — figment's Env provider only yields strings, so
+            # nested map — the RIO_ env layer only yields strings, so
             # it MUST come from TOML). subPath: serviceHmac mounts at
             # /etc/rio/service-hmac; whole-dir CM mount would shadow it.
             # checksum annotation rolls the pod on CM change.
@@ -181,9 +181,9 @@ spec:
           configMap:
             name: rio-controller-config
 ---
-# Mounted at /etc/rio/controller.toml. figment merges this UNDER env (RIO_*
-# wins for scalars). The [nodeclaim_pool] table is the ONLY way to
-# populate lead_time_seed: figment's Env provider yields bare strings, so
+# Mounted at /etc/rio/controller.toml. The config loader merges this UNDER
+# env (RIO_* wins for scalars). The [nodeclaim_pool] table is the ONLY way to
+# populate lead_time_seed: the RIO_ env layer yields bare strings, so
 # a `HashMap<String, f64>` field cannot load from env. Scalars duplicate
 # the scheduler's `[sla]` rendering (single source: `.Values.scheduler.
 # sla`) so the controller's deficit-cover caps and the scheduler's

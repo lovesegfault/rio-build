@@ -240,10 +240,10 @@ pub fn placeable_channel() -> (tokio::sync::watch::Sender<PlaceableSet>, Placeab
     (tx, PlaceableGate(rx))
 }
 
-/// Figment-loaded config. Scalars via `RIO_NODECLAIM_POOL__*` env;
+/// Layered-config-loaded config. Scalars via `RIO_NODECLAIM_POOL__*` env;
 /// `lead_time_seed` via the `[nodeclaim_pool]` table in
 /// `/etc/rio/controller.toml` (helm `rio-controller-config` ConfigMap) —
-/// figment's Env provider yields bare strings, so nested map fields
+/// the RIO_ env layer yields bare strings, so nested map fields
 /// cannot load from env.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
