@@ -1473,11 +1473,14 @@ Queue-level preemption is fully supported:
 The scheduler uses a leader-elected model for the in-memory global DAG. On
 leadership transitions:
 
-+ *Assignment generation counter*: Incremented on each leader election (by the
-  lease loop's acquire transition via `fetch_add` on the shared
-  `Arc<AtomicU64>`). Each `WorkAssignment` carries this generation number.
-  Executors compare it against the generation seen in `HeartbeatResponse` and
-  reject stale-generation assignments.
++ *Assignment generation counter*: Derived on each acquire transition from the
+  Lease's `leaseTransitions` count (the lease loop's
+  `fetch_max(transitions + 1)` on the shared `Arc<AtomicU64>`, floored during
+  recovery by the durable PG history ---
+  #rref("sched.recovery.fetch-max-seed")); a same-epoch re-acquire keeps its
+  generation. Each `WorkAssignment` carries this generation number. Executors
+  compare it against the generation seen in `HeartbeatResponse` and reject
+  stale-generation assignments.
 + *Recovery flag cleared*: The lease acquire transition clears
   `recovery_complete` and fires a `LeaderAcquired` command to the actor
   (fire-and-forget via `tokio::spawn` --- lease renewal MUST NOT block on
@@ -2093,15 +2096,17 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 
 = Leader Election
 
-#r("sched.lease.k8s-lease")[
+#r("sched.lease.k8s-lease+2")[
   The scheduler uses a *Kubernetes Lease* (`coordination.k8s.io/v1`) for leader
   election, via an in-house implementation modeled on client-go's
   `leaderelection` package. A background task polls every 5 seconds against a
   15-second lease TTL (3:1 renew ratio, per Kubernetes convention). On the
-  acquire transition (standby → leader), the task increments the in-memory
-  generation counter and sets `is_leader=true`; on the lose transition, it
-  clears `is_leader`. The dispatch loop checks `is_leader` and no-ops while
-  standby (DAGs are still merged so state is warm for takeover).
+  acquire transition (standby → leader), the task derives the leadership
+  generation from the Lease's `leaseTransitions` count
+  (#rref("sched.lease.generation-fence")) and sets `is_leader=true`; on the
+  lose transition, it clears `is_leader`. The dispatch loop checks `is_leader`
+  and no-ops while standby (DAGs are still merged so state is warm for
+  takeover).
 ]
 
 - *Configuration:* Enabled by setting `RIO_LEASE_NAME`. When unset (VM tests,

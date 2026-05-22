@@ -3,7 +3,7 @@
 //! When `lease_name` is configured, a background task acquires and
 //! renews a `coordination.k8s.io/v1` Lease. On acquire, it derives
 //! the generation from the lease's transition count (workers see the
-// r[impl sched.lease.k8s-lease]
+// r[impl sched.lease.k8s-lease+2]
 // r[impl sched.lease.generation-fence+2]
 //! new gen in heartbeat, reject stale-gen assignments from the old
 //! leader) and sets `is_leader=true` (dispatch_ready checks this).
@@ -30,9 +30,9 @@
 //! - DAG merge dedups by `drv_hash`. Two schedulers merging the
 //!   same SubmitBuild both end up with the same DAG node.
 //! - Workers compare `WorkAssignment.generation` against
-//!   `HeartbeatResponse.generation`. After the new leader
-//!   increments, the old leader's assignments are stale and
-//!   workers reject them.
+//!   `HeartbeatResponse.generation`. Once the new leader's
+//!   generation reaches them via heartbeat, the old leader's
+//!   assignments are stale and workers reject them.
 //! - Worst case: a derivation dispatches twice (one from each
 //!   leader), builds twice, produces the same output (deterministic
 //!   builds). Wasteful but correct.
@@ -1023,7 +1023,7 @@ fn spawn_patch_deletion_cost(client: kube::Client, namespace: String, pod_name: 
     });
 }
 
-// r[verify sched.lease.k8s-lease]
+// r[verify sched.lease.k8s-lease+2]
 // r[verify sched.lease.generation-fence+2]
 #[cfg(test)]
 mod tests {

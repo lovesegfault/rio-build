@@ -390,7 +390,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the lease loop (if configured). AFTER actor spawn so
     // the actor's generation is already the shared Arc — when the
-    // lease acquires and increments, the actor sees it.
+    // lease acquires and applies the lease-derived generation
+    // (fetch_max), the actor sees it.
     // Capture the handle: the lease loop calls step_down() on
     // shutdown (graceful release: the standby takes over on its next
     // 5s poll instead of waiting out the 19s steal threshold). That's

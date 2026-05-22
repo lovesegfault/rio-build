@@ -931,7 +931,7 @@ in
     subtests = [
       "antiAffinity"
       "lease-acquired"
-      # r[verify sched.lease.k8s-lease]
+      # r[verify sched.lease.k8s-lease+2]
       "stable-leadership"
       # r[verify sched.lease.graceful-release]
       # r[verify sched.lease.deletion-cost]
@@ -955,7 +955,7 @@ in
     # r[verify sched.lease.non-blocking-acquire]
     subtests = [
       "build-during-failover"
-      # r[verify sched.lease.k8s-lease]
+      # r[verify sched.lease.k8s-lease+2]
       # r[verify sched.lease.generation-fence+2]
       #   True ungraceful death: SIGKILL the leader's host PID via
       #   crictl (no SIGTERM, no step_down, no FIN). Kubelet restarts

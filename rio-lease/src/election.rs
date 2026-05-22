@@ -189,7 +189,7 @@ pub(crate) enum ObservedUpdate {
 /// one: it's `Some(age)` only when there IS an observation AND its rv
 /// matches the current lease rv. `None` covers both "no observation"
 /// and "rv changed" — both reset the clock (`StartObserving`).
-// r[impl sched.lease.k8s-lease]
+// r[impl sched.lease.k8s-lease+2]
 //
 // ── Kani contracts ───────────────────────────────────────────────────
 // Each `ensures` clause is one direction of an iff. The contract
@@ -601,7 +601,7 @@ impl LeaderElection {
     }
 }
 
-// r[verify sched.lease.k8s-lease]
+// r[verify sched.lease.k8s-lease+2]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,8 +44,11 @@ Split-brain is closed by the fence/steal asymmetry --- a leader that cannot
 renew self-fences at `SELF_FENCE_AFTER` (11s), `2 × FENCE_MARGIN` before any
 standby's `STEAL_AFTER` (19s) steal threshold --- and bounded by the
 executor-side generation fence for the clock-pause residual:
-- Each Lease acquisition increments an in-memory `Arc<AtomicU64>` generation
-  counter
+- The leadership generation derives from the Lease's `leaseTransitions` count
+  (the lease loop applies `fetch_max(transitions + 1)` to the shared in-memory
+  `Arc<AtomicU64>`), floored during recovery by the durable PG history
+  (`assignments` plus the `leader_generation_claims` ledger); a same-epoch
+  re-acquire keeps its generation
 - The generation flows into `WorkAssignment.generation`; executors reject
   stale-generation assignments after their next heartbeat sync
 - *No PostgreSQL-level write fencing exists* --- a deposed leader's in-flight

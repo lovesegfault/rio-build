@@ -299,7 +299,7 @@ in
     # minus the self-symmetric states -- the structural-identity
     # evidence that the two state spaces are the same space.
     # r[verify sched.lease.at-most-one-leader+3]
-    # r[verify sched.lease.k8s-lease]
+    # r[verify sched.lease.k8s-lease+2]
     # r[verify sched.recovery.fetch-max-seed+3]
     quint-leader-election = mkQuintCheck {
       name = "leader-election";
@@ -515,7 +515,7 @@ in
     # and the blind-leader self-fence flip (self-fence). The PG-side
     # rules (generation-claim, fetch-max-seed) are NOT marked: the
     # phase-1 projection omits genHW and the mock has no claims ledger.
-    # r[verify sched.lease.k8s-lease]
+    # r[verify sched.lease.k8s-lease+2]
     # r[verify sched.lease.at-most-one-leader+3]
     # r[verify sched.lease.self-fence+2]
     mbt-rio-lease = mkNextestRun {

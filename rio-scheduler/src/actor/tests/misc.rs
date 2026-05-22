@@ -140,7 +140,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
     let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), false, true);
 
     // Merge a DAG so there's something to count. Standby DOES merge
-    // (r[sched.lease.k8s-lease]: "DAGs are still merged so state is
+    // (r[sched.lease.k8s-lease+2]: "DAGs are still merged so state is
     // warm for takeover"). If the gate is broken, derivations_queued
     // would be set to 1 (this node enters ready_queue — no deps).
     merge_single_node(&handle, Uuid::new_v4(), "sg-drv", PriorityClass::Scheduled).await?;
