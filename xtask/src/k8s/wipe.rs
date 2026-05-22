@@ -13,10 +13,16 @@
 //! does NOT delete.
 //!
 //! All-or-nothing on EKS: the wipe refuses to start if the PG URL
-//! cannot be captured up front. Deleting the leader-election Leases
-//! without resetting the PG schema leaves the lease generation epoch
-//! out of sync with postgres (the generation-collision precondition),
-//! so a wipe that cannot finish must not start.
+//! cannot be captured up front. A wipe that deletes the Leases,
+//! namespaces, and chunk-bucket contents but cannot reset the PG
+//! schema leaves a half-wiped data plane: the next deploy runs
+//! against the old deployment's tenants, builds, and assignment
+//! history, and PG chunk/narinfo metadata keeps naming objects the
+//! wipe already emptied — exactly what `--wipe` exists to remove. So
+//! a wipe that cannot finish must not start. (Generation monotonicity
+//! is NOT the concern: recovery seeds past the durable PG floor,
+//! which survives Lease deletion — see
+//! `rio-scheduler/src/actor/recovery.rs`.)
 
 use std::time::Duration;
 
@@ -46,25 +52,33 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
     // the Secret is gone. Read it now; pass the URL forward.
     //
     // PREFLIGHT: if the Secret is already gone, refuse to start. A wipe
-    // that deletes the leader-election Leases (step 3b) and namespaces
-    // (step 5) but cannot reset the PG schema (step 8) leaves the lease
-    // generation epoch out of sync with postgres: the recreated Lease
-    // restarts `leaseTransitions` at 0 while postgres still remembers
-    // every generation the old deployment claimed — the exact precondition
-    // for a generation collision on the next deploy. Failing here, before
-    // anything is deleted, is the only point where the operator can still
-    // choose a safe path.
+    // that deletes the leader-election Leases (step 3b), namespaces
+    // (step 5), and chunk-bucket contents (step 7) but cannot reset the
+    // PG schema (step 8) leaves a half-wiped environment: the next
+    // deploy's migration Job and recovery run against the old
+    // deployment's tenants, builds, and assignment history, and PG
+    // chunk metadata keeps naming objects the wipe just emptied.
+    // (Generation monotonicity is safe either way — recovery seeds past
+    // the durable PG floor, which survives the Lease being recreated at
+    // transitions=0; the documented collision residual needs a PG-side
+    // fault (skipped claim write or point-in-time restore) in
+    // conjunction with the Lease deletion. See
+    // `rio-scheduler/src/actor/recovery.rs` and
+    // docs/spec/system/deployment.typ "Disaster Recovery".) Failing
+    // here, before anything is deleted, is the only point where the
+    // operator can still choose a safe path.
     let pg_url = if matches!(kind, ProviderKind::Eks) {
         let url = kube::get_secret_key(&client, NS, "rio-postgres", "url").await?;
         if url.is_none() {
             bail!(
                 "the rio-postgres Secret is already gone (prior partial wipe?) — \
-                 refusing to wipe: the leader-election Leases and namespaces would be \
-                 deleted but the PG schema could not be reset, leaving the lease \
-                 generation epoch out of sync with postgres. nothing has been deleted. \
-                 run `xtask k8s up` first so the ExternalSecret re-syncs rio-postgres, \
-                 then re-run `up --wipe`; or run `xtask k8s destroy` to tear down \
-                 postgres along with the cluster"
+                 refusing to wipe: the leader-election Leases, namespaces, and chunk \
+                 bucket would be deleted but the PG schema could not be reset, leaving \
+                 a half-wiped environment (the next deploy would run against the old \
+                 deployment's tenants, builds, and chunk metadata). nothing has been \
+                 deleted. run `xtask k8s up` first so the ExternalSecret re-syncs \
+                 rio-postgres, then re-run `up --wipe`; or run `xtask k8s destroy` to \
+                 tear down postgres along with the cluster"
             );
         }
         url
@@ -134,20 +148,22 @@ pub(super) async fn run(kind: ProviderKind) -> Result<()> {
             // The None arm is unreachable on EKS — the step-0 preflight
             // bails before any destructive step if the URL could not be
             // captured. It is a hard error (not a warn-and-skip) anyway:
-            // by this point the Leases and namespaces are gone, so
-            // silently skipping the schema reset would hand the next
-            // deploy a fresh Lease over a postgres that remembers the old
-            // generation history — the generation-collision precondition.
+            // by this point the Leases, namespaces, and chunk-bucket
+            // contents are gone, so silently skipping the schema reset
+            // would hand the next deploy the old deployment's tenants,
+            // builds, and chunk metadata (now pointing at an emptied
+            // bucket) — a half-wiped environment the operator must be
+            // told to finish resetting.
             match pg_url {
                 Some(url) => reset_pg_schema(&url).await?,
                 None => bail!(
                     "no PG URL was captured before the destructive steps — the \
-                     leader-election Leases and namespaces are already deleted but \
-                     the PG schema was NOT reset; the lease generation epoch is now \
-                     out of sync with postgres. run `xtask k8s up` so the \
-                     ExternalSecret re-syncs rio-postgres and re-run `up --wipe` to \
-                     finish the reset, or run `xtask k8s destroy` to tear down both \
-                     sides"
+                     leader-election Leases, namespaces, and chunk bucket are already \
+                     wiped but the PG schema was NOT reset; the old deployment's \
+                     tenants, builds, and chunk metadata are still in postgres. run \
+                     `xtask k8s up` so the ExternalSecret re-syncs rio-postgres and \
+                     re-run `up --wipe` to finish the reset, or run \
+                     `xtask k8s destroy` to tear down both sides"
                 ),
             }
         }
