@@ -72,3 +72,4 @@ runs:
     - uses: Mic92/niks3-action@a3da573cc4d21634990e5f21391abe55ed49ec46 # v1.0.2
       with:
         server-url: ${{ inputs.niks3-url }}
+        drain-timeout: 1200
