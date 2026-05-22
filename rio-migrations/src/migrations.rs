@@ -1009,8 +1009,11 @@ pub const M_060: () = ();
 /// `[rio: ~N earlier lines lost across scheduler failover]` marker, the lost
 /// range is counted even though the blob replaces it with that single line,
 /// so `first_line + line_count` is one past the last true worker line
-/// (`obs.log.gap-span`); the blob's physical line count may therefore be
-/// smaller, which is how `GetDerivationLogs` detects such blobs.
+/// (`obs.log.gap-span`); the same holds when the flush payload itself
+/// carries an unmarked interior hole (lines only an unflushed interim
+/// leader received) — the hole is counted with no stand-in line at all;
+/// the blob's physical line count may therefore be smaller, which is how
+/// `GetDerivationLogs` detects such blobs.
 ///
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();

@@ -41,7 +41,10 @@
 //! true line-number space (the gap is counted, the marker is not extra) —
 //! see `obs.log.gap-span`. An interior hole consisting of lines an interim
 //! leader received but never flushed remains a silent (unmarked) gap —
-//! unavoidable, and within the ≤30s periodic-flush budget.
+//! unavoidable, and within the ≤30s periodic-flush budget; the row's span
+//! still counts it, so a `since_line` past the hole is not told it is
+//! caught up — the read path's physical-vs-claimed check re-serves the
+//! blob from the start instead.
 //!
 //! Both flush kinds write **one** `drv_logs` row per execution, UPSERTed on
 //! `(exec_id)` — a periodic snapshot inserts the row at `is_complete=false`,
@@ -140,6 +143,11 @@ pub struct FlushRequest {
 /// from the prior leader's `.partial` blob.
 struct FlushPayload {
     first_line: u64,
+    /// Highest true worker line number present in `lines`. Equal to
+    /// `first_line + line_count - 1` for a contiguous payload; larger when
+    /// the ring carried an interior hole (lines delivered only to an interim
+    /// leader that never flushed them). Meaningless when `line_count == 0`.
+    last_line: u64,
     line_count: u64,
     raw_bytes: u64,
     lines: Vec<Vec<u8>>,
@@ -424,7 +432,7 @@ impl LogFlusher {
                 // authoritative — any retained lines it lacks fall within
                 // the accepted ≤30s periodic-flush failover-loss bound.
                 match self.buffers.drain_if_exec(&req.drv_path, req.exec_id) {
-                    Some((_, line_count, _, _)) => {
+                    Some((_, _, line_count, _, _)) => {
                         self.buffers.unseal(&req.drv_path);
                         warn!(
                             drv = %req.drv_path,
@@ -537,7 +545,7 @@ impl LogFlusher {
         // Read AFTER the reconcile and BEFORE the drain (the drain removes
         // the entry and the cached prefix with it).
         let pre_drain_prefix_state = self.buffers.prefix_state(&req.drv_path, req.exec_id);
-        if let Some((first_line, line_count, raw_bytes, lines)) =
+        if let Some((first_line, last_line, line_count, raw_bytes, lines)) =
             self.buffers.drain_if_exec(&req.drv_path, req.exec_id)
         {
             self.buffers.unseal(&req.drv_path);
@@ -558,6 +566,7 @@ impl LogFlusher {
                 req,
                 FlushPayload {
                     first_line,
+                    last_line,
                     line_count,
                     raw_bytes,
                     lines,
@@ -679,7 +688,8 @@ impl LogFlusher {
                 }
             }
 
-            let Some((first_line, line_count, raw_bytes, lines)) = self.buffers.snapshot(&drv_path)
+            let Some((first_line, last_line, line_count, raw_bytes, lines)) =
+                self.buffers.snapshot(&drv_path)
             else {
                 // Buffer vanished between active_keys() and snapshot() —
                 // drained by a concurrent flush_final. Fine, skip.
@@ -719,6 +729,7 @@ impl LogFlusher {
                 req,
                 FlushPayload {
                     first_line,
+                    last_line,
                     line_count,
                     raw_bytes,
                     lines,
@@ -982,7 +993,8 @@ impl LogFlusher {
     /// When the prefix is present the stored blob carries
     /// prefix + (optional gap marker) + ring lines, while the row's
     /// `first_line`/`line_count` describe the execution's TRUE
-    /// line-number span (the gap is counted, the marker is not extra —
+    /// line-number span (the prefix→ring gap and any interior hole are
+    /// counted, the marker is not extra —
     /// `obs.log.gap-span`) and `total_bytes` stays physical. The
     /// `.partial` overwrite is therefore strictly coverage-growing and the
     /// final `.log.zst` + `.partial` delete are safe again — including
@@ -1008,6 +1020,7 @@ impl LogFlusher {
         let exec_id = req.exec_id;
         let FlushPayload {
             first_line,
+            last_line,
             line_count,
             raw_bytes,
             lines,
@@ -1078,11 +1091,28 @@ impl LogFlusher {
         // flagging the spec-accepted ≤30s window that was never flushed by
         // the prior leader; ranges that abut exactly (gap == 0) get no
         // marker. `total_bytes` stays physical — it sizes the blob, not
-        // the span. The blob join assumes the flush payload is contiguous
-        // from `first_line` (today's ring drains/snapshots are); a future
-        // non-contiguous payload would have to revisit this block anyway.
+        // the span. The payload's own contribution is its line-number span
+        // (`last_line − first_line + 1`), NOT its physical count: a
+        // re-acquired ex-leader's retained ring can carry an interior hole
+        // (lines delivered only to an interim leader that never flushed
+        // them), and recording the physical count would understate the
+        // end — `s3_is_caught_up` would then skip stored tail lines and
+        // the read path's physical-vs-claimed re-serve could never fire
+        // because the counts would match. The hole gets no in-band marker
+        // (spec: its absence is not separately marked); hole-carrying
+        // blobs simply claim more lines than they physically hold, which
+        // is the divergence the read path already answers with a full
+        // re-serve. A later tenure still holding the hole lines truncates
+        // them at this (larger) end without storing them — the same
+        // accepted interim-leader loss, now without a lying row.
         // r[impl obs.log.gap-span]
         let prefix_lines_recovered = recovered_prefix.as_ref().map(|p| p.line_count);
+        // Non-empty payload (line_count == 0 returned above) with in-order
+        // batches ⇒ last_line ≥ first_line.
+        debug_assert!(
+            last_line >= first_line,
+            "non-empty flush payload with last_line {last_line} < first_line {first_line}"
+        );
         let (eff_first_line, eff_line_count, eff_total_bytes, gap_marker) = match &recovered_prefix
         {
             Some(p) => {
@@ -1095,14 +1125,15 @@ impl LogFlusher {
                 let marker_len = marker.as_ref().map(|m| m.len() as u64).unwrap_or(0);
                 (
                     p.first_line,
-                    // True span: prefix span + gap + ring lines
-                    // (= ring end − prefix start), NOT prefix + marker + ring.
-                    p.line_count + gap + line_count,
+                    // True span: prefix span + gap + ring line-number span
+                    // (= ring true end − prefix start), NOT prefix + marker
+                    // + physical ring lines.
+                    p.line_count + gap + (last_line - first_line + 1),
                     p.total_bytes + marker_len + raw_bytes,
                     marker,
                 )
             }
-            None => (first_line, line_count, raw_bytes, None),
+            None => (first_line, last_line - first_line + 1, raw_bytes, None),
         };
 
         // Compress in spawn_blocking. ~10 MiB of log compresses in ~50ms on
@@ -3368,7 +3399,7 @@ mod tests {
         // shutdown arm is about to see. An empty stamped entry would also
         // produce "no PUT" (the line_count==0 early-return in
         // upload_and_record) and make this test pass without the gate.
-        let (_, line_count, _, _) = buffers
+        let (_, _, line_count, _, _) = buffers
             .snapshot(drv_path)
             .expect("fixture entry must be stamped");
         assert_eq!(line_count, 1, "fixture must have a line to flush");
@@ -4921,6 +4952,164 @@ mod tests {
             1,
             "stored blob fetched exactly once"
         );
+        assert_eq!(buffers.active_count(), 0, "final flush drains");
+        Ok(())
+    }
+
+    /// A→B→A flap where the interim leader B receives lines but never flushes
+    /// them: A's stored row ends BEFORE its retained head does, so after the
+    /// reconcile the flush payload itself still carries an interior hole
+    /// (B-only lines). The row must still describe the execution's true span —
+    /// one past the highest line actually stored — so `since` cursors past the
+    /// claimed-but-missing range are not told they are caught up; the blob
+    /// then physically holds fewer lines than the row claims, which is the
+    /// divergence the read path answers with a full re-serve.
+    // r[verify obs.log.gap-span]
+    #[tokio::test]
+    async fn aba_flap_unflushed_interim_hole_periodic_records_true_span() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r13hole1-unflushed-interim.drv";
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_serving_last_put();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // (1) Tenure A1: worker streams 0-2, A's periodic flush stores them
+        //     (row {first_line: 0, line_count: 3}).
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"a-0", b"a-1", b"a-2"]);
+        flusher.flush_periodic().await;
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "fixture: A's first periodic PUT"
+        );
+
+        // (2) Lines 3-4 arrive after the tick — A's unflushed tail at lease loss.
+        buffers.push(&mk_batch(drv_path, 3, &[b"a-3", b"a-4"]));
+
+        // (3) Flap to B: the worker delivers 5-7 to B only; B's tenure is
+        //     shorter than a periodic tick, so nothing is flushed and the
+        //     stored row still ends at 3. (Nothing to do — that's the point.)
+
+        // (4) Flap back to A: recovery restamps the same exec onto the
+        //     retained entry and re-arms the stored-coverage check.
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+
+        // (5) The worker reconnects to A and re-streams only undelivered
+        //     lines (8-9): the ring is now {0..4, 8, 9} — an interior hole at
+        //     5-7 that no stored row covers.
+        buffers.push(&mk_batch(drv_path, 8, &[b"c-8", b"c-9"]));
+
+        // (6) A's next periodic flush: reconcile folds A's own stored prefix
+        //     (0-2), drops the superseded ring head, and uploads the rest.
+        flusher.flush_periodic().await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("merged periodic PUT");
+        assert!(key.ends_with(".partial.log.zst"), "still a snapshot: {key}");
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(
+            decoded, "a-0\na-1\na-2\na-3\na-4\nc-8\nc-9\n",
+            "blob carries the prefix plus everything this replica holds"
+        );
+        assert!(
+            !decoded.contains("[rio:"),
+            "an unflushed-interim hole gets no in-band marker"
+        );
+        // 7 physical lines vs a 10-line claimed span: the read path's
+        // physical-vs-claimed check re-serves this blob from the start.
+        assert_eq!(decoded.trim_end_matches('\n').split('\n').count(), 7);
+
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1, row.2),
+            (0, 10, false),
+            "row end must be one past the highest stored line (9), not the physical count"
+        );
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored prefix fetched exactly once"
+        );
+        Ok(())
+    }
+
+    /// Same hole shape but the execution never produced a drv_logs row before
+    /// the terminal (neither A's first tenure nor the interim leader ever
+    /// flushed): there is no prefix to fold, the payload is the whole upload,
+    /// and the final row must still claim the true span so a tail follower's
+    /// `since` is not short-circuited past stored lines (`obs.log.gap-span`'s
+    /// no-skip clause; the physical-vs-claimed divergence then drives the
+    /// read-path re-serve).
+    #[tokio::test]
+    async fn interior_hole_with_no_stored_row_final_records_true_span() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = "/nix/store/r13hole2-no-row-final.drv";
+        let drv_hash = "r13hole2";
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+
+        // Tenure A1 streams 0-4 (never flushed); the interim leader receives
+        // 5-7 (also never flushed); A re-acquires (same-exec restamp) and the
+        // worker re-streams from 8. Ring: {0..4, 8, 9}, no drv_logs row.
+        let exec_id = stamp_and_push(
+            &buffers,
+            drv_path,
+            &[b"a-0", b"a-1", b"a-2", b"a-3", b"a-4"],
+        );
+        buffers.set_exec(drv_path, exec_id, "test-worker");
+        buffers.push(&mk_batch(drv_path, 8, &[b"c-8", b"c-9"]));
+
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+            })
+            .await;
+
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (key, body) = captured.last().expect("final PUT");
+        assert_eq!(key, &format!("logs/{drv_hash}/{exec_id}.log.zst"));
+        let decoded = String::from_utf8(zstd::decode_all(&body[..])?)?;
+        assert_eq!(decoded, "a-0\na-1\na-2\na-3\na-4\nc-8\nc-9\n");
+        assert!(
+            !decoded.contains("[rio:"),
+            "no marker without a recovered prefix"
+        );
+
+        let row: (i64, i64, bool, Option<String>) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete, status FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1),
+            (0, 10),
+            "no-prefix payload with a hole still claims the true span (end = 10)"
+        );
+        assert!(row.2, "final flush finalizes the row");
+        assert_eq!(row.3.as_deref(), Some("succeeded"));
         assert_eq!(buffers.active_count(), 0, "final flush drains");
         Ok(())
     }

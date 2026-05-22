@@ -292,9 +292,13 @@ impl LogBuffers {
     /// space as the ring buffer (bug_084: previously the offset was
     /// discarded here and `try_s3` treated the client's `since` cursor as
     /// a 0-based blob index → silent log-tail loss after eviction).
+    /// (`last_line` is not exposed here — the production flush paths that
+    /// need the payload's true end use [`Self::drain_if_exec`] /
+    /// [`Self::snapshot`].)
     pub fn drain(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
         let (_key, rb) = self.buffers.remove(&drv_log_hash(drv_path))?;
-        Some(Self::into_drained(rb))
+        let (first_line, _last_line, line_count, total_bytes, lines) = Self::into_drained(rb);
+        Some((first_line, line_count, total_bytes, lines))
     }
 
     /// Drain the buffer for `drv_path` **only if** it is currently stamped
@@ -322,11 +326,23 @@ impl LogBuffers {
     /// successful drain; a refused drain means the live execution owns
     /// the seal, or there is no entry and `CleanupTerminalBuild` is the
     /// backstop).
+    ///
+    /// Returns `(first_line, last_line, line_count, total_bytes, lines)`;
+    /// `last_line` is the highest worker-assigned line number present —
+    /// the production flush path records the row span from it so an
+    /// interior hole still counts toward the execution's true end
+    /// (`obs.log.gap-span`).
+    #[allow(
+        clippy::type_complexity,
+        reason = "ordering mirrors span()'s (first, last, count); the flusher \
+                  destructures it once into FlushPayload fields — a named \
+                  struct here would just duplicate that type"
+    )]
     pub fn drain_if_exec(
         &self,
         drv_path: &str,
         expected: Uuid,
-    ) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
+    ) -> Option<(u64, u64, u64, u64, Vec<Vec<u8>>)> {
         let (_key, rb) = self
             .buffers
             .remove_if(&drv_log_hash(drv_path), |_, e| e.exec_id == Some(expected))?;
@@ -334,14 +350,20 @@ impl LogBuffers {
     }
 
     /// Shared tail of [`Self::drain`] / [`Self::drain_if_exec`]: unpack a
-    /// removed ring buffer into the `(first_line, line_count, total_bytes,
-    /// lines)` tuple the flusher uploads.
-    fn into_drained(rb: RingBuf) -> (u64, u64, u64, Vec<Vec<u8>>) {
+    /// removed ring buffer into the `(first_line, last_line, line_count,
+    /// total_bytes, lines)` tuple the flusher uploads. `last_line` is the
+    /// highest worker-assigned line number present — equal to
+    /// `first_line + line_count - 1` only when the payload is contiguous,
+    /// larger when it carries an interior hole (lines delivered only to an
+    /// interim leader during an A→B→A flap). first/last are meaningless
+    /// zeros when `line_count == 0`.
+    fn into_drained(rb: RingBuf) -> (u64, u64, u64, u64, Vec<Vec<u8>>) {
         let first_line = rb.lines.front().map(|(n, _)| *n).unwrap_or(0);
+        let last_line = rb.lines.back().map(|(n, _)| *n).unwrap_or(0);
         let line_count = rb.lines.len() as u64;
         let total_bytes = rb.bytes as u64;
         let lines: Vec<Vec<u8>> = rb.lines.into_iter().map(|(_n, bytes)| bytes).collect();
-        (first_line, line_count, total_bytes, lines)
+        (first_line, last_line, line_count, total_bytes, lines)
     }
 
     /// Read lines with line number ≥ `since`, non-consuming.
@@ -941,13 +963,23 @@ impl LogBuffers {
     /// log (wasteful in S3 PUTs, but bounded: at most one per 30s per active
     /// derivation, and the spec explicitly accepts that tradeoff at
     /// `observability.typ`).
-    pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
+    ///
+    /// Returns `(first_line, last_line, line_count, total_bytes, lines)`;
+    /// `last_line` is the highest worker-assigned line number present — it
+    /// exceeds `first_line + line_count − 1` exactly when the payload
+    /// carries an interior hole (`obs.log.gap-span`).
+    #[allow(
+        clippy::type_complexity,
+        reason = "same shape as drain_if_exec — see the allow there"
+    )]
+    pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, u64, u64, Vec<Vec<u8>>)> {
         let buf = self.buffers.get(&drv_log_hash(drv_path))?;
         let first_line = buf.lines.front().map(|(n, _)| *n).unwrap_or(0);
+        let last_line = buf.lines.back().map(|(n, _)| *n).unwrap_or(0);
         let line_count = buf.lines.len() as u64;
         let total_bytes = buf.bytes as u64;
         let lines: Vec<Vec<u8>> = buf.lines.iter().map(|(_n, bytes)| bytes.clone()).collect();
-        Some((first_line, line_count, total_bytes, lines))
+        Some((first_line, last_line, line_count, total_bytes, lines))
     }
 
     /// Line-number span of the entry for `drv_path` IF it is stamped with
@@ -1153,10 +1185,11 @@ mod tests {
             "executor-1"
         ));
 
-        let (first, count, bytes, lines) = bufs
+        let (first, last, count, bytes, lines) = bufs
             .drain_if_exec("drv-a", exec)
             .expect("matching exec must drain");
         assert_eq!(first, 0);
+        assert_eq!(last, 1);
         assert_eq!(count, 2);
         assert_eq!(bytes, 5 + 5);
         assert_eq!(lines, vec![b"hello".to_vec(), b"world".to_vec()]);
@@ -1194,7 +1227,7 @@ mod tests {
             "live entry's lines must survive the refused drain"
         );
         // And the live exec can still drain its own buffer afterwards.
-        let (_, count, _, _) = bufs.drain_if_exec("drv-a", live).expect("live exec drains");
+        let (_, _, count, _, _) = bufs.drain_if_exec("drv-a", live).expect("live exec drains");
         assert_eq!(count, 1);
     }
 
@@ -1212,6 +1245,29 @@ mod tests {
         bufs.push(&mk_batch("drv-a", 0, &[b"line"]));
         assert!(bufs.drain_if_exec("drv-a", Uuid::now_v7()).is_none());
         assert_eq!(bufs.active_count(), 1, "unstamped entry left in place");
+    }
+
+    /// A worker that reconnects after an interim-leader tenure re-streams only
+    /// undelivered batches, so a retained ring can carry an interior hole.
+    /// snapshot/drain must report the highest line actually present so the
+    /// flusher can record the execution's true span, not just the physical count.
+    #[test]
+    fn snapshot_and_drain_if_exec_report_last_line_across_interior_hole() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "test-worker");
+        bufs.push(&mk_batch("drv-a", 0, &[b"l0", b"l1", b"l2"]));
+        bufs.push(&mk_batch("drv-a", 6, &[b"l6", b"l7"]));
+
+        let (first, last, count, _bytes, lines) = bufs.snapshot("drv-a").unwrap();
+        assert_eq!((first, last, count), (0, 7, 5), "snapshot spans the hole");
+        assert_eq!(lines.len(), 5);
+
+        let (first, last, count, _bytes, lines) = bufs
+            .drain_if_exec("drv-a", exec)
+            .expect("stamped entry drains");
+        assert_eq!((first, last, count), (0, 7, 5), "drain spans the hole");
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]

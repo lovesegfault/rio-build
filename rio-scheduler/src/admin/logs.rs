@@ -244,7 +244,8 @@ pub(super) fn try_ring_buffer(
 /// is strictly more useful than NotFound.
 ///
 /// Blobs whose physical line count diverges from the row's span (a
-/// gap-merged blob — the failover marker stands in for the lost range,
+/// gap-merged blob — the failover marker stands in for the lost range —
+/// or a hole-carrying blob whose ring had an unmarked interior hole,
 /// `obs.log.gap-span`) are re-served from the start regardless of
 /// `since`: bandwidth over silently skipping lines the client never got.
 async fn try_s3(
@@ -364,7 +365,8 @@ async fn try_s3(
 /// short-circuited against `line_count=100000` (ring-capped survivors)
 /// → silently dropped the final 30k lines.
 ///
-/// For gap-merged rows `line_count` is the true span (gap counted —
+/// For gap-merged and hole-carrying rows `line_count` is the true span
+/// (the gap and any unmarked interior hole are counted —
 /// `obs.log.gap-span`), so this stays in true line-number space.
 pub(super) fn s3_is_caught_up(since: u64, first_line: u64, line_count: u64) -> bool {
     since >= first_line + line_count
@@ -422,10 +424,12 @@ pub(super) fn decompress_and_chunk(
     // unreliable past the marker: slicing at `since` would skip lines the
     // client never received and mislabel the rest. Ignore the cursor and
     // re-serve from the start (the caller's caught-up short-circuit already
-    // handled cursors at/past the true end). Gapless blobs and markers that
-    // replaced exactly one line keep physical == row count, so exact resume
-    // is preserved; any other mismatch (writer bug) gets the same
-    // conservative full re-serve.
+    // handled cursors at/past the true end). Contiguous blobs and markers
+    // that replaced exactly one line keep physical == row count, so exact
+    // resume is preserved. Hole-carrying blobs (a re-acquired ex-leader's
+    // ring with an unmarked interior hole — see `upload_and_record`, which
+    // still claims the true span) diverge the same way and get the same
+    // full re-serve, as does any remaining mismatch (writer bug).
     let physical_lines = raw.split(|b| *b == b'\n').count() as u64;
     let since = if physical_lines != row_line_count {
         0
