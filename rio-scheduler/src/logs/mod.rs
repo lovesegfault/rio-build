@@ -192,7 +192,9 @@ struct RingBuf {
     /// pin) leaves the entry and this mark in place — the entry may be the
     /// live execution's buffer on a re-acquired leader, so its reaper is
     /// then the live tenure's own final, the drv's next dispatch discard,
-    /// or process exit. Set at enqueue by the actor and
+    /// or process exit — unless the entry is still sealed and empty for
+    /// that exec (no restamp adopted it), in which case the tenure-drop arm
+    /// reaps it. Set at enqueue by the actor and
     /// re-asserted at deferral by the flusher (both exec-guarded); cleared by
     /// any `set_exec` restamp — cross-exec, or the same-exec restamp recovery
     /// performs at lease re-acquisition (the prior tenure's retained final

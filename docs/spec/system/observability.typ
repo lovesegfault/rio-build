@@ -145,6 +145,17 @@ change are dropped and counted
 execution then either gets finalized by the live tenure's own terminal flush
 or remains at its `.partial` coverage (surfaced per
 `obs.log.incomplete-surfaced`).
+The tenure check runs before the finalize guard's stored-row consult, so an
+orphaned request triggers no further PG or S3 work --- in particular none of
+the guard's reap or deferral arms, which are execution-scoped but not
+tenure-scoped and could otherwise touch a ring entry that the new tenure's
+recovery has restamped onto the still-live execution. When the orphaned
+request's entry is still sealed and empty (no restamp adopted it: the
+terminal persisted under the old tenure, so nothing else will ever resolve
+the entry), the drop also reaps that entry so log reads fall through to the
+stored `.partial` instead of an empty in-memory buffer; any other entry is
+left for its real owner --- the live tenure's own final, the next dispatch
+discard, or process exit.
 The protection starts at enqueue: a final still queued behind earlier stalled
 flushes during the same outage is protected exactly like one already
 attempted and deferred, and stays pinned until the flusher resolves the
