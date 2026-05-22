@@ -664,10 +664,17 @@ impl LogBuffers {
     /// cleared too (mirrors `discard`). Returns whether an entry was
     /// removed.
     ///
-    /// Used by the flusher when it concludes a final request is out of
-    /// tenure (`flush_final`'s tenure-drop arm and its post-await tenure
-    /// re-checks with `require_empty = true`; the finalized-elsewhere
-    /// orphan reap with `require_empty = false`). The competing writer is
+    /// Used by the flusher for entries it concludes are reapable orphan
+    /// residue. `require_empty = true` callers — `flush_final`'s
+    /// out-of-tenure drop arm and its `finalize_guard_error` / `pre_drain`
+    /// post-await re-checks — hold no evidence about the stored row, so
+    /// they only ever remove the empty no-reaper shape.
+    /// `require_empty = false` callers — the `already_finalized_refusal`
+    /// post-await re-check and the periodic refused-UPSERT reap in
+    /// `upload_and_record` — have already proven the execution's `drv_logs`
+    /// row is finalized (the in-hand guard row / the frozen-row UPSERT
+    /// refusal), which is what makes removing retained lines safe: the
+    /// durable record supersedes them. The competing writer is
     /// the actor task's `set_exec` same-exec restamp, which adopts the
     /// entry as the live execution's carrier and clears the seal while
     /// holding the same entry's lock — so the predicate sees either the
@@ -681,13 +688,17 @@ impl LogBuffers {
     /// batches in that window) — the trailing remove then clears it, same
     /// shape as [`Self::discard_if_empty_for_exec`]. What the predicate
     /// guarantees is only that the removed entry was sealed (+ empty when
-    /// required) and stamped with `expected` *at removal time*. For an
-    /// out-of-tenure request that entry is either a true prior-tenure
-    /// orphan (terminal persisted under the old tenure, no reaper left) or
-    /// an empty entry whose own in-tenure final is still pending (the
-    /// current tenure's epilogue re-sealed it after a same-exec restamp);
-    /// reaping the latter is benign — that final then resolves via the
-    /// no-entry arm and only the empty drain's status stamp is lost. It
+    /// required) and stamped with `expected` *at removal time*. The removed
+    /// entry is either a true prior-tenure orphan (terminal persisted under
+    /// the old tenure, no reaper left) or an entry whose own in-tenure
+    /// final is still pending (the current tenure's epilogue re-sealed it
+    /// after a same-exec restamp). Reaping the latter is benign: an empty
+    /// one only loses the empty drain's status stamp, and a non-empty one
+    /// can only be removed by a `require_empty = false` caller — i.e. with
+    /// the execution's row already finalized — so its lines were
+    /// unpersistable and the pending final's own already-finalized arm
+    /// would have drained and discarded them anyway (it then resolves via
+    /// the no-entry arm; the call sites carry the full safety argument). It
     /// must NOT be read as "sealed ⇒ orphan".
     ///
     /// Lock order matches every other caller (buffers entry/shard lock,

@@ -80,12 +80,14 @@
 //! it (`FlushRequest::lease_generation`): the tenure check runs before the
 //! finalize guard's row consult (and is re-checked after each awaited
 //! step), so a request orphaned by a leadership change is dropped without
-//! uploading anything. Its ring entry is reaped only while still sealed
-//! and stamped with that exec: an empty one outright (no PG read; left in
-//! place it would shadow the stored `.partial`), a non-empty one only
-//! after a read-only row consult shows another tenure already finalized
-//! the execution (the durable record supersedes the retained lines) — and
-//! the live tenure's own terminal processing finalizes the execution.
+//! any PG or S3 work and uploads nothing. Its ring entry is reaped only
+//! while still sealed and stamped with that exec: an empty one outright
+//! (left in place it would shadow the stored `.partial`); a non-empty one
+//! is left in place and reaped later by the periodic flush, whose snapshot
+//! UPSERT is refused by the frozen-row latch once another tenure has
+//! finalized the execution (the durable record supersedes the retained
+//! lines) — and the live tenure's own terminal processing finalizes the
+//! execution.
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.
@@ -128,8 +130,7 @@ const LOG_GC_BATCH: i64 = 1000;
 /// How many deferred final flushes (finalize guard could not read `drv_logs`)
 /// the flusher retains for retry. Each retained request pins its sealed ring
 /// entry in memory until PG answers (an orphaned-tenure request is dropped
-/// even earlier by the per-attempt tenure pin — its only PG work is the
-/// read-only row consult for a sealed non-empty entry; see
+/// even earlier by the per-attempt tenure pin, with no PG work at all; see
 /// `FlushRequest::lease_generation`) (≤ RING_BYTE_CAP each), and — since the
 /// final-pending mark is set at enqueue — entries whose finals are still
 /// *queued* are pinned too (bounded by the flush channel's 1000-deep
@@ -522,16 +523,17 @@ impl LogFlusher {
     /// writes coming) and upload with `is_complete=true`.
     ///
     /// Validates the request against its enqueueing lease tenure FIRST: an
-    /// out-of-tenure request is dropped before any S3 work and uploads
-    /// nothing. Its entry is reaped only when that entry is still sealed
-    /// and stamped with the request's exec (anything else may be the live
-    /// execution's restamped buffer): a sealed empty entry is reaped
-    /// outright (the no-reaper orphan shape, no PG read), and a sealed
-    /// non-empty one is reaped only after a read-only `drv_logs` consult
-    /// shows another tenure already finalized the execution (the durable
-    /// record supersedes the retained lines); otherwise the entry is left
-    /// in place. The tenure is re-checked after every awaited step
-    /// (guard SELECT, reconcile) before any destructive arm runs. An
+    /// out-of-tenure request is dropped before any PG or S3 work and uploads
+    /// nothing. Its entry is reaped only when that entry is still sealed,
+    /// stamped with the request's exec, AND empty (anything else may be the
+    /// live execution's restamped buffer); a sealed non-empty orphan is left
+    /// in place — its reaper is the periodic flush's refused-UPSERT reap
+    /// once another tenure has finalized the execution (see
+    /// [`Self::upload_and_record`]). The tenure is re-checked after every
+    /// awaited step (guard SELECT, reconcile) before any destructive arm
+    /// runs; a request that goes stale during the guard SELECT in the
+    /// already-finalized arm reaps the sealed residue (empty or not) using
+    /// the finalized row already in hand. An
     /// in-tenure request then consults the execution's stored `drv_logs`
     /// row: an execution another leader already finalized is refused
     /// (residue reaped if still stamped with it, nothing uploaded), and a
@@ -576,14 +578,12 @@ impl LogFlusher {
         // started; a request that goes stale DURING the guard/reconcile
         // awaits is caught by the post-await re-checks inside each arm
         // (`req_in_tenure` again, right before the entry-touching ops).
-        // The drop arm still consults drv_logs (read-only, same primitive
-        // and pool-acquire posture as the guard) for one shape only — a
-        // sealed NON-empty entry still stamped with the request's exec — so
-        // an orphan whose execution another tenure already finalized is
-        // reaped instead of shadowing the finalized blob until restart; the
-        // empty shape is reaped without any PG read, and every other stale
-        // request (no entry, unsealed live carrier) still skips PG and S3
-        // entirely during the very outage that orphaned it.
+        // The drop arm itself performs ZERO PG and S3 work: every stale
+        // request skips both during the very outage that orphaned it, so a
+        // backlog of orphaned finals can never stall the flusher loop on
+        // pool-acquire timeouts. The only entry it reaps is a sealed EMPTY
+        // one; a sealed non-empty orphan is left for the periodic flush's
+        // refused-UPSERT reap (see `upload_and_record`).
         //
         // generation() is monotone: bumped by on_acquire, raisable (never
         // lowered) by recovery's seed_generation_from, untouched by
@@ -625,35 +625,24 @@ impl LogFlusher {
             //    between the check and the reap — it either lands first
             //    (seal cleared, no reap) or recreates a fresh carrier right
             //    after.
-            //  - Sealed and NON-empty: consult the execution's drv_logs row
-            //    (read-only — the one PG read an out-of-tenure request may
-            //    still do, same pool-acquire posture as the finalize
-            //    guard). If some tenure already finalized the exec, the
-            //    durable finalized record is authoritative
-            //    (`obs.log.finalize-immutable`) and the retained lines are
-            //    superseded by it — drop them locally so the orphan stops
-            //    shadowing the finalized blob in GetDerivationLogs and the
-            //    periodic tick stops re-PUTting its `.partial` for the
-            //    process lifetime. The reap is the same atomic predicate
-            //    with require_empty=false: a same-exec restamp landing
-            //    during the SELECT clears the seal, so the discard then
-            //    no-ops regardless of how many lines the reconnected worker
-            //    pushed; if the restamped execution ALSO reached terminal
-            //    during that SELECT and the new tenure's epilogue re-sealed
-            //    it, the predicate can match again and remove that pending
-            //    final's entry — still safe, because this branch only
-            //    discards when the row is already frozen complete, so those
-            //    lines were unpersistable and the new final's own
-            //    already-finalized arm would have drained and discarded
-            //    them anyway (it then resolves via the no-entry arm).
-            //    Row absent / not finalized / SELECT error: leave the entry
-            //    untouched and just drop the request. The residual orphan
-            //    is therefore narrowed to sealed non-empty entries whose
-            //    exec was never finalized by any tenure — there the ring's
-            //    lines are the best data available and serving them as
-            //    is_complete=false is correct — plus the SELECT-error case
-            //    (no worse than dropping without consulting at all); both
-            //    are bounded by the next restamp/dispatch or process exit.
+            //  - Sealed and NON-empty: left in place — this arm does no PG
+            //    work, so it cannot tell whether another tenure already
+            //    finalized the exec, and a row consult here would burn a
+            //    pool-acquire timeout per orphaned final, serially on the
+            //    flusher loop, during the very outage that orphaned them.
+            //    Its reaper is the periodic flush: the snapshot sweep keeps
+            //    covering the entry, and the moment its row UPSERT is
+            //    refused by the frozen-row latch (another tenure finalized
+            //    the exec — `obs.log.finalize-immutable`) the still-sealed
+            //    entry is discarded; see the refused-UPSERT reap in
+            //    `upload_and_record`. That bounds the orphan's shadowing of
+            //    the finalized blob (and its `.partial` re-PUT churn) to
+            //    one periodic tick after PG/leadership recovery. The
+            //    permanent residual is an exec whose row is never finalized
+            //    by any tenure: there the ring's lines are the best data
+            //    available, the periodic path keeps them durable at
+            //    `.partial` coverage, and serving them as is_complete=false
+            //    is correct.
             warn!(
                 drv = %req.drv_path,
                 exec_id = %req.exec_id,
@@ -674,53 +663,6 @@ impl LogFlusher {
                     "reaped the dropped final's sealed, empty entry so reads \
                      fall through to the stored .partial"
                 );
-            } else if self.buffers.is_sealed(&req.drv_path)
-                && self.buffers.exec_id(&req.drv_path) == Some(req.exec_id)
-            {
-                // Sealed and stamped with this exec but the empty reap above
-                // refused ⇒ non-empty (the seal blocks pushes, so the shape
-                // is stable). The two reads are advisory-only — they gate
-                // the PG read; the atomic discard below is the decision
-                // point — so ordinary stale requests (no entry, unsealed
-                // live carrier, or already-reaped empty) never reach PG.
-                // r[impl obs.log.deferred-final-retry+3]
-                match self.fetch_stored_drv_log(req.exec_id).await {
-                    Ok(Some(stored)) if stored.is_complete => {
-                        if self.buffers.discard_if_sealed_for_exec(
-                            &req.drv_path,
-                            req.exec_id,
-                            false,
-                        ) {
-                            debug!(
-                                drv = %req.drv_path,
-                                exec_id = %req.exec_id,
-                                "reaped the dropped final's sealed entry: the \
-                                 execution is already finalized in drv_logs, so \
-                                 the durable record supersedes the retained \
-                                 lines and reads fall through to it"
-                            );
-                        }
-                    }
-                    Ok(_) => {
-                        debug!(
-                            drv = %req.drv_path,
-                            exec_id = %req.exec_id,
-                            "keeping the dropped final's sealed non-empty entry: \
-                             no finalized drv_logs row supersedes it (never \
-                             finalized by any tenure)"
-                        );
-                    }
-                    Err(e) => {
-                        debug!(
-                            drv = %req.drv_path,
-                            exec_id = %req.exec_id,
-                            error = %e,
-                            "keeping the dropped final's sealed non-empty entry: \
-                             drv_logs unreadable, cannot tell whether a finalized \
-                             record supersedes it"
-                        );
-                    }
-                }
             }
             return None;
         }
@@ -754,10 +696,13 @@ impl LogFlusher {
                 // carrier — which the exec-keyed drain below cannot tell
                 // apart. Re-validate the tenure before the residue
                 // drain/unseal; a request that went stale mid-await takes
-                // the same drop path as the entry-time pin.
+                // the same drop path as the entry-time pin — except that
+                // here the row in hand is proven finalized, so the reap may
+                // remove the sealed residue even when non-empty
+                // (require_empty=false; see `drop_stale_after_await`).
                 // r[impl obs.log.deferred-final-retry+3]
                 if !self.req_in_tenure(&req) {
-                    self.drop_stale_after_await(&req, "already_finalized_refusal");
+                    self.drop_stale_after_await(&req, "already_finalized_refusal", false);
                     return None;
                 }
                 // Reap the retained residue iff it is still stamped with
@@ -819,7 +764,7 @@ impl LogFlusher {
                 // acquire-timeout on the serial flusher.
                 // r[impl obs.log.deferred-final-retry+3]
                 if !self.req_in_tenure(&req) {
-                    self.drop_stale_after_await(&req, "finalize_guard_error");
+                    self.drop_stale_after_await(&req, "finalize_guard_error", true);
                     return None;
                 }
                 // Fail closed (`obs.log.finalize-immutable`): without the row we
@@ -954,7 +899,7 @@ impl LogFlusher {
         // class the design already discards.
         // r[impl obs.log.deferred-final-retry+3]
         if !self.req_in_tenure(&req) {
-            self.drop_stale_after_await(&req, "pre_drain");
+            self.drop_stale_after_await(&req, "pre_drain", true);
             return None;
         }
         if let Some((first_line, last_line, line_count, raw_bytes, lines)) =
@@ -1054,13 +999,25 @@ impl LogFlusher {
     /// Shared drop tail for a final whose tenure ended while `flush_final`
     /// was parked on an awaited step (the finalize-guard SELECT or the
     /// stored-prefix reconcile): warn, count it on the stale-tenure
-    /// counter, reap the entry only when it is still sealed AND empty for
-    /// this exec (the same atomic reap the entry-time tenure pin uses —
-    /// an unsealed entry may be the live execution's restamped carrier and
-    /// a non-empty sealed one still holds lines another owner may fold),
-    /// and let the caller return `None` so the request is never retained.
+    /// counter, reap the entry only when it is still sealed for this exec
+    /// AND the caller's `require_empty` bound holds (an unsealed entry may
+    /// be the live execution's restamped carrier and is never touched), and
+    /// let the caller return `None` so the request is never retained.
+    ///
+    /// `require_empty` is `true` at the `finalize_guard_error` and
+    /// `pre_drain` stages: those hold no evidence about the stored row, so
+    /// a non-empty sealed entry still holds lines another owner may fold
+    /// and only the empty no-reaper shape is reaped. The
+    /// `already_finalized_refusal` stage passes `false`: its guard SELECT
+    /// returned `is_complete = true` before the staleness was detected, and
+    /// finalize-immutability means that cannot regress — the durable record
+    /// supersedes the retained lines, so the sealed non-empty residue is
+    /// reaped too instead of shadowing the finalized blob until restart
+    /// (same safety argument as the periodic refused-UPSERT reap in
+    /// `upload_and_record`; a same-exec restamp landing mid-await clears
+    /// the seal and the discard no-ops).
     // r[impl obs.log.deferred-final-retry+3]
-    fn drop_stale_after_await(&self, req: &FlushRequest, stage: &str) {
+    fn drop_stale_after_await(&self, req: &FlushRequest, stage: &str, require_empty: bool) {
         warn!(
             drv = %req.drv_path,
             exec_id = %req.exec_id,
@@ -1075,13 +1032,14 @@ impl LogFlusher {
         metrics::counter!("rio_scheduler_log_flush_stale_tenure_total").increment(1);
         if self
             .buffers
-            .discard_if_sealed_for_exec(&req.drv_path, req.exec_id, true)
+            .discard_if_sealed_for_exec(&req.drv_path, req.exec_id, require_empty)
         {
             debug!(
                 drv = %req.drv_path,
                 exec_id = %req.exec_id,
-                "reaped the dropped final's sealed, empty entry so reads \
-                 fall through to the stored .partial"
+                require_empty,
+                "reaped the dropped final's sealed entry so reads fall \
+                 through to the stored drv_logs record"
             );
         }
     }
@@ -1816,7 +1774,7 @@ impl LogFlusher {
         // false→true on the final, and never back: the conflict clause
         // refuses the downgrade, so a periodic UPSERT that loses a race
         // with a final is a logged no-op, not corruption).
-        if let Err(e) = upsert_drv_log(
+        let row_written = match upsert_drv_log(
             &self.pool,
             exec_id,
             &drv_hash,
@@ -1829,17 +1787,58 @@ impl LogFlusher {
         )
         .await
         {
-            warn!(
-                s3_key = %s3_key,
-                "PG drv_logs upsert failed; S3 blob exists but read path \
-                 won't find it. Manual: SELECT from drv_logs or S3 list."
+            Ok(written) => written,
+            Err(e) => {
+                warn!(
+                    s3_key = %s3_key,
+                    "PG drv_logs upsert failed; S3 blob exists but read path \
+                     won't find it. Manual: SELECT from drv_logs or S3 list."
+                );
+                // Route through the chokepoint helper so the counter has a
+                // consistent {phase, is_final} label set (bug_018: the
+                // inline emit had `phase` only → `{is_final="true"}` queries
+                // silently excluded PG failures).
+                flush_failure(is_final, "pg", &s3_key, &e, &req.drv_path);
+                return;
+            }
+        };
+
+        // A REFUSED periodic UPSERT (frozen row — another tenure already
+        // finalized this execution) is the recurring "finalized elsewhere"
+        // signal for an orphaned ring entry: reap the entry iff it is still
+        // SEALED and stamped with the exec this snapshot was taken for.
+        // Still-sealed means no restamp in the current tenure adopted it as
+        // the live carrier (every restamp clears the seal) — typically a
+        // prior tenure's terminal orphan with no other reaper left
+        // (recovery restamps only Assigned|Running drvs, the acquisition
+        // sweep skips sealed keys, terminal cleanup skips marked entries,
+        // and `flush_final`'s out-of-tenure drop arm deliberately does no
+        // PG work). It can also be an entry the CURRENT tenure's epilogue
+        // re-sealed with its own final still pending — reaping it is still
+        // safe, because the row is already frozen complete, so those lines
+        // were unpersistable and that final's own already-finalized arm
+        // would have drained and discarded them anyway (it then resolves
+        // via its no-entry arm). An UNSEALED entry with a refused UPSERT is
+        // the live execution's carrier (the documented post-drain residual:
+        // a stale final froze the row while the same exec keeps streaming
+        // here) and is left alone. The reap ends the per-tick `.partial`
+        // re-PUT churn for the orphan and lets reads fall through to the
+        // finalized blob; the `.partial` this tick uploaded is swept by the
+        // TTL GC at expiry. Finals never take this branch: their entry was
+        // already drained before the upload.
+        if !is_final
+            && !row_written
+            && self
+                .buffers
+                .discard_if_sealed_for_exec(&req.drv_path, exec_id, false)
+        {
+            debug!(
+                drv = %req.drv_path,
+                exec_id = %exec_id,
+                "periodic snapshot refused (execution already finalized by \
+                 another tenure): reaped the sealed orphan entry so reads \
+                 fall through to the durable record"
             );
-            // Route through the chokepoint helper so the counter has a
-            // consistent {phase, is_final} label set (bug_018: the
-            // inline emit had `phase` only → `{is_final="true"}` queries
-            // silently excluded PG failures).
-            flush_failure(is_final, "pg", &s3_key, &e, &req.drv_path);
-            return;
         }
 
         // Best-effort delete the `.partial` snapshot AFTER the final blob's
@@ -2299,8 +2298,11 @@ fn compress_with_prefix(
 /// final wrote, because `flush_final` drains the buffer and nothing would
 /// ever repair it; and a stale re-finalization is refused upstream by
 /// `flush_final`'s already-finalized guard, with this clause as the
-/// defense-in-depth backstop. A refused write is reported via
-/// `rows_affected() == 0` and logged at `debug!`.
+/// defense-in-depth backstop. A refused write is observed via
+/// `rows_affected() == 0`, logged at `debug!`, and reported to the caller
+/// as `Ok(false)` (`Ok(true)` ⇒ the row was inserted/updated):
+/// `upload_and_record`'s periodic path uses that signal to reap a sealed
+/// orphan ring entry whose execution another tenure already finalized.
 // r[impl obs.log.finalize-immutable]
 #[allow(clippy::too_many_arguments)] // one UPSERT with the full row — a struct param would just rename the args
 async fn upsert_drv_log(
@@ -2313,7 +2315,7 @@ async fn upsert_drv_log(
     total_bytes: u64,
     is_complete: bool,
     status: Option<&str>,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<bool> {
     // Decode the dispatch instant from the UUIDv7's high 48 bits. A
     // non-v7 UUID has no embedded timestamp — should never happen since
     // `assign_to_worker` mints with `Uuid::now_v7()`. A naive
@@ -2394,8 +2396,9 @@ async fn upsert_drv_log(
             s3_key,
             "drv_logs upsert refused: row is already finalized (finalized rows are frozen)"
         );
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 // r[verify obs.log.periodic-flush]
@@ -5392,26 +5395,30 @@ mod tests {
         Ok(())
     }
 
-    /// bug_004 (r17): a tenure-dropped final whose entry is still SEALED and
-    /// NON-empty has no remaining reaper (recovery restamps only
-    /// Assigned|Running drvs, the sweep skips sealed keys, cleanup skips
-    /// marked entries, and the drv is terminal so no dispatch discard is
-    /// coming) — but when another tenure already finalized the exec, the
-    /// durable record is authoritative and the orphan only shadows it in
+    /// merged_bug_007 (r18, supersedes the r17 one-shot-consult shape): a
+    /// tenure-dropped final whose entry is still SEALED and NON-empty has no
+    /// request-driven reaper left (recovery restamps only Assigned|Running
+    /// drvs, the sweep skips sealed keys, cleanup skips marked entries, and
+    /// the drop arm itself does no PG work) — so once another tenure
+    /// finalized the exec, the orphan would shadow the finalized blob in
     /// GetDerivationLogs (stale lines served as is_complete=false) while the
     /// periodic tick re-PUTs its `.partial` for the process lifetime. The
-    /// tenure-drop arm must consult drv_logs read-only and reap the sealed
-    /// entry when the row is already complete: nothing uploaded, the
-    /// finalized row untouched, the request not retained.
+    /// recurring reaper is the periodic flush itself: its row UPSERT is
+    /// refused by the frozen-row latch (the row is already finalized), and
+    /// on that refusal the still-sealed, exec-stamped entry is discarded —
+    /// the durable record supersedes the retained lines and the re-PUT
+    /// churn ends. The drop arm keeps the entry; the reap self-heals within
+    /// one periodic tick of PG/leadership recovery.
     /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.finalize-immutable]
     #[tokio::test]
-    async fn stale_tenure_drop_reaps_sealed_nonempty_entry_when_finalized_elsewhere()
+    async fn stale_tenure_orphan_reaped_by_periodic_refused_upsert_when_finalized_elsewhere()
     -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let (s3, puts, deletes) = mock_s3_capturing();
         let buffers = Arc::new(LogBuffers::new());
-        let drv_path = "/nix/store/r17tg4-finalized-elsewhere.drv";
-        let drv_hash = "r17tg4";
+        let drv_path = "/nix/store/r18tg1-finalized-elsewhere.drv";
+        let drv_hash = "r18tg1";
 
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snap = recorder.snapshotter();
@@ -5460,16 +5467,56 @@ mod tests {
             30,
             state,
         );
+
+        // Phase 1 — the orphaned final: dropped, counted, zero PG and S3
+        // work, and the sealed non-empty entry deliberately left in place
+        // (the drop arm has no row consult; the periodic path below is the
+        // orphan's reaper).
         let ret = {
             let _guard = metrics::set_default_local_recorder(&recorder);
             flusher.flush_final(req).await
         };
         assert!(ret.is_none(), "orphaned request resolves as a drop");
-
-        // Read-only consult: nothing uploaded or deleted, the finalized row
-        // untouched.
-        assert!(puts.lock().unwrap().is_empty(), "no S3 PUT");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "the drop arm does no S3 PUT"
+        );
         assert!(deletes.lock().unwrap().is_empty(), "no S3 delete");
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "the drop arm keeps the sealed non-empty orphan (no PG consult)"
+        );
+        assert!(buffers.is_sealed(drv_path), "seal survives the drop");
+        assert!(buffers.final_pending(drv_path), "mark survives the drop");
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .any(|(n, _, v)| n == "rio_scheduler_log_flush_stale_tenure_total" && *v >= 1),
+            "tenure drop must be counted: {counters:?}"
+        );
+
+        // Phase 2 — the next periodic tick: the snapshot PUTs a `.partial`,
+        // the row UPSERT is refused (frozen by the interim leader's
+        // finalization), and the refusal reaps the sealed orphan so reads
+        // fall through to the authoritative finalized blob instead of stale
+        // is_complete=false ring lines until process restart.
+        flusher.flush_periodic().await;
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            None,
+            "refused periodic UPSERT must reap the sealed orphan stamped with the finalized exec"
+        );
+        assert!(
+            buffers.read_since(drv_path, 0).is_none(),
+            "ring must no longer shadow the finalized blob"
+        );
+        assert!(
+            !buffers.is_sealed(drv_path),
+            "seal tombstone cleared with the reaped entry"
+        );
+        // The finalized row is untouched (frozen-row latch).
         let row: (bool, i64, Option<String>, String) = sqlx::query_as(
             "SELECT is_complete, line_count, status, s3_key FROM drv_logs WHERE exec_id = $1",
         )
@@ -5480,38 +5527,39 @@ mod tests {
         assert_eq!(row.1, 10, "finalized coverage untouched");
         assert_eq!(row.2.as_deref(), Some("succeeded"), "status untouched");
         assert_eq!(row.3, final_key, "s3_key untouched");
-
-        // The sealed non-empty orphan is gone, so reads fall through to the
-        // authoritative finalized blob instead of stale is_complete=false
-        // ring lines until process restart.
+        // The tick that observed the refusal still PUT one `.partial`
+        // snapshot (the TTL GC sweeps it at expiry); nothing was deleted.
+        let put_keys: Vec<String> = puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
         assert_eq!(
-            buffers.exec_id(drv_path),
-            None,
-            "sealed non-empty orphan must be reaped once its exec is finalized elsewhere"
+            put_keys.len(),
+            1,
+            "exactly the one snapshot PUT that ran into the refusal: {put_keys:?}"
         );
-        assert!(
-            buffers.read_since(drv_path, 0).is_none(),
-            "ring must no longer shadow the finalized blob"
-        );
-        assert!(
-            !buffers.is_sealed(drv_path),
-            "seal tombstone cleared with the reaped entry"
-        );
-        // Counted as the stale-tenure drop (no new metric for the reap).
-        let counters = all_counters(&snap);
-        assert!(
-            counters
-                .iter()
-                .any(|(n, _, v)| n == "rio_scheduler_log_flush_stale_tenure_total" && *v >= 1),
-            "tenure drop must be counted: {counters:?}"
+        assert!(put_keys[0].ends_with(".partial.log.zst"));
+        assert!(deletes.lock().unwrap().is_empty(), "no S3 delete");
+
+        // Phase 3 — churn over: with the entry reaped the next tick has
+        // nothing left to snapshot for this drv.
+        flusher.flush_periodic().await;
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "no further re-PUT churn once the orphan is reaped"
         );
         Ok(())
     }
 
-    /// bug_004 (r17), the residual the reap must NOT widen into: same sealed
-    /// non-empty orphan shape, but no tenure ever finalized the exec — the
-    /// ring's lines are the best data available, so the entry stays (served
-    /// as is_complete=false) and only the request is dropped.
+    /// bug_004 (r17) / r18: the residual the reaps must NOT widen into — same
+    /// sealed non-empty orphan shape, but no tenure ever finalized the exec.
+    /// The ring's lines are the best data available, so the drop arm (which
+    /// performs no PG work) keeps the entry, only the request is dropped, and
+    /// the periodic snapshotter keeps it durable at `.partial` coverage
+    /// (served as is_complete=false) instead of reaping it.
     /// r[verify obs.log.deferred-final-retry+3]
     #[tokio::test]
     async fn stale_tenure_drop_keeps_sealed_nonempty_entry_when_not_finalized() -> anyhow::Result<()>
@@ -5589,6 +5637,290 @@ mod tests {
         );
         assert!(buffers.is_sealed(drv_path), "seal left untouched");
         assert!(buffers.final_pending(drv_path), "mark left untouched");
+        Ok(())
+    }
+
+    /// bug_009 (r18): the out-of-tenure drop arm performs ZERO PG work even
+    /// for the sealed non-empty shape — during the very outage that orphans
+    /// such requests, a row consult would serially burn a pool-acquire
+    /// timeout per retained final and stall the flusher select loop
+    /// (periodic snapshots, GC, new finals) for N×timeout. Structural pin:
+    /// with `drv_logs` locked ACCESS EXCLUSIVE (any read would block), the
+    /// drop must still resolve immediately — consumed, counted, entry kept.
+    /// r[verify obs.log.deferred-final-retry+3]
+    #[tokio::test]
+    async fn stale_tenure_drop_does_no_pg_work_for_sealed_nonempty_entry() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r18tg2-no-pg-work.drv";
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+
+        // Sealed, non-empty, exec-stamped, final-pending — the exact shape
+        // that previously (r17) triggered a drop-arm row consult.
+        let state = crate::lease::LeaderState::default();
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"pre-flap l0", b"pre-flap l1"]);
+        buffers.seal(drv_path);
+        assert!(buffers.mark_final_pending(drv_path, exec_id));
+        let req = FlushRequest {
+            drv_path: drv_path.into(),
+            exec_id,
+            status: Some("cancelled".into()),
+            lease_generation: state.generation(),
+        };
+        state.on_lose();
+        state.on_acquire();
+
+        // Wedge PG for reads: any drv_logs SELECT would park on this lock,
+        // so a drop arm that still consulted the row could not return until
+        // the lock is released (the timeout below would fire instead).
+        let mut lock_tx = db.pool.begin().await?;
+        sqlx::query("LOCK TABLE drv_logs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await?;
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            state,
+        );
+        let ret = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            tokio::time::timeout(Duration::from_secs(10), flusher.flush_final(req))
+                .await
+                .expect("the out-of-tenure drop arm must not block on PG")
+        };
+        lock_tx.rollback().await?;
+
+        assert!(ret.is_none(), "orphaned request resolves as a drop");
+        assert!(puts.lock().unwrap().is_empty(), "no S3 PUT");
+        assert!(deletes.lock().unwrap().is_empty(), "no S3 delete");
+        // The sealed non-empty orphan is left in place for the periodic
+        // refused-UPSERT reap (or, if never finalized elsewhere, for the
+        // periodic snapshotter to keep durable at `.partial` coverage).
+        assert_eq!(buffers.exec_id(drv_path), Some(exec_id), "entry kept");
+        assert!(
+            buffers
+                .read_since(drv_path, 0)
+                .is_some_and(|l| l.len() == 2),
+            "retained lines stay readable"
+        );
+        assert!(buffers.is_sealed(drv_path), "seal left untouched");
+        assert!(buffers.final_pending(drv_path), "mark left untouched");
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .any(|(n, _, v)| n == "rio_scheduler_log_flush_stale_tenure_total" && *v >= 1),
+            "tenure drop must be counted: {counters:?}"
+        );
+        Ok(())
+    }
+
+    /// merged_bug_007 part b (r18): a request that goes stale DURING the
+    /// finalize-guard SELECT in the already-finalized arm has the
+    /// `is_complete=true` row literally in hand — the mid-await drop must
+    /// use it and reap the sealed NON-empty residue (require_empty=false),
+    /// not just the empty shape, so the orphan does not shadow the
+    /// finalized blob until restart. Same LOCK TABLE fixture as the
+    /// not-finalized mid-await test; the row here is frozen complete.
+    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.finalize-immutable]
+    #[tokio::test]
+    async fn tenure_lost_during_finalized_guard_select_reaps_sealed_nonempty_residue()
+    -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r18tg3-mid-await-finalized.drv";
+        let drv_hash = "r18tg3";
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+
+        // Tenure 1: two retained pre-flap lines, sealed, marked — and the
+        // execution is ALREADY finalized in drv_logs (an interim leader
+        // completed it; this replica's request is pre-failover residue).
+        let state = crate::lease::LeaderState::default();
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"pre-flap l0", b"pre-flap l1"]);
+        buffers.seal(drv_path);
+        buffers.mark_prefix_checked(drv_path, exec_id);
+        assert!(buffers.mark_final_pending(drv_path, exec_id));
+        let req = FlushRequest {
+            drv_path: drv_path.into(),
+            exec_id,
+            status: Some("cancelled".into()),
+            lease_generation: state.generation(),
+        };
+
+        let final_key = log_s3_key(drv_path, &exec_id, false);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &final_key,
+            0,
+            10,
+            1_000,
+            true,
+            Some("succeeded"),
+        )
+        .await?;
+
+        // Hold the guard SELECT open: the lease moves while it is in
+        // flight, so it returns the finalized row into a stale tenure.
+        let mut lock_tx = db.pool.begin().await?;
+        sqlx::query("LOCK TABLE drv_logs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await?;
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            state.clone(),
+        );
+
+        // join! polls flush_final first: the synchronous entry pin passes
+        // under generation 1, the guard SELECT parks on the table lock, and
+        // the second branch then flips the tenure and releases the lock.
+        let ret = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (ret, ()) = tokio::join!(flusher.flush_final(req), async {
+                state.on_lose();
+                state.on_acquire();
+                lock_tx.rollback().await.expect("release the table lock");
+            });
+            ret
+        };
+        assert!(ret.is_none(), "stale-after-await request is not retained");
+
+        // Nothing uploaded or deleted; the finalized row untouched.
+        assert!(puts.lock().unwrap().is_empty(), "no S3 PUT");
+        assert!(deletes.lock().unwrap().is_empty(), "no S3 delete");
+        let row: (bool, i64, Option<String>, String) = sqlx::query_as(
+            "SELECT is_complete, line_count, status, s3_key FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(row.0, "finalized row stays complete");
+        assert_eq!(row.1, 10, "finalized coverage untouched");
+        assert_eq!(row.2.as_deref(), Some("succeeded"), "status untouched");
+        assert_eq!(row.3, final_key, "s3_key untouched");
+
+        // The in-hand finalized row proves the retained lines are
+        // superseded: the sealed non-empty residue is reaped so reads fall
+        // through to the durable blob instead of stale ring lines.
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            None,
+            "sealed non-empty residue must be reaped using the in-hand finalized row"
+        );
+        assert!(
+            buffers.read_since(drv_path, 0).is_none(),
+            "ring must no longer shadow the finalized blob"
+        );
+        assert!(
+            !buffers.is_sealed(drv_path),
+            "seal tombstone cleared with the reaped entry"
+        );
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .any(|(n, _, v)| n == "rio_scheduler_log_flush_stale_tenure_total" && *v >= 1),
+            "mid-await tenure loss must be counted as a stale-tenure drop: {counters:?}"
+        );
+        Ok(())
+    }
+
+    /// Negative space of the periodic refused-UPSERT reap (r18): an UNSEALED
+    /// entry is the live execution's carrier — a refused snapshot UPSERT
+    /// (row already finalized, e.g. the accepted post-drain residual where a
+    /// stale final froze the row while the same exec keeps streaming here)
+    /// must NOT reap it: the worker is still pushing into it and reads are
+    /// served from it. Only the seal (no restamp in the current tenure
+    /// adopted the entry) marks an entry as reapable orphan residue.
+    #[tokio::test]
+    async fn periodic_refused_upsert_leaves_unsealed_live_carrier_untouched() -> anyhow::Result<()>
+    {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, _deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r18tg4-live-carrier-refused.drv";
+        let drv_hash = "r18tg4";
+
+        // Live carrier: stamped, unsealed, streaming.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"live l0", b"live l1"]);
+
+        // The execution's row is already frozen complete (another tenure's
+        // final landed; the frozen-row latch will refuse this replica's
+        // periodic snapshot UPSERT).
+        let final_key = log_s3_key(drv_path, &exec_id, false);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &final_key,
+            0,
+            10,
+            1_000,
+            true,
+            Some("succeeded"),
+        )
+        .await?;
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        flusher.flush_periodic().await;
+
+        // The snapshot reached the UPSERT (one `.partial` PUT) and was
+        // refused — but the live carrier is untouched and still writable.
+        assert_eq!(puts.lock().unwrap().len(), 1, "snapshot PUT happened");
+        assert_eq!(
+            buffers.exec_id(drv_path),
+            Some(exec_id),
+            "unsealed live carrier must not be reaped on a refused UPSERT"
+        );
+        assert!(
+            buffers
+                .read_since(drv_path, 0)
+                .is_some_and(|l| l.len() == 2),
+            "live lines stay served from the ring"
+        );
+        assert!(!buffers.is_sealed(drv_path), "carrier stays unsealed");
+        assert!(
+            buffers.push_for(
+                drv_path,
+                &mk_batch(drv_path, 2, &[b"live l2"]),
+                "test-worker"
+            ),
+            "the live execution's batches must still be accepted"
+        );
+        let row: (bool, i64) =
+            sqlx::query_as("SELECT is_complete, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert!(
+            row.0,
+            "finalized row stays complete (latch refused the snapshot)"
+        );
+        assert_eq!(row.1, 10, "finalized coverage untouched");
         Ok(())
     }
 

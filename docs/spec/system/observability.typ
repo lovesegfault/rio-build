@@ -151,17 +151,21 @@ orphaned before its attempt or while the attempt was awaiting PG/S3 ---
 triggers no S3 work and none of the guard's destructive reap or deferral
 arms, which are execution-scoped but not tenure-scoped and could otherwise
 touch a ring entry that the new tenure's recovery has restamped onto the
-still-live execution. When the orphaned request's entry is still sealed for
-that execution (no restamp in the current tenure adopted it), the drop also
-reaps it: an empty entry outright (no PG read --- the terminal persisted
-under the old tenure, so nothing else will ever resolve it, and left in
-place it would shadow the stored `.partial` with an empty in-memory
-buffer), and a non-empty entry only after one read-only `drv_logs` consult
-shows another tenure already finalized the execution (the durable finalized
-record is authoritative and the retained lines are superseded by it). Any
-other entry --- unsealed, restamped, or sealed non-empty without a
-finalized row --- is left for its real owner: the live tenure's own final,
-the next dispatch discard, or process exit.
+still-live execution. The drop itself performs no PG work. When the orphaned
+request's entry is still sealed for that execution (no restamp in the current
+tenure adopted it), the drop reaps an empty entry outright (the terminal
+persisted under the old tenure, so nothing else will ever resolve it, and
+left in place it would shadow the stored `.partial` with an empty in-memory
+buffer); a sealed non-empty entry is left in place and reaped by the periodic
+flush instead --- once another tenure has finalized the execution, the
+snapshot's row UPSERT is refused by the frozen-row latch and the flusher
+discards the still-sealed entry on that refusal (the durable finalized record
+is authoritative and the retained lines are superseded by it), within one
+periodic tick of PG and leadership recovery. A sealed non-empty entry whose
+execution no tenure ever finalizes keeps being snapshotted at `.partial`
+coverage --- its ring lines are the best data available. Any other entry ---
+unsealed or restamped --- is left for its real owner: the live tenure's own
+final, the next dispatch discard, or process exit.
 The protection starts at enqueue: a final still queued behind earlier stalled
 flushes during the same outage is protected exactly like one already
 attempted and deferred, and stays pinned until the flusher resolves the
