@@ -183,7 +183,9 @@ tenure's own final, the next dispatch discard, or process exit. (None of these
 reaps gates read availability: `GetDerivationLogs` probes the execution's
 stored `.partial` whenever the ring entry it finds holds zero lines, falling
 back to the empty re-poll chunk only when nothing is stored for that execution
-yet.)
+yet, or when the stored side cannot be consulted at all (PG query / S3 fetch
+failure) --- the read warns and degrades to the re-poll answer rather than
+erroring.)
 The protection starts at enqueue: a final still queued behind earlier stalled
 flushes during the same outage is protected exactly like one already
 attempted and deferred, and stays pinned until the flusher resolves the
