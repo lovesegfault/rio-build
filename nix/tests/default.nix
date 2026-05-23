@@ -655,7 +655,7 @@ in
     };
   };
 
-  # ── lifecycle splits (4 tests, k3s-full fixture) ─────────────────────
+  # ── lifecycle splits (5 tests, k3s-full fixture) ─────────────────────
   # Monolith was ~14min (13 subtests serially after ~4min bootstrap).
   # Split critical path ~8min (autoscale: 238s subtests + 4min boot).
   # The `initial` subtest was dropped — it only existed to seed out_pin
@@ -681,13 +681,6 @@ in
       # r[verify builder.cgroup.kill-on-teardown]
       # r[verify builder.timeout.no-reassign]
       "build-timeout"
-      "gc-dry-run"
-      # r[verify store.gc.tenant-retention]
-      "gc-sweep"
-      # r[verify builder.upload.references-scanned]
-      # r[verify builder.upload.deriver-populated]
-      # r[verify store.gc.two-phase]
-      "refs-end-to-end"
       # r[verify ctrl.pool.reconcile]
       # r[verify ctrl.crd.pool]
       #   pool-lifecycle: apply Pool CRD → wait status → delete
@@ -695,6 +688,25 @@ in
       #   with the subtests above), so it folds into core rather than
       #   paying a separate k3s boot.
       "pool-lifecycle"
+    ];
+  };
+
+  # gc + refs split out of core. gc-sweep (~86s, includes a gateway
+  # scale-0→1 bounce) and refs-end-to-end were half of core's subtest
+  # budget, which made core the longest VM test in CI and therefore
+  # the tail of the pipeline's critical path. Both fragments build
+  # their own paths (no shared state with core's remaining subtests),
+  # so the split costs one more k3s boot and nothing else.
+  vm-lifecycle-gc-k3s = lifecycleMod.mkTest {
+    name = "gc";
+    subtests = [
+      "gc-dry-run"
+      # r[verify store.gc.tenant-retention]
+      "gc-sweep"
+      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.deriver-populated]
+      # r[verify store.gc.two-phase]
+      "refs-end-to-end"
     ];
   };
 
