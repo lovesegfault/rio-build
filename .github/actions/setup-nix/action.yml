@@ -10,6 +10,23 @@ inputs:
 runs:
   using: composite
   steps:
+    # ── migration shim ──────────────────────────────────────────────
+    # The ARC runner image is being switched to one with Nix baked in
+    # (rio-infra: nix/runner-image.nix). Skip the installer when nix
+    # is already present so this action works on both the stock image
+    # and the new one during the rollout. Once every scale set runs
+    # the new image, delete this probe and the two `if:`s below along
+    # with the steps they guard.
+    - id: probe
+      shell: bash
+      run: |
+        if command -v nix >/dev/null 2>&1; then
+          echo "have-nix=true" >> "$GITHUB_OUTPUT"
+          echo "nix pre-installed: $(nix --version)"
+        else
+          echo "have-nix=false" >> "$GITHUB_OUTPUT"
+        fi
+
     # nix-installer-action's trust-runner-user builds
     #   trusted-users = root $USER
     # but ARC containers spawn steps without a login shell, so $USER
@@ -17,7 +34,10 @@ runs:
     # extra-substituters and post-build-hook are rejected by the
     # daemon. Export it from getpwuid so the next step's $USER ref
     # expands. Upstream: NixOS/nix-installer-action#12 (id -un).
-    - shell: bash
+    # (Not needed on the pre-baked image: single-user nix has no
+    # daemon and the store owner is implicitly trusted.)
+    - if: steps.probe.outputs.have-nix != 'true'
+      shell: bash
       run: echo "USER=$(id -un)" >> "$GITHUB_ENV"
 
     # Warm flake-input fetches (gitv3/tarball-cache) and the eval
@@ -36,7 +56,8 @@ runs:
     # 6b8548f includes PR#9 (--enable-flakes; the wrapped installer
     # stopped enabling flakes by default) and PR#10 (skip udev write
     # on container runners — what enable-kvm:false below worked around).
-    - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+    - if: steps.probe.outputs.have-nix != 'true'
+      uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
       with:
         # Default is true; it writes a udev rule to /etc/udev/rules.d/
         # which doesn't exist in ARC runner containers. We handle KVM
