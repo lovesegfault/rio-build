@@ -1059,6 +1059,11 @@
                   # Fuzz corpus seeds are exact binary/text inputs; trailing
                   # newlines would change what the fuzzer sees.
                   "^fuzz/.+/corpus/"
+                  # Vendored patch files must stay byte-exact: unified-diff
+                  # context lines for blank lines are a single space, which
+                  # trim-trailing-whitespace would strip, corrupting the
+                  # patch.
+                  "^nix/patches/.+\\.patch$"
                 ];
 
                 settings.hooks = {

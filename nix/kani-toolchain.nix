@@ -33,7 +33,8 @@
 #            (verify-artifacts subcommand, compiler default rustc flags;
 #            upstream PRs to model-checking/kani in flight)
 #   nightly: 2025-11-21        (rust-toolchain.toml)
-#   cbmc:    6.8.0             (kani-dependencies; nixpkgs has exactly 6.8.0)
+#   cbmc:    6.8.0             (kani-dependencies; pinned locally below —
+#                               nixpkgs has moved on to a newer cbmc)
 #   kissat:  >= 4.0.1          (kani-dependencies; nixpkgs 4.0.4 satisfies)
 #
 # Layout (release-shaped, so kani-driver classifies as InstallType::Release):
@@ -110,10 +111,37 @@ let
   # with no CI signal. Assert at eval time so the bump fails loudly. When
   # bumping `kaniVersion`, re-read kani-dependencies at the new tag and
   # update the expected versions here in the same commit.
+  #
+  # nixpkgs' cbmc has moved past the 6.8.0 release kani 0.67.0 pins
+  # (kani-driver checks the version at startup and refuses a mismatch),
+  # so rebuild the same nixpkgs recipe at 6.8.0: the 6.8.0 source, the
+  # cadical-2.0.0 vendored solver source that release expects, and the
+  # matching do-not-download cmake patches (vendored under
+  # nix/patches/cbmc-6.8.0/, taken from the last nixpkgs revision that
+  # shipped 6.8.0). DROP this override — back to plain `pkgs.cbmc`, and
+  # delete nix/patches/cbmc-6.8.0/ — when the kani fork is refreshed to
+  # a release whose kani-dependencies accepts the cbmc nixpkgs ships;
+  # the bump checklist above governs that refresh.
+  cbmcPinned = pkgs.cbmc.overrideAttrs {
+    version = "6.8.0";
+    src = pkgs.fetchFromGitHub {
+      owner = "diffblue";
+      repo = "cbmc";
+      tag = "cbmc-6.8.0";
+      hash = "sha256-PT6AYiwkplCeyMREZnGZA0BKl4ZESRC02/9ibKg7mYU=";
+    };
+    srccadical = (pkgs.cadical.override { version = "2.0.0"; }).src;
+    patches = [
+      (pkgs.replaceVars ./patches/cbmc-6.8.0/0001-Do-not-download-sources-in-cmake.patch {
+        cudd = pkgs.cudd.src;
+      })
+      ./patches/cbmc-6.8.0/0002-Do-not-download-sources-in-cmake.patch
+    ];
+  };
   cbmc =
-    assert lib.assertMsg (pkgs.cbmc.version == "6.8.0")
-      "kani ${kaniVersion} expects CBMC 6.8.0, nixpkgs has ${pkgs.cbmc.version}; re-read kani-dependencies and update this pin";
-    pkgs.cbmc;
+    assert lib.assertMsg (cbmcPinned.version == "6.8.0")
+      "kani ${kaniVersion} expects CBMC 6.8.0, the local pin produced ${cbmcPinned.version}; re-read kani-dependencies and update this pin";
+    cbmcPinned;
   kissat =
     assert lib.assertMsg (lib.versionAtLeast pkgs.kissat.version "4.0.1")
       "kani ${kaniVersion} needs Kissat >= 4.0.1, nixpkgs has ${pkgs.kissat.version}";
