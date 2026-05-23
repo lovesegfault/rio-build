@@ -659,8 +659,9 @@ impl LogFlusher {
             //    kept flushing) and truncates the ring to empty, no UPSERT
             //    can ever run for it again — the periodic tick then reaps
             //    the sealed, now-empty entry at its empty-snapshot
-            //    early-return so reads fall through to that stored
-            //    `.partial`. Either way the orphan's shadowing of the
+            //    early-return (bookkeeping: reads already fall through to
+            //    that stored `.partial` once the ring holds zero
+            //    lines). Either way the orphan's shadowing of the
             //    durable record (and any `.partial` re-PUT churn) is
             //    bounded to one periodic tick after PG/leadership
             //    recovery. The permanent residual is an exec whose row is
@@ -686,8 +687,8 @@ impl LogFlusher {
                 debug!(
                     drv = %req.drv_path,
                     exec_id = %req.exec_id,
-                    "reaped the dropped final's sealed, empty entry so reads \
-                     fall through to the stored .partial"
+                    "reaped the dropped final's sealed, empty entry \
+                     (bookkeeping; reads are unaffected)"
                 );
             }
             return None;
@@ -822,8 +823,8 @@ impl LogFlusher {
                         drv = %req.drv_path,
                         exec_id = %req.exec_id,
                         error = %e,
-                        "deferring final flush with an empty entry: reaped it so \
-                         reads fall through to the stored .partial; row left to \
+                        "deferring final flush with an empty entry: reaped it \
+                         (bookkeeping; reads are unaffected); row left to \
                          the TTL sweep"
                     );
                     return None;
@@ -1669,8 +1670,8 @@ impl LogFlusher {
                 debug!(
                     drv = %req.drv_path,
                     exec_id = %exec_id,
-                    "empty periodic snapshot of a sealed entry: reaped it so \
-                     reads fall through to the stored .partial"
+                    "empty periodic snapshot of a sealed entry: reaped it \
+                     (bookkeeping; reads are unaffected)"
                 );
             }
             return;
@@ -4017,10 +4018,12 @@ mod tests {
 
     /// Scenario 3 of r14 merged_bug_003: a deferral that finds only an empty
     /// (failover-restamped, never-streamed) entry reaps it — exec-guarded —
-    /// so `GetDerivationLogs` falls through to the ex-leader's stored
-    /// `.partial` instead of serving empty still-active chunks until build
-    /// cleanup. A re-dispatched execution's fresh empty entry is never
-    /// touched by a stale deferred request.
+    /// instead of retaining it: nothing any retry could upload, and keeping
+    /// it would only pin memory and the final-pending mark until build
+    /// cleanup (reads are unaffected — `GetDerivationLogs` probes the
+    /// ex-leader's stored `.partial` for a zero-line entry either way). A
+    /// re-dispatched execution's fresh empty entry is never touched by a
+    /// stale deferred request.
     /// r[verify obs.log.deferred-final-retry+3]
     #[tokio::test]
     async fn deferred_final_with_empty_entry_reaps_it_for_this_exec_only() -> anyhow::Result<()> {
@@ -4059,7 +4062,7 @@ mod tests {
         assert_eq!(
             buffers.exec_id(drv_a),
             None,
-            "empty entry reaped so reads fall through to the stored .partial"
+            "deferred empty entry must be reaped (bookkeeping; nothing to retain for retry)"
         );
         assert!(
             !buffers.is_sealed(drv_a),
@@ -4067,7 +4070,7 @@ mod tests {
         );
         assert!(
             buffers.read_since(drv_a, 0).is_none(),
-            "ring no longer shadows S3"
+            "reaped entry leaves no ring state behind"
         );
 
         // (2) Exec guard: a stale deferred request must not reap the NEW
@@ -4915,13 +4918,13 @@ mod tests {
     }
 
     /// bug_009 (r16): a tenure-dropped final whose entry is still SEALED and
-    /// EMPTY is the orphaned-shadow shape — the terminal already persisted
+    /// EMPTY is the unowned-orphan shape — the terminal already persisted
     /// under the old tenure, so no reaper remains (recovery restamps only
     /// Assigned|Running, the acquisition sweep skips sealed entries, terminal
-    /// cleanup skips marked ones), and the empty entry makes
-    /// `GetDerivationLogs` serve empty is_complete=false chunks instead of
-    /// falling through to the prior leader's stored `.partial` until process
-    /// restart. The tenure-drop arm must reap it: still-sealed proves no
+    /// cleanup skips marked ones), and left in place the entry would just sit
+    /// in memory until process restart (reads are unaffected: for a zero-line
+    /// entry `GetDerivationLogs` probes the prior leader's stored `.partial`
+    /// directly). The tenure-drop arm must reap it: still-sealed proves no
     /// restamp adopted the entry (restamps clear seals), empty proves there
     /// is nothing to lose.
     /// r[verify obs.log.deferred-final-retry+3]
@@ -5009,9 +5012,9 @@ mod tests {
         assert!(!row.0, "stored row left incomplete (no stale finalize)");
         assert_eq!(row.1, 10, "stored coverage untouched");
         assert_eq!(row.2, None, "no stale terminal status stamped");
-        // ...and the sealed, empty, marked orphan is GONE so the read path
-        // falls through to the stored `.partial` instead of serving empty
-        // chunks until restart.
+        // ...and the sealed, empty, marked orphan is GONE — the bookkeeping
+        // reap; reads were already served from the stored `.partial` either
+        // way.
         assert_eq!(
             buffers.exec_id(drv_path),
             None,
@@ -5019,7 +5022,7 @@ mod tests {
         );
         assert!(
             buffers.read_since(drv_path, 0).is_none(),
-            "ring must no longer shadow the stored .partial"
+            "reaped orphan leaves no ring state behind"
         );
         assert!(
             !buffers.is_sealed(drv_path),
@@ -6004,9 +6007,9 @@ mod tests {
     /// early-returns out of the periodic path before any PUT/UPSERT — the
     /// refused-UPSERT reap is structurally unreachable and no other reaper
     /// exists. The periodic tick must reap the sealed, now-empty entry on
-    /// that same tick so reads fall through to the stored `.partial`
-    /// instead of serving a single empty is_complete=false chunk until
-    /// process restart.
+    /// that same tick — otherwise it would just sit in memory until process
+    /// restart (reads are unaffected either way: a zero-line entry's reads
+    /// are served from the stored `.partial`).
     /// r[verify obs.log.deferred-final-retry+3]
     /// r[verify obs.log.stored-coverage-preserved]
     #[tokio::test]
@@ -6107,7 +6110,7 @@ mod tests {
         );
         assert!(
             buffers.read_since(drv_path, 0).is_none(),
-            "reads must fall through to the stored .partial instead of an empty ring chunk"
+            "reaped entry leaves no ring state behind"
         );
         assert!(
             !buffers.is_sealed(drv_path),

@@ -109,8 +109,10 @@ frozen row keeps pointing at it.
 When the row cannot be consulted at all (the lookup itself fails), the flusher
 fails closed: nothing is uploaded on that attempt. A deferral with a non-empty
 buffer is retained and retried (below); a deferral that finds only an empty
-restamped entry reaps it so the read path falls through to the stored
-`.partial` instead of serving empty still-active chunks. Either way the
+restamped entry reaps it instead of retaining it (bookkeeping --- nothing any
+retry could upload, and `GetDerivationLogs` probes the execution's stored
+`.partial` whenever the ring entry it finds holds zero lines, so the reap does
+not gate reads). Either way the
 execution's row may remain `is_complete = false` (surfaced per
 `obs.log.incomplete-surfaced`) until a retry lands.
 
@@ -177,7 +179,8 @@ per-tenure stored-coverage reconcile finds a prior tenure's row covering past
 the retained ring and empties it: an empty ring is never uploaded, so the
 refused-UPSERT chokepoint can no longer observe that entry, and the periodic
 flush instead reaps the sealed, now-empty entry at its empty-snapshot
-early-return so reads fall through to that stored `.partial`. Any other
+early-return as bookkeeping --- reads are already served from that stored
+`.partial`. Any other
 entry --- unsealed or restamped --- is left for its real owner: the live
 tenure's own final, the next dispatch discard, or process exit. (None of these
 reaps gates read availability: `GetDerivationLogs` probes the execution's

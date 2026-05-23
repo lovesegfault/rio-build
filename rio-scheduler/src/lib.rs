@@ -362,7 +362,8 @@ pub fn describe_metrics() {
          periodic tick until PG answers (terminal cleanup leaves the buffer to the retry; a \
          request whose leadership tenure has ended by then is dropped instead — see \
          rio_scheduler_log_flush_stale_tenure_total); \
-         an empty buffer is reaped so reads fall through to the stored .partial. Counted per \
+         an empty buffer is reaped as bookkeeping (reads already fall through to the stored \
+         .partial when the ring entry holds zero lines). Counted per \
          attempt, so retries during one outage keep incrementing it. Sustained rate indicates \
          PG trouble on the flush path; loss requires the retry retention cap to overflow, \
          leadership to move before PG recovers, or the process to exit before PG recovers."

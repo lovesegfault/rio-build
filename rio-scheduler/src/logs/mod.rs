@@ -932,14 +932,15 @@ impl LogBuffers {
     /// task dead, or no flusher configured): the flusher's `drain_if_exec`
     /// will never remove the entry, the periodic snapshot skips zero-line
     /// entries, and the drv is terminal so no re-dispatch `discard` is
-    /// coming. Left in place, the empty entry makes `GetDerivationLogs`
-    /// serve an empty "still active" chunk instead of falling through to
-    /// S3 — which can hold the ex-leader's `.partial`, the only stored
-    /// content for the execution (the fresh-standby recovery-restamp shape
-    /// of `adopt_orphan_completion`). A non-empty entry is deliberately
-    /// left alone: its lines are still wanted (the periodic flush keeps
-    /// snapshotting them while a flusher exists; `CleanupTerminalBuild`
-    /// discards at build cleanup).
+    /// coming — left in place the dead carrier would just sit in memory
+    /// until `CleanupTerminalBuild`. Reads do not depend on the reap:
+    /// `GetDerivationLogs` probes the stored side (e.g. the ex-leader's
+    /// `.partial` from the fresh-standby recovery-restamp shape of
+    /// `adopt_orphan_completion`) whenever the entry it finds holds zero
+    /// lines, so removing the entry is bookkeeping hygiene. A non-empty
+    /// entry is deliberately left alone: its lines are still wanted (the
+    /// periodic flush keeps snapshotting them while a flusher exists;
+    /// `CleanupTerminalBuild` discards at build cleanup).
     ///
     /// Atomicity: the emptiness check and the removal happen together
     /// under `remove_if`'s per-shard lock. A `push_for` that passed the
@@ -1705,10 +1706,12 @@ mod tests {
     }
 
     /// bug_008 (round 11): when the terminal FlushRequest cannot be
-    /// enqueued, the actor reaps a ZERO-line (recovery-restamped) entry so
-    /// GetDerivationLogs falls through to the ex-leader's S3 `.partial`,
-    /// but must keep an entry that holds lines (the ex-leader retained
-    /// tail) for the periodic snapshot + CleanupTerminalBuild path.
+    /// enqueued, the actor reaps a ZERO-line (recovery-restamped) entry —
+    /// nothing will ever persist or serve it, so the reap is bookkeeping
+    /// (reads probe the ex-leader's S3 `.partial` for a zero-line entry
+    /// either way) — but must keep an entry that holds lines (the
+    /// ex-leader retained tail) for the periodic snapshot +
+    /// CleanupTerminalBuild path.
     #[test]
     fn discard_if_empty_removes_only_zero_line_entries() {
         let bufs = LogBuffers::new();
@@ -1730,7 +1733,7 @@ mod tests {
         );
         assert!(
             bufs.read_since("empty-drv", 0).is_none(),
-            "no entry left to shadow the S3 fallthrough"
+            "reaped entry leaves no ring state behind"
         );
         assert!(!bufs.is_sealed("empty-drv"), "removal also unseals");
 

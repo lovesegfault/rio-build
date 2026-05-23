@@ -761,8 +761,8 @@ impl DagActor {
         // coverage until process restart, or — when the stored-coverage
         // reconcile finds a prior tenure's row covering past the retained
         // ring and empties it — is reaped by the periodic flush's
-        // sealed-empty empty-snapshot reap so reads fall through to that
-        // stored `.partial`.
+        // sealed-empty empty-snapshot reap (bookkeeping; reads already
+        // fall through to that stored `.partial` once the ring is empty).
         // r[impl obs.log.deferred-final-retry+3]
         let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {

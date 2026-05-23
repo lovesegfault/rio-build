@@ -2949,11 +2949,13 @@ async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
 /// `test_orphan_completion_routes_log_through_epilogue`: when the flush
 /// channel is full at adoption time (post-failover terminal burst), the
 /// flusher will never `drain_if_exec` the recovery-stamped entry — the
-/// actor must reap the zero-line entry itself so `GetDerivationLogs`
-/// falls through to the ex-leader's S3 `.partial` instead of serving an
-/// empty "still active" chunk for the rest of the build's lifetime
-/// (bug_008, round 11). The retained-tail (non-empty) shape is NOT
-/// reaped — that is `test_orphan_completion_preserves_ex_leader_log_tail`
+/// actor must reap the zero-line entry itself (bug_008, round 11): no
+/// other reaper remains before the build's CleanupTerminalBuild, and the
+/// dead carrier would just sit in memory until then (reads are
+/// unaffected — `GetDerivationLogs` probes the ex-leader's S3 `.partial`
+/// for a zero-line entry whether or not it is reaped). The retained-tail
+/// (non-empty) shape is NOT reaped — that is
+/// `test_orphan_completion_preserves_ex_leader_log_tail`
 /// plus the `discard_if_empty_removes_only_zero_line_entries` unit test.
 /// Also asserts `bd.exec_id` directly: the discard runs before
 /// `record_exec_correlation` and must not affect it.
@@ -3049,16 +3051,15 @@ async fn test_orphan_completion_dropped_flush_discards_empty_buffer() -> TestRes
         "exactly one message total: the adoption's FlushRequest was dropped (channel full)"
     );
 
-    // KEY ASSERTION (the fix): the empty recovery-stamped entry is gone, so
-    // GetDerivationLogs' ring-buffer probe returns None and the handler
-    // falls through to S3, where the ex-leader's `.partial` row (when one
-    // exists) is the served content. Before the fix this read_since
-    // returned Some([]) and the handler answered with an empty
-    // is_complete=false "still active" chunk until the whole build's
-    // CleanupTerminalBuild.
+    // KEY ASSERTION (the fix): the empty recovery-stamped entry is gone
+    // instead of lingering as a dead carrier until the whole build's
+    // CleanupTerminalBuild. (When bug_008 was fixed this reap was also what
+    // let reads reach the ex-leader's `.partial`; GetDerivationLogs now
+    // probes the stored side for a zero-line entry itself, so the reap is
+    // bookkeeping and reads are unaffected either way.)
     assert!(
         log_buffers.read_since(&drv_path, 0).is_none(),
-        "dropped FlushRequest must not leave an empty entry shadowing S3"
+        "dropped FlushRequest must not leave a dead empty entry behind"
     );
     assert!(
         log_buffers.exec_id(&drv_path).is_none(),

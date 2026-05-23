@@ -964,21 +964,22 @@ impl DagActor {
             // flusher dead, or not configured), so its drain_if_exec will
             // never remove the entry. A zero-line entry has nothing the
             // periodic snapshot will ever persist (line_count==0 skip) and
-            // nothing to serve, but its existence makes GetDerivationLogs
-            // return an empty "still active" chunk instead of falling
-            // through to S3 — which can hold the ex-leader's `.partial`,
-            // the only stored content for this execution (recovery's
-            // restamp + adopt_orphan_completion). Reap it now; entries
-            // with lines keep the documented degraded mode (periodic
-            // `.partial` snapshots while a flusher exists, then
-            // CleanupTerminalBuild). A late LogBatch that would have hit
-            // the sealed-drop now hits the no-entry reject instead —
-            // dropped either way.
+            // nothing to serve; reads never depended on it either
+            // (GetDerivationLogs probes the stored side — e.g. the
+            // ex-leader's `.partial` from recovery's restamp +
+            // adopt_orphan_completion — when the entry it finds holds zero
+            // lines). Reap it now so the dead carrier does not sit in
+            // memory until CleanupTerminalBuild; entries with lines keep
+            // the documented degraded mode (periodic `.partial` snapshots
+            // while a flusher exists, then CleanupTerminalBuild). A late
+            // LogBatch that would have hit the sealed-drop now hits the
+            // no-entry reject instead — dropped either way.
             tracing::debug!(
                 drv_hash = %drv_hash,
                 exec_id = %exec_id,
                 status,
-                "flush enqueue failed; discarded empty sealed log buffer so reads fall through to S3"
+                "flush enqueue failed; discarded empty sealed log buffer \
+                 (bookkeeping; reads are unaffected)"
             );
         }
         self.record_exec_correlation(drv_hash, exec_id, interested_builds);
