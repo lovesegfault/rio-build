@@ -437,6 +437,29 @@ pub struct DagActor {
     /// cast `u64 as i64` at THAT single boundary instead of at every
     /// proto-encode site.
     leader: LeaderState,
+    /// True only while `self.dag` reflects PG: set in
+    /// `handle_leader_acquired`'s Ok arm (this tenure's
+    /// `recover_from_pg` succeeded), cleared by every
+    /// [`clear_persisted_state`](Self::clear_persisted_state) caller
+    /// (LeaderLost, recovery start, the TOCTOU flap discard, and the
+    /// failed-recovery Err arm).
+    ///
+    /// NOT the same thing as [`LeaderState::recovery_complete`]: that
+    /// flag is deliberately set true even when recovery FAILS (empty
+    /// DAG — "degrade, don't block", which `dispatch_ready` and
+    /// `LogFlusher::may_flush` want), and the lose-during-recovery
+    /// TODO can leave it stale-true into the next acquire's
+    /// pre-`LeaderAcquired` gap. Destructive consumers that infer
+    /// "stale" from "not in the DAG" (the disconnect-time log-buffer
+    /// discard) must check THIS bit instead.
+    ///
+    /// Initialized from the `LeaderState` constructor semantics
+    /// (`plumbing.leader.recovery_complete()`): `always_leader`
+    /// (non-K8s / single-scheduler / test default) starts true — no
+    /// lease loop ever sends `LeaderAcquired` there, and the never-
+    /// cleared DAG is all the state that exists; `pending` (K8s mode)
+    /// starts false until the first successful recovery.
+    dag_authoritative: bool,
     /// Weak clone of the actor's own command sender, for scheduling delayed
     /// internal commands (e.g., terminal build cleanup). Weak so the actor
     /// doesn't prevent channel close when all external handles are dropped.
@@ -684,6 +707,12 @@ impl DagActor {
             &cfg.sla,
             plumbing.cost_table.read().resolved_global(),
         );
+        // Mirror the LeaderState constructor semantics (see the field
+        // doc): always_leader starts with recovery_complete=true and no
+        // recovery will ever run (no lease loop → no LeaderAcquired),
+        // so its DAG counts as authoritative from the start; pending
+        // starts false until the first successful recovery's Ok arm.
+        let dag_authoritative = plumbing.leader.recovery_complete();
 
         Self {
             dag,
@@ -717,6 +746,7 @@ impl DagActor {
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
+            dag_authoritative,
             self_tx: None,
             soft_features: cfg.soft_features,
             hmac_signer: plumbing.hmac_signer,
@@ -780,6 +810,7 @@ impl DagActor {
             dispatched_cells,
             hung_nodes,
             authoritative_binding,
+            dag_authoritative,
             // Retained: rationale below.
             log_buffers: _,
             executors: _,
@@ -859,6 +890,14 @@ impl DagActor {
         // misattribute a re-dispatched drv to a previous-generation
         // node.
         authoritative_binding.clear();
+        // The DAG this fn just emptied no longer reflects PG; only the
+        // next successful recovery (handle_leader_acquired's Ok arm)
+        // re-asserts authoritativeness. Clearing HERE covers all four
+        // callers — LeaderLost, recovery start, the TOCTOU flap
+        // discard, and the failed-recovery Err arm — so the
+        // disconnect-time log-buffer discard fails closed in every
+        // empty-DAG window.
+        *dag_authoritative = false;
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
         // - `log_buffers`: retained so a still-streaming worker's in-flight
@@ -1045,9 +1084,10 @@ impl DagActor {
                     // the PG-writing tail (reassign_derivations →
                     // poison/Ready/terminal-log writes) self-gates on
                     // is_leader() in executor.rs, and the log-buffer discard
-                    // loop there additionally requires recovery_complete —
-                    // a LeaderLost-cleared / not-yet-rebuilt DAG cannot tell
-                    // stale entries from retained in-flight ones.
+                    // loop there additionally requires dag_authoritative —
+                    // a LeaderLost-cleared, not-yet-rebuilt, or
+                    // failed-recovery (empty) DAG cannot tell stale entries
+                    // from retained in-flight ones.
                     self.handle_executor_disconnected(&executor_id, stream_epoch, seen_drvs)
                         .await;
                 }

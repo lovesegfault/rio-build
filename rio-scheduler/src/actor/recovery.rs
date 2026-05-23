@@ -868,6 +868,15 @@ impl DagActor {
     }
 
     pub(super) async fn handle_leader_acquired(&mut self) {
+        // This tenure has not (re)proven its DAG against PG yet.
+        // Redundant on the single-threaded actor — recover_from_pg's
+        // first statement is clear_persisted_state(), which clears the
+        // bit — but it makes the acquisition handler's own contract
+        // explicit: only the Ok arm below may set it. (The
+        // pre-LeaderAcquired gap is closed by the PREVIOUS tenure's
+        // LeaderLost-time clear, not by anything in this fn.)
+        self.dag_authoritative = false;
+
         // Nudge `interrupt_housekeeping` so its lease-acquire
         // edge-reload of `cost_table` (and the `cost_was_leader`
         // false→true store) runs promptly. Without this, the gate on
@@ -1029,6 +1038,11 @@ impl DagActor {
                     }
                 }
                 self.leader.set_recovery_complete();
+                // Only HERE: the DAG was rebuilt from PG by this
+                // tenure's recover_from_pg, so "not in the DAG" means
+                // "stale" again and the disconnect-time log-buffer
+                // discard may resume.
+                self.dag_authoritative = true;
             }
             Err(e) => {
                 // PG failure mid-recovery. Set complete=true
@@ -1041,7 +1055,11 @@ impl DagActor {
                      (Phase 3a behavior: in-flight builds lost)"
                 );
                 // Explicitly re-clear: recovery may have partially
-                // populated before failing.
+                // populated before failing. dag_authoritative stays
+                // false (clear_persisted_state keeps it cleared): the
+                // degraded empty-DAG tenure retains its log-buffer
+                // entries, and the disconnect-time discard must not
+                // treat "not in the (empty) DAG" as "stale".
                 self.clear_persisted_state();
                 self.leader.set_recovery_complete();
             }

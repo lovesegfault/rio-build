@@ -4791,6 +4791,102 @@ async fn test_recovery_window_disconnect_preserves_retained_buffer() -> anyhow::
     Ok(())
 }
 
+/// bug_001 (r23): a FAILED recovery (PG down mid-recovery) sets
+/// `recovery_complete=true` with an EMPTY DAG (the Err arm's "degrade,
+/// don't block" — dispatch and the flusher deliberately want that), so
+/// `recovery_complete` does not mean "the DAG is authoritative". A
+/// worker that kept streaming through the degraded tenure and then
+/// disconnects would pass an `is_leader && recovery_complete` gate,
+/// every seen drv would be DAG-unknown against the empty DAG, and
+/// `discard_if_owned_by` would destroy the retained unsealed entry —
+/// the only copy of the lines the periodic flusher would have
+/// snapshotted once PG came back. The discard must instead gate on
+/// `dag_authoritative`, which only a SUCCESSFUL recovery sets.
+#[tokio::test]
+async fn test_failed_recovery_disconnect_preserves_retained_buffer() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
+    // K8s-shaped LeaderState: lease held (is_leader=true) but recovery
+    // not run yet (recovery_complete=false at construction). Same
+    // `from_parts` injection as test_recovery_failure_degrades_to_empty_dag
+    // so the test can observe the Err arm setting the flag.
+    let recovery_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rc = std::sync::Arc::clone(&recovery_complete);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.log_buffers = Some(bufs_for_actor);
+        p.leader = crate::lease::LeaderState::from_parts(
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            rc,
+        );
+    });
+
+    // Retained entry from before the flap: stamped to the connected
+    // worker, unsealed, holding lines past the last snapshot.
+    let drv_path = test_drv_path("failrec-drv");
+    let _rx = connect_executor(&handle, "failrec-w", "x86_64-linux").await?;
+    let exec = uuid::Uuid::now_v7();
+    log_buffers.set_exec(&drv_path, exec, "failrec-w");
+    let batch = rio_proto::types::BuildLogBatch {
+        derivation_path: drv_path.clone(),
+        lines: vec![b"pg-outage tail".to_vec()],
+        first_line_number: 0,
+        executor_id: "failrec-w".into(),
+    };
+    assert!(log_buffers.push_for(&drv_path, &batch, "failrec-w"));
+
+    // PG goes down, then the acquisition is processed: recover_from_pg
+    // fails (pool closed — same injection as the recovery tests), the
+    // Err arm sets recovery_complete=true with an EMPTY DAG.
+    db.pool.close().await;
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    assert!(
+        recovery_complete.load(std::sync::atomic::Ordering::Acquire),
+        "precondition: the Err arm sets recovery_complete=true (degrade, don't block)"
+    );
+    assert!(
+        handle
+            .debug_query_derivation("failrec-drv")
+            .await?
+            .is_none(),
+        "precondition: the DAG is empty after the failed recovery"
+    );
+    assert!(
+        log_buffers.read_since(&drv_path, 0).is_some(),
+        "precondition: the failed recovery retains the entry (the sweep \
+         never ran — the load failed before it)"
+    );
+
+    // The worker's stream closes during the degraded tenure (build
+    // finished / pod evicted / another blip). Epoch matches → the
+    // handler runs its log-buffer cleanup.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "failrec-w".into(),
+            stream_epoch: stream_epoch_for("failrec-w"),
+            seen_drvs: vec![drv_path.clone()],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        log_buffers.read_since(&drv_path, 0).map(|l| l.len()),
+        Some(1),
+        "failed-recovery disconnect must keep the retained entry: \
+         recovery_complete=true with an empty DAG is NOT an authoritative \
+         DAG, and the periodic flusher would snapshot these lines once PG \
+         returns"
+    );
+    assert_eq!(
+        log_buffers.exec_id(&drv_path),
+        Some(exec),
+        "exec stamp survives the failed-recovery disconnect"
+    );
+    Ok(())
+}
+
 /// bug_008: a REJECTED reconnect must not corrupt `stream_epoch`. The
 /// gRPC handler unconditionally spawns a reader that fires
 /// `ExecutorDisconnected{stream_epoch}` on close — if the rejected

@@ -428,15 +428,25 @@ impl DagActor {
         // Log-buffer cleanup, AFTER the epoch check above (a stale
         // reader's `seen_drvs` reaches here only when the epoch
         // matched). Runs only when this replica is the leader AND
-        // recovery is complete — the same composite `may_flush` and
-        // `dispatch_ready` gate on — because the DAG gate below infers
+        // `dag_authoritative` — because the DAG gate below infers
         // "stale" from "not in the DAG", which is only meaningful when
-        // the DAG is authoritative. After `LeaderLost` →
-        // `clear_persisted_state()` the DAG is empty while
-        // `log_buffers` is deliberately retained, and on a
-        // just-re-acquired leader this disconnect can be processed
-        // before `LeaderAcquired` rebuilds the DAG — in both windows
-        // the unconditional discard would destroy exactly the retained
+        // the DAG reflects PG. NOT the `recovery_complete` composite
+        // `may_flush` and `dispatch_ready` use: that flag is true even
+        // after a FAILED recovery (the Err arm degrades to an empty
+        // DAG rather than blocking dispatch — fine for consumers that
+        // reconcile, fatal for one that deletes), so in a leader+PG-
+        // down tenure a reconnected worker's disconnect would pass it
+        // and destroy the retained entries the periodic flusher would
+        // have snapshotted once PG returned. Both halves of the gate
+        // are load-bearing: `dag_authoritative` covers LeaderLost-
+        // emptied DAGs, the pre-`LeaderAcquired` window of a just-
+        // re-acquired leader, and the failed-recovery tenure;
+        // `is_leader()` covers the windows where the bit is stale-true
+        // because it is an actor field — after the lease task's
+        // `on_lose()` but before this actor dequeues `LeaderLost`, and
+        // the lose-during-recovery corner where the Ok arm sets the
+        // bit while already deposed. In every one of those windows the
+        // unconditional discard would destroy exactly the retained
         // in-flight entries the lease-flap retention preserves.
         // Stale-entry reconciliation there belongs to the
         // acquisition-time re-arm/restamp/sweep
@@ -446,7 +456,9 @@ impl DagActor {
         // process exit — bounded by the per-entry ring caps; no flush
         // churn (`may_flush` is leader-gated) and no read-path
         // consequence (`GetDerivationLogs` is leader-gated) on a
-        // standby.
+        // standby. Same residual for a degraded (failed-recovery)
+        // tenure: entries skipped there are reconciled by the next
+        // acquisition's sweep or kept until process exit.
         //
         // Two ownership gates, in order:
         //
@@ -479,7 +491,7 @@ impl DagActor {
         // build's buffer discarded before flusher drained it) and had no
         // ownership check at all.
         if let Some(bufs) = &self.log_buffers {
-            if self.leader.is_leader() && self.leader.recovery_complete() {
+            if self.leader.is_leader() && self.dag_authoritative {
                 for drv in seen_drvs {
                     if self.dag.hash_for_path(&drv).is_none()
                         && bufs.discard_if_owned_by(&drv, executor_id.as_str())
@@ -494,8 +506,9 @@ impl DagActor {
                 debug!(
                     executor_id = %executor_id,
                     seen_drvs = seen_drvs.len(),
-                    "skipping disconnect log-buffer discard: not leader or \
-                     recovery pending, so the DAG is not authoritative; \
+                    "skipping disconnect log-buffer discard: not leader, or \
+                     this tenure has no successfully recovered DAG (recovery \
+                     pending or failed), so the DAG is not authoritative; \
                      retained entries are reconciled at the next \
                      acquisition's re-arm/restamp/sweep (or kept until \
                      process exit)"

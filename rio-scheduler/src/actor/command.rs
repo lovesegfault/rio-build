@@ -204,9 +204,11 @@ pub enum ActorCommand {
         stream_epoch: u64,
         /// `derivation_path` keys this stream pushed into
         /// `LogBuffers`. The actor — AFTER the epoch check, and only
-        /// when it is the leader with recovery complete (an
-        /// authoritative DAG; otherwise retained entries are left to
-        /// the acquisition-time re-arm/restamp/sweep) — discards
+        /// when it is the leader AND this tenure's recovery succeeded
+        /// (`dag_authoritative`; `recovery_complete` alone is also
+        /// true after a FAILED recovery's empty DAG — otherwise
+        /// retained entries are left to the acquisition-time
+        /// re-arm/restamp/sweep) — discards
         /// only those the DAG has never heard of (fabricated by an
         /// untrusted worker, or post-cleanup). Real drvs are reaped by
         /// the existing machinery: `seal()` on completion, `discard()`
@@ -398,12 +400,15 @@ pub enum ActorCommand {
     /// forget (no reply) — the lease loop keeps renewing while
     /// recovery runs in the actor task. handle_leader_acquired
     /// sets recovery_complete=true when done (or on failure —
-    /// degrade to empty DAG, don't block).
+    /// degrade to empty DAG, don't block; only the success arm also
+    /// marks the DAG authoritative for destructive consumers).
     ///
-    /// In non-K8s mode (always_leader): sent once at spawn.
-    /// recovery_complete is already true there (no recovery needed
-    /// for single-instance) but the command is still processed
-    /// (no-op: empty PG → empty DAG → recovery_complete already true).
+    /// In non-K8s mode (always_leader) this command is never sent:
+    /// its only production sender is the lease hook in main.rs, and
+    /// the lease loop is only spawned in K8s mode. recovery_complete
+    /// (and the actor's dag_authoritative) start true there — no
+    /// failover, nothing to recover; the DAG starts empty and is
+    /// populated by live MergeDag traffic only.
     LeaderAcquired,
 
     /// Lease lost (or self-fenced): clear in-memory builds/dag/events
