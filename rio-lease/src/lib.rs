@@ -992,6 +992,13 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // Arc: the detached patch task owns a clone and clears it on
     // success.
     let marks_dirty = Arc::new(AtomicBool::new(true));
+    // Single-flight slot for the marks PATCH task: owned by the loop
+    // (which takes it before spawning) plus the one in-flight task,
+    // which releases it on completion via a Drop guard whose release
+    // runs AFTER the task's dirty-flag decision (end of scope) — a
+    // freed slot always means the flag already reflects that task's
+    // outcome.
+    let marks_patch_in_flight = Arc::new(AtomicBool::new(false));
     let mut last_successful_renew = Instant::now();
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
@@ -1211,22 +1218,25 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // patches the post-transition state (and the self-fence
                 // false-alarm pair — fence at the top of the tick, then
                 // a successful renew — never patches the label off).
-                // While dirty: one detached patch attempt per
-                // successful round-trip until one lands with a
-                // still-current polarity; steady state spawns nothing.
+                // At most one leader-marks PATCH is in flight at a
+                // time; `marks_dirty` persists across skipped ticks and
+                // is cleared only by a completed patch whose written
+                // polarity still matches the current desire, so the
+                // first tick after a release retries with the
+                // then-current polarity. Steady state spawns nothing.
                 // Detached because the lease loop MUST NOT block on the
-                // pod PATCH (same constraint as the hooks).
-                if marks_dirty.load(Ordering::SeqCst) {
-                    spawn_patch_leader_marks(
-                        pod_patch_client.clone(),
-                        cfg.namespace.clone(),
-                        cfg.holder_id.clone(),
-                        cfg.leader_pod_label.clone(),
-                        now_leading,
-                        Arc::clone(&marks_dirty),
-                        state.is_leader_arc(),
-                    );
-                }
+                // pod PATCH (same constraint as the hooks); each
+                // attempt is bounded by the renew deadline so a wedged
+                // PATCH cannot hold the single-flight slot forever.
+                let _ = maybe_spawn_leader_marks(
+                    &pod_patch_client,
+                    &cfg,
+                    now_leading,
+                    &marks_dirty,
+                    &marks_patch_in_flight,
+                    state.is_leader_arc(),
+                    renew_deadline,
+                );
             }
             outcome @ (Ok(Err(_)) | Err(_)) => {
                 // Either apiserver returned an error (Ok(Err)) or
@@ -1414,23 +1424,29 @@ fn leader_marks_patch(
 /// merge patch removes the partial-failure window (cost updated but
 /// label not).
 ///
-/// Level-triggered, not fire-and-forget: the caller spawns this while
-/// `marks_dirty` is set, once per successful election round-trip. The
-/// task clears `marks_dirty` ONLY when the PATCH succeeds AND the
-/// polarity it wrote (`leading`) still matches the pod's current
-/// leadership; a failed patch leaves the flag set, and a patch of a
-/// since-stale polarity re-marks it dirty. Either way the next tick
-/// retries with the then-current state instead of leaving the marks
-/// wrong until the next leadership transition — the label is
-/// load-bearing for the dashboard data path (leader-only Service), so
-/// "wrong until the next transition" would be an unbounded outage, not
-/// a cosmetic blip.
+/// Level-triggered, not fire-and-forget: the caller
+/// ([`maybe_spawn_leader_marks`]) spawns this while `marks_dirty` is
+/// set AND no other marks PATCH is in flight — at most one is in
+/// flight at a time, and dirtiness persists across the ticks the
+/// single-flight guard skips. The task clears `marks_dirty` ONLY when
+/// the PATCH succeeds AND the polarity it wrote (`leading`) still
+/// matches the pod's current leadership (re-checked once more after
+/// the clear); a failed or timed-out patch leaves the flag set, and a
+/// patch of a since-stale polarity re-marks it dirty. Either way the
+/// first tick after the slot frees retries with the then-current state
+/// instead of leaving the marks wrong until the next leadership
+/// transition — the label is load-bearing for the dashboard data path
+/// (leader-only Service), so "wrong until the next transition" would
+/// be an unbounded outage, not a cosmetic blip.
 ///
 /// `tokio::spawn` because the lease loop MUST NOT block. A slow
 /// apiserver PATCH would stall the renew tick — the blocked loop can
 /// neither renew nor self-fence while a standby steals after
 /// `STEAL_AFTER` of observed staleness — dual-leader. Same constraint
-/// as the LeaderAcquired actor send (see `run_lease_loop`).
+/// as the LeaderAcquired actor send (see `run_lease_loop`). Each call
+/// is bounded by `patch_timeout` (the loop passes its renew deadline):
+/// with single-flight, one wedged PATCH would otherwise block every
+/// further reconcile attempt.
 ///
 /// Merge patch (not Apply): we only touch one annotation key and one
 /// label key; Apply would need a fieldManager and a fuller object
@@ -1438,46 +1454,77 @@ fn leader_marks_patch(
 /// --overwrite` semantics, and a `null` value removes the key.
 fn spawn_patch_leader_marks(
     client: kube::Client,
-    namespace: String,
-    pod_name: String,
-    label: Option<(String, String)>,
+    cfg: &LeaseConfig,
     leading: bool,
     marks_dirty: Arc<AtomicBool>,
+    patch_in_flight: Arc<AtomicBool>,
     is_leader: Arc<AtomicBool>,
-) {
+    patch_timeout: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let namespace = cfg.namespace.clone();
+    let pod_name = cfg.holder_id.clone();
+    let label = cfg.leader_pod_label.clone();
     tokio::spawn(async move {
+        // Release the single-flight slot on every exit — success,
+        // failure, timeout, or panic. A slot that stayed taken would
+        // block every further reconcile attempt. Drop runs at the end
+        // of this scope, i.e. AFTER the dirty-flag decision below — a
+        // freed slot always means the flag already reflects this
+        // task's outcome.
+        struct SlotRelease(Arc<AtomicBool>);
+        impl Drop for SlotRelease {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _slot = SlotRelease(patch_in_flight);
+
         let pods: Api<Pod> = Api::namespaced(client, &namespace);
         let patch = leader_marks_patch(leading, label.as_ref());
-        match pods
-            .patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
+        match tokio::time::timeout(
+            patch_timeout,
+            pods.patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
         {
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 debug!(%pod_name, leading, "patched pod leader marks");
-                // Clear the dirty flag ONLY if the polarity we just
-                // wrote is still the desired one; otherwise force
-                // another reconcile. Two in-flight patches can complete
-                // out of order (this one outlived RENEW_INTERVAL while
-                // a newer one with the opposite polarity overtook it):
-                // the late stale patch is what the apiserver ends up
-                // with, and the earlier current one already cleared the
-                // flag — without the `store(true)` here the WRONG marks
-                // would freeze until the next transition. Worst case
-                // this costs one redundant idempotent re-patch on the
-                // next tick.
+                // Single-flight makes the apiserver's last-applied
+                // marks the ones THIS task wrote, so a successful patch
+                // whose polarity still matches the desire is safe to
+                // clear on; a since-stale polarity forces another
+                // reconcile instead. The re-check after the clear
+                // covers the one remaining race: an acquire/lose/
+                // self-fence edge whose `marks_dirty.store(true)` lands
+                // between the polarity comparison and the
+                // `store(false)` would be clobbered — re-reading the
+                // desire and re-dirtying recovers it (every edge writes
+                // `is_leader` before `marks_dirty`, both SeqCst, so a
+                // desire change that beat the clear is visible to the
+                // re-check; one that lands after it wins by program
+                // order).
                 if is_leader.load(Ordering::SeqCst) == leading {
                     marks_dirty.store(false, Ordering::SeqCst);
+                    if is_leader.load(Ordering::SeqCst) != leading {
+                        marks_dirty.store(true, Ordering::SeqCst);
+                    }
                 } else {
                     marks_dirty.store(true, Ordering::SeqCst);
                 }
             }
-            Err(e) => {
-                // marks_dirty stays set → the next successful election
-                // round-trip retries. A PERSISTENT failure (RBAC
-                // missing `patch pods` — 403; VM tests don't catch
-                // that, the k3s admin kubeconfig bypasses RBAC)
-                // therefore repeats this warning every tick — the
-                // steady stream in the logs is the operator signal.
+            Ok(Err(e)) => {
+                // marks_dirty stays set → the first tick after the slot
+                // frees retries (the retry contract in run_lease_loop's
+                // reconcile comment). A PERSISTENT failure (RBAC
+                // missing `patch pods` — 403) repeats this warning on
+                // every retry — the steady warn stream is the
+                // production operator signal. CI catches it too: the
+                // helm-rendered scheduler runs under an RBAC-enforced
+                // ServiceAccount in the lease-enabled VM scenarios, so
+                // a persistent 403 fails the vm-dashboard-k3s
+                // EndpointSlice wait (exactly one ready endpoint) and
+                // the leader-election scenario's
+                // deletion-cost assertion.
                 // While it keeps failing: scale-down ordering is
                 // arbitrary (deletion-cost half) and the leader-only
                 // Service has no or stale endpoints, i.e. the dashboard
@@ -1488,8 +1535,68 @@ fn spawn_patch_leader_marks(
                      retrying on the next election round-trip"
                 );
             }
+            Err(_) => {
+                // Per-call timeout. With single-flight, a wedged PATCH
+                // would otherwise hold the slot and block every further
+                // reconcile attempt, so the bound is required for
+                // liveness — and it is a liveness bound only: dropping
+                // the request future resets the HTTP/2 stream but does
+                // not prove the apiserver discarded it, so a
+                // cancelled-but-applied-late patch can in principle
+                // overwrite a successor until this pod's next edge
+                // (strictly narrower than the unbounded reordering race
+                // single-flight removed). marks_dirty stays set → the
+                // first tick after the slot frees retries.
+                warn!(
+                    %pod_name, leading, timeout = ?patch_timeout,
+                    "pod leader-marks PATCH timed out; \
+                     retrying on the next election round-trip"
+                );
+            }
         }
-    });
+    })
+}
+
+/// Spawn gate for the leader-marks reconcile: spawns
+/// [`spawn_patch_leader_marks`] iff the marks are dirty AND no other
+/// marks PATCH is in flight, taking the single-flight slot atomically.
+/// Returns the spawned task's handle (`None` when it skipped) — the
+/// lease loop ignores it; tests await it to observe the task's
+/// dirty-flag decision deterministically.
+///
+/// Single-flight is what couples "the marks the apiserver last
+/// applied" to "the polarity the completing task compares against the
+/// desire": with two patches of opposite polarity in flight, the
+/// apiserver's application order and the handlers' completion order
+/// are independent, so the flag could end up clear while the pod
+/// stores stale marks. While a patch is outstanding the dirty flag
+/// simply stays set; the first tick after the slot frees retries with
+/// the then-current polarity (the level-triggered contract is
+/// unchanged).
+pub(crate) fn maybe_spawn_leader_marks(
+    client: &kube::Client,
+    cfg: &LeaseConfig,
+    leading: bool,
+    marks_dirty: &Arc<AtomicBool>,
+    patch_in_flight: &Arc<AtomicBool>,
+    is_leader: Arc<AtomicBool>,
+    patch_timeout: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Short-circuit keeps the swap (which takes the slot) from firing
+    // on non-dirty ticks.
+    if marks_dirty.load(Ordering::SeqCst) && !patch_in_flight.swap(true, Ordering::SeqCst) {
+        Some(spawn_patch_leader_marks(
+            client.clone(),
+            cfg,
+            leading,
+            Arc::clone(marks_dirty),
+            Arc::clone(patch_in_flight),
+            is_leader,
+            patch_timeout,
+        ))
+    } else {
+        None
+    }
 }
 
 // r[verify sched.lease.k8s-lease+2]
@@ -2118,6 +2225,266 @@ mod tests {
                 LEADER_ROLE_LEADER.to_string()
             ))
         );
+    }
+
+    // ---- Marks reconcile: apply order vs completion order ----
+
+    use rio_test_support::kube_mock::RequestPark;
+
+    /// `LeaseConfig` for driving the marks reconcile directly: pod name
+    /// "us", leader label configured (the deployment shape the
+    /// `rio-scheduler-leader` Service depends on).
+    fn marks_test_cfg() -> LeaseConfig {
+        LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        }
+        .with_leader_pod_label(LEADER_ROLE_LABEL, LEADER_ROLE_LEADER)
+    }
+
+    /// Polarity a leader-marks patch body writes: `true` ⇔ leader marks
+    /// (deletion-cost "1"; the label, when configured, present).
+    fn body_polarity(body: &k8s_openapi::serde_json::Value) -> bool {
+        body["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION] == json!("1")
+    }
+
+    /// A canned 200 body for a pod PATCH response.
+    fn pod_ok(name: &str) -> k8s_openapi::serde_json::Value {
+        json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name}})
+    }
+
+    /// Opposite-polarity marks reconciles racing must not end with
+    /// `marks_dirty` clear while the apiserver's last-applied marks
+    /// disagree with the pod's leadership: the flag's final value is
+    /// decided by handler completion order, the pod's stored marks by
+    /// apiserver application order, and nothing couples the two unless
+    /// at most one patch is in flight. The label half is load-bearing
+    /// for the leader-only Service, so a silently-stale outcome is a
+    /// dashboard outage until the next leadership transition. Pre-fix
+    /// (no single-flight gate), the lose-while-in-flight schedule below
+    /// ended with the flag clear over leader marks stored on a
+    /// non-leader.
+    // r[verify sched.lease.deletion-cost+2]
+    #[tokio::test]
+    async fn marks_reconcile_single_flight_couples_flag_to_stored_polarity() {
+        let (client, mut park) = RequestPark::new();
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+        // Generous bound: nothing in this schedule relies on the
+        // timeout firing (the timed-out leg has its own test).
+        let patch_timeout = Duration::from_secs(60);
+
+        // The test's model of the apiserver: bodies in the order the
+        // test applies them; the last entry is what the pod stores.
+        let mut applied: Vec<k8s_openapi::serde_json::Value> = Vec::new();
+
+        // Leader + dirty → task A (leader polarity) spawns; its PATCH
+        // parks at the mock.
+        let handle_a = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            patch_timeout,
+        )
+        .expect("dirty + free slot must spawn");
+        let req_a = park.next().await;
+        assert!(
+            req_a.path.contains("/pods/us"),
+            "own-pod PATCH endpoint, got {}",
+            req_a.path
+        );
+
+        // Lose edge while A is still in flight: desire flips, dirty set.
+        is_leader.store(false, Ordering::SeqCst);
+        marks_dirty.store(true, Ordering::SeqCst);
+
+        // Single-flight: the opposite-polarity drive is skipped while A
+        // holds the slot — a concurrent pair of patches is exactly what
+        // decouples the apiserver's last write from the flag's final
+        // value.
+        assert!(
+            maybe_spawn_leader_marks(
+                &client,
+                &cfg,
+                false,
+                &marks_dirty,
+                &in_flight,
+                Arc::clone(&is_leader),
+                patch_timeout,
+            )
+            .is_none(),
+            "second reconcile must be skipped while a patch is in flight"
+        );
+        assert!(
+            park.try_next().await.is_none(),
+            "no second PATCH may reach the apiserver while A is in flight"
+        );
+
+        // A completes: applied at the apiserver, then its handler runs
+        // with a now-stale polarity → flag stays dirty, slot freed.
+        applied.push(req_a.body.clone());
+        req_a.respond_ok(pod_ok("us"));
+        handle_a.await.expect("patch task A");
+        assert!(
+            marks_dirty.load(Ordering::SeqCst),
+            "stale-polarity completion must leave the marks dirty"
+        );
+        assert!(
+            !in_flight.load(Ordering::SeqCst),
+            "completed task must release the single-flight slot"
+        );
+
+        // The retry spawns with the CURRENT polarity and converges.
+        let handle_c = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            false,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            patch_timeout,
+        )
+        .expect("dirty + freed slot must spawn the retry");
+        let req_c = park.next().await;
+        applied.push(req_c.body.clone());
+        req_c.respond_ok(pod_ok("us"));
+        handle_c.await.expect("patch task C");
+
+        // The structural invariant the bug violated: flag clear with no
+        // patch in flight ⇒ the apiserver's last-applied polarity equals
+        // the pod's leadership. Exactly two PATCHes total (A + retry).
+        assert!(
+            !marks_dirty.load(Ordering::SeqCst),
+            "converged reconcile clears the flag"
+        );
+        assert!(!in_flight.load(Ordering::SeqCst));
+        assert!(
+            park.try_next().await.is_none(),
+            "no further requests after convergence"
+        );
+        assert_eq!(
+            applied.len(),
+            2,
+            "exactly A and the retry reached the apiserver"
+        );
+        let stored = applied.last().expect("at least one applied patch");
+        assert_eq!(
+            body_polarity(stored),
+            is_leader.load(Ordering::SeqCst),
+            "marks_dirty is clear with nothing in flight, so the last-applied \
+             marks must match the pod's leadership"
+        );
+    }
+
+    /// A failed PATCH must release the single-flight slot and leave the
+    /// marks dirty, so the next round-trip can retry.
+    #[tokio::test]
+    async fn marks_patch_failure_releases_slot_and_keeps_dirty() {
+        let (client, mut park) = RequestPark::new();
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+        let patch_timeout = Duration::from_secs(60);
+
+        let handle = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            patch_timeout,
+        )
+        .expect("dirty + free slot must spawn");
+        park.next()
+            .await
+            .respond_status(403, "Forbidden", "rbac: missing patch on pods");
+        handle.await.expect("patch task");
+
+        assert!(
+            marks_dirty.load(Ordering::SeqCst),
+            "failed patch keeps the marks dirty"
+        );
+        assert!(
+            !in_flight.load(Ordering::SeqCst),
+            "failed patch releases the slot"
+        );
+        // The freed slot is genuinely usable: the next drive spawns.
+        assert!(
+            maybe_spawn_leader_marks(
+                &client,
+                &cfg,
+                true,
+                &marks_dirty,
+                &in_flight,
+                Arc::clone(&is_leader),
+                patch_timeout,
+            )
+            .is_some(),
+            "retry after a failure must be able to take the slot"
+        );
+    }
+
+    /// A PATCH that never gets an answer must end at the per-call
+    /// timeout: slot released, marks still dirty, retry possible. The
+    /// bound is what keeps single-flight from turning one wedged call
+    /// into a permanently stalled reconcile.
+    #[tokio::test(start_paused = true)]
+    async fn marks_patch_timeout_releases_slot_and_keeps_dirty() {
+        let (client, mut park) = RequestPark::new();
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+        // Same bound the loop passes: its renew deadline.
+        let patch_timeout = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+
+        let handle = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            patch_timeout,
+        )
+        .expect("dirty + free slot must spawn");
+        // Park the request and never answer it; the call must end via
+        // its own timeout once the (paused) clock passes the bound.
+        let parked = park.next().await;
+        tokio::time::advance(patch_timeout + Duration::from_millis(100)).await;
+        handle.await.expect("patch task ends via its timeout");
+
+        assert!(
+            marks_dirty.load(Ordering::SeqCst),
+            "timed-out patch keeps the marks dirty"
+        );
+        assert!(
+            !in_flight.load(Ordering::SeqCst),
+            "timed-out patch releases the slot"
+        );
+        assert!(
+            maybe_spawn_leader_marks(
+                &client,
+                &cfg,
+                true,
+                &marks_dirty,
+                &in_flight,
+                Arc::clone(&is_leader),
+                patch_timeout,
+            )
+            .is_some(),
+            "retry after a timeout must be able to take the slot"
+        );
+        drop(parked);
     }
 
     // ---- The loop's fence-check cadence (the NeverDual premise) ----

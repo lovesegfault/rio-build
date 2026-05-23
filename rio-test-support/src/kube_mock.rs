@@ -1,6 +1,6 @@
 //! tower-test fixtures for kube::Client integration tests.
 //!
-//! Two mocks with opposite philosophies:
+//! Three mocks with different philosophies:
 //!
 //! - [`ApiServerVerifier`] is a *scripted scenario queue*: the test
 //!   spells out what HTTP requests it EXPECTS the code under test to
@@ -14,6 +14,11 @@
 //!   injects whole-apiserver failure modes (fail fast, hang) on top of
 //!   the healthy state machine, for tests that drive a client loop
 //!   through an outage-and-recovery schedule.
+//! - [`RequestPark`] is a *parked-request queue*: every request the
+//!   client issues is handed to the test as data plus its responder,
+//!   and nothing is answered until the test says so. The right tool
+//!   for concurrency/ordering tests that must hold one request in
+//!   flight while the code under test is driven further.
 //!
 //! Extracted from rio-controller so rio-scheduler's lease
 //! election tests can share the same mock-apiserver plumbing.
@@ -26,7 +31,7 @@ use http_body_util::BodyExt;
 use kube::Client;
 use kube::client::Body;
 use tokio::task::JoinHandle;
-use tower_test::mock::{self, Handle};
+use tower_test::mock::{self, Handle, SendResponse};
 
 /// One expected HTTP interaction. The verifier asserts the
 /// incoming request matches `method` + `path_contains`, then
@@ -524,6 +529,138 @@ impl MockApiServer {
             .stored
             .take()
             .is_some()
+    }
+}
+
+/// One request pulled from [`RequestPark::next`]: the captured
+/// method/path/JSON body plus the responder for it. Until the test
+/// answers (or drops) it, the client-side request future stays pending —
+/// exactly the in-flight window a concurrency/ordering test needs to
+/// hold open while it drives the code under test further.
+///
+/// Dropping a `ParkedRequest` without responding completes the client's
+/// future with a connection error (tower-test drops the response
+/// channel) — fine for "the call must end via its own timeout" legs that
+/// keep the value alive until after the deadline, but not a substitute
+/// for an explicit error response.
+pub struct ParkedRequest {
+    pub method: http::Method,
+    /// Full request URI (path + query), for endpoint assertions.
+    pub path: String,
+    /// Request body parsed as JSON (`Null` for an empty body).
+    pub body: serde_json::Value,
+    send: SendResponse<Response<Body>>,
+}
+
+impl ParkedRequest {
+    /// Answer 200 with the given JSON body.
+    pub fn respond_ok(self, body: serde_json::Value) {
+        self.send.send_response(
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string().into_bytes()))
+                .expect("valid response"),
+        );
+    }
+
+    /// Answer with a `metav1.Status` error envelope (what
+    /// `kube::Error::Api` deserializes from), e.g. a 403 or 404.
+    pub fn respond_status(self, code: u16, reason: &str, message: &str) {
+        self.send.send_response(
+            Response::builder()
+                .status(code)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "kind": "Status",
+                        "apiVersion": "v1",
+                        "status": "Failure",
+                        "reason": reason,
+                        "code": code,
+                        "message": message,
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ))
+                .expect("valid response"),
+        );
+    }
+}
+
+/// Parked-request mock: a forwarder task captures every request the
+/// [`Client`] issues and queues it as a [`ParkedRequest`] for the test
+/// to inspect and answer in whatever order the test chooses. Unlike
+/// [`ApiServerVerifier`] (which answers each request as it arrives),
+/// the park lets a test keep request A unanswered while it drives the
+/// code under test into issuing — or provably NOT issuing — request B,
+/// which is the primitive ordering/single-flight tests need.
+pub struct RequestPark {
+    rx: tokio::sync::mpsc::UnboundedReceiver<ParkedRequest>,
+}
+
+impl RequestPark {
+    /// Create a mock Client whose every request is parked for the test.
+    /// The forwarder task exits when the Client (and every clone) is
+    /// dropped, or when the park itself is dropped.
+    pub fn new() -> (Client, Self) {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(mock_service, "default");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            while let Some((request, send)) = handle.next_request().await {
+                let method = request.method().clone();
+                let path = request.uri().to_string();
+                let bytes = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("request body collectible")
+                    .to_bytes();
+                let body = if bytes.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).expect("request body is JSON")
+                };
+                if tx
+                    .send(ParkedRequest {
+                        method,
+                        path,
+                        body,
+                        send,
+                    })
+                    .is_err()
+                {
+                    // The test dropped its receiver — nothing left to
+                    // observe; remaining requests fail as connection
+                    // errors when this task (and `send` with it) drops.
+                    return;
+                }
+            }
+        });
+        (client, Self { rx })
+    }
+
+    /// Receive the next request the client issued, waiting for it.
+    /// Panics if the client side is gone — the code under test made
+    /// fewer requests than the test expected.
+    pub async fn next(&mut self) -> ParkedRequest {
+        self.rx
+            .recv()
+            .await
+            .expect("client dropped before issuing the expected request")
+    }
+
+    /// Non-blocking probe for asserting a request was NOT made: yields
+    /// to the (current-thread) runtime enough times for any
+    /// already-spawned task to have issued its request, then checks the
+    /// queue without waiting.
+    pub async fn try_next(&mut self) -> Option<ParkedRequest> {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        self.rx.try_recv().ok()
     }
 }
 
