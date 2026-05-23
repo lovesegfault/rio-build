@@ -1,1051 +1,4 @@
 {
-  "by_component": {
-    "builder": [
-      {
-        "help": "Per-derivation build time",
-        "kind": "histogram",
-        "name": "rio_builder_build_duration_seconds"
-      },
-      {
-        "help": "Currently running builds on this worker",
-        "kind": "gauge",
-        "name": "rio_builder_builds_active"
-      },
-      {
-        "help": "Total builds executed (labeled by outcome: success/failure/cancelled/timed_out/log_limit/infra_failure)",
-        "kind": "counter",
-        "name": "rio_builder_builds_total"
-      },
-      {
-        "help": "Per-build cgroup rmdir failures on Drop (typically EBUSY — processes still in the tree). Leaked cgroups are harmless empty pseudo-dirs under /sys/fs/cgroup; pod restart clears them. Sustained rate = builds not reaping cleanly (investigate cgroup.kill timing or zombie builders).",
-        "kind": "counter",
-        "name": "rio_builder_cgroup_leak_total"
-      },
-      {
-        "help": "Builds killed by the cgroup OOM watcher (memory.events oom_kill incremented during build). Reported as InfrastructureFailure for scheduler resource_floor bump (I-196). Nonzero = pool's memory limit is undersized for its workload.",
-        "kind": "counter",
-        "name": "rio_builder_cgroup_oom_total"
-      },
-      {
-        "help": "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. 1.0 = one core fully used; >1.0 on multi-core.",
-        "kind": "gauge",
-        "name": "rio_builder_cpu_fraction"
-      },
-      {
-        "help": "FUSE cache hits (local symlink_metadata succeeded)",
-        "kind": "counter",
-        "name": "rio_builder_fuse_cache_hits_total"
-      },
-      {
-        "help": "FUSE cache misses (fetch from remote store required)",
-        "kind": "counter",
-        "name": "rio_builder_fuse_cache_misses_total"
-      },
-      {
-        "help": "1.0 when the FUSE fetch circuit breaker is open (store unreachable or degraded). Opens after 5 consecutive fetch failures OR 720s since last successful fetch with ≥1 failure since. Half-open after 30s (one probe fetch allowed).",
-        "kind": "gauge",
-        "name": "rio_builder_fuse_circuit_open"
-      },
-      {
-        "help": "Userspace read() callbacks served. When passthrough is ON (default), the kernel handles reads directly and this counter stays near zero — nonzero means open_backing() failed for some file. When passthrough is OFF (RIO_FUSE_PASSTHROUGH=false), every read comes through here. Sustained nonzero rate with passthrough ON = investigate open_backing.",
-        "kind": "counter",
-        "name": "rio_builder_fuse_fallback_reads_total"
-      },
-      {
-        "help": "Bytes fetched from store via FUSE misses (nar_data.len())",
-        "kind": "counter",
-        "name": "rio_builder_fuse_fetch_bytes_total"
-      },
-      {
-        "help": "Store path fetch latency (gRPC GetPath + stream drain)",
-        "kind": "histogram",
-        "name": "rio_builder_fuse_fetch_duration_seconds"
-      },
-      {
-        "help": "FUSE cache index/disk divergences detected and self-healed. Nonzero means something rm'd cache files out from under the in-memory index (manual debugging, disk cleanup scripts, interrupted extract). The path is purged and re-fetched; investigate if sustained.",
-        "kind": "counter",
-        "name": "rio_builder_fuse_index_divergence_total"
-      },
-      {
-        "help": "Top-level FUSE lookup outcomes under JIT fetch (I-043 redesign), labeled by outcome: reject (not in registered input set → fast ENOENT, no store contact), fetch (registered input materialized), eio (registered input fetch FAILED → EIO so overlay can't negative-cache). reject/fetch ratio ≈ closure utilization; eio nonzero = store degraded.",
-        "kind": "counter",
-        "name": "rio_builder_fuse_jit_lookup_total"
-      },
-      {
-        "help": "Daemon MiscFailure reclassified as InfrastructureFailure because the missing path is in the build's input closure (I-178). Sustained nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder throughput; lower the floor.",
-        "kind": "counter",
-        "name": "rio_builder_input_materialization_failures_total"
-      },
-      {
-        "help": "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. Equals compute_input_closure's output count for this build.",
-        "kind": "gauge",
-        "name": "rio_builder_jit_inputs_registered"
-      },
-      {
-        "help": "Log lines dropped by rate suppression (log_rate_limit). Build continues with a `[rio: N lines suppressed …]` marker. Nonzero is normal for bursty builds (kernel oldconfig, autoconf); sustained high rate = pathological producer.",
-        "kind": "counter",
-        "name": "rio_builder_log_lines_suppressed_total"
-      },
-      {
-        "help": "Worker cgroup memory utilization: memory.current / memory.max. 0.0 if memory.max is unbounded ('max' literal).",
-        "kind": "gauge",
-        "name": "rio_builder_memory_fraction"
-      },
-      {
-        "help": "Overlay unmount failures (leaked mount); alert if rate > 0",
-        "kind": "counter",
-        "name": "rio_builder_overlay_teardown_failures_total"
-      },
-      {
-        "help": "PrefetchHint paths skipped by the I-212 filter, by reason. reason=not_input: JIT allowlist armed and path is not a declared input (build can never read it). reason=size_cap: warm-gate batch (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); the build fetches it on-demand via JIT lookup if it turns out to be a real input.",
-        "kind": "counter",
-        "name": "rio_builder_prefetch_filtered_total"
-      },
-      {
-        "help": "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. error = store fetch failed (debug-only log; build's own FUSE ops surface the real problem if store is flaky).",
-        "kind": "counter",
-        "name": "rio_builder_prefetch_total"
-      },
-      {
-        "help": "Assignments rejected due to stale generation (from a deposed scheduler leader). Nonzero during leader transitions is expected; sustained = scheduler lease flapping.",
-        "kind": "counter",
-        "name": "rio_builder_stale_assignments_rejected_total"
-      },
-      {
-        "help": "Bytes uploaded to store via PutPath (nar_size on success)",
-        "kind": "counter",
-        "name": "rio_builder_upload_bytes_total"
-      },
-      {
-        "help": "Reference count per output upload (references.len() after scan). Distribution of dependency fan-out per built path. Zero-heavy = mostly leaves; high p99 = wide transitive closures.",
-        "kind": "histogram",
-        "name": "rio_builder_upload_references_count"
-      },
-      {
-        "help": "Output uploads skipped by the FindMissingPaths pre-check (path already complete in store). High sustained rate = scheduler dispatching already-built derivations (race or CA early-cutoff). The store's PutPath idempotency would no-op these server-side anyway; this counter measures the worker-side disk-read + NAR-stream savings.",
-        "kind": "counter",
-        "name": "rio_builder_upload_skipped_idempotent_total"
-      },
-      {
-        "help": "Output uploads (labeled by status: success/adopted/exhausted; adopted = concurrent uploader won, result polled via QueryPathInfo)",
-        "kind": "counter",
-        "name": "rio_builder_uploads_total"
-      }
-    ],
-    "controller": [
-      {
-        "help": "ComponentScaler desired replica count (labelled by cs=ns/name). What was last patched onto deployments/scale.",
-        "kind": "gauge",
-        "name": "rio_controller_component_scaler_desired_replicas"
-      },
-      {
-        "help": "ComponentScaler learned builders-per-replica ratio (labelled by cs=ns/name). EMA-adjusted against observed PG-pool load; persisted in .status.learnedRatio.",
-        "kind": "gauge",
-        "name": "rio_controller_component_scaler_learned_ratio"
-      },
-      {
-        "help": "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization across loadEndpoint pods at the last tick (labelled by cs=ns/name).",
-        "kind": "gauge",
-        "name": "rio_controller_component_scaler_observed_load"
-      },
-      {
-        "help": "Per-`cell` seed injections at CellSketches::seed(). Incremented once per cold-start cell whose z_active AND z_shadow sketches were both empty after PG load. >1 over controller lifetime = sketch persist failing (check tick errors).",
-        "kind": "counter",
-        "name": "rio_controller_ddsketch_seed_fallback_total"
-      },
-      {
-        "help": "DisruptionTarget watcher DrainExecutor calls. result=sent|timeout|rpc_error. Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain.",
-        "kind": "counter",
-        "name": "rio_controller_disruption_drains_total"
-      },
-      {
-        "help": "Excess Pending ephemeral Jobs deleted (labeled by pool). Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); zero rate with stuck Pending pods = reap not firing (check RBAC delete on batch/jobs).",
-        "kind": "counter",
-        "name": "rio_controller_ephemeral_jobs_reaped_total"
-      },
-      {
-        "help": "SpawnIntents FFD-placed at the last tick by `state`. state=registered: on a Registered=True NodeClaim (Jobs created this tick); state=inflight: on a not-yet-Registered claim (held by placeable-gate). Ratio registered/(registered+inflight) is the forecast warm-hit proxy.",
-        "kind": "gauge",
-        "name": "rio_controller_ffd_placeable_intents"
-      },
-      {
-        "help": "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation at the last tick. cover_deficit's per-cell input. Non-zero with created_total flat = max_fleet_cores or per-tick cap throttling.",
-        "kind": "gauge",
-        "name": "rio_controller_ffd_unplaced_cores"
-      },
-      {
-        "help": "GC cron runs. result=success|connect_failure|rpc_failure. connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted.",
-        "kind": "counter",
-        "name": "rio_controller_gc_runs_total"
-      },
-      {
-        "help": "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn (check apiserver health / pod restarts).",
-        "kind": "counter",
-        "name": "rio_controller_lease_acquired_total"
-      },
-      {
-        "help": "nodeclaim_pool lease lose transitions (explicit lose or local self-fence).",
-        "kind": "counter",
-        "name": "rio_controller_lease_lost_total"
-      },
-      {
-        "help": "Per-`cell` idle-NodeClaim reap threshold from the NA consolidation model (last node evaluated this tick; 0 when no idle nodes in the cell). max(boot_median/2, min_consolidation_time[cell]) floored. NA-extends past the floor ONLY for cells packing ~1 intent/node (E[c_fit] > cores/2); for bin-packed cells (the §13b MostAllocated builder default) the floor is a hard bound the model cannot exceed. Watch fetcher-* >= 600s and builder cells >= the 300s `*` floor to confirm the per-cell e_fitting_cores partition and the policy floor are both routing (r35 bug_023/bug_050; r38 bug_022).",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_consolidate_threshold_seconds"
-      },
-      {
-        "help": "nodeclaim_pool NodeClaim Api::create successes by `cell`. Σrate(created) − Σrate(reaped) over a window ≈ fleet growth; sustained created with zero placeable_intents = FFD/kube-scheduler-packed mismatch.",
-        "kind": "counter",
-        "name": "rio_controller_nodeclaim_created_total"
-      },
-      {
-        "help": "Per-`cell` closed-loop SLI: EWMA(α=0.2) of the fraction of intents satisfiable from already-Registered nodeclaims at dispatch time. Drives the Schmitt deadband on lead_time_q (widen below 0.85·target, narrow above 1.05·target). Restart-resets to 0.9 (target mid-zone).",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_forecast_hit_ewma"
-      },
-      {
-        "help": "Per-`cell` boot/ICE reap threshold the reaper acts at: max(2×lead_time_seed, q_0.99(boot)), floored at 2×seed until 100 boot samples. The StuckPending alert anchors on this (×2) so the alert always sits above the reaper — a firing alert means the reaper failed, not just a slow boot. Distinct from `lead_time_seconds` (q_0.9(boot−eta), what cover_deficit provisions ahead by — learns DOWN; not a reap floor).",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_ice_timeout_seconds"
-      },
-      {
-        "help": "Oldest in-flight NodeClaim per `cell` (now − metadata.creationTimestamp; 0 when none in-flight). The per-claim age the StuckPending alert keys on — the inflight count never touches 0 under sustained scale-up, so count-based `for: 90s` fires on healthy bursts.",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_inflight_age_max_seconds"
-      },
-      {
-        "help": "nodeclaim_pool intents dropped by `reason`. reason=no_pool_covers: no configured Builder or Fetcher Pool covers the intent's (kind, system, effective_features) — the placer would never spawn a Job for it, so provisioning would mint a permanently-idle NodeClaim; add a Pool or remove the hwClass advertising the feature. reason=no_hosting_class: no configured hw-class can host the intent EVEN WITH no ICE-masking — wrong arch, footprint exceeds every arch-matching class's max_cores/max_mem, or required_features unmatched (the hwClasses key-set lacks a `provides_features` entry for it). Persistent until `[sla.hw_classes]` changes. reason=all_cells_ice_masked: a class CAN host the intent but every hosting cell is ICE-masked — NodeClaim launches are failing in the cloud (capacity, quota, IAM). Self-heals once the ICE backoff expires *if* the cloud recovers; persistent if structural (e.g. missing AWSServiceRoleForEC2Spot). Check `nodeclaim_reaped_total{reason=~\"ice|vanished\"}` and Karpenter. reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned cell's per-class catalog ceiling (or max_node_disk) — the scheduler's ClassCeiling gate didn't reject it (override-bypass producer hole). The intent has no valid claim of any n; sizing drops it instead of looping mint→Pending. reason=unknown_hw_class: scheduler stamped a hwClass not yet in the controller's GetHwClassConfig — config skew; self-heals within ≤300s, persistent rate = controller's hw_refresh RPC failing.",
-        "kind": "counter",
-        "name": "rio_controller_nodeclaim_intent_dropped_total"
-      },
-      {
-        "help": "Per-`cell` boolean (0/1): the Schmitt loop can no longer widen lead_time_q — either q≥0.99 (clamp) or lead_time≥sla.maxLeadTime (widen-gate closed). Sustained 1 with low forecast_hit_ewma = structurally cannot cover (fat-tailed eta_error). Derivable from lead_time_seconds vs config; exported so the alert anchors on the actual gate predicate.",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_lead_time_q_at_cap"
-      },
-      {
-        "help": "Per-`cell` provisioning lead-time: lead_time_q-quantile of the z=boot−eta_error DDSketch. What cover_deficit provisions ahead by. Stuck at the seed value = no Registered=True transitions recorded yet (check seed_fallback_total).",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_lead_time_seconds"
-      },
-      {
-        "help": "Owned NodeClaims at the last tick by `cell` × `state`. state=registered: Registered=True AND not terminating (FFD-placeable); state=inflight: created but not yet Registered; state=terminating: metadata.deletionTimestamp set (Karpenter finalizer draining, ~60-90s; excluded from FFD placement, still in max_fleet_cores budget). Σ(registered) ≈ warm capacity; inflight stuck high = check reaped_total{reason=ice|boot-timeout}; terminating>0 with registered=0 + ffd_unplaced_cores>0 = node draining out from under a queue (cover_deficit mints the replacement next tick).",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_live"
-      },
-      {
-        "help": "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. reason=idle: NA-consolidate break-even; reason=ice: Launched=False (timeout or terminal LaunchFailed reason); reason=boot-timeout: Launched=True ∧ Registered=False past timeout; reason=dead: scheduler-reported hung node; reason=vanished: in-flight claim Karpenter-GC'd between ticks.",
-        "kind": "counter",
-        "name": "rio_controller_nodeclaim_reaped_total"
-      },
-      {
-        "help": "Oldest terminating NodeClaim per `cell` (now − metadata.deletionTimestamp; 0 when none terminating). The per-claim age the StuckTerminating alert keys on — the terminating count never touches 0 under sustained scale-down churn, so a count-based `for:` fires on every healthy reap burst (r38 merged_001 — lifecycle inverse of the inflight scale-up case).",
-        "kind": "gauge",
-        "name": "rio_controller_nodeclaim_terminating_age_max_seconds"
-      },
-      {
-        "help": "nodeclaim_pool reconcile_once latency. Recorded on success AND error (⊥-tick, apiserver 5xx). p99 approaching ADMIN_RPC_TIMEOUT (5s) = scheduler stalled; approaching tick interval = reconciler can't keep up.",
-        "kind": "histogram",
-        "name": "rio_controller_nodeclaim_tick_duration_seconds"
-      },
-      {
-        "help": "Running ephemeral Jobs deleted after orphan grace with no scheduler assignment (labeled by pool). Non-zero rate = builders stuck unable to self-exit (D-state FUSE wait, OOM-loop); investigate node/kernel health.",
-        "kind": "counter",
-        "name": "rio_controller_orphan_jobs_reaped_total"
-      },
-      {
-        "help": "Reconcile loop latency. reconciler=pool|componentscaler. Recorded on both success and error paths — long durations + errors = slow/timing-out apiserver.",
-        "kind": "histogram",
-        "name": "rio_controller_reconcile_duration_seconds"
-      },
-      {
-        "help": "Reconcile errors. reconciler=pool|componentscaler, error_kind=kube|finalizer|invalid_spec. error_kind is the variant discriminator (stable, low cardinality). Sustained rate > 0 = check controller logs.",
-        "kind": "counter",
-        "name": "rio_controller_reconcile_errors_total"
-      },
-      {
-        "help": "Autoscale patches executed. direction=up|down. High rate = queue depth oscillating (check stabilization windows).",
-        "kind": "counter",
-        "name": "rio_controller_scaling_decisions_total"
-      },
-      {
-        "help": "1 while the lease-acquire CellSketches reload from PG is pending (load() not yet succeeded since on_acquire); 0 once latched. While 1, persist() is gated off so a stale standby-startup snapshot doesn't overwrite the previous leader's PG rows. Stuck at 1 = PG unreachable from controller; reconcile runs degraded.",
-        "kind": "gauge",
-        "name": "rio_controller_sketches_reload_pending"
-      }
-    ],
-    "gateway": [
-      {
-        "help": "SSH auth accepted but tenant identity degraded to single-tenant mode (labeled by reason: interior_whitespace = authorized_keys comment has a space where a dash was intended)",
-        "kind": "counter",
-        "name": "rio_gateway_auth_degraded_total"
-      },
-      {
-        "help": "Bytes forwarded to/from SSH client (labeled by direction: rx/tx)",
-        "kind": "counter",
-        "name": "rio_gateway_bytes_total"
-      },
-      {
-        "help": "Currently active SSH channels",
-        "kind": "gauge",
-        "name": "rio_gateway_channels_active"
-      },
-      {
-        "help": "Currently active SSH connections",
-        "kind": "gauge",
-        "name": "rio_gateway_connections_active"
-      },
-      {
-        "help": "Total SSH connections (labeled by result: new/accepted/rejected/rejected_jwt)",
-        "kind": "counter",
-        "name": "rio_gateway_connections_total"
-      },
-      {
-        "help": "Protocol errors (labeled by type; type=session also carries stage=tcp-accepted|auth-attempted|authenticated|channel-open)",
-        "kind": "counter",
-        "name": "rio_gateway_errors_total"
-      },
-      {
-        "help": "Protocol handshakes completed (labeled by result: success/rejected/failure)",
-        "kind": "counter",
-        "name": "rio_gateway_handshakes_total"
-      },
-      {
-        "help": "JWT mint failed but jwt.required=false, degraded to tenant_name fallback",
-        "kind": "counter",
-        "name": "rio_gateway_jwt_mint_degraded_total"
-      },
-      {
-        "help": "Session JWT re-mint failed; stale token kept (downstream will reject ExpiredSignature)",
-        "kind": "counter",
-        "name": "rio_gateway_jwt_refresh_failed_total"
-      },
-      {
-        "help": "Session JWT re-minted on a long-lived SSH connection (cached token near expiry)",
-        "kind": "counter",
-        "name": "rio_gateway_jwt_refreshed_total"
-      },
-      {
-        "help": "Per-opcode handling latency",
-        "kind": "histogram",
-        "name": "rio_gateway_opcode_duration_seconds"
-      },
-      {
-        "help": "Protocol opcodes handled (labeled by opcode name)",
-        "kind": "counter",
-        "name": "rio_gateway_opcodes_total"
-      },
-      {
-        "help": "PutPath retries on store Code::Aborted (labeled by attempt). attempt=PUT_PATH_ABORTED_MAX_ATTEMPTS means budget exhausted and the error surfaced to the client (I-168).",
-        "kind": "counter",
-        "name": "rio_gateway_putpath_aborted_retries_total"
-      },
-      {
-        "help": "SubmitBuild rejected because tenant is over store quota (labeled by tenant)",
-        "kind": "counter",
-        "name": "rio_gateway_quota_rejections_total"
-      }
-    ],
-    "scheduler": [
-      {
-        "help": "Per-ActorCommand handling latency (labeled by cmd variant); the actor is single-threaded so a slow command head-of-line blocks every queued RPC",
-        "kind": "histogram",
-        "name": "rio_scheduler_actor_cmd_seconds"
-      },
-      {
-        "help": "ActorCommand mpsc queue depth, sampled once per dequeued command. Growth = commands arriving faster than the single-threaded loop retires them. Pair with actor_cmd_seconds to localize a wedge.",
-        "kind": "gauge",
-        "name": "rio_scheduler_actor_mailbox_depth"
-      },
-      {
-        "help": "Total derivation-to-worker assignments",
-        "kind": "counter",
-        "name": "rio_scheduler_assignments_total"
-      },
-      {
-        "help": "Derivations reset to Ready after running-since exceeded backstop (worker went silent)",
-        "kind": "counter",
-        "name": "rio_scheduler_backstop_timeouts_total"
-      },
-      {
-        "help": "BuildEvent broadcast events skipped by lagging subscribers (sum of RecvError::Lagged(n) across all bridge tasks). Non-zero under sustained event burst (large DAG, many concurrent drvs emitting Log lines) — gateway can't drain fast enough (I-144).",
-        "kind": "counter",
-        "name": "rio_scheduler_broadcast_lagged_total"
-      },
-      {
-        "help": "Total build duration",
-        "kind": "histogram",
-        "name": "rio_scheduler_build_duration_seconds"
-      },
-      {
-        "help": "Edge count per GetBuildGraph response. High p99 (>10k) = unusually dense DAG approaching the implicit subgraph bound.",
-        "kind": "histogram",
-        "name": "rio_scheduler_build_graph_edges"
-      },
-      {
-        "help": "Builds failed by per-build wall-clock timeout (BuildOptions.build_timeout seconds since submission). Distinct from backstop_timeouts_total (per-derivation heuristic — worker went silent).",
-        "kind": "counter",
-        "name": "rio_scheduler_build_timeouts_total"
-      },
-      {
-        "help": "Currently active builds",
-        "kind": "gauge",
-        "name": "rio_scheduler_builds_active"
-      },
-      {
-        "help": "Total builds at terminal state (labeled by outcome: success/failure/cancelled)",
-        "kind": "counter",
-        "name": "rio_scheduler_builds_total"
-      },
-      {
-        "help": "CA cutoff cascade walks that hit MAX_CASCADE_NODES (1000). Node-count cap, not tree-depth — for wide DAGs (fanout>1), 1000 nodes hit well before depth>3. Non-zero = cascades truncated; operator should review if non-zero.",
-        "kind": "counter",
-        "name": "rio_scheduler_ca_cutoff_depth_cap_hits_total"
-      },
-      {
-        "help": "Derivations skipped via CA early-cutoff (Queued→Skipped transitions). Each increment is one build that did NOT run because a CA dep's output matched the content index. Direct measure of CA cutoff efficacy.",
-        "kind": "counter",
-        "name": "rio_scheduler_ca_cutoff_saves_total"
-      },
-      {
-        "help": "Sum of est_duration of skipped derivations, in hw-normalized ref-seconds (r[sched.sla.hw-ref-seconds]; NOT wall-clock per-build — skipped builds were never assigned, so no hw_factor exists to denormalize; divide by fleet min hw_factor for a wall-clock lower bound). est_duration is the Estimator's EMA, not actual — a derivation that's never run has no actual. Paired with saves_total for avg-seconds-per-save.",
-        "kind": "counter",
-        "name": "rio_scheduler_ca_cutoff_seconds_saved"
-      },
-      {
-        "help": "CA early-cutoff output-hash lookups against the content index on successful completion (labeled by outcome=match|miss|skipped_after_miss| malformed|error). High match ratio → CA derivations rebuilding identical content; cutoff-propagate will skip downstream work. skipped_after_miss counts outputs short-circuited after an earlier miss in the same derivation. malformed = executor sent empty output_path; error = PG lookup failed/timed out (alert if rate>0).",
-        "kind": "counter",
-        "name": "rio_scheduler_ca_hash_compares_total"
-      },
-      {
-        "help": "Circuit-breaker open transitions (store unreachable for 5 consecutive checks); alert if > 0",
-        "kind": "counter",
-        "name": "rio_scheduler_cache_check_circuit_open_total"
-      },
-      {
-        "help": "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained",
-        "kind": "counter",
-        "name": "rio_scheduler_cache_check_failures_total"
-      },
-      {
-        "help": "Cache-hit derivations deferred to Queued because their inputDrvs are not yet Completed",
-        "kind": "counter",
-        "name": "rio_scheduler_cache_hit_deferred_total"
-      },
-      {
-        "help": "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)",
-        "kind": "counter",
-        "name": "rio_scheduler_cache_hits_total"
-      },
-      {
-        "help": "CancelSignal try_send drops (worker stream full/closed under backpressure). Best-effort: the transition to Cancelled is scheduler-authoritative regardless; worker disconnect reassign still fires. Alert if rate > 0 sustained.",
-        "kind": "counter",
-        "name": "rio_scheduler_cancel_signal_dropped_total"
-      },
-      {
-        "help": "CancelSignal messages successfully delivered to the executor stream (Ok on try_send). Excludes drops (counted in cancel_signal_dropped_total) and skipped attempts.",
-        "kind": "counter",
-        "name": "rio_scheduler_cancel_signals_total"
-      },
-      {
-        "help": "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0",
-        "kind": "counter",
-        "name": "rio_scheduler_cleanup_dropped_total"
-      },
-      {
-        "help": "CompletionReport dropped at the recv arm before reaching the actor. A real store path is ≤259 bytes, so path_too_long can only fire for a report that could never have matched a live assignment — the drop moves the actor's inevitable \"unknown derivation\" discard off the single-threaded event loop. Labeled by reason: path_too_long.",
-        "kind": "counter",
-        "name": "rio_scheduler_completions_rejected_total"
-      },
-      {
-        "help": "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)",
-        "kind": "histogram",
-        "name": "rio_scheduler_critical_path_accuracy"
-      },
-      {
-        "help": "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)",
-        "kind": "counter",
-        "name": "rio_scheduler_derivations_gc_deleted_total"
-      },
-      {
-        "help": "Derivations waiting for assignment",
-        "kind": "gauge",
-        "name": "rio_scheduler_derivations_queued"
-      },
-      {
-        "help": "Derivations currently building",
-        "kind": "gauge",
-        "name": "rio_scheduler_derivations_running"
-      },
-      {
-        "help": "Time from a derivation entering Ready to being Assigned (fed from DerivationState.ready_at). With ephemeral builders, dominated by node-provision (~60–180s on EKS).",
-        "kind": "histogram",
-        "name": "rio_scheduler_dispatch_wait_seconds"
-      },
-      {
-        "help": "BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained.",
-        "kind": "counter",
-        "name": "rio_scheduler_event_persist_dropped_total"
-      },
-      {
-        "help": "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)",
-        "kind": "counter",
-        "name": "rio_scheduler_executor_reconnect_rejected_total"
-      },
-      {
-        "help": "§13e+r35: EffectiveFeatures::derive stripped the declared requiredSystemFeatures at the FOD↔Fetcher chokepoint (labeled reason ∈ {non_fod_fetcher, fod_declared_features}). non_fod_fetcher: a non-FOD declared `fetcher` (rio-internal routing tag, not a tenant-declarable system feature); the drv routes to a Builder Pool. fod_declared_features: a FOD declared extraneous features (e.g. `kvm`); the drv routes to a Fetcher Pool. The strip produces correct routing — the WARN (debounced once per (pname, reason) edge) names the declared vs effective set so the tenant can fix the misconfig.",
-        "kind": "counter",
-        "name": "rio_scheduler_features_stripped_total"
-      },
-      {
-        "help": "Heartbeat-adoption found the DAG already Assigned to a DIFFERENT worker (reconcile re-dispatched before this worker reconnected). Both run; first to complete wins. Nonzero suggests reconcile delay is too short for the observed worker-reconnect time.",
-        "kind": "counter",
-        "name": "rio_scheduler_heartbeat_adopt_conflicts_total"
-      },
-      {
-        "help": "Builds re-claimed in the DAG from a reconnecting worker's heartbeat. Expected after scheduler restart: recovery's reconcile may have reset to Ready before the worker reconnected (I-063 keeps the stream alive during drain). Adoption prevents re-dispatch of work already in flight.",
-        "kind": "counter",
-        "name": "rio_scheduler_heartbeat_adoptions_total"
-      },
-      {
-        "help": "Heartbeats dropped by the actor-side identity binding (label: reason)",
-        "kind": "counter",
-        "name": "rio_scheduler_heartbeat_rejected_total"
-      },
-      {
-        "help": "Busy executors skipped by detect_hung_nodes because no controller-reported spec.nodeName binding exists yet (controller-lag or AckSpawnedIntents channel down). Sustained nonzero with hung nodes un-reaped → check rio-controller nodeclaim_pool reconcile loop.",
-        "kind": "counter",
-        "name": "rio_scheduler_hung_detect_skipped_no_authoritative_total"
-      },
-      {
-        "help": "Successful K8s Lease acquisitions (leader elections won)",
-        "kind": "counter",
-        "name": "rio_scheduler_lease_acquired_total"
-      },
-      {
-        "help": "K8s Lease losses (stepped down, partition, or preempted)",
-        "kind": "counter",
-        "name": "rio_scheduler_lease_lost_total"
-      },
-      {
-        "help": "BuildLogBatch dropped by the (executor, drv) binding check, the derivation_path length bound, or the line-number sanity checks (non-monotone vs the ring buffer, or numbering that would overflow u64). Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long | non_monotonic | line_number_overflow.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_batches_rejected_total"
-      },
-      {
-        "help": "Empty final drains (zero lines drained — failover restamp where the worker never reconnected, or an execution that never streamed a line) whose metadata-only status/finished_at stamp UPDATE on the drv_logs row failed (transient PG error). Not data loss: nothing was drained, and any prior .partial blob and its row stay intact and served with is_complete=false. The stamp is not retried; the row (if any) ages out at the TTL sweep. The data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_empty_drain_finalize_failures_total"
-      },
-      {
-        "help": "Final-flush requests dropped because the execution's drv_logs row is already is_complete=true (an interim leader finalized it across a lease flap); the retained ring-buffer entry was stale pre-failover residue and was discarded instead of re-finalizing. Alert if rate is sustained — it implies repeated lease flapping.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_already_finalized_total"
-      },
-      {
-        "help": "Final-flush requests dropped due to flusher channel backpressure",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_dropped_total"
-      },
-      {
-        "help": "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). is_final=true fires after the final drain (the drained data cannot be re-flushed); alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here. Empty-drain finalization stamp failures (zero lines drained) are counted by rio_scheduler_log_empty_drain_finalize_failures_total, not here.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_failures_total"
-      },
-      {
-        "help": "Final-flush attempts deferred because the finalize guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. A deferral with a non-empty buffer is retained by the flusher and retried each periodic tick until PG answers (terminal cleanup leaves the buffer to the retry; a request whose leadership tenure has ended by then is dropped instead — see rio_scheduler_log_flush_stale_tenure_total); an empty buffer is reaped as bookkeeping (reads already fall through to the stored .partial when the ring entry holds zero lines). Counted per attempt, so retries during one outage keep incrementing it. Sustained rate indicates PG trouble on the flush path; loss requires the retry retention cap to overflow, leadership to move before PG recovers, or the process to exit before PG recovers.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_finalize_deferred_total"
-      },
-      {
-        "help": "Flush payloads whose ring lines carried non-monotone worker line numbers at span-recording time, so the drv_logs row recorded the physical line count instead of the line-number span (labeled kind: final|periodic). Should be zero — push_for rejects non-monotone batches at ingestion, so a non-zero rate means an ingestion-gate regression. Not a data-loss signal: the blob is still uploaded and served.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_span_fallback_total"
-      },
-      {
-        "help": "Final log-flush requests dropped because the scheduler lease moved (lost, or lost-and-reacquired) between the request's enqueue and its processing: the live leadership tenure owns that execution's finalization, and uploading the stale ring would freeze a drv_logs row the live tenure may still be extending. Counted for first attempts and retained-deferral retries alike. The execution's log is finalized by the live tenure's own terminal flush; if its terminal had already persisted before the outage (or the drv was re-dispatched under a new exec_id), the row instead stays at its .partial (is_complete=false) coverage — the bounded pre-retry loss.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_stale_tenure_total"
-      },
-      {
-        "help": "Final-flush requests dropped because the drv was re-dispatched while the request was queued (the live ring-buffer exec_id no longer matches the request's). The re-dispatched execution's log is preserved; the stale request's exec was already lost when assign_to_worker discarded its buffer.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_stale_total"
-      },
-      {
-        "help": "Successful S3 log flushes (labeled by kind: final/periodic)",
-        "kind": "counter",
-        "name": "rio_scheduler_log_flush_total"
-      },
-      {
-        "help": "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_forward_dropped_total"
-      },
-      {
-        "help": "drv_logs rows (and their .log.zst + .partial.log.zst S3 blobs) deleted by the LogFlusher TTL GC sweep. Cadence ~1h; threshold scheduler.logRetentionDays.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_gc_swept_total"
-      },
-      {
-        "help": "Log lines forwarded via BuildEvent::Log (worker -> scheduler -> gateway broadcast)",
-        "kind": "counter",
-        "name": "rio_scheduler_log_lines_forwarded_total"
-      },
-      {
-        "help": "Stored-coverage lookups that failed during a flush's pre-drain reconciliation (labeled by phase: pg = drv_logs point-SELECT, s3 = prior .partial GET; is_final: true/false). Not data loss: the periodic snapshot skips the tick and retries next tick; the final flush uploads the drained ring without the stored prefix and preserves the .partial blob. Investigate if sustained (degraded log merges); the data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true.",
-        "kind": "counter",
-        "name": "rio_scheduler_log_prefix_fetch_failures_total"
-      },
-      {
-        "help": "Stored pre-failover log prefixes fetched from the prior leader's .partial blob and re-folded into this leader's flushes (failover with a reconnecting worker).",
-        "kind": "counter",
-        "name": "rio_scheduler_log_prefix_recovered_total"
-      },
-      {
-        "help": "LogBatch dropped: stream already has MAX_DRVS_PER_STREAM distinct accepted derivation_path values. Defense-in-depth tripwire — only accepted paths grow the cap, so a flood of rejected/fabricated paths alone cannot fill it (those are counted by rio_scheduler_log_batches_rejected_total).",
-        "kind": "counter",
-        "name": "rio_scheduler_log_unknown_drv_dropped_total"
-      },
-      {
-        "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0",
-        "kind": "counter",
-        "name": "rio_scheduler_malformed_built_output_total"
-      },
-      {
-        "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor.",
-        "kind": "histogram",
-        "name": "rio_scheduler_merge_phase_seconds"
-      },
-      {
-        "help": "Active builds auto-cancelled by the orphan-watcher sweep: no build_events receiver (gateway SubmitBuild/WatchBuild stream) for >ORPHAN_BUILD_GRACE (5min). Backstop for gateway crash / gateway→scheduler timeout during P0331 disconnect cleanup. Nonzero is expected on gateway restarts; sustained nonzero with healthy gateways means the gateway-side cancel is not firing.",
-        "kind": "counter",
-        "name": "rio_scheduler_orphan_builds_cancelled_total"
-      },
-      {
-        "help": "running_build entries drained after two consecutive heartbeats reported empty (lost completion / dead-stream-post-send). The slot was dead capacity until drained. Nonzero is the signal to look for I-032-class bugs upstream — the drain is the safety net, not the fix.",
-        "kind": "counter",
-        "name": "rio_scheduler_phantom_assignments_drained_total"
-      },
-      {
-        "help": "BuildPhase dropped by the actor-side (status, executor) binding check or the recv-side length bounds. Either the named derivation has no active (Assigned|Running) assignment, the calling stream is not the assigned executor, the path exceeds MAX_DERIVATION_PATH_LEN, or the phase text exceeds MAX_PHASE_LEN. Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long | phase_too_long.",
-        "kind": "counter",
-        "name": "rio_scheduler_phases_rejected_total"
-      },
-      {
-        "help": "Derivations poisoned because failed_builders excluded every registered worker of the matching kind (I-065). Nonzero rate with small fleet = poison threshold unreachable; the build would otherwise defer forever.",
-        "kind": "counter",
-        "name": "rio_scheduler_poison_fleet_exhausted_total"
-      },
-      {
-        "help": "PrefetchHint messages sent (one per assignment with paths to warm). Missing from a dispatch = leaf drv (no children).",
-        "kind": "counter",
-        "name": "rio_scheduler_prefetch_hints_sent_total"
-      },
-      {
-        "help": "Total paths in sent PrefetchHints. Divide by hints_sent for avg paths-per-hint.",
-        "kind": "counter",
-        "name": "rio_scheduler_prefetch_paths_sent_total"
-      },
-      {
-        "help": "Backpressure activations (queue reached 80% capacity)",
-        "kind": "counter",
-        "name": "rio_scheduler_queue_backpressure"
-      },
-      {
-        "help": "Deferred Ready derivations waiting for an executor of the matching kind (snapshot per dispatch pass; labeled by kind=builder|fetcher). Sustained nonzero → scale the matching pool.",
-        "kind": "gauge",
-        "name": "rio_scheduler_queue_depth"
-      },
-      {
-        "help": "Post-recovery ReconcileAssignments command dropped (actor channel full). Assigned-but-worker-gone derivations leak until NEXT recovery. Rare (channel is 1024 deep); alert if > 0.",
-        "kind": "counter",
-        "name": "rio_scheduler_reconcile_dropped_total"
-      },
-      {
-        "help": "Time to reconstruct actor state from PG on LeaderAcquired (labeled by outcome=success|failure)",
-        "kind": "histogram",
-        "name": "rio_scheduler_recovery_duration_seconds"
-      },
-      {
-        "help": "Scheduler state recoveries from PG after LeaderAcquired (labeled by outcome=success|failure|discarded_flap)",
-        "kind": "counter",
-        "name": "rio_scheduler_recovery_total"
-      },
-      {
-        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults.",
-        "kind": "counter",
-        "name": "rio_scheduler_resource_floor_bumps_total"
-      },
-      {
-        "help": "ALS alternation hit ALS_MAX_ROUNDS without ‖Δα‖₁ < ALS_DELTA_TOL convergence (labeled `tenant`). The α/T_ref(c) joint fit failed to converge — alpha is the final iterate, not a fixed point. Sustained nonzero ⇒ investigate rank-gate degeneracy or fixture quality (the cap is already a worst-case budget — see alpha.rs constants).",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_als_round_cap_hit_total"
-      },
-      {
-        "help": "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling (labeled `hw_class`). Always 1 for every class under `hwCostSource: static` (no AWS API, expected). Under `spot` a persistent 1 ⇒ `describe_instance_types` failed at boot (check IRSA), or the class's `requirements` match 0 types in the deployment region (operator typo / AWS deprecation). Class falls to the global ceiling — over-permits, never over-strips.",
-        "kind": "gauge",
-        "name": "rio_scheduler_sla_class_ceiling_uncatalogued"
-      },
-      {
-        "help": "SLA envelope hit/miss per tier (labeled tier, result=hit|miss, constraint=wall|mem|-). `constraint` names the dimension that missed; `-` for hits.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_envelope_result_total"
-      },
-      {
-        "help": "§13b: forecast-pass intent dropped before emit (unique drop events — debounced once per `(drv_hash, reason)` per LRU residency, r34 bug_018). Labeled `reason` ∈ {lead_horizon, tenant_budget}. `lead_horizon`: ETA exceeds the per-intent forecast horizon (`max(lead_time_seed)` over routable hwClasses pre-solve, over `intent.hw_class_names` post-solve) — the scheduler's seed-based approximation of the controller's `a_open` would drop it (r34 merged_bug_006: the controller reads a learned per-cell DDSketch quantile with no return channel to the scheduler, so when learned drifts above the seed this over-counts); `tenant_budget`: `max_forecast_cores_per_tenant` exhausted by higher-priority intents this poll. Sustained `lead_horizon` ⇒ deps complete far ahead of any seed lead (saved work) OR a routable class's `lead_time_seed` is missing. Sustained `tenant_budget` ⇒ Ready frontier already saturates the cap.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_forecast_dropped_total"
-      },
-      {
-        "help": "cost-poller fell back from a live spot-price source. Labeled `reason` ∈ {api_error, empty_history, parse, stale}. `stale`: `_hw_cost_stale_seconds > 6 × pollInterval` → price() clamped to the helm seed.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_hw_cost_fallback_total"
-      },
-      {
-        "help": "age of the hw-band $/vCPU·hr snapshot. Climbs when the lease-gated spot-price poller is failing or this replica is standby (price is PG-backed; standby reads but doesn't write)",
-        "kind": "gauge",
-        "name": "rio_scheduler_sla_hw_cost_stale_seconds"
-      },
-      {
-        "help": "solve hit a (hw_class, cap) cell the cost table has no $/vCPU·hr for; the cell is dropped from the admissible set (labeled `tenant`). Sustained nonzero ⇒ hwClasses config drifted from the cost-poller's instance-type menu.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_hw_cost_unknown_total"
-      },
-      {
-        "help": "ICE-mask hardware ladder exhausted at the terminal tier with no admissible (hw_class, cap) cell left. Labeled `tenant`, `exit` (the cell the ladder gave up on). Replaces `_ice_backoff_total`.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_hw_ladder_exhausted_total"
-      },
-      {
-        "help": "infeasible-at-any-tier count, labeled `reason` ∈ {serial_floor, mem_ceiling, disk_ceiling, core_ceiling, interrupt_runaway, capacity_exhausted}. The reason names which constraint bound at the loosest tier (see InfeasibleReason).",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_infeasible_total"
-      },
-      {
-        "help": "per-tenant LRU evicted a (pname, system) key at `sla.maxKeysPerTenant` (labeled `tenant`). Nonzero ⇒ a tenant is exhausting the fit-cache cap; check for random-pname submissions (`r[sched.sla.threat.corpus-clamp]`).",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_keys_evicted_total"
-      },
-      {
-        "help": "M(c) Koenker-Machado pseudo-R1<0.7 fallback to independent p90 (labeled tenant)",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_mem_fit_weak_total"
-      },
-      {
-        "help": "MAD-rejected samples (labeled tenant). Row stays in PG (outlier_excluded=TRUE) for forensics; refit excludes it.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_outlier_rejected_total"
-      },
-      {
-        "help": "actual/predicted, by dimension (labeled dim=wall|mem). 1.0=perfect; >1.0=under-predicted.",
-        "kind": "histogram",
-        "name": "rio_scheduler_sla_prediction_ratio"
-      },
-      {
-        "help": "fleet-median prior parameter ÷ operator-probe basis (labeled `param`); outside [0.5, 2.0] ⇒ clamped to the band edge",
-        "kind": "gauge",
-        "name": "rio_scheduler_sla_prior_divergence"
-      },
-      {
-        "help": "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — increments regardless of [sla] gate)",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_refit_total"
-      },
-      {
-        "help": "Hartigan dip test rejected unimodality (p<0.05) on a key's log-residuals (labeled tenant). The single-curve T(c) model is wrong — likely two workloads sharing a pname.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_residual_multimodal_total"
-      },
-      {
-        "help": "exploration froze at maxCores still saturated (labeled tenant). The build wants more cores than the cluster offers.",
-        "kind": "counter",
-        "name": "rio_scheduler_sla_suspicious_scaling_total"
-      },
-      {
-        "help": "Pre-existing Completed nodes reset to Ready at merge because output was GC'd from store. Nonzero rate = GC retention shorter than DAG node lifetime.",
-        "kind": "counter",
-        "name": "rio_scheduler_stale_completed_reset_total"
-      },
-      {
-        "help": "Pre-existing Completed nodes whose GC'd output was repopulated via upstream substitution at merge (instead of reset-to-Ready re-dispatch).",
-        "kind": "counter",
-        "name": "rio_scheduler_stale_completed_substituted_total"
-      },
-      {
-        "help": "CA realisations dropped from cache-hit set because the realized path was GC'd from store. Same operator signal as stale_completed_reset; this counts the newly-inserted-CA path, that one counts the pre-existing-completed path.",
-        "kind": "counter",
-        "name": "rio_scheduler_stale_realisation_filtered_total"
-      },
-      {
-        "help": "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss",
-        "kind": "counter",
-        "name": "rio_scheduler_substitute_fetch_failures_total"
-      },
-      {
-        "help": "Transient (Unavailable/Aborted/ResourceExhausted) substitute-fetch errors that triggered a backoff retry. High rate without matching failures = store load absorbed by retry; high rate WITH failures = backoff insufficient.",
-        "kind": "counter",
-        "name": "rio_scheduler_substitute_fetch_retries_total"
-      },
-      {
-        "help": "Derivations transitioned to Substituting (detached upstream fetch spawned). Pairs with substitute_fetch_failures_total to derive success rate.",
-        "kind": "counter",
-        "name": "rio_scheduler_substitute_spawned_total"
-      },
-      {
-        "help": "Submissions pruned to roots-only by the top-down substitution pre-check",
-        "kind": "counter",
-        "name": "rio_scheduler_topdown_prune_total"
-      },
-      {
-        "help": "Top-down-pruned roots whose deferred substitute fetch failed (build failed fast; resubmit re-probes)",
-        "kind": "counter",
-        "name": "rio_scheduler_topdown_substitute_fail_total"
-      },
-      {
-        "help": "State-machine transition rejections (labeled by target state); alert if rate > 0",
-        "kind": "counter",
-        "name": "rio_scheduler_transition_rejected_total"
-      },
-      {
-        "help": "Worker-supplied BuiltOutput.output_name not in derivation's output_names (dropped at handle_completion membership filter); alert if rate > 0",
-        "kind": "counter",
-        "name": "rio_scheduler_undeclared_built_output_total"
-      },
-      {
-        "help": "§13c: solve_intent_for found NO hwClass whose provides_features hosts the drv's required_features (labeled tenant). Debounced once per (tenant, required_features) edge. The intent is unroutable until a `[sla.hw_classes.$h]` with matching providesFeatures is added; the WARN names which features.",
-        "kind": "counter",
-        "name": "rio_scheduler_unroutable_features_total"
-      },
-      {
-        "help": "Ready derivations whose `system` is advertised by zero registered executors of the matching kind (labeled by system; snapshot per dispatch pass). Nonzero = no pool exists for that system; add it to a Pool's `systems` list.",
-        "kind": "gauge",
-        "name": "rio_scheduler_unroutable_ready"
-      },
-      {
-        "help": "Fraction of executors currently running a build (busy/total; labeled by kind=builder|fetcher). Emitted per dispatch pass alongside queue_depth.",
-        "kind": "gauge",
-        "name": "rio_scheduler_utilization"
-      },
-      {
-        "help": "best_executor() fell back to cold workers because NO warm worker passed the hard filter. Single-worker clusters and mass scale-up expect nonzero; sustained high rate = workers never warming (PrefetchComplete not arriving — check worker logs).",
-        "kind": "counter",
-        "name": "rio_scheduler_warm_gate_fallback_total"
-      },
-      {
-        "help": "Paths fetched per initial warm-gate PrefetchHint (from the worker's PrefetchComplete ACK). 0 = worker was already warm (cache hit on everything); high = fresh worker cold-fetched everything.",
-        "kind": "histogram",
-        "name": "rio_scheduler_warm_prefetch_paths"
-      },
-      {
-        "help": "Worker stream disconnects (graceful and ungraceful)",
-        "kind": "counter",
-        "name": "rio_scheduler_worker_disconnects_total"
-      },
-      {
-        "help": "Fully-registered workers (stream + heartbeat)",
-        "kind": "gauge",
-        "name": "rio_scheduler_workers_active"
-      }
-    ],
-    "store": [
-      {
-        "help": "check_available wall-clock (HEAD-probe phase of FindMissingPaths). ⌈N_uncached/128⌉ × RTT plus any 429 retry sleeps. p99 informs the scheduler's MERGE_FMP_TIMEOUT.",
-        "kind": "histogram",
-        "name": "rio_store_check_available_duration_seconds"
-      },
-      {
-        "help": "moka chunk cache hits (for cross-instance aggregation)",
-        "kind": "counter",
-        "name": "rio_store_chunk_cache_hits_total"
-      },
-      {
-        "help": "moka chunk cache misses",
-        "kind": "counter",
-        "name": "rio_store_chunk_cache_misses_total"
-      },
-      {
-        "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)",
-        "kind": "gauge",
-        "name": "rio_store_chunk_dedup_ratio"
-      },
-      {
-        "help": "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. Sustained nonzero = builder upload path is crashing repeatedly.",
-        "kind": "counter",
-        "name": "rio_store_gc_chunk_orphan_swept_total"
-      },
-      {
-        "help": "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)",
-        "kind": "counter",
-        "name": "rio_store_gc_chunk_resurrected_total"
-      },
-      {
-        "help": "Per-row reap_one failures during the orphan scanner's loop (e.g. chunks_refcount_nonneg CHECK violation from a pre-existing accounting bug). The scan continues; sustained nonzero = a poison row needs manual intervention.",
-        "kind": "counter",
-        "name": "rio_store_gc_orphan_reap_failed_total"
-      },
-      {
-        "help": "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)",
-        "kind": "counter",
-        "name": "rio_store_gc_path_resurrected_total"
-      },
-      {
-        "help": "Paths deleted by GC sweep (narinfo + CASCADE). Monotonic over store lifetime.",
-        "kind": "counter",
-        "name": "rio_store_gc_path_swept_total"
-      },
-      {
-        "help": "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks).",
-        "kind": "counter",
-        "name": "rio_store_gc_s3_key_enqueued_total"
-      },
-      {
-        "help": "Paths not yet processed by the in-progress GC sweep. Ticks down per batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow.",
-        "kind": "gauge",
-        "name": "rio_store_gc_sweep_paths_remaining"
-      },
-      {
-        "help": "GetPath body-stream tasks currently writing (drives SIGTERM stream-drain)",
-        "kind": "gauge",
-        "name": "rio_store_get_path_active"
-      },
-      {
-        "help": "Bytes served via GetPath (nar_size on stream start)",
-        "kind": "counter",
-        "name": "rio_store_get_path_bytes_total"
-      },
-      {
-        "help": "GetPath latency (stream_path entry to whole-NAR verify)",
-        "kind": "histogram",
-        "name": "rio_store_get_path_duration_seconds"
-      },
-      {
-        "help": "Total GetPath operations (incremented on successful whole-NAR verify)",
-        "kind": "counter",
-        "name": "rio_store_get_path_total"
-      },
-      {
-        "help": "PutPath rejections by HMAC assignment-token check (labeled by reason)",
-        "kind": "counter",
-        "name": "rio_store_hmac_rejected_total"
-      },
-      {
-        "help": "GetPath content integrity check failures (bitrot/corruption)",
-        "kind": "counter",
-        "name": "rio_store_integrity_failures_total"
-      },
-      {
-        "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching).",
-        "kind": "gauge",
-        "name": "rio_store_pg_pool_utilization"
-      },
-      {
-        "help": "Bytes accepted via PutPath (nar_size on success)",
-        "kind": "counter",
-        "name": "rio_store_put_path_bytes_total"
-      },
-      {
-        "help": "PutPath latency",
-        "kind": "histogram",
-        "name": "rio_store_put_path_duration_seconds"
-      },
-      {
-        "help": "Total PutPath operations (per store path; PutPathBatch counts each output)",
-        "kind": "counter",
-        "name": "rio_store_put_path_total"
-      },
-      {
-        "help": "PutPath retriable rejections (labeled by reason: serialization| deadlock|placeholder_missing|connection|resource_exhausted| concurrent_upload). Client retries on aborted/unavailable. Sustained high deadlock/connection rate = PG-side problem.",
-        "kind": "counter",
-        "name": "rio_store_putpath_retries_total"
-      },
-      {
-        "help": "Stale 'uploading' placeholders reclaimed on the PutPath hot path (I-207). Nonzero expected under fetcher churn; sustained high suggests under-sized fetcher pods (see I-208).",
-        "kind": "counter",
-        "name": "rio_store_putpath_stale_reclaimed_total"
-      },
-      {
-        "help": "Rows in pending_s3_deletes awaiting drain",
-        "kind": "gauge",
-        "name": "rio_store_s3_deletes_pending"
-      },
-      {
-        "help": "pending_s3_deletes rows at max retry attempts (alert if > 0)",
-        "kind": "gauge",
-        "name": "rio_store_s3_deletes_stuck"
-      },
-      {
-        "help": "S3 API calls (labeled by operation: put_object/get_object/head_object/delete_object)",
-        "kind": "counter",
-        "name": "rio_store_s3_requests_total"
-      },
-      {
-        "help": "PutPath HMAC checks bypassed via x-rio-service-token (labeled by caller)",
-        "kind": "counter",
-        "name": "rio_store_service_token_accepted_total"
-      },
-      {
-        "help": "SignPath requests for non-CA paths with zero references. Suspicious for non-leaf derivations — GC cannot protect deps without the ref graph. Check worker ref-scanner if sustained.",
-        "kind": "counter",
-        "name": "rio_store_sign_empty_refs_total"
-      },
-      {
-        "help": "PutPath/PutPathBatch tenant-key lookups that failed (transient PG error) and fell back to the cluster key. The upload still succeeds with a valid cluster signature; tenants that trust ONLY their own key will see verify failures. Alert if sustained nonzero.",
-        "kind": "counter",
-        "name": "rio_store_sign_tenant_key_fallback_total"
-      },
-      {
-        "help": "try_substitute calls rejected with ResourceExhausted after waiting SUBSTITUTE_ADMISSION_WAIT (25s) for a permit. Sustained non-zero = genuine per-replica overload; ComponentScaler should already be reacting via the GetLoad utilization signal.",
-        "kind": "counter",
-        "name": "rio_store_substitute_admission_rejected_total"
-      },
-      {
-        "help": "try_substitute admission-gate utilization: (capacity - available) / capacity. Updated on each acquire AND each GetLoad call. Can saturate independently of pg_pool_utilization (upstream HTTP bottleneck).",
-        "kind": "gauge",
-        "name": "rio_store_substitute_admission_utilization"
-      },
-      {
-        "help": "Bytes ingested via upstream substitution (nar_size on hit)",
-        "kind": "counter",
-        "name": "rio_store_substitute_bytes_total"
-      },
-      {
-        "help": "Upstream substitution latency (narinfo fetch + NAR download + ingest)",
-        "kind": "histogram",
-        "name": "rio_store_substitute_duration_seconds"
-      },
-      {
-        "help": "Upstream substitution NAR hash or size mismatches, labeled by tenant (UUID). Nonzero is a security-relevant signal: upstream served corrupt or tampered bytes / a lying NarSize.",
-        "kind": "counter",
-        "name": "rio_store_substitute_integrity_failures_total"
-      },
-      {
-        "help": "check_available HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path).",
-        "kind": "counter",
-        "name": "rio_store_substitute_probe_cache_hits_total"
-      },
-      {
-        "help": "check_available HEAD-probe cache misses (path uncached; an upstream HEAD was issued).",
-        "kind": "counter",
-        "name": "rio_store_substitute_probe_cache_misses_total"
-      },
-      {
-        "help": "Upstream HEAD/GET probes that returned 429, labeled by tenant. The rate-limited subset is retried (≤3 passes) after honoring Retry-After; concurrency is halved when >10% of a pass 429s.",
-        "kind": "counter",
-        "name": "rio_store_substitute_probe_ratelimited_total"
-      },
-      {
-        "help": "Stale 'uploading' placeholders reclaimed on the substitution hot path. Nonzero expected under network churn; sustained high suggests upstream instability or aggressive pod rollouts.",
-        "kind": "counter",
-        "name": "rio_store_substitute_stale_reclaimed_total"
-      },
-      {
-        "help": "Upstream substitution attempts, labeled by result (hit/miss/error) and tenant (UUID). Per-upstream debugging detail is in the debug!/warn! log lines (which carry upstream=<url>); the metric label is bounded by tenant count, not by tenant-supplied URL.",
-        "kind": "counter",
-        "name": "rio_store_substitute_total"
-      }
-    ]
-  },
   "names": [
     "rio_builder_build_duration_seconds",
     "rio_builder_builds_active",
@@ -1254,5 +207,1052 @@
     "rio_store_substitute_probe_ratelimited_total",
     "rio_store_substitute_stale_reclaimed_total",
     "rio_store_substitute_total"
-  ]
+  ],
+  "by_component": {
+    "builder": [
+      {
+        "name": "rio_builder_build_duration_seconds",
+        "kind": "histogram",
+        "help": "Per-derivation build time"
+      },
+      {
+        "name": "rio_builder_builds_active",
+        "kind": "gauge",
+        "help": "Currently running builds on this worker"
+      },
+      {
+        "name": "rio_builder_builds_total",
+        "kind": "counter",
+        "help": "Total builds executed (labeled by outcome: success/failure/cancelled/timed_out/log_limit/infra_failure)"
+      },
+      {
+        "name": "rio_builder_cgroup_leak_total",
+        "kind": "counter",
+        "help": "Per-build cgroup rmdir failures on Drop (typically EBUSY — processes still in the tree). Leaked cgroups are harmless empty pseudo-dirs under /sys/fs/cgroup; pod restart clears them. Sustained rate = builds not reaping cleanly (investigate cgroup.kill timing or zombie builders)."
+      },
+      {
+        "name": "rio_builder_cgroup_oom_total",
+        "kind": "counter",
+        "help": "Builds killed by the cgroup OOM watcher (memory.events oom_kill incremented during build). Reported as InfrastructureFailure for scheduler resource_floor bump (I-196). Nonzero = pool's memory limit is undersized for its workload."
+      },
+      {
+        "name": "rio_builder_cpu_fraction",
+        "kind": "gauge",
+        "help": "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. 1.0 = one core fully used; >1.0 on multi-core."
+      },
+      {
+        "name": "rio_builder_fuse_cache_hits_total",
+        "kind": "counter",
+        "help": "FUSE cache hits (local symlink_metadata succeeded)"
+      },
+      {
+        "name": "rio_builder_fuse_cache_misses_total",
+        "kind": "counter",
+        "help": "FUSE cache misses (fetch from remote store required)"
+      },
+      {
+        "name": "rio_builder_fuse_circuit_open",
+        "kind": "gauge",
+        "help": "1.0 when the FUSE fetch circuit breaker is open (store unreachable or degraded). Opens after 5 consecutive fetch failures OR 720s since last successful fetch with ≥1 failure since. Half-open after 30s (one probe fetch allowed)."
+      },
+      {
+        "name": "rio_builder_fuse_fallback_reads_total",
+        "kind": "counter",
+        "help": "Userspace read() callbacks served. When passthrough is ON (default), the kernel handles reads directly and this counter stays near zero — nonzero means open_backing() failed for some file. When passthrough is OFF (RIO_FUSE_PASSTHROUGH=false), every read comes through here. Sustained nonzero rate with passthrough ON = investigate open_backing."
+      },
+      {
+        "name": "rio_builder_fuse_fetch_bytes_total",
+        "kind": "counter",
+        "help": "Bytes fetched from store via FUSE misses (nar_data.len())"
+      },
+      {
+        "name": "rio_builder_fuse_fetch_duration_seconds",
+        "kind": "histogram",
+        "help": "Store path fetch latency (gRPC GetPath + stream drain)"
+      },
+      {
+        "name": "rio_builder_fuse_index_divergence_total",
+        "kind": "counter",
+        "help": "FUSE cache index/disk divergences detected and self-healed. Nonzero means something rm'd cache files out from under the in-memory index (manual debugging, disk cleanup scripts, interrupted extract). The path is purged and re-fetched; investigate if sustained."
+      },
+      {
+        "name": "rio_builder_fuse_jit_lookup_total",
+        "kind": "counter",
+        "help": "Top-level FUSE lookup outcomes under JIT fetch (I-043 redesign), labeled by outcome: reject (not in registered input set → fast ENOENT, no store contact), fetch (registered input materialized), eio (registered input fetch FAILED → EIO so overlay can't negative-cache). reject/fetch ratio ≈ closure utilization; eio nonzero = store degraded."
+      },
+      {
+        "name": "rio_builder_input_materialization_failures_total",
+        "kind": "counter",
+        "help": "Daemon MiscFailure reclassified as InfrastructureFailure because the missing path is in the build's input closure (I-178). Sustained nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder throughput; lower the floor."
+      },
+      {
+        "name": "rio_builder_jit_inputs_registered",
+        "kind": "gauge",
+        "help": "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. Equals compute_input_closure's output count for this build."
+      },
+      {
+        "name": "rio_builder_log_lines_suppressed_total",
+        "kind": "counter",
+        "help": "Log lines dropped by rate suppression (log_rate_limit). Build continues with a `[rio: N lines suppressed …]` marker. Nonzero is normal for bursty builds (kernel oldconfig, autoconf); sustained high rate = pathological producer."
+      },
+      {
+        "name": "rio_builder_memory_fraction",
+        "kind": "gauge",
+        "help": "Worker cgroup memory utilization: memory.current / memory.max. 0.0 if memory.max is unbounded ('max' literal)."
+      },
+      {
+        "name": "rio_builder_overlay_teardown_failures_total",
+        "kind": "counter",
+        "help": "Overlay unmount failures (leaked mount); alert if rate > 0"
+      },
+      {
+        "name": "rio_builder_prefetch_filtered_total",
+        "kind": "counter",
+        "help": "PrefetchHint paths skipped by the I-212 filter, by reason. reason=not_input: JIT allowlist armed and path is not a declared input (build can never read it). reason=size_cap: warm-gate batch (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); the build fetches it on-demand via JIT lookup if it turns out to be a real input."
+      },
+      {
+        "name": "rio_builder_prefetch_total",
+        "kind": "counter",
+        "help": "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. error = store fetch failed (debug-only log; build's own FUSE ops surface the real problem if store is flaky)."
+      },
+      {
+        "name": "rio_builder_stale_assignments_rejected_total",
+        "kind": "counter",
+        "help": "Assignments rejected due to stale generation (from a deposed scheduler leader). Nonzero during leader transitions is expected; sustained = scheduler lease flapping."
+      },
+      {
+        "name": "rio_builder_upload_bytes_total",
+        "kind": "counter",
+        "help": "Bytes uploaded to store via PutPath (nar_size on success)"
+      },
+      {
+        "name": "rio_builder_upload_references_count",
+        "kind": "histogram",
+        "help": "Reference count per output upload (references.len() after scan). Distribution of dependency fan-out per built path. Zero-heavy = mostly leaves; high p99 = wide transitive closures."
+      },
+      {
+        "name": "rio_builder_upload_skipped_idempotent_total",
+        "kind": "counter",
+        "help": "Output uploads skipped by the FindMissingPaths pre-check (path already complete in store). High sustained rate = scheduler dispatching already-built derivations (race or CA early-cutoff). The store's PutPath idempotency would no-op these server-side anyway; this counter measures the worker-side disk-read + NAR-stream savings."
+      },
+      {
+        "name": "rio_builder_uploads_total",
+        "kind": "counter",
+        "help": "Output uploads (labeled by status: success/adopted/exhausted; adopted = concurrent uploader won, result polled via QueryPathInfo)"
+      }
+    ],
+    "controller": [
+      {
+        "name": "rio_controller_component_scaler_desired_replicas",
+        "kind": "gauge",
+        "help": "ComponentScaler desired replica count (labelled by cs=ns/name). What was last patched onto deployments/scale."
+      },
+      {
+        "name": "rio_controller_component_scaler_learned_ratio",
+        "kind": "gauge",
+        "help": "ComponentScaler learned builders-per-replica ratio (labelled by cs=ns/name). EMA-adjusted against observed PG-pool load; persisted in .status.learnedRatio."
+      },
+      {
+        "name": "rio_controller_component_scaler_observed_load",
+        "kind": "gauge",
+        "help": "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
+      },
+      {
+        "name": "rio_controller_ddsketch_seed_fallback_total",
+        "kind": "counter",
+        "help": "Per-`cell` seed injections at CellSketches::seed(). Incremented once per cold-start cell whose z_active AND z_shadow sketches were both empty after PG load. >1 over controller lifetime = sketch persist failing (check tick errors)."
+      },
+      {
+        "name": "rio_controller_disruption_drains_total",
+        "kind": "counter",
+        "help": "DisruptionTarget watcher DrainExecutor calls. result=sent|timeout|rpc_error. Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
+      },
+      {
+        "name": "rio_controller_ephemeral_jobs_reaped_total",
+        "kind": "counter",
+        "help": "Excess Pending ephemeral Jobs deleted (labeled by pool). Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); zero rate with stuck Pending pods = reap not firing (check RBAC delete on batch/jobs)."
+      },
+      {
+        "name": "rio_controller_ffd_placeable_intents",
+        "kind": "gauge",
+        "help": "SpawnIntents FFD-placed at the last tick by `state`. state=registered: on a Registered=True NodeClaim (Jobs created this tick); state=inflight: on a not-yet-Registered claim (held by placeable-gate). Ratio registered/(registered+inflight) is the forecast warm-hit proxy."
+      },
+      {
+        "name": "rio_controller_ffd_unplaced_cores",
+        "kind": "gauge",
+        "help": "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation at the last tick. cover_deficit's per-cell input. Non-zero with created_total flat = max_fleet_cores or per-tick cap throttling."
+      },
+      {
+        "name": "rio_controller_gc_runs_total",
+        "kind": "counter",
+        "help": "GC cron runs. result=success|connect_failure|rpc_failure. connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
+      },
+      {
+        "name": "rio_controller_lease_acquired_total",
+        "kind": "counter",
+        "help": "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn (check apiserver health / pod restarts)."
+      },
+      {
+        "name": "rio_controller_lease_lost_total",
+        "kind": "counter",
+        "help": "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_consolidate_threshold_seconds",
+        "kind": "gauge",
+        "help": "Per-`cell` idle-NodeClaim reap threshold from the NA consolidation model (last node evaluated this tick; 0 when no idle nodes in the cell). max(boot_median/2, min_consolidation_time[cell]) floored. NA-extends past the floor ONLY for cells packing ~1 intent/node (E[c_fit] > cores/2); for bin-packed cells (the §13b MostAllocated builder default) the floor is a hard bound the model cannot exceed. Watch fetcher-* >= 600s and builder cells >= the 300s `*` floor to confirm the per-cell e_fitting_cores partition and the policy floor are both routing (r35 bug_023/bug_050; r38 bug_022)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_created_total",
+        "kind": "counter",
+        "help": "nodeclaim_pool NodeClaim Api::create successes by `cell`. Σrate(created) − Σrate(reaped) over a window ≈ fleet growth; sustained created with zero placeable_intents = FFD/kube-scheduler-packed mismatch."
+      },
+      {
+        "name": "rio_controller_nodeclaim_forecast_hit_ewma",
+        "kind": "gauge",
+        "help": "Per-`cell` closed-loop SLI: EWMA(α=0.2) of the fraction of intents satisfiable from already-Registered nodeclaims at dispatch time. Drives the Schmitt deadband on lead_time_q (widen below 0.85·target, narrow above 1.05·target). Restart-resets to 0.9 (target mid-zone)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_ice_timeout_seconds",
+        "kind": "gauge",
+        "help": "Per-`cell` boot/ICE reap threshold the reaper acts at: max(2×lead_time_seed, q_0.99(boot)), floored at 2×seed until 100 boot samples. The StuckPending alert anchors on this (×2) so the alert always sits above the reaper — a firing alert means the reaper failed, not just a slow boot. Distinct from `lead_time_seconds` (q_0.9(boot−eta), what cover_deficit provisions ahead by — learns DOWN; not a reap floor)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_inflight_age_max_seconds",
+        "kind": "gauge",
+        "help": "Oldest in-flight NodeClaim per `cell` (now − metadata.creationTimestamp; 0 when none in-flight). The per-claim age the StuckPending alert keys on — the inflight count never touches 0 under sustained scale-up, so count-based `for: 90s` fires on healthy bursts."
+      },
+      {
+        "name": "rio_controller_nodeclaim_intent_dropped_total",
+        "kind": "counter",
+        "help": "nodeclaim_pool intents dropped by `reason`. reason=no_pool_covers: no configured Builder or Fetcher Pool covers the intent's (kind, system, effective_features) — the placer would never spawn a Job for it, so provisioning would mint a permanently-idle NodeClaim; add a Pool or remove the hwClass advertising the feature. reason=no_hosting_class: no configured hw-class can host the intent EVEN WITH no ICE-masking — wrong arch, footprint exceeds every arch-matching class's max_cores/max_mem, or required_features unmatched (the hwClasses key-set lacks a `provides_features` entry for it). Persistent until `[sla.hw_classes]` changes. reason=all_cells_ice_masked: a class CAN host the intent but every hosting cell is ICE-masked — NodeClaim launches are failing in the cloud (capacity, quota, IAM). Self-heals once the ICE backoff expires *if* the cloud recovers; persistent if structural (e.g. missing AWSServiceRoleForEC2Spot). Check `nodeclaim_reaped_total{reason=~\"ice|vanished\"}` and Karpenter. reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned cell's per-class catalog ceiling (or max_node_disk) — the scheduler's ClassCeiling gate didn't reject it (override-bypass producer hole). The intent has no valid claim of any n; sizing drops it instead of looping mint→Pending. reason=unknown_hw_class: scheduler stamped a hwClass not yet in the controller's GetHwClassConfig — config skew; self-heals within ≤300s, persistent rate = controller's hw_refresh RPC failing."
+      },
+      {
+        "name": "rio_controller_nodeclaim_lead_time_q_at_cap",
+        "kind": "gauge",
+        "help": "Per-`cell` boolean (0/1): the Schmitt loop can no longer widen lead_time_q — either q≥0.99 (clamp) or lead_time≥sla.maxLeadTime (widen-gate closed). Sustained 1 with low forecast_hit_ewma = structurally cannot cover (fat-tailed eta_error). Derivable from lead_time_seconds vs config; exported so the alert anchors on the actual gate predicate."
+      },
+      {
+        "name": "rio_controller_nodeclaim_lead_time_seconds",
+        "kind": "gauge",
+        "help": "Per-`cell` provisioning lead-time: lead_time_q-quantile of the z=boot−eta_error lead-time sketch. What cover_deficit provisions ahead by. Stuck at the seed value = no Registered=True transitions recorded yet (check seed_fallback_total)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_live",
+        "kind": "gauge",
+        "help": "Owned NodeClaims at the last tick by `cell` × `state`. state=registered: Registered=True AND not terminating (FFD-placeable); state=inflight: created but not yet Registered; state=terminating: metadata.deletionTimestamp set (Karpenter finalizer draining, ~60-90s; excluded from FFD placement, still in max_fleet_cores budget). Σ(registered) ≈ warm capacity; inflight stuck high = check reaped_total{reason=ice|boot-timeout}; terminating>0 with registered=0 + ffd_unplaced_cores>0 = node draining out from under a queue (cover_deficit mints the replacement next tick)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_reaped_total",
+        "kind": "counter",
+        "help": "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. reason=idle: NA-consolidate break-even; reason=ice: Launched=False (timeout or terminal LaunchFailed reason); reason=boot-timeout: Launched=True ∧ Registered=False past timeout; reason=dead: scheduler-reported hung node; reason=vanished: in-flight claim Karpenter-GC'd between ticks."
+      },
+      {
+        "name": "rio_controller_nodeclaim_terminating_age_max_seconds",
+        "kind": "gauge",
+        "help": "Oldest terminating NodeClaim per `cell` (now − metadata.deletionTimestamp; 0 when none terminating). The per-claim age the StuckTerminating alert keys on — the terminating count never touches 0 under sustained scale-down churn, so a count-based `for:` fires on every healthy reap burst (r38 merged_001 — lifecycle inverse of the inflight scale-up case)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_tick_duration_seconds",
+        "kind": "histogram",
+        "help": "nodeclaim_pool reconcile_once latency. Recorded on success AND error (⊥-tick, apiserver 5xx). p99 approaching ADMIN_RPC_TIMEOUT (5s) = scheduler stalled; approaching tick interval = reconciler can't keep up."
+      },
+      {
+        "name": "rio_controller_orphan_jobs_reaped_total",
+        "kind": "counter",
+        "help": "Running ephemeral Jobs deleted after orphan grace with no scheduler assignment (labeled by pool). Non-zero rate = builders stuck unable to self-exit (D-state FUSE wait, OOM-loop); investigate node/kernel health."
+      },
+      {
+        "name": "rio_controller_reconcile_duration_seconds",
+        "kind": "histogram",
+        "help": "Reconcile loop latency. reconciler=pool|componentscaler. Recorded on both success and error paths — long durations + errors = slow/timing-out apiserver."
+      },
+      {
+        "name": "rio_controller_reconcile_errors_total",
+        "kind": "counter",
+        "help": "Reconcile errors. reconciler=pool|componentscaler, error_kind=kube|finalizer|invalid_spec. error_kind is the variant discriminator (stable, low cardinality). Sustained rate > 0 = check controller logs."
+      },
+      {
+        "name": "rio_controller_scaling_decisions_total",
+        "kind": "counter",
+        "help": "Autoscale patches executed. direction=up|down. High rate = queue depth oscillating (check stabilization windows)."
+      },
+      {
+        "name": "rio_controller_sketches_reload_pending",
+        "kind": "gauge",
+        "help": "1 while the lease-acquire CellSketches reload from PG is pending (load() not yet succeeded since on_acquire); 0 once latched. While 1, persist() is gated off so a stale standby-startup snapshot doesn't overwrite the previous leader's PG rows. Stuck at 1 = PG unreachable from controller; reconcile runs degraded."
+      }
+    ],
+    "gateway": [
+      {
+        "name": "rio_gateway_auth_degraded_total",
+        "kind": "counter",
+        "help": "SSH auth accepted but tenant identity degraded to single-tenant mode (labeled by reason: interior_whitespace = authorized_keys comment has a space where a dash was intended; invalid_utf8 = comment bytes are not valid UTF-8 — rewrite the comment as plain UTF-8)"
+      },
+      {
+        "name": "rio_gateway_bytes_total",
+        "kind": "counter",
+        "help": "Bytes forwarded to/from SSH client (labeled by direction: rx/tx)"
+      },
+      {
+        "name": "rio_gateway_channels_active",
+        "kind": "gauge",
+        "help": "Currently active SSH channels"
+      },
+      {
+        "name": "rio_gateway_connections_active",
+        "kind": "gauge",
+        "help": "Currently active SSH connections"
+      },
+      {
+        "name": "rio_gateway_connections_total",
+        "kind": "counter",
+        "help": "Total SSH connections (labeled by result: new/accepted/rejected/rejected_jwt)"
+      },
+      {
+        "name": "rio_gateway_errors_total",
+        "kind": "counter",
+        "help": "Protocol errors (labeled by type; type=session also carries stage=tcp-accepted|auth-attempted|authenticated|channel-open)"
+      },
+      {
+        "name": "rio_gateway_handshakes_total",
+        "kind": "counter",
+        "help": "Protocol handshakes completed (labeled by result: success/rejected/failure)"
+      },
+      {
+        "name": "rio_gateway_jwt_mint_degraded_total",
+        "kind": "counter",
+        "help": "JWT mint failed but jwt.required=false, degraded to tenant_name fallback"
+      },
+      {
+        "name": "rio_gateway_jwt_refresh_failed_total",
+        "kind": "counter",
+        "help": "Session JWT re-mint failed; stale token kept (downstream will reject ExpiredSignature)"
+      },
+      {
+        "name": "rio_gateway_jwt_refreshed_total",
+        "kind": "counter",
+        "help": "Session JWT re-minted on a long-lived SSH connection (cached token near expiry)"
+      },
+      {
+        "name": "rio_gateway_opcode_duration_seconds",
+        "kind": "histogram",
+        "help": "Per-opcode handling latency"
+      },
+      {
+        "name": "rio_gateway_opcodes_total",
+        "kind": "counter",
+        "help": "Protocol opcodes handled (labeled by opcode name)"
+      },
+      {
+        "name": "rio_gateway_putpath_aborted_retries_total",
+        "kind": "counter",
+        "help": "PutPath retries on store Code::Aborted (labeled by attempt). attempt=PUT_PATH_ABORTED_MAX_ATTEMPTS means budget exhausted and the error surfaced to the client (I-168)."
+      },
+      {
+        "name": "rio_gateway_quota_rejections_total",
+        "kind": "counter",
+        "help": "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
+      }
+    ],
+    "scheduler": [
+      {
+        "name": "rio_scheduler_actor_cmd_seconds",
+        "kind": "histogram",
+        "help": "Per-ActorCommand handling latency (labeled by cmd variant); the actor is single-threaded so a slow command head-of-line blocks every queued RPC"
+      },
+      {
+        "name": "rio_scheduler_actor_mailbox_depth",
+        "kind": "gauge",
+        "help": "ActorCommand mpsc queue depth, sampled once per dequeued command. Growth = commands arriving faster than the single-threaded loop retires them. Pair with actor_cmd_seconds to localize a wedge."
+      },
+      {
+        "name": "rio_scheduler_assignments_total",
+        "kind": "counter",
+        "help": "Total derivation-to-worker assignments"
+      },
+      {
+        "name": "rio_scheduler_backstop_timeouts_total",
+        "kind": "counter",
+        "help": "Derivations reset to Ready after running-since exceeded backstop (worker went silent)"
+      },
+      {
+        "name": "rio_scheduler_broadcast_lagged_total",
+        "kind": "counter",
+        "help": "BuildEvent broadcast events skipped by lagging subscribers (sum of RecvError::Lagged(n) across all bridge tasks). Non-zero under sustained event burst (large DAG, many concurrent drvs emitting Log lines) — gateway can't drain fast enough (I-144)."
+      },
+      {
+        "name": "rio_scheduler_build_duration_seconds",
+        "kind": "histogram",
+        "help": "Total build duration"
+      },
+      {
+        "name": "rio_scheduler_build_graph_edges",
+        "kind": "histogram",
+        "help": "Edge count per GetBuildGraph response. High p99 (>10k) = unusually dense DAG approaching the implicit subgraph bound."
+      },
+      {
+        "name": "rio_scheduler_build_timeouts_total",
+        "kind": "counter",
+        "help": "Builds failed by per-build wall-clock timeout (BuildOptions.build_timeout seconds since submission). Distinct from backstop_timeouts_total (per-derivation heuristic — worker went silent)."
+      },
+      {
+        "name": "rio_scheduler_builds_active",
+        "kind": "gauge",
+        "help": "Currently active builds"
+      },
+      {
+        "name": "rio_scheduler_builds_total",
+        "kind": "counter",
+        "help": "Total builds at terminal state (labeled by outcome: success/failure/cancelled)"
+      },
+      {
+        "name": "rio_scheduler_ca_cutoff_depth_cap_hits_total",
+        "kind": "counter",
+        "help": "CA cutoff cascade walks that hit MAX_CASCADE_NODES (1000). Node-count cap, not tree-depth — for wide DAGs (fanout>1), 1000 nodes hit well before depth>3. Non-zero = cascades truncated; operator should review if non-zero."
+      },
+      {
+        "name": "rio_scheduler_ca_cutoff_saves_total",
+        "kind": "counter",
+        "help": "Derivations skipped via CA early-cutoff (Queued→Skipped transitions). Each increment is one build that did NOT run because a CA dep's output matched the content index. Direct measure of CA cutoff efficacy."
+      },
+      {
+        "name": "rio_scheduler_ca_cutoff_seconds_saved",
+        "kind": "counter",
+        "help": "Sum of est_duration of skipped derivations, in hw-normalized ref-seconds (r[sched.sla.hw-ref-seconds]; NOT wall-clock per-build — skipped builds were never assigned, so no hw_factor exists to denormalize; divide by fleet min hw_factor for a wall-clock lower bound). est_duration is the Estimator's EMA, not actual — a derivation that's never run has no actual. Paired with saves_total for avg-seconds-per-save."
+      },
+      {
+        "name": "rio_scheduler_ca_hash_compares_total",
+        "kind": "counter",
+        "help": "CA early-cutoff output-hash lookups against the content index on successful completion (labeled by outcome=match|miss|skipped_after_miss| malformed|error). High match ratio → CA derivations rebuilding identical content; cutoff-propagate will skip downstream work. skipped_after_miss counts outputs short-circuited after an earlier miss in the same derivation. malformed = executor sent empty output_path; error = PG lookup failed/timed out (alert if rate>0)."
+      },
+      {
+        "name": "rio_scheduler_cache_check_circuit_open_total",
+        "kind": "counter",
+        "help": "Circuit-breaker open transitions (store unreachable for 5 consecutive checks); alert if > 0"
+      },
+      {
+        "name": "rio_scheduler_cache_check_failures_total",
+        "kind": "counter",
+        "help": "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
+      },
+      {
+        "name": "rio_scheduler_cache_hit_deferred_total",
+        "kind": "counter",
+        "help": "Cache-hit derivations deferred to Queued because their inputDrvs are not yet Completed"
+      },
+      {
+        "name": "rio_scheduler_cache_hits_total",
+        "kind": "counter",
+        "help": "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
+      },
+      {
+        "name": "rio_scheduler_cancel_signal_dropped_total",
+        "kind": "counter",
+        "help": "CancelSignal try_send drops (worker stream full/closed under backpressure). Best-effort: the transition to Cancelled is scheduler-authoritative regardless; worker disconnect reassign still fires. Alert if rate > 0 sustained."
+      },
+      {
+        "name": "rio_scheduler_cancel_signals_total",
+        "kind": "counter",
+        "help": "CancelSignal messages successfully delivered to the executor stream (Ok on try_send). Excludes drops (counted in cancel_signal_dropped_total) and skipped attempts."
+      },
+      {
+        "name": "rio_scheduler_cleanup_dropped_total",
+        "kind": "counter",
+        "help": "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_completions_rejected_total",
+        "kind": "counter",
+        "help": "CompletionReport dropped at the recv arm before reaching the actor. A real store path is ≤259 bytes, so path_too_long can only fire for a report that could never have matched a live assignment — the drop moves the actor's inevitable \"unknown derivation\" discard off the single-threaded event loop. Labeled by reason: path_too_long."
+      },
+      {
+        "name": "rio_scheduler_critical_path_accuracy",
+        "kind": "histogram",
+        "help": "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"
+      },
+      {
+        "name": "rio_scheduler_derivations_gc_deleted_total",
+        "kind": "counter",
+        "help": "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
+      },
+      {
+        "name": "rio_scheduler_derivations_queued",
+        "kind": "gauge",
+        "help": "Derivations waiting for assignment"
+      },
+      {
+        "name": "rio_scheduler_derivations_running",
+        "kind": "gauge",
+        "help": "Derivations currently building"
+      },
+      {
+        "name": "rio_scheduler_dispatch_wait_seconds",
+        "kind": "histogram",
+        "help": "Time from a derivation entering Ready to being Assigned (fed from DerivationState.ready_at). With ephemeral builders, dominated by node-provision (~60–180s on EKS)."
+      },
+      {
+        "name": "rio_scheduler_event_persist_dropped_total",
+        "kind": "counter",
+        "help": "BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
+      },
+      {
+        "name": "rio_scheduler_executor_reconnect_rejected_total",
+        "kind": "counter",
+        "help": "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
+      },
+      {
+        "name": "rio_scheduler_features_stripped_total",
+        "kind": "counter",
+        "help": "§13e+r35: EffectiveFeatures::derive stripped the declared requiredSystemFeatures at the FOD↔Fetcher chokepoint (labeled reason ∈ {non_fod_fetcher, fod_declared_features}). non_fod_fetcher: a non-FOD declared `fetcher` (rio-internal routing tag, not a tenant-declarable system feature); the drv routes to a Builder Pool. fod_declared_features: a FOD declared extraneous features (e.g. `kvm`); the drv routes to a Fetcher Pool. The strip produces correct routing — the WARN (debounced once per (pname, reason) edge) names the declared vs effective set so the tenant can fix the misconfig."
+      },
+      {
+        "name": "rio_scheduler_heartbeat_adopt_conflicts_total",
+        "kind": "counter",
+        "help": "Heartbeat-adoption found the DAG already Assigned to a DIFFERENT worker (reconcile re-dispatched before this worker reconnected). Both run; first to complete wins. Nonzero suggests reconcile delay is too short for the observed worker-reconnect time."
+      },
+      {
+        "name": "rio_scheduler_heartbeat_adoptions_total",
+        "kind": "counter",
+        "help": "Builds re-claimed in the DAG from a reconnecting worker's heartbeat. Expected after scheduler restart: recovery's reconcile may have reset to Ready before the worker reconnected (I-063 keeps the stream alive during drain). Adoption prevents re-dispatch of work already in flight."
+      },
+      {
+        "name": "rio_scheduler_heartbeat_rejected_total",
+        "kind": "counter",
+        "help": "Heartbeats dropped by the actor-side identity binding (label: reason)"
+      },
+      {
+        "name": "rio_scheduler_hung_detect_skipped_no_authoritative_total",
+        "kind": "counter",
+        "help": "Busy executors skipped by detect_hung_nodes because no controller-reported spec.nodeName binding exists yet (controller-lag or AckSpawnedIntents channel down). Sustained nonzero with hung nodes un-reaped → check rio-controller nodeclaim_pool reconcile loop."
+      },
+      {
+        "name": "rio_scheduler_lease_acquired_total",
+        "kind": "counter",
+        "help": "Successful K8s Lease acquisitions (leader elections won)"
+      },
+      {
+        "name": "rio_scheduler_lease_lost_total",
+        "kind": "counter",
+        "help": "K8s Lease losses (stepped down, partition, or preempted)"
+      },
+      {
+        "name": "rio_scheduler_log_batches_rejected_total",
+        "kind": "counter",
+        "help": "BuildLogBatch dropped by the (executor, drv) binding check, the derivation_path length bound, or the line-number sanity checks (non-monotone vs the ring buffer, or numbering that would overflow u64). Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long | non_monotonic | line_number_overflow."
+      },
+      {
+        "name": "rio_scheduler_log_empty_drain_finalize_failures_total",
+        "kind": "counter",
+        "help": "Empty final drains (zero lines drained — failover restamp where the worker never reconnected, or an execution that never streamed a line) whose metadata-only status/finished_at stamp UPDATE on the drv_logs row failed (transient PG error). Not data loss: nothing was drained, and any prior .partial blob and its row stay intact and served with is_complete=false. The stamp is not retried; the row (if any) ages out at the TTL sweep. The data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true."
+      },
+      {
+        "name": "rio_scheduler_log_flush_already_finalized_total",
+        "kind": "counter",
+        "help": "Final-flush requests dropped because the execution's drv_logs row is already is_complete=true (an interim leader finalized it across a lease flap); the retained ring-buffer entry was stale pre-failover residue and was discarded instead of re-finalizing. Alert if rate is sustained — it implies repeated lease flapping."
+      },
+      {
+        "name": "rio_scheduler_log_flush_dropped_total",
+        "kind": "counter",
+        "help": "Final-flush requests dropped due to flusher channel backpressure"
+      },
+      {
+        "name": "rio_scheduler_log_flush_failures_total",
+        "kind": "counter",
+        "help": "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). is_final=true fires after the final drain (the drained data cannot be re-flushed); alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here. Empty-drain finalization stamp failures (zero lines drained) are counted by rio_scheduler_log_empty_drain_finalize_failures_total, not here."
+      },
+      {
+        "name": "rio_scheduler_log_flush_finalize_deferred_total",
+        "kind": "counter",
+        "help": "Final-flush attempts deferred because the finalize guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. A deferral with a non-empty buffer is retained by the flusher and retried each periodic tick until PG answers (terminal cleanup leaves the buffer to the retry; a request whose leadership tenure has ended by then is dropped instead — see rio_scheduler_log_flush_stale_tenure_total); an empty buffer is reaped as bookkeeping (reads already fall through to the stored .partial when the ring entry holds zero lines). Counted per attempt, so retries during one outage keep incrementing it. Sustained rate indicates PG trouble on the flush path; loss requires the retry retention cap to overflow, leadership to move before PG recovers, or the process to exit before PG recovers."
+      },
+      {
+        "name": "rio_scheduler_log_flush_span_fallback_total",
+        "kind": "counter",
+        "help": "Flush payloads whose ring lines carried non-monotone worker line numbers at span-recording time, so the drv_logs row recorded the physical line count instead of the line-number span (labeled kind: final|periodic). Should be zero — push_for rejects non-monotone batches at ingestion, so a non-zero rate means an ingestion-gate regression. Not a data-loss signal: the blob is still uploaded and served."
+      },
+      {
+        "name": "rio_scheduler_log_flush_stale_tenure_total",
+        "kind": "counter",
+        "help": "Final log-flush requests dropped because the scheduler lease moved (lost, or lost-and-reacquired) between the request's enqueue and its processing: the live leadership tenure owns that execution's finalization, and uploading the stale ring would freeze a drv_logs row the live tenure may still be extending. Counted for first attempts and retained-deferral retries alike. The execution's log is finalized by the live tenure's own terminal flush; if its terminal had already persisted before the outage (or the drv was re-dispatched under a new exec_id), the row instead stays at its .partial (is_complete=false) coverage — the bounded pre-retry loss."
+      },
+      {
+        "name": "rio_scheduler_log_flush_stale_total",
+        "kind": "counter",
+        "help": "Final-flush requests dropped because the drv was re-dispatched while the request was queued (the live ring-buffer exec_id no longer matches the request's). The re-dispatched execution's log is preserved; the stale request's exec was already lost when assign_to_worker discarded its buffer."
+      },
+      {
+        "name": "rio_scheduler_log_flush_total",
+        "kind": "counter",
+        "help": "Successful S3 log flushes (labeled by kind: final/periodic)"
+      },
+      {
+        "name": "rio_scheduler_log_forward_dropped_total",
+        "kind": "counter",
+        "help": "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer."
+      },
+      {
+        "name": "rio_scheduler_log_gc_swept_total",
+        "kind": "counter",
+        "help": "drv_logs rows (and their .log.zst + .partial.log.zst S3 blobs) deleted by the LogFlusher TTL GC sweep. Cadence ~1h; threshold scheduler.logRetentionDays."
+      },
+      {
+        "name": "rio_scheduler_log_lines_forwarded_total",
+        "kind": "counter",
+        "help": "Log lines forwarded via BuildEvent::Log (worker -> scheduler -> gateway broadcast)"
+      },
+      {
+        "name": "rio_scheduler_log_prefix_fetch_failures_total",
+        "kind": "counter",
+        "help": "Stored-coverage lookups that failed during a flush's pre-drain reconciliation (labeled by phase: pg = drv_logs point-SELECT, s3 = prior .partial GET; is_final: true/false). Not data loss: the periodic snapshot skips the tick and retries next tick; the final flush uploads the drained ring without the stored prefix and preserves the .partial blob. Investigate if sustained (degraded log merges); the data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true."
+      },
+      {
+        "name": "rio_scheduler_log_prefix_recovered_total",
+        "kind": "counter",
+        "help": "Stored pre-failover log prefixes fetched from the prior leader's .partial blob and re-folded into this leader's flushes (failover with a reconnecting worker)."
+      },
+      {
+        "name": "rio_scheduler_log_unknown_drv_dropped_total",
+        "kind": "counter",
+        "help": "LogBatch dropped: stream already has MAX_DRVS_PER_STREAM distinct accepted derivation_path values. Defense-in-depth tripwire — only accepted paths grow the cap, so a flood of rejected/fabricated paths alone cannot fill it (those are counted by rio_scheduler_log_batches_rejected_total)."
+      },
+      {
+        "name": "rio_scheduler_malformed_built_output_total",
+        "kind": "counter",
+        "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_merge_phase_seconds",
+        "kind": "histogram",
+        "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+      },
+      {
+        "name": "rio_scheduler_orphan_builds_cancelled_total",
+        "kind": "counter",
+        "help": "Active builds auto-cancelled by the orphan-watcher sweep: no build_events receiver (gateway SubmitBuild/WatchBuild stream) for >ORPHAN_BUILD_GRACE (5min). Backstop for gateway crash / gateway→scheduler timeout during P0331 disconnect cleanup. Nonzero is expected on gateway restarts; sustained nonzero with healthy gateways means the gateway-side cancel is not firing."
+      },
+      {
+        "name": "rio_scheduler_phantom_assignments_drained_total",
+        "kind": "counter",
+        "help": "running_build entries drained after two consecutive heartbeats reported empty (lost completion / dead-stream-post-send). The slot was dead capacity until drained. Nonzero is the signal to look for I-032-class bugs upstream — the drain is the safety net, not the fix."
+      },
+      {
+        "name": "rio_scheduler_phases_rejected_total",
+        "kind": "counter",
+        "help": "BuildPhase dropped by the actor-side (status, executor) binding check or the recv-side length bounds. Either the named derivation has no active (Assigned|Running) assignment, the calling stream is not the assigned executor, the path exceeds MAX_DERIVATION_PATH_LEN, or the phase text exceeds MAX_PHASE_LEN. Labeled by reason: not_active | no_assignment | executor_mismatch | path_too_long | phase_too_long."
+      },
+      {
+        "name": "rio_scheduler_poison_fleet_exhausted_total",
+        "kind": "counter",
+        "help": "Derivations poisoned because failed_builders excluded every registered worker of the matching kind (I-065). Nonzero rate with small fleet = poison threshold unreachable; the build would otherwise defer forever."
+      },
+      {
+        "name": "rio_scheduler_prefetch_hints_sent_total",
+        "kind": "counter",
+        "help": "PrefetchHint messages sent (one per assignment with paths to warm). Missing from a dispatch = leaf drv (no children)."
+      },
+      {
+        "name": "rio_scheduler_prefetch_paths_sent_total",
+        "kind": "counter",
+        "help": "Total paths in sent PrefetchHints. Divide by hints_sent for avg paths-per-hint."
+      },
+      {
+        "name": "rio_scheduler_queue_backpressure",
+        "kind": "counter",
+        "help": "Backpressure activations (queue reached 80% capacity)"
+      },
+      {
+        "name": "rio_scheduler_queue_depth",
+        "kind": "gauge",
+        "help": "Deferred Ready derivations waiting for an executor of the matching kind (snapshot per dispatch pass; labeled by kind=builder|fetcher). Sustained nonzero → scale the matching pool."
+      },
+      {
+        "name": "rio_scheduler_reconcile_dropped_total",
+        "kind": "counter",
+        "help": "Post-recovery ReconcileAssignments command dropped (actor channel full). Assigned-but-worker-gone derivations leak until NEXT recovery. Rare (channel is 1024 deep); alert if > 0."
+      },
+      {
+        "name": "rio_scheduler_recovery_duration_seconds",
+        "kind": "histogram",
+        "help": "Time to reconstruct actor state from PG on LeaderAcquired (labeled by outcome=success|failure)"
+      },
+      {
+        "name": "rio_scheduler_recovery_total",
+        "kind": "counter",
+        "help": "Scheduler state recoveries from PG after LeaderAcquired (labeled by outcome=success|failure|discarded_flap)"
+      },
+      {
+        "name": "rio_scheduler_resource_floor_bumps_total",
+        "kind": "counter",
+        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults."
+      },
+      {
+        "name": "rio_scheduler_sla_als_round_cap_hit_total",
+        "kind": "counter",
+        "help": "ALS alternation hit ALS_MAX_ROUNDS without ‖Δα‖₁ < ALS_DELTA_TOL convergence (labeled `tenant`). The α/T_ref(c) joint fit failed to converge — alpha is the final iterate, not a fixed point. Sustained nonzero ⇒ investigate rank-gate degeneracy or fixture quality (the cap is already a worst-case budget — see alpha.rs constants)."
+      },
+      {
+        "name": "rio_scheduler_sla_class_ceiling_uncatalogued",
+        "kind": "gauge",
+        "help": "§13c-2: 1 per hwClass with NO boot-derived catalog ceiling (labeled `hw_class`). Always 1 for every class under `hwCostSource: static` (no AWS API, expected). Under `spot` a persistent 1 ⇒ `describe_instance_types` failed at boot (check IRSA), or the class's `requirements` match 0 types in the deployment region (operator typo / AWS deprecation). Class falls to the global ceiling — over-permits, never over-strips."
+      },
+      {
+        "name": "rio_scheduler_sla_envelope_result_total",
+        "kind": "counter",
+        "help": "SLA envelope hit/miss per tier (labeled tier, result=hit|miss, constraint=wall|mem|-). `constraint` names the dimension that missed; `-` for hits."
+      },
+      {
+        "name": "rio_scheduler_sla_forecast_dropped_total",
+        "kind": "counter",
+        "help": "§13b: forecast-pass intent dropped before emit (unique drop events — debounced once per `(drv_hash, reason)` per LRU residency, r34 bug_018). Labeled `reason` ∈ {lead_horizon, tenant_budget}. `lead_horizon`: ETA exceeds the per-intent forecast horizon (`max(lead_time_seed)` over routable hwClasses pre-solve, over `intent.hw_class_names` post-solve) — the scheduler's seed-based approximation of the controller's `a_open` would drop it (r34 merged_bug_006: the controller reads a learned per-cell sketch quantile with no return channel to the scheduler, so when learned drifts above the seed this over-counts); `tenant_budget`: `max_forecast_cores_per_tenant` exhausted by higher-priority intents this poll. Sustained `lead_horizon` ⇒ deps complete far ahead of any seed lead (saved work) OR a routable class's `lead_time_seed` is missing. Sustained `tenant_budget` ⇒ Ready frontier already saturates the cap."
+      },
+      {
+        "name": "rio_scheduler_sla_hw_cost_fallback_total",
+        "kind": "counter",
+        "help": "cost-poller fell back from a live spot-price source. Labeled `reason` ∈ {api_error, empty_history, parse, stale}. `stale`: `_hw_cost_stale_seconds > 6 × pollInterval` → price() clamped to the helm seed."
+      },
+      {
+        "name": "rio_scheduler_sla_hw_cost_stale_seconds",
+        "kind": "gauge",
+        "help": "age of the hw-band $/vCPU·hr snapshot. Climbs when the lease-gated spot-price poller is failing or this replica is standby (price is PG-backed; standby reads but doesn't write)"
+      },
+      {
+        "name": "rio_scheduler_sla_hw_cost_unknown_total",
+        "kind": "counter",
+        "help": "solve hit a (hw_class, cap) cell the cost table has no $/vCPU·hr for; the cell is dropped from the admissible set (labeled `tenant`). Sustained nonzero ⇒ hwClasses config drifted from the cost-poller's instance-type menu."
+      },
+      {
+        "name": "rio_scheduler_sla_hw_ladder_exhausted_total",
+        "kind": "counter",
+        "help": "ICE-mask hardware ladder exhausted at the terminal tier with no admissible (hw_class, cap) cell left. Labeled `tenant`, `exit` (the cell the ladder gave up on). Replaces `_ice_backoff_total`."
+      },
+      {
+        "name": "rio_scheduler_sla_infeasible_total",
+        "kind": "counter",
+        "help": "infeasible-at-any-tier count, labeled `reason` ∈ {serial_floor, mem_ceiling, disk_ceiling, core_ceiling, interrupt_runaway, capacity_exhausted}. The reason names which constraint bound at the loosest tier (see InfeasibleReason)."
+      },
+      {
+        "name": "rio_scheduler_sla_keys_evicted_total",
+        "kind": "counter",
+        "help": "per-tenant LRU evicted a (pname, system) key at `sla.maxKeysPerTenant` (labeled `tenant`). Nonzero ⇒ a tenant is exhausting the fit-cache cap; check for random-pname submissions (`r[sched.sla.threat.corpus-clamp]`)."
+      },
+      {
+        "name": "rio_scheduler_sla_mem_fit_weak_total",
+        "kind": "counter",
+        "help": "M(c) Koenker-Machado pseudo-R1<0.7 fallback to independent p90 (labeled tenant)"
+      },
+      {
+        "name": "rio_scheduler_sla_outlier_rejected_total",
+        "kind": "counter",
+        "help": "MAD-rejected samples (labeled tenant). Row stays in PG (outlier_excluded=TRUE) for forensics; refit excludes it."
+      },
+      {
+        "name": "rio_scheduler_sla_prediction_ratio",
+        "kind": "histogram",
+        "help": "actual/predicted, by dimension (labeled dim=wall|mem). 1.0=perfect; >1.0=under-predicted."
+      },
+      {
+        "name": "rio_scheduler_sla_prior_divergence",
+        "kind": "gauge",
+        "help": "fleet-median prior parameter ÷ operator-probe basis (labeled `param`); outside [0.5, 2.0] ⇒ clamped to the band edge"
+      },
+      {
+        "name": "rio_scheduler_sla_refit_total",
+        "kind": "counter",
+        "help": "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — increments regardless of [sla] gate)"
+      },
+      {
+        "name": "rio_scheduler_sla_residual_multimodal_total",
+        "kind": "counter",
+        "help": "Hartigan dip test rejected unimodality (p<0.05) on a key's log-residuals (labeled tenant). The single-curve T(c) model is wrong — likely two workloads sharing a pname."
+      },
+      {
+        "name": "rio_scheduler_sla_suspicious_scaling_total",
+        "kind": "counter",
+        "help": "exploration froze at maxCores still saturated (labeled tenant). The build wants more cores than the cluster offers."
+      },
+      {
+        "name": "rio_scheduler_stale_completed_reset_total",
+        "kind": "counter",
+        "help": "Pre-existing Completed nodes reset to Ready at merge because output was GC'd from store. Nonzero rate = GC retention shorter than DAG node lifetime."
+      },
+      {
+        "name": "rio_scheduler_stale_completed_substituted_total",
+        "kind": "counter",
+        "help": "Pre-existing Completed nodes whose GC'd output was repopulated via upstream substitution at merge (instead of reset-to-Ready re-dispatch)."
+      },
+      {
+        "name": "rio_scheduler_stale_realisation_filtered_total",
+        "kind": "counter",
+        "help": "CA realisations dropped from cache-hit set because the realized path was GC'd from store. Same operator signal as stale_completed_reset; this counts the newly-inserted-CA path, that one counts the pre-existing-completed path."
+      },
+      {
+        "name": "rio_scheduler_substitute_fetch_failures_total",
+        "kind": "counter",
+        "help": "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
+      },
+      {
+        "name": "rio_scheduler_substitute_fetch_retries_total",
+        "kind": "counter",
+        "help": "Transient (Unavailable/Aborted/ResourceExhausted) substitute-fetch errors that triggered a backoff retry. High rate without matching failures = store load absorbed by retry; high rate WITH failures = backoff insufficient."
+      },
+      {
+        "name": "rio_scheduler_substitute_spawned_total",
+        "kind": "counter",
+        "help": "Derivations transitioned to Substituting (detached upstream fetch spawned). Pairs with substitute_fetch_failures_total to derive success rate."
+      },
+      {
+        "name": "rio_scheduler_topdown_prune_total",
+        "kind": "counter",
+        "help": "Submissions pruned to roots-only by the top-down substitution pre-check"
+      },
+      {
+        "name": "rio_scheduler_topdown_substitute_fail_total",
+        "kind": "counter",
+        "help": "Top-down-pruned roots whose deferred substitute fetch failed (build failed fast; resubmit re-probes)"
+      },
+      {
+        "name": "rio_scheduler_transition_rejected_total",
+        "kind": "counter",
+        "help": "State-machine transition rejections (labeled by target state); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_undeclared_built_output_total",
+        "kind": "counter",
+        "help": "Worker-supplied BuiltOutput.output_name not in derivation's output_names (dropped at handle_completion membership filter); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_unroutable_features_total",
+        "kind": "counter",
+        "help": "§13c: solve_intent_for found NO hwClass whose provides_features hosts the drv's required_features (labeled tenant). Debounced once per (tenant, required_features) edge. The intent is unroutable until a `[sla.hw_classes.$h]` with matching providesFeatures is added; the WARN names which features."
+      },
+      {
+        "name": "rio_scheduler_unroutable_ready",
+        "kind": "gauge",
+        "help": "Ready derivations whose `system` is advertised by zero registered executors of the matching kind (labeled by system; snapshot per dispatch pass). Nonzero = no pool exists for that system; add it to a Pool's `systems` list."
+      },
+      {
+        "name": "rio_scheduler_utilization",
+        "kind": "gauge",
+        "help": "Fraction of executors currently running a build (busy/total; labeled by kind=builder|fetcher). Emitted per dispatch pass alongside queue_depth."
+      },
+      {
+        "name": "rio_scheduler_warm_gate_fallback_total",
+        "kind": "counter",
+        "help": "best_executor() fell back to cold workers because NO warm worker passed the hard filter. Single-worker clusters and mass scale-up expect nonzero; sustained high rate = workers never warming (PrefetchComplete not arriving — check worker logs)."
+      },
+      {
+        "name": "rio_scheduler_warm_prefetch_paths",
+        "kind": "histogram",
+        "help": "Paths fetched per initial warm-gate PrefetchHint (from the worker's PrefetchComplete ACK). 0 = worker was already warm (cache hit on everything); high = fresh worker cold-fetched everything."
+      },
+      {
+        "name": "rio_scheduler_worker_disconnects_total",
+        "kind": "counter",
+        "help": "Worker stream disconnects (graceful and ungraceful)"
+      },
+      {
+        "name": "rio_scheduler_workers_active",
+        "kind": "gauge",
+        "help": "Fully-registered workers (stream + heartbeat)"
+      }
+    ],
+    "store": [
+      {
+        "name": "rio_store_check_available_duration_seconds",
+        "kind": "histogram",
+        "help": "check_available wall-clock (HEAD-probe phase of FindMissingPaths). ⌈N_uncached/128⌉ × RTT plus any 429 retry sleeps. p99 informs the scheduler's MERGE_FMP_TIMEOUT."
+      },
+      {
+        "name": "rio_store_chunk_cache_hits_total",
+        "kind": "counter",
+        "help": "moka chunk cache hits (for cross-instance aggregation)"
+      },
+      {
+        "name": "rio_store_chunk_cache_misses_total",
+        "kind": "counter",
+        "help": "moka chunk cache misses"
+      },
+      {
+        "name": "rio_store_chunk_dedup_ratio",
+        "kind": "gauge",
+        "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)"
+      },
+      {
+        "name": "rio_store_gc_chunk_orphan_swept_total",
+        "kind": "counter",
+        "help": "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. Sustained nonzero = builder upload path is crashing repeatedly."
+      },
+      {
+        "name": "rio_store_gc_chunk_resurrected_total",
+        "kind": "counter",
+        "help": "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
+      },
+      {
+        "name": "rio_store_gc_orphan_reap_failed_total",
+        "kind": "counter",
+        "help": "Per-row reap_one failures during the orphan scanner's loop (e.g. chunks_refcount_nonneg CHECK violation from a pre-existing accounting bug). The scan continues; sustained nonzero = a poison row needs manual intervention."
+      },
+      {
+        "name": "rio_store_gc_path_resurrected_total",
+        "kind": "counter",
+        "help": "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)"
+      },
+      {
+        "name": "rio_store_gc_path_swept_total",
+        "kind": "counter",
+        "help": "Paths deleted by GC sweep (narinfo + CASCADE). Monotonic over store lifetime."
+      },
+      {
+        "name": "rio_store_gc_s3_key_enqueued_total",
+        "kind": "counter",
+        "help": "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
+      },
+      {
+        "name": "rio_store_gc_sweep_paths_remaining",
+        "kind": "gauge",
+        "help": "Paths not yet processed by the in-progress GC sweep. Ticks down per batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow."
+      },
+      {
+        "name": "rio_store_get_path_active",
+        "kind": "gauge",
+        "help": "GetPath body-stream tasks currently writing (drives SIGTERM stream-drain)"
+      },
+      {
+        "name": "rio_store_get_path_bytes_total",
+        "kind": "counter",
+        "help": "Bytes served via GetPath (nar_size on stream start)"
+      },
+      {
+        "name": "rio_store_get_path_duration_seconds",
+        "kind": "histogram",
+        "help": "GetPath latency (stream_path entry to whole-NAR verify)"
+      },
+      {
+        "name": "rio_store_get_path_total",
+        "kind": "counter",
+        "help": "Total GetPath operations (incremented on successful whole-NAR verify)"
+      },
+      {
+        "name": "rio_store_hmac_rejected_total",
+        "kind": "counter",
+        "help": "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+      },
+      {
+        "name": "rio_store_integrity_failures_total",
+        "kind": "counter",
+        "help": "GetPath content integrity check failures (bitrot/corruption)"
+      },
+      {
+        "name": "rio_store_pg_pool_utilization",
+        "kind": "gauge",
+        "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+      },
+      {
+        "name": "rio_store_put_path_bytes_total",
+        "kind": "counter",
+        "help": "Bytes accepted via PutPath (nar_size on success)"
+      },
+      {
+        "name": "rio_store_put_path_duration_seconds",
+        "kind": "histogram",
+        "help": "PutPath latency"
+      },
+      {
+        "name": "rio_store_put_path_total",
+        "kind": "counter",
+        "help": "Total PutPath operations (per store path; PutPathBatch counts each output)"
+      },
+      {
+        "name": "rio_store_putpath_retries_total",
+        "kind": "counter",
+        "help": "PutPath retriable rejections (labeled by reason: serialization| deadlock|placeholder_missing|connection|resource_exhausted| concurrent_upload). Client retries on aborted/unavailable. Sustained high deadlock/connection rate = PG-side problem."
+      },
+      {
+        "name": "rio_store_putpath_stale_reclaimed_total",
+        "kind": "counter",
+        "help": "Stale 'uploading' placeholders reclaimed on the PutPath hot path (I-207). Nonzero expected under fetcher churn; sustained high suggests under-sized fetcher pods (see I-208)."
+      },
+      {
+        "name": "rio_store_s3_deletes_pending",
+        "kind": "gauge",
+        "help": "Rows in pending_s3_deletes awaiting drain"
+      },
+      {
+        "name": "rio_store_s3_deletes_stuck",
+        "kind": "gauge",
+        "help": "pending_s3_deletes rows at max retry attempts (alert if > 0)"
+      },
+      {
+        "name": "rio_store_s3_requests_total",
+        "kind": "counter",
+        "help": "S3 API calls (labeled by operation: put_object/get_object/head_object/delete_object)"
+      },
+      {
+        "name": "rio_store_service_token_accepted_total",
+        "kind": "counter",
+        "help": "PutPath HMAC checks bypassed via x-rio-service-token (labeled by caller)"
+      },
+      {
+        "name": "rio_store_sign_empty_refs_total",
+        "kind": "counter",
+        "help": "SignPath requests for non-CA paths with zero references. Suspicious for non-leaf derivations — GC cannot protect deps without the ref graph. Check worker ref-scanner if sustained."
+      },
+      {
+        "name": "rio_store_sign_tenant_key_fallback_total",
+        "kind": "counter",
+        "help": "PutPath/PutPathBatch tenant-key lookups that failed (transient PG error) and fell back to the cluster key. The upload still succeeds with a valid cluster signature; tenants that trust ONLY their own key will see verify failures. Alert if sustained nonzero."
+      },
+      {
+        "name": "rio_store_substitute_admission_rejected_total",
+        "kind": "counter",
+        "help": "try_substitute calls rejected with ResourceExhausted after waiting SUBSTITUTE_ADMISSION_WAIT (25s) for a permit. Sustained non-zero = genuine per-replica overload; ComponentScaler should already be reacting via the GetLoad utilization signal."
+      },
+      {
+        "name": "rio_store_substitute_admission_utilization",
+        "kind": "gauge",
+        "help": "try_substitute admission-gate utilization: (capacity - available) / capacity. Updated on each acquire AND each GetLoad call. Can saturate independently of pg_pool_utilization (upstream HTTP bottleneck)."
+      },
+      {
+        "name": "rio_store_substitute_bytes_total",
+        "kind": "counter",
+        "help": "Bytes ingested via upstream substitution (nar_size on hit)"
+      },
+      {
+        "name": "rio_store_substitute_duration_seconds",
+        "kind": "histogram",
+        "help": "Upstream substitution latency (narinfo fetch + NAR download + ingest)"
+      },
+      {
+        "name": "rio_store_substitute_integrity_failures_total",
+        "kind": "counter",
+        "help": "Upstream substitution NAR hash or size mismatches, labeled by tenant (UUID). Nonzero is a security-relevant signal: upstream served corrupt or tampered bytes / a lying NarSize."
+      },
+      {
+        "name": "rio_store_substitute_probe_cache_hits_total",
+        "kind": "counter",
+        "help": "check_available HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path)."
+      },
+      {
+        "name": "rio_store_substitute_probe_cache_misses_total",
+        "kind": "counter",
+        "help": "check_available HEAD-probe cache misses (path uncached; an upstream HEAD was issued)."
+      },
+      {
+        "name": "rio_store_substitute_probe_ratelimited_total",
+        "kind": "counter",
+        "help": "Upstream HEAD/GET probes that returned 429, labeled by tenant. The rate-limited subset is retried (≤3 passes) after honoring Retry-After; concurrency is halved when >10% of a pass 429s."
+      },
+      {
+        "name": "rio_store_substitute_stale_reclaimed_total",
+        "kind": "counter",
+        "help": "Stale 'uploading' placeholders reclaimed on the substitution hot path. Nonzero expected under network churn; sustained high suggests upstream instability or aggressive pod rollouts."
+      },
+      {
+        "name": "rio_store_substitute_total",
+        "kind": "counter",
+        "help": "Upstream substitution attempts, labeled by result (hit/miss/error) and tenant (UUID). Per-upstream debugging detail is in the debug!/warn! log lines (which carry upstream=<url>); the metric label is bounded by tenant count, not by tenant-supplied URL."
+      }
+    ]
+  }
 }

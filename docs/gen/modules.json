@@ -23,14 +23,14 @@
   ],
   "rio-builder": [
     {
-      "path": "cgroup.rs",
-      "depth": 0,
-      "doc": "Per-build cgroup v2 resource tracking."
-    },
-    {
       "path": "banner.rs",
       "depth": 0,
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
+    },
+    {
+      "path": "cgroup.rs",
+      "depth": 0,
+      "doc": "Per-build cgroup v2 resource tracking."
     },
     {
       "path": "config.rs",
