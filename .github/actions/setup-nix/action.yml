@@ -1,5 +1,7 @@
 name: Setup Nix
-description: Install Nix + configure rio-nix-cache via niks3-action
+description: >-
+  Configure Nix (installing it only if the runner image doesn't
+  pre-bake it) + rio-nix-cache via niks3-action
 inputs:
   kvm:
     description: Add kvm/nixos-test system-features
@@ -51,11 +53,54 @@ runs:
         key: nix-eval-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
         restore-keys: nix-eval-${{ runner.os }}-${{ runner.arch }}-
 
+    # The runner image pre-bakes nix (and python3). Detect it so the
+    # installer only runs on images that lack it — installing nix from
+    # scratch was ~18s of every job's setup, ~22 runner-minutes per
+    # full fan-out. Detection rather than assumption keeps CI working
+    # if the image is ever rolled back to a stock one.
+    - id: nix
+      shell: bash
+      run: |
+        if command -v nix >/dev/null 2>&1; then
+          echo "preinstalled=true" >> "$GITHUB_OUTPUT"
+          echo "pre-installed nix: $(command -v nix) ($(nix --version))"
+        else
+          echo "preinstalled=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Pre-installed path: the image owns the installation; this step
+    # only applies the per-job configuration the installer's
+    # extra-conf used to carry. It goes in a user conf file
+    # (NIX_USER_CONF_FILES, prepended so the niks3-action's own entry
+    # composes) rather than /etc/nix/nix.conf so it needs no sudo and
+    # no daemon restart. The image must keep the runner user in
+    # trusted-users for the daemon to honor the restricted settings
+    # (sandbox, system-features, extra-substituters); if a job fails
+    # here with "ignoring untrusted setting", that's the image
+    # invariant that broke.
+    - if: steps.nix.outputs.preinstalled == 'true'
+      shell: bash
+      run: |
+        conf="$RUNNER_TEMP/rio-nix.conf"
+        {
+          echo "experimental-features = nix-command flakes"
+          echo "max-jobs = auto"
+          echo "sandbox = true"
+          if [ "${{ inputs.kvm }}" = "true" ]; then
+            echo "system-features = nixos-test benchmark big-parallel kvm"
+          fi
+          if [ "${{ inputs.drv-cache }}" = "true" ]; then
+            echo "extra-substituters = file://$RUNNER_TEMP/drv-cache"
+          fi
+        } > "$conf"
+        echo "NIX_USER_CONF_FILES=$conf${NIX_USER_CONF_FILES:+:$NIX_USER_CONF_FILES}" >> "$GITHUB_ENV"
+
     # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
     # 6b8548f includes PR#9 (--enable-flakes; the wrapped installer
     # stopped enabling flakes by default) and PR#10 (skip udev write
     # on container runners — what enable-kvm:false below worked around).
-    - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
+    - if: steps.nix.outputs.preinstalled == 'false'
+      uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
       with:
         # Default is true; it writes a udev rule to /etc/udev/rules.d/
         # which doesn't exist in ARC runner containers. We handle KVM
