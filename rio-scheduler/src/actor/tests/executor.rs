@@ -4746,7 +4746,7 @@ async fn test_recovery_window_disconnect_preserves_retained_buffer() -> anyhow::
     let leader = crate::lease::LeaderState::pending(std::sync::Arc::new(
         std::sync::atomic::AtomicU64::new(1),
     ));
-    leader.on_acquire();
+    leader.on_acquire(1);
     let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
         p.log_buffers = Some(bufs_for_actor);
@@ -4810,16 +4810,21 @@ async fn test_failed_recovery_disconnect_preserves_retained_buffer() -> anyhow::
     // K8s-shaped LeaderState: lease held (is_leader=true) but recovery
     // not run yet (recovery_complete=false at construction). Same
     // `from_parts` injection as test_recovery_failure_degrades_to_empty_dag
-    // so the test can observe the Err arm setting the flag.
-    let recovery_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let rc = std::sync::Arc::clone(&recovery_complete);
+    // so the test can observe the Err arm completing the recovery. With
+    // the pool closed the PG floor is unreadable too, so the term is
+    // confirmation-gated — keep a simulated lease loop confirming
+    // Leading rounds for the test's lifetime or the recovery would be
+    // discarded instead of degrading to the empty DAG.
+    let leader = crate::lease::LeaderState::from_parts(
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        false,
+    );
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
         p.log_buffers = Some(bufs_for_actor);
-        p.leader = crate::lease::LeaderState::from_parts(
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            rc,
-        );
+        p.leader = leader_for_actor;
     });
 
     // Retained entry from before the flap: stamped to the connected
@@ -4843,7 +4848,7 @@ async fn test_failed_recovery_disconnect_preserves_retained_buffer() -> anyhow::
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
     assert!(
-        recovery_complete.load(std::sync::atomic::Ordering::Acquire),
+        leader.recovery_complete(),
         "precondition: the Err arm sets recovery_complete=true (degrade, don't block)"
     );
     assert!(

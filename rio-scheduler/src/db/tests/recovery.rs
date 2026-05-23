@@ -402,8 +402,13 @@ async fn test_max_known_generation_covers_unpersisted_claims() -> anyhow::Result
 
     // An assignment at a higher generation dominates.
     let drv_id = insert_test_derivation(&db, "genfloor").await?;
-    db.insert_assignment(drv_id, &ExecutorId::from("worker-1"), 9)
-        .await?;
+    db.insert_assignment(
+        drv_id,
+        &ExecutorId::from("worker-1"),
+        9,
+        uuid::Uuid::now_v7(),
+    )
+    .await?;
     assert_eq!(
         db.max_known_generation().await?,
         Some(9),

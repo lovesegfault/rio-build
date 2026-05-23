@@ -3562,6 +3562,13 @@ async fn poison_threshold_disconnect_fixture(
 )> {
     let db = TestDb::new(&MIGRATOR).await;
     let leader = crate::lease::LeaderState::default(); // always-leader
+    // The dispatch below leaves an assignment row at the entry
+    // generation with no claim row, so the LeaderAcquired in step 3 is
+    // a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`). The guard only needs to outlive
+    // that recovery, which the step-3 barrier completes before this
+    // fixture returns.
+    let _confirmations = spawn_leading_confirmations(leader.clone());
     let leader_for_actor = leader.clone();
     let (handle, task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
         p.leader = leader_for_actor;
@@ -3932,10 +3939,17 @@ async fn test_recovery_repopulates_log_buffers_exec_id() -> TestResult {
     .await?;
 
     // --- Phase 2: fresh actor recovers, with log_buffers wired so we
-    // can observe the re-stamp. ---
+    // can observe the re-stamp. The seeded assignment row makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime. ---
     let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
         plumbing.log_buffers = Some(log_buffers.clone());
+        plumbing.leader = leader_for_actor;
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4018,8 +4032,16 @@ async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
         "fixture premise: the retained entry holds the old execution's lines"
     );
 
+    // The interim leader's assignment row at generation 2 makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime.
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
         plumbing.log_buffers = Some(log_buffers.clone());
+        plumbing.leader = leader_for_actor;
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4128,8 +4150,16 @@ async fn test_recovery_restamp_unseals_sealed_deferred_entry() -> TestResult {
         "fixture premise: the old execution's final is pending with the flusher"
     );
 
+    // The interim leader's assignment row at generation 2 makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime.
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
         plumbing.log_buffers = Some(log_buffers.clone());
+        plumbing.leader = leader_for_actor;
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4252,13 +4282,21 @@ async fn test_orphan_completion_routes_log_through_epilogue() -> TestResult {
     .execute(&sched_db.pool)
     .await?;
 
-    // --- Phase 2: fresh actor recovers with log_buffers + store wired. ---
+    // --- Phase 2: fresh actor recovers with log_buffers + store wired.
+    // The seeded assignment row at the entry generation makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime. ---
     let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) =
         setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
             plumbing.log_buffers = Some(log_buffers.clone());
             plumbing.log_flush_tx = Some(flush_tx);
+            plumbing.leader = leader_for_actor;
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4406,11 +4444,19 @@ async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
         "fixture premise: the retained entry holds the prior leadership's lines"
     );
 
+    // The seeded assignment row at the entry generation makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime.
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) =
         setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
             plumbing.log_buffers = Some(log_buffers.clone());
             plumbing.log_flush_tx = Some(flush_tx);
+            plumbing.leader = leader_for_actor;
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4513,10 +4559,18 @@ async fn test_orphan_completion_dropped_flush_discards_empty_buffer() -> TestRes
             lease_generation: 1,
         })
         .expect("pre-fill the only slot");
+    // The seeded assignment row at the entry generation makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime.
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) =
         setup_actor_configured(sched_db.pool.clone(), Some(store_client), |_, plumbing| {
             plumbing.log_buffers = Some(log_buffers.clone());
             plumbing.log_flush_tx = Some(flush_tx);
+            plumbing.leader = leader_for_actor;
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4656,12 +4710,20 @@ async fn test_recovery_preserves_reset_exec_id_clear() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    // --- Phase 2: fresh leader recovers with log_buffers + flusher wired. ---
+    // --- Phase 2: fresh leader recovers with log_buffers + flusher wired.
+    // The leaked assignment row at the entry generation makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime. ---
     let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
         plumbing.log_buffers = Some(log_buffers.clone());
         plumbing.log_flush_tx = Some(flush_tx);
+        plumbing.leader = leader_for_actor;
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -4885,10 +4947,18 @@ async fn test_recovery_sweeps_stale_log_buffers() -> TestResult {
         );
     }
 
+    // The seeded assignment row at the entry generation makes the
+    // recovery a bump target that waits for a post-claim Leading round
+    // (`sched.recovery.bump-confirm`) — keep a simulated lease loop
+    // confirming rounds for the test's lifetime.
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(8);
+    let leader = crate::lease::LeaderState::default();
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let leader_for_actor = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, plumbing| {
         plumbing.log_buffers = Some(log_buffers.clone());
         plumbing.log_flush_tx = Some(flush_tx);
+        plumbing.leader = leader_for_actor;
     });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;

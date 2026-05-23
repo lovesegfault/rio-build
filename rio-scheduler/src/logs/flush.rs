@@ -4264,7 +4264,7 @@ mod tests {
         // restamps the SAME exec — the victim's entry is now the live
         // execution's carrier (lines retained, unsealed, unmarked).
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
         buffers.set_exec(drv_v, exec_v, "test-worker");
 
         let flusher = LogFlusher::new(
@@ -4517,7 +4517,7 @@ mod tests {
         // terminal persist failed in the same outage, so PG still holds the
         // drv as Assigned/Running).
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
         buffers.set_exec(drv_path, exec_id, "test-worker");
 
         // The reconnected worker keeps streaming the same execution: its
@@ -4879,7 +4879,7 @@ mod tests {
         };
         // ...processed after a lose/re-acquire flap: tenure 2, leader again.
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
 
         let flusher = LogFlusher::new(
             s3,
@@ -4991,7 +4991,7 @@ mod tests {
         // replica re-acquires (generation 2) and serves reads. The drv is
         // terminal in PG, so recovery does NOT restamp this entry.
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
 
         let flusher = LogFlusher::new(
             s3,
@@ -5090,7 +5090,7 @@ mod tests {
         // the entry is now the live execution's carrier, unsealed and still
         // empty until the reconnected worker re-streams.
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
         buffers.set_exec(drv_path, exec_id, "test-worker");
         assert!(
             !buffers.is_sealed(drv_path),
@@ -5187,7 +5187,7 @@ mod tests {
         // flusher processes the orphaned request BEFORE the actor's recovery
         // restamps the entry: the sealed, empty orphan is reaped.
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
         let flusher = LogFlusher::new(
             s3,
             "test-bucket".into(),
@@ -5308,7 +5308,7 @@ mod tests {
             let _guard = metrics::set_default_local_recorder(&recorder);
             let (ret, ()) = tokio::join!(flusher.flush_final(req), async {
                 state.on_lose();
-                state.on_acquire();
+                state.on_acquire(1);
                 lock_tx.rollback().await.expect("release the table lock");
             });
             ret
@@ -5444,7 +5444,7 @@ mod tests {
             // restamps the SAME exec — the entry is now the live execution's
             // carrier (unsealed, unmarked, still empty).
             state2.on_lose();
-            state2.on_acquire();
+            state2.on_acquire(1);
             bufs.set_exec(&drv, exec_id, "test-worker");
             // Now fail the parked SELECT so the guard returns Err into the
             // (stale) tenure.
@@ -5549,7 +5549,7 @@ mod tests {
         // The lease flaps before the flusher reaches the request; this
         // replica re-acquires (generation 2) and serves reads.
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
 
         let flusher = LogFlusher::new(
             s3,
@@ -5689,7 +5689,7 @@ mod tests {
         .await?;
 
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
 
         let flusher = LogFlusher::new(
             s3,
@@ -5763,7 +5763,7 @@ mod tests {
             lease_generation: state.generation(),
         };
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
 
         // Wedge PG for reads: any drv_logs SELECT would park on this lock,
         // so a drop arm that still consulted the row could not return until
@@ -5887,7 +5887,7 @@ mod tests {
             let _guard = metrics::set_default_local_recorder(&recorder);
             let (ret, ()) = tokio::join!(flusher.flush_final(req), async {
                 state.on_lose();
-                state.on_acquire();
+                state.on_acquire(1);
                 lock_tx.rollback().await.expect("release the table lock");
             });
             ret
@@ -6080,7 +6080,7 @@ mod tests {
         // The lease flaps before the flusher reaches A's queued final; this
         // replica re-acquires (generation 2).
         state.on_lose();
-        state.on_acquire();
+        state.on_acquire(1);
 
         let flusher = LogFlusher::new(
             s3,
@@ -8472,7 +8472,7 @@ mod tests {
 
         // (3) A re-acquires: the lease loop stores is_leader=true; the actor
         // has NOT dequeued LeaderAcquired (no rearm, no restamp).
-        state.on_acquire();
+        state.on_acquire(1);
         // Anti-vacuousness: the exact preconditions under which an un-gated
         // tick would shrink B's row.
         assert!(
@@ -8542,7 +8542,7 @@ mod tests {
             1,
             "the stale latch existed"
         );
-        state.set_recovery_complete();
+        state.set_recovery_complete(state.acquired_transitions());
         buffers.push(&mk_batch(drv_path, 6, &[b"c-6", b"c-7"]));
 
         // (6) Gate open: the next self-driven flush (channel-close arm —
