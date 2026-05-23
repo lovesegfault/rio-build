@@ -2573,18 +2573,32 @@ acquisition-shaped event --- and no separate counter is added.
   the leader.
 ]
 
-#r("sched.lease.deletion-cost")[
-  On the acquire transition, the lease loop annotates its own Pod with
-  `controller.kubernetes.io/pod-deletion-cost: "1"`; on the lose transition, it
-  sets `"0"`. Kubernetes's ReplicaSet controller sorts pods by this annotation
-  (ascending, lower = kill first) when picking which pod to evict during
-  scale-down --- including the surge-reconcile phase of RollingUpdate. With
-  cost=1 on the leader and cost=0 on the standby, `kubectl rollout restart`
-  kills the standby first, new pod comes up, acquires (old leader step_down on
-  SIGTERM), no double leadership churn. The PATCH is fire-and-forget (the lease
-  loop must not block on it) and failure is non-fatal: without the annotation,
-  K8s picks arbitrarily, which means 50% of rollouts churn leadership twice
-  instead of once. Annoying but correct.
+#r("sched.lease.deletion-cost+2")[
+  On the acquire transition, the lease loop reconciles both leader marks onto
+  its own Pod in one merge patch: the annotation
+  `controller.kubernetes.io/pod-deletion-cost: "1"` and, when configured, the
+  leader role label the leader-only `rio-scheduler-leader` Service selects on;
+  on the lose transition it writes cost `"0"` and removes the label.
+  Kubernetes's ReplicaSet controller sorts pods by the annotation (ascending,
+  lower = kill first) when picking which pod to evict during scale-down ---
+  including the surge-reconcile phase of RollingUpdate. With cost=1 on the
+  leader and cost=0 on the standby, `kubectl rollout restart` kills the standby
+  first, new pod comes up, acquires (old leader step_down on SIGTERM), no
+  double leadership churn. While leading, the same retried reconcile also
+  strips the leader marks from any other Pod still carrying them (a partitioned
+  ex-leader cannot remove its own); a failed sweep leaves the marks unconverged
+  and the reconcile retried, exactly like a failed own-Pod patch. The reconcile
+  is level-triggered, not fire-and-forget: the patch is spawned so the lease
+  loop never blocks on the apiserver, at most one marks-reconcile attempt is in
+  flight at a time, and each attempt is bounded by a call timeout; the marks
+  MUST be re-reconciled on subsequent successful election round-trips ---
+  beginning with the first round-trip after the in-flight attempt completes ---
+  until they reflect the Pod's current leadership. While reconciliation keeps
+  failing, scale-down ordering is arbitrary (the annotation half) and the
+  leader-only Service's endpoints are missing or stale --- including a peer's
+  stale label the sweep has not yet removed --- degrading or downing the
+  dashboard data path that resolves it (the label half); the warning repeated
+  on each failed attempt is the operator signal.
 ]
 
 *Deployment strategy interaction:* Readiness is decoupled from leadership
@@ -2607,9 +2621,10 @@ deletion-cost rule above --- extends it), requests reaching a stale-labeled,
 self-fenced ex-leader fail with that same un-retryable UNAVAILABLE. Combined with `step_down()` and
 pod-deletion-cost, a rollout flips leadership exactly once: K8s kills the
 standby first (cost=0), new pod comes up as standby, K8s kills the old leader,
-old leader step_down releases the lease, new pod acquires within one poll
-(\~1s), balanced-channel clients reroute within one probe tick (\~3s).
-Executors reconnect in place --- running builds continue, no pod restarts.
+old leader step_down releases the lease, the new pod acquires on its next poll
+tick (one `RENEW_INTERVAL`, 5s), balanced-channel clients reroute within one
+probe tick (\~3s). Executors reconnect in place --- running builds continue, no
+pod restarts.
 
 #info(title: [VM test])[
   The 2-replica failover path is covered by

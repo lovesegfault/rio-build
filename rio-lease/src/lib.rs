@@ -1084,7 +1084,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             "acquired leadership"
                         );
 
-                        // r[impl sched.lease.deletion-cost]
+                        // r[impl sched.lease.deletion-cost+2]
                         // The leader marks (pod-deletion-cost=1 so K8s
                         // kills the standby first on scale-down, plus
                         // the optional leader label the
@@ -1212,7 +1212,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     state.confirm_leading_round(round);
                 }
 
-                // r[impl sched.lease.deletion-cost]
+                // r[impl sched.lease.deletion-cost+2]
                 // Level-triggered leader-marks reconcile. Runs AFTER
                 // the edge detection so a transition on THIS tick
                 // patches the post-transition state (and the self-fence
@@ -1411,7 +1411,7 @@ fn leader_marks_patch(
     }
 }
 
-// r[impl sched.lease.deletion-cost]
+// r[impl sched.lease.deletion-cost+2]
 /// Detached PATCH of the leader marks on our own Pod:
 ///
 /// - `controller.kubernetes.io/pod-deletion-cost`: K8s's ReplicaSet
@@ -2205,7 +2205,7 @@ mod tests {
     /// the leader-only Service routes to two pods. Regression:
     /// maybe_self_fence previously consumed the `was_leading` edge
     /// without arranging the deferred patch.
-    // r[verify sched.lease.deletion-cost]
+    // r[verify sched.lease.deletion-cost+2]
     #[test]
     fn self_fence_sets_marks_dirty() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
@@ -2255,7 +2255,7 @@ mod tests {
     // assertion are the end-to-end coverage for it.
 
     /// Acquire: cost=1 and the label is present with its value.
-    // r[verify sched.lease.deletion-cost]
+    // r[verify sched.lease.deletion-cost+2]
     #[test]
     fn leader_marks_patch_sets_label_on_acquire() {
         let label = (
