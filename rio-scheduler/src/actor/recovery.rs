@@ -56,10 +56,13 @@
 //! Lease object being deleted and recreated at `leaseTransitions = 0`.
 //!
 //! Before `recovery_complete` ungates dispatch, the target generation
-//! is durably CLAIMED in `leader_generation_claims` (the sole
-//! exception is the floor-unreadable fallback, where no claim is
-//! possible because PG cannot answer even the single-row floor query)
-//! — without that, a leader deposed before persisting a single
+//! is durably CLAIMED in `leader_generation_claims` on the
+//! non-degraded path. The exceptions: the floor-unreadable fallback
+//! (no claim is possible when PG cannot answer even the single-row
+//! floor query) and the claim-INSERT-failure / conflict-exhaustion
+//! arms, which proceed unclaimed — see the bump-confirm pricing and
+//! the claim-target disposition in `handle_leader_acquired`.
+//! Without the claim, a leader deposed before persisting a single
 //! assignment leaves no trace in PG, and its post-deletion successor
 //! seeds from the same stale floor and reuses its generation. The
 //! claim bounds the post-deletion damage; it cannot prevent it under
@@ -1192,8 +1195,9 @@ impl DagActor {
         //   not re-acquired — the foreign term may still be in
         //   progress.
         // - `generation`: belt-and-suspenders. recover_from_pg() does
-        //   NOT write to self.leader's generation (it returns the PG
-        //   high-water for us to seed below), so any change here is
+        //   NOT write to self.leader's generation (the caller reads
+        //   the PG floor as an independent step; the seed is applied
+        //   only at the shared post-gate tail), so any change here is
         //   unambiguously a lease-loop write; keeping the comparison
         //   also catches any future writer or seed-ordering mistake.
         //
@@ -1301,10 +1305,10 @@ impl DagActor {
         // Sweep them — safe to remove (drv is terminal, inputs no
         // longer in-use). Best-effort; grace period is fallback.
         // Runs BEFORE the gen re-check so a lease flap during this
-        // await is caught at the TOCTOU gate below — this is the
-        // second async PG round-trip in handle_leader_acquired and
-        // must be inside the gen_at_entry window. The DELETE is
-        // DB-side terminal-status based, independent of `result`.
+        // await is caught at the TOCTOU gate below — like every other
+        // PG round-trip in handle_leader_acquired it must run inside
+        // the gen_at_entry window. The DELETE is DB-side
+        // terminal-status based, independent of `result`.
         match self.db.sweep_stale_live_pins().await {
             Ok(n) if n > 0 => {
                 info!(
@@ -1708,7 +1712,8 @@ impl DagActor {
         // the next LeaderAcquired re-run it.
         //
         // INVARIANT: no await may be introduced between this check and
-        // set_recovery_complete() (either match arm below) — and new PG
+        // set_recovery_complete() (its single call site, at the end of
+        // the shared tail below) — and new PG
         // round-trips or waits (like the bump confirmation) belong
         // ABOVE, with recover_from_pg, the sweep_stale_* calls, and the
         // generation-claim loop. The completion below is keyed to

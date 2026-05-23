@@ -2480,11 +2480,12 @@ claim-conflict exhaustion proceeds unclaimed (a DAG-load failure on its own
 does not --- the floor is read independently of the load, so that term still
 claims; only the builds are lost), and a floor-unreadable recovery completes
 (only after the post-claim leadership confirmation, which needs no PG)
-at the recovery-entry generation --- the unclaimed term advertises an
+at the recovery-entry generation --- both degraded shapes advertise an
 unclaimed generation (the same one-term residual already priced for the claim
-machinery above), while the floor-unreadable term's exposure is under-floor
-advertisement: in the saturated post-deletion regime the executors' latch
-silently rejects its dispatches until the next leadership transition. The
+machinery above), and the floor-unreadable term carries, additionally,
+under-floor advertisement in the saturated post-deletion regime: the
+executors' latch silently rejects its dispatches until the next leadership
+transition. The
 trade-off is that fence arming is deferred:
 workers learn the new generation only after the new leader's recovery
 completes, plus up to one heartbeat interval, so a paused-and-deposed

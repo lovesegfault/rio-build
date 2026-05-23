@@ -1036,10 +1036,12 @@ impl GenerationReader {
     /// (`sched.recovery.bump-confirm`) in recovery.rs. (A DAG-load
     /// failure no longer lands here: the floor is read independently
     /// of the load, so that term floors, claims, and confirms like any
-    /// other; only the floor-unreadable fallback remains, and its
-    /// exposure is under-floor advertisement — in the saturated regime
-    /// the latched builders silently reject its work — rather than an
-    /// unclaimed generation.) The exits are
+    /// other; only the floor-unreadable fallback remains, which also
+    /// completes unclaimed (no claim is possible without the floor
+    /// read), so it carries the same pre-existing claim-failure
+    /// residual and, additionally, under-floor advertisement in the
+    /// saturated regime — the latched builders silently reject its
+    /// work.) The exits are
     /// the queued-loss invalidation above, a re-acquire at a different
     /// count (the stamp mismatches — the different-count case above),
     /// or at the same count (the deliberate same-epoch keep); a rebound
