@@ -1063,13 +1063,31 @@ impl LogFlusher {
             .buffers
             .discard_if_sealed_for_exec(&req.drv_path, req.exec_id, require_empty)
         {
-            debug!(
-                drv = %req.drv_path,
-                exec_id = %req.exec_id,
-                require_empty,
-                "reaped the dropped final's sealed entry so reads fall \
-                 through to the stored drv_logs record"
-            );
+            if require_empty {
+                // finalize_guard_error / pre_drain: only an empty entry is
+                // ever reaped here, and reads already fall through to the
+                // stored side for a zero-line entry whether or not the reap
+                // fires.
+                debug!(
+                    drv = %req.drv_path,
+                    exec_id = %req.exec_id,
+                    require_empty,
+                    "reaped the dropped final's sealed, empty entry \
+                     (bookkeeping; reads are unaffected)"
+                );
+            } else {
+                // already_finalized_refusal: the guard row is proven
+                // is_complete=true, so the sealed non-empty residue is
+                // dropped and reads fall through to the finalized drv_logs
+                // record instead of the stale ring lines.
+                debug!(
+                    drv = %req.drv_path,
+                    exec_id = %req.exec_id,
+                    require_empty,
+                    "reaped the dropped final's sealed entry so reads fall \
+                     through to the finalized drv_logs record"
+                );
+            }
         }
     }
 
