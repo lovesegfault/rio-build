@@ -98,6 +98,8 @@
     "rio_scheduler_event_persist_dropped_total",
     "rio_scheduler_executor_reconnect_rejected_total",
     "rio_scheduler_features_stripped_total",
+    "rio_scheduler_generation_claim_failed_total",
+    "rio_scheduler_generation_floor_read_failed_total",
     "rio_scheduler_heartbeat_adopt_conflicts_total",
     "rio_scheduler_heartbeat_adoptions_total",
     "rio_scheduler_heartbeat_rejected_total",
@@ -709,6 +711,16 @@
         "help": "§13e+r35: EffectiveFeatures::derive stripped the declared requiredSystemFeatures at the FOD↔Fetcher chokepoint (labeled reason ∈ {non_fod_fetcher, fod_declared_features}). non_fod_fetcher: a non-FOD declared `fetcher` (rio-internal routing tag, not a tenant-declarable system feature); the drv routes to a Builder Pool. fod_declared_features: a FOD declared extraneous features (e.g. `kvm`); the drv routes to a Fetcher Pool. The strip produces correct routing — the WARN (debounced once per (pname, reason) edge) names the declared vs effective set so the tenant can fix the misconfig."
       },
       {
+        "name": "rio_scheduler_generation_claim_failed_total",
+        "kind": "counter",
+        "help": "Generation-claim INSERTs that failed during recovery (PG error between the seed read and the claim write). The leader proceeds unclaimed: dispatch is not blocked, but that term's generation is absent from the leader_generation_claims ledger, re-opening the deposed-before-persist collision window for that one term. Sustained nonzero means PG is flapping exactly at failover time."
+      },
+      {
+        "name": "rio_scheduler_generation_floor_read_failed_total",
+        "kind": "counter",
+        "help": "PG generation-floor reads that failed during recovery. The term proceeds unclaimed at the recovery-entry generation after the post-claim leadership confirmation — dispatch is not blocked, but that term's generation is absent from the leader_generation_claims ledger and may sit below the durable floor. Sustained nonzero means PG is flapping exactly at failover time."
+      },
+      {
         "name": "rio_scheduler_heartbeat_adopt_conflicts_total",
         "kind": "counter",
         "help": "Heartbeat-adoption found the DAG already Assigned to a DIFFERENT worker (reconcile re-dispatched before this worker reconnected). Both run; first to complete wins. Nonzero suggests reconcile delay is too short for the observed worker-reconnect time."
@@ -776,7 +788,7 @@
       {
         "name": "rio_scheduler_log_flush_stale_tenure_total",
         "kind": "counter",
-        "help": "Final log-flush requests dropped because the scheduler lease moved (lost, or lost-and-reacquired) between the request's enqueue and its processing: the live leadership tenure owns that execution's finalization, and uploading the stale ring would freeze a drv_logs row the live tenure may still be extending. Counted for first attempts and retained-deferral retries alike. The execution's log is finalized by the live tenure's own terminal flush; if its terminal had already persisted before the outage (or the drv was re-dispatched under a new exec_id), the row instead stays at its .partial (is_complete=false) coverage — the bounded pre-retry loss."
+        "help": "Final log-flush requests dropped because the scheduler leadership tenure that enqueued them ended before they were processed: the replica no longer holds the lease, its generation moved past the enqueue-time stamp, or the recorded acquire-epoch (the Lease's leaseTransitions count) moved — a holder change always breaks the tenure, even when the PG-floor-saturated generation does not move; a same-count re-acquire (self-fence false alarm) breaks neither and keeps the request. The live leadership tenure owns that execution's finalization, and uploading the stale ring would freeze a drv_logs row the live tenure may still be extending. Counted for first attempts and retained-deferral retries alike. The execution's log is finalized by the live tenure's own terminal flush; if its terminal had already persisted before the outage (or the drv was re-dispatched under a new exec_id), the row instead stays at its .partial (is_complete=false) coverage — the bounded pre-retry loss."
       },
       {
         "name": "rio_scheduler_log_flush_stale_total",
@@ -881,7 +893,7 @@
       {
         "name": "rio_scheduler_recovery_total",
         "kind": "counter",
-        "help": "Scheduler state recoveries from PG after LeaderAcquired (labeled by outcome=success|failure|discarded_flap)"
+        "help": "Scheduler state recoveries from PG after LeaderAcquired; exactly one increment per attempt: outcome=success|failure when the loaded result is applied (or the load failed), outcome=discarded_flap| discarded_unconfirmed when the post-recovery gate throws the result away (discard outcomes take precedence over the load result)"
       },
       {
         "name": "rio_scheduler_resource_floor_bumps_total",

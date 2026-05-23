@@ -608,6 +608,11 @@
       "path": "lib.rs",
       "depth": 0,
       "doc": "Kubernetes Lease-based leader election."
+    },
+    {
+      "path": "mbt_tests.rs",
+      "depth": 0,
+      "doc": "Model-based testing: replay traces generated from the leader-election"
     }
   ],
   "rio-migrations": [
@@ -1021,6 +1026,11 @@
       "path": "grpc/scheduler_service.rs",
       "depth": 1,
       "doc": "`SchedulerService` gRPC implementation for [`SchedulerGrpc`]."
+    },
+    {
+      "path": "lease_hooks.rs",
+      "depth": 0,
+      "doc": "Scheduler-side [`LeaseHooks`](crate::lease::LeaseHooks) impl: ordered,"
     },
     {
       "path": "lib.rs",
