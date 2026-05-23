@@ -1798,7 +1798,9 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 /// dispatches would be silently rejected (the inversion this pins
 /// against). Pairs with `test_recovery_failure_degrades_to_empty_dag`,
 /// which closes the pool so the floor read fails too and pins the
-/// floor-unreadable fallback's confirmed completion.
+/// floor-unreadable fallback's confirmed completion. Also pairs with
+/// `test_recovery_load_failure_unconfirmed_bump_is_discarded` (the
+/// unconfirmed direction).
 // r[verify sched.recovery.fetch-max-seed+4]
 // r[verify sched.lease.generation-claim+2]
 // r[verify sched.recovery.bump-confirm+2]
@@ -1869,6 +1871,87 @@ async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestRe
         41,
         "heartbeats advertise the floored, claimed generation — not the \
          under-floor entry generation"
+    );
+    Ok(())
+}
+
+/// The negative arm of the load-failure case: a DAG-load failure with a
+/// readable floor still requires the post-claim confirmation — with no
+/// post-claim Leading round the recovery must be discarded, never
+/// seeded, never completed, never advertised (the last also pins
+/// claim-before-advertise for the discard direction). The discriminating
+/// assertions are the absence poll and the final entry-generation check;
+/// the completion/advertisement asserts also hold under a skipped wait
+/// because `on_lose()` clears the stamp before they run. Pairs with
+/// `test_recovery_load_failure_still_floors_claims_and_confirms` (the
+/// confirmed direction). The leftover (41, 'pod-us') claim row is the
+/// documented harmless over-claim and is deliberately not asserted,
+/// same as the other discard tests.
+// r[verify sched.recovery.bump-confirm+2]
+#[tokio::test]
+async fn test_recovery_load_failure_unconfirmed_bump_is_discarded() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Saturated regime, same fixture as the confirmed-direction test:
+    // a dead predecessor's claim row far above the entry generation (2).
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) \
+         VALUES (40, 'dead-previous')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let generation = Arc::new(AtomicU64::new(2));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.fail_next_recovery_load = true;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    // Deliberately grant NO Leading round before releasing: the
+    // confirmation can never arrive.
+    release_tx.send(()).expect("actor still listening");
+
+    // No lease loop is running, so no confirmation can ever arrive. The
+    // seed to 41 must never land — on the unconfirmed-seed regression it
+    // lands within the first few polls.
+    for _ in 0..20 {
+        assert!(
+            generation.load(Ordering::Acquire) <= 2,
+            "an unconfirmed load-failure bump must never seed above the entry generation"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The deposal observation that in production arrives within a renew
+    // interval: the lose edge ends the wait and the gate discards.
+    leader.on_lose();
+    barrier(&handle).await;
+
+    assert!(
+        !leader.recovery_complete(),
+        "an unconfirmed load-failure bump recovery must be discarded, not completed"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        2,
+        "the generation must still be the entry generation after the discard"
+    );
+    assert_eq!(
+        handle.generation.advertised(),
+        0,
+        "claim-before-advertise: a discarded load-failure recovery must not advertise"
     );
     Ok(())
 }
