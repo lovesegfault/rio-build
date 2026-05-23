@@ -429,17 +429,20 @@ resource "aws_iam_policy" "rio_store_s3" {
   policy = data.aws_iam_policy_document.rio_store_s3.json
 }
 
-# IRSA for rio-scheduler: S3 PutObject/ListBucket on the chunks bucket
-# (build-log flush writes under logs/ prefix in the same bucket). The
-# scheduler aggregates worker logs and flushes to S3 — it does NOT read
-# or delete, so narrower than the store policy.
+# IRSA for rio-scheduler: S3 object access scoped to the logs/ prefix
+# of the chunks bucket. The log flusher writes .partial snapshots and
+# final blobs there; GetDerivationLogs and the post-failover stored-
+# prefix merge read them back; the .partial cleanup and the TTL sweep
+# delete them. Narrower than the store policy: same actions, logs/* only.
 data "aws_iam_policy_document" "rio_scheduler_s3" {
   statement {
     effect = "Allow"
     actions = [
+      "s3:GetObject",
       "s3:PutObject",
+      "s3:DeleteObject",
     ]
-    resources = ["${aws_s3_bucket.chunks.arn}/*"]
+    resources = ["${aws_s3_bucket.chunks.arn}/logs/*"]
   }
   statement {
     effect    = "Allow"
