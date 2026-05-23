@@ -36,9 +36,11 @@
 //! claimed, and (when required) confirmed before `recovery_complete`
 //! is set, so its dispatches stay inside what the durable floor
 //! covers (only the in-flight builds are lost). Only when the PG
-//! floor itself cannot be read does the term complete at the
-//! recovery-entry generation (the floor-unreadable fallback — see the
-//! disposition comment in `handle_leader_acquired`). A panicked
+//! floor itself cannot be read does the term skip the claim attempt
+//! entirely and complete — after the post-claim leadership
+//! confirmation, which needs no PG — at the recovery-entry generation
+//! (the floor-unreadable fallback — see the disposition comment in
+//! `handle_leader_acquired`). A panicked
 //! recovery with `is_leader=true` + `recovery_complete=false` would
 //! block dispatch FOREVER while holding the lease — standby can
 //! never take over. Degrading is better.
@@ -65,10 +67,11 @@
 //! together).
 //!
 //! A claim target the durable floor cannot vouch for — one ABOVE the
-//! entry generation, or a retained entry generation more than one above
-//! the floor — is additionally seeded (and the recovery completed) only
-//! after a post-claim apiserver round-trip that ended with this replica
-//! holding the Lease (`sched.recovery.bump-confirm`): the PG floor
+//! entry generation, a retained entry generation more than one above
+//! the floor, or a retained entry generation whose floor could not be
+//! read at all — is additionally seeded (and the recovery completed)
+//! only after a post-claim apiserver round-trip that ended with this
+//! replica holding the Lease (`sched.recovery.bump-confirm`): the PG floor
 //! cannot distinguish a dead predecessor's claim from a live
 //! successor's, nor can it rule out a live successor inside a
 //! never-claimed gap, so a deposed-but-unaware leader whose recovery
@@ -1269,11 +1272,21 @@ impl DagActor {
         // spans assignments ∪ leader_generation_claims — see
         // max_known_generation's doc for why neither arm alone is
         // reliable.
-        let pg_floor_read: Result<Option<i64>, ActorError> = self
-            .db
-            .max_known_generation()
-            .await
-            .map_err(ActorError::from);
+        // Test-only: deterministic floor-read failure (same `ActorError`
+        // shape a sqlx error maps to) without touching the DB; scoped to
+        // the floor read only — the DAG load above is unaffected.
+        #[cfg(test)]
+        let fail_floor_read = std::mem::take(&mut self.fail_next_floor_read);
+        #[cfg(not(test))]
+        let fail_floor_read = false;
+        let pg_floor_read: Result<Option<i64>, ActorError> = if fail_floor_read {
+            Err(ActorError::Database(sqlx::Error::PoolClosed))
+        } else {
+            self.db
+                .max_known_generation()
+                .await
+                .map_err(ActorError::from)
+        };
         // For the post-gate "seeded generation" log line: the floor
         // value when readable (None when unreadable or empty — the
         // field keeps its historical name).
@@ -1412,13 +1425,27 @@ impl DagActor {
         // r[impl sched.lease.generation-claim+2]
         let (claim_target, floor_vouches_entry) = match &pg_floor_read {
             // Floor unreadable: PG could not answer even the
-            // single-row floor query. The target degenerates to the
-            // entry generation — no claim is possible (the INSERT
-            // would fail the same way) and no confirmation is
-            // required — and the shared post-gate tail still runs the
-            // (no-op) seed and completes; see the floor-unreadable
-            // pricing at the disposition below.
-            Err(_) => (gen_at_entry, true),
+            // single-row floor query, so it cannot vouch for the entry
+            // generation — the same conservative posture as a failed
+            // claims-ledger read ("counts as no proof"). No claim
+            // INSERT is attempted (it would fail the same way); the
+            // post-claim Leading-round confirmation below needs no PG
+            // and still runs, so a deposed-but-unaware replica is
+            // discarded instead of completing above a live successor.
+            // The shared post-gate tail still runs the (no-op) seed; a
+            // confirmed term completes unclaimed at the entry
+            // generation — see the floor-unreadable pricing at the
+            // disposition below.
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    gen_at_entry,
+                    "PG generation floor unreadable; proceeding unclaimed at the \
+                     entry generation after the post-claim leadership confirmation"
+                );
+                metrics::counter!("rio_scheduler_generation_floor_read_failed_total").increment(1);
+                (gen_at_entry, false)
+            }
             Ok(pg_max_gen) => {
                 // u64 view of the PG floor. A negative BIGINT is a
                 // hand-edited or corrupt row — clamp to 0 (below every
@@ -1634,6 +1661,11 @@ impl DagActor {
         //   inside that gap, below us, and completing above it would
         //   invert the fence the same way.
         //
+        // - A RETAINED entry generation under an UNREADABLE floor: a
+        //   floor that cannot be read cannot vouch for anything, so the
+        //   fallback waits for the same confirmation even though its
+        //   target degenerates to the entry generation.
+        //
         // Ordinary failovers (floor + 1 == entry), same-epoch
         // re-acquires (floor ties the entry on our own claim row), and
         // fresh-cluster entries (no floor, entry == 1) skip this
@@ -1641,12 +1673,12 @@ impl DagActor {
         // because a successor over that floor either collides with our
         // claim at the entry generation (the PK CAS) or seeds above us
         // — except in the named adjacent-floor-race residual (see the
-        // confirmation fn's doc). The floor-unreadable fallback never
-        // waits (degrade, don't block), and the claim-failure/
-        // proceed-unclaimed degradation never blocks beyond the
+        // confirmation fn's doc). The floor-unreadable fallback
+        // proceeds unclaimed but is confirmation-gated like every
+        // other non-vouched path, and the claim-failure/
+        // proceed-unclaimed degradation still never blocks beyond the
         // existing cap.
-        let needs_confirmation =
-            pg_floor_read.is_ok() && (claim_target > gen_at_entry || !floor_vouches_entry);
+        let needs_confirmation = claim_target > gen_at_entry || !floor_vouches_entry;
         let confirm_started = Instant::now();
         let confirmed = if needs_confirmation {
             self.await_post_claim_leadership_confirmation(
@@ -1774,13 +1806,16 @@ impl DagActor {
             // and (when required) confirmed like any other; its
             // dispatches stay inside what the durable floor covers.
             // Only when the floor itself was unreadable
-            // (`floored = false` below) does the term proceed at the
-            // entry generation: in the saturated post-deletion regime
-            // that generation sits below the executors' fetch_max
-            // latch, so long-lived builders silently reject its
-            // dispatches until the next leadership transition — the
-            // operator signal is this error line plus the builder-side
-            // stale-assignment counter. Better than blocking dispatch
+            // (`floored = false` below) does the term proceed —
+            // confirmation-gated, unclaimed — at the entry generation:
+            // in the saturated post-deletion regime that generation
+            // sits below the executors' fetch_max latch, so long-lived
+            // builders silently reject its dispatches until the next
+            // leadership transition. The floor-unreadable operator
+            // signal is the warn plus the floor-read-failure counter
+            // at the claim-target match (they fire whether or not the
+            // load also failed); this error line remains the
+            // load-failure signal. Better than blocking dispatch
             // forever while holding the lease.
             error!(
                 error = %e,
@@ -1835,8 +1870,9 @@ impl DagActor {
     /// Wait for a post-claim apiserver round-trip that ended with this
     /// replica as the Lease holder, before a claim target the durable
     /// PG floor cannot vouch for — one above the recovery-entry
-    /// generation, or a retained entry generation more than one above
-    /// the floor — is seeded and the recovery completed
+    /// generation, a retained entry generation more than one above
+    /// the floor, or a retained entry generation whose floor could not
+    /// be read at all — is seeded and the recovery completed
     /// (`sched.recovery.bump-confirm`).
     ///
     /// What a confirming round establishes — and what it does not:
@@ -1850,8 +1886,9 @@ impl DagActor {
     ///   that round began, so any replica that acquires later reads a
     ///   floor at or above our claim and exceeds it — its generation
     ///   lands above ours, the correct direction. (On the
-    ///   proceed-unclaimed arm leg (ii) does not hold; that is the
-    ///   pre-existing claim-failure residual, unchanged here.)
+    ///   proceed-unclaimed and floor-unreadable arms leg (ii) does not
+    ///   hold; that is the pre-existing claim-failure residual,
+    ///   unchanged here.)
     ///
     /// Residuals that remain: the count-coincidence ABA documented at
     /// the gate's entry-snapshot comment (an edge-ful re-steal, or a

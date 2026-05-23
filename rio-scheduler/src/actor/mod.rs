@@ -635,6 +635,11 @@ pub struct DagActor {
     /// `DagActorPlumbing::fail_next_recovery_load`.
     #[cfg(test)]
     fail_next_recovery_load: bool,
+    /// Test-only: fail the next independent PG-floor read (the DAG
+    /// load is unaffected). See
+    /// `DagActorPlumbing::fail_next_floor_read`.
+    #[cfg(test)]
+    fail_next_floor_read: bool,
     /// Test-only structural counters. Asserting on these (rather than
     /// wall-clock or absence-of-side-effect) makes the I-163 / I-139
     /// regression tests fail under their target mutation.
@@ -794,6 +799,8 @@ impl DagActor {
             #[cfg(test)]
             fail_next_recovery_load: plumbing.fail_next_recovery_load,
             #[cfg(test)]
+            fail_next_floor_read: plumbing.fail_next_floor_read,
+            #[cfg(test)]
             test_counters: TestCounters::default(),
         }
     }
@@ -889,6 +896,8 @@ impl DagActor {
                 recovery_toctou_gate: _,
             #[cfg(test)]
                 fail_next_recovery_load: _,
+            #[cfg(test)]
+                fail_next_floor_read: _,
             #[cfg(test)]
                 test_counters: _,
         } = self;

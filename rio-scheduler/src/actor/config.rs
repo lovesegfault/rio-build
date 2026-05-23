@@ -144,6 +144,13 @@ pub struct DagActorPlumbing {
     /// deterministically without closing the pool.
     #[cfg(test)]
     pub fail_next_recovery_load: bool,
+    /// Test-only: when set, the next independent PG-floor read in
+    /// `handle_leader_acquired` fails (same `ActorError` shape a sqlx
+    /// error maps to) without touching the DB — the DAG load is
+    /// deliberately unaffected, so the floor-unreadable tests can
+    /// exercise that fallback in isolation, without closing the pool.
+    #[cfg(test)]
+    pub fail_next_floor_read: bool,
 }
 
 impl Default for DagActorPlumbing {
@@ -165,6 +172,8 @@ impl Default for DagActorPlumbing {
             recovery_toctou_gate: None,
             #[cfg(test)]
             fail_next_recovery_load: false,
+            #[cfg(test)]
+            fail_next_floor_read: false,
         }
     }
 }

@@ -542,6 +542,14 @@ pub fn describe_metrics() {
          collision window for that one term. Sustained nonzero means PG is flapping \
          exactly at failover time."
     );
+    describe_counter!(
+        "rio_scheduler_generation_floor_read_failed_total",
+        "PG generation-floor reads that failed during recovery. The term proceeds \
+         unclaimed at the recovery-entry generation after the post-claim leadership \
+         confirmation — dispatch is not blocked, but that term's generation is absent \
+         from the leader_generation_claims ledger and may sit below the durable floor. \
+         Sustained nonzero means PG is flapping exactly at failover time."
+    );
     describe_histogram!(
         "rio_scheduler_recovery_duration_seconds",
         "Time to reconstruct actor state from PG on LeaderAcquired \

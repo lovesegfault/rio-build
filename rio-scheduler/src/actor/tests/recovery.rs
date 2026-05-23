@@ -276,14 +276,16 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
     Ok(())
 }
 
-/// Recovery failure (PG down mid-recovery) → recovery_complete set
-/// TRUE with empty DAG. Degrade, don't block. The alternative (leave
-/// recovery_complete=false) would block dispatch forever while the
-/// scheduler holds the lease. With the pool closed, BOTH the DAG load
-/// and the independent PG-floor read fail, so this pins the
-/// floor-unreadable fallback specifically: the term completes at the
-/// recovery-entry generation (no floor, no claim). The floored
-/// load-failure path is pinned by
+/// Recovery failure with PG fully down (pool closed: BOTH the DAG load
+/// and the independent PG-floor read fail) still requires the PG-free
+/// post-claim leadership confirmation, then completes at the
+/// recovery-entry generation with an EMPTY DAG — degrade after
+/// confirmation, don't block. The alternative (never completing) would
+/// block dispatch forever while the scheduler holds the lease and the
+/// standby cannot take over. The unconfirmed direction of the same
+/// fallback is pinned by
+/// `test_recovery_floor_unreadable_unconfirmed_is_discarded`; the
+/// floored load-failure path is pinned by
 /// `test_recovery_load_failure_still_floors_claims_and_confirms`.
 // r[verify sched.recovery.gate-dispatch]
 #[tokio::test]
@@ -298,22 +300,35 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
         Arc::new(AtomicBool::new(true)),
         false,
     );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
     let l = leader.clone();
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
         p.leader = l;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
     });
     // Close the pool BEFORE sending LeaderAcquired — all PG queries
     // will fail. This simulates PG going down mid-recovery.
     db.pool.close().await;
 
-    // LeaderAcquired → recover_from_pg → PG fails → Err arm → set
-    // recovery_complete=true with EMPTY DAG.
+    // LeaderAcquired → recover_from_pg fails AND the floor read fails →
+    // the floor-unreadable fallback. Park at the gate and drive one
+    // post-claim Leading round so the (PG-free) confirmation succeeds
+    // on its first poll — no real-time stall.
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    let round = leader.begin_renew_round();
+    leader.confirm_leading_round(round);
+    release_tx.send(()).expect("actor still listening");
     barrier(&handle).await;
 
     assert!(
         leader.recovery_complete(),
-        "Err arm must set recovery_complete=true (degrade, don't block dispatch)"
+        "a confirmed floor-unreadable term completes (degrade after confirmation, \
+         don't block dispatch)"
     );
     assert_eq!(
         leader.generation(),
@@ -324,6 +339,230 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     let info = handle.debug_query_derivation("anything").await?;
     assert!(info.is_none(), "DAG should be empty after recovery failure");
 
+    Ok(())
+}
+
+/// The floor-unreadable fallback is confirmation-gated: when the PG
+/// floor cannot be read, the term proceeds unclaimed at the entry
+/// generation but must still obtain the PG-free post-claim leadership
+/// confirmation before completing — with no post-claim Leading round
+/// the recovery must be discarded, never completed, never advertised,
+/// and never silently counted as a success. The DAG load succeeds here;
+/// only the floor read fails. Pairs with
+/// `test_recovery_floor_unreadable_confirms_and_completes_unclaimed`
+/// (the confirmed direction) and with
+/// `test_recovery_failure_degrades_to_empty_dag` (both PG reads down).
+// r[verify sched.recovery.bump-confirm+2]
+#[tokio::test]
+async fn test_recovery_floor_unreadable_unconfirmed_is_discarded() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    use crate::sla::metrics::counter_map_by;
+
+    // The increments fire inside the SPAWNED actor task, so install the
+    // recorder process-globally before the actor spawns (safe under
+    // nextest's process-per-test model).
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    rec.install().expect("install global debugging recorder");
+
+    let db = TestDb::new(&MIGRATOR).await;
+    // Saturated-regime entry generation: completing here without the
+    // confirmation is exactly the deposed-but-unaware leapfrog the
+    // confirmation exists to prevent.
+    let generation = Arc::new(AtomicU64::new(2));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.fail_next_floor_read = true;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    // Deliberately grant NO Leading round before releasing: the
+    // confirmation can never arrive.
+    release_tx.send(()).expect("actor still listening");
+
+    // No lease loop is running, so no confirmation can ever arrive. The
+    // term must neither seed, complete, nor advertise inside this
+    // window — on the unconfirmed-completion regression it does all
+    // three within the first few polls.
+    for _ in 0..20 {
+        assert!(
+            generation.load(Ordering::Acquire) <= 2,
+            "a floor-unreadable term must never seed above the entry generation"
+        );
+        assert!(
+            !leader.recovery_complete(),
+            "a floor-unreadable term must not complete before the post-claim confirmation"
+        );
+        assert_eq!(
+            handle.generation.advertised(),
+            0,
+            "claim-before-advertise: an unconfirmed floor-unreadable recovery must not advertise"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The deposal observation that in production arrives within a renew
+    // interval: the lose edge ends the wait and the gate discards.
+    leader.on_lose();
+    barrier(&handle).await;
+
+    assert!(
+        !leader.recovery_complete(),
+        "an unconfirmed floor-unreadable recovery must be discarded, not completed"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        2,
+        "the generation must still be the entry generation after the discard"
+    );
+    // Exactly one rio_scheduler_recovery_total increment, and it is a
+    // discard — never a silent success. (The lose edge that ends the
+    // wait makes the gate label the discard a flap; which discard label
+    // applies is not the point — the absence of `success` is.)
+    let by_outcome = counter_map_by(&snap, "rio_scheduler_recovery_total", Some("outcome"));
+    assert_eq!(
+        by_outcome.get("success").copied().unwrap_or(0),
+        0,
+        "an unconfirmed floor-unreadable recovery must not count as success: {by_outcome:?}"
+    );
+    assert_eq!(
+        by_outcome.get("failure").copied().unwrap_or(0),
+        0,
+        "the DAG load succeeded; only the floor read failed: {by_outcome:?}"
+    );
+    let discarded: u64 = by_outcome
+        .iter()
+        .filter(|(k, _)| k.starts_with("discarded"))
+        .map(|(_, v)| *v)
+        .sum();
+    assert_eq!(
+        discarded, 1,
+        "the discard must be counted exactly once: {by_outcome:?}"
+    );
+    Ok(())
+}
+
+/// The degraded-but-confirmed leg of the floor-unreadable fallback:
+/// when only the floor read fails (the DAG load succeeds) and the lease
+/// loop completes a post-claim Leading round, the term completes
+/// unclaimed at the entry generation, advertises it, and the failure is
+/// visible to the operator (the floor-read-failure counter) instead of
+/// being silent. There is no claim INSERT on this path — the floor
+/// could not be read, so nothing is offered to the ledger.
+// r[verify sched.recovery.bump-confirm+2]
+#[tokio::test]
+async fn test_recovery_floor_unreadable_confirms_and_completes_unclaimed() -> TestResult {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    rec.install().expect("install global debugging recorder");
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let generation = Arc::new(AtomicU64::new(2));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::clone(&generation),
+        Arc::new(AtomicBool::new(true)),
+        false,
+    );
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let l = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = l;
+        p.holder_id = "pod-us".into();
+        p.fail_next_floor_read = true;
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+    // Parked before the confirmation wait: simulate the lease loop
+    // completing one post-claim Leading round so the confirmation
+    // succeeds on its first poll. (No claim INSERT precedes the park on
+    // this path — the floor read already failed.)
+    let round = leader.begin_renew_round();
+    leader.confirm_leading_round(round);
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    assert!(
+        leader.recovery_complete(),
+        "a confirmed floor-unreadable term completes (degrade after confirmation, don't block)"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        2,
+        "the floor-unreadable term completes at the entry generation (nothing to seed from)"
+    );
+    assert_eq!(
+        handle.generation.advertised(),
+        2,
+        "a confirmed floor-unreadable term advertises the entry generation"
+    );
+    let claim: Option<(i64, String)> = sqlx::query_as(
+        "SELECT generation, holder_id FROM leader_generation_claims \
+         WHERE holder_id = 'pod-us'",
+    )
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(
+        claim, None,
+        "no claim INSERT is possible when the floor cannot be read"
+    );
+    // One drained capture serves both metric assertions (the
+    // snapshotter drains on read — see counter_map_by's caveat).
+    let mut floor_failures = 0u64;
+    let mut success = 0u64;
+    let mut non_success: Vec<(String, u64)> = Vec::new();
+    for (ck, _, _, v) in snap.snapshot().into_vec() {
+        let DebugValue::Counter(c) = v else { continue };
+        let k = ck.key();
+        match k.name() {
+            "rio_scheduler_generation_floor_read_failed_total" => floor_failures += c,
+            "rio_scheduler_recovery_total" => {
+                let outcome = k
+                    .labels()
+                    .find(|l| l.key() == "outcome")
+                    .map(|l| l.value().to_owned())
+                    .unwrap_or_default();
+                if outcome == "success" {
+                    success += c;
+                } else {
+                    non_success.push((outcome, c));
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        floor_failures, 1,
+        "the floor-read failure must be visible to the operator (counter)"
+    );
+    assert_eq!(
+        success, 1,
+        "the confirmed floor-unreadable term still counts as a (degraded) success"
+    );
+    assert!(
+        non_success.iter().all(|(_, c)| *c == 0),
+        "no discard or failure outcome may be recorded for a confirmed completion: \
+         {non_success:?}"
+    );
     Ok(())
 }
 
@@ -1559,7 +1798,7 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 /// dispatches would be silently rejected (the inversion this pins
 /// against). Pairs with `test_recovery_failure_degrades_to_empty_dag`,
 /// which closes the pool so the floor read fails too and pins the
-/// floor-unreadable fallback.
+/// floor-unreadable fallback's confirmed completion.
 // r[verify sched.recovery.fetch-max-seed+4]
 // r[verify sched.lease.generation-claim+2]
 // r[verify sched.recovery.bump-confirm+2]

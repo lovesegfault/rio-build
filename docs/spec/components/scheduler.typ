@@ -2479,6 +2479,7 @@ the existing pricing rather than new pricing: a claim-write failure or
 claim-conflict exhaustion proceeds unclaimed (a DAG-load failure on its own
 does not --- the floor is read independently of the load, so that term still
 claims; only the builds are lost), and a floor-unreadable recovery completes
+(only after the post-claim leadership confirmation, which needs no PG)
 at the recovery-entry generation --- the unclaimed term advertises an
 unclaimed generation (the same one-term residual already priced for the claim
 machinery above), while the floor-unreadable term's exposure is under-floor
