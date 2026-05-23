@@ -1531,7 +1531,7 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
 /// An assignments-only floor that ties the entry generation, with NO
 /// claim row at all, must be exceeded — the ledger cannot affirm the
 /// floor is ours. This is the first post-upgrade handover (assignment
-/// history written before the claims ledger existed, migration 061
+/// history written before the claims ledger existed, migration 063
 /// ships no backfill) and the unclaimed-proceed-predecessor case:
 /// assignment rows carry no scheduler-holder identity, so a silent
 /// ledger at our generation reads as foreign. Retaining here would let

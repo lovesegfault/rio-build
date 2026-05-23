@@ -457,9 +457,7 @@ pub struct DagActor {
     /// NOT the same thing as [`LeaderState::recovery_complete`]: that
     /// flag is deliberately set true even when recovery FAILS (empty
     /// DAG — "degrade, don't block", which `dispatch_ready` and
-    /// `LogFlusher::may_flush` want), and the lose-during-recovery
-    /// TODO can leave it stale-true into the next acquire's
-    /// pre-`LeaderAcquired` gap. Destructive consumers that infer
+    /// `LogFlusher::may_flush` want). Destructive consumers that infer
     /// "stale" from "not in the DAG" (the disconnect-time log-buffer
     /// discard) must check THIS bit instead.
     ///

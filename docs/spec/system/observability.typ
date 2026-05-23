@@ -141,7 +141,16 @@ at terminal time, the same window in which the terminal-status persist fails
 and the lease lapses, so after a leadership change the execution may still
 be live and being extended by the tenure that now owns it, and a late stale
 final must not freeze that row (`obs.log.finalize-immutable`,
-`obs.log.stored-coverage-preserved`). Requests orphaned by a leadership
+`obs.log.stored-coverage-preserved`). The tenure is identified by the
+generation _and_ the acquire-epoch (the Lease `leaseTransitions` count
+recorded at the most recent acquire edge or rebound), both stamped on the
+request at enqueue time: either moving breaks the tenure --- a generation
+raise (including the recovery PG-floor seed) or a holder change recorded at
+an acquire edge or a rebound, which moves the acquire-epoch even when the
+floor-saturated generation does not --- while a same-count re-acquire (a
+self-fence false alarm followed by a successful renew, no holder change)
+moves neither and keeps the request resolvable by its own tenure. Requests
+orphaned by a leadership
 change are dropped and counted
 (#(refs.metric)("rio_scheduler_log_flush_stale_tenure_total")); the
 execution then either gets finalized by the live tenure's own terminal flush

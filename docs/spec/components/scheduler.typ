@@ -1520,6 +1520,10 @@ leadership transitions:
   PG-writing housekeeping (orphan-watcher cancel, build-timeout fail, backstop
   reassign, poison-clear, derivations-gc) cannot race the new leader.
 ]
+The cleared set is not exhaustive: retained ring-buffer log entries survive
+the loss --- a still-streaming worker's in-flight execution keeps its lines
+across the flap --- and are reconciled (re-armed, restamped, or swept) at the
+next acquisition (#rref("sched.recovery.log-buffer-sweep")).
 
 #r("sched.lease.hook-order")[
   Lease hook commands MUST be delivered to the actor in invocation order; in
@@ -1619,7 +1623,7 @@ persisting any assignment leaves no trace in `assignments` at all
 A floor that _ties_ the entry generation is exceeded unless the claims ledger
 shows this holder's own row there, because assignment rows carry no
 scheduler-holder identity and the assignment history written before the claims
-ledger existed (migration 061 ships no backfill) has no claim rows at all ---
+ledger existed (migration 063 ships no backfill) has no claim rows at all ---
 so on the first post-upgrade acquisition, and after a predecessor that
 proceeded unclaimed, the floor cannot be assumed to be ours. A failed ledger
 read counts as "not shown" and is likewise exceeded; the conservative cost is

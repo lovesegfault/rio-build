@@ -191,12 +191,10 @@ impl DagActor {
         // (`LogFlusher::may_flush`), which is set only after this fn
         // returns — so on the normal acquire path no self-driven flush
         // runs until this re-arm (and the restamp + sweep below) have
-        // finished; keeping the re-arm first remains belt-and-suspenders
-        // (and still matters in the lose-during-recovery corner where a
-        // previous set left `recovery_complete` true — see the TODO at
-        // the set site). It still must precede `set_recovery_complete`,
-        // and still runs when the load below fails (the degraded
-        // empty-DAG tenure retains the entries).
+        // finished; keeping the re-arm first remains belt-and-suspenders.
+        // It still must precede `set_recovery_complete`, and still runs
+        // when the load below fails (the degraded empty-DAG tenure
+        // retains the entries).
         // r[impl obs.log.stored-coverage-preserved]
         if let Some(bufs) = &self.log_buffers {
             let rearmed = bufs.rearm_prefix_reconciliation();
@@ -664,10 +662,11 @@ impl DagActor {
     /// Called from `recover_from_pg` right after `load_dag_from_rows`
     /// succeeds. Correctness depends only on that load having succeeded
     /// (the discard decisions are keyed on the freshly loaded PG
-    /// snapshot); later recovery phases (`restore_builds`,
-    /// `max_assignment_generation`) or the TOCTOU-discard arm may still
-    /// fail or run after the sweep, which is safe — swept entries were
-    /// terminal-or-absent in that snapshot, never a live stream's buffer.
+    /// snapshot); later recovery phases (`restore_builds`, the caller's
+    /// `max_known_generation` floor read) or the TOCTOU-discard arm may
+    /// still fail or run after the sweep, which is safe — swept entries
+    /// were terminal-or-absent in that snapshot, never a live stream's
+    /// buffer.
     /// If the load itself fails, the sweep does not run and the
     /// retain-everything degraded behavior is unchanged.
     // r[impl sched.recovery.log-buffer-sweep+2]
@@ -1505,7 +1504,7 @@ impl DagActor {
                     // ledger cannot affirm it is ours: another holder's
                     // claim row, an assignments-only floor with no
                     // claim row at all (pre-claim-ledger assignment
-                    // history from before migration 061, or a
+                    // history from before migration 063, or a
                     // predecessor that proceeded unclaimed), or a
                     // failed ledger read. Treat it as foreign and
                     // exceed it.

@@ -360,13 +360,11 @@ impl LogFlusher {
     /// cannot wedge a degraded tenure. The guarantee: a self-driven
     /// flush only ever consults prefix latches that were re-armed at,
     /// or reconciled after, the most recent recovery — never a previous
-    /// tenure's latch. (Not quite "never flush before this tenure's
-    /// re-arm": a lease lost while recovery is running leaves the flag
-    /// set through standby — see the TODO at the
-    /// `set_recovery_complete` call site — so the next acquire's gap is
-    /// open; but in exactly that history every retained entry is still
-    /// Unchecked from that recovery's re-arm, so a gap flush reconciles
-    /// stored coverage rather than overwriting it.) Mirrors
+    /// tenure's latch. (The completion stamp is keyed to the
+    /// acquire-epoch, so a completion recorded under a previous epoch —
+    /// including one orphaned by a lease lost while its recovery was
+    /// still running — reads as not-complete after the next acquire
+    /// records a different transition count.) Mirrors
     /// `dispatch_ready`'s two-flag gate. Both accessors are SeqCst, so
     /// observing `recovery_complete=true` also observes the re-arm's
     /// latch clears. The GC sweep needs no latch but inherits the gate
