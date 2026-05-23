@@ -21,10 +21,6 @@
   preCommitInstall,
   # nix/kani-toolchain.nix — cargo-kani for local proof iteration
   kaniToolchain,
-  # Quint 0.32.0 + bundled Apalache from the `nixpkgs-quint` flake
-  # input (the primary nixpkgs only has 0.30.0, which cannot verify
-  # hermetically). Drop the arg when the primary nixpkgs catches up.
-  quintPkg,
   # nix/quint-mcp.nix — hermetic quint-llm-kit MCP servers (KB search +
   # LSP bridge), invoked by the project-scoped .mcp.json.
   quintMcp,
@@ -147,9 +143,8 @@ let
     # --invariant=<i> docs/spec/models/M.qnt`. `quint verify` finds
     # Apalache (and the TLC inside it) via QUINT_HOME inside the
     # package — a store path, no runtime download, which is why the
-    # checks in nix/quint.nix work in the network-less sandbox. From
-    # the `nixpkgs-quint` input, NOT `pkgs` (see flake.nix).
-    quintPkg
+    # checks in nix/quint.nix work in the network-less sandbox.
+    pkgs.quint
 
     # MCP servers launched by the project-scoped .mcp.json (tracey above
     # is the third): curated Quint knowledge-base search and LSP-grade

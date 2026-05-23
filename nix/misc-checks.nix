@@ -24,13 +24,9 @@
   nodeAmi,
   docsLib,
   xtaskBin,
-  # Quint + bundled Apalache from the `nixpkgs-quint` flake input (NOT
-  # `pkgs` — the primary nixpkgs' quint is too old to verify offline).
-  # Only nix/quint.nix's checks consume it.
-  quintPkg,
   # nix/checks.nix's nextest reuse-build helpers and rio-lease's prebuilt
   # test binary. Only nix/quint.nix's mbt-rio-lease conformance check
-  # consumes them (same pass-through posture as quintPkg).
+  # consumes them.
   mkNextestRun,
   mkNextestMeta,
   rioLeaseTestBin,
@@ -954,7 +950,6 @@ in
   inherit
     pkgs
     unfilteredRoot
-    quintPkg
     mkNextestRun
     mkNextestMeta
     rioLeaseTestBin

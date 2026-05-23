@@ -43,7 +43,7 @@
 # step count) but the ceiling must be present anyway so the same spec is
 # checkable under both backends.
 #
-# Where the tools come from: quintPkg's bin/quint is a wrapper that puts
+# Where the tools come from: pkgs.quint's bin/quint is a wrapper that puts
 # its own JRE on PATH and sets QUINT_HOME to the package's share/quint,
 # which carries the bundled Apalache distribution as a store path. The
 # tlc backend runs `java -cp <QUINT_HOME>/apalache-dist-*/apalache/lib/
@@ -83,12 +83,6 @@
   pkgs,
   lib,
   unfilteredRoot,
-  # Quint with the bundled Apalache dist, evaluated from the
-  # `nixpkgs-quint` flake input rather than `pkgs` (the primary nixpkgs
-  # quint has no bundled Apalache and tries to download one at
-  # runtime — impossible in the sandbox). See the input's comment in
-  # flake.nix for when this goes away.
-  quintPkg,
   # nix/checks.nix's nextest reuse-build helpers and rio-lease's prebuilt
   # test binary, threaded through misc-checks.nix. Only the mbt-rio-lease
   # conformance check below consumes them — the model checks need
@@ -131,7 +125,7 @@ let
     }:
     pkgs.runCommand "quint-${name}"
       {
-        nativeBuildInputs = [ quintPkg ];
+        nativeBuildInputs = [ pkgs.quint ];
         # Only the one .qnt file. A model that imports another file
         # (a shared harness, a Choreo vendored module) extends the
         # fileset here — keeping it narrow means an unrelated docs/
@@ -214,7 +208,7 @@ let
     }:
     pkgs.runCommand "quint-${name}"
       {
-        nativeBuildInputs = [ quintPkg ];
+        nativeBuildInputs = [ pkgs.quint ];
         # Same single-file narrowing as mkQuintCheck.
         src = lib.fileset.toSource {
           root = modelsDir;
@@ -575,7 +569,7 @@ in
       name = "mbt-rio-lease";
       member = "rio-lease";
       meta = mkNextestMeta { rio-lease = rioLeaseTestBin; };
-      extraRuntimeInputs = [ quintPkg ];
+      extraRuntimeInputs = [ pkgs.quint ];
       extraArgs = [
         "-E"
         "package(rio-lease) and test(/mbt_/)"

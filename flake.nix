@@ -19,23 +19,6 @@
 
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    # Quint (the TLA+-successor specification language) pinned past the
-    # primary nixpkgs, whose quint has NO bundled Apalache — `quint
-    # verify` tries to download it at runtime, which the sandbox
-    # forbids. The quint on nixpkgs master bundles the Apalache dist as
-    # a store path inside the package (located via QUINT_HOME), so
-    # `quint verify` works hermetically. A second input rather than a
-    # copied package definition because quint has two FOD sub-builds
-    # (npmDepsHash + cargoHash) whose hashes are sensitive to the
-    # evaluating nixpkgs' fetcher normalization — pinning the whole rev
-    # gives the byte-identical derivation master builds and caches.
-    # Only `legacyPackages.<system>.quint` is ever evaluated from this
-    # input. DROP this input (and the quintPkg plumbing into
-    # nix/devshell.nix and into nix/misc-checks.nix → nix/quint.nix)
-    # when the primary nixpkgs is bumped past a rev whose quint is
-    # >= 0.32.0.
-    nixpkgs-quint.url = "github:NixOS/nixpkgs/fcc5c713107633fb50dbd513444b56504b158374";
-
     flake-compat = {
       url = "github:edolstra/flake-compat";
       flake = false;
@@ -717,12 +700,6 @@
                   docsLib
                   ;
                 xtaskBin = crateBuild.memberBins.xtask;
-                # Quint + bundled Apalache from the out-of-band nixpkgs
-                # pin (see the nixpkgs-quint input comment). The same
-                # memoized thunk the dev shell binds — referencing the
-                # flake input's legacyPackages twice does not evaluate
-                # the second nixpkgs twice.
-                quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
                 # The nextest reuse-build helpers plus rio-lease's
                 # prebuilt test binary, for the mbt-rio-lease conformance
                 # check in nix/quint.nix (it runs the #[ignore]d mbt_*
@@ -1116,14 +1093,6 @@
                   ;
                 treefmtWrapper = config.treefmt.build.wrapper;
                 preCommitInstall = config.pre-commit.installationScript;
-                # Quint + bundled Apalache from the out-of-band nixpkgs
-                # pin (see the nixpkgs-quint input comment). Evaluated
-                # against ITS OWN nixpkgs so the npm/cargo FOD hashes
-                # match what master builds. The quint model/witness/MBT
-                # checks (nix/quint.nix, wired via nix/misc-checks.nix)
-                # consume this same memoized thunk, so checks.* forces
-                # this second nixpkgs eval too.
-                quintPkg = inputs.nixpkgs-quint.legacyPackages.${system}.quint;
                 # Hermetically packaged quint-llm-kit MCP servers (KB
                 # search + LSP bridge) for the project-scoped .mcp.json;
                 # dev-shell-only, never referenced by checks.*.
