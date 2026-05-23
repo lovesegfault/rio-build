@@ -104,13 +104,15 @@ let
   };
 
   # Kani 0.67.0 pins CBMC 6.8.0 and requires Kissat >= 4.0.1
-  # (kani-dependencies). Neither is pinned in this file — both float with
-  # the project's nixpkgs lock, and `kani-toolchain` is a manual
-  # `packages.*` target (not in `checks.*`), so a routine `nix flake
-  # update` would drift them silently and break `kani-driver` weeks later
-  # with no CI signal. Assert at eval time so the bump fails loudly. When
-  # bumping `kaniVersion`, re-read kani-dependencies at the new tag and
-  # update the expected versions here in the same commit.
+  # (kani-dependencies). Kissat still floats with the project's nixpkgs
+  # lock, so its eval-time assert below is what turns a routine
+  # `nix flake update` that drops below the requirement into a loud
+  # eval failure instead of a silent kani-driver break. CBMC no longer
+  # floats: it is pinned locally below (`cbmcPinned`, with its own DROP
+  # condition), so its assert guards the pin itself and exists to force
+  # this block to be revisited when `kaniVersion` moves. When bumping
+  # `kaniVersion`, re-read kani-dependencies at the new tag and update
+  # the expected versions here in the same commit.
   #
   # nixpkgs' cbmc has moved past the 6.8.0 release kani 0.67.0 pins
   # (kani-driver checks the version at startup and refuses a mismatch),

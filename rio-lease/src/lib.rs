@@ -578,9 +578,10 @@ impl LeaderState {
     }
 
     /// Monotonically raise generation to at least `target`. `Release`
-    /// `fetch_max` — defensive against Lease annotation reset
-    /// (`kubectl delete lease` zeros the annotation; PG's high-water
-    /// persists). Returns the previous value.
+    /// `fetch_max` — defensive against a Lease transition-count reset
+    /// (`kubectl delete lease` recreates the Lease at
+    /// `leaseTransitions = 0`, so the lease-derived generation regresses
+    /// while PG's high-water persists). Returns the previous value.
     pub fn seed_generation_from(&self, target: u64) -> u64 {
         self.generation.fetch_max(target, Ordering::Release)
     }
