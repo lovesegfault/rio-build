@@ -427,7 +427,28 @@ impl DagActor {
 
         // Log-buffer cleanup, AFTER the epoch check above (a stale
         // reader's `seen_drvs` reaches here only when the epoch
-        // matched). Two ownership gates, in order:
+        // matched). Runs only when this replica is the leader AND
+        // recovery is complete — the same composite `may_flush` and
+        // `dispatch_ready` gate on — because the DAG gate below infers
+        // "stale" from "not in the DAG", which is only meaningful when
+        // the DAG is authoritative. After `LeaderLost` →
+        // `clear_persisted_state()` the DAG is empty while
+        // `log_buffers` is deliberately retained, and on a
+        // just-re-acquired leader this disconnect can be processed
+        // before `LeaderAcquired` rebuilds the DAG — in both windows
+        // the unconditional discard would destroy exactly the retained
+        // in-flight entries the lease-flap retention preserves.
+        // Stale-entry reconciliation there belongs to the
+        // acquisition-time re-arm/restamp/sweep
+        // (`handle_leader_acquired`), not to a disconnect that raced
+        // the lease. Residual: a deposed leader that never re-acquires
+        // keeps the skipped entries until its own next acquisition or
+        // process exit — bounded by the per-entry ring caps; no flush
+        // churn (`may_flush` is leader-gated) and no read-path
+        // consequence (`GetDerivationLogs` is leader-gated) on a
+        // standby.
+        //
+        // Two ownership gates, in order:
         //
         // 1. DAG gate: only consider paths the DAG has never heard of.
         //    With the recv task only inserting *accepted* batches into
@@ -458,15 +479,27 @@ impl DagActor {
         // build's buffer discarded before flusher drained it) and had no
         // ownership check at all.
         if let Some(bufs) = &self.log_buffers {
-            for drv in seen_drvs {
-                if self.dag.hash_for_path(&drv).is_none()
-                    && bufs.discard_if_owned_by(&drv, executor_id.as_str())
-                {
-                    debug!(
-                        executor_id = %executor_id, drv = %drv,
-                        "reaped DAG-unknown log buffer on disconnect"
-                    );
+            if self.leader.is_leader() && self.leader.recovery_complete() {
+                for drv in seen_drvs {
+                    if self.dag.hash_for_path(&drv).is_none()
+                        && bufs.discard_if_owned_by(&drv, executor_id.as_str())
+                    {
+                        debug!(
+                            executor_id = %executor_id, drv = %drv,
+                            "reaped DAG-unknown log buffer on disconnect"
+                        );
+                    }
                 }
+            } else {
+                debug!(
+                    executor_id = %executor_id,
+                    seen_drvs = seen_drvs.len(),
+                    "skipping disconnect log-buffer discard: not leader or \
+                     recovery pending, so the DAG is not authoritative; \
+                     retained entries are reconciled at the next \
+                     acquisition's re-arm/restamp/sweep (or kept until \
+                     process exit)"
+                );
             }
         }
     }

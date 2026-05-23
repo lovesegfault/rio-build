@@ -1041,10 +1041,13 @@ impl DagActor {
                     seen_drvs,
                 } => {
                     // r[sched.lease.standby-drops-writes]: arm stays ungated
-                    // (executors-map/gauge/log-buffer bookkeeping must run on
-                    // standby); the PG-writing tail (reassign_derivations →
+                    // (executors-map/gauge bookkeeping must run on standby);
+                    // the PG-writing tail (reassign_derivations →
                     // poison/Ready/terminal-log writes) self-gates on
-                    // is_leader() in executor.rs.
+                    // is_leader() in executor.rs, and the log-buffer discard
+                    // loop there additionally requires recovery_complete —
+                    // a LeaderLost-cleared / not-yet-rebuilt DAG cannot tell
+                    // stale entries from retained in-flight ones.
                     self.handle_executor_disconnected(&executor_id, stream_epoch, seen_drvs)
                         .await;
                 }

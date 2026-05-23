@@ -203,7 +203,10 @@ pub enum ActorCommand {
         /// from a prior stream → no-op.
         stream_epoch: u64,
         /// `derivation_path` keys this stream pushed into
-        /// `LogBuffers`. The actor — AFTER the epoch check — discards
+        /// `LogBuffers`. The actor — AFTER the epoch check, and only
+        /// when it is the leader with recovery complete (an
+        /// authoritative DAG; otherwise retained entries are left to
+        /// the acquisition-time re-arm/restamp/sweep) — discards
         /// only those the DAG has never heard of (fabricated by an
         /// untrusted worker, or post-cleanup). Real drvs are reaped by
         /// the existing machinery: `seal()` on completion, `discard()`
