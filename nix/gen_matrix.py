@@ -7,33 +7,50 @@
 # and warm-stage logic pushed that script past what jq-in-bash can
 # carry maintainably.
 #
+# Eval-once / realise-everywhere: this is the only job in the
+# pipeline that evaluates the flake. Every downstream job receives
+# DERIVATION PATHS and runs `nix build /nix/store/...drv^*`,
+# substituting the .drv closure from the binary cache this script
+# pushes it to. No flake checkout-eval in 80 build jobs.
+#
 # Outputs written to $GITHUB_OUTPUT (one `key=json` line each):
-#   warm            ["checks", ...]  kinds whose warm.<kind> trunk
-#                                    aggregate is NOT cached -> the
-#                                    matching warm-* job must run.
+#   warm            {"checks": "/nix/store/a.drv /nix/store/b.drv",
+#                    "fuzz": "", ...}
+#                   Per kind, the drvs needed by >=2 of that kind's
+#                   clusters -- the shared trunk the warm-<kind> job
+#                   realises before the kind's matrix fans out. Empty
+#                   string -> nothing shared -> warm job skipped.
 #   checks          [{"name": "rio-store",
-#                     "targets": "clippy-rio-store nextest-rio-store"},
-#                    {"name": "misc", "targets": "treefmt helm-lint"}]
+#                     "targets": "clippy-rio-store nextest-rio-store",
+#                     "drvs": "/nix/store/x.drv /nix/store/y.drv"}]
+#                   Clusters whose members need something from the
+#                   warm set -- they gate on warm-checks.
+#   checks-nowait   Same shape; clusters with NO overlap with the
+#                   warm set. They start as soon as gen-matrix
+#                   finishes (treefmt feedback does not wait for the
+#                   rust trunk). Only `checks` gets this split: every
+#                   fuzz/vm/coverage entry always needs its kind's
+#                   trunk, so a nowait partition there would always
+#                   be empty.
 #   fuzz            singleton clusters, same object shape
 #   vm-test         singleton clusters, same object shape
 #   coverage        one "unit" cluster + vm-* singletons
 #   coverage-paths  {"unit-rio-store": "/nix/store/...", ...}
 #
-# Matrix entries are OBJECTS (name + space-separated targets) so a
-# job can build several flake attrs in one `nix build --keep-going`
-# invocation: the attrs share a store and a scheduler, so their
-# common dependencies build once. `name` is the GHA display name and
-# the runs-on selector (vm-* prefix -> KVM runner).
+# Matrix entries are OBJECTS: `targets` (attr names, for display and
+# failure attribution) and `drvs` (parallel list of drv paths, what
+# the job actually builds). One `nix build --keep-going` per cluster:
+# the drvs share a store and a scheduler, so their common
+# dependencies build once.
 #
 # Cache-filter granularity stays per-derivation: a cluster only
 # contains its UNCACHED members.
 #
-# v2 (deferred): the nix-eval-jobs output also carries neededBuilds
-# (the per-target uncached drv closure). Computing the exact shared
-# set from it -- and dispatching drv paths instead of attr names --
-# would replace the static warm.<kind> aggregates and kill the
-# per-job flake eval. See the `::notice::redundancy` line main()
-# emits: it quantifies what the static trunk misses.
+# The warm set is computed across CLUSTERS, not entries: two checks
+# of the same crate share that crate's dep closure, but they run in
+# the same job, so warming their shared deps would only serialize
+# that cluster behind a warm job doing work the cluster could do
+# itself in parallel with the other clusters.
 #
 # Dry-run locally:
 #   GITHUB_OUTPUT=/dev/stdout nix run .#gen-matrix
@@ -68,9 +85,7 @@ DEFAULT_WORKERS = 8
 # crate's cluster -- it still gets built.
 CHECK_KIND_RE = re.compile(r"^(clippy-test|clippy|doc|nextest)-(.+)$")
 
-# All matrix kinds, in stable emission order. `warm` is the
-# pseudo-kind holding the trunk aggregates and is emitted as its own
-# output rather than as a build matrix.
+# All matrix kinds, in stable emission order.
 MATRIX_KINDS = ("checks", "fuzz", "vm-test", "coverage")
 
 
@@ -110,25 +125,93 @@ def split_attr(attr):
     return kind, name
 
 
-def uncached(results):
-    """Entries not already in a substituter, as {kind: [name, ...]}.
+def pending(results):
+    """Uncached entries as {kind: {name: meta}}.
 
-    'local' and 'notBuilt' are both kept: CI runners have an empty
-    store so 'local' never appears there, and keeping it makes local
-    dry-runs reflect what a never-pushed branch would build.
+    meta is {"drv": <drvPath>, "needed": frozenset(<neededBuilds>)}.
+    `needed` is the entry's uncached build closure (what nix would
+    have to build to realise it) -- the input to the shared-trunk
+    analysis. `drv` is what the matrix job realises.
+
+    'local' and 'notBuilt' cache statuses are both kept: CI runners
+    have an empty store so 'local' never appears there, and keeping
+    it makes local dry-runs reflect what a never-pushed branch would
+    build.
     """
-    out = defaultdict(list)
+    out = defaultdict(dict)
     for r in results:
         if r.get("cacheStatus") == "cached":
             continue
         kind, name = split_attr(r["attr"])
-        out[kind].append(name)
+        out[kind][name] = {
+            "drv": r["drvPath"],
+            "needed": frozenset(r.get("neededBuilds", [])),
+        }
     return dict(out)
 
 
-def warm_kinds(results):
-    """Kinds whose warm.<kind> aggregate is uncached, sorted."""
-    return sorted(uncached(results).get("warm", []))
+def cluster_needed(cluster, meta):
+    """Union of a cluster's members' needed-sets."""
+    needed = set()
+    for target in cluster["targets"].split():
+        needed |= meta[target]["needed"]
+    return needed
+
+
+def shared_drvs(clusters, meta):
+    """Drvs appearing in >=2 clusters' needed-sets, sorted.
+
+    This is the kind's warm set: build these once in the warm job and
+    every cluster that needs them substitutes instead of rebuilding.
+    Drvs needed by only ONE cluster are left to that cluster's job --
+    warming them would serialize the cluster behind the warm job for
+    no dedup benefit. A kind with a single uncached cluster therefore
+    has an empty warm set.
+    """
+    counts = defaultdict(int)
+    for cluster in clusters:
+        for drv in cluster_needed(cluster, meta):
+            counts[drv] += 1
+    return sorted(drv for drv, n in counts.items() if n >= 2)
+
+
+def attach_drvs(clusters, meta):
+    """Return clusters with a `drvs` field parallel to `targets`."""
+    return [
+        {
+            **c,
+            "drvs": " ".join(
+                meta[t]["drv"] for t in c["targets"].split()
+            ),
+        }
+        for c in clusters
+    ]
+
+
+def partition_gated(clusters, meta, shared):
+    """Split clusters into (gated, nowait) by warm-set overlap.
+
+    A cluster whose needed-set intersects the warm set must wait for
+    the warm job to finish (otherwise it would race it on the shared
+    drvs and rebuild them). A cluster with no overlap starts
+    immediately -- this is what lets treefmt report a formatting
+    error in ~3min while the rust trunk is still compiling.
+
+    A MIXED cluster (some members need the trunk, some do not -- in
+    practice only `misc`, where golden-* needs the conformance binary
+    but treefmt needs nothing) is split in two so its fast members do
+    not wait for its slow ones' dependencies.
+    """
+    gated, nowait = [], []
+    for c in clusters:
+        targets = c["targets"].split()
+        hot = [t for t in targets if meta[t]["needed"] & shared]
+        cold = [t for t in targets if not (meta[t]["needed"] & shared)]
+        if hot:
+            gated.append({**c, "targets": " ".join(hot)})
+        if cold:
+            nowait.append({**c, "targets": " ".join(cold)})
+    return gated, nowait
 
 
 def cluster_checks(names):
@@ -192,23 +275,54 @@ def coverage_paths(results):
 
 
 def build_outputs(results):
-    """Assemble the full GITHUB_OUTPUT key->JSON-string map."""
-    pending = uncached(results)
+    """Assemble the full GITHUB_OUTPUT key->JSON-string map.
+
+    Per kind: cluster the uncached entry names, attach drv paths,
+    compute the cross-cluster shared set (the warm job's work list),
+    and -- for checks only -- split the clusters into gated/nowait by
+    whether they overlap the warm set.
+    """
+    pend = pending(results)
     clusterers = {
         "checks": cluster_checks,
         "fuzz": singletons,
         "vm-test": singletons,
         "coverage": cluster_coverage,
     }
-    outputs = {"warm": json.dumps(warm_kinds(results))}
+    matrices = {}
+    warm = {}
     for kind in MATRIX_KINDS:
-        outputs[kind] = json.dumps(
-            clusterers[kind](pending.get(kind, [])), separators=(",", ":")
-        )
+        meta = pend.get(kind, {})
+        clusters = clusterers[kind](sorted(meta))
+        shared = shared_drvs(clusters, meta)
+        warm[kind] = " ".join(shared)
+        if kind == "checks":
+            gated, nowait = partition_gated(clusters, meta, set(shared))
+            matrices["checks"] = attach_drvs(gated, meta)
+            matrices["checks-nowait"] = attach_drvs(nowait, meta)
+        else:
+            matrices[kind] = attach_drvs(clusters, meta)
+    outputs = {"warm": json.dumps(warm, separators=(",", ":"))}
+    for key, value in matrices.items():
+        outputs[key] = json.dumps(value, separators=(",", ":"))
     outputs["coverage-paths"] = json.dumps(
         coverage_paths(results), separators=(",", ":")
     )
     return outputs
+
+
+def push_paths(results):
+    """Store paths whose closures must reach the binary cache for the
+    realise-only jobs to work: every uncached entry's drvPath. The
+    uploader expands each to its reference closure (input drvs +
+    input sources, transitively), so downstream `nix build <drv>^*`
+    can substitute the whole build graph. Cached entries' jobs never
+    run, so their drvs are not needed."""
+    return sorted(
+        r["drvPath"]
+        for r in results
+        if r.get("cacheStatus") != "cached" and "drvPath" in r
+    )
 
 
 def write_outputs(outputs, fh):
@@ -261,6 +375,41 @@ def run_nix_eval_jobs(workers):
     return parse_results(lines)
 
 
+def push_drv_closures(paths):
+    """Send drv paths to the binary-cache uploader so realise-only
+    jobs can substitute their build graphs.
+
+    Reuses the post-build-hook the runner already has configured (the
+    niks3 upload daemon's `send` client). The hook protocol is "read
+    OUT_PATHS from the environment, enqueue those store paths"; the
+    uploader expands each path to its reference closure -- and a .drv
+    file's references ARE its input drvs and input sources -- then
+    skips whatever the server already has. Outside CI (no hook
+    configured) this is a no-op so local dry-runs still work.
+    """
+    if not paths:
+        return
+    hook = subprocess.run(
+        ["nix", "config", "show", "post-build-hook"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if not hook:
+        print(
+            "::warning::no post-build-hook configured -- skipping the "
+            "drv-closure push. Realise-only jobs will fail to substitute "
+            "their drvs unless something else uploads them."
+        )
+        return
+    env = dict(os.environ, OUT_PATHS=" ".join(paths), DRV_PATH="")
+    subprocess.run([hook], env=env, check=True)
+    print(
+        f"queued {len(paths)} drv closures for upload via {hook}",
+        file=sys.stderr,
+    )
+
+
 def main():
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -282,30 +431,23 @@ def main():
 
     outputs = build_outputs(results)
 
-    # Visibility: what was elided, what runs, and what the static warm
-    # trunks DON'T cover (drvs needed by >=2 uncached entries that the
-    # warm aggregates would not have built first). The last number is
-    # the case for graduating to dynamic shared-set dispatch (v2).
+    # Ship the build graph to the cache BEFORE emitting outputs: once
+    # this job succeeds, downstream jobs assume their drvs are
+    # substitutable. The hook enqueues to a background uploader that
+    # the niks3-action post-step drains before the job completes (and
+    # dependents only start after post-steps finish).
+    push_drv_closures(push_paths(results))
+
     skipped = sorted(
         r["attr"] for r in results if r.get("cacheStatus") == "cached"
     )
     print(f"::notice::cached (skipped): {json.dumps(skipped)}")
-    print(f"::notice::warm: {outputs['warm']}")
-    for kind in MATRIX_KINDS:
-        print(f"::notice::{kind}: {outputs[kind]}")
-    needed = defaultdict(int)
-    for r in results:
-        kind, _ = split_attr(r["attr"])
-        if kind == "warm" or r.get("cacheStatus") == "cached":
-            continue
-        for drv in r.get("neededBuilds", []):
-            needed[drv] += 1
-    shared = sum(1 for n in needed.values() if n > 1)
-    print(
-        f"::notice::redundancy: {shared} uncached drvs are needed by >=2 "
-        "matrix entries (the static warm trunks should cover most; a "
-        "persistently high number is the case for dynamic drv dispatch)"
-    )
+    warm = json.loads(outputs["warm"])
+    for kind, drvs in warm.items():
+        n = len(drvs.split()) if drvs else 0
+        print(f"::notice::warm {kind}: {n} shared drvs")
+    for key in ("checks", "checks-nowait", "fuzz", "vm-test", "coverage"):
+        print(f"::notice::{key}: {outputs[key]}")
 
     with open(output_path, "a") as fh:
         write_outputs(outputs, fh)
@@ -316,12 +458,15 @@ def main():
 # ----------------------------------------------------------------------
 
 
-def _entry(attr, status="notBuilt", out=None, error=None):
+def _entry(attr, status="notBuilt", out=None, error=None, drv=None, needed=None):
     if error is not None:
         return {"attr": attr, "error": error}
     e = {"attr": attr, "cacheStatus": status}
     if out is not None:
         e["outputs"] = {"out": out}
+    e["drvPath"] = drv if drv is not None else f"/d/{attr}.drv"
+    if needed is not None:
+        e["neededBuilds"] = needed
     return e
 
 
@@ -353,23 +498,152 @@ class FilterTests(unittest.TestCase):
     def test_cached_dropped_local_and_notbuilt_kept(self):
         results = [
             _entry("checks.a", "cached"),
-            _entry("checks.b", "local"),
+            _entry("checks.b", "local", needed=["/d/dep.drv"]),
             _entry("checks.c", "notBuilt"),
             _entry("fuzz.d", "notBuilt"),
         ]
         self.assertEqual(
-            uncached(results),
-            {"checks": ["b", "c"], "fuzz": ["d"]},
+            pending(results),
+            {
+                "checks": {
+                    "b": {
+                        "drv": "/d/checks.b.drv",
+                        "needed": frozenset({"/d/dep.drv"}),
+                    },
+                    "c": {"drv": "/d/checks.c.drv", "needed": frozenset()},
+                },
+                "fuzz": {
+                    "d": {"drv": "/d/fuzz.d.drv", "needed": frozenset()},
+                },
+            },
         )
 
-    def test_warm_kinds_only_uncached(self):
+    def test_push_paths_are_uncached_entry_drvs(self):
         results = [
-            _entry("warm.checks", "notBuilt"),
-            _entry("warm.fuzz", "cached"),
-            _entry("warm.vm-test", "local"),
-            _entry("checks.a", "notBuilt"),
+            _entry("checks.a", "cached", drv="/d/a.drv"),
+            _entry("checks.b", "notBuilt", drv="/d/b.drv"),
+            _entry("coverage.c", "notBuilt", drv="/d/c.drv"),
         ]
-        self.assertEqual(warm_kinds(results), ["checks", "vm-test"])
+        self.assertEqual(push_paths(results), ["/d/b.drv", "/d/c.drv"])
+
+
+def _meta(**entries):
+    """Shorthand: _meta(a=({"x"}, "/d/a.drv")) -> pending-style map."""
+    return {
+        name: {"drv": drv, "needed": frozenset(needed)}
+        for name, (needed, drv) in entries.items()
+    }
+
+
+class SharedDrvsTests(unittest.TestCase):
+    def test_drv_in_two_clusters_is_shared(self):
+        clusters = [
+            {"name": "a", "targets": "a"},
+            {"name": "b", "targets": "b"},
+        ]
+        meta = _meta(a=({"/d/dep.drv"}, "/d/a.drv"), b=({"/d/dep.drv"}, "/d/b.drv"))
+        self.assertEqual(shared_drvs(clusters, meta), ["/d/dep.drv"])
+
+    def test_intra_cluster_sharing_is_not_warmed(self):
+        # Both members of ONE cluster need dep.drv; no other cluster
+        # does. The cluster's single nix invocation already builds it
+        # once -- warming it would only serialize this cluster behind
+        # the warm job.
+        clusters = [
+            {"name": "rio-store", "targets": "clippy-rio-store nextest-rio-store"},
+            {"name": "rio-nix", "targets": "clippy-rio-nix"},
+        ]
+        meta = _meta(**{
+            "clippy-rio-store": ({"/d/store-deps.drv"}, "/d/c.drv"),
+            "nextest-rio-store": ({"/d/store-deps.drv"}, "/d/n.drv"),
+            "clippy-rio-nix": ({"/d/nix-deps.drv"}, "/d/x.drv"),
+        })
+        self.assertEqual(shared_drvs(clusters, meta), [])
+
+    def test_single_cluster_kind_has_empty_warm_set(self):
+        clusters = [{"name": "a", "targets": "a"}]
+        meta = _meta(a=({"/d/dep.drv"}, "/d/a.drv"))
+        self.assertEqual(shared_drvs(clusters, meta), [])
+
+    def test_entry_own_drv_can_be_shared(self):
+        # vm tests embed the docker images; the image drv appears in
+        # every vm entry's neededBuilds and must land in the warm set.
+        clusters = [
+            {"name": "vm-a", "targets": "vm-a"},
+            {"name": "vm-b", "targets": "vm-b"},
+            {"name": "vm-c", "targets": "vm-c"},
+        ]
+        meta = _meta(
+            **{
+                "vm-a": ({"/d/img.drv", "/d/a-only.drv"}, "/d/a.drv"),
+                "vm-b": ({"/d/img.drv"}, "/d/b.drv"),
+                "vm-c": (set(), "/d/c.drv"),
+            }
+        )
+        self.assertEqual(shared_drvs(clusters, meta), ["/d/img.drv"])
+
+
+class AttachPartitionTests(unittest.TestCase):
+    def test_attach_drvs_parallel_to_targets(self):
+        clusters = [{"name": "rio-nix", "targets": "clippy-rio-nix doc-rio-nix"}]
+        meta = _meta(
+            **{
+                "clippy-rio-nix": (set(), "/d/clippy.drv"),
+                "doc-rio-nix": (set(), "/d/doc.drv"),
+            }
+        )
+        self.assertEqual(
+            attach_drvs(clusters, meta),
+            [
+                {
+                    "name": "rio-nix",
+                    "targets": "clippy-rio-nix doc-rio-nix",
+                    "drvs": "/d/clippy.drv /d/doc.drv",
+                }
+            ],
+        )
+
+    def test_partition_by_warm_overlap(self):
+        clusters = [
+            {"name": "rio-nix", "targets": "clippy-rio-nix"},
+            {"name": "misc", "targets": "treefmt"},
+        ]
+        meta = _meta(
+            **{
+                "clippy-rio-nix": ({"/d/trunk.drv"}, "/d/c.drv"),
+                "treefmt": (set(), "/d/t.drv"),
+            }
+        )
+        gated, nowait = partition_gated(clusters, meta, {"/d/trunk.drv"})
+        self.assertEqual([c["name"] for c in gated], ["rio-nix"])
+        self.assertEqual([c["name"] for c in nowait], ["misc"])
+
+    def test_empty_warm_set_gates_nothing(self):
+        clusters = [{"name": "misc", "targets": "treefmt"}]
+        meta = _meta(treefmt=(set(), "/d/t.drv"))
+        gated, nowait = partition_gated(clusters, meta, set())
+        self.assertEqual(gated, [])
+        self.assertEqual([c["name"] for c in nowait], ["misc"])
+
+    def test_mixed_cluster_splits_so_fast_checks_do_not_wait(self):
+        # treefmt and golden-conformance share the misc cluster.
+        # golden needs the rust trunk; treefmt does not. The cluster
+        # must split so a formatting error surfaces while the trunk
+        # is still compiling.
+        clusters = [
+            {"name": "misc", "targets": "golden-conformance treefmt"}
+        ]
+        meta = _meta(
+            **{
+                "golden-conformance": ({"/d/trunk.drv"}, "/d/g.drv"),
+                "treefmt": (set(), "/d/t.drv"),
+            }
+        )
+        gated, nowait = partition_gated(clusters, meta, {"/d/trunk.drv"})
+        self.assertEqual(
+            gated, [{"name": "misc", "targets": "golden-conformance"}]
+        )
+        self.assertEqual(nowait, [{"name": "misc", "targets": "treefmt"}])
 
 
 class ClusterTests(unittest.TestCase):
@@ -467,30 +741,68 @@ class OutputTests(unittest.TestCase):
         )
 
     def test_build_outputs_end_to_end(self):
+        trunk = "/d/rio-common-build.drv"
         results = [
-            _entry("warm.checks", "notBuilt"),
-            _entry("warm.fuzz", "cached"),
-            _entry("warm.vm-test", "cached"),
-            _entry("warm.coverage", "cached"),
-            _entry("checks.clippy-rio-nix", "notBuilt"),
-            _entry("checks.treefmt", "notBuilt"),
+            # Two crates' clippy both need the trunk drv -> it is
+            # shared across two clusters -> warm set for checks.
+            _entry(
+                "checks.clippy-rio-nix",
+                "notBuilt",
+                drv="/d/clippy-rio-nix.drv",
+                needed=[trunk, "/d/clippy-rio-nix.drv"],
+            ),
+            _entry(
+                "checks.clippy-rio-store",
+                "notBuilt",
+                drv="/d/clippy-rio-store.drv",
+                needed=[trunk, "/d/clippy-rio-store.drv"],
+            ),
+            # treefmt needs nothing from the trunk -> nowait.
+            _entry(
+                "checks.treefmt",
+                "notBuilt",
+                drv="/d/treefmt.drv",
+                needed=["/d/treefmt.drv"],
+            ),
             _entry("checks.doc-rio-nix", "cached"),
-            _entry("fuzz.fuzz-refscan", "notBuilt"),
+            # Single uncached fuzz entry -> nothing shared -> no warm.
+            _entry("fuzz.fuzz-refscan", "notBuilt", drv="/d/refscan.drv"),
             _entry("vm-test.vm-chaos-standalone", "cached"),
             _entry("coverage.unit-rio-nix", "cached", out="/nix/store/aaa"),
         ]
         out = build_outputs(results)
-        self.assertEqual(json.loads(out["warm"]), ["checks"])
+        self.assertEqual(
+            json.loads(out["warm"]),
+            {"checks": trunk, "fuzz": "", "vm-test": "", "coverage": ""},
+        )
         self.assertEqual(
             json.loads(out["checks"]),
             [
-                {"name": "misc", "targets": "treefmt"},
-                {"name": "rio-nix", "targets": "clippy-rio-nix"},
+                {
+                    "name": "rio-nix",
+                    "targets": "clippy-rio-nix",
+                    "drvs": "/d/clippy-rio-nix.drv",
+                },
+                {
+                    "name": "rio-store",
+                    "targets": "clippy-rio-store",
+                    "drvs": "/d/clippy-rio-store.drv",
+                },
             ],
         )
         self.assertEqual(
+            json.loads(out["checks-nowait"]),
+            [{"name": "misc", "targets": "treefmt", "drvs": "/d/treefmt.drv"}],
+        )
+        self.assertEqual(
             json.loads(out["fuzz"]),
-            [{"name": "fuzz-refscan", "targets": "fuzz-refscan"}],
+            [
+                {
+                    "name": "fuzz-refscan",
+                    "targets": "fuzz-refscan",
+                    "drvs": "/d/refscan.drv",
+                }
+            ],
         )
         self.assertEqual(json.loads(out["vm-test"]), [])
         self.assertEqual(json.loads(out["coverage"]), [])
