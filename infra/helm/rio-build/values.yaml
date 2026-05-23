@@ -1087,8 +1087,10 @@ karpenter:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-dashboard (Cilium Gateway API)
 # ──────────────────────────────────────────────────────────────────────────
-# Svelte SPA + Cilium Gateway routing to rio-scheduler, which serves
-# gRPC-Web natively via tonic-web (D3). The GatewayClass/Gateway/
+# Svelte SPA (nginx proxies in-cluster /rio.* gRPC-Web to the
+# leader-only rio-scheduler-leader Service) + optional Cilium Gateway
+# north-south route to rio-scheduler, which serves gRPC-Web natively
+# via tonic-web (D3). The GatewayClass/Gateway/
 # GRPCRoute in dashboard-gateway.yaml render when enabled; they need
 # Cilium installed with gatewayAPI.enabled=true and the upstream
 # Gateway API CRDs present (cilium-render.nix vendors them).

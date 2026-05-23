@@ -57,11 +57,23 @@ and `SchedulerService` via gRPC-Web.
     ),
     edge(
       <ng>,
+      <sch>,
+      "-|>",
+      [`proxy_buffering off`; proxies `/rio.*` to the leader-only
+        `rio-scheduler-leader` Service],
+      label-size: 0.8em,
+      label-side: left,
+      bend: -35deg,
+    ),
+    edge(
+      <br>,
       <gw>,
       "-|>",
-      [`proxy_buffering off`; proxies `/rio.*` to the Cilium Gateway Service],
+      [north-south route (no port-forward): Gateway API `GRPCRoute` via the
+        LoadBalancer IP],
       label-size: 0.8em,
       label-side: right,
+      bend: 35deg,
     ),
     edge(
       <gw>,
@@ -78,10 +90,19 @@ gRPC-Web translation happens *in-process at the scheduler* via `tonic-web`
 (`GrpcWebLayer` + `accept_http1`). The Cilium Gateway is a plain HTTP router
 reconciled from `GatewayClass`/`Gateway`/`GRPCRoute` CRDs
 (`infra/helm/rio-build/templates/dashboard-gateway.yaml`); Cilium's embedded
-envoy handles it (no separate Envoy Gateway operator). nginx is a thin HTTP/1.1
-proxy that serves the SPA static assets and forwards `/rio.*` to the
-Cilium-provisioned Gateway Service. CORS lives in the scheduler (`tower-http`
-`CorsLayer`, `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`), not in a proxy #gls("crd").
+envoy handles it (no separate Envoy Gateway operator) and it carries only the
+north-south (browser → LoadBalancer) route. nginx is a thin HTTP/1.1 proxy that
+serves the SPA static assets and forwards `/rio.*` directly to the leader-only
+`rio-scheduler-leader` Service: its selector admits only pods carrying
+`rio.build/scheduler-role=leader`, which the lease holder maintains on itself
+(and sweeps off peers as part of the same reconcile), so endpoints converge to
+the current leader on the holder's first successful reconcile after acquiring.
+Operationally that means a brief 0-endpoint window during failover, and a
+leader that never labels itself (RBAC, patch bug) leaves this Service empty
+while the plain `rio-scheduler` Service still shows two ready pods; the full
+failover/partition semantics are documented in `nix/dashboard-nginx.conf`. CORS
+lives in the scheduler (`tower-http` `CorsLayer`,
+`RIO_DASHBOARD__CORS_ALLOW_ORIGINS`), not in a proxy #gls("crd").
 
 *No Ingress.* Access is via `kubectl port-forward svc/rio-dashboard 8080:80`
 --- the dashboard is an operator-facing tool (matches the Grafana model, not a

@@ -25,8 +25,10 @@
 #      comment block.
 #   2. Re-read `rust-toolchain.toml` from the new kani source → bump
 #      `kaniNightlyDate`.
-#   3. Re-read `kani-dependencies` → check the CBMC pin still matches
-#      what nixpkgs ships (the eval-time `assertMsg` will catch a drift).
+#   3. Re-read `kani-dependencies` → check whether the NEW kani still
+#      expects CBMC 6.8.0; the eval-time `assertMsg` on the cbmc pin
+#      fails on any `kaniVersion` bump until that block is re-derived
+#      (or the pin is dropped per its DROP condition).
 #
 # Pins (verified against the kani-0.67.0 tag):
 #   kani:    rio-build branch (lovesegfault/kani) = kani-0.67.0 + 2 patches
@@ -109,8 +111,9 @@ let
   # `nix flake update` that drops below the requirement into a loud
   # eval failure instead of a silent kani-driver break. CBMC no longer
   # floats: it is pinned locally below (`cbmcPinned`, with its own DROP
-  # condition), so its assert guards the pin itself and exists to force
-  # this block to be revisited when `kaniVersion` moves. When bumping
+  # condition), so its assert instead guards the pairing of that pin
+  # with the `kaniVersion` it was derived from and exists to force this
+  # block to be revisited when `kaniVersion` moves. When bumping
   # `kaniVersion`, re-read kani-dependencies at the new tag and update
   # the expected versions here in the same commit.
   #
@@ -141,8 +144,8 @@ let
     ];
   };
   cbmc =
-    assert lib.assertMsg (cbmcPinned.version == "6.8.0")
-      "kani ${kaniVersion} expects CBMC 6.8.0, the local pin produced ${cbmcPinned.version}; re-read kani-dependencies and update this pin";
+    assert lib.assertMsg (kaniVersion == "0.67.0")
+      "the local CBMC 6.8.0 pin above was derived from kani 0.67.0's kani-dependencies; kaniVersion is now ${kaniVersion} — re-read kani-dependencies at the new tag and update or drop the pin (see its DROP condition)";
     cbmcPinned;
   kissat =
     assert lib.assertMsg (lib.versionAtLeast pkgs.kissat.version "4.0.1")

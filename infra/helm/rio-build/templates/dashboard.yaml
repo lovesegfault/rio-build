@@ -2,9 +2,11 @@
 {{- $d := .Values.dashboard -}}
 {{- $ns := .Values.namespaces.system.name -}}
 # nginx-only pod: serves the Svelte SPA and proxies /rio.* gRPC-Web to
-# rio-scheduler:9001 DIRECTLY (in-cluster traffic can't reach the
+# rio-scheduler-leader:9001 DIRECTLY (label-selected leader-only
+# Service; failover/partition semantics documented in
+# nix/dashboard-nginx.conf). In-cluster traffic can't reach the
 # Cilium Gateway ClusterIP — selectorless Service, L7 redirect fires
-# only on the LoadBalancer IP; see docker.nix dashboardNginxConf).
+# only on the LoadBalancer IP; see docker.nix dashboardNginxConf.
 # rio-scheduler handles gRPC-Web translation in-process (tonic-web,
 # D3). nginx is a thin HTTP/1.1 proxy with the same readonly allow-
 # list as the Gateway (parity-checked at build time).
@@ -46,10 +48,11 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        # SPA serve + gRPC-Web proxy to Cilium Gateway Service. Config
-        # is baked into the image (nix/docker.nix dashboardNginxConf)
-        # — no ConfigMap, no runtime templating. A changed upstream
-        # name is a docker-dashboard rebuild, not a helm value.
+        # SPA serve + gRPC-Web proxy to the leader-only
+        # rio-scheduler-leader Service. Config is baked into the image
+        # (nix/docker.nix dashboardNginxConf) — no ConfigMap, no
+        # runtime templating. A changed upstream name is a
+        # docker-dashboard rebuild, not a helm value.
         - name: nginx
           image: {{ include "rio.image" (list . $d.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
