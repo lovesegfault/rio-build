@@ -13566,10 +13566,6 @@
       },
       "dependencies": [
         {
-          "name": "ahash",
-          "packageId": "ahash"
-        },
-        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -14148,10 +14144,6 @@
         }
       ],
       "buildDependencies": [
-        {
-          "name": "ahash",
-          "packageId": "ahash"
-        },
         {
           "name": "anstyle",
           "packageId": "anstyle"
@@ -14940,14 +14932,49 @@
       "source": {
         "type": "crates-io"
       },
+      "dependencies": [
+        {
+          "name": "zeroize_derive",
+          "packageId": "zeroize_derive"
+        }
+      ],
       "resolvedDefaultFeatures": [
         "aarch64",
         "alloc",
-        "default"
+        "default",
+        "derive",
+        "zeroize_derive"
       ],
       "libCrateTypes": [
         "lib"
       ],
+      "authors": [
+        "The RustCrypto Project Developers"
+      ]
+    },
+    "zeroize_derive": {
+      "crateName": "zeroize_derive",
+      "version": "1.4.3",
+      "edition": "2021",
+      "sha256": "0bl5vd1lz27p4z336nximg5wrlw5j7jc8fxh7iv6r1wrhhav99c5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
       "authors": [
         "The RustCrypto Project Developers"
       ]

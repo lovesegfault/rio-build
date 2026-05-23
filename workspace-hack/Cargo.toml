@@ -16,7 +16,6 @@ publish = false
 
 ### BEGIN HAKARI SECTION
 [dependencies]
-ahash = { version = "0.8" }
 anstyle = { version = "1" }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-1-x", "rt-tokio", "test-util"] }
@@ -131,13 +130,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 winnow = { version = "1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
-zeroize = { version = "1", features = ["aarch64"] }
+zeroize = { version = "1", features = ["aarch64", "derive"] }
 zstd = { version = "0.13" }
 zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [build-dependencies]
-ahash = { version = "0.8" }
 anstyle = { version = "1" }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-1-x", "rt-tokio", "test-util"] }
@@ -253,7 +251,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 winnow = { version = "1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
-zeroize = { version = "1", features = ["aarch64"] }
+zeroize = { version = "1", features = ["aarch64", "derive"] }
 zstd = { version = "0.13" }
 zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
