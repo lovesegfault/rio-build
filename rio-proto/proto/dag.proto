@@ -83,6 +83,17 @@ message DerivationNode {
   // (migration 056) so a later p̄:=1 seed can distinguish. Absent ≠ false
   // (same as enable_parallel_building).
   optional bool enable_parallel_checking = 17;
+
+  // Demand-driven completeness: the subset of output_names that any
+  // consumer actually references (union over all parents' inputDrvs
+  // output-name sets) ∪ the root request's OutputsSpec. Computed by the
+  // gateway post-BFS (populate_wanted_outputs). Used by the scheduler
+  // ONLY for the cache-hit / substitutability classification — the
+  // assignment-token allowlist, GC pins, and the client-facing output
+  // report keep using the full output_names/expected_output_paths pair.
+  // EMPTY MEANS "ALL DECLARED OUTPUTS WANTED" (the BasicDerivation
+  // fallback, pre-migration recovery rows, and ^* roots).
+  repeated string wanted_output_names = 18;
 }
 
 // A dependency edge in the derivation DAG.
