@@ -118,6 +118,18 @@ let
   # what leaks is tar metadata: readdir-order entry sequencing, build
   # wall-clock mtimes, and the sandbox UID's username (nixbld vs nixbld1
   # on different hosts). gzip's -n already strips its own mtime header.
+  #
+  # The N transcodes run in PARALLEL into per-image layouts that are
+  # merged afterwards. Serially they were the longest single link in
+  # the CI warm stage (~20s × N images of zstd recompression). The
+  # merge produces byte-identical output to a serial copy into one
+  # layout: the blobs are content-addressed (zstd level 6 of the same
+  # input is deterministic, re-verified by executor-seed-layer-parity),
+  # the no-clobber copy dedups shared layers exactly like skopeo's own
+  # already-present check did, and index.json keeps the images-list
+  # manifest order. The cost is that shared base layers are transcoded
+  # N times instead of once — wasted CPU on otherwise-idle cores, not
+  # wall-clock.
   mkSeed =
     { name, images }:
     pkgs.runCommand "rio-${name}-seed.oci.tar.gz"
@@ -126,11 +138,37 @@ let
           pkgs.skopeo
           pkgs.gnutar
           pkgs.gzip
+          pkgs.jq
         ];
       }
       ''
+        ${lib.concatStrings (
+          lib.imap0 (
+            i:
+            { ref, archive }:
+            ''
+              (${ociSkopeoCopy archive "oci:$TMPDIR/oci-${toString i}:${ref}"}) &
+            ''
+          ) images
+        )}
+        wait
+
         d=$TMPDIR/oci
-        ${lib.concatMapStrings ({ ref, archive }: ociSkopeoCopy archive "oci:$d:${ref}") images}
+        mkdir -p $d/blobs/sha256
+        cp --no-preserve=mode $TMPDIR/oci-0/oci-layout $d/
+        for i in $(seq 0 ${toString (builtins.length images - 1)}); do
+          for blob in "$TMPDIR/oci-$i"/blobs/sha256/*; do
+            [ -e "$d/blobs/sha256/''${blob##*/}" ] \
+              || cp --no-preserve=mode "$blob" $d/blobs/sha256/
+          done
+        done
+        # First layout's index as the template; manifests concatenated
+        # in images-list order (= the order a serial copy appends them).
+        jq -cs '.[0] + {manifests: (map(.manifests) | add)}' \
+          ${
+            lib.concatStringsSep " " (lib.imap0 (i: _: ''"$TMPDIR/oci-${toString i}/index.json"'') images)
+          } > $d/index.json
+
         tar -C $d -c \
           --sort=name --mtime='@1' --owner=0 --group=0 --numeric-owner \
           . | gzip -1n > $out
