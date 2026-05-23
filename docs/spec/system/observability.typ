@@ -249,6 +249,42 @@ emptied it --- the periodic sealed-empty reap may remove it first, the final
 then resolving via the no-entry arm with only the empty drain's
 status/finished_at stamp lost).
 
+#r("obs.log.entry-justified")[
+  A retained log-buffer entry MUST at all times be justified by at least one
+  of: its derivation is tracked in a non-terminal state by this replica's
+  authoritative DAG, a final flush for its stamped execution is marked
+  pending and not yet resolved, or this replica's DAG is not authoritative
+  for staleness decisions; an entry that has lost every justification MUST
+  be discarded by the next reap path that observes it.
+]
+
+The justifications are the three reasons an entry is worth memory: it is the
+live carrier for an execution that may still stream (including a buffer
+retained across a reset that the cancel-sweep finalization still needs to
+finalize), it holds the only copy of lines a not-yet-resolved final flush
+may still upload, or this replica cannot yet tell which entries are stale (a
+standby, a deposed leader, a tenure whose acquisition-time recovery has not
+completed or whose DAG load failed --- those entries are held for the next
+authoritative reconciliation). The reap paths each restore the invariant
+after a specific event breaks an entry's last justification. The
+acquisition-time sweep (`sched.recovery.log-buffer-sweep`), terminal
+cleanup's post-delay discard, the dispatch-time discard, the poison-TTL
+discard, and the disconnect-time discard cover entries whose derivation left
+the non-terminal DAG; the four flusher/epilogue reaps cover entries whose
+pending final resolves without an upload --- the tenure-orphan drop (the
+enqueueing tenure ended and the sealed entry is empty: the old tenure's
+terminal persisted and nothing remains to upload), the refused-UPSERT reap
+(another tenure already finalized the execution, so the durable record
+supersedes the retained lines), the sealed-empty reap (a silent build or the
+stored-coverage reconcile left nothing any flush could upload), and the
+enqueue-failure reap (the flusher will never see the request and an empty
+entry has nothing to lose). The model phase checks that this set of reaps is
+*complete*: there is no reachable entry state that is unjustified and that
+no reap path will ever observe. An entry whose final flush no tenure ever
+resolves stays justified indefinitely --- its ring lines are the best data
+available and the periodic flush keeps them durable at `.partial` coverage
+--- which is the rule's intended fixed point, not a leak.
+
 #r("obs.log.incomplete-surfaced")[
   A `GetDerivationLogs` response whose final chunk carries
   `is_complete = false` MUST be surfaced to the user as incomplete: the CLI

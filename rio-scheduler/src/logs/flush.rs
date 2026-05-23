@@ -705,6 +705,11 @@ impl LogFlusher {
                  tenure; the live tenure owns this execution's finalization"
             );
             metrics::counter!("rio_scheduler_log_flush_stale_tenure_total").increment(1);
+            // Tenure-orphan reap: the dropped request was the entry's last
+            // justification (sealed ⇒ no live carrier adopted it; empty ⇒
+            // nothing a retry could upload), so the entry is discarded by
+            // the same arm that drops the request.
+            // r[impl obs.log.entry-justified]
             if self
                 .buffers
                 .discard_if_sealed_for_exec(&req.drv_path, req.exec_id, true)
@@ -1724,6 +1729,11 @@ impl LogFlusher {
                 .buffers
                 .discard_if_sealed_for_exec(&req.drv_path, exec_id, true)
             {
+                // Sealed-empty reap: a sealed, empty entry can never reach
+                // the PUT/UPSERT below, so no other reap will ever observe
+                // it — its pending final has nothing left to resolve and
+                // the entry has lost every justification.
+                // r[impl obs.log.entry-justified]
                 debug!(
                     drv = %req.drv_path,
                     exec_id = %exec_id,
@@ -1962,6 +1972,11 @@ impl LogFlusher {
         // finalized blob; the `.partial` this tick uploaded is swept by the
         // TTL GC at expiry. Finals never take this branch: their entry was
         // already drained before the upload.
+        // Refused-UPSERT reap: the frozen row proves another tenure already
+        // finalized this execution, so the retained lines are superseded by
+        // the durable record and the entry's pending final is resolved
+        // externally — its last justification is gone.
+        // r[impl obs.log.entry-justified]
         if !is_final
             && !row_written
             && self

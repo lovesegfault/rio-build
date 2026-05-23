@@ -961,9 +961,13 @@ impl DagActor {
             // r[impl obs.log.deferred-final-retry+4]
             self.mark_log_final_pending(drv_hash, exec_id);
         } else if self.discard_log_buffer_if_empty(drv_hash) {
-            // The flusher will never see this request (channel full,
-            // flusher dead, or not configured), so its drain_if_exec will
-            // never remove the entry. A zero-line entry has nothing the
+            // Enqueue-failure reap: the flusher will never see this request
+            // (channel full, flusher dead, or not configured), so its
+            // drain_if_exec will never remove the entry — the failed
+            // enqueue means no final is pending and an empty entry has
+            // lost every justification.
+            // r[impl obs.log.entry-justified]
+            // A zero-line entry has nothing the
             // periodic snapshot will ever persist (line_count==0 skip) and
             // nothing to serve; reads never depended on it either
             // (GetDerivationLogs probes the stored side — e.g. the
