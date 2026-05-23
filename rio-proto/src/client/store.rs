@@ -295,10 +295,19 @@ pub async fn query_path_info_opt(
     }
 }
 
-/// `SubstitutePath` (server-streaming) with the same `Option`-on-NotFound
-/// shape as [`query_path_info_opt`]. Progress messages are forwarded to
+/// `SubstitutePath` (server-streaming). Progress messages are forwarded to
 /// `on_progress(bytes_done, bytes_expected, upstream_uri)` as they arrive;
-/// the call returns when the terminal `PathInfo` (or error/NotFound) lands.
+/// the call returns when the terminal `PathInfo` (or error) lands.
+///
+/// Unlike [`query_path_info_opt`], `NotFound` is **not** collapsed into an
+/// `Option` — it propagates as `Err(Status)` with the store's message
+/// intact. The store uses that message to distinguish "every upstream
+/// definitively missed" from "I refused to try" (no tenant context on the
+/// request, substituter not configured, …), and the caller's demotion to
+/// build-from-source is only diagnosable if that distinction survives the
+/// round-trip. Collapsing to a message-less `Ok(None)` is how the
+/// 2026-05-23 build-the-world incident became undebuggable from the
+/// scheduler's logs.
 ///
 /// `timeout` bounds **only the initial stream-open** (the unary `await` on
 /// `client.substitute_path(req)`). The body-stream read is unbounded —
@@ -312,7 +321,7 @@ pub async fn substitute_path_with_progress(
     timeout: Duration,
     extra_metadata: &[(&'static str, &str)],
     mut on_progress: impl FnMut(u64, u64, &str),
-) -> Result<Option<ValidatedPathInfo>, tonic::Status> {
+) -> Result<ValidatedPathInfo, tonic::Status> {
     use crate::types::substitute_path_response::Msg;
     let mut req = tonic::Request::new(crate::types::SubstitutePathRequest {
         store_path: store_path.to_string(),
@@ -322,7 +331,6 @@ pub async fn substitute_path_with_progress(
     let mut stream =
         match with_timeout_status("SubstitutePath", timeout, client.substitute_path(req)).await {
             Ok(resp) => resp.into_inner(),
-            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
             Err(status) => return Err(status),
         };
     loop {
@@ -335,7 +343,7 @@ pub async fn substitute_path_with_progress(
                     let validated = ValidatedPathInfo::try_from(info).map_err(|e| {
                         tonic::Status::internal(format!("store returned malformed PathInfo: {e}"))
                     })?;
-                    return Ok(Some(validated));
+                    return Ok(validated);
                 }
                 None => {}
             },
@@ -347,7 +355,6 @@ pub async fn substitute_path_with_progress(
                     "SubstitutePath stream closed without terminal",
                 ));
             }
-            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
             Err(status) => return Err(status),
         }
     }

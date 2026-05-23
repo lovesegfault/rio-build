@@ -237,6 +237,20 @@ pub fn describe_metrics() {
          label is bounded by tenant count, not by tenant-supplied URL."
     );
     describe_counter!(
+        "rio_store_substitute_skipped_total",
+        "Substitution requests short-circuited WITHOUT contacting any \
+         upstream, labeled by reason (no_tenant: the request carried no \
+         resolvable tenant identity; no_upstreams: the tenant has zero \
+         tenant_upstreams rows; disabled: no substituter on this replica). \
+         Every skip degrades to a from-source build at the scheduler, so a \
+         sustained nonzero no_tenant/disabled rate means cache.nixos.org-\
+         cached paths are being compiled. Distinct from \
+         rio_store_substitute_total{result=miss}, which counts attempts \
+         that DID reach the upstreams and definitively missed. Granularity: \
+         no_tenant/disabled are per-request; no_upstreams is per \
+         singleflight leader (same as result=hit|miss)."
+    );
+    describe_counter!(
         "rio_store_substitute_bytes_total",
         "Bytes ingested via upstream substitution (nar_size on hit)"
     );

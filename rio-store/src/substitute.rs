@@ -535,8 +535,30 @@ impl Substituter {
                 };
                 let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
                 if upstreams.is_empty() {
-                    // Normal — most tenants don't configure upstreams.
-                    // No metric; this isn't a miss, it's a no-op.
+                    // Correct behaviour for a tenant with no upstreams
+                    // configured — but it MUST be countable. Every
+                    // skip in the substitution pipeline degrades to
+                    // "build it from source" at the scheduler, and a
+                    // skip that leaves no trace is indistinguishable
+                    // from "the upstream really doesn't have it"
+                    // (2026-05-23: hours of builder CPU compiling
+                    // cache.nixos.org-cached paths because every
+                    // no-op branch was silent). debug! not warn! —
+                    // an upstream-less tenant hits this on every
+                    // cache miss; the counter is the alertable
+                    // signal, the log line is for when you're
+                    // already looking. Counted once per singleflight
+                    // leader, same granularity as `result=hit|miss`.
+                    debug!(
+                        tenant = %tenant_id,
+                        path = store_path,
+                        "substitute skipped: tenant has no upstreams configured"
+                    );
+                    metrics::counter!(
+                        "rio_store_substitute_skipped_total",
+                        "reason" => "no_upstreams"
+                    )
+                    .increment(1);
                     return Ok(None);
                 }
                 // r[impl store.substitute.admission]
@@ -2423,6 +2445,39 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await.unwrap();
         assert!(got.is_none(), "no upstreams → None");
+    }
+
+    /// A tenant with zero `tenant_upstreams` rows returning `Ok(None)`
+    /// is correct behaviour — but it MUST be countable. Every skip
+    /// branch in the substitution pipeline degrading silently to
+    /// "build it from source" is how the 2026-05-23 incident burned
+    /// builder CPU compiling cache.nixos.org-cached paths: the
+    /// operator had no signal distinguishing "the upstream really
+    /// doesn't have it" from "we never asked the upstream".
+    /// `reason=no_upstreams` is the "asked to substitute for a tenant
+    /// with no upstreams configured" signal. Counted once per
+    /// singleflight leader (same granularity as `result=hit|miss`).
+    #[tokio::test]
+    async fn substitute_skip_no_upstreams_is_counted() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-none-counted").await;
+        let (path, _) = make_path();
+        let sub = test_substituter(db.pool.clone());
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_none(), "no upstreams → None");
+        assert_eq!(
+            rec.get("rio_store_substitute_skipped_total{reason=no_upstreams}"),
+            1,
+            "a no-upstreams skip must increment \
+             rio_store_substitute_skipped_total{{reason=no_upstreams}}, \
+             not silently no-op; keys={:?}",
+            rec.all_keys()
+        );
     }
 
     // r[verify store.substitute.probe-429-retry+2]
