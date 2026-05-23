@@ -519,6 +519,12 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
+        // Empty here (= "all declared outputs wanted"). A post-BFS pass
+        // will narrow this to the union of every consumer's inputDrvs
+        // output-name set ∪ the root request's OutputsSpec once the
+        // full DAG is available — same staging as ca_modular_hash /
+        // needs_resolve below.
+        wanted_output_names: Vec::new(),
         drv_content: Vec::new(),
         is_content_addressed: drv.is_content_addressed(),
         // Empty here — populate_ca_modular_hashes() fills AFTER the

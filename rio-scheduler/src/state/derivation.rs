@@ -824,6 +824,14 @@ pub struct DerivationState {
     /// approximation (children's expected_output_paths = parent's
     /// inputs; see `approx_input_closure`).
     pub expected_output_paths: Vec<String>,
+    /// Output NAMES any consumer actually references (∪ over parents'
+    /// inputDrvs sets ∪ the root OutputsSpec). EMPTY = all declared
+    /// outputs wanted. Only the cache-hit/substitute classification and
+    /// the substitute-walk failure criterion consult this; everything
+    /// else (assignment token, GC pins, prefetch, client output report)
+    /// keeps using expected_output_paths. Grows monotonically via
+    /// union_wanted() — never shrink while any interested build is live.
+    pub wanted_output_names: Vec<String>,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
     /// When the derivation entered Ready state (for assignment latency metric).
@@ -936,6 +944,7 @@ impl DerivationState {
             retry: RetryState::default(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
+            wanted_output_names: node.wanted_output_names.clone(),
             db_id: None,
             ready_at: None,
             running_since: None,
@@ -1042,6 +1051,11 @@ impl DerivationState {
             },
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
+            // TODO: not yet persisted — recovered rows degrade to the
+            // empty sentinel (= all declared outputs wanted, today's
+            // conservative behaviour) until the migration adds the
+            // column and the recovery SELECT carries it.
+            wanted_output_names: Vec::new(),
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
             // ready_at: Some(now) if Ready → dispatch_wait_seconds
@@ -1126,6 +1140,7 @@ impl DerivationState {
             },
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
+            wanted_output_names: Vec::new(),
             db_id: Some(row.derivation_id),
             ready_at: None,
             running_since: None,
@@ -1205,6 +1220,42 @@ impl DerivationState {
     pub fn output_paths_probeable(&self) -> bool {
         !self.expected_output_paths.is_empty()
             && self.expected_output_paths.iter().all(|p| !p.is_empty())
+    }
+
+    /// The wanted subset of `expected_output_paths`, resolved by zipping
+    /// the (output_names ↔ expected_output_paths) parallel arrays.
+    /// Empty `wanted_output_names` ⇒ all declared outputs (yields every
+    /// expected path). A wanted name with no matching declared output
+    /// is ignored (defensive — the gateway only unions declared names).
+    pub fn wanted_output_paths(&self) -> impl Iterator<Item = &String> {
+        let all = self.wanted_output_names.is_empty();
+        self.output_names
+            .iter()
+            .zip(self.expected_output_paths.iter())
+            .filter(move |(name, _)| all || self.wanted_output_names.contains(*name))
+            .map(|(_, path)| path)
+    }
+
+    /// Union a newly-merged consumer's wanted set into this node's. The
+    /// wanted set only ever grows — never shrink it while any
+    /// interested build is live, or build B's `{out}` could un-want
+    /// build A's still-needed `dev`.
+    ///
+    /// Empty is the "all declared outputs wanted" sentinel, so the
+    /// union saturates: `all ∪ X = all`. If either side is empty, the
+    /// result is empty (= all). Otherwise the result is the sorted,
+    /// deduplicated set union.
+    pub fn union_wanted(&mut self, incoming: &[String]) {
+        if self.wanted_output_names.is_empty() || incoming.is_empty() {
+            self.wanted_output_names.clear(); // all ∪ anything = all
+            return;
+        }
+        for n in incoming {
+            if !self.wanted_output_names.contains(n) {
+                self.wanted_output_names.push(n.clone());
+            }
+        }
+        self.wanted_output_names.sort_unstable();
     }
 
     /// The derivation's `name` attribute, as encoded in the `.drv`
@@ -1473,6 +1524,74 @@ mod tests {
         bad.drv_content = b"not a derivation".to_vec();
         let bad_state = DerivationState::try_from_node(&bad).unwrap();
         assert!(bad_state.input_srcs.is_empty());
+    }
+
+    /// `wanted_output_paths()` filters the (output_names ↔ expected_output_paths)
+    /// parallel arrays down to the wanted subset. Empty wanted = all declared
+    /// (pre-migration rows, the BasicDerivation fallback, and `^*` roots must
+    /// keep today's conservative all-outputs behaviour).
+    #[test]
+    fn wanted_output_paths_filters_and_empty_means_all() {
+        let mut s = DerivationState::try_from_node(&dummy_node()).unwrap();
+        s.output_names = vec!["out".into(), "dev".into(), "debug".into()];
+        s.expected_output_paths = vec![
+            "/nix/store/aaaa-glibc".into(),
+            "/nix/store/bbbb-glibc-dev".into(),
+            "/nix/store/cccc-glibc-debug".into(),
+        ];
+
+        s.wanted_output_names = vec![];
+        assert_eq!(
+            s.wanted_output_paths().collect::<Vec<_>>(),
+            vec![
+                "/nix/store/aaaa-glibc",
+                "/nix/store/bbbb-glibc-dev",
+                "/nix/store/cccc-glibc-debug"
+            ],
+            "empty wanted set must mean ALL declared outputs"
+        );
+
+        s.wanted_output_names = vec!["out".into(), "dev".into()];
+        assert_eq!(
+            s.wanted_output_paths().collect::<Vec<_>>(),
+            vec!["/nix/store/aaaa-glibc", "/nix/store/bbbb-glibc-dev"],
+            "wanted subset must exclude the unwanted -debug path"
+        );
+
+        // A wanted name with no matching declared output (defensive) is ignored.
+        s.wanted_output_names = vec!["out".into(), "nonexistent".into()];
+        assert_eq!(
+            s.wanted_output_paths().collect::<Vec<_>>(),
+            vec!["/nix/store/aaaa-glibc"]
+        );
+    }
+
+    /// `union_wanted` semantics: empty is the "all outputs wanted"
+    /// sentinel, so the union of "all" with anything saturates to "all"
+    /// (stays/becomes empty). Non-empty ∪ non-empty is a sorted,
+    /// deduplicated set union — the wanted set only ever grows.
+    #[test]
+    fn union_wanted_grows_and_empty_saturates() {
+        let mut s = DerivationState::try_from_node(&dummy_node()).unwrap();
+
+        // {out} ∪ {dev} = {dev, out} (sorted union).
+        s.wanted_output_names = vec!["out".into()];
+        s.union_wanted(&["dev".into()]);
+        assert_eq!(s.wanted_output_names, vec!["dev", "out"]);
+
+        // Re-union of an already-present name is a no-op (no duplicates).
+        s.union_wanted(&["out".into()]);
+        assert_eq!(s.wanted_output_names, vec!["dev", "out"]);
+
+        // {} ∪ {out} = {} — "all" absorbs any subset.
+        s.wanted_output_names = vec![];
+        s.union_wanted(&["out".into()]);
+        assert_eq!(s.wanted_output_names, Vec::<String>::new());
+
+        // {out} ∪ {} = {} — a consumer wanting all saturates the union.
+        s.wanted_output_names = vec!["out".into()];
+        s.union_wanted(&[]);
+        assert_eq!(s.wanted_output_names, Vec::<String>::new());
     }
 
     /// `drv_name()` strips the `.drv` suffix from the store-path

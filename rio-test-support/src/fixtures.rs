@@ -65,6 +65,7 @@ pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
         output_names: vec!["out".into()],
         is_fixed_output: false,
         expected_output_paths: vec![],
+        wanted_output_names: vec![],
         drv_content: Vec::new(),
         is_content_addressed: false,
         ca_modular_hash: Vec::new(),

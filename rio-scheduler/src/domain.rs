@@ -49,6 +49,12 @@ pub struct DerivationNode {
     pub output_names: Vec<String>,
     pub is_fixed_output: bool,
     pub expected_output_paths: Vec<String>,
+    /// Demand-driven wanted-output set: the subset of `output_names`
+    /// any consumer actually references (∪ over parents' inputDrvs sets
+    /// ∪ the root OutputsSpec). EMPTY = all declared outputs wanted
+    /// (the BasicDerivation fallback, `^*` roots). See dag.proto
+    /// field 18.
+    pub wanted_output_names: Vec<String>,
     /// Opaque ATerm blob the scheduler only stores and forwards
     /// (`WorkAssignment.drv_content`); never parsed. `Vec<u8>` instead
     /// of prost's `Bytes` so this module doesn't pull in the `bytes`
@@ -83,6 +89,7 @@ impl From<proto::DerivationNode> for DerivationNode {
             output_names: n.output_names,
             is_fixed_output: n.is_fixed_output,
             expected_output_paths: n.expected_output_paths,
+            wanted_output_names: n.wanted_output_names,
             drv_content: n.drv_content.to_vec(),
             is_content_addressed: n.is_content_addressed,
             needs_resolve: n.needs_resolve,
