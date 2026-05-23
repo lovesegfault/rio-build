@@ -623,7 +623,7 @@ impl LogBuffers {
     /// `terminal_log_epilogue` on a successful enqueue and by `flush_final`'s
     /// deferral arm (re-assert + does-an-entry-stamped-with-this-exec-still-
     /// exist check).
-    // r[impl obs.log.deferred-final-retry+3]
+    // r[impl obs.log.deferred-final-retry+4]
     pub(crate) fn mark_final_pending(&self, drv_path: &str, exec_id: Uuid) -> bool {
         match self.buffers.get_mut(&drv_log_hash(drv_path)) {
             Some(mut e) if e.exec_id == Some(exec_id) => {
@@ -1991,7 +1991,7 @@ mod tests {
     /// own; `require_empty=false` widens the reap to non-empty sealed
     /// entries (the finalized-elsewhere case) without touching unsealed or
     /// mis-stamped ones.
-    // r[verify obs.log.deferred-final-retry+3]
+    // r[verify obs.log.deferred-final-retry+4]
     #[test]
     fn discard_if_sealed_for_exec_checks_seal_exec_and_emptiness() {
         let bufs = LogBuffers::new();

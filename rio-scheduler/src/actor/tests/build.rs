@@ -418,7 +418,7 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
 /// the default `test_drv_path` fixture uses one shared `TEST_HASH` for every
 /// name, which would silently collapse both buffers into one entry and make
 /// the assertions vacuous (the fixture-collision trap).
-/// r[verify obs.log.deferred-final-retry+3]
+/// r[verify obs.log.deferred-final-retry+4]
 #[tokio::test]
 async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -513,7 +513,7 @@ async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
 /// hash would collapse both into one entry and make the assertions
 /// vacuous. Buffers are seeded via set_exec + push_for (push() leaves
 /// entries unstamped and the epilogue would skip them).
-/// r[verify obs.log.deferred-final-retry+3]
+/// r[verify obs.log.deferred-final-retry+4]
 #[tokio::test]
 async fn epilogue_marks_enqueued_final_pending_and_cleanup_preserves_it() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

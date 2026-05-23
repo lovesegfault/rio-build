@@ -116,7 +116,7 @@ not gate reads). Either way the
 execution's row may remain `is_complete = false` (surfaced per
 `obs.log.incomplete-surfaced`) until a retry lands.
 
-#r("obs.log.deferred-final-retry+3")[
+#r("obs.log.deferred-final-retry+4")[
   A final flush deferred because the finalize guard could not consult
   `drv_logs` MUST be retained by the flusher --- up to a bounded retention
   cap --- and retried while the execution's sealed ring-buffer entry remains
@@ -126,10 +126,12 @@ execution's row may remain `is_complete = false` (surfaced per
   drops that execution's buffered entry instead of retaining it. A final
   flush request --- first attempt or retained retry --- MUST NOT finalize
   the execution under a leadership tenure other than the one that enqueued
-  it: the request carries the scheduler-lease generation at enqueue time and
-  the flusher MUST drop it, uploading nothing, when the replica no longer
-  holds the lease or its generation has moved on; the live tenure's own
-  terminal processing owns that execution's finalization.
+  it: the request carries the tenure's identity at enqueue time and the
+  flusher MUST drop it, uploading nothing, when the replica no longer holds
+  the lease or the recorded acquire-epoch --- the Lease `leaseTransitions`
+  count recorded at the most recent acquire edge or rebound --- has moved
+  past the request's enqueue-time stamp; the live tenure's own terminal
+  processing owns that execution's finalization.
 ]
 
 This is what keeps a transient PG failure at final-flush time from losing
@@ -141,15 +143,21 @@ at terminal time, the same window in which the terminal-status persist fails
 and the lease lapses, so after a leadership change the execution may still
 be live and being extended by the tenure that now owns it, and a late stale
 final must not freeze that row (`obs.log.finalize-immutable`,
-`obs.log.stored-coverage-preserved`). The tenure is identified by the
-generation _and_ the acquire-epoch (the Lease `leaseTransitions` count
-recorded at the most recent acquire edge or rebound), both stamped on the
-request at enqueue time: either moving breaks the tenure --- a generation
-raise (including the recovery PG-floor seed) or a holder change recorded at
-an acquire edge or a rebound, which moves the acquire-epoch even when the
-floor-saturated generation does not --- while a same-count re-acquire (a
-self-fence false alarm followed by a successful renew, no holder change)
-moves neither and keeps the request resolvable by its own tenure. Requests
+`obs.log.stored-coverage-preserved`). The acquire-epoch is the
+discriminator because it is the one stamp that moves on every holder
+change the lease loop observes --- through an acquire edge or a rebound ---
+in every regime, while a same-count re-acquire (a self-fence false alarm
+followed by a successful renew, no holder change) leaves it in place and
+keeps the request resolvable by its own tenure. The request also carries
+the scheduler-lease generation at enqueue time, and the flusher breaks the
+tenure on a generation raise too (the recovery PG-floor seed can raise it
+mid-tenure with no holder change --- a conservative extra drop, not the
+discriminator): the generation alone cannot identify the tenure once the
+floor seed has saturated it past `leaseTransitions + 1` (the permanent
+state after a lease deletion), where `on_acquire`'s `fetch_max` is a no-op
+on every subsequent holder change and an A→B→A flap leaves the generation
+equal to the enqueue-time stamp while the tenure that enqueued the request
+has ended. Requests
 orphaned by a leadership
 change are dropped and counted
 (#(refs.metric)("rio_scheduler_log_flush_stale_tenure_total")); the

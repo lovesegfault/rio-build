@@ -494,7 +494,7 @@ impl LogFlusher {
                         // leadership change) happens inside `flush_final`.
                         // The snapshot sweep below keeps its `may_flush`
                         // gate.
-                        // r[impl obs.log.deferred-final-retry+3]
+                        // r[impl obs.log.deferred-final-retry+4]
                         self.retry_deferred(&mut deferred).await;
                         // Gated. A standby's `LogBuffers` is
                         // structurally empty (no worker streams connect to it),
@@ -631,7 +631,7 @@ impl LogFlusher {
         // successful renew — no holder change) moves neither stamp and
         // deliberately keeps the request in tenure (same-epoch ⇒ the
         // in-flight final is still this tenure's to resolve).
-        // r[impl obs.log.deferred-final-retry+3]
+        // r[impl obs.log.deferred-final-retry+4]
         if !self.req_in_tenure(&req) {
             // The retained entry is left for its real owner: across an
             // A→B→A flap recovery restamps the SAME exec_id onto it and the
@@ -752,7 +752,7 @@ impl LogFlusher {
                 // here the row in hand is proven finalized, so the reap may
                 // remove the sealed residue even when non-empty
                 // (require_empty=false; see `drop_stale_after_await`).
-                // r[impl obs.log.deferred-final-retry+3]
+                // r[impl obs.log.deferred-final-retry+4]
                 if !self.req_in_tenure(&req) {
                     self.drop_stale_after_await(&req, "already_finalized_refusal", false);
                     return None;
@@ -814,7 +814,7 @@ impl LogFlusher {
                 // here: the SELECT just failed on this same pool, so
                 // another `fetch_stored_drv_log` would only burn a second
                 // acquire-timeout on the serial flusher.
-                // r[impl obs.log.deferred-final-retry+3]
+                // r[impl obs.log.deferred-final-retry+4]
                 if !self.req_in_tenure(&req) {
                     self.drop_stale_after_await(&req, "finalize_guard_error", true);
                     return None;
@@ -827,7 +827,7 @@ impl LogFlusher {
                 // stored-coverage reconcile needs this same row (it skips the
                 // tick), and on a deposed leader it does not run at all, so
                 // "leave it to the snapshotter" is not a durability story.
-                // r[impl obs.log.deferred-final-retry+3]
+                // r[impl obs.log.deferred-final-retry+4]
                 metrics::counter!("rio_scheduler_log_flush_finalize_deferred_total").increment(1);
 
                 // A zero-line entry (failover restamp whose worker never
@@ -951,7 +951,7 @@ impl LogFlusher {
         // streaming past a terminal this tenure already observed (the
         // cancel race), and those post-cancel lines are the same marginal
         // class the design already discards.
-        // r[impl obs.log.deferred-final-retry+3]
+        // r[impl obs.log.deferred-final-retry+4]
         if !self.req_in_tenure(&req) {
             self.drop_stale_after_await(&req, "pre_drain", true);
             return None;
@@ -1073,7 +1073,7 @@ impl LogFlusher {
     /// (same safety argument as the periodic refused-UPSERT reap in
     /// `upload_and_record`; a same-exec restamp landing mid-await clears
     /// the seal and the discard no-ops).
-    // r[impl obs.log.deferred-final-retry+3]
+    // r[impl obs.log.deferred-final-retry+4]
     fn drop_stale_after_await(&self, req: &FlushRequest, stage: &str, require_empty: bool) {
         warn!(
             drv = %req.drv_path,
@@ -1137,7 +1137,7 @@ impl LogFlusher {
     /// carrier (at most a sealed empty one, except the already-finalized
     /// re-check, which also removes a sealed non-empty residue because its
     /// guard row is already finalized).
-    // r[impl obs.log.deferred-final-retry+3]
+    // r[impl obs.log.deferred-final-retry+4]
     fn retain_deferred(&self, deferred: &mut Vec<FlushRequest>, req: FlushRequest) {
         if let Some(existing) = deferred.iter_mut().find(|d| d.exec_id == req.exec_id) {
             // One retained request per execution. Prefer the most recently
@@ -1217,7 +1217,7 @@ impl LogFlusher {
     /// exec) stays at its `.partial` coverage (surfaced per
     /// `obs.log.incomplete-surfaced`), and an execution with no stored row
     /// yet loses only its un-flushed ring prefix.
-    // r[impl obs.log.deferred-final-retry+3]
+    // r[impl obs.log.deferred-final-retry+4]
     async fn retry_deferred(&self, deferred: &mut Vec<FlushRequest>) {
         if deferred.is_empty() {
             return;
@@ -3881,7 +3881,7 @@ mod tests {
     /// first-attempt final would (scenario 1 of r14 merged_bug_003: a fast
     /// build whose first-ever flush met a transient PG blip must not lose its
     /// whole log to the ~60s terminal-cleanup discard while S3 is healthy).
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn deferred_final_is_retried_and_uploads_after_pg_recovers() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3994,7 +3994,7 @@ mod tests {
     /// assumption as the existing closed-pool deferral tests). If a future
     /// sqlx bump changes that, this test will hang/time out rather than
     /// pass vacuously.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn deferred_final_retry_loop_runs_when_not_leader() -> anyhow::Result<()> {
@@ -4095,7 +4095,7 @@ mod tests {
     /// ex-leader's stored `.partial` for a zero-line entry either way). A
     /// re-dispatched execution's fresh empty entry is never touched by a
     /// stale deferred request.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn deferred_final_with_empty_entry_reaps_it_for_this_exec_only() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -4180,7 +4180,7 @@ mod tests {
     /// (terminal cleanup may already have run and skipped it on the
     /// enqueue-time final-pending mark, so nothing else would ever reap it),
     /// and duplicate exec_ids do not consume cap slots.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn deferred_final_retention_cap_drops_entry_on_overflow() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -4296,7 +4296,7 @@ mod tests {
     /// exec-guard alone cannot tell the two apart — the overflow arm must
     /// drop the request without touching the entry, exactly like the
     /// tenure-drop arm in `flush_final`.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn deferred_final_retention_cap_overflow_leaves_out_of_tenure_victims_entry()
     -> anyhow::Result<()> {
@@ -4655,7 +4655,7 @@ mod tests {
     /// `rio_scheduler_log_flush_stale_tenure_total`) and the retained
     /// entry is left untouched for its real owners (the live tenure's own
     /// final, the drv's next dispatch discard, or process exit).
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn deposed_leader_deferred_retry_must_not_freeze_live_leaders_row() -> anyhow::Result<()>
     {
@@ -4806,7 +4806,7 @@ mod tests {
     /// enters the retry machinery at all, so the validation must live in
     /// `flush_final` itself. Same destructive outcome as the retry route on
     /// un-pinned code; same drop-without-touching-anything expectation.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_first_attempt_on_deposed_leader_must_not_freeze_live_leaders_row()
     -> anyhow::Result<()> {
@@ -4904,7 +4904,7 @@ mod tests {
     /// SAME exec_id and the execution is live again on this very replica. The
     /// stale `status="cancelled"` final must be dropped — the entry it would
     /// have drained is the live execution's buffer.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_final_dropped_after_lease_flap_even_when_leader_again() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -5013,7 +5013,7 @@ mod tests {
     /// directly). The tenure-drop arm must reap it: still-sealed proves no
     /// restamp adopted the entry (restamps clear seals), empty proves there
     /// is nothing to lose.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_tenure_drop_reaps_sealed_empty_orphan_entry() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -5127,7 +5127,7 @@ mod tests {
     /// tenure-guarded, so without the pin running first it removes the live
     /// carrier: every later push lands on no_assignment and the execution's
     /// log is permanently lost while S3 is healthy.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_tenure_drop_before_guard_leaves_live_carrier_writable() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -5230,7 +5230,7 @@ mod tests {
     /// (entry().or_default()) and the reconnected worker's batches land in
     /// it. Complements `stale_tenure_drop_before_guard_leaves_live_carrier_
     /// writable`, which pins the restamp-then-drop ordering.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_tenure_drop_then_same_exec_restamp_recreates_live_carrier() -> anyhow::Result<()>
     {
@@ -5309,7 +5309,7 @@ mod tests {
     /// real owner. Deterministic fixture: an ACCESS EXCLUSIVE table lock
     /// holds the guard SELECT open while the generation is bumped through
     /// the shared `LeaderState` handle, then the lock is released.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn tenure_lost_during_guard_select_drops_final_without_freezing_row() -> anyhow::Result<()>
     {
@@ -5444,7 +5444,7 @@ mod tests {
     /// stale tenure. The Err arm's re-check must drop the request without
     /// touching the entry: no empty-reap of the live carrier, no re-mark,
     /// no retention.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn tenure_lost_during_guard_select_err_arm_leaves_live_carrier_unreaped()
     -> anyhow::Result<()> {
@@ -5574,7 +5574,7 @@ mod tests {
     /// the durable record supersedes the retained lines and the re-PUT
     /// churn ends. The drop arm keeps the entry; the reap self-heals within
     /// one periodic tick of PG/leadership recovery.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     /// r[verify obs.log.finalize-immutable]
     #[tokio::test]
     async fn stale_tenure_orphan_reaped_by_periodic_refused_upsert_when_finalized_elsewhere()
@@ -5726,7 +5726,7 @@ mod tests {
     /// performs no PG work) keeps the entry, only the request is dropped, and
     /// the periodic snapshotter keeps it durable at `.partial` coverage
     /// (served as is_complete=false) instead of reaping it.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_tenure_drop_keeps_sealed_nonempty_entry_when_not_finalized() -> anyhow::Result<()>
     {
@@ -5818,7 +5818,7 @@ mod tests {
     /// must also compare the recorded acquire-epoch
     /// (`acquired_transitions`), which the apiserver moves on every
     /// holder change regardless of the generation.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_tenure_drop_fires_on_holder_change_with_saturated_generation()
     -> anyhow::Result<()> {
@@ -5927,7 +5927,7 @@ mod tests {
     /// (periodic snapshots, GC, new finals) for N×timeout. Structural pin:
     /// with `drv_logs` locked ACCESS EXCLUSIVE (any read would block), the
     /// drop must still resolve immediately — consumed, counted, entry kept.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn stale_tenure_drop_does_no_pg_work_for_sealed_nonempty_entry() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -6010,7 +6010,7 @@ mod tests {
     /// not just the empty shape, so the orphan does not shadow the
     /// finalized blob until restart. Same LOCK TABLE fixture as the
     /// not-finalized mid-await test; the row here is frozen complete.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     /// r[verify obs.log.finalize-immutable]
     #[tokio::test]
     async fn tenure_lost_during_finalized_guard_select_reaps_sealed_nonempty_residue()
@@ -6218,7 +6218,7 @@ mod tests {
     /// that same tick — otherwise it would just sit in memory until process
     /// restart (reads are unaffected either way: a zero-line entry's reads
     /// are served from the stored `.partial`).
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     /// r[verify obs.log.stored-coverage-preserved]
     #[tokio::test]
     async fn stale_tenure_orphan_emptied_by_stored_coverage_reconcile_reaped_on_periodic_tick()
@@ -6500,7 +6500,7 @@ mod tests {
     /// still uploads and finalizes through `retry_deferred` itself (the
     /// round-14 win this fix must not regress). Green before and after the
     /// tenure pin — guards against an over-eager gate.
-    /// r[verify obs.log.deferred-final-retry+3]
+    /// r[verify obs.log.deferred-final-retry+4]
     #[tokio::test]
     async fn retry_deferred_same_tenure_attempts_and_uploads() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;

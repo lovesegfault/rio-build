@@ -958,7 +958,7 @@ impl DagActor {
             // the pool-acquire timeout per attempt) does not discard the
             // only copy of the log out from under it. Marking only at
             // deferral time left queued-but-unattempted finals unprotected.
-            // r[impl obs.log.deferred-final-retry+3]
+            // r[impl obs.log.deferred-final-retry+4]
             self.mark_log_final_pending(drv_hash, exec_id);
         } else if self.discard_log_buffer_if_empty(drv_hash) {
             // The flusher will never see this request (channel full,
