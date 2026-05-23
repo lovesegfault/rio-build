@@ -747,7 +747,7 @@ fn s3_short_circuit_respects_first_line() {
 /// Equality (gapless blobs, or a marker standing in for exactly one
 /// line) keeps exact slicing — pinned by the existing roundtrip/offset
 /// tests via the new argument.
-// r[verify obs.log.gap-span]
+// r[verify obs.log.gap-span+2]
 #[test]
 fn decompress_and_chunk_line_deficit_ignores_since() -> anyhow::Result<()> {
     let zst = compress_lines(&[
@@ -775,7 +775,7 @@ fn decompress_and_chunk_line_deficit_ignores_since() -> anyhow::Result<()> {
 /// short-circuit fires only at/past the TRUE end — pre-fix, since=6
 /// against this row was index-sliced to nothing and sfx-6 (true line 6)
 /// was silently lost.
-// r[verify obs.log.gap-span]
+// r[verify obs.log.gap-span+2]
 #[tokio::test]
 async fn s3_gap_merged_blob_resumes_from_start_and_caught_up_uses_true_end() -> anyhow::Result<()> {
     let db = TestDb::new(&crate::MIGRATOR).await;

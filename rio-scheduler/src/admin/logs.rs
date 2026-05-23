@@ -516,7 +516,7 @@ pub(super) fn decompress_and_chunk(
     // case structurally.
     let raw: &[u8] = decoded.strip_suffix(b"\n").unwrap_or(&decoded);
 
-    // r[impl obs.log.gap-span]
+    // r[impl obs.log.gap-span+2]
     // A gap-merged blob (a failover marker replaced two or more lost lines —
     // see `upload_and_record`'s effective-metadata block) has fewer physical
     // lines than the row's true span, so the index→line mapping below is

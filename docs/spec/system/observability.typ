@@ -76,25 +76,33 @@ with a `[rio: ~N earlier lines lost across scheduler failover]` line;
 lines an interim leader received but never flushed are within the same
 30-second bound but their absence is not separately marked.
 
-#r("obs.log.gap-span")[
-  A `drv_logs` row whose blob folds a recovered pre-failover prefix MUST
-  describe the execution's true line-number span --- `first_line + line_count`
-  is one past the highest true worker line stored, with the lost range counted
-  even though the blob replaces it with a single marker line. A
-  `GetDerivationLogs` read with `since_line > 0` MUST NOT skip lines the
-  client has not received: when the stored blob's physical line count does not
-  match the row's claimed span, the server re-serves the blob from its start
-  unless the cursor is at or past the true end.
+#r("obs.log.gap-span+2")[
+  A `drv_logs` row recorded for a flush payload that does not physically
+  contain every line of the range it covers --- it folds a recovered
+  pre-failover prefix whose gap is collapsed to a single marker line, or its
+  ring lines carry an interior hole delivered only to an interim leader ---
+  MUST describe the execution's true line-number span: `first_line +
+  line_count` is one past the highest true worker line stored, with the lost
+  range counted even though the blob omits it or replaces it with a marker.
+  A `GetDerivationLogs` read with `since_line > 0` MUST NOT skip lines the
+  client has not received: when the stored blob's physical line count does
+  not match the row's claimed span, the server re-serves the blob from its
+  start unless the cursor is at or past the true end.
 ]
 
-The marker collapses the lost range into one physical line, so blob index and
-true line number diverge once a marker stands in for two or more lines.
-Keeping the row's range in true line-number space keeps the `since_line`
-short-circuit and the next failover's prefix/gap computation honest; the read
-path detects the divergence by comparing the decoded blob's physical line
-count against the row's span, so gapless blobs (and a marker that replaced a
-single lost line) keep exact resume, and any mismatch is served in full ---
-bandwidth over silent loss. A client that derives its resume cursor from chunk
+The marker collapses the lost range into one physical line (and an interior
+hole gets no marker at all), so blob index and true line number diverge once
+the blob omits two or more lines of the claimed range. Keeping the row's
+range in true line-number space keeps the `since_line` short-circuit and the
+next failover's prefix/gap computation honest; the read path detects the
+divergence by comparing the decoded blob's physical line count against the
+row's span, so gapless blobs (and a marker that replaced a single lost line)
+keep exact resume, and any mismatch is served in full --- bandwidth over
+silent loss. Recording the physical count instead --- for either shape ---
+would understate the execution's end: `s3_is_caught_up` would skip stored
+tail lines and the physical-vs-claimed re-serve could never fire because the
+counts would match, which is exactly the silent skip the read-path half
+forbids. A client that derives its resume cursor from chunk
 labels will re-download such a blob on each poll until the row is finalized;
 no first-party client does (the CLI and dashboard both read from line 0).
 Per-chunk `first_line_number` labels inside a gap-merged blob remain

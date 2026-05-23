@@ -1781,7 +1781,7 @@ impl LogFlusher {
         // re-serve. A later tenure still holding the hole lines truncates
         // them at this (larger) end without storing them — the same
         // accepted interim-leader loss, now without a lying row.
-        // r[impl obs.log.gap-span]
+        // r[impl obs.log.gap-span+2]
         let prefix_lines_recovered = recovered_prefix.as_ref().map(|p| p.line_count);
         // Ring contribution to the row span, in TRUE line-number space
         // (last − first + 1; exceeds the physical count exactly when the ring
@@ -7618,7 +7618,7 @@ mod tests {
     /// end (line 7) merges with NO second marker. Pre-fix the first merge
     /// recorded the physical count (6); this leg then computed gap = 7−6 = 1
     /// and folded a spurious "[rio: ~1 earlier lines lost…]" marker per flap.
-    // r[verify obs.log.gap-span]
+    // r[verify obs.log.gap-span+2]
     #[tokio::test]
     async fn second_failover_merge_uses_true_span_of_stored_row() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -8818,7 +8818,7 @@ mod tests {
     /// claimed-but-missing range are not told they are caught up; the blob
     /// then physically holds fewer lines than the row claims, which is the
     /// divergence the read path answers with a full re-serve.
-    // r[verify obs.log.gap-span]
+    // r[verify obs.log.gap-span+2]
     #[tokio::test]
     async fn aba_flap_unflushed_interim_hole_periodic_records_true_span() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
