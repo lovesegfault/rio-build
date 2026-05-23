@@ -6,9 +6,11 @@
 # rio-dashboard Deployment that the browser talks to) which serves the
 # SPA bundle and proxies /rio.* POSTs to rio-scheduler.
 #
-# Five assertions:
+# Six assertions:
 #   1. SPA served — index.html has the Svelte mount <div id="app">
 #   2. SPA routing fallback — /builds/xyz returns index.html (try_files)
+#   2b. rio-scheduler-leader EndpointSlice has exactly 1 ready endpoint
+#       (the lease holder labeled its own pod — nginx's upstream)
 #   3. Unary gRPC-Web THROUGH nginx — 0x00 DATA frame prefix
 #   4. Server-streaming THROUGH nginx — 0x80 trailer byte
 #   5. method-gate via nginx — allow-list fail-closed
@@ -63,43 +65,49 @@
           "| grep -qF 'id=\"app\"'"
       )
 
-  # ── Pin the scheduler to a single replica ─────────────────────────
-  # Both replicas are Ready (readiness is tcpSocket, not leadership);
-  # the standby answers every actor-gated RPC with a Trailers-Only
-  # Unavailable (HTTP 200, empty body), and nginx's ClusterIP upstream
-  # neither targets the leader nor re-rolls the backend on retry (see
-  # ci-failure-patterns.md "nginx LB to standby replica"). Scale to 1
-  # so the only endpoint IS the leader; nothing after this fragment
-  # needs two replicas.
-  with subtest("pin scheduler to one replica for the nginx proxy path"):
-      k3s_server.succeed(
-          "k3s kubectl -n ${ns} scale deploy/rio-scheduler --replicas=1"
-      )
-      # The ReplicaSet controller may pick the leader as the scale-down
-      # victim; the survivor then acquires the lease within LEASE_TTL
-      # (15s). Budget: termination grace + TTL + acquire retry + slack.
+  # ── (2b) leader-only Service has exactly one ready endpoint ──────
+  # nginx's upstream is rio-scheduler-leader, whose selector includes
+  # the rio.build/scheduler-role=leader label the lease holder stamps
+  # on its own pod (rio-lease spawn_patch_leader_marks, level-triggered
+  # off the election loop). Until that patch lands the Service has 0
+  # endpoints and every proxied request fails with a connect error.
+  # Waiting here turns "the leader never labeled itself" (RBAC, patch
+  # bug, label typo between chart and Rust constant) into an immediate,
+  # named failure instead of a 60s timeout in the gRPC-Web subtests
+  # below. Exactly 1 (not >=1): 2 ready endpoints would mean the
+  # standby is also labeled — the exact bug this Service exists to
+  # prevent.
+  with subtest("leader Service: rio-scheduler-leader has exactly 1 ready endpoint"):
       k3s_server.wait_until_succeeds(
-          "pods=$(k3s kubectl -n ${ns} get pods -l app.kubernetes.io/name=rio-scheduler "
-          "-o jsonpath='{.items[*].metadata.name}'); "
-          "holder=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-          "-o jsonpath='{.spec.holderIdentity}'); "
-          "test -n \"$holder\" && test \"$pods\" = \"$holder\"",
-          timeout=90,
+          "test \"$(k3s kubectl -n ${ns} get endpointslices "
+          "-l kubernetes.io/service-name=rio-scheduler-leader "
+          "-o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}' "
+          "| wc -w)\" = 1",
+          timeout=60,
       )
 
   # ── (3) gRPC-Web unary THROUGH nginx ─────────────────────────────
   # curl → nginx:8080 → /rio.admin.AdminService/ClusterStatus matches
   # the `location ~ ^/rio\.(admin|scheduler)\./` block → proxy_pass
-  # straight to rio-scheduler:9001 (D3: scheduler serves gRPC-Web
-  # natively via tonic-web; no Gateway hop in-cluster).
+  # straight to rio-scheduler-leader:9001 (D3: scheduler serves
+  # gRPC-Web natively via tonic-web; no Gateway hop in-cluster).
   # The 0x00 byte is the gRPC-Web DATA frame compression flag — if
   # ANY hop mangles the binary framing (e.g., nginx gzip, envoy
   # buffering, wrong content-type pass-through), the first byte
   # won't be 0x00.
   #
   # Empty proto body = 5-byte header (1 byte flag + 4 bytes len=0).
-  # --max-time 5: nginx's proxy_connect_timeout is 60s, so one hung
-  # upstream connection would otherwise eat the whole retry budget.
+  # wait_until_succeeds: nginx's upstream is the leader-only Service
+  # (selector includes the leader label), so a Trailers-Only
+  # Unavailable from the standby is structurally impossible — the
+  # standby is never an endpoint. What CAN still fail transiently is
+  # the window between subtest 2b and nginx re-resolving (rare —
+  # ClusterIP is stable, only endpoints change), or a hung upstream
+  # connection (nginx proxy_connect_timeout is 60s — one hang would
+  # eat the whole budget without --max-time). --max-time 5 caps each
+  # attempt so the budget always buys >=10 independent tries; the
+  # except block captures the evidence needed to tell those modes
+  # apart if it still fails.
   try:
       with subtest("gRPC-Web unary via nginx: ClusterStatus 0x00 prefix"):
           k3s_server.wait_until_succeeds(
@@ -167,10 +175,12 @@
               timeout=60,
           )
   except Exception:
-      # Discriminate "the lone replica still answers Trailers-Only"
-      # (access log full of 200s with 0 body bytes — the replica lost
-      # the lease or never finished recovery) from "connections hang"
-      # (504s / connect timeouts) from "leader not in the endpoint set".
+      # Discriminate "leader-only Service has no/extra endpoints" (the
+      # label patch never landed, or the standby is also labeled) from
+      # "connections to the leader hang" (504s / connect timeouts) from
+      # "nginx still resolves the old ClusterIP" (200s with ~0 body
+      # bytes would mean a standby answered — impossible unless the
+      # selector matched it).
       print("== DIAGNOSTIC: nginx -> scheduler gRPC-Web proxy path ==")
       print(k3s_server.execute(
           "printf '\\x00\\x00\\x00\\x00\\x00' | "
@@ -182,8 +192,9 @@
           "k3s kubectl -n ${ns} logs deploy/rio-dashboard --tail=80 2>&1"
       )[1])
       print(k3s_server.execute(
+          "k3s kubectl -n ${ns} get endpointslices -l kubernetes.io/service-name=rio-scheduler-leader -o yaml 2>&1; "
           "k3s kubectl -n ${ns} get endpointslices -l kubernetes.io/service-name=rio-scheduler -o yaml 2>&1; "
-          "k3s kubectl -n ${ns} get pods -o wide 2>&1; "
+          "k3s kubectl -n ${ns} get pods -o wide --show-labels 2>&1; "
           "k3s kubectl -n ${ns} get lease rio-scheduler-leader -o jsonpath='{.spec.holderIdentity}' 2>&1"
       )[1])
       raise

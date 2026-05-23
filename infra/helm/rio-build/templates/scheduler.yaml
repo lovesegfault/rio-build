@@ -305,6 +305,42 @@ spec:
 # retry, fine off the hot path.
 {{ include "rio.grpcServicePair" (dict "root" . "name" "rio-scheduler" "ns" .Values.namespaces.system.name "component" "scheduler" "port" 9001) }}
 ---
+# Leader-only Service. Same port/labels as `rio-scheduler` but the selector
+# additionally requires the rio.build/scheduler-role=leader label, which the
+# lease loop reconciles onto its OWN pod (present while leading, removed on
+# lose — rio-lease spawn_patch_leader_marks). Endpoints are therefore exactly
+# the current leader: 1 pod in steady state, 0 during failover / before the
+# first acquire.
+#
+# Exists for ClusterIP consumers that CANNOT retry a Trailers-Only
+# Unavailable from the standby — concretely the dashboard's nginx upstream
+# (nix/dashboard-nginx.conf), whose connections get pinned to one backend of
+# the plain `rio-scheduler` ClusterIP. Everything else should keep using
+# `rio-scheduler` (per-call + retry) or the headless Service (health-probing
+# balanced channel); this Service trades the standby-Unavailable failure
+# mode for a 0-endpoint window during failover, which only makes sense for
+# clients that already retry connection errors.
+#
+# publishNotReadyAddresses stays default (false): a Terminating ex-leader
+# drops out of the ready endpoints even while its label is still present.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-scheduler-leader
+  namespace: {{ .Values.namespaces.system.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  {{- include "rio.ipFamily" . | nindent 2 }}
+  type: ClusterIP
+  selector:
+    {{- include "rio.selectorLabels" "rio-scheduler" | nindent 4 }}
+    rio.build/scheduler-role: leader
+  ports:
+    - name: grpc
+      port: 9001
+      targetPort: grpc
+---
 # Mounted at /etc/rio/scheduler.toml. The config loader merges this UNDER
 # env (RIO_* wins). The [sla] table is mandatory — the SchedulerConfig has no
 # Option<SlaConfig> arm; an absent block falls back to the tiny

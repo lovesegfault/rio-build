@@ -221,8 +221,12 @@ rules:
     resources: [leases]
     resourceNames: [{{ .Values.scheduler.leaseName | default "rio-scheduler-leader" | quote }}]
     verbs: [get, update]
-  # pod-deletion-cost annotation: leader PATCHes own Pod's
-  # metadata.annotations so K8s kills standby first during RollingUpdate.
+  # Leader marks: the lease holder PATCHes its own Pod's
+  # metadata.annotations (controller.kubernetes.io/pod-deletion-cost, so
+  # K8s kills the standby first during RollingUpdate) and metadata.labels
+  # (rio.build/scheduler-role=leader, the rio-scheduler-leader Service
+  # selector) in one merge patch. RBAC `patch` on `pods` covers both —
+  # verbs aren't field-scoped, so the label needs no extra rule.
   # Namespace-wide (NOT resourceNames-scoped) because pod name is dynamic
   # (Deployment-generated). Code only patches cfg.holder_id = HOSTNAME =
   # own pod. `get` needed: kube-rs's Api::patch GETs first for

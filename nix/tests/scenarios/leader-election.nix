@@ -230,11 +230,12 @@ let
       # drain window → step_down() completes, main() returns, atexit
       # flushes profraw. Graceful-release body: step_down in run_lease_loop.
       #
-      # deletion-cost: on acquire, spawn_patch_deletion_cost writes
-      # controller.kubernetes.io/pod-deletion-cost=1 to the pod. K8s
-      # ReplicaSet sorts by this during scale-down/RollingUpdate →
-      # kills standby first → no leadership churn on rollout. The new
-      # leader's pod should have it.
+      # deletion-cost: on acquire, spawn_patch_leader_marks writes
+      # controller.kubernetes.io/pod-deletion-cost=1 to the pod (along
+      # with the leader label the rio-scheduler-leader Service selects
+      # on). K8s ReplicaSet sorts by the cost during
+      # scale-down/RollingUpdate → kills standby first → no leadership
+      # churn on rollout. The new leader's pod should have it.
       with subtest("graceful-release: SIGTERM leader → step_down → standby acquires <10s"):
           import time as _time
           leader = leader_pod()
@@ -270,8 +271,9 @@ let
               f"step_down didn't fire — graceful-release broken?"
           )
 
-          # deletion-cost on the NEW leader. Fire-and-forget spawn
-          # (spawn_patch_deletion_cost) — may take a tick to land. 5s slack.
+          # deletion-cost on the NEW leader. Detached spawn off the
+          # election loop (spawn_patch_leader_marks) — may take a tick
+          # to land. 5s slack.
           new_leader = leader_pod()
           k3s_server.wait_until_succeeds(
               f"test \"$(k3s kubectl -n ${ns} get pod {new_leader} "

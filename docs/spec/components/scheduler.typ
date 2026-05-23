@@ -2595,7 +2595,11 @@ Clients route via a health-aware balanced channel against the headless Service
 `grpc.health.v1/Check` on each (NOT_SERVING on standby), and only insert the
 leader into the tonic p2c balancer. The ClusterIP Service `rio-scheduler` is
 kept for per-call connects (controller reconcilers, rio-cli) where a 50% chance
-of hitting UNAVAILABLE + retry is acceptable. Combined with `step_down()` and
+of hitting UNAVAILABLE + retry is acceptable. A third Service,
+`rio-scheduler-leader`, selects on the `rio.build/scheduler-role=leader` label
+the lease holder reconciles onto its own Pod, so its endpoints are exactly the
+current leader --- for in-cluster proxies that can neither health-probe nor
+retry a Trailers-Only UNAVAILABLE (the dashboard's nginx upstream). Combined with `step_down()` and
 pod-deletion-cost, a rollout flips leadership exactly once: K8s kills the
 standby first (cost=0), new pod comes up as standby, K8s kills the old leader,
 old leader step_down releases the lease, new pod acquires within one poll
