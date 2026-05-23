@@ -359,12 +359,10 @@ jobs:
     runs-on: rio-ci
     timeout-minutes: 60
     steps:
-      # alls-green shells out to `python` (not `python3`); ARC's stock
-      # image has python3 but not the bare `python` symlink that GH-
-      # hosted runners ship. setup-python adds it (~5s).
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: '3.x'
+      # alls-green shells out to `python`; the runner image pre-bakes
+      # one (along with python3 for gen-matrix), so the
+      # actions/setup-python step that used to provide it — and which
+      # does not work on the custom image — is gone.
       - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
