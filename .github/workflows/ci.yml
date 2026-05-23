@@ -63,9 +63,22 @@ jobs:
         # one fan-out job below, and teach nix/gen_matrix.py the
         # kind's clustering rule; the warm stage picks up the new
         # kind's shared drvs automatically.
-        run: nix run .#gen-matrix
+        #
+        # Run the script straight from the checkout with the runner's
+        # python3 (stdlib only): `nix run .#gen-matrix` costs an extra
+        # ~18s of critical path evaluating the flake a second time and
+        # substituting the python+flake8 toolchain just to build the
+        # wrapper. The script's lint+test gate is the
+        # gen-matrix-selftest entry in the checks matrix instead.
+        run: python3 nix/gen_matrix.py
         env:
           DRV_CACHE_DIR: ${{ runner.temp }}/drv-cache
+          # 51 of the ~160 evaluated attrs are full NixOS module-system
+          # evaluations (~8s each); they dominate the eval tail. 16
+          # workers halves that tail vs the 8 default. Each worker is a
+          # full evaluator (~500MB-1GB peak) — if gen-matrix starts
+          # getting OOM-killed here, this is the knob to turn back down.
+          NEJ_WORKERS: '16'
       # The run's build graph: every uncached target's .drv closure
       # (derivation files + eval-time sources, all content-addressed).
       # Build jobs register this as a substituter instead of
@@ -79,6 +92,12 @@ jobs:
           path: ${{ runner.temp }}/drv-cache
           if-no-files-found: ignore
           retention-days: 1
+          # The contents are .drv files (small text) and crate source
+          # trees; level 6 spends ~14s of the critical path shaving a
+          # few MB off an 80MB artifact that 80 jobs download over a
+          # fast link. Level 1 is ~5x faster to produce for ~10% more
+          # bytes.
+          compression-level: 1
       # setup-nix restores ~/.cache/nix everywhere; only this job
       # saves. Build jobs no longer evaluate the flake, but they still
       # restore this cache for the fetcher entries (flake input

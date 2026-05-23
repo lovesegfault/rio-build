@@ -66,14 +66,18 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unittest
 from collections import defaultdict
 
-# Substituted by pkgs.replaceVars in flake.nix. Running the file
-# straight from the repo leaves the literal in place; only main()
-# dereferences it.
+# Substituted by pkgs.replaceVars when this script is built into
+# `packages.gen-matrix`. CI runs the file straight from the checkout
+# (`python3 nix/gen_matrix.py` -- the wrapper package costs an extra
+# flake eval plus a python+flake8 toolchain substitution on the
+# critical path), which leaves the literal in place; resolve_nix_eval_jobs
+# falls back to PATH and then to building the pinned binary.
 NIX_EVAL_JOBS = "@nix_eval_jobs@"
 
 # ARC pods are CFS-quota'd, not cpuset-pinned, so nproc reports the
@@ -452,6 +456,30 @@ def write_outputs(outputs, fh):
         fh.write(f"{key}={value}\n")
 
 
+def resolve_nix_eval_jobs():
+    """Locate nix-eval-jobs without paying for a wrapper-package build.
+
+    Preference order: the path replaceVars baked in (running as the
+    built `gen-matrix` package), the runner image's PATH (free once
+    the image pre-bakes it), and finally `nix build .#nix-eval-jobs`
+    (one flake eval, still cheaper than `nix run .#gen-matrix` which
+    additionally builds the flake8-checked wrapper and substitutes the
+    python toolchain).
+    """
+    if not NIX_EVAL_JOBS.startswith("@"):
+        return NIX_EVAL_JOBS
+    on_path = shutil.which("nix-eval-jobs")
+    if on_path:
+        return on_path
+    out_path = subprocess.run(
+        ["nix", "build", ".#nix-eval-jobs", "--no-link", "--print-out-paths"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return f"{out_path}/bin/nix-eval-jobs"
+
+
 def run_nix_eval_jobs(workers):
     """Stream-eval .#githubActions, echoing progress to stderr.
 
@@ -461,7 +489,7 @@ def run_nix_eval_jobs(workers):
     cached entries can be elided.
     """
     cmd = [
-        NIX_EVAL_JOBS,
+        resolve_nix_eval_jobs(),
         "--flake",
         ".#githubActions",
         "--force-recurse",
