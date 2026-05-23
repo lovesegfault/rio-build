@@ -199,6 +199,20 @@ pub struct FlushRequest {
     /// coverage. The periodic snapshot path builds its request inline with
     /// the current generation; the field is not consulted there.
     pub lease_generation: u64,
+    /// The acquire-epoch (`LeaderState::acquired_transitions()` — the
+    /// Lease's `leaseTransitions` count recorded at the most recent
+    /// acquire edge or rebound) under which the actor enqueued this
+    /// request. The tenure discriminator that still moves when the
+    /// generation does not: once the recovery PG-floor seed has raised
+    /// the generation past `leaseTransitions + 1` (the permanent state
+    /// after a `kubectl delete lease`), `on_acquire`'s `fetch_max` is a
+    /// generation no-op on every subsequent holder change — an A→B→A
+    /// flap leaves `lease_generation` matching while the tenure that
+    /// enqueued this request has ended. `req_in_tenure` requires BOTH
+    /// stamps to match; a same-count re-acquire (a self-fence false
+    /// alarm followed by a successful renew, no holder change) moves
+    /// neither and deliberately keeps the request in tenure.
+    pub acquired_transitions: u64,
 }
 
 /// One execution's flushable content: the ring snapshot/drain plus, after a
@@ -601,11 +615,24 @@ impl LogFlusher {
         // reaps — refused-UPSERT, or sealed-empty once the stored-coverage
         // reconcile empties its ring (see `upload_and_record`).
         //
-        // generation() is monotone: bumped by on_acquire, raisable (never
-        // lowered) by recovery's seed_generation_from, untouched by
-        // on_lose — so `is_leader && generation == enqueue-time stamp` is
-        // exactly "the same unbroken tenure", including flaps too fast for
-        // any tick to observe the standby window.
+        // generation() is monotone: derived from the Lease's transition
+        // count by on_acquire's fetch_max, raisable (never lowered) by
+        // recovery's seed_generation_from, untouched by on_lose. It alone
+        // cannot identify the tenure: once the PG-floor seed has raised it
+        // past `leaseTransitions + 1` (the saturated post-lease-deletion
+        // regime), the fetch_max is a no-op even on a real holder change,
+        // so an A→B→A flap leaves it equal to the enqueue-time stamp. The
+        // pin therefore also compares the recorded acquire-epoch
+        // (`acquired_transitions`), which moves on every holder change the
+        // lease loop observes — through an acquire edge or a rebound —
+        // regardless of the generation. `is_leader && generation ==
+        // enqueue-time stamp && acquired_transitions == enqueue-time
+        // stamp` is exactly "the same unbroken tenure", including flaps
+        // too fast for any tick to observe the standby window; a
+        // same-count re-acquire (a self-fence false alarm followed by a
+        // successful renew — no holder change) moves neither stamp and
+        // deliberately keeps the request in tenure (same-epoch ⇒ the
+        // in-flight final is still this tenure's to resolve).
         // r[impl obs.log.deferred-final-retry+3]
         if !self.req_in_tenure(&req) {
             // The retained entry is left for its real owner: across an
@@ -1016,13 +1043,16 @@ impl LogFlusher {
 
     /// Whether `req` was enqueued by the leadership tenure this replica
     /// currently holds: leader AND the generation still equals the
-    /// enqueue-time stamp. The single definition of "in tenure" shared by
-    /// `flush_final`'s entry pin, its post-await re-checks, and
-    /// `retain_deferred`'s overflow gate (see the entry pin's comment for
-    /// why generation monotonicity makes this exactly "the same unbroken
-    /// tenure").
+    /// enqueue-time stamp AND the recorded acquire-epoch
+    /// (`acquired_transitions`) still equals the enqueue-time stamp. The
+    /// single definition of "in tenure" shared by `flush_final`'s entry
+    /// pin, its post-await re-checks, and `retain_deferred`'s overflow
+    /// gate (see the entry pin's comment for why the two stamps together
+    /// make this exactly "the same unbroken tenure").
     fn req_in_tenure(&self, req: &FlushRequest) -> bool {
-        self.leader.is_leader() && self.leader.generation() == req.lease_generation
+        self.leader.is_leader()
+            && self.leader.generation() == req.lease_generation
+            && self.leader.acquired_transitions() == req.acquired_transitions
     }
 
     /// Shared drop tail for a final whose tenure ended while `flush_final`
@@ -1117,8 +1147,12 @@ impl LogFlusher {
             // a second, legitimate final from the new tenure (recovery
             // restamps the same exec), and the older request is already dead
             // under the tenure check — keeping it would shadow the only
-            // request that can still finalize the row.
-            if existing.lease_generation != req.lease_generation {
+            // request that can still finalize the row. "Different tenure" is
+            // either stamp differing — in the saturated regime a holder
+            // change moves only the acquire-epoch, not the generation.
+            if existing.lease_generation != req.lease_generation
+                || existing.acquired_transitions != req.acquired_transitions
+            {
                 *existing = req;
             }
             return;
@@ -1283,6 +1317,7 @@ impl LogFlusher {
                 // self-driven and already behind `may_flush`); stamped for
                 // completeness.
                 lease_generation: self.leader.generation(),
+                acquired_transitions: self.leader.acquired_transitions(),
             };
 
             // Recovered-prefix handling (any later tenure of the same
@@ -2682,6 +2717,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -2758,6 +2794,7 @@ mod tests {
                 exec_id: Uuid::now_v7(),
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -2807,6 +2844,7 @@ mod tests {
                 exec_id: exec1,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -2834,6 +2872,7 @@ mod tests {
                 exec_id: exec2,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         let row: (Uuid, i64, Option<String>) =
@@ -2892,6 +2931,7 @@ mod tests {
                 exec_id: exec1,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert_eq!(puts.lock().unwrap().len(), 1, "stale final must not PUT");
@@ -2915,6 +2955,7 @@ mod tests {
                 exec_id: exec2,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         let rows: Vec<(Uuid, bool, Option<String>)> =
@@ -2986,6 +3027,7 @@ mod tests {
                 exec_id: exec1,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3010,6 +3052,7 @@ mod tests {
                 exec_id: exec2,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert!(
@@ -3055,6 +3098,7 @@ mod tests {
                 exec_id: Uuid::now_v7(),
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3166,6 +3210,7 @@ mod tests {
                 exec_id,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3244,6 +3289,7 @@ mod tests {
                 exec_id,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3351,6 +3397,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3444,6 +3491,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         let fin: (bool, String) =
@@ -3546,6 +3594,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         let baseline: (bool, String, Option<String>, i64, i64, Option<f64>) = sqlx::query_as(
@@ -3588,6 +3637,7 @@ mod tests {
                 exec_id,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3663,6 +3713,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert_eq!(puts.lock().unwrap().len(), 1, "fixture: B's final PUT");
@@ -3690,6 +3741,7 @@ mod tests {
                 exec_id,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3771,6 +3823,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert!(
@@ -3860,6 +3913,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -3978,6 +4032,7 @@ mod tests {
             exec_id,
             status: Some("succeeded".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         })
         .await?;
 
@@ -4073,6 +4128,7 @@ mod tests {
                 exec_id: exec_a,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert!(ret.is_none(), "nothing to retry for an empty entry");
@@ -4106,6 +4162,7 @@ mod tests {
                 exec_id: exec_old,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert!(
@@ -4160,6 +4217,7 @@ mod tests {
                     exec_id: Uuid::now_v7(),
                     status: None,
                     lease_generation: 1,
+                    acquired_transitions: 0,
                 },
             );
         }
@@ -4174,6 +4232,7 @@ mod tests {
                 exec_id: dup_exec,
                 status: None,
                 lease_generation: 1,
+                acquired_transitions: 0,
             },
         );
         assert_eq!(deferred.len(), DEFERRED_FINALS_MAX, "dedup by exec_id");
@@ -4193,6 +4252,7 @@ mod tests {
                 exec_id: dup_exec,
                 status: Some("cancelled".into()),
                 lease_generation: 2,
+                acquired_transitions: 1,
             },
         );
         assert_eq!(
@@ -4214,6 +4274,7 @@ mod tests {
                 exec_id: exec_o,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             },
         );
         assert_eq!(deferred.len(), DEFERRED_FINALS_MAX, "cap holds");
@@ -4258,6 +4319,7 @@ mod tests {
             exec_id: exec_v,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // The lease flaps; the same replica re-acquires and recovery
@@ -4288,6 +4350,7 @@ mod tests {
                     exec_id: Uuid::now_v7(),
                     status: None,
                     lease_generation: state.generation(),
+                    acquired_transitions: state.acquired_transitions(),
                 },
             );
         }
@@ -4365,6 +4428,7 @@ mod tests {
                 exec_id: exec1,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await
             .expect("non-empty entry + unreadable drv_logs ⇒ deferred and retained");
@@ -4438,6 +4502,7 @@ mod tests {
                     exec_id: exec2,
                     status: Some("succeeded".into()),
                     lease_generation: 1,
+                    acquired_transitions: 0,
                 })
                 .await
                 .is_none()
@@ -4509,6 +4574,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
         assert!(buffers.mark_final_pending(drv_path, exec_id));
 
@@ -4553,6 +4619,7 @@ mod tests {
                     exec_id,
                     status: Some("succeeded".into()),
                     lease_generation: state.generation(),
+                    acquired_transitions: state.acquired_transitions(),
                 })
                 .await
                 .is_none()
@@ -4653,6 +4720,7 @@ mod tests {
                 exec_id,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             },
         );
         assert!(buffers.mark_final_pending(drv_path, exec_id));
@@ -4788,6 +4856,7 @@ mod tests {
                 exec_id,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert!(ret.is_none(), "orphaned first attempt resolves as a drop");
@@ -4876,6 +4945,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
         // ...processed after a lose/re-acquire flap: tenure 2, leader again.
         state.on_lose();
@@ -4972,6 +5042,7 @@ mod tests {
             exec_id,
             status: Some("succeeded".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
         let partial_key = log_s3_key(drv_path, &exec_id, true);
         upsert_drv_log(
@@ -5083,6 +5154,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // The lease flaps (the terminal persist failed in the same outage);
@@ -5181,6 +5253,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // The lease flaps; the same replica re-acquires (generation 2). The
@@ -5265,6 +5338,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // The live tenure's row this stale final must not freeze: `.partial`
@@ -5394,6 +5468,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // Hold the guard SELECT open.
@@ -5528,6 +5603,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // The interim leader finalized this execution: drv_logs row frozen
@@ -5671,6 +5747,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // Only a periodic `.partial` row exists — no tenure finalized it.
@@ -5732,6 +5809,119 @@ mod tests {
         Ok(())
     }
 
+    /// Saturated-regime variant of the stale-tenure drop: once the
+    /// recovery PG-floor seed has raised the generation past
+    /// `leaseTransitions + 1` (the permanent state after a
+    /// `kubectl delete lease`), `on_acquire`'s `fetch_max` is a
+    /// generation no-op even on a real holder change — an A→B→A flap
+    /// leaves `generation()` equal to the enqueue-time stamp, so a
+    /// generation-only tenure pin would let the pre-flap final pass and
+    /// freeze a `drv_logs` row the interim tenure B extended. The pin
+    /// must also compare the recorded acquire-epoch
+    /// (`acquired_transitions`), which the apiserver moves on every
+    /// holder change regardless of the generation.
+    /// r[verify obs.log.deferred-final-retry+3]
+    #[tokio::test]
+    async fn stale_tenure_drop_fires_on_holder_change_with_saturated_generation()
+    -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (s3, puts, deletes) = mock_s3_capturing();
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/satgen1-saturated-flap.drv";
+        let drv_hash = "satgen1";
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+
+        // Saturated regime: a previous recovery seeded the generation from
+        // the PG floor far past `leaseTransitions + 1`.
+        let state = crate::lease::LeaderState::default();
+        state.seed_generation_from(10);
+
+        // Tenure A (generation 10, acquired at transition count 0): the
+        // worker streamed two lines, a cancel-class terminal sealed the
+        // entry and enqueued the final.
+        let exec_id = stamp_and_push(&buffers, drv_path, &[b"pre-flap l0", b"pre-flap l1"]);
+        buffers.seal(drv_path);
+        assert!(buffers.mark_final_pending(drv_path, exec_id));
+        let req = FlushRequest {
+            drv_path: drv_path.into(),
+            exec_id,
+            status: Some("cancelled".into()),
+            lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
+        };
+
+        // The interim leader B extended the stored row past A's ring and
+        // never finalized it.
+        let partial_key = log_s3_key(drv_path, &exec_id, true);
+        upsert_drv_log(
+            &db.pool,
+            exec_id,
+            drv_hash,
+            &partial_key,
+            0,
+            10,
+            1_000,
+            false,
+            None,
+        )
+        .await?;
+
+        // A→B→A: a real holder change (B acquired at transition count 1,
+        // A re-acquired at 2) whose generation fetch_max(3) is a no-op on
+        // the saturated generation 10.
+        state.on_lose();
+        state.on_acquire(2);
+        assert_eq!(
+            state.generation(),
+            req.lease_generation,
+            "fixture premise: the saturated generation does not move on the holder change"
+        );
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            state,
+        );
+        let ret = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            flusher.flush_final(req).await
+        };
+        assert!(ret.is_none(), "orphaned request resolves as a drop");
+
+        // Counted as a stale-tenure drop, with nothing written or deleted.
+        let counters = all_counters(&snap);
+        assert!(
+            counters
+                .iter()
+                .any(|(n, _, v)| n == "rio_scheduler_log_flush_stale_tenure_total" && *v >= 1),
+            "a holder change must break the tenure even when the generation \
+             is saturated: {counters:?}"
+        );
+        assert!(puts.lock().unwrap().is_empty(), "no S3 PUT");
+        assert!(
+            deletes.lock().unwrap().is_empty(),
+            "the live .partial must not be deleted"
+        );
+        let row: (bool, i64, Option<String>) = sqlx::query_as(
+            "SELECT is_complete, line_count, status FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(
+            !row.0,
+            "the interim tenure's row must not be frozen by the pre-flap final"
+        );
+        assert_eq!(row.1, 10, "stored coverage untouched");
+        assert_eq!(row.2, None, "no stale terminal status stamped");
+        Ok(())
+    }
+
     /// bug_009 (r18): the out-of-tenure drop arm performs ZERO PG work even
     /// for the sealed non-empty shape — during the very outage that orphans
     /// such requests, a row consult would serially burn a pool-acquire
@@ -5761,6 +5951,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
         state.on_lose();
         state.on_acquire(1);
@@ -5848,6 +6039,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         let final_key = log_s3_key(drv_path, &exec_id, false);
@@ -6058,6 +6250,7 @@ mod tests {
             exec_id,
             status: Some("cancelled".into()),
             lease_generation: state.generation(),
+            acquired_transitions: state.acquired_transitions(),
         };
 
         // The interim leader B durably extended the stored row past A's
@@ -6263,6 +6456,7 @@ mod tests {
                 exec_id,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert!(ret.is_none(), "request consumed, not retained");
@@ -6339,6 +6533,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             },
         );
         assert!(buffers.mark_final_pending(drv_path, exec_id));
@@ -6467,6 +6662,7 @@ mod tests {
                 exec_id,
                 status: Some("cancelled".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -6530,6 +6726,7 @@ mod tests {
                     exec_id,
                     status: Some("failed".into()),
                     lease_generation: 1,
+                    acquired_transitions: 0,
                 })
                 .await;
         }
@@ -6680,6 +6877,7 @@ mod tests {
                 exec_id: exec_fail,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
         assert_eq!(
@@ -6695,6 +6893,7 @@ mod tests {
                 exec_id: exec_ok,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -7568,6 +7767,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -7635,6 +7835,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -7909,6 +8110,7 @@ mod tests {
                 exec_id,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -7973,6 +8175,7 @@ mod tests {
                     exec_id,
                     status: Some("failed".into()),
                     lease_generation: 1,
+                    acquired_transitions: 0,
                 })
                 .await;
         }
@@ -8178,6 +8381,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -8376,6 +8580,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -8708,6 +8913,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -8787,6 +8993,7 @@ mod tests {
                 exec_id,
                 status: Some("failed".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 
@@ -8858,6 +9065,7 @@ mod tests {
                     exec_id,
                     status: Some("succeeded".into()),
                     lease_generation: 1,
+                    acquired_transitions: 0,
                 })
                 .await;
         }
@@ -8930,6 +9138,7 @@ mod tests {
                 exec_id,
                 status: Some("succeeded".into()),
                 lease_generation: 1,
+                acquired_transitions: 0,
             })
             .await;
 

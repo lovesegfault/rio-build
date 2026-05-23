@@ -359,15 +359,19 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_flush_stale_tenure_total",
-        "Final log-flush requests dropped because the scheduler lease moved (lost, or \
-         lost-and-reacquired) between the request's enqueue and its processing: the live \
-         leadership tenure owns that execution's finalization, and uploading the stale ring \
-         would freeze a drv_logs row the live tenure may still be extending. Counted for \
-         first attempts and retained-deferral retries alike. The execution's log is \
-         finalized by the live tenure's own terminal flush; if its terminal had already \
-         persisted before the outage (or the drv was re-dispatched under a new exec_id), \
-         the row instead stays at its .partial (is_complete=false) coverage — the bounded \
-         pre-retry loss."
+        "Final log-flush requests dropped because the scheduler leadership tenure that \
+         enqueued them ended before they were processed: the replica no longer holds the \
+         lease, its generation moved past the enqueue-time stamp, or the recorded \
+         acquire-epoch (the Lease's leaseTransitions count) moved — a holder change always \
+         breaks the tenure, even when the PG-floor-saturated generation does not move; a \
+         same-count re-acquire (self-fence false alarm) breaks neither and keeps the \
+         request. The live leadership tenure owns that execution's finalization, and \
+         uploading the stale ring would freeze a drv_logs row the live tenure may still be \
+         extending. Counted for first attempts and retained-deferral retries alike. The \
+         execution's log is finalized by the live tenure's own terminal flush; if its \
+         terminal had already persisted before the outage (or the drv was re-dispatched \
+         under a new exec_id), the row instead stays at its .partial (is_complete=false) \
+         coverage — the bounded pre-retry loss."
     );
     describe_counter!(
         "rio_scheduler_log_flush_finalize_deferred_total",

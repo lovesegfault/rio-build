@@ -657,6 +657,7 @@ impl DagActor {
             exec_id,
             status: Some(status.to_string()),
             lease_generation: self.leader.generation(),
+            acquired_transitions: self.leader.acquired_transitions(),
         })
     }
 

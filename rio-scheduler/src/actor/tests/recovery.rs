@@ -4557,6 +4557,7 @@ async fn test_orphan_completion_dropped_flush_discards_empty_buffer() -> TestRes
             exec_id: Uuid::now_v7(),
             status: None,
             lease_generation: 1,
+            acquired_transitions: 0,
         })
         .expect("pre-fill the only slot");
     // The seeded assignment row at the entry generation makes the
