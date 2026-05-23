@@ -443,13 +443,8 @@ impl MbtSystem {
         let last_renew = tokio::time::Instant::now()
             .checked_sub(blind_for)
             .expect("host uptime exceeds the model's clock ceiling");
-        let mut owe_cost_clear = false;
-        let fired = maybe_self_fence(
-            &h.state,
-            &mut h.was_leading,
-            &mut owe_cost_clear,
-            last_renew,
-        );
+        let marks_dirty = std::sync::atomic::AtomicBool::new(false);
+        let fired = maybe_self_fence(&h.state, &mut h.was_leading, &marks_dirty, last_renew);
         // The model's selfFence precondition is `leading[n] ∧ deadline
         // passed`; the tick mapping guarantees the implementation agrees
         // the deadline passed. A non-firing fence here is a driver or

@@ -84,10 +84,22 @@ async fn main() -> anyhow::Result<()> {
     // instance. spawn injects it into the actor via DagActorPlumbing,
     // REPLACING the actor's default Arc(1) — same init value,
     // shared reference.
+    // The leader pod label feeds the rio-scheduler-leader Service
+    // (helm scheduler.yaml): present on the leader's own pod, removed
+    // on lose, so that Service's endpoints are exactly the current
+    // leader. ClusterIP consumers that cannot retry a Trailers-Only
+    // Unavailable from the standby (the dashboard's nginx upstream)
+    // use it instead of the balanced channel.
     let lease_cfg = rio_scheduler::lease::LeaseConfig::from_parts(
         cfg.lease_name.clone(),
         cfg.lease_namespace.clone(),
-    );
+    )
+    .map(|c| {
+        c.with_leader_pod_label(
+            rio_scheduler::lease::LEADER_ROLE_LABEL,
+            rio_scheduler::lease::LEADER_ROLE_LEADER,
+        )
+    });
     // 1 is the generation FLOOR, not a base for an increment: every
     // writer (the lease loop's on_acquire, recovery's PG seed) is a
     // fetch_max that can only raise it. 0 is reserved as the proto

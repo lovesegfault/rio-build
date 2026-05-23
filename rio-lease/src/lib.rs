@@ -245,6 +245,24 @@ const _: () = {
     );
 };
 
+/// Annotation key the leader stamps on its own Pod so the ReplicaSet
+/// controller evicts the standby first during scale-down/RollingUpdate.
+/// See `spawn_patch_leader_marks` (private) / `sched.lease.deletion-cost`.
+pub const POD_DELETION_COST_ANNOTATION: &str = "controller.kubernetes.io/pod-deletion-cost";
+
+/// Label key marking the pod that currently holds the lease. Consumed by
+/// the `rio-scheduler-leader` Service selector (helm `scheduler.yaml`) so
+/// ClusterIP clients that cannot retry a Trailers-Only `Unavailable`
+/// (the dashboard's nginx upstream) only ever reach the leader.
+///
+/// The non-leader state is **label absent**, not `standby`: a Service
+/// selector can only match presence+value, and absence is the safe
+/// default for a pod that has never run the election loop.
+pub const LEADER_ROLE_LABEL: &str = "rio.build/scheduler-role";
+
+/// Value of [`LEADER_ROLE_LABEL`] on the current leader.
+pub const LEADER_ROLE_LEADER: &str = "leader";
+
 /// Lease configuration, built from the scheduler's loaded `Config`.
 ///
 /// `Option` because it's entirely optional — `None` means non-K8s
@@ -264,6 +282,16 @@ pub struct LeaseConfig {
     /// set by K8s). Written into `Lease.spec.holderIdentity` when
     /// we hold the lock — `kubectl get lease` shows who's leading.
     pub holder_id: String,
+    /// Optional `(key, value)` label the lease loop reconciles onto its
+    /// OWN Pod to mirror its leadership: present while leading, removed
+    /// (merge-patch `null`) while not. Level-triggered — re-patched on
+    /// every successful election round-trip until a patch lands, so a
+    /// dropped PATCH or an in-place container restart converges within
+    /// one tick. A leader-only Service selects on it (see
+    /// [`LEADER_ROLE_LABEL`]). `None` (the default, and what the
+    /// controller's nodeclaim-pool lease uses) → only the deletion-cost
+    /// annotation is patched.
+    pub leader_pod_label: Option<(String, String)>,
 }
 
 impl LeaseConfig {
@@ -303,7 +331,22 @@ impl LeaseConfig {
             lease_name,
             namespace,
             holder_id,
+            leader_pod_label: None,
         })
+    }
+
+    /// Reconcile `key: value` onto the leader's own Pod (present while
+    /// leading, absent otherwise). See the `leader_pod_label` field doc
+    /// and [`LEADER_ROLE_LABEL`]. Builder-style so
+    /// `from_parts(...).map(|c| c.with_leader_pod_label(...))` keeps the
+    /// `Option` chain at the call site.
+    pub fn with_leader_pod_label(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.leader_pod_label = Some((key.into(), value.into()));
+        self
     }
 }
 
@@ -904,8 +947,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     hooks: H,
     shutdown: rio_common::signal::Token,
 ) {
-    // Clone for pod-deletion-cost patching. LeaderElection::new
-    // takes ownership (wraps the client in Api<Lease>).
+    // Clone for leader-mark (pod-deletion-cost annotation + leader
+    // label) patching. LeaderElection::new takes ownership (wraps the
+    // client in Api<Lease>).
     let pod_patch_client = client.clone();
 
     let mut election = LeaderElection::new(
@@ -928,7 +972,26 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     );
 
     let mut was_leading = false;
-    let mut owe_cost_clear = false;
+    // Level-triggered pod-marks reconciliation. `true` means "this
+    // pod's leader marks (deletion-cost annotation + optional leader
+    // label) may not match its actual leadership — re-patch on the
+    // next reachable election round-trip". The label half is
+    // LOAD-BEARING for the dashboard data path (the leader-only
+    // Service selects on it), so a single dropped PATCH must not leave
+    // it wrong until the next leadership transition. Set on:
+    //   - startup (init true): an in-place container restart keeps the
+    //     pod object and its labels, so a previous incarnation's marks
+    //     may still be there. A genuinely fresh pod pays one no-op
+    //     PATCH (cost "0" ≡ absent label ≡ removing nothing).
+    //   - every acquire/lose transition, including the self-fence
+    //     (which cannot patch — the apiserver is unreachable — so the
+    //     flag IS the deferred debt the old `owe_cost_clear` carried).
+    //   - implicitly kept set by a failed or stale PATCH: the spawned
+    //     task clears it only when a patch succeeds AND the polarity it
+    //     wrote still matches the pod's leadership.
+    // Arc: the detached patch task owns a clone and clears it on
+    // success.
+    let marks_dirty = Arc::new(AtomicBool::new(true));
     let mut last_successful_renew = Instant::now();
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
@@ -953,7 +1016,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         if maybe_self_fence(
             &state,
             &mut was_leading,
-            &mut owe_cost_clear,
+            &marks_dirty,
             last_successful_renew,
         ) {
             hooks.on_lose();
@@ -988,26 +1051,6 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 };
                 let now_leading = leading_transitions.is_some();
 
-                // r[impl sched.lease.deletion-cost]
-                // Deferred deletion-cost clear: if we self-fenced
-                // while the apiserver was unreachable, the cost=0
-                // patch was owed but skipped (no connectivity).
-                // This is the first reachable observation since —
-                // pay the debt now. Level-triggered (not edge):
-                // `was_leading` was already flipped false by the
-                // self-fence so the lose-transition arm below will
-                // never see the edge. If we re-acquired before
-                // anyone else (`now_leading`), the acquire arm
-                // sets cost=1 anyway, so just drop the debt.
-                if std::mem::take(&mut owe_cost_clear) && !now_leading {
-                    spawn_patch_deletion_cost(
-                        pod_patch_client.clone(),
-                        cfg.namespace.clone(),
-                        cfg.holder_id.clone(),
-                        0,
-                    );
-                }
-
                 // Edge detection on (leading?, was_leading). Binding
                 // the transition count in the acquire pattern makes
                 // "acquired without a transition count to derive the
@@ -1035,22 +1078,14 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         );
 
                         // r[impl sched.lease.deletion-cost]
-                        // Annotate our own Pod with pod-deletion-cost=1.
-                        // K8s's ReplicaSet controller sorts by this when
-                        // picking which pod to kill during scale-down
-                        // (incl. RollingUpdate). Leader gets the higher
-                        // cost → k8s kills the standby first → no
-                        // leadership churn on rollout. Fire-and-forget:
-                        // the lease loop MUST NOT block (see below).
-                        // Patch failure is non-fatal — without the
-                        // annotation, k8s picks arbitrarily (rollout
-                        // still works, just with possible double-churn).
-                        spawn_patch_deletion_cost(
-                            pod_patch_client.clone(),
-                            cfg.namespace.clone(),
-                            cfg.holder_id.clone(),
-                            1,
-                        );
+                        // The leader marks (pod-deletion-cost=1 so K8s
+                        // kills the standby first on scale-down, plus
+                        // the optional leader label the
+                        // rio-scheduler-leader Service selects on) no
+                        // longer match this pod — the reconcile arm
+                        // after the edge match patches them this same
+                        // tick.
+                        marks_dirty.store(true, Ordering::SeqCst);
 
                         // r[impl sched.lease.non-blocking-acquire+2]
                         // Fire the per-component on-acquire hook
@@ -1094,15 +1129,15 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // leader-only gauges.
                         hooks.on_lose();
 
-                        // Clear deletion cost — we're standby now, K8s
-                        // should prefer to kill us over the new leader.
-                        spawn_patch_deletion_cost(
-                            pod_patch_client.clone(),
-                            cfg.namespace.clone(),
-                            cfg.holder_id.clone(),
-                            0,
-                        );
-                        owe_cost_clear = false;
+                        // The leader marks must be cleared — we're
+                        // standby now: K8s should prefer to kill us
+                        // over the new leader, and the leader-only
+                        // Service must stop routing to us (the
+                        // dashboard's RPCs would land here as
+                        // Trailers-Only Unavailable otherwise). The
+                        // reconcile arm after the edge match patches
+                        // this tick.
+                        marks_dirty.store(true, Ordering::SeqCst);
                     }
                     (Some(transitions), true) => {
                         // ---- Still leading ----
@@ -1128,10 +1163,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // re-recovery. Hook delivery is ordered
                         // (sched.lease.hook-order), so skipping the
                         // lose is about avoiding wasted work, not a
-                        // reordering hazard. No
-                        // spawn_patch_deletion_cost either — the cost
-                        // annotation is already 1 from the original
-                        // acquire. The count-coincidence ABA (the
+                        // reordering hazard. The leader marks are not
+                        // dirtied either — leadership polarity is
+                        // unchanged, so cost=1 and the leader label
+                        // already match. The count-coincidence ABA (the
                         // observed value lands back exactly on the
                         // recorded one) remains the accepted residual —
                         // see the recovery gate's entry-snapshot comment
@@ -1168,6 +1203,29 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // are never confirmed.
                 if now_leading {
                     state.confirm_leading_round(round);
+                }
+
+                // r[impl sched.lease.deletion-cost]
+                // Level-triggered leader-marks reconcile. Runs AFTER
+                // the edge detection so a transition on THIS tick
+                // patches the post-transition state (and the self-fence
+                // false-alarm pair — fence at the top of the tick, then
+                // a successful renew — never patches the label off).
+                // While dirty: one detached patch attempt per
+                // successful round-trip until one lands with a
+                // still-current polarity; steady state spawns nothing.
+                // Detached because the lease loop MUST NOT block on the
+                // pod PATCH (same constraint as the hooks).
+                if marks_dirty.load(Ordering::SeqCst) {
+                    spawn_patch_leader_marks(
+                        pod_patch_client.clone(),
+                        cfg.namespace.clone(),
+                        cfg.holder_id.clone(),
+                        cfg.leader_pod_label.clone(),
+                        now_leading,
+                        Arc::clone(&marks_dirty),
+                        state.is_leader_arc(),
+                    );
                 }
             }
             outcome @ (Ok(Err(_)) | Err(_)) => {
@@ -1212,7 +1270,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 if maybe_self_fence(
                     &state,
                     &mut was_leading,
-                    &mut owe_cost_clear,
+                    &marks_dirty,
                     last_successful_renew,
                 ) {
                     // Self-fence is a lose-transition: same on-lose
@@ -1268,7 +1326,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
 fn maybe_self_fence(
     state: &LeaderState,
     was_leading: &mut bool,
-    owe_cost_clear: &mut bool,
+    marks_dirty: &AtomicBool,
     last_successful_renew: Instant,
 ) -> bool {
     if *was_leading && last_successful_renew.elapsed() > SELF_FENCE_AFTER {
@@ -1279,25 +1337,94 @@ fn maybe_self_fence(
         );
         state.on_lose();
         *was_leading = false;
-        // No spawn_patch_deletion_cost here: can't reach apiserver.
-        // Record the debt so the FIRST reachable round-trip in
-        // run_lease_loop's Ok arm patches cost=0. The peer's cost=1
-        // doesn't clear OURS — without this deferred clear we'd stay
-        // tied at cost=1 with the new leader and the next
-        // RollingUpdate picks arbitrarily.
-        *owe_cost_clear = true;
+        // No spawn_patch_leader_marks here: the apiserver is
+        // unreachable. Mark the pod's leader marks dirty so the FIRST
+        // reachable round-trip in run_lease_loop's Ok arm reconciles
+        // them (cost=0, leader label removed — unless we re-acquired by
+        // then, in which case it re-asserts the leader marks). The
+        // peer's cost=1 doesn't clear OURS — without this deferred
+        // reconcile we'd stay tied at cost=1 with the new leader (next
+        // RollingUpdate picks arbitrarily) AND keep the leader label
+        // (the leader-only Service would route to two pods).
+        marks_dirty.store(true, Ordering::SeqCst);
         true
     } else {
         false
     }
 }
 
+/// Merge-patch body for [`spawn_patch_leader_marks`]. Pure so the JSON
+/// shape (and the merge-patch-`null`-removes-the-label encoding) is
+/// unit-testable without a mock apiserver.
+///
+/// - `leading=true`  → `pod-deletion-cost: "1"`, label = its value.
+/// - `leading=false` → `pod-deletion-cost: "0"`, label = `null`
+///   (RFC 7396: a `null` member in a JSON merge patch REMOVES the key,
+///   i.e. `kubectl label pod foo key-`). Absence — not `standby` — is
+///   the non-leader state, so a leader-only Service selector never
+///   matches a demoted pod.
+/// - `label=None` → no `labels` key at all (the controller's
+///   nodeclaim-pool lease has no leader Service).
+fn leader_marks_patch(
+    leading: bool,
+    label: Option<&(String, String)>,
+) -> k8s_openapi::serde_json::Value {
+    // The annotation value is a string (all k8s annotations are),
+    // parsed as int32 by the ReplicaSet controller. Invalid values
+    // sort as 0.
+    let cost = if leading { "1" } else { "0" };
+    match label {
+        Some((key, value)) => {
+            // Computed before the json! call: `if` expressions in the
+            // macro's value position confuse its tt-munching.
+            let label_value = if leading {
+                json!(value)
+            } else {
+                k8s_openapi::serde_json::Value::Null
+            };
+            json!({
+                "metadata": {
+                    "annotations": { POD_DELETION_COST_ANNOTATION: cost },
+                    "labels": { key.as_str(): label_value }
+                }
+            })
+        }
+        None => json!({
+            "metadata": {
+                "annotations": { POD_DELETION_COST_ANNOTATION: cost }
+            }
+        }),
+    }
+}
+
 // r[impl sched.lease.deletion-cost]
-/// Fire-and-forget PATCH on our own Pod's `controller.kubernetes.io/
-/// pod-deletion-cost` annotation. K8s's ReplicaSet controller sorts
-/// pods by this value (ascending) when deciding which to evict during
-/// scale-down --- including RollingUpdate surge reconciliation. Leader
-/// sets cost=1, standby sets cost=0, k8s kills the standby first.
+/// Detached PATCH of the leader marks on our own Pod:
+///
+/// - `controller.kubernetes.io/pod-deletion-cost`: K8s's ReplicaSet
+///   controller sorts pods by this value (ascending) when deciding
+///   which to evict during scale-down --- including RollingUpdate surge
+///   reconciliation. Leader sets cost=1, standby cost=0, so K8s kills
+///   the standby first.
+/// - The optional leader label (`cfg.leader_pod_label`, e.g.
+///   [`LEADER_ROLE_LABEL`]`=`[`LEADER_ROLE_LEADER`]): present on the
+///   leader, absent on the standby — the `rio-scheduler-leader` Service
+///   selects on it, so its endpoints are exactly the current leader.
+///
+/// One PATCH for both: they flip on the same transitions, and a single
+/// merge patch removes the partial-failure window (cost updated but
+/// label not).
+///
+/// Level-triggered, not fire-and-forget: the caller spawns this while
+/// `marks_dirty` is set, once per successful election round-trip. The
+/// task clears `marks_dirty` ONLY when the PATCH succeeds AND the
+/// polarity it wrote (`leading`) still matches the pod's current
+/// leadership; a failed patch leaves the flag set, and a patch of a
+/// since-stale polarity re-marks it dirty. Either way the next tick
+/// retries with the then-current state instead of leaving the marks
+/// wrong until the next leadership transition — the label is
+/// load-bearing for the dashboard data path (leader-only Service), so
+/// "wrong until the next transition" would be an unbounded outage, not
+/// a cosmetic blip.
 ///
 /// `tokio::spawn` because the lease loop MUST NOT block. A slow
 /// apiserver PATCH would stall the renew tick — the blocked loop can
@@ -1305,36 +1432,60 @@ fn maybe_self_fence(
 /// `STEAL_AFTER` of observed staleness — dual-leader. Same constraint
 /// as the LeaderAcquired actor send (see `run_lease_loop`).
 ///
-/// Merge patch (not Apply): we only touch one annotation key; Apply
-/// would need a fieldManager and a fuller object shape. Merge is
-/// `kubectl annotate --overwrite` semantics.
-fn spawn_patch_deletion_cost(client: kube::Client, namespace: String, pod_name: String, cost: i32) {
+/// Merge patch (not Apply): we only touch one annotation key and one
+/// label key; Apply would need a fieldManager and a fuller object
+/// shape. Merge is `kubectl annotate --overwrite` / `kubectl label
+/// --overwrite` semantics, and a `null` value removes the key.
+fn spawn_patch_leader_marks(
+    client: kube::Client,
+    namespace: String,
+    pod_name: String,
+    label: Option<(String, String)>,
+    leading: bool,
+    marks_dirty: Arc<AtomicBool>,
+    is_leader: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         let pods: Api<Pod> = Api::namespaced(client, &namespace);
-        // The annotation value is a string (all k8s annotations are),
-        // parsed as int32 by the ReplicaSet controller. Invalid
-        // values sort as 0.
-        let patch = json!({
-            "metadata": {
-                "annotations": {
-                    "controller.kubernetes.io/pod-deletion-cost": cost.to_string()
-                }
-            }
-        });
+        let patch = leader_marks_patch(leading, label.as_ref());
         match pods
             .patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
         {
-            Ok(_) => debug!(%pod_name, cost, "patched pod-deletion-cost"),
+            Ok(_) => {
+                debug!(%pod_name, leading, "patched pod leader marks");
+                // Clear the dirty flag ONLY if the polarity we just
+                // wrote is still the desired one; otherwise force
+                // another reconcile. Two in-flight patches can complete
+                // out of order (this one outlived RENEW_INTERVAL while
+                // a newer one with the opposite polarity overtook it):
+                // the late stale patch is what the apiserver ends up
+                // with, and the earlier current one already cleared the
+                // flag — without the `store(true)` here the WRONG marks
+                // would freeze until the next transition. Worst case
+                // this costs one redundant idempotent re-patch on the
+                // next tick.
+                if is_leader.load(Ordering::SeqCst) == leading {
+                    marks_dirty.store(false, Ordering::SeqCst);
+                } else {
+                    marks_dirty.store(true, Ordering::SeqCst);
+                }
+            }
             Err(e) => {
-                // Non-fatal: rollout still works, k8s just picks
-                // arbitrarily. RBAC missing `patch pods` is the
-                // likely cause — 403 Forbidden. VM tests don't
-                // catch this (k3s admin kubeconfig bypasses RBAC).
+                // marks_dirty stays set → the next successful election
+                // round-trip retries. A PERSISTENT failure (RBAC
+                // missing `patch pods` — 403; VM tests don't catch
+                // that, the k3s admin kubeconfig bypasses RBAC)
+                // therefore repeats this warning every tick — the
+                // steady stream in the logs is the operator signal.
+                // While it keeps failing: scale-down ordering is
+                // arbitrary (deletion-cost half) and the leader-only
+                // Service has no or stale endpoints, i.e. the dashboard
+                // is down (label half).
                 warn!(
-                    %pod_name, cost, error = %e,
-                    "failed to patch pod-deletion-cost (rollout still works, \
-                     k8s will pick arbitrarily during scale-down)"
+                    %pod_name, leading, error = %e,
+                    "failed to patch pod leader marks (deletion-cost + leader label); \
+                     retrying on the next election round-trip"
                 );
             }
         }
@@ -1752,12 +1903,12 @@ mod tests {
         state.set_recovery_complete(state.acquired_transitions());
 
         let mut was_leading = true;
-        let mut owe_cost_clear = false;
+        let marks_dirty = AtomicBool::new(false);
         // 20s ago > SELF_FENCE_AFTER (11s). Same back-dated Observed
         // pre-seeding as election.rs's steal-test fixtures.
         let last_renew = Instant::now() - Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
 
         assert!(fired, "self-fence should fire past SELF_FENCE_AFTER");
         assert!(
@@ -1786,12 +1937,12 @@ mod tests {
         state.set_recovery_complete(state.acquired_transitions());
 
         let mut was_leading = true;
-        let mut owe_cost_clear = false;
+        let marks_dirty = AtomicBool::new(false);
         // 10s ago < SELF_FENCE_AFTER (11s). Two failed ticks, lease
         // still validly held as far as we know.
         let last_renew = Instant::now() - Duration::from_secs(10);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
 
         assert!(!fired, "within SELF_FENCE_AFTER → no self-fence");
         assert!(
@@ -1812,56 +1963,161 @@ mod tests {
         // is_leader already false, recovery_complete already false.
 
         let mut was_leading = false;
-        let mut owe_cost_clear = false;
+        let marks_dirty = AtomicBool::new(false);
         let last_renew = Instant::now() - Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
 
         assert!(!fired, "not leading → no fence even past TTL");
         assert!(!state.is_leader.load(Ordering::Relaxed));
         assert!(!was_leading);
     }
 
-    /// Self-fence sets `owe_cost_clear` so the lease loop's first
-    /// reachable round-trip clears our pod-deletion-cost annotation.
-    /// Without the deferred clear, an ex-leader keeps cost=1 tied with
-    /// the new leader (peer's cost=1 patch doesn't touch OUR pod) and
-    /// the next RollingUpdate evicts arbitrarily — defeating
-    /// `r[sched.lease.deletion-cost]`. Regression: maybe_self_fence
-    /// previously consumed the `was_leading` edge without arranging
-    /// the deferred patch.
+    /// Self-fence sets `marks_dirty` so the lease loop's next reachable
+    /// round-trip reconciles our pod's leader marks (deletion-cost
+    /// annotation + leader label) — it cannot patch from inside the
+    /// fence, the apiserver is unreachable. Without the deferred
+    /// reconcile, an ex-leader keeps cost=1 tied with the new leader
+    /// (peer's cost=1 patch doesn't touch OUR pod) so the next
+    /// RollingUpdate evicts arbitrarily — defeating
+    /// `r[sched.lease.deletion-cost]` — AND keeps the leader label, so
+    /// the leader-only Service routes to two pods. Regression:
+    /// maybe_self_fence previously consumed the `was_leading` edge
+    /// without arranging the deferred patch.
     // r[verify sched.lease.deletion-cost]
     #[test]
-    fn self_fence_sets_owe_cost_clear() {
+    fn self_fence_sets_marks_dirty() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
         state.is_leader.store(true, Ordering::Relaxed);
         state.set_recovery_complete(state.acquired_transitions());
 
         let mut was_leading = true;
-        let mut owe_cost_clear = false;
+        let marks_dirty = AtomicBool::new(false);
         let last_renew = Instant::now() - Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
         assert!(fired);
         assert!(
-            owe_cost_clear,
-            "self-fence must record the owed cost=0 patch (apiserver unreachable now, \
-             so the lease loop pays it on first reachable round-trip)"
+            marks_dirty.load(Ordering::SeqCst),
+            "self-fence must mark the pod's leader marks dirty (apiserver unreachable \
+             now, so the lease loop reconciles them on the next reachable round-trip)"
         );
 
         // No-fire path leaves the flag untouched (a standby that never
-        // led has no cost to clear).
+        // led has no marks to reconcile).
         let standby = LeaderState::pending(Arc::new(AtomicU64::new(1)));
         let mut was_leading = false;
-        let mut owe_cost_clear = false;
+        let marks_dirty = AtomicBool::new(false);
         let fired = maybe_self_fence(
             &standby,
             &mut was_leading,
-            &mut owe_cost_clear,
+            &marks_dirty,
             Instant::now() - Duration::from_secs(20),
         );
         assert!(!fired);
-        assert!(!owe_cost_clear, "no-fire → no debt recorded");
+        assert!(
+            !marks_dirty.load(Ordering::SeqCst),
+            "no-fire → flag untouched"
+        );
+    }
+
+    // ---- Leader-marks patch body (deletion-cost + leader label) ----
+    //
+    // The detached PATCH itself has no mock-apiserver test (it is a
+    // tokio::spawn off the lease loop); the JSON body is the part that
+    // encodes the set/remove semantics, so that's what's pinned here.
+    // The dirty-flag plumbing (set on every transition, cleared only by
+    // a successful patch of a still-current polarity, retried every
+    // round-trip otherwise) stays inline in `run_lease_loop` /
+    // `spawn_patch_leader_marks`; the vm-dashboard-k3s EndpointSlice
+    // wait and the leader-election VM scenario's deletion-cost
+    // assertion are the end-to-end coverage for it.
+
+    /// Acquire: cost=1 and the label is present with its value.
+    // r[verify sched.lease.deletion-cost]
+    #[test]
+    fn leader_marks_patch_sets_label_on_acquire() {
+        let label = (
+            LEADER_ROLE_LABEL.to_string(),
+            LEADER_ROLE_LEADER.to_string(),
+        );
+        let p = leader_marks_patch(true, Some(&label));
+        assert_eq!(
+            p["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION],
+            json!("1")
+        );
+        assert_eq!(
+            p["metadata"]["labels"][LEADER_ROLE_LABEL],
+            json!(LEADER_ROLE_LEADER),
+            "leader label must be present with its value on acquire"
+        );
+    }
+
+    /// Lose / demote: cost=0 and the label key is EXPLICITLY null.
+    /// RFC 7396 merge-patch semantics: a null member removes the key.
+    /// An absent `labels` key here would leave the stale label in
+    /// place — the leader-only Service would keep routing to the
+    /// ex-leader.
+    #[test]
+    fn leader_marks_patch_nulls_label_on_lose() {
+        let label = (
+            LEADER_ROLE_LABEL.to_string(),
+            LEADER_ROLE_LEADER.to_string(),
+        );
+        let p = leader_marks_patch(false, Some(&label));
+        assert_eq!(
+            p["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION],
+            json!("0")
+        );
+        let labels = p["metadata"]["labels"]
+            .as_object()
+            .expect("labels map present on demote");
+        assert!(
+            labels.contains_key(LEADER_ROLE_LABEL),
+            "label key must be PRESENT (set to null) so the merge patch removes it"
+        );
+        assert!(
+            labels[LEADER_ROLE_LABEL].is_null(),
+            "label value must be null (= remove) on lose, not a 'standby' string"
+        );
+    }
+
+    /// No label configured (the controller's nodeclaim-pool lease):
+    /// the patch only carries the deletion-cost annotation — no
+    /// `labels` key at all, so we never touch another component's pod
+    /// labels.
+    #[test]
+    fn leader_marks_patch_omits_labels_when_unconfigured() {
+        for leading in [true, false] {
+            let p = leader_marks_patch(leading, None);
+            assert!(
+                p["metadata"].get("labels").is_none(),
+                "no leader_pod_label configured → no labels key in the patch"
+            );
+            assert_eq!(
+                p["metadata"]["annotations"][POD_DELETION_COST_ANNOTATION],
+                json!(if leading { "1" } else { "0" })
+            );
+        }
+    }
+
+    /// `with_leader_pod_label` round-trips through `LeaseConfig`, and
+    /// `from_parts` defaults to None (the controller path is unchanged).
+    #[test]
+    fn lease_config_leader_pod_label_default_and_builder() {
+        // HOSTNAME may or may not be set in the test environment;
+        // from_parts falls back to a UUID either way and this test
+        // only cares about the label field.
+        let cfg = LeaseConfig::from_parts(Some("lease".into()), Some("ns".into())).unwrap();
+        assert_eq!(cfg.leader_pod_label, None, "default: no label management");
+        let cfg = cfg.with_leader_pod_label(LEADER_ROLE_LABEL, LEADER_ROLE_LEADER);
+        assert_eq!(
+            cfg.leader_pod_label,
+            Some((
+                LEADER_ROLE_LABEL.to_string(),
+                LEADER_ROLE_LEADER.to_string()
+            ))
+        );
     }
 
     // ---- The loop's fence-check cadence (the NeverDual premise) ----
@@ -1920,6 +2176,7 @@ mod tests {
             lease_name: "rio-sched".into(),
             namespace: "default".into(),
             holder_id: "us".into(),
+            leader_pod_label: None,
         };
         let hooks = RecordingHooks::default();
         let shutdown = rio_common::signal::Token::new();
@@ -2028,6 +2285,7 @@ mod tests {
             lease_name: "rio-sched".into(),
             namespace: "default".into(),
             holder_id: "us".into(),
+            leader_pod_label: None,
         };
         let hooks = RecordingHooks::default();
         let shutdown = rio_common::signal::Token::new();
@@ -2119,6 +2377,7 @@ mod tests {
             lease_name: "rio-sched".into(),
             namespace: "default".into(),
             holder_id: "us".into(),
+            leader_pod_label: None,
         };
         let hooks = RecordingHooks::default();
         let shutdown = rio_common::signal::Token::new();
@@ -2174,6 +2433,7 @@ mod tests {
             lease_name: "rio-sched".into(),
             namespace: "default".into(),
             holder_id: "us".into(),
+            leader_pod_label: None,
         };
         let hooks = RecordingHooks::default();
         let shutdown = rio_common::signal::Token::new();
