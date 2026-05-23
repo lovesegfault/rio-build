@@ -121,14 +121,53 @@ impl StoreServiceImpl {
         let req = request.into_inner();
         validate_store_path(&req.store_path)?;
 
-        let (Some(sub), Some(tid)) = (self.substituter.clone(), tenant_id) else {
-            // No substituter or no tenant context — definitive miss,
-            // same as QueryPathInfo's `try_substitute_on_miss` returning
-            // None. Unary path returns NotFound; here the stream is the
-            // contract, so return an empty stream that immediately
-            // errors.
+        // Both preconditions surface as NotFound (the only caller is the
+        // scheduler's detached fetch, which maps any non-hit to "demote
+        // to build-from-source") — but they MUST be loud and they MUST
+        // be distinguishable from a genuine all-upstreams-missed
+        // NotFound. The status *message* is the only channel that
+        // reaches the scheduler's demotion log; the counter is the
+        // alertable signal. 2026-05-23: a bare "path not found" here
+        // was indistinguishable from a real upstream miss and hundreds
+        // of cache.nixos.org-cached paths were compiled from source.
+        let Some(sub) = self.substituter.clone() else {
+            warn!(
+                store_path = %req.store_path,
+                "SubstitutePath refused: substituter not configured on this replica"
+            );
+            metrics::counter!(
+                "rio_store_substitute_skipped_total",
+                "reason" => "disabled"
+            )
+            .increment(1);
             return Err(Status::not_found(format!(
-                "path not found (substitution disabled): {}",
+                "path not found (substituter not configured on this store replica): {}",
+                req.store_path
+            )));
+        };
+        let Some(tid) = tenant_id else {
+            // SubstitutePath is only ever called by the scheduler, which
+            // always intends to substitute — a request with no resolvable
+            // tenant is a misconfiguration (missing/invalid
+            // x-rio-service-token, missing x-rio-probe-tenant-id, or a
+            // build record with no tenant), never a normal miss. warn!,
+            // unlike the QueryPathInfo/GetPath miss path where anonymous
+            // callers are expected.
+            warn!(
+                store_path = %req.store_path,
+                "SubstitutePath refused: no tenant context on request \
+                 (need x-rio-tenant-token, or x-rio-probe-tenant-id + a \
+                 valid x-rio-service-token from an allowlisted caller)"
+            );
+            metrics::counter!(
+                "rio_store_substitute_skipped_total",
+                "reason" => "no_tenant"
+            )
+            .increment(1);
+            return Err(Status::not_found(format!(
+                "path not found (no tenant context on request — substitution \
+                 requires x-rio-tenant-token or x-rio-probe-tenant-id + \
+                 x-rio-service-token): {}",
                 req.store_path
             )));
         };

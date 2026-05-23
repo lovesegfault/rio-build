@@ -2618,7 +2618,7 @@ pub(super) async fn walk_substitute_closure(
                 )
                 .await
                 {
-                    Ok(Some(info)) => {
+                    Ok(info) => {
                         // Store-side cache-hit / AlreadyComplete returns
                         // here without ever calling `path_progress`, so
                         // `expected_total` must learn `nar_size` here too
@@ -2638,9 +2638,21 @@ pub(super) async fn walk_substitute_closure(
                         }
                         continue 'paths;
                     }
-                    Ok(None) => {
-                        warn!(path = %p, "detached substitute fetch: NotFound \
-                               (upstream HEAD probe lied?); demoting to cache-miss");
+                    Err(e) if e.code() == tonic::Code::NotFound => {
+                        // The consequence of this arm is "compile the
+                        // derivation (and its build closure) from
+                        // source", so the WHY must survive into the
+                        // log. `store_msg` is rio-store's own reason:
+                        // "no tenant context on request" / "substituter
+                        // not configured" mean the request never
+                        // reached cache.nixos.org (fix the auth chain
+                        // / config); a bare "path not found" means
+                        // every configured upstream definitively
+                        // missed (the HEAD probe and the GET really
+                        // did disagree). Indistinguishable before
+                        // 2026-05-23.
+                        warn!(path = %p, store_msg = e.message(),
+                              "detached substitute fetch: NotFound; demoting to cache-miss");
                         metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
                             .increment(1);
                         ok = false;

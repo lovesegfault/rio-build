@@ -205,6 +205,7 @@
     "rio_store_substitute_probe_cache_hits_total",
     "rio_store_substitute_probe_cache_misses_total",
     "rio_store_substitute_probe_ratelimited_total",
+    "rio_store_substitute_skipped_total",
     "rio_store_substitute_stale_reclaimed_total",
     "rio_store_substitute_total"
   ],
@@ -1242,6 +1243,11 @@
         "name": "rio_store_substitute_probe_ratelimited_total",
         "kind": "counter",
         "help": "Upstream HEAD/GET probes that returned 429, labeled by tenant. The rate-limited subset is retried (≤3 passes) after honoring Retry-After; concurrency is halved when >10% of a pass 429s."
+      },
+      {
+        "name": "rio_store_substitute_skipped_total",
+        "kind": "counter",
+        "help": "Substitution requests short-circuited WITHOUT contacting any upstream, labeled by reason (no_tenant: the request carried no resolvable tenant identity; no_upstreams: the tenant has zero tenant_upstreams rows; disabled: no substituter on this replica). Every skip degrades to a from-source build at the scheduler, so a sustained nonzero no_tenant/disabled rate means cache.nixos.org- cached paths are being compiled. Distinct from rio_store_substitute_total{result=miss}, which counts attempts that DID reach the upstreams and definitively missed. Granularity: no_tenant/disabled are per-request; no_upstreams is per singleflight leader (same as result=hit|miss)."
       },
       {
         "name": "rio_store_substitute_stale_reclaimed_total",
