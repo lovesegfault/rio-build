@@ -210,7 +210,7 @@ async fn get_derivation_logs_from_s3_fallback() -> anyhow::Result<()> {
 /// UUIDv7 is time-sortable). Two seeds, the request asks for "latest",
 /// and the chunk reports which exec it picked.
 ///
-/// `r[verify obs.log.exec-keyed]` — proves the latest-exec resolution
+/// `r[verify obs.log.exec-keyed+2]` — proves the latest-exec resolution
 /// the design promises: `rio-cli logs <drv>` works without a build_id
 /// or exec_id.
 #[tokio::test]

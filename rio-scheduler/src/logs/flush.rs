@@ -2553,7 +2553,7 @@ async fn upsert_drv_log(
 }
 
 // r[verify obs.log.periodic-flush]
-// r[verify obs.log.exec-keyed]
+// r[verify obs.log.exec-keyed+2]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2839,7 +2839,7 @@ mod tests {
     /// `status`, marked `is_complete=true`, and `push_for` from exec₂'s
     /// worker would land in nothing (entry gone). The whole re-dispatched
     /// log would be silently lost.
-    /// r[verify obs.log.exec-keyed]
+    /// r[verify obs.log.exec-keyed+2]
     #[tokio::test]
     async fn flush_final_stale_request_does_not_drain_redispatched_exec() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3185,7 +3185,7 @@ mod tests {
     /// stay visible), WITHOUT repointing `s3_key` at a `.log.zst` blob
     /// that was never uploaded and WITHOUT deleting the `.partial` blob
     /// (the only stored content).
-    /// r[verify obs.log.exec-keyed]
+    /// r[verify obs.log.exec-keyed+2]
     #[tokio::test]
     async fn flush_final_empty_drain_stamps_status_but_stays_incomplete() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -7208,7 +7208,7 @@ mod tests {
     /// to verify the "one TTL, no `is_complete` discriminator" rule —
     /// a 60-day-old `.partial`-only row (flusher crashed mid-write) is
     /// exactly as expired as a complete one.
-    // r[verify obs.log.exec-keyed]
+    // r[verify obs.log.exec-keyed+2]
     #[tokio::test]
     async fn gc_sweep_deletes_expired_logs_and_keeps_recent() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;

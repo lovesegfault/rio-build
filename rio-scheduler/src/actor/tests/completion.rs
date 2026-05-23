@@ -4072,7 +4072,7 @@ async fn completion_records_build_exec_correlation() -> TestResult {
 /// exec-keyed storage; the storage-key shape itself is verified in
 /// `logs/flush.rs` and `admin/tests/logs_tests.rs`.
 ///
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[tokio::test]
 async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -4158,7 +4158,7 @@ async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult
 /// inside it.
 ///
 /// r[verify sched.merge.exec-correlation+7]
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[tokio::test]
 async fn epilogue_skips_never_dispatched_drv() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -4465,7 +4465,7 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
 /// the (false) claim that cascaded ancestors "never executed".
 ///
 /// r[verify sched.merge.exec-correlation+7]
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[tokio::test]
 async fn cascade_finalizes_reset_ancestor_exec_log() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

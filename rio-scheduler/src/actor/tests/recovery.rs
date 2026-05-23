@@ -3974,7 +3974,7 @@ async fn test_recovery_repopulates_log_buffers_exec_id() -> TestResult {
 /// and `logs/{drv_hash}/{exec_id}.partial.log.zst` key, and `flush_final`
 /// later bakes them into the permanent blob.
 ///
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[tokio::test]
 async fn test_recovery_restamp_clears_stale_exec_lines() -> TestResult {
     let old_exec = Uuid::now_v7();
@@ -4393,7 +4393,7 @@ async fn test_orphan_completion_routes_log_through_epilogue() -> TestResult {
 /// `drv_logs` row to `is_complete=true`.
 ///
 /// r[verify sched.merge.exec-correlation+7]
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[tokio::test]
 async fn test_orphan_completion_preserves_ex_leader_log_tail() -> TestResult {
     use super::integration::{put_test_path, setup_inproc_store};

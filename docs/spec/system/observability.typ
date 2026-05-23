@@ -26,17 +26,32 @@ Metadata (S3 key, line counts, byte offsets, completion status, timestamps)
 is stored in the `drv_logs` PostgreSQL table for efficient seeking,
 pagination, and TTL retention.
 
-#r("obs.log.exec-keyed")[
+#r("obs.log.exec-keyed+2")[
   Build logs MUST be stored at `logs/{drv_hash}/{exec_id}.log.zst` keyed by
   per-execution UUIDv7. One blob and one PG row per execution regardless of
-  how many builds are interested in the derivation.
+  how many builds are interested in the derivation. The per-execution
+  isolation extends to the in-memory ring entry that feeds those artifacts:
+  re-stamping a derivation's entry with a different `exec_id` MUST clear the
+  prior execution's accumulated lines, seal, pending-final mark, and
+  recovered-prefix state rather than carry any of them into the new
+  execution's blob and row.
 ]
 
 A derivation is built once even if N builds want it (`sched.merge.dedup`), so
 keying by `(build_id, drv_hash)` would write N PG rows pointing at one blob ---
 or, in the prior model, N copies of the blob under N keys. Keying by
 `(drv_hash, exec_id)` stores the log once and lets `build_derivations.exec_id`
-carry the build↔execution correlation. Periodic snapshots get the `.partial`
+carry the build↔execution correlation. The ring buffer is keyed by
+derivation, not by execution, so the per-execution keying of the stored
+artifacts is only as honest as the entry's stamp: the dispatch path discards
+the prior entry before stamping a fresh execution, but recovery re-stamps an
+ex-leader's *retained* entry in place, and an interim leader may have
+re-dispatched the derivation under a new `exec_id` in between --- carrying
+the retained lines across that restamp would hand one execution's output to
+another execution's S3 key and `drv_logs` row. A same-`exec_id` re-stamp
+keeps the lines (a single lease flap with no interim re-dispatch; the
+still-streaming worker's execution must keep accumulating across it).
+Periodic snapshots get the `.partial`
 suffix and a `drv_logs` row with `is_complete = false`; the final flush
 overwrites the row, writes the non-`.partial` key, and best-effort deletes the
 snapshot. Both are swept by the same TTL.

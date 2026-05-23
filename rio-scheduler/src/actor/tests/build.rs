@@ -1095,7 +1095,7 @@ async fn test_cancel_signals_total_counts_delivered_only() -> TestResult {
 /// for a log that was actually streamed.
 ///
 /// r[verify sched.merge.exec-correlation+7]
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[rstest::rstest]
 #[case::running(DerivationStatus::Running)]
 #[case::assigned(DerivationStatus::Assigned)]
@@ -1239,7 +1239,7 @@ async fn cancel_running_drv_finalizes_log(#[case] from_status: DerivationStatus)
 /// no buffer, so the call would be a guaranteed no-op".
 ///
 /// r[verify sched.merge.exec-correlation+7]
-/// r[verify obs.log.exec-keyed]
+/// r[verify obs.log.exec-keyed+2]
 #[rstest::rstest]
 #[case::ready(DerivationStatus::Ready, DerivationStatus::DependencyFailed)]
 #[case::substituting(DerivationStatus::Substituting, DerivationStatus::Cancelled)]

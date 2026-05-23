@@ -70,7 +70,7 @@ pub fn drv_log_hash(s: &str) -> String {
 /// Construct the canonical S3 key for a derivation execution's log blob:
 /// `logs/{drv_hash}/{exec_id}.log.zst` (or `.partial.log.zst` for periodic
 /// snapshots). One blob per execution.
-// r[impl obs.log.exec-keyed]
+// r[impl obs.log.exec-keyed+2]
 ///
 /// The `logs/` segment is fixed (peer to rio-store's `chunks/` in the same
 /// bucket); rio assumes a dedicated bucket, so there is no configurable
@@ -497,7 +497,13 @@ impl LogBuffers {
         let mut entry = self.buffers.entry(key.clone()).or_default();
         if entry.exec_id.is_some() && entry.exec_id != Some(exec_id) {
             // Cross-exec restamp: the assignment was re-issued under a
-            // different exec_id while this entry sat retained. Bounded,
+            // different exec_id while this entry sat retained. Everything
+            // cleared here belongs to the execution being replaced —
+            // carrying any of it across would hand one execution's lines
+            // (or its seal, pending-final mark, or cached prefix) to the
+            // new execution's S3 key and drv_logs row.
+            // r[impl obs.log.exec-keyed+2]
+            // Bounded,
             // accepted data loss: everything the prior execution flushed
             // is already stored under its own exec_id; only the ≤30s
             // unflushed tail of an abandoned execution is dropped.
@@ -1806,6 +1812,7 @@ mod tests {
     /// re-dispatched the drv) clears it along with the rest of the prior
     /// execution's bookkeeping, so terminal cleanup goes back to bounding
     /// the NEW execution's buffer.
+    /// r[verify obs.log.exec-keyed+2]
     #[test]
     fn final_pending_mark_restamp_lifecycle() {
         let bufs = LogBuffers::new();
@@ -1852,6 +1859,7 @@ mod tests {
     /// execution's bookkeeping: the prior exec's final can no longer drain
     /// this entry, and a surviving seal would make push_for silently drop
     /// every batch of the NEW execution (bug_009, round 15).
+    /// r[verify obs.log.exec-keyed+2]
     #[test]
     fn seal_restamp_lifecycle() {
         let bufs = LogBuffers::new();
