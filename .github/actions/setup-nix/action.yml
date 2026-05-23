@@ -1,24 +1,18 @@
 name: Setup Nix
-description: Install Nix + configure rio-nix-cache via niks3-action
+description: Configure rio-nix-cache via niks3-action (nix ships in the runner image)
 inputs:
-  kvm:
-    description: Add kvm/nixos-test system-features
-    default: 'false'
   niks3-url:
     description: niks3 server URL (cache-config + push endpoint)
     default: http://niks3.niks3.svc.cluster.local:5751
 runs:
   using: composite
   steps:
-    # nix-installer-action's trust-runner-user builds
-    #   trusted-users = root $USER
-    # but ARC containers spawn steps without a login shell, so $USER
-    # is unset → only root is trusted → niks3-action's user-conf
-    # extra-substituters and post-build-hook are rejected by the
-    # daemon. Export it from getpwuid so the next step's $USER ref
-    # expands. Upstream: NixOS/nix-installer-action#12 (id -un).
-    - shell: bash
-      run: echo "USER=$(id -un)" >> "$GITHUB_ENV"
+    # Nix itself is baked into the ARC runner image (rio-infra:
+    # nix/runner-image.nix) as a single-user install owned by the
+    # runner uid: no installer download, no daemon, no trusted-users
+    # dance. KVM runners get `system-features = kvm` from a NIX_CONFIG
+    # env var on the pod (rio-infra: arc.tf), not from a workflow
+    # input.
 
     # Warm flake-input fetches (gitv3/tarball-cache) and the eval
     # cache. Restore-only: gen-matrix (ci.yml) is the canonical saver
@@ -32,42 +26,15 @@ runs:
         key: nix-eval-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
         restore-keys: nix-eval-${{ runner.os }}-${{ runner.arch }}-
 
-    # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
-    # 6b8548f includes PR#9 (--enable-flakes; the wrapped installer
-    # stopped enabling flakes by default) and PR#10 (skip udev write
-    # on container runners — what enable-kvm:false below worked around).
-    - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
-      with:
-        # Default is true; it writes a udev rule to /etc/udev/rules.d/
-        # which doesn't exist in ARC runner containers. We handle KVM
-        # ourselves: hostPath mount (arc.tf) + system-features below.
-        enable-kvm: false
-        # extra-conf lands verbatim in /etc/nix/nix.conf before the
-        # daemon launches. Substituters + post-build-hook are NOT set
-        # here — niks3-action below fetches them from /api/cache-config
-        # and writes extra-substituters via NIX_USER_CONF_FILES (additive
-        # to the default cache.nixos.org).
-        #
-        # experimental-features is set explicitly even though the action
-        # now passes --enable-flakes (PR#9) — the action's pin is on the
-        # wrapper, not the installer it downloads at runtime, so the
-        # default can shift again. Belt-and-suspenders.
-        extra-conf: |
-          experimental-features = nix-command flakes
-          max-jobs = auto
-          sandbox = true
-          ${{ inputs.kvm == 'true' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
-
     # post-build-hook + uploader + post-job drain. Fetches the
     # substituter URL + public key from /api/cache-config and writes
     # them via NIX_USER_CONF_FILES (so cache.nixos.org default is
     # preserved). Downloads its own SHA-pinned niks3 CLI. Degrades to
     # substituter-only on fork PRs (no id-token:write).
     #
-    # With the runner in trusted-users (pre-step above), the action's
-    # isTrustedUser() check passes → hook mode (per-derivation upload,
-    # built-paths-only) instead of storescan (drain-time diff that
-    # would re-push everything substituted from cache.nixos.org).
+    # The action's isTrustedUser() check passes because single-user
+    # nix's store owner is always trusted → hook mode (per-derivation
+    # upload, built-paths-only) instead of storescan.
     #
     - uses: Mic92/niks3-action@a3da573cc4d21634990e5f21391abe55ed49ec46 # v1.0.2
       with:
