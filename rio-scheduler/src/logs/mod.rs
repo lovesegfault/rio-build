@@ -300,6 +300,12 @@ impl LogBuffers {
         // before) so a single batch larger than RING_CAPACITY doesn't
         // leave the buffer empty — instead it keeps the tail of that
         // batch.
+        //
+        // Eviction only ever pops the FRONT, so the survivors stay a
+        // contiguous tail and the next flush's `first_line` (read off
+        // `lines.front()`) reveals exactly which head range was evicted —
+        // the disclosed head-loss channel of the line-conservation law.
+        // r[impl obs.log.line-conservation]
         while buf.lines.len() > RING_CAPACITY || buf.bytes > RING_BYTE_CAP {
             let Some((_, l)) = buf.lines.pop_front() else {
                 break;

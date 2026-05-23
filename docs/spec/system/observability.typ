@@ -86,6 +86,40 @@ Per-chunk `first_line_number` labels inside a gap-merged blob remain
 physical-index based --- exact labels would need per-segment metadata, which
 no current client justifies.
 
+#r("obs.log.line-conservation")[
+  Every log line a worker has delivered for an execution --- accepted by the
+  batch ingestion gates into that execution's ring-buffer entry --- MUST at
+  all times be present in the in-memory ring, present in the execution's
+  stored `drv_logs` coverage, or counted in the stored row's claimed line
+  span as a marked or unmarked gap. A delivered line MUST NOT leave all
+  three except through a loss channel the stored record itself discloses: a
+  recorded `first_line` above the execution's true first line (evicted or
+  superseded head loss), or an execution whose stored record never reaches
+  `is_complete = true` (an unflushed tail lost to a failover, a discarded
+  abandoned execution, or a retention-cap overflow).
+]
+
+This is the conservation law that the gap-span arithmetic, the ring's
+head-only eviction, the stored-coverage reconciliation, and the failover
+prefix recovery each preserve one piece of; the model phase checks the
+conjunction over the execution's delivered-so-far interval rather than any
+single piece. The pieces: the line/byte-cap eviction pops lines only off
+the ring's head, so the survivors stay a contiguous tail and the next
+flush's `first_line` reveals exactly what was evicted; the stored-coverage
+reconciliation drops ring lines only below a stored row's end --- where the
+durable copy supersedes them, or where a non-overlapping head falls below
+the folded prefix's own `first_line` and inside the failover budget; and
+the gap-merge fold counts every line between the folded prefix and the
+resumed ring in the row's span (marked in-band for the prefix-to-ring gap,
+unmarked for an interior hole), so the physical-vs-claimed divergence the
+read path answers with a full re-serve (`obs.log.gap-span`) and the
+incomplete indicator (`obs.log.incomplete-surfaced`) between them disclose
+every line the record does not physically hold. Lines a worker sends that
+the ingestion gates reject --- a sealed entry, a foreign executor,
+non-monotone numbering --- are never delivered into the entry and are
+outside this rule, as is the component telemetry covered by
+`obs.log.required-fields`.
+
 #r("obs.log.finalize-immutable")[
   Once an execution's `drv_logs` row has `is_complete = true`, its stored final
   blob and row content MUST NOT be overwritten or regressed by a later flush of

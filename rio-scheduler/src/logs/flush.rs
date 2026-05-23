@@ -1575,7 +1575,13 @@ impl LogFlusher {
                     // merge cannot un-cover durable content (overlapping
                     // lines are superseded; a non-overlapping head below
                     // the stored range is the prior tenure's ≤30s unflushed
-                    // tail — see the rustdoc).
+                    // tail — see the rustdoc). Conservation: every line
+                    // dropped here is either inside the stored range (the
+                    // durable copy now accounts for it) or below the folded
+                    // prefix's own `first_line` (disclosed head loss) — the
+                    // recovered-prefix fold is one of the three places a
+                    // line leaves the ring without reaching the store.
+                    // r[impl obs.log.line-conservation]
                     let (dropped_lines, dropped_bytes) =
                         self.buffers.truncate_below(drv_path, exec_id, stored_end);
                     info!(
@@ -1804,6 +1810,13 @@ impl LogFlusher {
                 line_count
             }
         };
+        // Gap-merge fold: the lines between the folded prefix's end and the
+        // ring's resumed start were delivered to a prior tenure and never
+        // flushed — they are gone from every ring and every blob, so the
+        // only account left is the row's claimed span (which counts them)
+        // and the in-band marker (which discloses them). This is the
+        // counted-gap leg of the line-conservation law.
+        // r[impl obs.log.line-conservation]
         let (eff_first_line, eff_line_count, eff_total_bytes, gap_marker) = match &recovered_prefix
         {
             Some(p) => {
