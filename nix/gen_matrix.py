@@ -15,17 +15,23 @@
 # graph). No flake checkout-eval in the build jobs.
 #
 # Outputs written to $GITHUB_OUTPUT (one `key=json` line each):
-#   warm            {"checks": "/nix/store/a.drv /nix/store/b.drv",
-#                    "fuzz": "", ...}
-#                   Per kind, the drvs needed by >=2 of that kind's
-#                   clusters -- the shared trunk the warm-<kind> job
-#                   realises before the kind's matrix fans out. Empty
-#                   string -> nothing shared -> warm job skipped.
+#   warm            [{"name": "checks+vm-test",
+#                     "drvs": "/nix/store/a.drv /nix/store/b.drv"}]
+#                   The GLOBAL trunk (drvs needed by >=2 clusters of
+#                   any kind), partitioned into dependency-closed
+#                   components and packed into at most
+#                   MAX_WARM_SHARDS matrix entries. One warm matrix
+#                   job realises all shards in parallel before the
+#                   gated fan-out starts. [] -> nothing shared ->
+#                   warm skipped. Counting globally (not per kind)
+#                   is what stops two warm runners from racing to
+#                   build the member libs that both the check
+#                   clusters and the docker images need.
 #   checks          [{"name": "rio-store",
 #                     "targets": "clippy-rio-store nextest-rio-store",
 #                     "drvs": "/nix/store/x.drv /nix/store/y.drv"}]
 #                   Clusters whose members need something from the
-#                   warm set -- they gate on warm-checks.
+#                   trunk -- they gate on the warm matrix.
 #   checks-nowait   Same shape; clusters with NO overlap with the
 #                   warm set. They start as soon as gen-matrix
 #                   finishes (treefmt feedback does not wait for the
@@ -88,6 +94,14 @@ CHECK_KIND_RE = re.compile(r"^(clippy-test|clippy|doc|nextest)-(.+)$")
 
 # All matrix kinds, in stable emission order.
 MATRIX_KINDS = ("checks", "fuzz", "vm-test", "coverage")
+
+# Upper bound on warm matrix width. The trunk usually decomposes into
+# 2-4 independent components (the normal tree + images, the
+# instrumented tree, the fuzz workspaces), each of which gets its own
+# runner; more components than this get packed together. Raising it
+# only helps when the trunk has more genuinely independent components
+# than this, which would be unusual for this dependency graph.
+MAX_WARM_SHARDS = 4
 
 
 def parse_results(lines):
@@ -159,21 +173,119 @@ def cluster_needed(cluster, meta):
     return needed
 
 
-def shared_drvs(clusters, meta):
-    """Drvs appearing in >=2 clusters' needed-sets, sorted.
+def global_trunk(kind_clusters, kind_meta):
+    """Drvs needed by >=2 clusters ACROSS ALL KINDS, as a set.
 
-    This is the kind's warm set: build these once in the warm job and
-    every cluster that needs them substitutes instead of rebuilding.
+    This is the warm stage's work list: build these once and every
+    cluster that needs them substitutes instead of rebuilding. The
+    count is global, not per-kind, because the kinds' closures
+    overlap (the docker images embed the same member libs the check
+    clusters link against; on a dep bump both rustc profiles need the
+    same third-party crates) and a per-kind count would assign the
+    overlap to several warm jobs that then race to build it.
+
     Drvs needed by only ONE cluster are left to that cluster's job --
-    warming them would serialize the cluster behind the warm job for
-    no dedup benefit. A kind with a single uncached cluster therefore
-    has an empty warm set.
+    warming them would serialize the cluster behind the warm stage
+    for no dedup benefit.
     """
     counts = defaultdict(int)
-    for cluster in clusters:
-        for drv in cluster_needed(cluster, meta):
-            counts[drv] += 1
-    return sorted(drv for drv, n in counts.items() if n >= 2)
+    for kind, clusters in kind_clusters.items():
+        for cluster in clusters:
+            for drv in cluster_needed(cluster, kind_meta[kind]):
+                counts[drv] += 1
+    return {drv for drv, n in counts.items() if n >= 2}
+
+
+def trunk_components(trunk, kind_clusters, kind_meta):
+    """Partition the trunk into co-occurrence components.
+
+    Two trunk drvs are connected iff some cluster needs both.
+    neededBuilds is closed under uncached-dependency, so every
+    dependency edge inside the trunk is also a co-occurrence edge --
+    which makes each component dependency-closed: no component ever
+    needs a drv from another component, so components can build on
+    separate runners concurrently with zero cross-talk.
+
+    Returns [{"drvs": frozenset, "kinds": frozenset}] sorted largest
+    first. `kinds` is the set of matrix kinds whose clusters touch
+    the component -- it exists purely to give the warm shard a
+    human-readable name in the GHA UI.
+    """
+    parent = {drv: drv for drv in trunk}
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    kinds_touching = defaultdict(set)
+    for kind, clusters in kind_clusters.items():
+        for cluster in clusters:
+            shared = cluster_needed(cluster, kind_meta[kind]) & trunk
+            if not shared:
+                continue
+            it = iter(shared)
+            first = next(it)
+            for drv in it:
+                parent[find(drv)] = find(first)
+            kinds_touching[find(first)].add(kind)
+
+    groups = defaultdict(set)
+    for drv in trunk:
+        groups[find(drv)].add(drv)
+    comps = [
+        {
+            "drvs": frozenset(drvs),
+            # kinds_touching is keyed by a root that may have been
+            # re-parented by a later union; re-resolve every root.
+            "kinds": frozenset(
+                kind
+                for root, kinds in kinds_touching.items()
+                if find(root) == find(next(iter(drvs)))
+                for kind in kinds
+            ),
+        }
+        for drvs in groups.values()
+    ]
+    return sorted(
+        comps, key=lambda c: (-len(c["drvs"]), sorted(c["drvs"]))
+    )
+
+
+def pack_shards(comps, max_shards):
+    """LPT-pack components into at most max_shards warm matrix
+    entries: [{"name": "checks+vm-test", "drvs": "a.drv b.drv"}].
+
+    One shard per component when there are few components (the common
+    case: the normal tree + images, the instrumented tree, the fuzz
+    tree). More components than slots -> largest-first into the
+    currently-lightest shard, which keeps max(shard) within 4/3 of
+    optimal. Components are never split: splitting one would put a
+    drv's dependency in a sibling shard that runs concurrently.
+    """
+    if not comps:
+        return []
+    bins = [
+        {"drvs": set(), "kinds": set()}
+        for _ in range(min(len(comps), max_shards))
+    ]
+    # comps arrive largest-first from trunk_components; keep that
+    # order so LPT's approximation bound holds.
+    for comp in comps:
+        target = min(bins, key=lambda b: len(b["drvs"]))
+        target["drvs"] |= comp["drvs"]
+        target["kinds"] |= comp["kinds"]
+    return [
+        {
+            "name": "+".join(sorted(b["kinds"])) or "trunk",
+            "drvs": " ".join(sorted(b["drvs"])),
+        }
+        for b in bins
+        if b["drvs"]
+    ]
 
 
 def attach_drvs(clusters, meta):
@@ -290,20 +402,28 @@ def build_outputs(results):
         "vm-test": singletons,
         "coverage": cluster_coverage,
     }
-    matrices = {}
-    warm = {}
+    # Cluster every kind first: the trunk analysis is global, so it
+    # needs the full cluster list before any kind's matrix can be
+    # finalized.
+    kind_clusters = {
+        kind: clusterers[kind](sorted(pend.get(kind, {})))
+        for kind in MATRIX_KINDS
+    }
+    trunk = global_trunk(kind_clusters, pend)
+    shards = pack_shards(
+        trunk_components(trunk, kind_clusters, pend), MAX_WARM_SHARDS
+    )
+    matrices = {"warm": shards}
     for kind in MATRIX_KINDS:
         meta = pend.get(kind, {})
-        clusters = clusterers[kind](sorted(meta))
-        shared = shared_drvs(clusters, meta)
-        warm[kind] = " ".join(shared)
+        clusters = kind_clusters[kind]
         if kind == "checks":
-            gated, nowait = partition_gated(clusters, meta, set(shared))
+            gated, nowait = partition_gated(clusters, meta, trunk)
             matrices["checks"] = attach_drvs(gated, meta)
             matrices["checks-nowait"] = attach_drvs(nowait, meta)
         else:
             matrices[kind] = attach_drvs(clusters, meta)
-    outputs = {"warm": json.dumps(warm, separators=(",", ":"))}
+    outputs = {}
     for key, value in matrices.items():
         outputs[key] = json.dumps(value, separators=(",", ":"))
     outputs["coverage-paths"] = json.dumps(
@@ -450,10 +570,9 @@ def main():
         r["attr"] for r in results if r.get("cacheStatus") == "cached"
     )
     print(f"::notice::cached (skipped): {json.dumps(skipped)}")
-    warm = json.loads(outputs["warm"])
-    for kind, drvs in warm.items():
-        n = len(drvs.split()) if drvs else 0
-        print(f"::notice::warm {kind}: {n} shared drvs")
+    for shard in json.loads(outputs["warm"]):
+        n = len(shard["drvs"].split())
+        print(f"::notice::warm {shard['name']}: {n} shared drvs")
     for key in ("checks", "checks-nowait", "fuzz", "vm-test", "coverage"):
         print(f"::notice::{key}: {outputs[key]}")
 
@@ -543,52 +662,168 @@ def _meta(**entries):
     }
 
 
-class SharedDrvsTests(unittest.TestCase):
-    def test_drv_in_two_clusters_is_shared(self):
-        clusters = [
-            {"name": "a", "targets": "a"},
-            {"name": "b", "targets": "b"},
+def _kinded(**kinds):
+    """Shorthand for (kind_clusters, kind_meta) from
+    _kinded(checks=[("a", {"/d/x.drv"}), ...], ...). Each entry is a
+    singleton cluster named after itself."""
+    kind_clusters, kind_meta = {}, {}
+    for kind, entries in kinds.items():
+        kind_clusters[kind] = [
+            {"name": n, "targets": n} for n, _ in entries
         ]
-        meta = _meta(a=({"/d/dep.drv"}, "/d/a.drv"), b=({"/d/dep.drv"}, "/d/b.drv"))
-        self.assertEqual(shared_drvs(clusters, meta), ["/d/dep.drv"])
+        kind_meta[kind] = {
+            n: {"drv": f"/d/{n}.drv", "needed": frozenset(needed)}
+            for n, needed in entries
+        }
+    return kind_clusters, kind_meta
+
+
+class GlobalTrunkTests(unittest.TestCase):
+    def test_sharing_counts_across_kinds(self):
+        # The member lib is needed by one CHECK cluster and one VM
+        # cluster. A per-kind count would see 1+1 and never warm it;
+        # the global count sees 2 and does. This is the bug class
+        # that had two warm jobs racing to build the same members.
+        kc, km = _kinded(
+            checks=[("clippy-rio-common", {"/d/member.drv"})],
+            **{"vm-test": [("vm-chaos", {"/d/member.drv", "/d/img.drv"})]},
+        )
+        self.assertEqual(global_trunk(kc, km), {"/d/member.drv"})
 
     def test_intra_cluster_sharing_is_not_warmed(self):
         # Both members of ONE cluster need dep.drv; no other cluster
         # does. The cluster's single nix invocation already builds it
         # once -- warming it would only serialize this cluster behind
-        # the warm job.
-        clusters = [
-            {"name": "rio-store", "targets": "clippy-rio-store nextest-rio-store"},
-            {"name": "rio-nix", "targets": "clippy-rio-nix"},
-        ]
-        meta = _meta(**{
-            "clippy-rio-store": ({"/d/store-deps.drv"}, "/d/c.drv"),
-            "nextest-rio-store": ({"/d/store-deps.drv"}, "/d/n.drv"),
-            "clippy-rio-nix": ({"/d/nix-deps.drv"}, "/d/x.drv"),
-        })
-        self.assertEqual(shared_drvs(clusters, meta), [])
-
-    def test_single_cluster_kind_has_empty_warm_set(self):
-        clusters = [{"name": "a", "targets": "a"}]
-        meta = _meta(a=({"/d/dep.drv"}, "/d/a.drv"))
-        self.assertEqual(shared_drvs(clusters, meta), [])
-
-    def test_entry_own_drv_can_be_shared(self):
-        # vm tests embed the docker images; the image drv appears in
-        # every vm entry's neededBuilds and must land in the warm set.
-        clusters = [
-            {"name": "vm-a", "targets": "vm-a"},
-            {"name": "vm-b", "targets": "vm-b"},
-            {"name": "vm-c", "targets": "vm-c"},
-        ]
-        meta = _meta(
-            **{
-                "vm-a": ({"/d/img.drv", "/d/a-only.drv"}, "/d/a.drv"),
-                "vm-b": ({"/d/img.drv"}, "/d/b.drv"),
-                "vm-c": (set(), "/d/c.drv"),
+        # the warm stage.
+        kc, km = _kinded(checks=[])
+        kc["checks"] = [
+            {
+                "name": "rio-store",
+                "targets": "clippy-rio-store nextest-rio-store",
             }
+        ]
+        km["checks"] = {
+            "clippy-rio-store": {
+                "drv": "/d/c.drv",
+                "needed": frozenset({"/d/store-deps.drv"}),
+            },
+            "nextest-rio-store": {
+                "drv": "/d/n.drv",
+                "needed": frozenset({"/d/store-deps.drv"}),
+            },
+        }
+        self.assertEqual(global_trunk(kc, km), set())
+
+    def test_single_cluster_total_has_empty_trunk(self):
+        kc, km = _kinded(checks=[("a", {"/d/dep.drv"})])
+        self.assertEqual(global_trunk(kc, km), set())
+
+
+class ComponentTests(unittest.TestCase):
+    def test_disjoint_closures_are_separate_components(self):
+        # The normal tree (checks+vm) and the instrumented tree
+        # (coverage) never appear in the same cluster's needs ->
+        # independent components -> separate warm runners.
+        kc, km = _kinded(
+            checks=[
+                ("clippy-a", {"/d/member.drv"}),
+                ("clippy-b", {"/d/member.drv"}),
+            ],
+            coverage=[
+                ("unit", {"/d/member-cov.drv"}),
+                ("vm-x", {"/d/member-cov.drv"}),
+            ],
         )
-        self.assertEqual(shared_drvs(clusters, meta), ["/d/img.drv"])
+        trunk = global_trunk(kc, km)
+        comps = trunk_components(trunk, kc, km)
+        self.assertEqual(
+            sorted(sorted(c["drvs"]) for c in comps),
+            [["/d/member-cov.drv"], ["/d/member.drv"]],
+        )
+        self.assertEqual(
+            sorted(sorted(c["kinds"]) for c in comps),
+            [["checks"], ["coverage"]],
+        )
+
+    def test_co_occurrence_bridges_into_one_component(self):
+        # The image depends on the member, so any vm cluster's needs
+        # contain both -> they must land in the same shard (a shard
+        # cannot substitute a sibling shard's output).
+        kc, km = _kinded(
+            checks=[
+                ("clippy-a", {"/d/member.drv"}),
+                ("clippy-b", {"/d/member.drv"}),
+            ],
+            **{
+                "vm-test": [
+                    ("vm-x", {"/d/member.drv", "/d/img.drv"}),
+                    ("vm-y", {"/d/img.drv"}),
+                ]
+            },
+        )
+        trunk = global_trunk(kc, km)
+        comps = trunk_components(trunk, kc, km)
+        self.assertEqual(len(comps), 1)
+        self.assertEqual(comps[0]["drvs"], frozenset({"/d/member.drv", "/d/img.drv"}))
+        self.assertEqual(comps[0]["kinds"], frozenset({"checks", "vm-test"}))
+
+    def test_components_sorted_largest_first(self):
+        kc, km = _kinded(
+            checks=[
+                ("a", {"/d/x.drv"}),
+                ("b", {"/d/x.drv"}),
+            ],
+            fuzz=[
+                ("f1", {"/d/p.drv", "/d/q.drv", "/d/r.drv"}),
+                ("f2", {"/d/p.drv", "/d/q.drv", "/d/r.drv"}),
+            ],
+        )
+        comps = trunk_components(global_trunk(kc, km), kc, km)
+        self.assertEqual(
+            [len(c["drvs"]) for c in comps], [3, 1]
+        )
+
+
+class PackTests(unittest.TestCase):
+    @staticmethod
+    def _comp(kinds, *drvs):
+        return {"drvs": frozenset(drvs), "kinds": frozenset(kinds)}
+
+    def test_one_shard_per_component_when_room(self):
+        comps = [
+            self._comp({"checks", "vm-test"}, "/d/a.drv", "/d/b.drv"),
+            self._comp({"coverage"}, "/d/c.drv"),
+        ]
+        self.assertEqual(
+            pack_shards(comps, 4),
+            [
+                {"name": "checks+vm-test", "drvs": "/d/a.drv /d/b.drv"},
+                {"name": "coverage", "drvs": "/d/c.drv"},
+            ],
+        )
+
+    def test_overflow_packs_into_lightest_shard(self):
+        comps = [
+            self._comp({"checks"}, "/d/a.drv", "/d/b.drv", "/d/c.drv"),
+            self._comp({"coverage"}, "/d/d.drv", "/d/e.drv"),
+            self._comp({"fuzz"}, "/d/f.drv"),
+        ]
+        shards = pack_shards(comps, 2)
+        self.assertEqual(len(shards), 2)
+        # Largest component alone in shard 0; the two smaller ones
+        # packed together in shard 1 (3 vs 2+1).
+        self.assertEqual(
+            sorted(s["drvs"].split() for s in shards),
+            [
+                ["/d/a.drv", "/d/b.drv", "/d/c.drv"],
+                ["/d/d.drv", "/d/e.drv", "/d/f.drv"],
+            ],
+        )
+        merged = next(s for s in shards if "/d/f.drv" in s["drvs"])
+        self.assertEqual(merged["name"], "coverage+fuzz")
+
+    def test_empty_components_empty_shards(self):
+        self.assertEqual(pack_shards([], 4), [])
 
 
 class AttachPartitionTests(unittest.TestCase):
@@ -749,21 +984,22 @@ class OutputTests(unittest.TestCase):
         )
 
     def test_build_outputs_end_to_end(self):
-        trunk = "/d/rio-common-build.drv"
+        member = "/d/rio-common-build.drv"
+        img = "/d/docker-img.drv"
+        cov = "/d/rio-common-cov.drv"
         results = [
-            # Two crates' clippy both need the trunk drv -> it is
-            # shared across two clusters -> warm set for checks.
+            # Two crates' clippy both need the member drv -> shared.
             _entry(
                 "checks.clippy-rio-nix",
                 "notBuilt",
                 drv="/d/clippy-rio-nix.drv",
-                needed=[trunk, "/d/clippy-rio-nix.drv"],
+                needed=[member, "/d/clippy-rio-nix.drv"],
             ),
             _entry(
                 "checks.clippy-rio-store",
                 "notBuilt",
                 drv="/d/clippy-rio-store.drv",
-                needed=[trunk, "/d/clippy-rio-store.drv"],
+                needed=[member, "/d/clippy-rio-store.drv"],
             ),
             # treefmt needs nothing from the trunk -> nowait.
             _entry(
@@ -773,15 +1009,54 @@ class OutputTests(unittest.TestCase):
                 needed=["/d/treefmt.drv"],
             ),
             _entry("checks.doc-rio-nix", "cached"),
+            # Two VM tests need the image, which needs the member ->
+            # the member and the image co-occur -> one component
+            # spanning checks and vm-test.
+            _entry(
+                "vm-test.vm-a",
+                "notBuilt",
+                drv="/d/vm-a.drv",
+                needed=[member, img, "/d/vm-a.drv"],
+            ),
+            _entry(
+                "vm-test.vm-b",
+                "notBuilt",
+                drv="/d/vm-b.drv",
+                needed=[member, img, "/d/vm-b.drv"],
+            ),
+            # The unit cluster and a vm-* coverage cluster both need
+            # the instrumented member (the cov image embeds it) --
+            # two distinct clusters -> trunk -> its own component,
+            # disjoint from the normal tree.
+            _entry(
+                "coverage.unit-rio-nix",
+                "notBuilt",
+                drv="/d/unit-rio-nix.drv",
+                needed=[cov],
+                out="/nix/store/aaa",
+            ),
+            _entry(
+                "coverage.vm-chaos-standalone",
+                "notBuilt",
+                drv="/d/cov-vm-chaos.drv",
+                needed=[cov],
+                out="/nix/store/bbb",
+            ),
             # Single uncached fuzz entry -> nothing shared -> no warm.
             _entry("fuzz.fuzz-refscan", "notBuilt", drv="/d/refscan.drv"),
-            _entry("vm-test.vm-chaos-standalone", "cached"),
-            _entry("coverage.unit-rio-nix", "cached", out="/nix/store/aaa"),
         ]
         out = build_outputs(results)
+        # Two shards: the normal tree (member+img, largest first) and
+        # the instrumented tree.
         self.assertEqual(
             json.loads(out["warm"]),
-            {"checks": trunk, "fuzz": "", "vm-test": "", "coverage": ""},
+            [
+                {
+                    "name": "checks+vm-test",
+                    "drvs": f"{img} {member}",
+                },
+                {"name": "coverage", "drvs": cov},
+            ],
         )
         self.assertEqual(
             json.loads(out["checks"]),
@@ -812,11 +1087,14 @@ class OutputTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(json.loads(out["vm-test"]), [])
-        self.assertEqual(json.loads(out["coverage"]), [])
+        self.assertEqual(len(json.loads(out["vm-test"])), 2)
+        self.assertEqual(len(json.loads(out["coverage"])), 2)
         self.assertEqual(
             json.loads(out["coverage-paths"]),
-            {"unit-rio-nix": "/nix/store/aaa"},
+            {
+                "unit-rio-nix": "/nix/store/aaa",
+                "vm-chaos-standalone": "/nix/store/bbb",
+            },
         )
 
     def test_outputs_are_single_line(self):

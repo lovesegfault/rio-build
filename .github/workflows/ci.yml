@@ -20,13 +20,13 @@ concurrency:
 # substituting the build graph from the cache instead of re-deriving
 # it from a flake eval (~1-2min saved per job, times ~80 jobs).
 #
-# Two-stage build: each kind's `warm-<kind>` job first realises the
-# drvs that >=2 of that kind's clusters need (the dynamically
-# computed shared trunk), then the kind's matrix fans out and
-# substitutes them. Without the warm stage, N runners with empty
-# stores all rebuild the same uncached trunk simultaneously —
-# niks3's post-build-hook can't help because they all miss the cache
-# before any of them finishes pushing.
+# Two-stage build: the `warm` matrix first realises the trunk — the
+# drvs needed by >=2 fan-out clusters of any kind, partitioned into
+# dependency-closed shards that build on separate runners — then the
+# fan-out matrices substitute it. Without the warm stage, N runners
+# with empty stores all rebuild the same uncached trunk
+# simultaneously — niks3's post-build-hook can't help because they
+# all miss the cache before any of them finishes pushing.
 #
 # Matrix entries are clusters ({name, targets, drvs}): one runner
 # realises several drvs in a single `nix build --keep-going`,
@@ -60,8 +60,9 @@ jobs:
         # exports the uncached entries' drv closures to a local file://
         # binary cache for the artifact upload below. Adding a new
         # matrix kind to flake.nix → add one `outputs:` entry above,
-        # one warm-<kind>/<kind> job pair below, and teach
-        # nix/gen_matrix.py the kind's clustering rule.
+        # one fan-out job below, and teach nix/gen_matrix.py the
+        # kind's clustering rule; the warm stage picks up the new
+        # kind's shared drvs automatically.
         run: nix run .#gen-matrix
         env:
           DRV_CACHE_DIR: ${{ runner.temp }}/drv-cache
@@ -90,79 +91,44 @@ jobs:
           key: nix-eval-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
 
   # ── Warm stage ─────────────────────────────────────────────────────
-  # One job per kind with a non-empty shared set: realise the drvs
-  # that >=2 of the kind's clusters would otherwise each build. The
-  # post-build hook pushes each constituent to niks3 as it completes,
-  # so the gated fan-out jobs substitute instead of rebuilding.
-  # Nothing shared → empty set → job skipped → zero added latency.
+  # The trunk: every drv needed by >=2 fan-out clusters, computed
+  # globally across all kinds so the overlap between them (the member
+  # libs that both the check clusters and the docker images need; the
+  # third-party deps both rustc profiles share on a lock bump) is
+  # built exactly once. gen-matrix partitions the trunk into
+  # dependency-closed components — no shard ever needs a sibling
+  # shard's output — and packs them into at most a handful of matrix
+  # entries, each realised on its own runner. The post-build hook
+  # pushes each constituent to niks3 as it completes, so the gated
+  # fan-out substitutes instead of rebuilding. Nothing shared → empty
+  # matrix → skipped → zero added latency.
   #
-  # None of these need KVM: building a NixOS image / docker archive is
-  # an ordinary nix build. Only *booting* the result needs /dev/kvm.
-  # Keeping the warm jobs on spot reserves the KVM pool for jobs that
-  # actually run VMs.
+  # No shard needs KVM: building a NixOS image / docker archive is an
+  # ordinary nix build. Only *booting* the result needs /dev/kvm.
+  # Keeping the warm stage on spot reserves the KVM pool for jobs
+  # that actually run VMs.
   #
-  # A warm failure (the trunk doesn't compile) skips the kind's gated
-  # fan-out: every leaf would have failed identically, and ci-gate
-  # still goes red on the warm job itself.
-  warm-checks:
-    name: warm / checks
+  # A shard failure (the trunk doesn't compile) skips the gated
+  # fan-out: every leaf needing that shard would have failed
+  # identically, and ci-gate still goes red on the warm job itself.
+  warm:
+    name: warm / ${{ matrix.name }}
     needs: gen-matrix
-    if: fromJSON(needs.gen-matrix.outputs.warm)['checks'] != ''
+    if: needs.gen-matrix.outputs.warm != '[]'
     runs-on: rio-ci
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gen-matrix.outputs.warm) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
         with:
           drv-cache: 'true'
-      - name: Realise shared trunk
+      - name: Realise trunk shard
         run: |
-          read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['checks'] }}"
-          nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
-  warm-fuzz:
-    name: warm / fuzz
-    needs: gen-matrix
-    if: fromJSON(needs.gen-matrix.outputs.warm)['fuzz'] != ''
-    runs-on: rio-ci
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-nix
-        with:
-          drv-cache: 'true'
-      - name: Realise shared trunk
-        run: |
-          read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['fuzz'] }}"
-          nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
-  warm-vm-test:
-    name: warm / vm-test
-    needs: gen-matrix
-    if: fromJSON(needs.gen-matrix.outputs.warm)['vm-test'] != ''
-    runs-on: rio-ci
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-nix
-        with:
-          drv-cache: 'true'
-      - name: Realise shared trunk
-        run: |
-          read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['vm-test'] }}"
-          nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
-  warm-coverage:
-    name: warm / coverage
-    needs: gen-matrix
-    if: fromJSON(needs.gen-matrix.outputs.warm)['coverage'] != ''
-    runs-on: rio-ci
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-nix
-        with:
-          drv-cache: 'true'
-      - name: Realise shared trunk
-        run: |
-          read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['coverage'] }}"
+          read -ra drvs <<< "${{ matrix.drvs }}"
           nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
 
   # ── Fan-out stage ──────────────────────────────────────────────────
@@ -179,11 +145,11 @@ jobs:
   # actually failed.
   checks:
     name: check / ${{ matrix.name }}
-    needs: [gen-matrix, warm-checks]
+    needs: [gen-matrix, warm]
     if: |
       !cancelled()
       && needs.gen-matrix.result == 'success'
-      && needs.warm-checks.result != 'failure'
+      && needs.warm.result != 'failure'
       && needs.gen-matrix.outputs.checks != '[]'
     runs-on: rio-ci
     timeout-minutes: 60
@@ -239,11 +205,11 @@ jobs:
           exit "$status"
   fuzz:
     name: fuzz / ${{ matrix.name }}
-    needs: [gen-matrix, warm-fuzz]
+    needs: [gen-matrix, warm]
     if: |
       !cancelled()
       && needs.gen-matrix.result == 'success'
-      && needs.warm-fuzz.result != 'failure'
+      && needs.warm.result != 'failure'
       && needs.gen-matrix.outputs.fuzz != '[]'
     runs-on: rio-ci
     timeout-minutes: 60
@@ -261,11 +227,11 @@ jobs:
           nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
   vm-test:
     name: vm / ${{ matrix.name }}
-    needs: [gen-matrix, warm-vm-test]
+    needs: [gen-matrix, warm]
     if: |
       !cancelled()
       && needs.gen-matrix.result == 'success'
-      && needs.warm-vm-test.result != 'failure'
+      && needs.warm.result != 'failure'
       && needs.gen-matrix.outputs.vm-test != '[]'
     runs-on: rio-ci-kvm
     timeout-minutes: 60
@@ -286,11 +252,11 @@ jobs:
           nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
   coverage:
     name: coverage / ${{ matrix.name }}
-    needs: [gen-matrix, warm-coverage]
+    needs: [gen-matrix, warm]
     if: |
       !cancelled()
       && needs.gen-matrix.result == 'success'
-      && needs.warm-coverage.result != 'failure'
+      && needs.warm.result != 'failure'
       && needs.gen-matrix.outputs.coverage != '[]'
     # Runner selection by naming convention: `vm-*` entries need
     # KVM (instrumented VM tests → profraw → lcov). The single
@@ -364,10 +330,7 @@ jobs:
     if: always()
     needs:
       - gen-matrix
-      - warm-checks
-      - warm-fuzz
-      - warm-vm-test
-      - warm-coverage
+      - warm
       - checks
       - check-nowait
       - fuzz
@@ -386,9 +349,9 @@ jobs:
       - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # warm-* skip when nothing in their kind is shared; the build
-          # matrices skip when fully cache-filtered or when their warm
-          # job failed (in which case the warm job is the red one).
+          # warm skips when nothing is shared across clusters; the
+          # build matrices skip when fully cache-filtered or when the
+          # warm stage failed (in which case warm is the red one).
           # gen-matrix and coverage-upload are NOT listed: both must
           # always run — if either skips, something is wrong.
-          allowed-skips: warm-checks, warm-fuzz, warm-vm-test, warm-coverage, checks, check-nowait, fuzz, vm-test, coverage
+          allowed-skips: warm, checks, check-nowait, fuzz, vm-test, coverage
