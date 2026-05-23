@@ -57,13 +57,27 @@ jobs:
         id: gen
         # Cache-filters + clusters every `.#githubActions.<kind>.<name>`,
         # computes each kind's shared trunk from neededBuilds, and
-        # queues the uncached drv closures for upload (drained by the
-        # niks3-action post step before this job completes — and
-        # dependents only start after post steps finish). Adding a new
+        # exports the uncached entries' drv closures to a local file://
+        # binary cache for the artifact upload below. Adding a new
         # matrix kind to flake.nix → add one `outputs:` entry above,
         # one warm-<kind>/<kind> job pair below, and teach
         # nix/gen_matrix.py the kind's clustering rule.
         run: nix run .#gen-matrix
+        env:
+          DRV_CACHE_DIR: ${{ runner.temp }}/drv-cache
+      # The run's build graph: every uncached target's .drv closure
+      # (derivation files + eval-time sources, all content-addressed).
+      # Build jobs register this as a substituter instead of
+      # re-evaluating the flake. Run-scoped by design — the permanent
+      # binary cache is for build OUTPUTS; the graph that produces
+      # them is ephemeral. ignore: a fully-cached run exports nothing
+      # and runs no build jobs.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: drv-cache
+          path: ${{ runner.temp }}/drv-cache
+          if-no-files-found: ignore
+          retention-days: 1
       # setup-nix restores ~/.cache/nix everywhere; only this job
       # saves. Build jobs no longer evaluate the flake, but they still
       # restore this cache for the fetcher entries (flake input
@@ -99,6 +113,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - name: Realise shared trunk
         run: |
           read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['checks'] }}"
@@ -112,6 +128,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - name: Realise shared trunk
         run: |
           read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['fuzz'] }}"
@@ -125,6 +143,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - name: Realise shared trunk
         run: |
           read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['vm-test'] }}"
@@ -138,6 +158,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - name: Realise shared trunk
         run: |
           read -ra drvs <<< "${{ fromJSON(needs.gen-matrix.outputs.warm)['coverage'] }}"
@@ -172,6 +194,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - name: Build ${{ matrix.targets }}
         run: |
           read -ra targets <<< "${{ matrix.targets }}"
@@ -200,6 +224,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - name: Build ${{ matrix.targets }}
         run: |
           read -ra targets <<< "${{ matrix.targets }}"
@@ -228,6 +254,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
       - run: |
           read -ra drvs <<< "${{ matrix.drvs }}"
           nix build --keep-going --print-build-logs "${drvs[@]/%/^*}"
@@ -250,6 +278,7 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           kvm: true
+          drv-cache: 'true'
       - name: Verify KVM
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
       - run: |
@@ -277,6 +306,7 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           kvm: ${{ startsWith(matrix.name, 'vm-') }}
+          drv-cache: 'true'
       - name: Verify KVM
         if: startsWith(matrix.name, 'vm-')
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'

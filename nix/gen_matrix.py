@@ -10,8 +10,9 @@
 # Eval-once / realise-everywhere: this is the only job in the
 # pipeline that evaluates the flake. Every downstream job receives
 # DERIVATION PATHS and runs `nix build /nix/store/...drv^*`,
-# substituting the .drv closure from the binary cache this script
-# pushes it to. No flake checkout-eval in 80 build jobs.
+# substituting the .drv closure from a run-scoped workflow artifact
+# this script exports (a local file:// binary cache of the build
+# graph). No flake checkout-eval in the build jobs.
 #
 # Outputs written to $GITHUB_OUTPUT (one `key=json` line each):
 #   warm            {"checks": "/nix/store/a.drv /nix/store/b.drv",
@@ -375,37 +376,46 @@ def run_nix_eval_jobs(workers):
     return parse_results(lines)
 
 
-def push_drv_closures(paths):
-    """Send drv paths to the binary-cache uploader so realise-only
-    jobs can substitute their build graphs.
+def export_drv_closures(paths, dest):
+    """Write the drv closures to a local file:// binary cache for the
+    realise-only jobs to substitute from.
 
-    Reuses the post-build-hook the runner already has configured (the
-    niks3 upload daemon's `send` client). The hook protocol is "read
-    OUT_PATHS from the environment, enqueue those store paths"; the
-    uploader expands each path to its reference closure -- and a .drv
-    file's references ARE its input drvs and input sources -- then
-    skips whatever the server already has. Outside CI (no hook
-    configured) this is a no-op so local dry-runs still work.
+    The cache directory is uploaded as a run-scoped workflow artifact;
+    every build job downloads it and passes it as an extra
+    substituter, so `nix build /nix/store/...drv^*` finds the .drv
+    and its whole input graph without a flake eval. Everything in a
+    drv closure is content-addressed (.drv files are text-CA,
+    eval-time sources are source-CA), so the substituted paths verify
+    by content and need no signature configuration.
+
+    This deliberately does NOT go through the niks3 binary cache: its
+    uploader describes paths via `nix path-info -- <path>`, which
+    reinterprets a .drv argument as its outputs and so cannot upload
+    derivation files. The drv graph is also run-scoped ephemeral data
+    that has no business in the permanent cache.
+
+    No-op when dest is empty (local dry-runs).
     """
-    if not paths:
+    if not paths or not dest:
+        if paths:
+            print(
+                "::notice::DRV_CACHE_DIR unset -- skipping the drv-closure "
+                "export (fine locally; realise-only CI jobs need it)"
+            )
         return
-    hook = subprocess.run(
-        ["nix", "config", "show", "post-build-hook"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    if not hook:
-        print(
-            "::warning::no post-build-hook configured -- skipping the "
-            "drv-closure push. Realise-only jobs will fail to substitute "
-            "their drvs unless something else uploads them."
-        )
-        return
-    env = dict(os.environ, OUT_PATHS=" ".join(paths), DRV_PATH="")
-    subprocess.run([hook], env=env, check=True)
+    subprocess.run(
+        [
+            "nix",
+            "copy",
+            "--derivation",
+            "--to",
+            f"file://{dest}?compression=none",
+            *paths,
+        ],
+        check=True,
+    )
     print(
-        f"queued {len(paths)} drv closures for upload via {hook}",
+        f"exported {len(paths)} drv closures to {dest}",
         file=sys.stderr,
     )
 
@@ -431,12 +441,10 @@ def main():
 
     outputs = build_outputs(results)
 
-    # Ship the build graph to the cache BEFORE emitting outputs: once
-    # this job succeeds, downstream jobs assume their drvs are
-    # substitutable. The hook enqueues to a background uploader that
-    # the niks3-action post-step drains before the job completes (and
-    # dependents only start after post-steps finish).
-    push_drv_closures(push_paths(results))
+    # Ship the build graph BEFORE emitting outputs: once this job
+    # succeeds, downstream jobs assume their drvs are substitutable
+    # from the drv-cache artifact.
+    export_drv_closures(push_paths(results), os.environ.get("DRV_CACHE_DIR"))
 
     skipped = sorted(
         r["attr"] for r in results if r.get("cacheStatus") == "cached"

@@ -4,12 +4,31 @@ inputs:
   kvm:
     description: Add kvm/nixos-test system-features
     default: 'false'
+  drv-cache:
+    description: >-
+      Download the gen-matrix job's drv-cache artifact (a file://
+      binary cache of the run's derivation closures) and register it
+      as a substituter. Build jobs realise bare drv paths instead of
+      evaluating the flake; this is where they get the .drv files and
+      eval-time sources from. Everything in it is content-addressed,
+      so no trusted key is needed.
+    default: 'false'
   niks3-url:
     description: niks3 server URL (cache-config + push endpoint)
     default: http://niks3.niks3.svc.cluster.local:5751
 runs:
   using: composite
   steps:
+    # Must precede the installer: the substituter is registered in
+    # extra-conf below, and a registered-but-empty file:// cache makes
+    # every substitution attempt warn. Hard-fails if the artifact is
+    # missing — a build job only runs when its matrix is non-empty,
+    # which implies gen-matrix exported at least that entry's closure.
+    - if: inputs.drv-cache == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: drv-cache
+        path: ${{ runner.temp }}/drv-cache
     # nix-installer-action's trust-runner-user builds
     #   trusted-users = root $USER
     # but ARC containers spawn steps without a login shell, so $USER
@@ -57,6 +76,7 @@ runs:
           max-jobs = auto
           sandbox = true
           ${{ inputs.kvm == 'true' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
+          ${{ inputs.drv-cache == 'true' && format('extra-substituters = file://{0}/drv-cache', runner.temp) || '' }}
 
     # post-build-hook + uploader + post-job drain. Fetches the
     # substituter URL + public key from /api/cache-config and writes
