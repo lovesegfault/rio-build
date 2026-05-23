@@ -1646,11 +1646,11 @@ impl DagActor {
             .record(elapsed.as_secs_f64());
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
-        // r[impl sched.recovery.bump-confirm+2]
+        // r[impl sched.recovery.bump-confirm+3]
         // A claim target the durable floor cannot vouch for is only
         // seeded — and the recovery only completed — after positive,
         // post-claim evidence from the apiserver that this replica
-        // holds the Lease. Two trigger shapes:
+        // holds the Lease. Three trigger shapes:
         //
         // - A target ABOVE the entry generation (the floor-above,
         //   foreign-row-at-our-gen, conflict-retry, and
@@ -1730,7 +1730,7 @@ impl DagActor {
         if gen_now != gen_at_entry
             || transitions_now != transitions_at_entry
             || !still_leader
-            // r[impl sched.recovery.bump-confirm+2]
+            // r[impl sched.recovery.bump-confirm+3]
             || !confirmed
         {
             // Distinguish "the lease state moved" from "the lease state
@@ -1926,7 +1926,7 @@ impl DagActor {
     /// intentionally untested: it requires a wedged-but-believing loop,
     /// and the loop-level wiring that matters is covered by rio-lease's
     /// round tests.
-    // r[impl sched.recovery.bump-confirm+2]
+    // r[impl sched.recovery.bump-confirm+3]
     async fn await_post_claim_leadership_confirmation(
         &self,
         rounds_at_claim: u64,

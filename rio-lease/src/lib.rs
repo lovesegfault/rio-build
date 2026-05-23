@@ -1158,7 +1158,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 }
 
                 was_leading = now_leading;
-                // r[impl sched.recovery.bump-confirm+2]
+                // r[impl sched.recovery.bump-confirm+3]
                 // Confirm AFTER the edge-detection match: when an
                 // acquire edge and a confirmation land in the same
                 // round, on_acquire's stores are already visible by
@@ -1498,7 +1498,7 @@ mod tests {
     /// Confirmation-round bookkeeping: round ids increase per
     /// `begin_renew_round`, confirming records the round, and a stale
     /// (lower) confirmation never regresses `last_leading_round`.
-    // r[verify sched.recovery.bump-confirm+2]
+    // r[verify sched.recovery.bump-confirm+3]
     #[test]
     fn confirmation_rounds_are_monotone() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -2018,7 +2018,7 @@ mod tests {
     /// confirmation from a round that began before its claim, or from a
     /// round that did not end with us holding the Lease). Drives the
     /// real loop against the mock apiserver under a paused clock.
-    // r[verify sched.recovery.bump-confirm+2]
+    // r[verify sched.recovery.bump-confirm+3]
     #[tokio::test(start_paused = true)]
     async fn leading_rounds_confirm_failed_rounds_do_not() {
         let (client, mock) = MockApiServer::new();
@@ -2092,7 +2092,7 @@ mod tests {
     /// are never confirmed: `last_leading_round` only ever names rounds
     /// in which WE were the holder, which is exactly the evidence the
     /// scheduler's bump-confirmation consumes.
-    // r[verify sched.recovery.bump-confirm+2]
+    // r[verify sched.recovery.bump-confirm+3]
     #[tokio::test(start_paused = true)]
     async fn standby_rounds_never_confirm() {
         let (client, mock) = MockApiServer::new();

@@ -352,7 +352,7 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
 /// `test_recovery_floor_unreadable_confirms_and_completes_unclaimed`
 /// (the confirmed direction) and with
 /// `test_recovery_failure_degrades_to_empty_dag` (both PG reads down).
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_floor_unreadable_unconfirmed_is_discarded() -> TestResult {
     use metrics_util::debugging::DebuggingRecorder;
@@ -462,7 +462,7 @@ async fn test_recovery_floor_unreadable_unconfirmed_is_discarded() -> TestResult
 /// visible to the operator (the floor-read-failure counter) instead of
 /// being silent. There is no claim INSERT on this path — the floor
 /// could not be read, so nothing is offered to the ledger.
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_floor_unreadable_confirms_and_completes_unclaimed() -> TestResult {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -1659,7 +1659,7 @@ async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> T
 /// claim path ran) and no confirmation ever arrives — the recovery must
 /// be discarded, never seeded. The leftover (13, 'pod-us') claim row is
 /// the documented harmless over-claim and is deliberately not asserted.
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1725,7 +1725,7 @@ async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> Test
 /// completes. Pairs with
 /// `test_recovery_unconfirmed_bump_above_live_holder_is_discarded` to
 /// pin both directions of the confirmation gate.
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1803,7 +1803,7 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 /// unconfirmed direction).
 // r[verify sched.recovery.fetch-max-seed+4]
 // r[verify sched.lease.generation-claim+2]
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1887,7 +1887,7 @@ async fn test_recovery_load_failure_still_floors_claims_and_confirms() -> TestRe
 /// confirmed direction). The leftover (41, 'pod-us') claim row is the
 /// documented harmless over-claim and is deliberately not asserted,
 /// same as the other discard tests.
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_load_failure_unconfirmed_bump_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1967,7 +1967,7 @@ async fn test_recovery_load_failure_unconfirmed_bump_is_discarded() -> TestResul
 /// leftover (6, 'pod-us') claim row is the documented harmless
 /// over-claim (it forces the next term above 6) and is deliberately not
 /// asserted, same as the bump-discard test above.
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_unconfirmed_gap_retain_below_entry_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2039,7 +2039,7 @@ async fn test_recovery_unconfirmed_gap_retain_below_entry_is_discarded() -> Test
 /// generation, claims it, and completes. Pairs with
 /// `test_recovery_unconfirmed_gap_retain_below_entry_is_discarded` to
 /// pin both directions of the gap-retain trigger.
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_gap_retain_with_confirmation_completes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2160,7 +2160,7 @@ async fn test_recovery_adjacent_floor_retain_completes_without_confirmation() ->
 /// post-claim Leading round -- the absent-floor arm of the confirmation
 /// trigger.
 // r[verify sched.recovery.fetch-max-seed+4]
-// r[verify sched.recovery.bump-confirm+2]
+// r[verify sched.recovery.bump-confirm+3]
 #[tokio::test]
 async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

@@ -1626,16 +1626,18 @@ read counts as "not shown" and is likewise exceeded; the conservative cost is
 one burned generation and an idempotent re-dispatch of the holder's own
 in-flight work.
 
-#r("sched.recovery.bump-confirm+2")[
+#r("sched.recovery.bump-confirm+3")[
   A claim target that exceeds the generation the recovery entered with --- or
   one that retains that entry generation while the durable PG floor, taken as
   zero when no assignment or claim row exists at all, lies more than one
   generation below it (the claims-and-assignments history then cannot vouch
-  for the generations in between) --- MUST NOT be seeded into the in-memory
-  generation, and dispatch MUST NOT be ungated at it, until this replica has
-  completed an apiserver round-trip --- initiated after the write-ahead claim
-  step completed --- that ended with this replica as the Lease holder; absent
-  that confirmation the recovery MUST be discarded.
+  for the generations in between) --- or one that retains that entry
+  generation when the durable PG floor could not be read at all (a floor that
+  cannot be read cannot vouch for anything) --- MUST NOT be seeded into the
+  in-memory generation, and dispatch MUST NOT be ungated at it, until this
+  replica has completed an apiserver round-trip --- initiated after the
+  write-ahead claim step completed --- that ended with this replica as the
+  Lease holder; absent that confirmation the recovery MUST be discarded.
 ]
 
 The PG floor cannot distinguish a dead predecessor's claim from a live
