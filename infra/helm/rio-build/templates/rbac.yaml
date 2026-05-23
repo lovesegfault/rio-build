@@ -228,13 +228,17 @@ rules:
   # selector) in one merge patch. RBAC `patch` on `pods` covers both —
   # verbs aren't field-scoped, so the label needs no extra rule.
   # Namespace-wide (NOT resourceNames-scoped) because pod name is dynamic
-  # (Deployment-generated). Code only patches cfg.holder_id = HOSTNAME =
-  # own pod. `get` needed: kube-rs's Api::patch GETs first for
-  # resourceVersion (Merge doesn't strictly need it but client does
-  # GET-before-PATCH anyway).
+  # (Deployment-generated). The holder patches its own pod
+  # (cfg.holder_id = HOSTNAME) and, while leading, sweeps the stale
+  # leader label off peer pods that a partitioned ex-leader cannot
+  # remove itself (rio-lease sweep_peer_leader_marks). `list` exists for
+  # that peer sweep — it lists pods by the leader label; RBAC cannot
+  # label-scope a list, so it is namespace-wide like the patch. `get`
+  # needed: kube-rs's Api::patch GETs first for resourceVersion (Merge
+  # doesn't strictly need it but client does GET-before-PATCH anyway).
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, patch]
+    verbs: [get, list, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

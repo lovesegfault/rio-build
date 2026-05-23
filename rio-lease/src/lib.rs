@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::serde_json::json;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
 // tokio's Instant, not std's: identical semantics in production (a thin
 // wrapper over std's monotonic clock), but it follows tokio's test clock
 // under `start_paused`, which is what makes the lease loop's fence-check
@@ -1351,11 +1351,15 @@ fn maybe_self_fence(
         // unreachable. Mark the pod's leader marks dirty so the FIRST
         // reachable round-trip in run_lease_loop's Ok arm reconciles
         // them (cost=0, leader label removed — unless we re-acquired by
-        // then, in which case it re-asserts the leader marks). The
-        // peer's cost=1 doesn't clear OURS — without this deferred
-        // reconcile we'd stay tied at cost=1 with the new leader (next
-        // RollingUpdate picks arbitrarily) AND keep the leader label
-        // (the leader-only Service would route to two pods).
+        // then, in which case it re-asserts the leader marks). While we
+        // stay partitioned we cannot remove our own stale label; the
+        // new holder's peer sweep (sweep_peer_leader_marks) is what
+        // bounds its lifetime, and until that holder's first successful
+        // reconcile any request landing on us fails with this
+        // self-fence's un-retryable UNAVAILABLE. The deferred local
+        // reconcile still matters: in a symmetric partition there is no
+        // reachable holder to sweep us, and our own first reachable
+        // round-trip is what clears the marks (and the cost tie) then.
         marks_dirty.store(true, Ordering::SeqCst);
         true
     } else {
@@ -1418,7 +1422,11 @@ fn leader_marks_patch(
 /// - The optional leader label (`cfg.leader_pod_label`, e.g.
 ///   [`LEADER_ROLE_LABEL`]`=`[`LEADER_ROLE_LEADER`]): present on the
 ///   leader, absent on the standby — the `rio-scheduler-leader` Service
-///   selects on it, so its endpoints are exactly the current leader.
+///   selects on it, so its endpoints converge to the current leader on
+///   the holder's first successful reconcile after acquiring. When
+///   leading, the task also strips the label from any other pod still
+///   carrying it (the peer sweep, [`sweep_peer_leader_marks`]) — a
+///   partitioned ex-leader cannot remove its own.
 ///
 /// One PATCH for both: they flip on the same transitions, and a single
 /// merge patch removes the partial-failure window (cost updated but
@@ -1489,10 +1497,26 @@ fn spawn_patch_leader_marks(
         {
             Ok(Ok(_)) => {
                 debug!(%pod_name, leading, "patched pod leader marks");
+                // Peer sweep — only while leading with a label
+                // configured: strip the leader marks off any OTHER pod
+                // still carrying the label (a partitioned ex-leader
+                // cannot remove its own). The single-flight slot covers
+                // own patch + list + peer patches; a transition during
+                // that window is picked up by the next round-trip
+                // (level-triggered, nothing lost). A failed sweep keeps
+                // the reconcile dirty exactly like a failed own-pod
+                // patch.
+                let sweep_ok = match (leading, label.as_ref()) {
+                    (true, Some(l)) => {
+                        sweep_peer_leader_marks(&pods, &pod_name, l, patch_timeout).await
+                    }
+                    _ => true,
+                };
                 // Single-flight makes the apiserver's last-applied
                 // marks the ones THIS task wrote, so a successful patch
                 // whose polarity still matches the desire is safe to
-                // clear on; a since-stale polarity forces another
+                // clear on once the sweep also landed; a since-stale
+                // polarity (or an incomplete sweep) forces another
                 // reconcile instead. The re-check after the clear
                 // covers the one remaining race: an acquire/lose/
                 // self-fence edge whose `marks_dirty.store(true)` lands
@@ -1503,7 +1527,7 @@ fn spawn_patch_leader_marks(
                 // desire change that beat the clear is visible to the
                 // re-check; one that lands after it wins by program
                 // order).
-                if is_leader.load(Ordering::SeqCst) == leading {
+                if sweep_ok && is_leader.load(Ordering::SeqCst) == leading {
                     marks_dirty.store(false, Ordering::SeqCst);
                     if is_leader.load(Ordering::SeqCst) != leading {
                         marks_dirty.store(true, Ordering::SeqCst);
@@ -1555,6 +1579,96 @@ fn spawn_patch_leader_marks(
             }
         }
     })
+}
+
+/// Pure target selection for the peer sweep: every labeled pod except
+/// our own. The own-name exclusion is the one mistake that could strip
+/// the real leader's label, so it is pinned by its own unit test.
+fn peer_sweep_targets(labeled_pod_names: Vec<String>, own_name: &str) -> Vec<String> {
+    labeled_pod_names
+        .into_iter()
+        .filter(|name| name != own_name)
+        .collect()
+}
+
+/// Peer sweep: while leading, strip the leader marks off any OTHER pod
+/// still carrying the leader label — a partitioned ex-leader cannot
+/// remove its own (its self-fence only defers its own reconcile), so
+/// the new holder is the only replica that can bound that stale
+/// label's lifetime. Runs inside the single in-flight reconcile task,
+/// after the own-pod patch. Returns `false` if the list or any peer
+/// patch failed; the caller then keeps the marks dirty so the whole
+/// reconcile (self + sweep) retries on the next successful round-trip.
+///
+/// The peer is demoted with the same body a standby writes for itself
+/// ([`leader_marks_patch`] with `leading=false`): label removed AND
+/// deletion-cost `"0"` — the cost reset for a non-leader is deliberate,
+/// not incidental (a stale cost=1 on an ex-leader would tie it with the
+/// real leader at the next scale-down).
+///
+/// Residuals, structurally: the stale-label bound holds on the new
+/// holder's first SUCCESSFUL reconcile and only while it can reach the
+/// apiserver; a pre-partition own-patch landing after the sweep is made
+/// unreachable by the per-call timeout (far below the steal threshold);
+/// the sweep can strip a just-re-acquired leader's label, which that
+/// victim's own level-triggered reconcile re-asserts on its next dirty
+/// event; in a symmetric partition there is no holder to sweep and
+/// nothing can be scheduled anyway.
+async fn sweep_peer_leader_marks(
+    pods: &Api<Pod>,
+    own_name: &str,
+    label: &(String, String),
+    call_timeout: Duration,
+) -> bool {
+    let (key, value) = label;
+    let lp = ListParams::default().labels(&format!("{key}={value}"));
+    let labeled = match tokio::time::timeout(call_timeout, pods.list(&lp)).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            warn!(error = %e, "peer-sweep pod list failed; keeping leader marks dirty to retry");
+            return false;
+        }
+        Err(_) => {
+            warn!(
+                timeout = ?call_timeout,
+                "peer-sweep pod list timed out; keeping leader marks dirty to retry"
+            );
+            return false;
+        }
+    };
+    let names = labeled
+        .items
+        .into_iter()
+        .filter_map(|p| p.metadata.name)
+        .collect();
+    let mut all_ok = true;
+    for peer in peer_sweep_targets(names, own_name) {
+        let patch = leader_marks_patch(false, Some(label));
+        match tokio::time::timeout(
+            call_timeout,
+            pods.patch(&peer, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => debug!(%peer, "stripped stale leader marks off peer pod"),
+            Ok(Err(e)) => {
+                warn!(
+                    %peer, error = %e,
+                    "failed to strip stale leader marks off peer pod; \
+                     keeping leader marks dirty to retry"
+                );
+                all_ok = false;
+            }
+            Err(_) => {
+                warn!(
+                    %peer, timeout = ?call_timeout,
+                    "peer leader-marks PATCH timed out; keeping leader marks dirty to retry"
+                );
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
 }
 
 /// Spawn gate for the leader-marks reconcile: spawns
@@ -2331,6 +2445,22 @@ mod tests {
         // with a now-stale polarity → flag stays dirty, slot freed.
         applied.push(req_a.body.clone());
         req_a.respond_ok(pod_ok("us"));
+        // A wrote the leader polarity, so its task also runs the peer
+        // sweep inside the same single-flight slot (own patch + list);
+        // answer the label-selected LIST with no peers so A's handler
+        // can reach its flag decision.
+        let req_list = park.next().await;
+        assert!(
+            req_list.path.contains("labelSelector="),
+            "peer-sweep LIST endpoint, got {}",
+            req_list.path
+        );
+        req_list.respond_ok(json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": {"resourceVersion": "1"},
+            "items": []
+        }));
         handle_a.await.expect("patch task A");
         assert!(
             marks_dirty.load(Ordering::SeqCst),
@@ -2485,6 +2615,148 @@ mod tests {
             "retry after a timeout must be able to take the slot"
         );
         drop(parked);
+    }
+
+    // ---- Peer sweep: stale leader label on another pod ----
+    //
+    // ApiServerVerifier is already imported by the renewal-timeout
+    // tests above; only the scenario types are new here.
+
+    use rio_test_support::kube_mock::{Method, Scenario};
+
+    /// Pure target selection: never our own pod, every other labeled
+    /// pod. The own-name exclusion is the one mistake that could strip
+    /// the real leader's label.
+    #[test]
+    fn peer_sweep_targets_excludes_own_name() {
+        assert_eq!(
+            peer_sweep_targets(vec!["other-1".into(), "us".into(), "other-2".into()], "us"),
+            vec!["other-1".to_string(), "other-2".to_string()]
+        );
+        assert!(peer_sweep_targets(vec!["us".into()], "us").is_empty());
+        assert!(peer_sweep_targets(vec![], "us").is_empty());
+    }
+
+    /// PodList response body whose items all carry the leader label.
+    fn labeled_pod_list(names: &[&str]) -> String {
+        let items: Vec<_> = names
+            .iter()
+            .map(|n| {
+                json!({"metadata": {"name": n, "namespace": "default",
+                       "labels": {LEADER_ROLE_LABEL: LEADER_ROLE_LEADER}}})
+            })
+            .collect();
+        json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": {"resourceVersion": "1"},
+            "items": items
+        })
+        .to_string()
+    }
+
+    /// While leading, the reconcile strips the leader marks off any
+    /// other pod still carrying the label. This is the deterministic
+    /// stand-in for the asymmetric-partition aftermath: a self-fenced
+    /// ex-leader cannot remove its own label, so the new holder's sweep
+    /// is what bounds the stale endpoint's lifetime. The peer PATCH
+    /// must carry the demote body (label removed via merge-patch null,
+    /// cost "0"), and the flag clears only after own patch + sweep all
+    /// landed.
+    // r[verify sched.lease.deletion-cost+2]
+    #[tokio::test]
+    async fn leading_reconcile_sweeps_stale_peer_label() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+
+        let guard = verifier.run(vec![
+            Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
+            Scenario::ok(
+                Method::GET,
+                "labelSelector=",
+                labeled_pod_list(&["us", "old-leader"]),
+            ),
+            Scenario {
+                body_contains: Some(r#""rio.build/scheduler-role":null"#),
+                ..Scenario::ok(
+                    Method::PATCH,
+                    "/pods/old-leader",
+                    pod_ok("old-leader").to_string(),
+                )
+            },
+        ]);
+
+        let handle = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            Duration::from_secs(60),
+        )
+        .expect("dirty + free slot must spawn");
+        handle.await.expect("reconcile task");
+        guard.verified().await;
+
+        assert!(
+            !marks_dirty.load(Ordering::SeqCst),
+            "own patch + sweep all landed → flag clears"
+        );
+        assert!(!in_flight.load(Ordering::SeqCst), "slot released");
+    }
+
+    /// A peer PATCH that fails (here: the pod vanished, 404) keeps the
+    /// marks dirty so the whole reconcile — self + sweep — retries on
+    /// the next successful round-trip.
+    #[tokio::test]
+    async fn failed_peer_sweep_keeps_marks_dirty() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+
+        let guard = verifier.run(vec![
+            Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
+            Scenario::ok(
+                Method::GET,
+                "labelSelector=",
+                labeled_pod_list(&["us", "old-leader"]),
+            ),
+            Scenario::k8s_error(
+                Method::PATCH,
+                "/pods/old-leader",
+                404,
+                "NotFound",
+                "pods \"old-leader\" not found",
+            ),
+        ]);
+
+        let handle = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            Duration::from_secs(60),
+        )
+        .expect("dirty + free slot must spawn");
+        handle.await.expect("reconcile task");
+        guard.verified().await;
+
+        assert!(
+            marks_dirty.load(Ordering::SeqCst),
+            "incomplete sweep must keep the marks dirty"
+        );
+        assert!(
+            !in_flight.load(Ordering::SeqCst),
+            "slot released even when the sweep failed"
+        );
     }
 
     // ---- The loop's fence-check cadence (the NeverDual premise) ----

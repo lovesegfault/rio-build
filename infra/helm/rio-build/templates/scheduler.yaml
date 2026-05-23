@@ -308,9 +308,13 @@ spec:
 # Leader-only Service. Same port/labels as `rio-scheduler` but the selector
 # additionally requires the rio.build/scheduler-role=leader label, which the
 # lease loop reconciles onto its OWN pod (present while leading, removed on
-# lose — rio-lease spawn_patch_leader_marks). Endpoints are therefore exactly
-# the current leader: 1 pod in steady state, 0 during failover / before the
-# first acquire.
+# lose, or swept off by the new holder's reconcile when a partitioned
+# ex-leader cannot remove it itself — rio-lease spawn_patch_leader_marks).
+# Endpoints therefore converge to the current leader on the holder's first
+# successful reconcile after acquiring: 1 pod in steady state, 0 during
+# failover / before the first acquire, and transiently 2 while a partitioned
+# ex-leader's stale label awaits that sweep (its requests fail with the
+# un-retryable UNAVAILABLE of its self-fence until then).
 #
 # Exists for ClusterIP consumers that CANNOT retry a Trailers-Only
 # Unavailable from the standby — concretely the dashboard's nginx upstream

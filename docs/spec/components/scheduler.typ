@@ -2597,9 +2597,14 @@ leader into the tonic p2c balancer. The ClusterIP Service `rio-scheduler` is
 kept for per-call connects (controller reconcilers, rio-cli) where a 50% chance
 of hitting UNAVAILABLE + retry is acceptable. A third Service,
 `rio-scheduler-leader`, selects on the `rio.build/scheduler-role=leader` label
-the lease holder reconciles onto its own Pod, so its endpoints are exactly the
-current leader --- for in-cluster proxies that can neither health-probe nor
-retry a Trailers-Only UNAVAILABLE (the dashboard's nginx upstream). Combined with `step_down()` and
+the lease holder reconciles onto its own Pod (and sweeps off any other Pod
+still carrying it), so its endpoints converge to the current leader on the
+holder's first successful reconcile after acquiring --- for in-cluster proxies
+that can neither health-probe nor retry a Trailers-Only UNAVAILABLE (the
+dashboard's nginx upstream); until that reconcile lands (an asymmetric
+partition delays it, and persistent reconcile failure --- priced by the
+deletion-cost rule above --- extends it), requests reaching a stale-labeled,
+self-fenced ex-leader fail with that same un-retryable UNAVAILABLE. Combined with `step_down()` and
 pod-deletion-cost, a rollout flips leadership exactly once: K8s kills the
 standby first (cost=0), new pod comes up as standby, K8s kills the old leader,
 old leader step_down releases the lease, new pod acquires within one poll

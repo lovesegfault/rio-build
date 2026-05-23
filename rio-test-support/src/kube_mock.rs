@@ -33,6 +33,10 @@ use kube::client::Body;
 use tokio::task::JoinHandle;
 use tower_test::mock::{self, Handle, SendResponse};
 
+// Re-exported so consumers building [`Scenario`]s don't need their own
+// `http` dependency just for the method enum.
+pub use http::Method;
+
 /// One expected HTTP interaction. The verifier asserts the
 /// incoming request matches `method` + `path_contains`, then
 /// responds with `status` + `body_json`.

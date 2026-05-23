@@ -78,6 +78,15 @@
   # standby is also labeled — the exact bug this Service exists to
   # prevent.
   with subtest("leader Service: rio-scheduler-leader has exactly 1 ready endpoint"):
+      # The peer sweep (rio-lease sweep_peer_leader_marks) needs `list
+      # pods` to strip a partitioned ex-leader's stale label. Mock tests
+      # bypass RBAC and helm-lint only templates, so assert the live
+      # grant here, where a forgotten verb becomes a loud named failure
+      # instead of a silently never-running sweep.
+      k3s_server.succeed(
+          "k3s kubectl auth can-i list pods "
+          "--as=system:serviceaccount:${ns}:rio-scheduler -n ${ns}"
+      )
       k3s_server.wait_until_succeeds(
           "test \"$(k3s kubectl -n ${ns} get endpointslices "
           "-l kubernetes.io/service-name=rio-scheduler-leader "
