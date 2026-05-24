@@ -12,12 +12,17 @@
 //   - the per-derivation ring-buffer entry: execution stamp, executor
 //     binding, held lines, seal tombstone, pending-final mark,
 //     stored-coverage reconciliation state;
-//   - the batch accept/reject predicate (seal, binding gate, monotone
-//     numbering);
-//   - the byte-cap eviction, abstracted to "an arbitrary non-empty proper
-//     prefix of the held lines may be dropped" (a sound over-approximation
-//     of the real eviction policy — the model reaches strictly more states
-//     than the code, so a safety invariant that holds here holds there);
+//   - the batch accept/reject predicate (seal, binding gate, and the
+//     line-numbering floor: one past the highest line the entry has ever
+//     accounted for, including the cached stored prefix's end);
+//   - the byte-cap eviction, push-coupled exactly as the real one is: it
+//     fires only inside an accepting push, pops only the front, and
+//     always leaves at least the just-pushed batch's last line. (An
+//     earlier free-standing over-approximation could strand the ring
+//     below a stored row end this replica itself wrote — a state the
+//     real eviction cannot produce — and the first lineSpanExact
+//     counterexample was reduced through that unreachable state; see
+//     pushBatchAccepted.);
 //   - the periodic and final flushes, including the once-per-tenure
 //     stored-coverage reconciliation, the recovered-prefix gap-merge fold,
 //     the true-line-span row arithmetic, the frozen-row UPSERT latch, and
@@ -132,12 +137,19 @@ module logBufferLifecycle {
   /// A `LogBuffers` ring-buffer entry (`RingBuf`). Absence from the map is
   /// `NoEntry`. The model has no unstamped-entry state: the legacy
   /// `push()` `or_default()` path that creates one is test-only.
+  /// `accountedBelow` is one past the highest line the entry has ever
+  /// accounted for under its current execution stamp (`RingBuf::
+  /// accounted_below`): the max of every accepted batch's end and the
+  /// cached stored prefix's end. Never lowered — not by the
+  /// stored-coverage truncation, not by eviction, not by the ring
+  /// emptying; reset only by a cross-exec restamp.
   type EntrySlot =
     | NoEntry
     | Entry({
         exec: int,
         executor: Executor,
         held: Set[int],
+        accountedBelow: int,
         finalPending: bool,
         prefix: Prefix,
       })
@@ -194,6 +206,18 @@ module logBufferLifecycle {
   const ENABLE_ENQUEUE_FAILURE: bool
   const ENABLE_PERSIST_FAILURE: bool
   const ENABLE_GUARD_FAILURE: bool
+  /// Guard switch (NOT a fault switch): when true, the batch accept
+  /// predicate rejects a batch starting below the entry's accounted
+  /// high-water mark (`RingBuf::accounted_below` — the gate that keeps
+  /// the gap-merge fold's "the ring starts at or after the cached
+  /// prefix's end" precondition true at the trust boundary). When false,
+  /// the predicate degrades to the pre-fix comparison against the ring's
+  /// CURRENT tail only — the comparison that resets when the ring
+  /// empties. Every shipped regime sets it true; the `Ungated` module
+  /// sets it false and is wired as an expect-violation check proving the
+  /// gate is load-bearing for `lineSpanExact` (deleting the guard
+  /// re-falsifies the invariant).
+  const ENABLE_ACCOUNTED_FLOOR: bool
 
   /// `recoveredEpoch` sentinel: no epoch has completed recovery
   /// (rio-lease's `RECOVERY_NOT_COMPLETE`). -1 can never equal a real
@@ -358,17 +382,21 @@ module logBufferLifecycle {
     match entries.get(d) { | NoEntry => "" | Entry(en) => en.executor }
   def entryHeld(d: Drv): Set[int] =
     match entries.get(d) { | NoEntry => Set() | Entry(en) => en.held }
+  def entryAccountedBelow(d: Drv): int =
+    match entries.get(d) { | NoEntry => 0 | Entry(en) => en.accountedBelow }
   def entryFinalPending(d: Drv): bool =
     match entries.get(d) { | NoEntry => false | Entry(en) => en.finalPending }
   def entryPrefix(d: Drv): Prefix =
     match entries.get(d) { | NoEntry => PrefChecked | Entry(en) => en.prefix }
-  /// Rebuild `d`'s entry with new held lines / pending mark / prefix
-  /// state, keeping the stamp. Only meaningful under a `hasEntry` guard.
-  def entryWith(d: Drv, held: Set[int], fp: bool, pref: Prefix): EntrySlot =
+  /// Rebuild `d`'s entry with new held lines / accounted mark / pending
+  /// mark / prefix state, keeping the stamp. Only meaningful under a
+  /// `hasEntry` guard.
+  def entryWith(d: Drv, held: Set[int], acct: int, fp: bool, pref: Prefix): EntrySlot =
     Entry({
       exec: entryExec(d),
       executor: entryExecutor(d),
       held: held,
+      accountedBelow: acct,
       finalPending: fp,
       prefix: pref,
     })
@@ -389,6 +417,7 @@ module logBufferLifecycle {
   val boundsOK = and {
     DRVS.forall(d => dispatched.get(d) >= 0 and dispatched.get(d) <= MAX_EXECS),
     DRVS.forall(d => entryHeld(d).forall(n => n >= 0 and n < MAX_LINE)),
+    DRVS.forall(d => entryAccountedBelow(d) >= 0 and entryAccountedBelow(d) <= MAX_LINE),
     DRVS.forall(d => 1.to(MAX_EXECS).forall(e =>
       delivered.get(d).get(e).forall(n => n >= 0 and n < MAX_LINE))),
     DRVS.forall(d => hasEntry(d) implies
@@ -599,10 +628,12 @@ module logBufferLifecycle {
       | Final(req) => not(reqInTenure(req))
     }))
 
-  /// Violated when an eviction drops a non-empty head prefix of a held
-  /// ring (the byte-cap over-approximation actually fires).
+  /// Violated when an accepting push's eviction drops a non-empty head
+  /// prefix of the appended ring (the push-coupled byte-cap eviction
+  /// actually fires).
   val noEviction = not(wit.evicted)
-  /// Violated when the ingestion gate rejects a non-monotone batch.
+  /// Violated when the ingestion gate rejects a batch numbered below what
+  /// the entry has already accounted for.
   val noNonMonotoneRejection = not(wit.rejectedNonMonotone)
   /// Violated when a cross-exec restamp clears a non-empty ring (the
   /// clearing `noCrossExecContamination` depends on is load-bearing, not
@@ -661,6 +692,7 @@ module logBufferLifecycle {
         exec: nextExec,
         executor: ex,
         held: Set(),
+        accountedBelow: 0,
         finalPending: false,
         prefix: PrefUnchecked,
       })),
@@ -686,10 +718,17 @@ module logBufferLifecycle {
   ///      derivation_path must not allocate a buffer);
   ///   3. the entry's `assigned_executor` matches the calling stream's
   ///      (`executor_mismatch` otherwise) — r[sched.log.batch-binding];
-  ///   4. the batch's `first_line_number` is strictly above the ring's
-  ///      highest stored line number (`non_monotonic` otherwise) — the
-  ///      comparison is against the CURRENT ring contents only, so it
-  ///      resets when the ring empties — r[sched.executor.input-bounds+2].
+  ///   4. the batch's `first_line_number` is at or above the entry's
+  ///      accounted high-water mark (`non_monotonic` /
+  ///      `below_stored_prefix` otherwise) — the mark survives the ring
+  ///      emptying and the stored-coverage truncation, so a re-delivered
+  ///      line a cached stored prefix already covers is rejected instead
+  ///      of re-entering the ring below the prefix end —
+  ///      r[sched.executor.input-bounds+2] r[obs.log.gap-span+2].
+  /// With ENABLE_ACCOUNTED_FLOOR false, conjunct 4 degrades to the
+  /// pre-fix comparison against the ring's CURRENT tail (which resets
+  /// when the ring empties) — the `Ungated` module's expect-violation
+  /// check proves that degradation re-falsifies `lineSpanExact`.
   /// The `line_number_overflow` arm is unrepresentable in the bounded
   /// line domain (a Kani obligation, not a model one). The `unstamped`
   /// arm is unreachable (the model has no legacy `push()` entries).
@@ -697,20 +736,44 @@ module logBufferLifecycle {
     not(sealed.get(d)),
     hasEntry(d),
     entryExecutor(d) == ex,
-    entryHeld(d) == Set() or lo > setHi(entryHeld(d)),
+    if (ENABLE_ACCOUNTED_FLOOR)
+      lo >= entryAccountedBelow(d)
+    else
+      entryHeld(d) == Set() or lo > setHi(entryHeld(d)),
   }
 
   /// `LogBuffers::push_for` + `push_into`, accept path: the batch's lines
-  /// are appended to the ring and (ghost) attributed to the entry's
+  /// are appended to the ring, the accounted high-water mark is raised to
+  /// the batch's end, and the lines are (ghost) attributed to the entry's
   /// current execution. The batch is the contiguous worker interval
   /// `[lo, hi)`; an upward gap between the ring's current end and `lo` is
   /// accepted and becomes an interior hole (obs.log.gap-span).
   /// The check and the write happen under one shard write-lock in the
   /// code, so accept-then-append is one atomic step here too.
-  // Mirrors: LogBuffers::push_for (accept), LogBuffers::push_into.
+  ///
+  /// The line/byte-cap eviction is part of this step, not a free-standing
+  /// action: the real eviction runs only inside `push_into`, after the
+  /// append, pops only the front, and always leaves at least the
+  /// just-pushed batch's last line (a line is capped at MAX_LINE_LEN <
+  /// RING_BYTE_CAP, so the byte loop always stops with one line left).
+  /// The earlier free-standing `evict` over-approximation could strand
+  /// the ring's surviving tail strictly below a stored row end this
+  /// replica itself wrote — a state the push-coupled real eviction cannot
+  /// produce (the surviving back is the just-pushed line, the gate forces
+  /// every push above the previous back, and a row this replica writes
+  /// ends at its ring's back + 1) — and the original lineSpanExact
+  /// counterexample exploited exactly that unreachable state. The cut
+  /// point (the new front) is any held line at or below the just-pushed
+  /// last line; cut == the current minimum means no eviction fired.
+  /// Survivors stay a suffix, so the next flush's `first_line` reveals
+  /// exactly which head range was evicted — the disclosed head-loss
+  /// channel of obs.log.line-conservation.
+  // Mirrors: LogBuffers::push_for (accept), LogBuffers::push_into
+  //          (append + the `while ... pop_front` eviction loop).
   action pushBatchAccepted(d: Drv, ex: Executor, lo: int, hi: int): bool = {
     val lines = lo.to(hi - 1)
     val e = entryExec(d)
+    val newHeld = entryHeld(d).union(lines)
     all {
       lo < hi,
       hi <= MAX_LINE,
@@ -731,8 +794,22 @@ module logBufferLifecycle {
       // surface is the fuzz target's and sched.executor.input-bounds'
       // subject, not this model's.
       not(rowComplete(d, e)) or hi <= rowEnd(d, e),
-      entries' = entries.put(d,
-        entryWith(d, entryHeld(d).union(lines), entryFinalPending(d), entryPrefix(d))),
+      // The eviction's cut point: the new front after the append. Must
+      // keep the just-pushed batch's last line (`hi - 1`); equals the
+      // post-append minimum when no eviction fires, which is the only
+      // enabled choice when the eviction switch is off.
+      nondet cut = newHeld.oneOf()
+      all {
+        cut <= hi - 1,
+        ENABLE_EVICTION or cut == setLo(newHeld),
+        entries' = entries.put(d, entryWith(
+          d,
+          newHeld.filter(n => n >= cut),
+          maxInt(entryAccountedBelow(d), hi),
+          entryFinalPending(d),
+          entryPrefix(d))),
+        wit' = if (cut > setLo(newHeld)) { ...wit, evicted: true } else wit,
+      },
       delivered' = delivered.put(d,
         delivered.get(d).put(e, delivered.get(d).get(e).union(lines))),
       sealed' = sealed,
@@ -743,69 +820,34 @@ module logBufferLifecycle {
       stored' = stored,
       replica' = replica,
       leaseTransitions' = leaseTransitions,
-      wit' = wit,
     }
   }
 
-  /// `LogBuffers::push_for`, non-monotone reject arm: a non-empty batch
-  /// whose `first_line_number` is at or below the ring's highest stored
-  /// line number is dropped — per-batch, no state change beyond the
-  /// rejection counter (here: the witness flag). The other reject arms
-  /// (sealed, no entry, foreign executor) are pure no-ops and are not
-  /// modeled as steps — a no-op self-loop adds no reachable state and the
-  /// binding-gate invariant is about what `pushBatchAccepted` ADMITS, not
-  /// about the rejections being observable.
-  // Mirrors: LogBuffers::push_for (reason="non_monotonic").
+  /// `LogBuffers::push_for`, line-numbering reject arm: a non-empty batch
+  /// whose `first_line_number` is below what the entry has already
+  /// accounted for is dropped — per-batch, no state change beyond the
+  /// rejection counter (here: the witness flag). Covers both reasons the
+  /// code partitions the arm into (`non_monotonic`: at or below the
+  /// ring's current tail; `below_stored_prefix`: below the accounted mark
+  /// while the ring holds nothing at or above the batch). The other
+  /// reject arms (sealed, no entry, foreign executor) are pure no-ops and
+  /// are not modeled as steps — a no-op self-loop adds no reachable state
+  /// and the binding-gate invariant is about what `pushBatchAccepted`
+  /// ADMITS, not about the rejections being observable.
+  // Mirrors: LogBuffers::push_for (reason="non_monotonic" /
+  //          reason="below_stored_prefix").
   action pushBatchRejectedNonMonotone(d: Drv, ex: Executor, lo: int): bool = all {
     not(sealed.get(d)),
     hasEntry(d),
     entryExecutor(d) == ex,
-    entryHeld(d) != Set(),
-    lo <= setHi(entryHeld(d)),
+    if (ENABLE_ACCOUNTED_FLOOR)
+      lo < entryAccountedBelow(d)
+    else
+      and { entryHeld(d) != Set(), lo <= setHi(entryHeld(d)) },
     lo >= 0,
     lo < MAX_LINE,
     wit' = { ...wit, rejectedNonMonotone: true },
     entries' = entries,
-    sealed' = sealed,
-    pendingFinal' = pendingFinal,
-    dispatched' = dispatched,
-    dag' = dag,
-    pg' = pg,
-    delivered' = delivered,
-    stored' = stored,
-    replica' = replica,
-    leaseTransitions' = leaseTransitions,
-  }
-
-  // --- 6c. eviction -----------------------------------------------------
-
-  /// The line/byte-cap eviction inside `LogBuffers::push_into`: pop lines
-  /// off the FRONT of the ring until under the cap. Abstracted to "an
-  /// arbitrary non-empty proper prefix of the held lines may be dropped at
-  /// any time the ring holds at least two lines" — a sound
-  /// over-approximation of the real policy (the real eviction fires only
-  /// when a push exceeds RING_CAPACITY/RING_BYTE_CAP and always leaves at
-  /// least the just-pushed tail; the model may evict more often and more
-  /// aggressively, reaching strictly more states). Eviction only ever pops
-  /// the front, so the survivors stay a suffix and the next flush's
-  /// `first_line` reveals exactly which head range was evicted — the
-  /// disclosed head-loss channel of obs.log.line-conservation.
-  // Mirrors: LogBuffers::push_into (the `while ... pop_front` loop).
-  action evict(d: Drv): bool = all {
-    ENABLE_EVICTION,
-    entryHeld(d).size() >= 2,
-    // The new front: any held line above the current front; every line
-    // below it is evicted. The -1 sentinel keeps the nondet domain
-    // non-empty when the guard above is false (oneOf of an empty set is
-    // undefined); the `cut >= 0` conjunct disables those picks.
-    nondet cut = entryHeld(d).union(Set(-1)).oneOf()
-    all {
-      cut > setLo(entryHeld(d)),
-      cut >= 0,
-      entries' = entries.put(d,
-        entryWith(d, entryHeld(d).filter(n => n >= cut), entryFinalPending(d), entryPrefix(d))),
-    },
-    wit' = { ...wit, evicted: true },
     sealed' = sealed,
     pendingFinal' = pendingFinal,
     dispatched' = dispatched,
@@ -856,7 +898,7 @@ module logBufferLifecycle {
       // mark_final_pending is exec-guarded: applied only when the entry
       // is stamped with the execution the request pins.
       entries' = if (hasEntry(d) and entryExec(d) == e)
-        entries.put(d, entryWith(d, entryHeld(d), true, entryPrefix(d)))
+        entries.put(d, entryWith(d, entryHeld(d), entryAccountedBelow(d), true, entryPrefix(d)))
       else entries,
     },
     sealed' = sealed.put(d, true),
@@ -931,7 +973,7 @@ module logBufferLifecycle {
         transitions: acquiredTransitions,
       })),
       entries' = if (hasEntry(d) and entryExec(d) == e)
-        entries.put(d, entryWith(d, entryHeld(d), true, entryPrefix(d)))
+        entries.put(d, entryWith(d, entryHeld(d), entryAccountedBelow(d), true, entryPrefix(d)))
       else entries,
     },
     sealed' = sealed.put(d, true),
@@ -1037,17 +1079,25 @@ module logBufferLifecycle {
       not(ringSubsumesRow(d, e)),
     }
     entries' = if (needsFold)
-      // Found: cache the row's recorded span as the prefix and drop every
-      // ring line below its stated end.
+      // Found: cache the row's recorded span as the prefix, drop every
+      // ring line below its stated end, and raise the accounted mark to
+      // that end — every line below it is now durably accounted for by
+      // the stored row, so a later batch numbered below it is rejected
+      // instead of re-entering the ring under the cached prefix
+      // (truncate_below and set_recovered_prefix both raise the mark in
+      // the code; the model's reconcile is one atomic step so one raise
+      // covers both).
       entries.put(d, entryWith(
         d,
         entryHeld(d).filter(n => n >= rowEnd(d, e)),
+        maxInt(entryAccountedBelow(d), rowEnd(d, e)),
         entryFinalPending(d),
         PrefCached({ lo: rowLo(d, e), cnt: rowCnt(d, e) })))
     else
       // NotNeeded: no row, a finalized row (the already-finalized guard /
       // the frozen UPSERT own that), or the ring subsumes it.
-      entries.put(d, entryWith(d, entryHeld(d), entryFinalPending(d), PrefChecked)),
+      entries.put(d, entryWith(
+        d, entryHeld(d), entryAccountedBelow(d), entryFinalPending(d), PrefChecked)),
     sealed' = sealed,
     pendingFinal' = pendingFinal,
     dispatched' = dispatched,
@@ -1079,7 +1129,21 @@ module logBufferLifecycle {
         // gap = first_line.saturating_sub(prefix_end)
         val prefixEnd = p.lo + p.cnt
         val gap = if (ringFirst > prefixEnd) ringFirst - prefixEnd else 0
-        { lo: p.lo, cnt: p.cnt + gap + ringSpan, trueEnd: ringLast + 1, complete: complete }
+        // The ghost truth: one past the highest true worker line the
+        // row's CONTENT (prefix blob + ring lines) covers. The prefix's
+        // own recorded span is exact (an inductive property of this very
+        // fold), so its content reaches prefixEnd - 1; the ring reaches
+        // ringLast. Under the accept gate's precondition (the ring starts
+        // at or after the prefix end) the max is always ringLast + 1; the
+        // max form keeps the ghost honest in the Ungated module, where a
+        // ring stranded below the prefix end would otherwise UNDERSTATE
+        // the truth and overstate the violation.
+        {
+          lo: p.lo,
+          cnt: p.cnt + gap + ringSpan,
+          trueEnd: maxInt(prefixEnd, ringLast + 1),
+          complete: complete,
+        }
       | PrefUnchecked =>
         { lo: ringFirst, cnt: ringSpan, trueEnd: ringLast + 1, complete: complete }
       | PrefChecked =>
@@ -1261,7 +1325,7 @@ module logBufferLifecycle {
       all {
         entries' = if (emptyReap) entries.put(d, NoEntry)
           else if (retained)
-            entries.put(d, entryWith(d, entryHeld(d), true, entryPrefix(d)))
+            entries.put(d, entryWith(d, entryHeld(d), entryAccountedBelow(d), true, entryPrefix(d)))
           else entries,
         sealed' = if (emptyReap) sealed.put(d, false) else sealed,
         // Retained for retry: the request stays in the slot. Consumed
@@ -1545,25 +1609,38 @@ module logBufferLifecycle {
   /// to one retained entry against the persisted assignment `(e, ex)`:
   ///   - no entry: create a fresh empty stamped entry (the carrier for
   ///     the periodic flush before the worker's first batch);
-  ///   - same exec: keep the lines (a single lease flap with no interim
-  ///     re-dispatch — the still-streaming worker's execution must keep
-  ///     accumulating), but clear the seal, the pending-final mark, and
-  ///     the per-tenure prefix bookkeeping (the prior tenure's retained
-  ///     final can no longer resolve the entry, and an interim leader may
-  ///     have extended the stored row past what this ring holds);
+  ///   - same exec: keep the lines and the accounted high-water mark (a
+  ///     single lease flap with no interim re-dispatch — the
+  ///     still-streaming worker's execution must keep accumulating, and
+  ///     its numbering does not restart), but clear the seal, the
+  ///     pending-final mark, and the per-tenure prefix bookkeeping (the
+  ///     prior tenure's retained final can no longer resolve the entry,
+  ///     and an interim leader may have extended the stored row past what
+  ///     this ring holds);
   ///   - cross exec: the assignment was re-issued under a different
   ///     exec_id while this entry sat retained — clear the lines, the
-  ///     seal, the pending-final mark, and the prefix state; carrying any
-  ///     of them across would hand one execution's output to another
-  ///     execution's S3 key and drv_logs row (obs.log.exec-keyed+2).
+  ///     accounted mark (the new execution restarts its numbering at 0),
+  ///     the seal, the pending-final mark, and the prefix state; carrying
+  ///     any of them across would hand one execution's output to another
+  ///     execution's S3 key and drv_logs row (obs.log.exec-keyed+2) or
+  ///     mute the new execution's entire stream.
   pure def restampEntry(slot: EntrySlot, e: int, ex: Executor): EntrySlot =
     match slot {
-      | NoEntry => Entry({ exec: e, executor: ex, held: Set(), finalPending: false, prefix: PrefUnchecked })
+      | NoEntry => Entry({
+          exec: e, executor: ex, held: Set(), accountedBelow: 0,
+          finalPending: false, prefix: PrefUnchecked,
+        })
       | Entry(en) =>
         if (en.exec == e)
-          Entry({ exec: e, executor: ex, held: en.held, finalPending: false, prefix: PrefUnchecked })
+          Entry({
+            exec: e, executor: ex, held: en.held, accountedBelow: en.accountedBelow,
+            finalPending: false, prefix: PrefUnchecked,
+          })
         else
-          Entry({ exec: e, executor: ex, held: Set(), finalPending: false, prefix: PrefUnchecked })
+          Entry({
+            exec: e, executor: ex, held: Set(), accountedBelow: 0,
+            finalPending: false, prefix: PrefUnchecked,
+          })
     }
 
   /// Whether restamping `slot` against persisted exec `e` is a cross-exec
@@ -1748,7 +1825,11 @@ module logBufferLifecycle {
     leaseTransitions > acquiredTransitions,
     pg.get(d) != PgNone,
     val e = match pg.get(d) { | PgNone => 1 | PgLive(a) => a.exec }
-    val floor = maxInt(setEnd(delivered.get(d).get(e)), 1)
+    // The end is at least every line this replica received, AND at least
+    // the execution's current stored end: the interim's own final folds
+    // its own stored coverage (stored-coverage-preserved), so its
+    // finalized span can never regress what any tenure already recorded.
+    val floor = maxInt(maxInt(setEnd(delivered.get(d).get(e)), 1), rowEnd(d, e))
     all {
       floor <= MAX_LINE,
       nondet end = floor.to(MAX_LINE).oneOf()
@@ -1756,6 +1837,51 @@ module logBufferLifecycle {
         Stored({ lo: 0, cnt: end, trueEnd: end, complete: true }))),
     },
     pg' = pg.put(d, PgNone),
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    delivered' = delivered,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// An interim leader's periodic flush extends the live execution's
+  /// `drv_logs` row WITHOUT finalizing it: the interim received lines
+  /// this replica may never have held (the worker reconnected to it and
+  /// kept streaming) and snapshotted them, folding any prior stored
+  /// coverage per the gap-merge rules — so the row stays exact
+  /// (`lo + cnt == trueEnd`) and its end only grows. This is the
+  /// documented reason `reconcile_stored_prefix` exists ("an interim
+  /// leader flushed lines this replica never received … or stored
+  /// coverage past the ring's tail") and the only way a NON-finalized
+  /// stored row can end past this replica's retained ring once eviction
+  /// is push-coupled: a row this replica writes always ends at its own
+  /// ring's back + 1, so its own reconcile can never truncate the ring to
+  /// empty. Without this action the recovered-prefix fold's hard case —
+  /// the truncate-to-empty that used to reset the ingestion gate — is
+  /// unreachable and `lineSpanExact`'s gap-merge branch is vacuous.
+  // Mirrors: another replica's flush_periodic + upload_and_record +
+  //          upsert_drv_log (is_final=false), projected onto the shared
+  //          row.
+  action interimExtendsRow(d: Drv): bool = all {
+    not(isLeader),
+    leaseTransitions > acquiredTransitions,
+    pg.get(d) != PgNone,
+    val e = match pg.get(d) { | PgNone => 1 | PgLive(a) => a.exec }
+    all {
+      // Only extend a live, non-finalized row (the frozen-row UPSERT
+      // refuses writes to a finalized one), and strictly: a non-extending
+      // snapshot is a stored-state no-op.
+      not(rowComplete(d, e)),
+      rowEnd(d, e) < MAX_LINE,
+      nondet end = (rowEnd(d, e) + 1).to(MAX_LINE).oneOf()
+      stored' = stored.put(d, stored.get(d).put(e,
+        Stored({ lo: 0, cnt: end, trueEnd: end, complete: false }))),
+    },
+    pg' = pg,
     entries' = entries,
     sealed' = sealed,
     pendingFinal' = pendingFinal,
@@ -1908,7 +2034,9 @@ module logBufferLifecycle {
     nondet ex = EXECUTORS.oneOf()
     dispatch(d, ex)
   }
-  /// One worker batch is accepted into one entry.
+  /// One worker batch is accepted into one entry (possibly evicting a
+  /// head prefix of the appended ring — the push-coupled byte-cap
+  /// eviction).
   action pushBatchAcceptedAny = {
     nondet d = DRVS.oneOf()
     nondet ex = EXECUTORS.oneOf()
@@ -1916,17 +2044,12 @@ module logBufferLifecycle {
     nondet hi = 1.to(MAX_LINE).oneOf()
     pushBatchAccepted(d, ex, lo, hi)
   }
-  /// One worker batch is rejected as non-monotone.
+  /// One worker batch is rejected by the line-numbering gate.
   action pushBatchRejectedNonMonotoneAny = {
     nondet d = DRVS.oneOf()
     nondet ex = EXECUTORS.oneOf()
     nondet lo = 0.to(MAX_LINE - 1).oneOf()
     pushBatchRejectedNonMonotone(d, ex, lo)
-  }
-  /// One entry's ring evicts a head prefix.
-  action evictAny = {
-    nondet d = DRVS.oneOf()
-    evict(d)
   }
   /// One derivation reaches a terminal state and its final flush is
   /// enqueued.
@@ -2000,6 +2123,11 @@ module logBufferLifecycle {
     nondet d = DRVS.oneOf()
     interimFinalizes(d)
   }
+  /// One interim leader's periodic flush extends one execution's row.
+  action interimExtendsRowAny = {
+    nondet d = DRVS.oneOf()
+    interimExtendsRow(d)
+  }
   /// One interim leader re-dispatches one derivation.
   action interimRedispatchesAny = {
     nondet d = DRVS.oneOf()
@@ -2016,7 +2144,6 @@ module logBufferLifecycle {
     dispatchAny,
     pushBatchAcceptedAny,
     pushBatchRejectedNonMonotoneAny,
-    evictAny,
     terminalEnqueuedAny,
     terminalEnqueueFailedAny,
     terminalPersistFailedAny,
@@ -2039,6 +2166,7 @@ module logBufferLifecycle {
     recoveryLoadFailed,
     recoveryDiscarded,
     interimFinalizesAny,
+    interimExtendsRowAny,
     interimRedispatchesAny,
     executorDisconnectsAny,
   }
@@ -2091,7 +2219,8 @@ module logBufferLifecycleBase {
     ENABLE_DISCARDED_RECOVERY = false,
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
-    ENABLE_GUARD_FAILURE = false
+    ENABLE_GUARD_FAILURE = false,
+    ENABLE_ACCOUNTED_FLOOR = true
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -2198,14 +2327,64 @@ module logBufferLifecycleFlap {
     ENABLE_DISCARDED_RECOVERY = false,
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
-    ENABLE_GUARD_FAILURE = false
+    ENABLE_GUARD_FAILURE = false,
+    ENABLE_ACCOUNTED_FLOOR = true
   ).*
+
+  /// Regression run for the obs.log.gap-span+2 falsification: the
+  /// reachable pre-fix counterexample trace, replayed against the gated
+  /// model. An interim leader extends the execution's stored row past
+  /// everything this replica's retained ring holds; the re-acquiring
+  /// replica's stored-coverage reconcile fetches the row, truncates the
+  /// whole ring away, and caches the prefix; the worker then re-delivers
+  /// a line the stored row already covers. Pre-fix that line landed in
+  /// the empty ring and the final's gap-merge fold double-counted it
+  /// (line_count = prefix(3) + gap(0) + ring_span(1) = 4 over a true
+  /// span of 3). With the accounted-floor gate the re-delivery is
+  /// rejected, the final drains an empty ring, and the recorded span
+  /// stays exact. The same trace against the Ungated module (below)
+  /// still reaches the violation — the machine-checked evidence that the
+  /// gate is the load-bearing fix.
+  run gapSpanRedeliveryRegressionRun =
+    init
+      .then(dispatch("d1", "e1"))
+      .then(pushBatchAccepted("d1", "e1", 0, 2))
+      .then(reconcileStoredPrefix("d1"))
+      .then(flushPeriodicUpload("d1"))
+      .expect(rowLo("d1", 1) == 0 and rowCnt("d1", 1) == 2 and not(rowComplete("d1", 1)))
+      .then(loseLease)
+      .then(foreignSteal)
+      .then(interimExtendsRow("d1"))
+      .expect(rowEnd("d1", 1) == 3 and not(rowComplete("d1", 1)))
+      .then(reacquireAfterHolderChange)
+      .then(recoveryOk)
+      .expect(entryHeld("d1") == Set(0, 1) and entryPrefix("d1") == PrefUnchecked)
+      .then(reconcileStoredPrefix("d1"))
+      .expect(all {
+        entryHeld("d1") == Set(),
+        entryPrefix("d1") == PrefCached({ lo: 0, cnt: 3 }),
+        entryAccountedBelow("d1") == 3,
+        // The re-delivery of a covered line is no longer accepted.
+        not(batchAccepted("d1", "e1", 1)),
+      })
+      .then(pushBatchRejectedNonMonotone("d1", "e1", 1))
+      .expect(entryHeld("d1") == Set() and wit.rejectedNonMonotone)
+      .then(terminalEnqueued("d1"))
+      .then(flushFinalEmptyDrain("d1"))
+      .expect(all {
+        // The empty drain leaves the interim's exact row untouched
+        // (is_complete stays false; the incomplete indicator survives).
+        rowLo("d1", 1) == 0,
+        rowCnt("d1", 1) == 3,
+        not(rowComplete("d1", 1)),
+        lineSpanExact,
+      })
 }
 
 // =========================================================================
 // THE FAULT REGIME: every local fault-injection branch enabled on top of
-// the flap regime's lease budget — ring evictions (the byte-cap
-// over-approximation), DAG-load failures and TOCTOU-discarded
+// the flap regime's lease budget — ring evictions (the push-coupled
+// byte-cap eviction), DAG-load failures and TOCTOU-discarded
 // recoveries, flush-channel-full enqueue failures, terminal-status
 // persist failures (the correlated failure that leaves PG saying a
 // terminal derivation is still running), and finalize-guard SELECT
@@ -2232,38 +2411,41 @@ module logBufferLifecycleFault {
     ENABLE_DISCARDED_RECOVERY = true,
     ENABLE_ENQUEUE_FAILURE = true,
     ENABLE_PERSIST_FAILURE = true,
-    ENABLE_GUARD_FAILURE = true
+    ENABLE_GUARD_FAILURE = true,
+    ENABLE_ACCOUNTED_FLOOR = true
   ).*
 }
 
 // =========================================================================
-// FALSIFICATION REPRODUCER — lineSpanExact is VIOLATED on this trace.
+// THE UNGATED VARIANT — the expect-violation witness that the accept
+// gate is the load-bearing fix for the obs.log.gap-span+2 falsification,
+// and calibration-table entry #0.
 //
-// This module is the captured counterexample of an open falsification of
-// obs.log.gap-span+2, awaiting adjudication (a real protocol bug in the
-// gap-merge fold vs. a worker-contract assumption to be added to the
-// model). The analysis lives in the campaign's
-// phase2-falsification-lineSpanExact.md report. The run's final .expect
-// asserts not(lineSpanExact) — it PASSES while the bug exists and will
-// FAIL (flagging this module for removal or inversion into a regression
-// run) once either the code's fold arithmetic or the model's ingestion
-// assumptions change.
+// Identical to the flap regime except ENABLE_ACCOUNTED_FLOOR = false:
+// the batch accept predicate degrades to the pre-fix comparison against
+// the ring's CURRENT tail only, which resets when the stored-coverage
+// reconcile truncates the ring to empty. lineSpanExact is then VIOLATED:
+// an interim leader extends the execution's stored row past everything
+// this replica's retained ring holds, the re-acquiring replica's
+// reconcile fetches the row, truncates the whole ring away, and caches
+// the prefix; a re-delivered (or fabricated) line the stored row already
+// covers lands in the empty ring; and the gap-merge fold saturates the
+// negative prefix-to-ring gap to 0 and adds the overlapping ring span on
+// top of the prefix span that already covers it. The recorded
+// first_line + line_count overshoots the execution's true end by the
+// overlap.
 //
-// The trace: a periodic flush records [0,2), the ring evicts its head to
-// {1}, a self-fence false alarm re-runs recovery, the stored-coverage
-// reconcile fetches the [0,2) prefix and truncates the ring to empty
-// (resetting the monotone ingestion gate), the worker re-delivers line 1
-// (accepted — the empty ring has no high-water mark), and the final
-// flush's gap-merge fold double-counts the overlapping line:
-// line_count = prefix(2) + saturated-gap(0) + ring_span(1) = 3 over a
-// true span of 2, so first_line + line_count lands two past the highest
-// true worker line stored instead of one.
-//
-// NOT wired as a CI check: no regime check is wired until the
-// falsification is adjudicated (a red invariant check on the merge gate
-// would block unrelated work on a known, reported, owned issue).
+// Wired as quint-log-witness-gap-span-ungated in nix/quint.nix: the
+// check PASSES only when the checker violates lineSpanExact here. A
+// green exhaustive check on the gated regimes plus a red lineSpanExact
+// here is the machine-checked statement "the gate is necessary and
+// sufficient at these bounds". The deterministic run below pins the
+// minimal trace; the analysis lives in the campaign's
+// phase2-falsification-lineSpanExact report and its adversarial review
+// (which corrected the original reproducer's unreachable free-standing
+// eviction step to the interim-leader row extension used here).
 // =========================================================================
-module lineSpanExactRepro {
+module logBufferLifecycleUngated {
   import logBufferLifecycle(
     DRVS = Set("d1"),
     EXECUTORS = Set("e1", "e2"),
@@ -2271,29 +2453,38 @@ module lineSpanExactRepro {
     MAX_LINE = 3,
     MAX_TRANSITIONS = 2,
     MAX_GEN = 4,
-    ENABLE_EVICTION = true,
+    ENABLE_EVICTION = false,
     ENABLE_LOAD_FAILURE = false,
     ENABLE_DISCARDED_RECOVERY = false,
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
-    ENABLE_GUARD_FAILURE = false
+    ENABLE_GUARD_FAILURE = false,
+    ENABLE_ACCOUNTED_FLOOR = false
   ).*
 
-  run lineSpanExactFalsificationRun =
+  /// The minimal reachable pre-fix counterexample. Steps 1-9 are
+  /// identical to the flap regime's gapSpanRedeliveryRegressionRun; the
+  /// re-delivery at step 10 is ACCEPTED here (the empty ring has no
+  /// surviving high-water mark) and the final fold double-counts it.
+  run ungatedRedeliveryFalsifiesSpanRun =
     init
       .then(dispatch("d1", "e1"))
       .then(pushBatchAccepted("d1", "e1", 0, 2))
       .then(reconcileStoredPrefix("d1"))
       .then(flushPeriodicUpload("d1"))
       .expect(rowLo("d1", 1) == 0 and rowCnt("d1", 1) == 2 and not(rowComplete("d1", 1)))
-      .then(evict("d1"))
-      .expect(entryHeld("d1") == Set(1))
       .then(loseLease)
-      .then(reacquireSameEpoch)
+      .then(foreignSteal)
+      .then(interimExtendsRow("d1"))
+      .expect(rowEnd("d1", 1) == 3 and not(rowComplete("d1", 1)))
+      .then(reacquireAfterHolderChange)
       .then(recoveryOk)
-      .expect(entryHeld("d1") == Set(1) and entryPrefix("d1") == PrefUnchecked)
+      .expect(entryHeld("d1") == Set(0, 1) and entryPrefix("d1") == PrefUnchecked)
       .then(reconcileStoredPrefix("d1"))
-      .expect(entryHeld("d1") == Set() and entryPrefix("d1") == PrefCached({ lo: 0, cnt: 2 }))
+      .expect(entryHeld("d1") == Set() and entryPrefix("d1") == PrefCached({ lo: 0, cnt: 3 }))
+      // The worker re-delivers line 1 — a line the cached prefix already
+      // covers. The ring is empty, so the pre-fix tail comparison has
+      // nothing to compare against and the batch is accepted.
       .then(pushBatchAccepted("d1", "e1", 1, 2))
       .expect(entryHeld("d1") == Set(1))
       .then(terminalEnqueued("d1"))
@@ -2301,7 +2492,9 @@ module lineSpanExactRepro {
       .expect(all {
         rowComplete("d1", 1),
         rowLo("d1", 1) == 0,
-        rowCnt("d1", 1) == 3,
+        // prefix(3) + saturated-gap(0) + ring_span(1) = 4 over a true
+        // span of 3: one line past the execution's true end.
+        rowCnt("d1", 1) == 4,
         not(lineSpanExact),
       })
 }
