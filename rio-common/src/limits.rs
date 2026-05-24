@@ -103,6 +103,26 @@ pub fn is_hw_class_name(s: &str) -> bool {
 /// an unbounded number of per-output accumulation buffers on the server.
 pub const MAX_BATCH_OUTPUTS: usize = 16;
 
+/// Maximum number of `Directory` bodies in a single `PutPathChunked`
+/// `Begin` message (ADR-022 §6.2 bounds).
+///
+/// One derivation's outputs. A chromium-scale output tree is ~8k
+/// distinct directories; 64k gives 8× headroom while bounding the
+/// per-request decode + revalidate + digest-recompute work. Each body
+/// is itself bounded by the gRPC message size, so the worst case is
+/// `MAX_DIR_NODES × avg_body` of transient memory during validation.
+pub const MAX_DIR_NODES: usize = 65_536;
+
+/// Maximum number of `input_closure` entries in a single
+/// `PutPathChunked` `Begin` message (ADR-022 §6.2 bounds).
+///
+/// The input closure is the refscan candidate set the scheduler
+/// attested via `claims.input_closure_digest`. Full nixpkgs stdenv is
+/// ~5k paths, a full system ~20k; 64k bounds the per-request
+/// blake3-digest + candidate-set build against a hostile closure list
+/// while never rejecting a legitimate one.
+pub const MAX_INPUT_CLOSURE: usize = 65_536;
+
 /// Maximum number of DAG nodes in a single SubmitBuild request.
 ///
 /// Protects the scheduler from unbounded DAG merges. Matches

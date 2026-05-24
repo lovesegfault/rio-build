@@ -306,6 +306,26 @@ impl ChunkService for MockStore {
         )))
     }
 
+    /// Durable-presence probe (ADR-022 §6.2). The mock has no
+    /// `durable` flag — every seeded chunk is "durable" (a bit is set
+    /// iff the digest is in `state.chunks`). Tests that need the
+    /// not-yet-durable distinction use the real store against
+    /// ephemeral PG.
+    async fn has_chunks(
+        &self,
+        request: Request<types::HasChunksRequest>,
+    ) -> Result<Response<types::HasChunksResponse>, Status> {
+        let digests = request.into_inner().digests;
+        let chunks = self.state.chunks.read().unwrap();
+        let mut bitmap = vec![0u8; digests.len().div_ceil(8)];
+        for (i, d) in digests.iter().enumerate() {
+            if chunks.contains_key(d) {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(Response::new(types::HasChunksResponse { bitmap }))
+    }
+
     type GetChunksStream = tokio_stream::wrappers::ReceiverStream<Result<types::ChunkData, Status>>;
 
     /// Bidi-stream batch fetch (P0568). Same lookup as `get_chunk` —
@@ -412,6 +432,19 @@ impl MockStore {
 
 #[tonic::async_trait]
 impl StoreService for MockStore {
+    /// Not modeled: the mock's consumers (builder upload tests against
+    /// the legacy path, gateway/scheduler tests) don't speak the
+    /// chunked protocol yet. The builder-half dispatch adds a real
+    /// implementation when it rewrites `upload_all_outputs`.
+    async fn put_path_chunked(
+        &self,
+        _request: Request<Streaming<types::PutPathChunkedRequest>>,
+    ) -> Result<Response<types::PutPathResponse>, Status> {
+        Err(Status::unimplemented(
+            "MockStore does not model PutPathChunked",
+        ))
+    }
+
     async fn put_path(
         &self,
         request: Request<Streaming<types::PutPathRequest>>,

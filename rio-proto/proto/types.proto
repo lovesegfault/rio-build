@@ -1,6 +1,8 @@
 syntax = "proto3";
 package rio.types;
 
+import "castore.proto"; // PutPathChunkedBegin.directories / OutputHeader.root_node
+
 // Shared primitive message types — imported by every other .proto in the
 // package. Domain split:
 //
@@ -479,6 +481,101 @@ message GetChunksRequest {
 message ChunkData {
   bytes digest = 1;                       // BLAKE3 digest (32 bytes)
   bytes data = 2;                         // Chunk bytes; blake3(data) == digest
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// PutPathChunked (ADR-022 §6) — builder-side chunked multi-output upload
+// ───────────────────────────────────────────────────────────────────────────
+
+// Batch presence probe over chunk digests (the chunk-granular sibling
+// of HasDirectories/HasBlobs). The builder calls this before
+// PutPathChunked to compute `Begin.novel`.
+message HasChunksRequest {
+  repeated bytes digests = 1;  // 32-byte BLAKE3 chunk digests
+}
+
+// One bit per request index, LSB-first within each byte; trailing bits
+// of the last byte are 0. Bit i set ⇔ digests[i] is S3-DURABLE:
+// referenced by at least one `complete` manifest (`chunks.durable AND
+// NOT deleted`), not merely refcount ≥ 1. Durable-presence semantics
+// close the I-201 stranded-chunk race: a SIGKILL between refcount-bump
+// and S3 PutObject combined with a concurrent uploader's presence-skip
+// would otherwise permanently strand the digest. No tenant scoping —
+// chunks are content-addressed and knowing a BLAKE3 hash already
+// proves you have (or had) the bytes.
+message HasChunksResponse {
+  bytes bitmap = 1;
+}
+
+// r[impl store.put.chunked-wire]
+// Client-stream frame for PutPathChunked. Stream shape:
+//   Begin (exactly 1, first) → Chunk (one per Begin.novel entry, in
+//   Begin.novel order) → half-close.
+// Authentication: the `x-rio-assignment-token` request-metadata header
+// (same HMAC assignment token as PutPath), NOT a message field.
+message PutPathChunkedRequest {
+  oneof msg {
+    PutPathChunkedBegin begin = 1;
+    PutPathChunkedChunk chunk = 2;
+  }
+}
+
+// One output of the derivation being uploaded.
+message ChunkedOutputHeader {
+  // Full /nix/store/... path of this output.
+  string store_path = 1;
+  // Claimed SHA-256 of this output's canonical NAR serialization
+  // (32 bytes). The store independently recomputes it from the
+  // Directory tree + chunk bodies before commit
+  // (r[store.put.narhash-sync]); a mismatch fails the whole RPC.
+  bytes nar_hash = 2;
+  // Claimed NAR size in bytes. Cross-checked against the recomputed
+  // framing + chunk lengths.
+  uint64 nar_size = 3;
+  // Runtime references (full store paths). Must be a subset of
+  // Begin.input_closure ∪ {all outputs' store_paths}. The store
+  // re-scans the reconstructed NAR byte stream and rejects on
+  // mismatch (r[store.put.refs-sync]).
+  repeated string refs = 4;
+  // Root of this output's castore tree. DirectoryNode roots reference
+  // a digest that MUST be present in Begin.directories.
+  rio.castore.RootNode root_node = 5;
+  // Ordered (digest, len) list over this output's regular-file
+  // contents in canonical NAR walk order. For each regular file the
+  // contiguous run of `size` values sums to that FileEntry.size
+  // (chunks are per-file-aligned; FastCDC restarts at each file).
+  repeated ChunkRef chunk_manifest = 6;
+}
+
+// First (and only first) message of a PutPathChunked stream.
+message PutPathChunkedBegin {
+  // Store path of the .drv that produced these outputs. Bound to the
+  // assignment token's drv_hash claim.
+  string deriver = 1;
+  // All outputs of the derivation. Committed atomically
+  // (r[store.atomic.multi-output]).
+  repeated ChunkedOutputHeader outputs = 2;
+  // Directory bodies for every dir_digest reachable from any output's
+  // root_node, deduplicated across outputs. The store revalidates each
+  // body and recomputes its digest (r[store.put.chunked-bounds]).
+  repeated rio.castore.Directory directories = 3;
+  // Exactly the chunk digests the builder will send as Chunk frames,
+  // ordered by GLOBAL FIRST OCCURRENCE: the order each digest is first
+  // encountered when walking outputs[0].chunk_manifest, then
+  // outputs[1].chunk_manifest, and so on. Typically the
+  // HasChunks-false subset of the union of all chunk_manifest digests.
+  repeated bytes novel = 4;
+  // The refscan candidate set (full store paths), attested via
+  // claims.input_closure_digest = blake3(sorted(input_closure)).
+  repeated string input_closure = 5;
+}
+
+// One novel chunk's bytes. MUST arrive in Begin.novel order; digest
+// MUST equal blake3(data) and len(data) MUST equal every
+// chunk_manifest entry's size for this digest.
+message PutPathChunkedChunk {
+  bytes digest = 1;  // 32-byte BLAKE3
+  bytes data = 2;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -19,6 +19,20 @@ service StoreService {
   // "all outputs or none" contract).
   rpc PutPathBatch(stream rio.types.PutPathBatchRequest) returns (rio.types.PutPathBatchResponse);
 
+  // r[impl store.put.chunked]
+  // ADR-022 §6: builder-side chunked multi-output upload. The builder
+  // FastCDC-chunks each output during its fused NAR walk, probes
+  // HasChunks for the missing set, and streams Begin{outputs[],
+  // directories[], novel[], input_closure[]} followed by one Chunk
+  // frame per `novel` digest in `novel` order. The store verifies each
+  // chunk's BLAKE3 on arrival, writes it to S3 immediately (no
+  // whole-NAR buffer), reconstructs each output's NAR byte stream from
+  // the Directory tree + chunk bodies to independently recompute
+  // nar_hash and references, and commits all outputs in one
+  // transaction. Authenticated by the x-rio-assignment-token header.
+  // `created` is true iff at least one output was newly committed.
+  rpc PutPathChunked(stream rio.types.PutPathChunkedRequest) returns (rio.types.PutPathResponse);
+
   // Download a store path's NAR data (streaming).
   rpc GetPath(rio.types.GetPathRequest) returns (stream rio.types.GetPathResponse);
 
@@ -171,6 +185,15 @@ service DirectoryService {
 service ChunkService {
   // Download a chunk by its digest.
   rpc GetChunk(rio.types.GetChunkRequest) returns (stream rio.types.GetChunkResponse);
+
+  // r[impl store.chunk.has-chunks-durable]
+  // Batch durable-presence probe (ADR-022 §6.2). A bit is set only if
+  // the chunk is referenced by at least one `complete` manifest
+  // (`chunks.durable AND NOT deleted`), NOT merely refcount ≥ 1 — see
+  // HasChunksResponse for the I-201 rationale. The builder calls this
+  // before PutPathChunked to compute `Begin.novel`. Unscoped, like
+  // GetChunk.
+  rpc HasChunks(rio.types.HasChunksRequest) returns (rio.types.HasChunksResponse);
 
   // Batched chunk download (P0568). The castore-FUSE fill task (P0559)
   // sends GetChunksRequest frames as it discovers local-cache misses;
