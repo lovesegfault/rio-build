@@ -531,6 +531,115 @@ async fn test_fixed_ca_fod_path_based_lane(
     Ok(())
 }
 
+/// THE incident scenario: a multi-output derivation whose only missing
+/// output is one nothing wants (glibc-debug) must classify as a cache
+/// hit, not fall through to a from-source build dispatch. Three cases:
+///
+/// 1. `wanted=[out]`, P_out present, P_debug missing+unsubstitutable →
+///    cache hit (Completed at merge, build Succeeded). The recorded
+///    `output_paths` still cover ALL declared outputs (constraint 4 —
+///    the hit VALUES stay `expected_output_paths`).
+/// 2. Same store state, `wanted=[]` (the all-wanted sentinel) → NOT a
+///    hit; falls through to Ready exactly as today. Pre-migration rows
+///    and the BasicDerivation fallback keep the conservative criterion.
+/// 3. `wanted=[out,debug]`, P_debug missing-but-substitutable →
+///    pending_substitute (detached fetch → Completed), not hits, not a
+///    from-source fall-through.
+#[tokio::test]
+async fn missing_unwanted_output_is_still_a_cache_hit() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // --- Case 1: missing output is unwanted → cache hit -------------
+    let out_1 = test_store_path("wo-hit-out");
+    let dbg_1 = test_store_path("wo-hit-debug");
+    store.seed_with_content(&out_1, b"out");
+    // dbg_1 deliberately NOT seeded and NOT substitutable.
+    let mut n1 = make_node("wo-hit");
+    n1.output_names = vec!["out".into(), "debug".into()];
+    n1.expected_output_paths = vec![out_1.clone(), dbg_1.clone()];
+    n1.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![n1], vec![], false).await?;
+    barrier(&handle).await;
+
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "missing UNWANTED output must not condemn the derivation to a \
+         from-source build — all wanted outputs are locally present"
+    );
+    assert_eq!(s1.cached_derivations, 1, "classified as a cache hit");
+    let d1 = expect_drv(&handle, "wo-hit").await;
+    assert_eq!(d1.status, DerivationStatus::Completed);
+    assert_eq!(
+        d1.output_paths,
+        vec![out_1, dbg_1],
+        "the hit VALUES keep recording all declared paths, not just the \
+         wanted subset"
+    );
+
+    // --- Case 2: empty wanted set = all wanted → NOT a hit ----------
+    let out_2 = test_store_path("wo-all-out");
+    let dbg_2 = test_store_path("wo-all-debug");
+    store.seed_with_content(&out_2, b"out");
+    let mut n2 = make_node("wo-all");
+    n2.output_names = vec!["out".into(), "debug".into()];
+    n2.expected_output_paths = vec![out_2, dbg_2];
+    n2.wanted_output_names = vec![];
+    let b2 = Uuid::new_v4();
+    merge_dag(&handle, b2, vec![n2], vec![], false).await?;
+    barrier(&handle).await;
+
+    let s2 = query_status(&handle, b2).await?;
+    assert_eq!(
+        s2.state,
+        rio_proto::types::BuildState::Active as i32,
+        "empty wanted set means ALL declared outputs wanted — a missing \
+         declared output must keep blocking the cache hit"
+    );
+    assert_eq!(s2.cached_derivations, 0);
+    assert_eq!(
+        expect_drv(&handle, "wo-all").await.status,
+        DerivationStatus::Ready,
+        "falls through to a from-source build"
+    );
+
+    // --- Case 3: missing WANTED output is substitutable → pending ---
+    let out_3 = test_store_path("wo-sub-out");
+    let dbg_3 = test_store_path("wo-sub-debug");
+    store.seed_with_content(&out_3, b"out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(dbg_3.clone());
+    let mut n3 = make_node("wo-sub");
+    n3.output_names = vec!["out".into(), "debug".into()];
+    n3.expected_output_paths = vec![out_3, dbg_3.clone()];
+    n3.wanted_output_names = vec!["out".into(), "debug".into()];
+    let b3 = Uuid::new_v4();
+    merge_dag(&handle, b3, vec![n3], vec![], false).await?;
+    settle_substituting(&handle, &["wo-sub"]).await;
+
+    let s3 = query_status(&handle, b3).await?;
+    assert_eq!(
+        s3.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "a missing WANTED output that is substitutable goes through the \
+         pending_substitute lane, not hits and not a from-source build"
+    );
+    let qpi = store.calls.qpi_calls.read().unwrap().clone();
+    assert!(
+        qpi.contains(&dbg_3),
+        "the detached substitute fetch ran for the missing wanted output; \
+         qpi_calls={qpi:?}"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.merge.substitute-probe]
 // r[verify sched.merge.substitute-fetch]
 /// Substitutable-probe matrix at merge time. A path NOT in the store

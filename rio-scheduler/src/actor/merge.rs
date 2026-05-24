@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use rio_proto::types::FindMissingPathsRequest;
 
-use crate::state::{BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash};
+use crate::state::{
+    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, wanted_subset,
+};
 
 use super::{ActorError, DagActor, MergeDagRequest};
 
@@ -1198,15 +1200,29 @@ impl DagActor {
         jwt_token: Option<&str>,
         tenant_id: Option<Uuid>,
     ) -> HashSet<String> {
-        // Collect (drv_hash, output_paths) for pre-existing Completed
-        // OR Skipped nodes in this merge. Skipped carries real
-        // output_paths (stamped at completion) and unlocks dependents
-        // via all_deps_completed; a GC'd Skipped output bypasses I-047
-        // and dispatches dependents against a missing path. Skip nodes
-        // with empty output_paths — nothing to verify (shouldn't
-        // happen for a real done node, but defensive against test
-        // fixtures).
-        let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+        // Collect (drv_hash, output_paths, unwanted_paths) for
+        // pre-existing Completed OR Skipped nodes in this merge.
+        // Skipped carries real output_paths (stamped at completion) and
+        // unlocks dependents via all_deps_completed; a GC'd Skipped
+        // output bypasses I-047 and dispatches dependents against a
+        // missing path. Skip nodes with empty output_paths — nothing to
+        // verify (shouldn't happen for a real done node, but defensive
+        // against test fixtures).
+        //
+        // `unwanted_paths` is the set of declared-but-not-wanted output
+        // paths of the CURRENT submission's node: a recorded output
+        // whose absence is forgiven by the demand-driven criterion. A
+        // Completed node whose only missing recorded output is one this
+        // build doesn't want must NOT reset (it was legitimately never
+        // substituted — resetting it on every merge would ping-pong
+        // Completed↔Ready forever). A build that wants a previously-
+        // unwanted output finds it missing → one reset → re-classifies
+        // under the new wanted set → substitutes the delta. Only paths
+        // positively identifiable as unwanted (declared in
+        // expected_output_paths but outside the wanted subset) are
+        // forgiven; a missing recorded path NOT in expected (a realized
+        // floating-CA path) keeps triggering the reset as today.
+        let mut candidates: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
                 continue;
@@ -1228,7 +1244,19 @@ impl DagActor {
             if state.output_paths.is_empty() {
                 continue;
             }
-            candidates.push((node.drv_hash.clone(), state.output_paths.clone()));
+            let wanted: HashSet<&String> = wanted_subset(
+                &node.output_names,
+                &node.expected_output_paths,
+                &node.wanted_output_names,
+            )
+            .collect();
+            let unwanted: HashSet<String> = node
+                .expected_output_paths
+                .iter()
+                .filter(|p| !p.is_empty() && !wanted.contains(*p))
+                .cloned()
+                .collect();
+            candidates.push((node.drv_hash.clone(), state.output_paths.clone(), unwanted));
         }
 
         if candidates.is_empty() {
@@ -1239,10 +1267,12 @@ impl DagActor {
             return HashSet::new();
         };
 
-        // Batch all output paths into one FindMissingPaths call.
+        // Batch all output paths into one FindMissingPaths call. The
+        // probe set stays ALL recorded paths (probing an unwanted path
+        // is harmless; only the reset DECISION below filters by wanted).
         let check_paths: Vec<String> = candidates
             .iter()
-            .flat_map(|(_, paths)| paths.iter().cloned())
+            .flat_map(|(_, paths, _)| paths.iter().cloned())
             .collect();
 
         let mut req = tonic::Request::new(FindMissingPathsRequest {
@@ -1335,11 +1365,18 @@ impl DagActor {
         // verdict was computed against the now-stale Completed dep).
         // Collected in `demote_parents` and applied after pass 2.
         //
-        // Pass 1: collect reset_set (no mutation).
+        // Pass 1: collect reset_set (no mutation). A missing recorded
+        // output that the current submission positively does not want
+        // does not trigger the reset — see the candidate-collection
+        // comment above.
         let reset_set: HashSet<DrvHash> = candidates
             .iter()
-            .filter(|(_, paths)| paths.iter().any(|p| missing.contains(p.as_str())))
-            .map(|(h, _)| DrvHash::from(h.as_str()))
+            .filter(|(_, paths, unwanted)| {
+                paths
+                    .iter()
+                    .any(|p| missing.contains(p.as_str()) && !unwanted.contains(p.as_str()))
+            })
+            .map(|(h, _, _)| DrvHash::from(h.as_str()))
             .collect();
 
         // Pass 2: per-node, compute deps_ok against reset_set + DAG
@@ -1348,8 +1385,11 @@ impl DagActor {
         let mut reset = HashSet::new();
         let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
         let mut demote_parents: HashSet<DrvHash> = HashSet::new();
-        for (drv_hash, output_paths) in candidates {
-            let Some(gone) = output_paths.iter().find(|p| missing.contains(p.as_str())) else {
+        for (drv_hash, output_paths, unwanted) in candidates {
+            let Some(gone) = output_paths
+                .iter()
+                .find(|p| missing.contains(p.as_str()) && !unwanted.contains(p.as_str()))
+            else {
                 continue;
             };
             let drv_hash_k: DrvHash = drv_hash.as_str().into();
@@ -1666,6 +1706,7 @@ impl DagActor {
             &merge_result.new_edges,
             &merge_result.interest_added,
             &merge_result.traceparent_upgraded,
+            &merge_result.wanted_grown,
             build_id,
             merge_result.removed_retriable,
         );
@@ -1758,8 +1799,9 @@ impl DagActor {
             .collect();
 
         // A derivation is cached if it has at least one non-empty
-        // expected output path AND all of them are LOCALLY present.
-        // Skip nodes the floating-CA lane already resolved.
+        // expected output path AND all of its WANTED outputs are
+        // LOCALLY present. Skip nodes the floating-CA lane already
+        // resolved.
         // r[impl sched.merge.substitute-probe-indeterminate]
         // Indeterminate (probe got 429/5xx/deadline-cut) is treated the
         // SAME as substitutable here: optimistically try the detached
@@ -1767,6 +1809,23 @@ impl DagActor {
         // (`SubstituteComplete{ok=false}`) sets `substitute_tried` and
         // falls through to build — so a true miss costs one extra fetch
         // attempt, not a wrong build dispatch.
+        //
+        // Demand-driven completeness: only the WANTED outputs (the ones
+        // some consumer's inputDrvs names, or the root asked for) must
+        // be present for a hit / present-or-substitutable for
+        // pending_substitute. A missing output nothing consumes
+        // (glibc-debug) must not condemn the derivation — and its
+        // entire build-time closure — to a from-source rebuild. The
+        // wanted subset yields ALL declared paths when the wanted set
+        // is empty (pre-migration rows, the BasicDerivation fallback,
+        // ^* roots). The wanted set is read from the DAG state, not the
+        // submission node: dag.merge already ran (step 2), so the DAG
+        // carries the union over EVERY interested build — using only
+        // this submission's narrower set could complete a shared
+        // re-probed node while another build still wants a missing
+        // output. The hit/pending VALUES stay `expected_output_paths`
+        // (the realized-output stamp, the GC pin set, and the client
+        // output report keep covering every declared output).
         let mut pending_substitute: Vec<(DrvHash, Vec<String>)> = Vec::new();
         for h in probe_set {
             if hits.contains_key(h) {
@@ -1778,16 +1837,29 @@ impl DagActor {
             if !n.expected_output_paths.iter().any(|p| !p.is_empty()) {
                 continue;
             }
-            if n.expected_output_paths
-                .iter()
-                .all(|p| p.is_empty() || present.contains(p))
-            {
+            let wanted: Vec<&String> = wanted_subset(
+                &n.output_names,
+                &n.expected_output_paths,
+                self.dag
+                    .node(h)
+                    .map(|s| s.wanted_output_names.as_slice())
+                    .unwrap_or(&n.wanted_output_names),
+            )
+            .collect();
+            // Defensive: a wanted set that resolves to no non-empty
+            // concrete path (every wanted name unmatched) cannot be
+            // verified — fall through to build, same as the
+            // all-declared guard above.
+            if !wanted.iter().any(|p| !p.is_empty()) {
+                continue;
+            }
+            if wanted.iter().all(|p| p.is_empty() || present.contains(*p)) {
                 hits.insert(h.clone(), n.expected_output_paths.clone());
-            } else if n.expected_output_paths.iter().all(|p| {
+            } else if wanted.iter().all(|p| {
                 p.is_empty()
-                    || present.contains(p)
-                    || substitutable.contains(p)
-                    || indeterminate.contains(p)
+                    || present.contains(*p)
+                    || substitutable.contains(*p)
+                    || indeterminate.contains(*p)
             }) {
                 pending_substitute.push((h.clone(), n.expected_output_paths.clone()));
             }
@@ -2211,10 +2283,15 @@ impl DagActor {
             "top-down: FindMissingPaths response"
         );
 
-        // --- All-or-nothing: every root output available? -----------
+        // --- All-or-nothing: every WANTED root output available? ----
         // "Available" = present in store (NOT in missing_paths) OR
-        // substitutable upstream. A single unavailable root → fall
-        // through to the full merge.
+        // substitutable upstream. A single unavailable wanted root
+        // output → fall through to the full merge. Unwanted root
+        // outputs (declared but referenced by no consumer and not in
+        // the root's OutputsSpec) are excluded from the criterion —
+        // probing them is harmless but their absence must not defeat
+        // the prune. The wanted subset degrades to all declared paths
+        // for an empty wanted set.
         let substitutable: HashSet<&str> = resp
             .substitutable_paths
             .iter()
@@ -2226,13 +2303,17 @@ impl DagActor {
             .map(String::as_str)
             .filter(|p| !substitutable.contains(p))
             .collect();
-        if root_paths
-            .iter()
+        if roots.iter().any(|n| {
+            wanted_subset(
+                &n.output_names,
+                &n.expected_output_paths,
+                &n.wanted_output_names,
+            )
             .any(|p| truly_missing.contains(p.as_str()))
-        {
+        }) {
             debug!(
                 missing = truly_missing.len(),
-                "top-down: root output(s) unavailable; falling through to full merge"
+                "top-down: wanted root output(s) unavailable; falling through to full merge"
             );
             return None;
         }
