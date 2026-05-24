@@ -27,6 +27,11 @@ mod client;
 // first callers; the allow goes away with them.
 #[allow(dead_code)]
 mod substituter;
+// The supply planner (workload set, closure walk, source ladder, upload
+// ordering, cross-request upload claims) also lands ahead of its consumers —
+// the prewarm and timeline modules drive it; the allow goes away with them.
+#[allow(dead_code)]
+mod supply;
 
 /// Exit-code policy for a replay run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
