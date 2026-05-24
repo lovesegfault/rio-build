@@ -13,7 +13,7 @@ use super::handshake::{
     HandshakeError, HandshakeResult, PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2,
 };
 use super::opcodes::WorkerOp;
-use super::pathinfo::{ValidPathInfo, read_valid_path_info};
+use super::pathinfo::{ValidPathInfo, read_valid_path_info, write_valid_path_info};
 use super::stderr::{
     ResultField, STDERR_ERROR, STDERR_LAST, STDERR_NEXT, STDERR_READ, STDERR_RESULT,
     STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY, STDERR_WRITE, StderrError,
@@ -21,7 +21,7 @@ use super::stderr::{
 use super::wire::{self, Result, WireError};
 use crate::derivation::BasicDerivation;
 use std::collections::BTreeSet;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A message received from the daemon during the STDERR loop.
 #[derive(Debug)]
@@ -439,13 +439,16 @@ pub struct KeyedBuildResult {
 }
 
 /// Send `wopBuildPathsWithResults` (46) with `buildMode = Normal`: build the
-/// given derived paths (`"<drvpath>!<out1>,<out2>"` or `"<drvpath>!*"`) and
-/// collect the daemon's per-path [`BuildResult`]s.
+/// given derived paths (`"<drvpath>!<out1>,<out2>"`, `"<drvpath>!*"`, or an
+/// opaque store path) and collect the daemon's per-path [`BuildResult`]s.
 ///
 /// Build logs and activities arrive on the STDERR loop and are discarded by
 /// the typed drain; after `STDERR_LAST` the daemon replies with a count
 /// followed by one (echoed derived path, [`BuildResult`]) entry per requested
-/// path, in submission order.
+/// path, in submission order. Correlate results with the submitted slice
+/// positionally (and check the returned length matches) rather than parsing
+/// or matching the echoed string — against non-rio daemons the echo may be a
+/// re-serialization of the parsed path, not a byte-identical copy.
 ///
 /// `negotiated_version` comes from [`client_handshake`]; it gates
 /// version-dependent [`BuildResult`] fields (e.g. cpu stats at >= 1.37).
@@ -534,6 +537,254 @@ pub async fn client_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
         return Ok(None);
     }
     Ok(Some(read_valid_path_info(reader).await?))
+}
+
+// ---------------------------------------------------------------------------
+// Store uploads (AddToStoreNar / AddMultipleToStore)
+// ---------------------------------------------------------------------------
+
+/// Read-chunk size for streaming [`NarPayload::Reader`] payloads into the
+/// framed stream (64 KiB).
+const NAR_COPY_CHUNK: usize = 64 * 1024;
+
+/// NAR payload for an upload entry: in-memory bytes or a streaming reader of
+/// exactly `len` bytes.
+pub enum NarPayload {
+    /// The whole NAR serialization, already in memory.
+    Bytes(Vec<u8>),
+    /// A streaming source of exactly `len` NAR bytes. Only the first `len`
+    /// bytes are consumed (a longer source is never over-read); a source that
+    /// ends before `len` bytes is a wire error.
+    Reader {
+        /// Exact number of bytes to take from `reader`.
+        len: u64,
+        /// The byte source.
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+    },
+}
+
+impl NarPayload {
+    /// Number of NAR bytes this payload puts on the wire.
+    pub fn len(&self) -> u64 {
+        match self {
+            NarPayload::Bytes(bytes) => bytes.len() as u64,
+            NarPayload::Reader { len, .. } => *len,
+        }
+    }
+
+    /// Whether the payload is zero bytes long.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One path to upload: its store path, wire path-info, and NAR bytes.
+///
+/// `info.nar_size` MUST equal `nar.len()`; both upload ops check this before
+/// writing the entry and refuse to start it otherwise (a mismatch would
+/// desync the framed stream).
+pub struct StoreEntry {
+    /// Full store path being imported (e.g. `/nix/store/<hash>-<name>`).
+    pub store_path: String,
+    /// Wire path-info body sent ahead of the NAR bytes.
+    pub info: ValidPathInfo,
+    /// NAR serialization of the path contents.
+    pub nar: NarPayload,
+}
+
+/// Enforce the `info.nar_size == nar.len()` precondition for one entry.
+fn check_entry_nar_size(entry: &StoreEntry) -> Result<()> {
+    let declared = entry.info.nar_size;
+    let actual = entry.nar.len();
+    if declared != actual {
+        return Err(WireError::Io(std::io::Error::other(format!(
+            "nar size mismatch for {}: info says {declared}, payload is {actual}",
+            entry.store_path
+        ))));
+    }
+    Ok(())
+}
+
+/// Stream one entry's NAR bytes through the framed writer.
+///
+/// `Bytes` payloads are handed to the framed writer whole (it slices them
+/// into frames itself); `Reader` payloads are copied in [`NAR_COPY_CHUNK`]
+/// pieces. Each read is capped to the bytes still owed, so a longer source
+/// can never overrun the declared length; a source that ends early is a wire
+/// error.
+async fn write_nar_payload<W: AsyncWrite + Unpin>(
+    framed: &mut wire::FramedWriter<W>,
+    store_path: &str,
+    nar: NarPayload,
+) -> std::result::Result<(), ClientOpError> {
+    match nar {
+        NarPayload::Bytes(bytes) => framed.write(&bytes).await?,
+        NarPayload::Reader { len, mut reader } => {
+            let mut buf = vec![0u8; NAR_COPY_CHUNK];
+            let mut remaining = len;
+            while remaining > 0 {
+                let cap = remaining.min(NAR_COPY_CHUNK as u64) as usize;
+                let n = reader.read(&mut buf[..cap]).await.map_err(WireError::Io)?;
+                if n == 0 {
+                    return Err(ClientOpError::Wire(WireError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "NAR reader for {store_path} ended {remaining} bytes short of \
+                             the declared {len}"
+                        ),
+                    ))));
+                }
+                framed.write(&buf[..n]).await?;
+                remaining -= n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Send `wopAddToStoreNar` (39): import one store path together with its NAR
+/// serialization.
+///
+/// Request layout, in the order rio-gateway's `handle_add_to_store_nar`
+/// consumes it: opcode, store path, the 8-field [`ValidPathInfo`] body,
+/// `repair`, `dont_check_sigs`, then the NAR bytes as a framed byte stream
+/// (`u64(len) + data` chunks, `u64(0)` terminator). The response is the
+/// STDERR loop alone — nothing follows `STDERR_LAST`.
+///
+/// `entry.info.nar_size` MUST equal `entry.nar.len()`: the framed stream has
+/// to carry exactly the declared byte count, so the op refuses to start
+/// (without writing anything) on a mismatch.
+///
+/// `dont_check_sigs` asks the daemon not to require signatures on the
+/// uploaded path info. rio-gateway reads and ignores the flag (signature
+/// policy is delegated to rio-store); a real nix-daemon skips its signature
+/// check when a trusted client sets it.
+///
+/// # Concurrency and failure
+///
+/// The daemon may emit STDERR messages — including a refusal — while the
+/// payload is still being written; if they were left unread, both sides could
+/// deadlock on full buffers. The payload write and the STDERR drain therefore
+/// run concurrently, and the first error cancels the other side. On a daemon
+/// refusal this returns [`ClientOpError::Daemon`], but the framed upload is
+/// left incomplete: the connection MUST be abandoned afterwards (the same
+/// contract as [`wire::FramedWriter`]'s cancellation note).
+pub async fn client_add_to_store_nar<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    entry: StoreEntry,
+    repair: bool,
+    dont_check_sigs: bool,
+) -> std::result::Result<(), ClientOpError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    check_entry_nar_size(&entry)?;
+    let StoreEntry {
+        store_path,
+        info,
+        nar,
+    } = entry;
+
+    let write_side = async {
+        wire::write_u64(&mut *writer, WorkerOp::AddToStoreNar as u64).await?;
+        wire::write_string(&mut *writer, &store_path).await?;
+        write_valid_path_info(&mut *writer, &info).await?;
+        wire::write_bool(&mut *writer, repair).await?;
+        wire::write_bool(&mut *writer, dont_check_sigs).await?;
+
+        let mut framed = wire::FramedWriter::new(&mut *writer);
+        write_nar_payload(&mut framed, &store_path, nar).await?;
+        let inner = framed.finish().await?;
+        inner.flush().await.map_err(WireError::Io)?;
+        Ok::<(), ClientOpError>(())
+    };
+    let drain_side = drain_stderr_typed(&mut *reader);
+
+    tokio::try_join!(write_side, drain_side)?;
+    Ok(())
+}
+
+/// Send `wopAddMultipleToStore` (44): import a batch of store paths in one
+/// framed stream.
+///
+/// Request layout, in the order rio-gateway's `handle_add_multiple_to_store`
+/// consumes it: opcode, `repair`, `dont_check_sigs`, then ONE framed byte
+/// stream whose de-framed content is `u64(count)` followed by, per entry, the
+/// store path string, the 8-field [`ValidPathInfo`] body, and exactly
+/// `nar_size` raw NAR bytes (NOT nested-framed). Entry boundaries are
+/// independent of frame boundaries. The response is the STDERR loop alone —
+/// nothing follows `STDERR_LAST`.
+///
+/// Every entry's `info.nar_size` MUST equal its `nar.len()`; the batch
+/// refuses to start (without writing anything) if any entry mismatches, since
+/// a wrong length would desync every entry that follows in the framed stream.
+///
+/// `dont_check_sigs` asks the daemon not to require signatures on the
+/// uploaded path infos. rio-gateway reads and ignores the flag (signature
+/// policy is delegated to rio-store); a real nix-daemon skips its signature
+/// check when a trusted client sets it.
+///
+/// # Concurrency and failure
+///
+/// Same contract as [`client_add_to_store_nar`]: the payload write and the
+/// STDERR drain run concurrently so a mid-upload refusal cannot deadlock on
+/// full buffers, and the first error cancels the other side. On
+/// [`ClientOpError::Daemon`] (or any error after writing began) the framed
+/// stream is left incomplete and the connection MUST be abandoned.
+pub async fn client_add_multiple_to_store<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    repair: bool,
+    dont_check_sigs: bool,
+    entries: Vec<StoreEntry>,
+) -> std::result::Result<(), ClientOpError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let count = entries.len() as u64;
+    if count > wire::MAX_COLLECTION_COUNT {
+        return Err(ClientOpError::Wire(WireError::CollectionTooLarge(count)));
+    }
+    for entry in &entries {
+        check_entry_nar_size(entry)?;
+    }
+
+    let write_side = async {
+        wire::write_u64(&mut *writer, WorkerOp::AddMultipleToStore as u64).await?;
+        wire::write_bool(&mut *writer, repair).await?;
+        wire::write_bool(&mut *writer, dont_check_sigs).await?;
+
+        let mut framed = wire::FramedWriter::new(&mut *writer);
+        // The count and per-entry metadata are encoded with the ordinary
+        // wire/pathinfo helpers into a scratch buffer, then routed through
+        // the framed writer — frames are cut wherever 256 KiB lands,
+        // independent of entry boundaries.
+        let mut head = Vec::new();
+        wire::write_u64(&mut head, count).await?;
+        framed.write(&head).await?;
+        for entry in entries {
+            let StoreEntry {
+                store_path,
+                info,
+                nar,
+            } = entry;
+            head.clear();
+            wire::write_string(&mut head, &store_path).await?;
+            write_valid_path_info(&mut head, &info).await?;
+            framed.write(&head).await?;
+            write_nar_payload(&mut framed, &store_path, nar).await?;
+        }
+        let inner = framed.finish().await?;
+        inner.flush().await.map_err(WireError::Io)?;
+        Ok::<(), ClientOpError>(())
+    };
+    let drain_side = drain_stderr_typed(&mut *reader);
+
+    tokio::try_join!(write_side, drain_side)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1424,6 +1675,291 @@ mod tests {
         assert_eq!(results[1].derived_path, dp_out);
         assert_eq!(results[1].result.status, BuildStatus::PermanentFailure);
         assert_eq!(results[1].result.error_msg, "boom");
+        Ok(())
+    }
+
+    /// A response count above `MAX_COLLECTION_COUNT` is rejected as a wire
+    /// error before any per-entry reads (bounds check on the count prefix).
+    #[tokio::test]
+    async fn client_build_paths_with_results_count_too_large_is_wire_error() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let dp = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv!*";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let _op = wire::read_u64(&mut sr).await?;
+            let _paths = wire::read_strings(&mut sr).await?;
+            let _mode = wire::read_u64(&mut sr).await?;
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            wire::write_u64(&mut sw, wire::MAX_COLLECTION_COUNT + 1).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let err = client_build_paths_with_results(&mut cr, &mut cw, &[dp], PROTOCOL_VERSION)
+            .await
+            .expect_err("oversized result count must be rejected");
+        assert!(
+            matches!(err, ClientOpError::Wire(WireError::CollectionTooLarge(_))),
+            "got: {err:?}"
+        );
+        server.await??;
+        Ok(())
+    }
+
+    /// An empty request is valid: the daemon sees an empty derived-path
+    /// collection and the client maps a zero-count response to an empty vec.
+    #[tokio::test]
+    async fn client_build_paths_with_results_empty_request_ok() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::BuildPathsWithResults as u64);
+            let paths = wire::read_strings(&mut sr).await?;
+            assert!(
+                paths.is_empty(),
+                "empty request must reach the wire as an empty collection"
+            );
+            let mode = wire::read_u64(&mut sr).await?;
+            assert_eq!(mode, BuildMode::Normal as u64);
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            wire::write_u64(&mut sw, 0).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let results =
+            client_build_paths_with_results(&mut cr, &mut cw, wire::NO_STRINGS, PROTOCOL_VERSION)
+                .await?;
+        assert!(results.is_empty());
+        server.await??;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // client_add_to_store_nar / client_add_multiple_to_store
+    // -----------------------------------------------------------------------
+
+    /// client_add_to_store_nar wire layout round-trip with a streaming
+    /// (`NarPayload::Reader`) payload large enough to span multiple 256 KiB
+    /// frames: the fake server reads the metadata head exactly as the
+    /// gateway's `handle_add_to_store_nar` does (path, ValidPathInfo body,
+    /// repair, dontCheckSigs), then de-frames the NAR through
+    /// `FramedStreamReader` and must recover the original bytes; the client
+    /// completes with Ok(()) once STDERR_LAST arrives.
+    #[tokio::test]
+    async fn client_add_to_store_nar_streams_framed_payload() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let store_path = "/nix/store/ffffffffffffffffffffffffffffffff-uploaded";
+        let payload: Vec<u8> = (0..600 * 1024).map(|i| (i % 251) as u8).collect();
+        let payload_len = payload.len() as u64;
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::AddToStoreNar as u64);
+            let path = wire::read_string(&mut sr).await?;
+            assert_eq!(path, store_path);
+            let info = read_valid_path_info(&mut sr).await?;
+            assert_eq!(info.nar_size, payload_len);
+            assert_eq!(info.nar_hash, vec![0xab; 32]);
+            let repair = wire::read_bool(&mut sr).await?;
+            assert!(!repair, "repair flag must reach the wire as false");
+            let dont_check_sigs = wire::read_bool(&mut sr).await?;
+            assert!(dont_check_sigs, "dontCheckSigs must reach the wire as true");
+            // The NAR arrives as a framed stream; de-frame it through the
+            // same reader the gateway uses.
+            let mut framed = wire::FramedStreamReader::new(&mut sr, info.nar_size);
+            let mut nar = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut framed, &mut nar).await?;
+            // Acknowledge only after the payload is fully consumed.
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            sw.flush().await?;
+            anyhow::Ok(nar)
+        });
+
+        let entry = StoreEntry {
+            store_path: store_path.to_string(),
+            info: ValidPathInfo {
+                nar_hash: vec![0xab; 32],
+                nar_size: payload_len,
+                ..Default::default()
+            },
+            nar: NarPayload::Reader {
+                len: payload_len,
+                reader: Box::new(std::io::Cursor::new(payload.clone())),
+            },
+        };
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        client_add_to_store_nar(&mut cr, &mut cw, entry, false, true).await?;
+
+        let received = server.await??;
+        assert_eq!(
+            received, payload,
+            "de-framed NAR must equal the original payload"
+        );
+        Ok(())
+    }
+
+    /// client_add_multiple_to_store batch round-trip: two entries (one
+    /// in-memory, one streaming) travel inside ONE framed stream whose
+    /// decoded content is the count, then per entry the path string, the
+    /// ValidPathInfo body, and exactly nar_size raw NAR bytes (not
+    /// nested-framed). The fake server de-frames with `FramedStreamReader`
+    /// and parses the interior exactly as the gateway's
+    /// `handle_add_multiple_to_store` does.
+    #[tokio::test]
+    async fn client_add_multiple_to_store_two_entries_roundtrip() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let path_a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-first";
+        let path_b = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-second";
+        let nar_a = b"first entry nar bytes".to_vec();
+        let nar_b: Vec<u8> = (0..300 * 1024).map(|i| (i % 247) as u8).collect();
+        let (len_a, len_b) = (nar_a.len() as u64, nar_b.len() as u64);
+
+        let server = tokio::spawn({
+            let (nar_a, nar_b) = (nar_a.clone(), nar_b.clone());
+            async move {
+                let (mut sr, mut sw) = tokio::io::split(server_stream);
+                let op = wire::read_u64(&mut sr).await?;
+                assert_eq!(op, WorkerOp::AddMultipleToStore as u64);
+                let repair = wire::read_bool(&mut sr).await?;
+                assert!(!repair, "repair flag must reach the wire as false");
+                let dont_check_sigs = wire::read_bool(&mut sr).await?;
+                assert!(dont_check_sigs, "dontCheckSigs must reach the wire as true");
+
+                // Everything else lives inside one framed stream.
+                let mut framed = wire::FramedStreamReader::new_unbounded(&mut sr);
+                let count = wire::read_u64(&mut framed).await?;
+                assert_eq!(count, 2);
+
+                // Entry 1.
+                let path = wire::read_string(&mut framed).await?;
+                assert_eq!(path, path_a);
+                let info = read_valid_path_info(&mut framed).await?;
+                assert_eq!(info.nar_size, len_a);
+                let mut got_a = vec![0u8; len_a as usize];
+                tokio::io::AsyncReadExt::read_exact(&mut framed, &mut got_a).await?;
+                assert_eq!(got_a, nar_a);
+
+                // Entry 2 — its metadata starts wherever entry 1's NAR ended,
+                // with no relation to frame boundaries.
+                let path = wire::read_string(&mut framed).await?;
+                assert_eq!(path, path_b);
+                let info = read_valid_path_info(&mut framed).await?;
+                assert_eq!(info.nar_size, len_b);
+                let mut got_b = vec![0u8; len_b as usize];
+                tokio::io::AsyncReadExt::read_exact(&mut framed, &mut got_b).await?;
+                assert_eq!(got_b, nar_b);
+
+                // Nothing after the last entry but the frame terminator.
+                let mut probe = [0u8; 1];
+                let n = tokio::io::AsyncReadExt::read(&mut framed, &mut probe).await?;
+                assert_eq!(n, 0, "no trailing data after the declared entries");
+
+                wire::write_u64(&mut sw, STDERR_LAST).await?;
+                sw.flush().await?;
+                anyhow::Ok(())
+            }
+        });
+
+        let entries = vec![
+            StoreEntry {
+                store_path: path_a.to_string(),
+                info: ValidPathInfo {
+                    nar_hash: vec![0x11; 32],
+                    nar_size: len_a,
+                    ..Default::default()
+                },
+                nar: NarPayload::Bytes(nar_a),
+            },
+            StoreEntry {
+                store_path: path_b.to_string(),
+                info: ValidPathInfo {
+                    nar_hash: vec![0x22; 32],
+                    nar_size: len_b,
+                    ..Default::default()
+                },
+                nar: NarPayload::Reader {
+                    len: len_b,
+                    reader: Box::new(std::io::Cursor::new(nar_b)),
+                },
+            },
+        ];
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        client_add_multiple_to_store(&mut cr, &mut cw, false, true, entries).await?;
+        server.await??;
+        Ok(())
+    }
+
+    /// A daemon refusal that arrives while the upload is still in flight is
+    /// surfaced as `ClientOpError::Daemon` instead of deadlocking. The fake
+    /// server reads only the fixed header, then refuses and STOPS READING
+    /// while keeping the connection open; the payload (1 MiB across two
+    /// entries) is far larger than the 64 KiB duplex buffer, so the client
+    /// can only complete if the stderr drain runs concurrently with the
+    /// (stalled) payload write.
+    #[tokio::test]
+    async fn client_add_multiple_to_store_daemon_refusal_is_typed() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        // Held until the client call returns so the server halves stay open:
+        // a dropped server would fail the client's writes with a broken pipe
+        // instead of exercising the buffer-full + concurrent-drain path.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (mut sr, sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::AddMultipleToStore as u64);
+            let _repair = wire::read_bool(&mut sr).await?;
+            let _dont_check_sigs = wire::read_bool(&mut sr).await?;
+            // Refuse immediately, without consuming any of the framed
+            // payload, and stop reading.
+            let mut w = StderrWriter::new(sw);
+            w.error(&StderrError::simple("rio-build", "store quota exceeded"))
+                .await?;
+            let _ = done_rx.await;
+            anyhow::Ok(())
+        });
+
+        let entry = |path: &str, fill: u8| StoreEntry {
+            store_path: path.to_string(),
+            info: ValidPathInfo {
+                nar_hash: vec![fill; 32],
+                nar_size: 512 * 1024,
+                ..Default::default()
+            },
+            nar: NarPayload::Bytes(vec![fill; 512 * 1024]),
+        };
+        let entries = vec![
+            entry("/nix/store/cccccccccccccccccccccccccccccccc-big-one", 0x33),
+            entry("/nix/store/dddddddddddddddddddddddddddddddd-big-two", 0x44),
+        ];
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_add_multiple_to_store(&mut cr, &mut cw, false, false, entries),
+        )
+        .await
+        .expect("refusal must be picked up concurrently, not deadlock on the unread payload");
+
+        match result.expect_err("daemon refusal must surface as an error") {
+            ClientOpError::Daemon(e) => {
+                assert!(
+                    e.message.contains("store quota exceeded"),
+                    "daemon message must be preserved: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected ClientOpError::Daemon, got {other:?}"),
+        }
+        drop(done_tx);
+        server.await??;
         Ok(())
     }
 }
