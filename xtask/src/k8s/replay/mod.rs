@@ -22,6 +22,11 @@ mod archive;
 // with them.
 #[allow(dead_code)]
 mod client;
+// The pre-warm phase (run-wide supply context + bulk pre-upload before the
+// replay clock starts) also lands ahead of its consumers — the timeline and
+// orchestration wiring drive it; the allow goes away with them.
+#[allow(dead_code)]
+mod prewarm;
 // Substituter access (narinfo probe + NAR fetch over HTTPS/S3) also lands
 // ahead of its consumers — the supply planner and prewarm phases are the
 // first callers; the allow goes away with them.
