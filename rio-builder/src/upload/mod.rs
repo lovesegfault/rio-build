@@ -908,7 +908,7 @@ mod tests {
             &store_dir,
             "",
             &deriver,
-            &[dep.clone()],
+            std::slice::from_ref(&dep),
             &closure,
         )
         .await
