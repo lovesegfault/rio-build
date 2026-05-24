@@ -3715,6 +3715,126 @@ async fn walk_fails_on_wanted_seed_not_found() -> TestResult {
     Ok(())
 }
 
+/// The NON-TRANSIENT-ERROR arm (generic `Err(e)`, here `Internal`) has
+/// its own forgiveness gate: a forgivable seed that fails with a
+/// non-transient error must not fail the walk; the same failure on a
+/// non-forgivable seed must. Single-seed A/B because the mock's fault
+/// knob is global (every QPI fails) — the wanted-seed-succeeds-while-
+/// unwanted-fails composition is covered by the NotFound pair above
+/// and the end-to-end test below.
+#[tokio::test]
+async fn walk_forgives_unwanted_seed_non_transient_error() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    // Internal — non-transient, not NotFound → the generic `Err(e)`
+    // arm on the FIRST attempt (no retry ladder).
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, Ordering::SeqCst);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    for (tag, forgivable_dbg, expect_ok) in [("fgve-f", true, true), ("fgve-w", false, false)] {
+        let dbg = test_store_path(&format!("{tag}-debug"));
+        let forgivable: HashSet<String> = if forgivable_dbg {
+            [dbg.clone()].into()
+        } else {
+            HashSet::new()
+        };
+        let ok = crate::actor::dispatch::walk_substitute_closure(
+            &client,
+            vec![dbg.clone()],
+            &forgivable,
+            &auth,
+            &shutdown,
+            |_, _, _| {},
+        )
+        .await;
+        assert_eq!(
+            ok, expect_ok,
+            "{tag}: a non-transient error on a seed must be forgiven \
+             iff the seed is forgivable"
+        );
+        // Structural: exactly one attempt — the error arm fired, not
+        // the retry ladder / exhaust fallthrough.
+        assert_eq!(
+            store
+                .calls
+                .qpi_attempts_by_path
+                .read()
+                .unwrap()
+                .get(&dbg)
+                .copied(),
+            Some(1),
+            "{tag}: Internal is non-transient → no retries → the \
+             generic Err(e) arm made the decision"
+        );
+    }
+    Ok(())
+}
+
+/// The RETRY-EXHAUST fallthrough (after `SUBSTITUTE_FETCH_MAX_ATTEMPTS`
+/// transient errors) has its own forgiveness gate: a forgivable seed
+/// whose retries exhaust must not fail the walk; a non-forgivable one
+/// must. `start_paused` virtualizes the ~32 s of backoff between the 8
+/// attempts; the per-seed attempt count is asserted to be exactly
+/// `SUBSTITUTE_FETCH_MAX_ATTEMPTS` so a spurious auto-advance through
+/// an in-flight RPC (which would surface as a non-transient
+/// `DeadlineExceeded` and route to the WRONG arm) fails the test
+/// instead of silently passing via the error gate.
+#[tokio::test(start_paused = true)]
+async fn walk_forgives_unwanted_seed_retry_exhaust() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    // Unavailable — transient → the retry ladder runs to exhaustion.
+    store
+        .faults
+        .fail_query_path_info
+        .store(true, Ordering::SeqCst);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    for (tag, forgivable_dbg, expect_ok) in [("fgvx-f", true, true), ("fgvx-w", false, false)] {
+        let dbg = test_store_path(&format!("{tag}-debug"));
+        let forgivable: HashSet<String> = if forgivable_dbg {
+            [dbg.clone()].into()
+        } else {
+            HashSet::new()
+        };
+        let ok = crate::actor::dispatch::walk_substitute_closure(
+            &client,
+            vec![dbg.clone()],
+            &forgivable,
+            &auth,
+            &shutdown,
+            |_, _, _| {},
+        )
+        .await;
+        assert_eq!(
+            ok, expect_ok,
+            "{tag}: exhausted retries on a seed must be forgiven iff \
+             the seed is forgivable"
+        );
+        // Structural: all attempts reached the store — the transient
+        // ladder ran to exhaustion and the post-loop fallthrough made
+        // the decision, not the NotFound or generic-error arm.
+        assert_eq!(
+            store
+                .calls
+                .qpi_attempts_by_path
+                .read()
+                .unwrap()
+                .get(&dbg)
+                .copied(),
+            Some(crate::actor::SUBSTITUTE_FETCH_MAX_ATTEMPTS),
+            "{tag}: every attempt must reach the store before the \
+             exhaust fallthrough fires"
+        );
+    }
+    Ok(())
+}
+
 /// Forgiveness is scoped to unwanted SEEDS only. A path discovered via
 /// the reference BFS (a runtime reference of a successfully fetched
 /// seed) is never forgivable — its absence is a hole in a closure the

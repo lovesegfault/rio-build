@@ -2556,11 +2556,26 @@ fn closure_cap_exceeded(visited: usize) -> bool {
 /// WANTED seed and a failed reference-BFS-discovered path (a runtime
 /// reference of something already fetched — its absence is a hole in a
 /// closure we are about to declare complete) keep failing the walk;
-/// only unwanted seeds are in `forgivable` by construction. A wanted
-/// output that runtime-references an unwanted sibling output is served
-/// by the upstream's own closure invariant (it has the closure of
-/// whatever it substitutes), so the forgiven seed cannot leave a hole
-/// under a successfully fetched wanted path.
+/// only unwanted seeds are in `forgivable` by construction.
+///
+/// **Residual hole risk.** If a WANTED output runtime-references an
+/// unwanted sibling output, forgiving that sibling can leave a hole in
+/// the wanted output's runtime closure even though the walk returns
+/// `ok=true`. The no-hole guarantee only holds for the **NotFound**
+/// arm, and only against an upstream that maintains its closure
+/// invariant: an upstream that served the wanted output has every path
+/// in that output's closure, so a true miss on the sibling proves the
+/// wanted output does not reference it. The **non-transient-error**
+/// and **retry-exhaust** arms carry no such proof — the upstream may
+/// well have the sibling (a 500, a timeout, a flaky connection) and
+/// the walk still completes with the reference unsatisfied. Accepted
+/// because (a) it requires the rare wanted→unwanted-sibling reference
+/// direction (`-debug`/`-doc` outputs reference their `out`, not the
+/// reverse), and (b) the alternative — failing the walk — is a
+/// GUARANTEED from-source rebuild of the derivation and its entire
+/// build-time closure, versus a POSSIBLE FUSE ENOENT on one path in
+/// one dependent's build, whose retry re-queries the path and
+/// re-triggers substitution.
 pub(super) async fn walk_substitute_closure(
     store: &rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
     seeds: Vec<String>,
@@ -2733,9 +2748,13 @@ pub(super) async fn walk_substitute_closure(
                         // misses is forgiven: not a failure (no
                         // metric), the walk continues, the closure is
                         // still complete for every output anything
-                        // consumes.
+                        // consumes. `store_msg` for the same reason as
+                        // the fatal arm below: "no tenant context" /
+                        // "substituter not configured" mean the
+                        // request never reached the upstream — a
+                        // forgiven skip that should have been a fetch.
                         if forgivable.contains(&p) {
-                            info!(path = %p,
+                            info!(path = %p, store_msg = e.message(),
                                   "unwanted output not substituted; continuing without it");
                             continue 'paths;
                         }
