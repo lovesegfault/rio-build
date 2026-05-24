@@ -593,7 +593,7 @@ impl DagActor {
                 // Substituting included: the spawned task is gone after
                 // restart, so re-derive Ready/Queued via the same dep-
                 // walk and let the next dispatch-time batch re-probe.
-                // r[impl sched.substitute.detached+2]
+                // r[impl sched.substitute.detached+3]
                 let status_matches = matches!(
                     s.status(),
                     DerivationStatus::Created
@@ -1114,6 +1114,7 @@ impl DagActor {
         let missing = self.batch_probe_orphan_outputs(all_outputs).await;
 
         for o in orphaned {
+            // r[impl sched.merge.wanted-outputs]
             // Did the build complete while the scheduler was down
             // (orphan completion)? All WANTED outputs present = none in
             // `missing` (the probe set stays all expected paths; an

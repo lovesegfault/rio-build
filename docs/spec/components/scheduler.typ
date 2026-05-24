@@ -767,6 +767,29 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   in the priority queue is updated.
 ]
 
+#r("sched.merge.wanted-outputs")[
+  The cache-hit and substitutability classification of a derivation MUST be
+  evaluated over its *wanted* outputs only: the union of the output names
+  referenced by any consumer's `inputDrvs` entry for it and the root request's
+  output selection, with an empty wanted set meaning every declared output.
+  The wanted set MUST only ever grow --- unioned across consumers within one
+  submission, across roots of a multi-root submission, across concurrent
+  builds merging the same derivation, and across rows in the persistence
+  upsert --- and MUST never shrink while any interested build is live. The
+  assignment-token output allowlist, the GC pin set, and the client-facing
+  output report MUST continue to cover every declared output. A wanted set
+  that resolves to no verifiable concrete path MUST fall through to the
+  conservative all-declared criterion rather than vacuously classifying the
+  derivation as available.
+]
+A missing output that nothing consumes (the `-debug` output of a multi-output
+derivation) must not condemn the derivation --- and, through dependency
+gating, its entire build-time closure --- to a from-source rebuild when every
+output that is actually consumed is present or substitutable. The probe set
+stays all declared paths (probing an unwanted path is harmless and
+opportunistically fetches it if the upstream has it); only the classification
+predicates filter by the wanted subset.
+
 #r("sched.merge.substitute-probe")[
   The merge-time cache check (`check_cached_outputs`) MUST forward the
   submitting session's JWT (`x-rio-tenant-token`) on its `FindMissingPaths`
@@ -890,7 +913,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   compile-time caught, not silently-zero.
 ]
 
-#r("sched.substitute.detached+2")[
+#r("sched.substitute.detached+3")[
   The upstream-substitute fetch MUST run outside the actor event loop. Awaiting
   it inline blocks `MergeDag`/dispatch for the duration of the slowest closure
   walk --- a single ghc-sized NAR (1.9 GB) exceeds the 30s `grpc_timeout` and
@@ -902,9 +925,13 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   triggering store-side `try_substitute`) with a separate
   `SUBSTITUTE_FETCH_TIMEOUT` (minutes, not seconds), and post
   `ActorCommand::SubstituteComplete{drv_hash, ok}` back into the mailbox. The
-  task posts `ok=true` ONLY if every closure node was found or substituted; any
-  per-ref `NotFound` / non-transient error / retry-exhaust /
-  `MAX_SUBSTITUTE_CLOSURE` cap → `ok=false`. The store substitutes ONE path per
+  task posts `ok=true` ONLY if every *wanted* seed and every node discovered
+  by the reference BFS was found or substituted; a `NotFound` / non-transient
+  error / retry-exhaust on any of those, or the `MAX_SUBSTITUTE_CLOSURE` cap,
+  → `ok=false`. A seed that is declared-but-unwanted
+  (#rref("sched.merge.wanted-outputs")) is still attempted --- opportunistic
+  completeness --- but its failure is forgiven: logged, not counted as a fetch
+  failure. The store substitutes ONE path per
   call (no recursion), so this BFS is the only place the runtime closure can be
   completed. `Substituting` is NOT terminal (`all_deps_completed` returns false
   → dependents stay gated); on `ok=true` the handler transitions `Substituting
@@ -1221,14 +1248,22 @@ Queue-level preemption is fully supported:
   or `ClearPoison` admin RPC to override).
 ]
 
-#r("sched.merge.stale-completed-verify+3")[
+#r("sched.merge.stale-completed-verify+4")[
   When a build merges and finds a pre-existing `completed` or `skipped` node in
   the global DAG, the scheduler batches a `FindMissingPaths` against rio-store
   with that node's `output_paths` before computing initial states for
-  newly-inserted dependents. If any output is missing, the node resets to
-  `ready` (or `queued` if a dependency was also reset --- "ready ⟹ all deps'
-  outputs available" must hold), clearing `output_paths`, and
-  #(refs.metric)("rio_scheduler_stale_completed_reset_total") increments.
+  newly-inserted dependents. If any *wanted* output is missing, the node
+  resets to `ready` (or `queued` if a dependency was also reset --- "ready ⟹
+  all deps' outputs available" must hold), clearing `output_paths`, and
+  #(refs.metric)("rio_scheduler_stale_completed_reset_total") increments. A
+  missing recorded path that the current submission positively identifies as
+  declared-but-unwanted (listed in the node's `expected_output_paths` but
+  outside its wanted subset, #rref("sched.merge.wanted-outputs")) is forgiven
+  --- it was legitimately never produced or substituted, and resetting on it
+  would ping-pong the node `completed → ready` on every re-merge; a build that
+  newly wants it gets the one reset that re-opens the node and substitutes the
+  delta. A missing recorded path outside the declared set (a realized
+  floating-CA output) still resets.
   `skipped` is included because it carries real `output_paths` and unlocks
   dependents the same as `completed`. The reset MUST run before any
   dependent-advancement step that reads `all_deps_completed` (including the

@@ -46,7 +46,7 @@ pub(super) struct MergeIngest {
     /// Derivations whose outputs are upstream-substitutable but not
     /// yet locally present. `reconcile_merged_state` spawns the
     /// detached fetch for these after `seed_initial_states`.
-    /// r[sched.substitute.detached+2]
+    /// r[sched.substitute.detached+3]
     pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
@@ -259,7 +259,7 @@ impl DagActor {
         //
         // Falls through to the full DAG on any uncertainty (store
         // unreachable, partial root cache, CA roots). The fetch
-        // itself is deferred (`r[sched.substitute.detached+2]`); on
+        // itself is deferred (`r[sched.substitute.detached+3]`); on
         // fetch failure the build fails fast (`r[sched.merge.
         // substitute-topdown]` — resubmit re-probes). The existing
         // check_cached_outputs at step 4 handles fall-through
@@ -596,7 +596,7 @@ impl DagActor {
         // otherwise newly-inserted dependents would be unlocked against a
         // dep whose output is gone, and the worker fails on isValidPath.
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify+3]
+        // r[impl sched.merge.stale-completed-verify+4]
         let stale_reset = self
             .verify_preexisting_completed(
                 nodes,
@@ -608,7 +608,7 @@ impl DagActor {
             .await;
         phase!("6c-verify-preexisting");
 
-        // r[impl sched.substitute.detached+2]
+        // r[impl sched.substitute.detached+3]
         // Reprobe-substitutable lane FIRST: a hard-Poisoned node whose
         // output is now upstream-substitutable transitions Poisoned →
         // Substituting BEFORE seed_initial_states reads
@@ -666,7 +666,7 @@ impl DagActor {
         }
         phase!("6f-reprobe-unlocked");
 
-        // r[impl sched.substitute.detached+2]
+        // r[impl sched.substitute.detached+3]
         // Newly-inserted substitutable lane: nodes are at Created/
         // Queued/Ready (via seed_initial_states above). Nodes whose
         // transition is rejected (e.g. apply_cached_hits already
@@ -1340,7 +1340,7 @@ impl DagActor {
         }
 
         // r[impl sched.merge.stale-substitutable]
-        // r[impl sched.substitute.detached+2]
+        // r[impl sched.substitute.detached+3]
         // Missing-but-substitutable: instead of awaiting eager-fetch
         // (which blocked the actor), reset Completed→Ready and spawn
         // the detached fetch (Ready→Substituting). SubstituteComplete
@@ -1423,7 +1423,7 @@ impl DagActor {
                 continue;
             }
             state.output_paths.clear();
-            // r[impl sched.merge.stale-completed-verify+3]
+            // r[impl sched.merge.stale-completed-verify+4]
             // Pre-existing Ready parents of this reset node were Ready
             // against its now-gone output. Collect for demotion to
             // Queued after pass 2 (try_dispatch_one's `!= Ready` guard
@@ -1786,7 +1786,7 @@ impl DagActor {
 
         // r[impl sched.merge.substitute-probe]
         // r[impl sched.merge.substitute-fetch]
-        // r[impl sched.substitute.detached+2]
+        // r[impl sched.substitute.detached+3]
         // Locally-present → cached_hits (Created→Completed inline).
         // Upstream-substitutable → pending_substitute (caller spawns
         // the detached fetch after seed_initial_states; the actor loop
@@ -1811,6 +1811,7 @@ impl DagActor {
         // falls through to build — so a true miss costs one extra fetch
         // attempt, not a wrong build dispatch.
         //
+        // r[impl sched.merge.wanted-outputs]
         // Demand-driven completeness: only the WANTED outputs (the ones
         // some consumer's inputDrvs names, or the root asked for) must
         // be present for a hit / present-or-substitutable for
@@ -1946,7 +1947,7 @@ impl DagActor {
         }
 
         // --- Floating-CA store-existence verify (I-048) ----------------
-        // r[impl sched.merge.stale-completed-verify+3]
+        // r[impl sched.merge.stale-completed-verify+4]
         // The realisations table is scheduler-local PG; store GC doesn't
         // touch it. A realisation can point to a path that's been GC'd.
         // Without this verify, such a node flips to Completed here and
@@ -2279,6 +2280,7 @@ impl DagActor {
         );
 
         // --- All-or-nothing: every WANTED root output available? ----
+        // r[impl sched.merge.wanted-outputs]
         // "Available" = present in store (NOT in missing_paths) OR
         // substitutable upstream. A single unavailable wanted root
         // output → fall through to the full merge. Unwanted root
@@ -2320,7 +2322,7 @@ impl DagActor {
             return None;
         }
 
-        // r[impl sched.substitute.detached+2]
+        // r[impl sched.substitute.detached+3]
         // No inline QPI: awaiting query_path_info_opt here blocked the
         // actor for the duration of the store-side closure walk
         // (ghc-sized roots take minutes; grpc_timeout = 30s) — the

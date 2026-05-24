@@ -185,7 +185,7 @@ db_str_enum! {
         /// `QueryPathInfo` (which triggers store-side `try_substitute`)
         /// for this derivation's outputs. Dependents stay gated (NOT
         /// Completed/Skipped); the spawned task posts `SubstituteComplete`
-        /// when done. r[sched.substitute.detached+2]
+        /// when done. r[sched.substitute.detached+3]
         Substituting = "substituting",
         Completed = "completed",
         Failed = "failed",
@@ -392,7 +392,7 @@ impl DerivationStatus {
             // race a prior Queued→Ready promotion — matches
             // DependencyFailed precedent at completion.rs).
             (Self::Queued | Self::Ready, Self::Skipped) => true,
-            // r[impl sched.substitute.detached+2]
+            // r[impl sched.substitute.detached+3]
             // Detached upstream fetch: spawned from any pre-dispatch
             // state (merge-time) or Ready (dispatch-time). Completed →
             // fetch landed; Ready/Queued → fetch failed, fall through
@@ -1436,6 +1436,7 @@ impl DerivationState {
 /// `crate::domain::DerivationNode` before a `DerivationState` exists;
 /// both call sites MUST share one implementation or the hit criterion
 /// drifts between merge time and dispatch time.
+// r[impl sched.merge.wanted-outputs]
 pub fn wanted_subset<'a>(
     output_names: &'a [String],
     expected_output_paths: &'a [String],
@@ -1468,6 +1469,7 @@ pub fn wanted_subset<'a>(
 /// fall back to all declared paths, or treat the node as unavailable.
 /// Falling through to a from-source build / the full merge is always
 /// safe; a false "complete" is not.
+// r[impl sched.merge.wanted-outputs]
 pub fn verifiable_wanted_paths<'a>(
     output_names: &'a [String],
     expected_output_paths: &'a [String],
@@ -2124,7 +2126,7 @@ mod tests {
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),
-            // Detached upstream fetch (r[sched.substitute.detached+2])
+            // Detached upstream fetch (r[sched.substitute.detached+3])
             (Created, Substituting),
             (Queued, Substituting),
             (Ready, Substituting),

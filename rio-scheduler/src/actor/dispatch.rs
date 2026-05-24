@@ -655,7 +655,7 @@ impl DagActor {
         // queued Tick doesn't reap the fleet on a slow store.
         self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
-        // r[impl sched.substitute.detached+2]
+        // r[impl sched.substitute.detached+3]
         // Partition: locally-present (not in missing_paths) → complete
         // inline; substitutable → spawn detached fetch; truly-missing →
         // leave Ready (dispatches normally). The detached fetch runs
@@ -675,6 +675,7 @@ impl DagActor {
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
             let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
+            // r[impl sched.merge.wanted-outputs]
             // Demand-driven completeness: only the WANTED outputs must
             // be present (→ complete inline) or present-or-
             // substitutable (→ detached fetch). A missing output
@@ -767,7 +768,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+2]
+    // r[impl sched.substitute.detached+3]
     /// Transition each candidate to `Substituting` and spawn a
     /// background task that triggers store-side `try_substitute` (via
     /// `QueryPathInfo`) for its output paths AND their transitive
@@ -843,6 +844,7 @@ impl DagActor {
             ) {
                 state.retry.clear();
             }
+            // r[impl sched.merge.wanted-outputs]
             // The forgivable seed subset: declared output paths whose
             // name is OUTSIDE the node's (non-empty) wanted set. The
             // walk still attempts them (opportunistic completeness)
@@ -969,7 +971,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+2]
+    // r[impl sched.substitute.detached+3]
     /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
     /// detached fetch task. `ok=true` → output now in rio-store with
     /// its full reference closure ([`walk_substitute_closure`] walked
@@ -1198,6 +1200,7 @@ impl DagActor {
             }
             state.probed_generation = probe_gen;
             let substitute_tried = state.substitute_tried;
+            // r[impl sched.merge.wanted-outputs]
             // Demand-driven completeness: the probe set stays ALL
             // expected paths, but the present/substitutable verdicts
             // below are evaluated over the WANTED subset only.
@@ -1256,7 +1259,7 @@ impl DagActor {
                     self.complete_ready_from_store(drv_hash).await;
                     return true;
                 }
-                // r[impl sched.substitute.detached+2] — spawn instead of
+                // r[impl sched.substitute.detached+3] — spawn instead of
                 // awaiting eager_substitute_fetch in the actor loop.
                 // r[impl sched.merge.substitute-probe-indeterminate]
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
@@ -2456,7 +2459,7 @@ impl DagActor {
     }
 }
 
-// r[impl sched.substitute.detached+2]
+// r[impl sched.substitute.detached+3]
 /// Auth source for the detached substitute closure walk.
 ///
 /// `Service` holds `(signer, tenant_id)` and re-mints a fresh
