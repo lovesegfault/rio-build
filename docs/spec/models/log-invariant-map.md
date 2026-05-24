@@ -1,19 +1,29 @@
 # Build-log invariant ↔ spec-rule map
 
-Working artifact for the log-formal campaign's Phase 1 (spec audit). Maps the
-ten invariants of the build-log verification design (§3.4: five model-A
-invariants over the single-replica entry lifecycle, five model-B invariants
-over cross-replica finalization) onto the `obs.log.*` / `sched.log.*` /
-`sched.merge.*` / `sched.recovery.*` rule set. Phase 2 moves the model-A half
-of this table into `logBufferLifecycle.qnt`'s header comment.
+Working artifact for the log-formal campaign's Phase 1 (spec audit) and
+Phase 2 (model A). Maps the ten invariants of the build-log verification
+design (§3.4: five model-A invariants over the single-replica entry
+lifecycle, five model-B invariants over cross-replica finalization) onto the
+`obs.log.*` / `sched.log.*` / `sched.merge.*` / `sched.recovery.*` rule set.
 
-This is the post-audit state: every invariant now maps onto a rule whose
-normative MUST sentence states it (the COVERS column is total). The "audit
+This is the post-Phase-2 state: every invariant maps onto a rule whose
+normative MUST sentence states it (the COVERS column is total), and every
+model-A invariant is verified exhaustively by the `quint-log-*` checks in
+`nix/quint.nix` (TLC backend, full reachable state space, six regimes: `base`,
+`flap`, `fault-local`, `fault-recovery`, `fault-persist`, `fault-guard`). The "audit
 finding" column records what the pre-audit rule set was missing and which
 Phase-1 task closed it, so the model phases can cite why each rule has the
-shape it has.
+shape it has. The "Findings" section at the end records what the Phase-2
+model checking itself found.
 
 ## Model A — single-replica entry lifecycle
+
+Verified by: `quint-log-base`, `quint-log-flap`, `quint-log-fault-local`,
+`quint-log-fault-recovery`, `quint-log-fault-persist`, `quint-log-fault-guard`
+(each asserts all five invariants plus the `boundsOK` ceiling tripwire over
+its regime's full reachable state space); non-vacuity pinned by the eleven
+`quint-log-witness-*` expect-violation checks plus
+`quint-log-witness-gap-span-ungated`.
 
 | Invariant | Rule(s) | Verdict | Audit finding |
 |---|---|---|---|
@@ -59,18 +69,79 @@ shape it has.
   acquisition-time sweep's predicate (unsealed ∧ not non-terminal in the
   rebuilt DAG).
 
-## Verify-marker status (Phase-2 wiring targets)
+## Verify-marker status
 
-`tracey query untested` filtered to `obs.log.*` / `sched.log.*` /
-`sched.merge.exec-correlation` / `sched.recovery.log-buffer-sweep` after the
-Phase-1 commits lists exactly two rows:
+The two rows Phase 1 left in `tracey query untested` are now closed:
 
-- `obs.log.line-conservation` — verified by model A's `NoSilentLineLoss`
-  check (Task 2.10/2.11).
+- `obs.log.line-conservation` — verified by model A's `noSilentLineLoss`
+  invariant in all six `quint-log-*` regime checks (the markers live at the
+  check wiring points in `nix/quint.nix`).
 - `obs.log.entry-justified` — verified by model A's
-  `EveryRetainedEntryIsJustified` check (Task 2.10/2.11).
+  `everyRetainedEntryIsJustified` invariant in the same checks.
 
-Both are deliberate: their verification is the Phase-2 model checks (the
-`r[verify]` markers land at the check wiring points in `nix/quint.nix`), not
-a unit test. Every other rule in the inventory already carries at least one
-`r[verify]` site. `tracey query uncovered` shows no log-domain rows.
+Every other rule in the inventory already carries at least one `r[verify]`
+site. `tracey query uncovered` shows no log-domain rows.
+
+## Findings (Phase-2 model checking)
+
+### Calibration entry #0: the gap-merge fold's accept-gate precondition (`obs.log.gap-span+2`)
+
+The first falsification of the campaign, and the template for the Phase-3
+calibration table (each entry is "revert `<fix>`, run `<check>`, watch
+`<invariant>` go red").
+
+- **Falsification:** `lineSpanExact` violated. `push_for`'s line-numbering
+  gate compared a batch only against the ring's current tail, so it reset
+  whenever the ring emptied — and the stored-coverage reconcile empties the
+  ring on exactly the path where the comparison matters (it truncates every
+  retained line below a prior tenure's stored row end and caches that row as
+  the recovered prefix). A batch numbered below the cached prefix's end then
+  landed in the empty ring and the gap-merge fold double-counted it: the
+  row's `first_line + line_count` overshot the execution's true end by the
+  overlap, the blob held the overlapping lines twice, and the read path's
+  physical-vs-claimed divergence check stayed blind (duplication and
+  overstatement cancel). The original machine-found counterexample reached
+  the precondition through the model's then-free-standing eviction action — a
+  state the real push-coupled eviction cannot produce; the adversarial review
+  re-derived the violation through the reachable path (an interim leader
+  extending the stored row past this replica's retained ring).
+- **Fix:** the entry-lifetime accept floor `RingBuf::accounted_below` — one
+  past the highest line the entry has ever accounted for, raised by every
+  accepted push, by the stored-coverage truncation, and by the prefix cache;
+  never lowered; reset only by a cross-exec restamp. `push_for` rejects any
+  batch starting below it (`reason="below_stored_prefix"` when the ring holds
+  nothing at or above the batch).
+- **Witness that the fix is load-bearing:** `quint-log-witness-gap-span-ungated`
+  — the flap regime with the floor disabled (`ENABLE_ACCOUNTED_FLOOR = false`)
+  MUST still violate `lineSpanExact`. A green exhaustive `quint-log-flap`
+  plus a red `lineSpanExact` in the ungated module is the machine-checked
+  statement that the gate is necessary and sufficient at the model's bounds.
+
+### The sealed-orphan reaps are gated on `may_flush()`, which a rebound suspends for a full recovery cycle (`obs.log.entry-justified`)
+
+Found by the first exhaustive run of the flap regime (the violation is 13
+actions deep; 20 000 random 24-step traces never reached it). A sealed
+non-empty orphan left by `flush_final`'s out-of-tenure drop arm, whose ring
+the stored-coverage reconcile then empties, has exactly one reaper left: the
+periodic sealed-empty reap (its sibling, the refused-UPSERT reap, covers the
+non-empty-with-a-finalized-row shape). Both periodic reaps are gated on
+`may_flush() = is_leader && recovery_complete()`, and `on_rebound` clears the
+recovery-completion stamp without clearing `is_leader`, the DAG, or
+`dag_authoritative` — so a rebound suspends the orphan's only reaper for a
+full recovery cycle while the replica still looks like an authoritative
+leader. The acquisition-time sweep does not cover the entry (it skips sealed
+keys). Adjudicated as an invariant-encoding gap, not a code bug: the
+re-fired LeaderAcquired's recovery re-opens the gate and the next periodic
+tick reaps the entry, so the window is bounded; the invariant's
+pre-recovery-window disjunct is now keyed on the reap's own gate.
+
+**Architectural note for Phase 6:** this is direct evidence for the
+"four reaps → one ungated general reap" simplification candidate. The four
+orphan shapes (tenure-drop, refused-UPSERT, sealed-empty, enqueue-failure)
+are reaped by four different code paths with three different gates
+(`req_in_tenure`, `may_flush()`, none), and the justification argument for
+"no fifth orphan shape" has to thread the union of those gates through every
+lease transition. A single reap pass that runs unconditionally on every
+periodic tick (or at every acquisition) and discards any entry that has lost
+every justification would collapse the case analysis and remove the
+rebound-window sensitivity entirely.
