@@ -2310,6 +2310,10 @@ impl DagActor {
                     rio_proto::types::DerivationEvent::started(
                         drv_path.clone(),
                         executor_id.to_string(),
+                        // TODO: thread the real exec_id from assignment state
+                        // (harden-logs commit 3); the gateway keys its TailLog
+                        // subscriptions on it from commit 4.
+                        String::new(),
                     ),
                 ),
             );

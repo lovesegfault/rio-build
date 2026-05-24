@@ -266,6 +266,12 @@ message CompletionReport {
   // sample's wall-seconds to reference-seconds. The scheduler has no
   // Node informer, so this is the only path; absent → factor=1.0.
   optional string hw_class = 9;
+
+  // Total log lines this execution emitted, INCLUDING the banner header (3)
+  // and footer (2) lines. The store's log-completeness predicate is
+  // "drv_log_chunks covers a contiguous [0, final_line_count)".
+  // 0 means "never reported" (older builders do not set this).
+  uint64 final_line_count = 10;
 }
 
 // Result of building a single derivation.

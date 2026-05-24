@@ -210,6 +210,7 @@ fn migration_checksums_frozen() {
         (63, "3590687681bee63e3254a1ae52c20768b547f6d26d3ee126aeca5e0e284f869afea4f25d03cd15cb49d68655af24531a"),
         (64, "0b64d644a1fdb2f381c8655bbe2a8ab4258dba6fe8bf4fa428cc1df7e627b3b9c4eb8152cc640215dff290bd3ac72dea"),
         (65, "fbefd9e2249865351d6901071bfcb8f06ff85e89e64661b4b68073569c7fb88c2437a2907df5fdb77448e1277b6f8497"),
+        (66, "a74322821f1b7a97c76185dba48bbd25643fe56cee466ad6dbf0006c28e4efe16aeef0d9e8bfa3eaa0794f957721dc84"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -289,6 +290,22 @@ async fn cross_service_schema_contract() {
         ("tenants", "tenant_name",        "text"),
         ("tenants", "cache_token",        "text"),
         ("tenants", "gc_max_store_bytes", "int8"),
+        // logs (063): the AppendLog binding gate resolves the latest
+        // assignment for a derivation (assignments JOIN derivations)
+        // to verify the claimed exec_id/builder_id.
+        ("assignments", "exec_id",        "uuid"),
+        ("assignments", "builder_id",     "text"),
+        ("assignments", "status",         "text"),
+        ("assignments", "assigned_at",    "timestamptz"),
+        ("assignments", "derivation_id",  "uuid"),
+        ("derivations", "derivation_id",  "uuid"),
+        ("derivations", "drv_hash",       "text"),
+        // logs (063): latest-exec resolution + the completeness
+        // predicate. drv_executions is scheduler-WRITTEN, store-READ.
+        ("drv_executions", "exec_id",          "uuid"),
+        ("drv_executions", "drv_hash",         "bpchar"),
+        ("drv_executions", "status",           "text"),
+        ("drv_executions", "final_line_count", "int8"),
     ];
 
     for &(table, col, want_udt) in STORE_READS {

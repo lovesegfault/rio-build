@@ -130,6 +130,11 @@ message DerivationEvent {
   repeated string output_paths = 4;         // COMPLETED, CACHED, SUBSTITUTING only
   string error_message = 5;                 // FAILED only
   BuildResultStatus failure_status = 6;     // FAILED only (types.proto)
+  // The execution this STARTED event corresponds to (UUIDv7 minted at
+  // dispatch). Set only on STARTED; empty for all other kinds. A duplicate
+  // STARTED with a DIFFERENT exec_id means the derivation was re-dispatched
+  // and any per-execution subscription keyed on the old value is stale.
+  string exec_id = 7;
 }
 
 enum DerivationEventKind {

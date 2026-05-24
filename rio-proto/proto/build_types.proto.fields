@@ -121,6 +121,7 @@ uint64 build_timeout = 2;
 uint64 build_timeout = 6;
 uint64 bytes_done = 2;
 uint64 bytes_expected = 3;
+uint64 final_line_count = 10;
 uint64 first_line_number = 3;
 uint64 generation = 2;
 uint64 generation = 7;

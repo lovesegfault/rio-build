@@ -883,7 +883,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
             cached_derivations: 0,
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(target.clone(), "w1".into()),
+            types::DerivationEvent::started(target.clone(), "w1".into(), String::new()),
         )),
         ev(build_event::Event::Derivation(
             types::DerivationEvent::completed(target.clone(), vec![]),
@@ -998,11 +998,11 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
             cached_derivations: 0,
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(target.clone(), "w1".into()),
+            types::DerivationEvent::started(target.clone(), "w1".into(), String::new()),
         )),
         // Reassign to a different executor while still in-flight.
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(target.clone(), "w2".into()),
+            types::DerivationEvent::started(target.clone(), "w2".into(), String::new()),
         )),
         ev(build_event::Event::Derivation(
             types::DerivationEvent::completed(target.clone(), vec![]),
@@ -1073,7 +1073,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
             cached_derivations: 0,
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(target.clone(), "w1".into()),
+            types::DerivationEvent::started(target.clone(), "w1".into(), String::new()),
         )),
         ev(build_event::Event::Derivation(
             types::DerivationEvent::failed(
@@ -1149,7 +1149,7 @@ async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Resu
             cached_derivations: 0,
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(trigger.clone(), "w1".into()),
+            types::DerivationEvent::started(trigger.clone(), "w1".into(), String::new()),
         )),
         // Trigger drv actually ran and failed → has a log → gets the hint.
         ev(build_event::Event::Derivation(
@@ -1369,7 +1369,11 @@ async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result
             cached_derivations: 0,
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(target.clone(), "rio-builder-x86-64-abc".into()),
+            types::DerivationEvent::started(
+                target.clone(),
+                "rio-builder-x86-64-abc".into(),
+                String::new(),
+            ),
         )),
         ev(build_event::Event::Phase(types::BuildPhase {
             derivation_path: target.clone(),

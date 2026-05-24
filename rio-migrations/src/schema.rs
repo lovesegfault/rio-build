@@ -56,3 +56,76 @@ pub struct TenantRow {
     pub has_cache_token: bool,
     pub created_at: i64,
 }
+
+/// `drv_executions` row (063).
+///
+/// Scheduler-OWNED, store-READ: rio-scheduler INSERTs at dispatch and
+/// UPDATEs `status`/`finished_at`/`final_line_count` at terminal;
+/// rio-store reads it for latest-exec resolution (`WHERE drv_hash = ?
+/// ORDER BY exec_id DESC LIMIT 1`) and the log-completeness predicate
+/// (`status` is terminal AND `final_line_count` known AND the chunk
+/// manifest covers `[0, final_line_count)`), and its TTL sweep
+/// DELETEs by `started_at` age.
+///
+/// `drv_hash` is the `drv_log_hash()` form (32-char bare hash,
+/// CHAR(32)/`bpchar`) — NOT `derivations.drv_hash` (the DAG key,
+/// TEXT). Nothing joins the two; see M_061/M_064.
+///
+/// Timestamps are epoch seconds via `EXTRACT(EPOCH FROM …)::bigint`
+/// at the query site — keeps this module chrono-free (the `TenantRow`
+/// convention).
+#[derive(Debug, sqlx::FromRow)]
+pub struct DrvExecutionRow {
+    pub exec_id: Uuid,
+    pub drv_hash: String,
+    pub executor_id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// `succeeded` | `failed` | `cancelled`; NULL while running.
+    pub status: Option<String>,
+    /// Total lines incl. the banner header/footer; NULL until the
+    /// builder's CompletionReport carries it. The completeness
+    /// predicate's upper bound.
+    pub final_line_count: Option<i64>,
+}
+
+/// `drv_log_chunks` row (063).
+///
+/// Store-OWNED, store-written (INSERT-only, idempotent on the
+/// `(exec_id, session_id, chunk_seq)` PK): the line-range manifest
+/// for one execution's log. Two ingest sessions for the same
+/// execution may record overlapping `[first_line, first_line +
+/// line_count)` ranges; readers dedup by line number. Defined here
+/// (rather than in rio-store) so a future scheduler/dashboard
+/// manifest read inherits the compile-time column contract.
+#[derive(Debug, sqlx::FromRow)]
+pub struct DrvLogChunkRow {
+    pub exec_id: Uuid,
+    pub session_id: Uuid,
+    pub chunk_seq: i32,
+    pub first_line: i64,
+    pub line_count: i64,
+    pub byte_size: i64,
+    pub s3_key: String,
+    /// Epoch seconds (`EXTRACT(EPOCH FROM …)::bigint` at the query
+    /// site).
+    pub created_at: i64,
+}
+
+/// `log_ingest_sessions` row (063).
+///
+/// Store-OWNED, store-written: the live-ingest routing registry. At
+/// most one live session per execution (PK on `exec_id`); `acquire`
+/// steals a row whose `heartbeat_at` is older than 30 s. Readers
+/// treat a row with a stale heartbeat as dead and serve history-only.
+#[derive(Debug, sqlx::FromRow)]
+pub struct LogIngestSessionRow {
+    pub exec_id: Uuid,
+    pub session_id: Uuid,
+    pub replica_pod: String,
+    /// Epoch seconds (`EXTRACT(EPOCH FROM …)::bigint` at the query
+    /// site).
+    pub started_at: i64,
+    /// Epoch seconds; the 15 s heartbeat / 30 s staleness lease.
+    pub heartbeat_at: i64,
+}

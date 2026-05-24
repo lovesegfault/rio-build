@@ -119,6 +119,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
                     node_name: None,
                     hw_class: None,
                     final_resources: None,
+                    final_line_count: 0,
                 },
             )),
         })
@@ -1054,6 +1055,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
                     node_name: None,
                     hw_class: None,
                     final_resources: None,
+                    final_line_count: 0,
                 },
             )),
         })

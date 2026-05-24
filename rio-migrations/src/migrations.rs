@@ -1212,6 +1212,59 @@ pub const M_064: () = ();
 /// Read/written by **rio-scheduler** only.
 pub const M_065: () = ();
 
+/// `migrations/066_log_chunks.sql`
+///
+/// The schema for the chunked, store-owned build-log pipeline (harden-logs).
+/// Build-log durability moves off the leader-elected scheduler onto
+/// rio-store: builders stream batches to the store's `LogService.AppendLog`,
+/// the store cuts immutable zstd chunks to S3 and records them here, and
+/// readers (`TailLog`) reassemble a log from the chunk manifest. Three
+/// tables instead of one because each has exactly one writer and one
+/// lifecycle:
+///
+/// - `drv_executions` — lifecycle. Written by **rio-scheduler** (INSERT at
+///   `assign_to_worker`, UPDATE of `status`/`finished_at`/`final_line_count`
+///   at terminal), aged out by **rio-store**'s TTL sweep. Deliberately
+///   duplicates `exec_id`/`executor_id`/timestamps that also exist on
+///   `assignments`: that table keeps one row per *attempt* with its own
+///   audit semantics and an active-rows-only partial unique index, while
+///   this one is the log subsystem's stable per-execution anchor and the
+///   completeness predicate's source of truth (`is_complete` ⇔ status is
+///   terminal ∧ `final_line_count` known ∧ the chunk manifest covers a
+///   contiguous `[0, final_line_count)`). `drv_hash` is the 32-char
+///   `drv_log_hash()` form, NOT `derivations.drv_hash` (same caveat as
+///   M_061). The two indexes serve the latest-exec lookup (UUIDv7 DESC =
+///   newest) and the TTL sweep's sub-`LIMIT` passes (same pattern as
+///   `drv_logs_started_at`, M_061).
+///
+/// - `drv_log_chunks` — the append-only chunk manifest. Written by
+///   **rio-store** only, INSERT-only (`ON CONFLICT DO NOTHING`), one row
+///   per durably committed S3 object. The PK is
+///   `(exec_id, session_id, chunk_seq)` rather than `(exec_id, chunk_seq)`
+///   or `(exec_id, first_line)` because two ingest sessions for the same
+///   execution can coexist across a store-replica failover or a builder
+///   reconnect: the replayed tail lands in a *new* session's chunks, so
+///   sessions must never collide on a key. Overlapping line ranges across
+///   sessions are legal; readers select chunks by line-range intersection
+///   on `drv_log_chunks_range` and dedup by line number. Stored coverage is
+///   therefore a monotone union — no writer can regress another writer's
+///   data, which is the property the previous (`drv_logs` + mutable
+///   `.partial` blob) design had to maintain with a reconciliation
+///   protocol.
+///
+/// - `log_ingest_sessions` — the live-ingest routing registry. Written by
+///   **rio-store** only. `exec_id` PK = at most one live session per
+///   execution (the single-session admission rule); the row carries which
+///   replica owns the in-memory ingest buffer so `TailLog` subscribers on
+///   other replicas can proxy to it. Heartbeat-leased (15 s beat / 30 s
+///   staleness), deleted on clean stream close; a stale row is stealable.
+///
+/// `drv_logs` is intentionally NOT dropped here: the scheduler code that
+/// reads and writes it survives until the harden-logs cutover commit
+/// deletes it, and a later migration drops the table. Until then both
+/// schemas coexist.
+pub const M_066: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

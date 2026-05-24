@@ -66,11 +66,12 @@ pub mod types {
 /// 5 scheduler emit sites and keep "which fields are valid for which
 /// kind" documented in one place.
 impl types::DerivationEvent {
-    pub fn started(derivation_path: String, executor_id: String) -> Self {
+    pub fn started(derivation_path: String, executor_id: String, exec_id: String) -> Self {
         Self {
             derivation_path,
             kind: types::DerivationEventKind::Started as i32,
             executor_id,
+            exec_id,
             ..Default::default()
         }
     }

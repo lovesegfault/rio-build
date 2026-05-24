@@ -33,7 +33,8 @@
     "services": [
       "StoreService",
       "ChunkService",
-      "StoreAdminService"
+      "StoreAdminService",
+      "LogService"
     ],
     "doc": "Store service for NAR storage and path metadata."
   },

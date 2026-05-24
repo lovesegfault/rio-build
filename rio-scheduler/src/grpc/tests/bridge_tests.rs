@@ -132,6 +132,7 @@ async fn test_completed_event_survives_log_flood() {
             executor_id: String::new(),
             error_message: String::new(),
             failure_status: 0,
+            exec_id: String::new(),
         })),
     });
 

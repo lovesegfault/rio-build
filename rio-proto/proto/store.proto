@@ -3,6 +3,7 @@ package rio.store;
 
 import "google/protobuf/empty.proto";
 import "types.proto";
+import "build_types.proto"; // LogService.AppendLog → BuildLogBatch
 
 // Store service for NAR storage and path metadata.
 // Inspired by tvix castore/store protos (MIT).
@@ -173,4 +174,60 @@ service StoreAdminService {
   // per-replica ratio. I-105: PG pool exhaustion is the cliff that
   // cascades into FUSE circuit-trip; this is the leading indicator.
   rpc GetLoad(rio.types.GetLoadRequest) returns (rio.types.GetLoadResponse);
+}
+
+// Build-log data plane. AppendLog is the builder's authenticated ingest
+// stream (x-rio-assignment-token metadata, same as PutPath); TailLog is the
+// unauthenticated read/follow stream used by the gateway, dashboard, and CLI.
+service LogService {
+  // Authenticated builder ingest. Errors: UNAUTHENTICATED on a bad/expired
+  // assignment token; PERMISSION_DENIED when the claimed execution does not
+  // match the derivation's latest assignment; FAILED_PRECONDITION when the
+  // execution's log is already complete; ALREADY_EXISTS when another live
+  // ingest session holds this execution; RESOURCE_EXHAUSTED past the
+  // per-execution byte cap; UNAVAILABLE when the replica cannot commit
+  // chunks (the client should reconnect and replay).
+  rpc AppendLog(stream AppendLogRequest) returns (stream AppendLogAck);
+
+  // Unauthenticated read/follow. Errors are yielded in-stream (grpc-web
+  // clients cannot read trailers): NOT_FOUND when the derivation has no
+  // recorded execution or a pinned exec_id is unknown.
+  rpc TailLog(TailLogRequest) returns (stream TailLogChunk);
+}
+
+message AppendLogRequest {
+  oneof msg {
+    AppendLogHeader header = 1;        // first message, exactly once
+    rio.types.BuildLogBatch batch = 2; // 0..n subsequent messages
+  }
+}
+
+// First message on every AppendLog stream. Establishes the stream's identity;
+// derivation_path/executor_id embedded in subsequent batches are IGNORED.
+message AppendLogHeader {
+  string derivation_path = 1; // must drv_log_hash-normalize to the token's drv_hash
+  string exec_id = 2;         // UUIDv7; validated against the latest assignments row
+}
+
+// Sent after each durably committed chunk (S3 PUT + manifest INSERT both done).
+message AppendLogAck {
+  uint64 durable_through_line = 1;
+}
+
+message TailLogRequest {
+  string derivation = 1; // full path | basename | bare 32-char hash
+  string exec_id = 2;    // optional; empty = latest execution for the derivation
+  uint64 since_line = 3; // Resume from this line number (0 = from start). Chunk
+                         // granularity means the server may send lines before
+                         // since_line; clients must tolerate and skip them.
+  bool follow = 4;       // true: keep streaming until the ingest session ends (the
+                         // client re-opens on premature end); false: drain stored
+                         // history and close.
+}
+
+message TailLogChunk {
+  string exec_id = 1; // resolved server-side
+  repeated bytes lines = 2;
+  uint64 first_line_number = 3;
+  bool is_complete = 4; // meaningful on the final chunk of a non-follow read
 }

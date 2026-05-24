@@ -1,0 +1,13 @@
+AppendLogHeader header = 1;
+bool follow = 4;
+bool is_complete = 4;
+repeated bytes lines = 2;
+rio.types.BuildLogBatch batch = 2;
+string derivation = 1;
+string derivation_path = 1;
+string exec_id = 1;
+string exec_id = 2;
+string exec_id = 2;
+uint64 durable_through_line = 1;
+uint64 first_line_number = 3;
+uint64 since_line = 3;
