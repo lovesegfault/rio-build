@@ -544,7 +544,7 @@ pub(super) async fn decrement_hashes_and_enqueue(
     // S3 object by then. `durable = false` for the same reason: a
     // resurrected chunk whose S3 object the drain already removed must
     // not answer `HasChunks` true (the builder would skip re-sending
-    // it → permanent data loss). r[impl store.chunk.durable-flag]
+    // it → permanent data loss). ADR-022 §6.2 durable-presence.
     let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
         UPDATE chunks SET deleted = true, uploaded_at = NULL, durable = false

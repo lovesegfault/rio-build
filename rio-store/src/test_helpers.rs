@@ -150,6 +150,181 @@ pub fn path_hash(path: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// PutPathChunked fixture + stream helpers (ADR-022 §6)
+// ---------------------------------------------------------------------------
+
+/// Build a `ChunkedOutputHeader` + chunk bodies for one on-disk tree:
+/// dump the real NAR with `dump_path_streaming`, derive the Directory
+/// DAG with `nar_ls` + `castore::build` (the same code the read path
+/// trusts), and chunk each file's contents at `chunk_size` boundaries.
+///
+/// This is a miniature of the builder's fused walk — using the
+/// existing, separately-tested `nar_ls`/`castore::build` for the
+/// fixture side means the server's NAR reconstruction is tested against
+/// an independent implementation of the same format. Returns the output
+/// header, the deduplicated `Directory` bodies, the chunk bodies keyed
+/// by digest, and the reference NAR bytes.
+///
+/// The 4-tuple is destructured at every call site
+/// (`let (out, dirs, chunks, nar) = …`), which is more readable than a
+/// named struct that each test would immediately pull apart.
+#[allow(clippy::type_complexity)]
+pub fn chunked_output_for_tree(
+    root: &std::path::Path,
+    store_path: &str,
+    chunk_size: usize,
+) -> (
+    rio_proto::types::ChunkedOutputHeader,
+    Vec<rio_proto::castore::Directory>,
+    std::collections::HashMap<[u8; 32], Vec<u8>>,
+    Vec<u8>,
+) {
+    use prost::Message;
+    let mut nar = Vec::new();
+    rio_nix::nar::dump_path_streaming(root, &mut nar).expect("dump_path_streaming");
+    let entries = rio_nix::nar::nar_ls(std::io::Cursor::new(&nar)).expect("nar_ls");
+    let dag = crate::castore::build(&entries);
+
+    let mut chunk_manifest: Vec<rio_proto::types::ChunkRef> = Vec::new();
+    let mut chunks: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
+    for e in &entries {
+        if e.kind != rio_nix::nar::NarEntryKind::Regular {
+            continue;
+        }
+        let contents = &nar[e.nar_offset as usize..(e.nar_offset + e.size) as usize];
+        for piece in contents.chunks(chunk_size.max(1)) {
+            let digest = *blake3::hash(piece).as_bytes();
+            chunks.insert(digest, piece.to_vec());
+            chunk_manifest.push(rio_proto::types::ChunkRef {
+                hash: digest.to_vec(),
+                size: piece.len() as u32,
+            });
+        }
+    }
+
+    let directories: Vec<rio_proto::castore::Directory> = dag
+        .directories
+        .iter()
+        .map(|(_, body)| {
+            rio_proto::castore::Directory::decode(body.as_slice())
+                .expect("castore::build emits valid bodies")
+        })
+        .collect();
+
+    let header = rio_proto::types::ChunkedOutputHeader {
+        store_path: store_path.to_owned(),
+        nar_hash: Sha256::digest(&nar).to_vec(),
+        nar_size: nar.len() as u64,
+        refs: vec![],
+        root_node: Some(
+            rio_proto::castore::RootNode::decode(dag.root_node.as_slice())
+                .expect("valid root node"),
+        ),
+        chunk_manifest,
+    };
+    (header, directories, chunks, nar)
+}
+
+/// Assemble a multi-output `PutPathChunkedBegin` from per-output
+/// headers + directory sets, computing `novel` as the global
+/// first-occurrence order over all outputs' chunk manifests (i.e. a
+/// builder that found `HasChunks` false for everything). Directories
+/// are deduplicated across outputs by their encoded bytes.
+pub fn assemble_begin(
+    outputs: Vec<rio_proto::types::ChunkedOutputHeader>,
+    directories: Vec<Vec<rio_proto::castore::Directory>>,
+) -> rio_proto::types::PutPathChunkedBegin {
+    use prost::Message;
+    let mut seen_dirs = std::collections::HashSet::new();
+    let directories: Vec<rio_proto::castore::Directory> = directories
+        .into_iter()
+        .flatten()
+        .filter(|d| seen_dirs.insert(d.encode_to_vec()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let novel: Vec<Vec<u8>> = outputs
+        .iter()
+        .flat_map(|o| o.chunk_manifest.iter())
+        .filter(|c| seen.insert(c.hash.clone()))
+        .map(|c| c.hash.clone())
+        .collect();
+    rio_proto::types::PutPathChunkedBegin {
+        deriver: String::new(),
+        outputs,
+        directories,
+        novel,
+        input_closure: vec![],
+    }
+}
+
+/// Drive a `PutPathChunked` RPC: send `Begin`, then one `Chunk` frame
+/// per `Begin.novel` entry (bodies looked up in `chunks`), then
+/// half-close. `mangle` lets rejection tests tamper with a frame before
+/// it is sent (return `None` to drop the frame and close early).
+pub async fn put_path_chunked(
+    client: &mut StoreServiceClient<Channel>,
+    begin: rio_proto::types::PutPathChunkedBegin,
+    chunks: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+    token: Option<&str>,
+    mangle: impl Fn(
+        usize,
+        rio_proto::types::PutPathChunkedChunk,
+    ) -> Option<rio_proto::types::PutPathChunkedChunk>
+    + Send
+    + 'static,
+) -> Result<bool, tonic::Status> {
+    use rio_proto::types::{PutPathChunkedChunk, PutPathChunkedRequest, put_path_chunked_request};
+    let novel = begin.novel.clone();
+    let (tx, rx) = mpsc::channel(8);
+    // Sender task: the server consumes Begin + chunks interleaved with
+    // its own S3 writes, so the 8-deep channel backpressures naturally.
+    let chunks = chunks.clone();
+    let sender = tokio::spawn(async move {
+        if tx
+            .send(PutPathChunkedRequest {
+                msg: Some(put_path_chunked_request::Msg::Begin(begin)),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        for (i, digest) in novel.iter().enumerate() {
+            let key: [u8; 32] = digest.as_slice().try_into().expect("32-byte digest");
+            let frame = PutPathChunkedChunk {
+                digest: digest.clone(),
+                data: chunks
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("novel digest {} has no body", hex::encode(key)))
+                    .clone(),
+            };
+            let Some(frame) = mangle(i, frame) else {
+                return; // simulate a builder dying mid-stream
+            };
+            if tx
+                .send(PutPathChunkedRequest {
+                    msg: Some(put_path_chunked_request::Msg::Chunk(frame)),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    if let Some(t) = token {
+        req.metadata_mut().insert(
+            rio_proto::ASSIGNMENT_TOKEN_HEADER,
+            t.parse().expect("token must be a valid header value"),
+        );
+    }
+    let resp = client.put_path_chunked(req).await;
+    sender.abort();
+    resp.map(|r| r.into_inner().created)
+}
+
+// ---------------------------------------------------------------------------
 // TenantSeed — tenants/tenant_keys fixture builder
 // ---------------------------------------------------------------------------
 

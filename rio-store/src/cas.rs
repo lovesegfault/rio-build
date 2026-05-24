@@ -135,7 +135,7 @@ pub struct PutChunkedStats {
     /// Deduplicated 32-byte BLAKE3 hashes of every chunk in the
     /// manifest — the set whose refcounts were incremented. The
     /// completion transaction flips these to `durable = TRUE` alongside
-    /// the `'complete'` status flip (`r[store.chunk.durable-flag]`).
+    /// the `'complete'` status flip (ADR-022 §6.2 durable-presence).
     pub chunk_hashes: Vec<Vec<u8>>,
 }
 
@@ -194,7 +194,7 @@ pub async fn put_chunked(
 
     // --- Step 5: Complete ---
     // The `durable = TRUE` flip for the manifest's chunks rides in the
-    // same tx as the `'complete'` status flip (r[store.chunk.durable-flag]).
+    // same tx as the `'complete'` status flip (ADR-022 §6.2 durable-presence).
     if let Err(e) =
         metadata::complete_manifest_chunked(pool, info, claim, &stats.chunk_hashes).await
     {
@@ -356,7 +356,7 @@ pub async fn stage_chunked(
     };
     // Hand the deduped chunk set to the caller so the completion tx can
     // flip `durable = TRUE` for exactly the hashes whose refcounts were
-    // incremented above (r[store.chunk.durable-flag]).
+    // incremented above (ADR-022 §6.2 durable-presence).
     stats.chunk_hashes = chunk_hashes.clone();
 
     // --- Step 4b: Commit S3 presence ---

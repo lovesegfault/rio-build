@@ -59,7 +59,7 @@ pub(in crate::grpc) enum NarPersist {
     /// configured. Chunks already uploaded + refcounted via
     /// [`cas::stage_chunked`]; the `status='complete'` flip and the
     /// `durable = TRUE` flip for the carried chunk set remain for the
-    /// batch tx (`r[store.chunk.durable-flag]`).
+    /// batch tx (ADR-022 §6.2 durable-presence).
     ChunkedStaged { chunk_hashes: Vec<Vec<u8>> },
 }
 

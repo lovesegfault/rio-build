@@ -255,7 +255,6 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
 /// so `HasChunks`' durable-presence invariant — bit set iff referenced
 /// by ≥1 complete manifest — holds without a window where the manifest
 /// is complete but its chunks still report absent (or vice versa).
-// r[impl store.chunk.durable-flag]
 #[instrument(skip(pool, info, chunk_hashes), fields(store_path = %info.store_path.as_str()))]
 pub(crate) async fn complete_manifest_chunked(
     pool: &PgPool,
@@ -275,7 +274,6 @@ pub(crate) async fn complete_manifest_chunked(
 /// set, inside the caller's transaction. Sorted before binding per
 /// `r[store.chunk.lock-order]`; `AND NOT durable` keeps the write set
 /// minimal on re-uploads of already-durable content.
-// r[impl store.chunk.durable-flag]
 pub(crate) async fn mark_chunks_durable(
     conn: &mut sqlx::PgConnection,
     chunk_hashes: &[Vec<u8>],

@@ -926,7 +926,6 @@ async fn sweep_orphan_batch(
     // `durable = FALSE` alongside the tombstone for the same reason as
     // `uploaded_at = NULL`: a resurrected chunk must not answer
     // `HasChunks` true after the drain removed its S3 object.
-    // r[impl store.chunk.durable-flag]
     let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
         UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, durable = FALSE

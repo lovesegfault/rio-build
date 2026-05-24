@@ -389,7 +389,7 @@ impl StoreServiceImpl {
                 ));
             }
             // Chunked outputs: flip their chunk set durable in the same
-            // tx as the 'complete' flip (r[store.chunk.durable-flag]).
+            // tx as the 'complete' flip (ADR-022 §6.2 durable-presence).
             if let Err(e) = metadata::mark_chunks_durable(&mut tx, &chunk_hashes).await {
                 drop(tx);
                 return Err(putpath_metadata_status(

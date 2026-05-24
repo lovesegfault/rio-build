@@ -151,7 +151,6 @@ async fn commit_one(
 
         // Durable: the manifest referencing these chunks becomes
         // 'complete' in this transaction.
-        // r[impl store.chunk.durable-flag]
         metadata::mark_chunks_durable(tx, &hashes)
             .await
             .map_err(|e| {

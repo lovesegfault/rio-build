@@ -248,6 +248,7 @@ mod directory;
 mod hash_part;
 mod hmac;
 mod nar_index;
+mod put_path_chunked;
 mod realisations;
 mod reassembly;
 mod signing;
