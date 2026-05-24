@@ -20008,6 +20008,10 @@
           "packageId": "bytes"
         },
         {
+          "name": "cc",
+          "packageId": "cc"
+        },
+        {
           "name": "chacha20",
           "packageId": "chacha20"
         },

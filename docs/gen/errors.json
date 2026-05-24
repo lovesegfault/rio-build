@@ -190,6 +190,41 @@
       "doc": ""
     },
     {
+      "enum": "FrameError",
+      "name": "Codec",
+      "crate": "rio-builder",
+      "msg": "postcard: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Eof",
+      "crate": "rio-builder",
+      "msg": "peer closed the connection",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Io",
+      "crate": "rio-builder",
+      "msg": "socket: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Oversize",
+      "crate": "rio-builder",
+      "msg": "frame exceeds MAX_FRAME_BYTES ({0} > {MAX_FRAME_BYTES})",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Truncated",
+      "crate": "rio-builder",
+      "msg": "frame truncated by the kernel (MSG_TRUNC) — peer sent an oversize datagram",
+      "doc": ""
+    },
+    {
       "enum": "OverlayError",
       "name": "DirCreate",
       "crate": "rio-builder",
@@ -1339,6 +1374,11 @@
       "name": "ExecutorError",
       "crate": "rio-builder",
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
+    },
+    {
+      "name": "FrameError",
+      "crate": "rio-builder",
+      "doc": "Frame-level decode/encode errors (not protocol errors — those are [`ErrKind`])."
     },
     {
       "name": "OverlayError",

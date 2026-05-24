@@ -28,6 +28,61 @@
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
     },
     {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/rio-mountd.rs",
+      "depth": 1,
+      "doc": "`rio-mountd` — privileged per-node broker for castore-FUSE."
+    },
+    {
+      "path": "bin/spike_digest_fuse.rs",
+      "depth": 1,
+      "doc": "Spike: digest-addressed FUSE object store for composefs-style overlay tests."
+    },
+    {
+      "path": "bin/spike_mountd.rs",
+      "depth": 1,
+      "doc": "Spike: privileged mount helper for the composefs-style stack (P0541)."
+    },
+    {
+      "path": "bin/spike_mountd_client.rs",
+      "depth": 1,
+      "doc": "VM-test client for the production `rio-mountd` daemon (P0567)."
+    },
+    {
+      "path": "bin/spike_negdentry_fuse.rs",
+      "depth": 1,
+      "doc": "Spike: FUSE-layer negative-dentry caching via `ReplyEntry{ino=0, entry_valid=MAX}`."
+    },
+    {
+      "path": "bin/spike_passthrough_fuse.rs",
+      "depth": 1,
+      "doc": "Spike: FUSE passthrough under overlay (P0578)."
+    },
+    {
+      "path": "bin/spike_stream_fuse.rs",
+      "depth": 1,
+      "doc": "Spike: streaming-open for the composefs digest-FUSE (P0575 / ADR-022 §C.7)."
+    },
+    {
+      "path": "castore_fuse/",
+      "depth": 0,
+      "doc": "Castore-FUSE lazy `/nix/store` (ADR-022 §2)."
+    },
+    {
+      "path": "castore_fuse/mountd.rs",
+      "depth": 1,
+      "doc": "`rio-mountd` — the privileged per-node broker for castore-FUSE."
+    },
+    {
+      "path": "castore_fuse/mountd_proto.rs",
+      "depth": 1,
+      "doc": "UDS wire protocol between the unprivileged builder and `rio-mountd`."
+    },
+    {
       "path": "cgroup.rs",
       "depth": 0,
       "doc": "Per-build cgroup v2 resource tracking."
@@ -106,11 +161,6 @@
       "path": "fuse/fetch/",
       "depth": 1,
       "doc": "Fetch and materialize store paths into the local cache."
-    },
-    {
-      "path": "fuse/fetch/client.rs",
-      "depth": 2,
-      "doc": "gRPC client bundle for FUSE fetches."
     },
     {
       "path": "fuse/inode.rs",
@@ -201,6 +251,11 @@
       "path": "runtime/slot.rs",
       "depth": 1,
       "doc": "Single-build occupancy tracking and cancellation."
+    },
+    {
+      "path": "store_fetch.rs",
+      "depth": 0,
+      "doc": "Store-fetch primitives shared by the old FUSE (`fuse::fetch`) and"
     },
     {
       "path": "synth_db.rs",
@@ -662,6 +717,11 @@
       "path": "nar/fs.rs",
       "depth": 1,
       "doc": "Filesystem ↔ NAR streaming."
+    },
+    {
+      "path": "nar/ls.rs",
+      "depth": 1,
+      "doc": "Streaming NAR index — `nar_ls`."
     },
     {
       "path": "nar/reader.rs",
@@ -1175,14 +1235,24 @@
       "doc": "Per-replica admission gate for `try_substitute_on_miss`."
     },
     {
-      "path": "backend.rs",
+      "path": "backend/",
       "depth": 0,
       "doc": "Chunk storage backends."
+    },
+    {
+      "path": "backend/tiered.rs",
+      "depth": 1,
+      "doc": "Two-tier chunk backend: per-AZ S3 Express read-through cache over"
     },
     {
       "path": "cas.rs",
       "depth": 0,
       "doc": "Chunked content-addressable storage orchestration."
+    },
+    {
+      "path": "castore.rs",
+      "depth": 0,
+      "doc": "Directory merkle layer (ADR-022 §8): bottom-up `dir_digest` pass"
     },
     {
       "path": "chunker.rs",
@@ -1243,6 +1313,11 @@
       "path": "grpc/chunk.rs",
       "depth": 1,
       "doc": "ChunkService gRPC implementation."
+    },
+    {
+      "path": "grpc/directory.rs",
+      "depth": 1,
+      "doc": "ADR-022 castore RPC surface (P0573 / P0577 / P0570)."
     },
     {
       "path": "grpc/get_path.rs",
@@ -1328,6 +1403,11 @@
       "path": "metadata/upstreams.rs",
       "depth": 1,
       "doc": "Per-tenant upstream binary-cache config (`tenant_upstreams` table,"
+    },
+    {
+      "path": "nar_index.rs",
+      "depth": 0,
+      "doc": "Derived per-path NAR file/dir/symlink listing (`nar_index` table)."
     },
     {
       "path": "realisations.rs",

@@ -68,6 +68,11 @@
     "rio_gateway_opcodes_total",
     "rio_gateway_putpath_aborted_retries_total",
     "rio_gateway_quota_rejections_total",
+    "rio_mountd_connections_current",
+    "rio_mountd_promote_bytes_total",
+    "rio_mountd_promote_inflight",
+    "rio_mountd_promote_reject_total",
+    "rio_mountd_request_seconds",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -172,6 +177,11 @@
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
+    "rio_store_directory_get_seconds",
+    "rio_store_directory_has_batch_size",
+    "rio_store_directory_read_seconds",
+    "rio_store_express_bytes",
+    "rio_store_express_evicted_total",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_orphan_reap_failed_total",
@@ -185,6 +195,9 @@
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
     "rio_store_integrity_failures_total",
+    "rio_store_nar_index_cache_hits_total",
+    "rio_store_nar_index_compute_seconds",
+    "rio_store_nar_index_compute_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
@@ -206,7 +219,11 @@
     "rio_store_substitute_probe_cache_misses_total",
     "rio_store_substitute_probe_ratelimited_total",
     "rio_store_substitute_stale_reclaimed_total",
-    "rio_store_substitute_total"
+    "rio_store_substitute_total",
+    "rio_store_tiered_local_errors_total",
+    "rio_store_tiered_local_hits_total",
+    "rio_store_tiered_local_misses_total",
+    "rio_store_tiered_writethrough_errors_total"
   ],
   "by_component": {
     "builder": [
@@ -553,6 +570,33 @@
         "name": "rio_gateway_quota_rejections_total",
         "kind": "counter",
         "help": "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
+      }
+    ],
+    "mountd": [
+      {
+        "name": "rio_mountd_connections_current",
+        "kind": "gauge",
+        "help": "Live UDS connections (== builds being served on this node)"
+      },
+      {
+        "name": "rio_mountd_promote_bytes_total",
+        "kind": "counter",
+        "help": "Bytes verify-copied into the shared caches by Promote/PromoteChunks"
+      },
+      {
+        "name": "rio_mountd_promote_inflight",
+        "kind": "gauge",
+        "help": "Promote copy tasks currently running"
+      },
+      {
+        "name": "rio_mountd_promote_reject_total",
+        "kind": "counter",
+        "help": "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/other)"
+      },
+      {
+        "name": "rio_mountd_request_seconds",
+        "kind": "histogram",
+        "help": "UDS request latency (labeled by op: mount/backing_open/backing_close/promote/promote_chunks)"
       }
     ],
     "scheduler": [
@@ -1079,6 +1123,31 @@
         "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)"
       },
       {
+        "name": "rio_store_directory_get_seconds",
+        "kind": "histogram",
+        "help": "GetDirectory wall time per RPC (recursive BFS over the Directory DAG)"
+      },
+      {
+        "name": "rio_store_directory_has_batch_size",
+        "kind": "histogram",
+        "help": "Digest-list length per HasDirectories/HasBlobs call (labeled rpc)"
+      },
+      {
+        "name": "rio_store_directory_read_seconds",
+        "kind": "histogram",
+        "help": "ReadBlob wall time per RPC (chunk fetch + slice + stream)"
+      },
+      {
+        "name": "rio_store_express_bytes",
+        "kind": "gauge",
+        "help": "Per-AZ Express bucket size in bytes (labeled az_id; emitted by the lease-holding sweeper)"
+      },
+      {
+        "name": "rio_store_express_evicted_total",
+        "kind": "counter",
+        "help": "Chunks deleted from Express by the eviction sweeper (labeled az_id)"
+      },
+      {
         "name": "rio_store_gc_chunk_orphan_swept_total",
         "kind": "counter",
         "help": "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. Sustained nonzero = builder upload path is crashing repeatedly."
@@ -1141,7 +1210,22 @@
       {
         "name": "rio_store_integrity_failures_total",
         "kind": "counter",
-        "help": "GetPath content integrity check failures (bitrot/corruption)"
+        "help": "Content integrity check failures, labeled by `site`: `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), `chunk` (per-chunk BLAKE3, indicates bitrot/corruption)"
+      },
+      {
+        "name": "rio_store_nar_index_cache_hits_total",
+        "kind": "counter",
+        "help": "GetNarIndex requests served from the nar_index table without recompute"
+      },
+      {
+        "name": "rio_store_nar_index_compute_seconds",
+        "kind": "histogram",
+        "help": "Per-path NAR reassemble + nar_ls + persist (indexer_loop only)"
+      },
+      {
+        "name": "rio_store_nar_index_compute_total",
+        "kind": "counter",
+        "help": "NAR-index computations (eager PutPath + indexer_loop + sync-on-miss)"
       },
       {
         "name": "rio_store_pg_pool_utilization",
@@ -1252,6 +1336,26 @@
         "name": "rio_store_substitute_total",
         "kind": "counter",
         "help": "Upstream substitution attempts, labeled by result (hit/miss/error) and tenant (UUID). Per-upstream debugging detail is in the debug!/warn! log lines (which carry upstream=<url>); the metric label is bounded by tenant count, not by tenant-supplied URL."
+      },
+      {
+        "name": "rio_store_tiered_local_errors_total",
+        "kind": "counter",
+        "help": "Tiered backend Express-tier read errors (degraded — falls through to S3 standard; alert if sustained)"
+      },
+      {
+        "name": "rio_store_tiered_local_hits_total",
+        "kind": "counter",
+        "help": "Tiered backend Express-tier hits (chunk served without an S3-standard RTT)"
+      },
+      {
+        "name": "rio_store_tiered_local_misses_total",
+        "kind": "counter",
+        "help": "Tiered backend Express-tier misses (fell through to S3 standard, then write-through filled Express)"
+      },
+      {
+        "name": "rio_store_tiered_writethrough_errors_total",
+        "kind": "counter",
+        "help": "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
       }
     ]
   }

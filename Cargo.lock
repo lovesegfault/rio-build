@@ -9077,6 +9077,7 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
+ "cc",
  "chacha20",
  "cipher",
  "crossbeam-epoch",
