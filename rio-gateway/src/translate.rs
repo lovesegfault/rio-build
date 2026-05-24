@@ -3,7 +3,7 @@
 //! Translates the per-session derivation cache into `SubmitBuildRequest`
 //! messages for the scheduler, walking `inputDrvs` recursively to build
 //! the full derivation graph.
-// r[impl gw.dag.reconstruct+2]
+// r[impl gw.dag.reconstruct+3]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -342,6 +342,7 @@ fn populate_needs_resolve(
 /// Only the scheduler's cache-hit / substitutability classification
 /// reads this; `output_names` / `expected_output_paths` keep the full
 /// declared set (assignment-token allowlist, GC pins, client report).
+// r[impl gw.dag.reconstruct+3]
 fn populate_wanted_outputs(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -713,14 +714,14 @@ pub async fn filter_and_inline_drv(
         }
     };
 
-    // Walk nodes; inline those with ANY missing output.
+    // Walk nodes; inline those with ANY missing WANTED output.
     let mut total_inlined: usize = 0;
     let mut inlined_count: usize = 0;
     let mut skipped_budget: usize = 0;
     let mut budget_exhausted = false;
 
     for node in nodes.iter_mut() {
-        // At least one output missing → this node will dispatch.
+        // At least one WANTED output missing → this node will dispatch.
         // Empty path = floating-CA (unknown until built) → ALWAYS
         // dispatches: can't cache-hit by path, and the scheduler's
         // `maybe_resolve_ca` REQUIRES drv_content to rewrite
@@ -730,10 +731,38 @@ pub async fn filter_and_inline_drv(
         // not rely on (layer-9 ca-cutoff failure: scheduler boots
         // before store ready → store_client=None → fallback dead).
         // All outputs present → cache hit → never dispatches → skip.
-        let will_dispatch = node
-            .expected_output_paths
+        //
+        // r[impl sched.merge.wanted-outputs]
+        // The will-dispatch prediction mirrors the scheduler's
+        // demand-driven cache-hit criterion: a node whose only missing
+        // outputs are ones no consumer's inputDrvs names (and the root
+        // didn't select) classifies as a hit / pending-substitute and
+        // never dispatches, so inlining its drv_content is wasted
+        // budget. The wanted subset zips the (output_names ↔
+        // expected_output_paths) parallel arrays exactly like the
+        // scheduler's `wanted_subset`; empty `wanted_output_names` =
+        // every declared output. A wanted set that resolves to no
+        // concrete path (all floating-CA, or no declared name matches)
+        // falls back to the all-declared criterion — the conservative
+        // direction is "inline it": over-inlining costs bytes,
+        // under-inlining costs a worker→store round-trip on a node
+        // that DOES dispatch.
+        let all_wanted = node.wanted_output_names.is_empty();
+        let verifiable_wanted: Vec<&String> = node
+            .output_names
             .iter()
-            .any(|p| p.is_empty() || missing.contains(p));
+            .zip(node.expected_output_paths.iter())
+            .filter(|(name, _)| all_wanted || node.wanted_output_names.contains(name))
+            .map(|(_, path)| path)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let will_dispatch = if verifiable_wanted.is_empty() {
+            node.expected_output_paths
+                .iter()
+                .any(|p| p.is_empty() || missing.contains(p))
+        } else {
+            verifiable_wanted.iter().any(|p| missing.contains(*p))
+        };
         if !will_dispatch {
             continue;
         }
@@ -1538,6 +1567,68 @@ mod tests {
         Ok(())
     }
 
+    // r[verify sched.merge.wanted-outputs]
+    /// Will-dispatch prediction is evaluated over the WANTED subset: a
+    /// node whose only missing output is one nothing wants classifies
+    /// as a cache hit at the scheduler and never dispatches, so its
+    /// drv_content must NOT be inlined (wasted budget). The same node
+    /// with the empty (= all declared outputs wanted) sentinel keeps
+    /// the conservative behaviour and IS inlined.
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_missing_unwanted_output_not_inlined() -> anyhow::Result<()>
+    {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (store, mut store_client, _handle) = spawn_mock_store_with_client().await?;
+
+        // Two outputs: `out` (seeded → present) and `debug` (missing).
+        let drv_path = sp("/nix/store/wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww-multi.drv");
+        let out_base = "/nix/store/wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww-multi";
+        let drv = make_multi_output_derivation(out_base, &["debug", "out"], &[]);
+        store.seed(
+            rio_proto::validated::ValidatedPathInfo {
+                store_path: rio_nix::store_path::StorePath::parse(&format!("{out_base}-out"))?,
+                nar_hash: [0u8; 32],
+                nar_size: 1,
+                store_path_hash: vec![],
+                deriver: None,
+                references: vec![],
+                signatures: vec![],
+                content_address: None,
+                registration_time: 0,
+                ultimate: false,
+            },
+            vec![0u8; 1],
+        );
+
+        let mut cache = HashMap::new();
+        cache.insert(drv_path.clone(), drv.clone());
+
+        // wanted = {out}: the only missing output (debug) is unwanted →
+        // the scheduler will classify this as a hit → must NOT inline.
+        let mut node = build_node(drv_path.as_str(), &drv);
+        node.wanted_output_names = vec!["out".into()];
+        let mut nodes = vec![node];
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+        assert!(
+            nodes[0].drv_content.is_empty(),
+            "all WANTED outputs present → predicted cache hit → not inlined"
+        );
+
+        // wanted = [] (all declared outputs wanted): debug is missing
+        // and wanted → will dispatch → inlined. Guards against the
+        // wanted filter accidentally narrowing the empty sentinel.
+        let mut nodes = vec![build_node(drv_path.as_str(), &drv)];
+        assert!(nodes[0].wanted_output_names.is_empty());
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+        assert!(
+            !nodes[0].drv_content.is_empty(),
+            "empty wanted sentinel → all outputs wanted → missing debug → inlined"
+        );
+
+        Ok(())
+    }
+
     /// Store unreachable → skip inlining entirely. Safe degrade:
     /// worker will fetch. This is an OPTIMIZATION, not correctness.
     #[tokio::test]
@@ -1987,6 +2078,7 @@ mod tests {
         Derivation::parse(&aterm).expect("test ATerm should parse")
     }
 
+    // r[verify gw.dag.reconstruct+3]
     /// A node consumed by one parent that names only `{out}` of its three
     /// declared outputs gets `wanted_output_names == ["out"]`. The `^*`
     /// root keeps the empty (= all declared outputs wanted) sentinel.

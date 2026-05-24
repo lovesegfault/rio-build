@@ -883,14 +883,19 @@ the handshake before the client will send any opcodes.
 
 = DAG Reconstruction
 
-#r("gw.dag.reconstruct+2")[
+#r("gw.dag.reconstruct+3")[
   When the gateway receives `wopBuildDerivation`, `wopBuildPaths`, or
   `wopBuildPathsWithResults`, it reconstructs the full derivation DAG to send
   to the scheduler via `SubmitBuild`. `wopBuildDerivation` (build-hook path)
   attempts the same full-DAG walk: it resolves the `.drv` from the session
   cache or the store and runs `reconstruct_dag`; only if resolution fails does
   it fall back to a single-node DAG built from the inline `BasicDerivation`
-  (see #rref("gw.hook.single-node-dag")). The algorithm:
+  (see #rref("gw.hook.single-node-dag")). Alongside the node/edge walk, the
+  gateway computes each node's `wanted_output_names` --- the union of every
+  consumer's `inputDrvs` output-name references for it plus the root request's
+  output selection, empty meaning every declared output --- which feeds the
+  scheduler's demand-driven cache-hit classification
+  (#rref("sched.merge.wanted-outputs")). The algorithm:
 ]
 
 + *During store uploads:* The gateway intercepts each uploaded path. If the

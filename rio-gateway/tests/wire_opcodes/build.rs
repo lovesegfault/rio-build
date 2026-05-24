@@ -2,7 +2,7 @@
 // r[verify gw.opcode.build-paths-with-results]
 // r[verify gw.opcode.build-derivation+2]
 // r[verify gw.wire.derived-path]
-// r[verify gw.dag.reconstruct+2]
+// r[verify gw.dag.reconstruct+3]
 // r[verify gw.hook.single-node-dag]
 // r[verify gw.hook.ifd-detection+2]
 // r[verify gw.stderr.activity+2]
