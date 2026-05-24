@@ -219,6 +219,121 @@ module logBufferLifecycle {
   /// re-falsifies the invariant).
   const ENABLE_ACCOUNTED_FLOOR: bool
 
+  // Calibration switches (NOT fault switches). Each restores the
+  // pre-fix behavior of one historical log-subsystem fix so the
+  // override modules in docs/spec/models/calibration/ can demonstrate
+  // that the fix is what keeps an invariant true — or record that no
+  // model-A invariant observes its absence. Every shipped regime sets
+  // every switch to the post-fix value (true unless noted); each
+  // calibration module flips exactly one (the OneShotConsult module
+  // flips two that revert to the same intermediate point in history).
+  // The commit -> switch -> verdict table is log-invariant-map.md's
+  // phase-3 findings section. ENABLE_ACCOUNTED_FLOOR above is
+  // calibration entry #0 and follows the same pattern.
+
+  /// true: every final-flush arm validates the request against the
+  /// leadership tenure that enqueued it (`req_in_tenure`) and an
+  /// out-of-tenure request is dropped. false: pre-3ce5d03e4 — every
+  /// request is treated as in-tenure; the destructive arms run
+  /// regardless of leadership and the drop arm is never enabled.
+  const ENABLE_TENURE_PIN: bool
+  /// true: the tenure pin is the OUTERMOST flush_final guard — the
+  /// already-finalized refusal's residue drain, the guard-error arm's
+  /// reap/retention, and the drop arm's orphan reap are all
+  /// tenure-gated. false: pre-646022e37 — the refusal arms run for
+  /// out-of-tenure requests too (exec-guarded only) and the drop arm
+  /// reaps nothing.
+  const ENABLE_TENURE_PIN_FIRST: bool
+  /// true: a cross-exec restamp clears the retained lines and the
+  /// accounted mark. false: pre-6c26e85f8 — set_exec overwrote only the
+  /// stamp and the executor, carrying the prior execution's lines into
+  /// the new execution's entry.
+  const ENABLE_CROSS_EXEC_LINE_CLEAR: bool
+  /// true: a cross-exec restamp clears the seal tombstone. false:
+  /// pre-699ea1692 — the prior execution's seal survives over the new
+  /// execution's entry and mutes its entire stream.
+  const ENABLE_CROSS_EXEC_UNSEAL: bool
+  /// true: a same-exec restamp clears the seal and the final-pending
+  /// mark. false: pre-2f9a747d0 — both survive the restamp; the prior
+  /// tenure's tenure-dropped final can never unseal the entry and the
+  /// reconnected worker's post-flap batches are rejected.
+  const ENABLE_SAME_EXEC_RESTAMP_CLEAR: bool
+  /// true: the periodic flush's refused-UPSERT chokepoint reaps a
+  /// sealed orphan whose execution another tenure finalized. false:
+  /// pre-463090eb7/pre-f8ce10b8e — no recurring reaper exists for that
+  /// orphan shape. Gates the reap action, its reapEnabledFor promise,
+  /// and its half of the pre-recovery-window justification disjunct
+  /// together — a justification promise about a reap that does not
+  /// exist in the instantiated module would make the override
+  /// trivially hold.
+  const ENABLE_REAP_REFUSED_UPSERT: bool
+  /// true: the periodic flush's empty-snapshot early return reaps a
+  /// sealed empty entry. false: pre-81824cfbb — no reaper exists for a
+  /// sealed entry whose ring the stored-coverage reconcile emptied
+  /// after its pending final was consumed. Same three-site gating rule
+  /// as ENABLE_REAP_REFUSED_UPSERT.
+  const ENABLE_REAP_SEALED_EMPTY: bool
+  /// true: the terminal epilogue reaps the zero-line entry whose final
+  /// FlushRequest could not be enqueued. false: pre-6aab70b47 — the
+  /// orphan waits for terminal cleanup / the periodic sealed-empty
+  /// reap.
+  const ENABLE_REAP_ENQUEUE_FAIL: bool
+  /// 463090eb7's superseded mechanism: the one-shot read-only drv_logs
+  /// consult at the tenure-drop arm (reap a sealed NON-empty orphan iff
+  /// some tenure already finalized its execution, evaluated once at
+  /// request-drop time, never re-run). FALSE everywhere except the
+  /// OneShotConsult calibration module, which proves the intermediate
+  /// fix was insufficient (the f8ce10b8e row's distinct evidence).
+  const ENABLE_DROP_ARM_FINALIZED_CONSULT: bool
+  /// true: the batch accept predicate requires the calling executor to
+  /// be the one bound to the derivation's current execution. false:
+  /// pre-496e6fb14 — the recv task called the legacy push() and never
+  /// compared the calling stream's identity against assigned_executor.
+  const ENABLE_BINDING_GATE: bool
+  /// true: the disconnect-time log-buffer discard is gated on
+  /// is_leader && dag_authoritative. false: pre-2c301438d — "not in the
+  /// DAG" is read as "stale" even when the DAG was just wiped by a
+  /// lease loss, destroying the retained in-flight entries the
+  /// lease-flap retention preserves.
+  const ENABLE_DISCONNECT_DAG_GATE: bool
+  /// true: a successful recovery sweeps every retained unsealed entry
+  /// whose derivation is not live in the rebuilt DAG. false:
+  /// pre-e6c18add2 — acquisition-time reconciliation only restamps;
+  /// an entry for a drv that went terminal under the interim leader is
+  /// never discarded by any path.
+  const ENABLE_ACQUISITION_SWEEP: bool
+  /// true: the periodic UPSERT refuses to write a row another flush
+  /// already finalized (the frozen-row latch as evaluated by a
+  /// periodic write). false: pre-abfade4d5 — the DO UPDATE has no
+  /// WHERE clause; a periodic .partial snapshot downgrades
+  /// is_complete true->false and replaces the row's content. The
+  /// refused-UPSERT reap is keyed on the refusal and degrades to
+  /// never-reap with it.
+  const ENABLE_PERIODIC_FROZEN_ROW: bool
+  /// true: flush_final consults the drv_logs row before any
+  /// destructive work and refuses to re-finalize an execution whose
+  /// row is already complete. false: pre-44905298b — the consult does
+  /// not exist and the UPSERT clause admits the true->true rewrite;
+  /// a second final overwrites the finalized row with the retained
+  /// residue's (smaller) span.
+  const ENABLE_FINALIZE_REFUSAL: bool
+  /// true: the gap-merge fold counts the prefix->ring gap itself in
+  /// the recorded line_count. false: pre-d8944727e — the fold counts
+  /// the single synthetic marker line instead, understating the span
+  /// by gap - 1 whenever gap >= 2.
+  const ENABLE_TRUE_GAP_SPAN: bool
+  /// true: a flush payload's span contribution is its line-NUMBER span
+  /// (last - first + 1). false: pre-effefb0a1 — it is the payload's
+  /// physical line count, understating the span by the size of any
+  /// interior hole.
+  const ENABLE_RING_SPAN: bool
+  /// true: the stored-coverage reconcile folds any non-finalized row
+  /// the ring does not contiguously subsume. false: pre-e1fd179b9 —
+  /// only a row wholly disjoint from (strictly below) the ring is
+  /// folded; an overlapping row an interim leader extended past the
+  /// ring's tail is overwritten by the ring-only snapshot.
+  const ENABLE_OVERLAP_FOLD: bool
+
   /// `recoveredEpoch` sentinel: no epoch has completed recovery
   /// (rio-lease's `RECOVERY_NOT_COMPLETE`). -1 can never equal a real
   /// transition count (>= 0).
@@ -376,10 +491,17 @@ module logBufferLifecycle {
   /// the acquire-epoch alone is belt-and-braces'd by the generation
   /// (a mid-tenure floor seed moves the generation without moving the
   /// epoch, though never after a request of that tenure is enqueued).
-  def reqInTenure(req: Req): bool = and {
-    isLeader,
-    generation == req.gen,
-    acquiredTransitions == req.transitions,
+  /// With ENABLE_TENURE_PIN false this degrades to the pre-3ce5d03e4
+  /// behavior: every request is treated as in-tenure, so the
+  /// destructive final-flush arms are un-gated and `flushFinalDropStale`
+  /// is never enabled.
+  def reqInTenure(req: Req): bool = or {
+    not(ENABLE_TENURE_PIN),
+    and {
+      isLeader,
+      generation == req.gen,
+      acquiredTransitions == req.transitions,
+    },
   }
 
   /// The lines held by `d`'s entry iff it is stamped with `e`, else the
@@ -544,11 +666,16 @@ module logBufferLifecycle {
       isLeader, not(recoveryComplete), not(sealed.get(d)),
       pg.get(d) == PgNone,
     },
-    // The periodic sealed-empty reap.
-    and { mayFlush, sealed.get(d), entryHeld(d) == Set() },
+    // The periodic sealed-empty reap. Gated on the same calibration
+    // switch as the action: a justification promise about a reap that
+    // does not exist in the instantiated module would make every
+    // reap-disable override trivially hold.
+    and { ENABLE_REAP_SEALED_EMPTY, mayFlush, sealed.get(d), entryHeld(d) == Set() },
     // The periodic refused-UPSERT reap (the row is already finalized, so
-    // the durable record supersedes the retained lines).
+    // the durable record supersedes the retained lines). Same gating
+    // rule.
     and {
+      ENABLE_REAP_REFUSED_UPSERT,
       mayFlush, sealed.get(d), entryHeld(d) != Set(),
       rowComplete(d, entryExec(d)),
     },
@@ -618,7 +745,12 @@ module logBufferLifecycle {
         isLeader,
         not(recoveryComplete),
         sealed.get(d),
-        or { entryHeld(d) == Set(), rowComplete(d, entryExec(d)) },
+        // Each entry shape is keyed on its reap's calibration switch —
+        // see the reapEnabledFor gating-rule comment.
+        or {
+          and { ENABLE_REAP_SEALED_EMPTY, entryHeld(d) == Set() },
+          and { ENABLE_REAP_REFUSED_UPSERT, rowComplete(d, entryExec(d)) },
+        },
       },
       // (4) The best-data-available fixed point: a non-empty ring whose
       // execution no tenure has finalized holds the only copy of those
@@ -872,7 +1004,12 @@ module logBufferLifecycle {
   def batchAccepted(d: Drv, ex: Executor, lo: int): bool = and {
     not(sealed.get(d)),
     hasEntry(d),
-    entryExecutor(d) == ex,
+    // Conjunct 3, the (executor, drv) binding gate. With
+    // ENABLE_BINDING_GATE false the predicate degrades to the
+    // pre-496e6fb14 recv task, which appended any unsealed batch via
+    // the legacy push() without comparing the calling stream's
+    // identity against the entry's binding.
+    not(ENABLE_BINDING_GATE) or entryExecutor(d) == ex,
     if (ENABLE_ACCOUNTED_FLOOR)
       lo >= entryAccountedBelow(d)
     else
@@ -1072,7 +1209,9 @@ module logBufferLifecycle {
     ENABLE_ENQUEUE_FAILURE,
     dag.get(d) == DagLive,
     dispatched.get(d) > 0,
-    val emptyReap = and { hasEntry(d), entryHeld(d) == Set() }
+    // Pre-6aab70b47 the epilogue could not tell the enqueue failed
+    // (try_log_flush returned ()) and reaped nothing.
+    val emptyReap = and { ENABLE_REAP_ENQUEUE_FAIL, hasEntry(d), entryHeld(d) == Set() }
     all {
       entries' = if (emptyReap) entries.put(d, NoEntry) else entries,
       // discard_if_empty clears the seal it just set only when it removed
@@ -1219,7 +1358,15 @@ module logBufferLifecycle {
     val needsFold = and {
       rowExists(d, e),
       not(rowComplete(d, e)),
-      not(ringSubsumesRow(d, e)),
+      // Post-e1fd179b9: fold anything the ring does not contiguously
+      // subsume. Pre-fix: fold only a row wholly disjoint from
+      // (strictly below) the ring — an overlapping row an interim
+      // leader extended past the ring's tail was declared "not needed"
+      // and the next flush overwrote it with the ring-only snapshot.
+      if (ENABLE_OVERLAP_FOLD)
+        not(ringSubsumesRow(d, e))
+      else
+        rowEnd(d, e) <= setLo(entryHeld(d)),
     }
     entries' = if (needsFold)
       // Found: cache the row's recorded span as the prefix, drop every
@@ -1267,7 +1414,12 @@ module logBufferLifecycle {
   pure def mergedRow(pref: Prefix, ring: Set[int], complete: bool): Row = {
     val ringFirst = setLo(ring)
     val ringLast = setHi(ring)
-    val ringSpan = ringLast - ringFirst + 1
+    // The payload's span contribution. Post-effefb0a1 it is the
+    // line-NUMBER span (a hole-carrying blob claims more lines than it
+    // physically holds — the divergence the read path answers with a
+    // full re-serve); pre-fix it was the physical line count, which
+    // understates the recorded end by the size of any interior hole.
+    val ringSpan = if (ENABLE_RING_SPAN) ringLast - ringFirst + 1 else ring.size()
     match pref {
       | PrefCached(p) =>
         // gap = first_line.saturating_sub(prefix_end)
@@ -1284,7 +1436,12 @@ module logBufferLifecycle {
         // the truth and overstate the violation.
         {
           lo: p.lo,
-          cnt: p.cnt + gap + ringSpan,
+          // Post-d8944727e the prefix->ring gap is counted in the
+          // recorded line_count (the synthetic marker line stands in
+          // for `gap` lost lines but is not itself counted); pre-fix
+          // the marker was counted as 1, understating the span by
+          // gap - 1 whenever gap >= 2.
+          cnt: p.cnt + (if (ENABLE_TRUE_GAP_SPAN) gap else (if (gap > 0) 1 else 0)) + ringSpan,
           trueEnd: maxInt(prefixEnd, ringLast + 1),
           complete: complete,
         }
@@ -1320,8 +1477,11 @@ module logBufferLifecycle {
     entryHeld(d) != Set(),
     entryPrefix(d) != PrefUnchecked,
     val e = entryExec(d)
-    val refused = rowComplete(d, e)
-    val reap = and { refused, sealed.get(d) }
+    // Pre-abfade4d5 the DO UPDATE had no WHERE clause: nothing is
+    // refused, the finalized row is downgraded and overwritten, and
+    // (there being no refusal signal to key it on) nothing is reaped.
+    val refused = and { ENABLE_PERIODIC_FROZEN_ROW, rowComplete(d, e) }
+    val reap = and { ENABLE_REAP_REFUSED_UPSERT, refused, sealed.get(d) }
     val newRow = mergedRow(entryPrefix(d), entryHeld(d), false)
     all {
       stored' = if (refused) stored else
@@ -1356,6 +1516,9 @@ module logBufferLifecycle {
   // Mirrors: upload_and_record (line_count == 0, !is_final) +
   //          discard_if_sealed_for_exec(require_empty=true).
   action flushPeriodicSealedEmptyReap(d: Drv): bool = all {
+    // Pre-81824cfbb the empty-snapshot early return did nothing; the
+    // whole action is the reap, so the switch disables it outright.
+    ENABLE_REAP_SEALED_EMPTY,
     mayFlush,
     hasEntry(d),
     entryHeld(d) == Set(),
@@ -1393,10 +1556,21 @@ module logBufferLifecycle {
       pendingFinal.get(d) != NoFinal,
       not(reqInTenure(req)),
       val reap = and {
+        // The drop arm's orphan reap arrived with 646022e37 (the
+        // pin-outermost commit); pre-fix the drop arm reaped nothing.
+        ENABLE_TENURE_PIN_FIRST,
         sealed.get(d),
         hasEntry(d),
         entryExec(d) == req.exec,
-        entryHeld(d) == Set(),
+        or {
+          entryHeld(d) == Set(),
+          // 463090eb7's superseded one-shot finalized-elsewhere
+          // consult, evaluated once at request-drop time and never
+          // re-run. Removed by f8ce10b8e in favor of the recurring
+          // refused-UPSERT reap; enabled only in the OneShotConsult
+          // calibration module.
+          and { ENABLE_DROP_ARM_FINALIZED_CONSULT, rowComplete(d, req.exec) },
+        },
       }
       all {
         entries' = if (reap) entries.put(d, NoEntry) else entries,
@@ -1429,7 +1603,13 @@ module logBufferLifecycle {
     val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
     all {
       pendingFinal.get(d) != NoFinal,
-      reqInTenure(req),
+      // Pre-646022e37 the already-finalized guard SELECT ran BEFORE the
+      // tenure pin, so this arm (and its residue drain) fired for
+      // out-of-tenure requests too.
+      not(ENABLE_TENURE_PIN_FIRST) or reqInTenure(req),
+      // Pre-44905298b the row consult did not exist: this arm is the
+      // consult, so disabling the refusal disables the whole arm.
+      ENABLE_FINALIZE_REFUSAL,
       rowComplete(d, req.exec),
       val drained = and { hasEntry(d), entryExec(d) == req.exec }
       all {
@@ -1467,7 +1647,10 @@ module logBufferLifecycle {
     all {
       ENABLE_GUARD_FAILURE,
       pendingFinal.get(d) != NoFinal,
-      reqInTenure(req),
+      // Pre-646022e37 the guard SELECT ran BEFORE the tenure pin, so
+      // this arm's reap and retention fired for out-of-tenure requests
+      // too (exec-guarded only).
+      not(ENABLE_TENURE_PIN_FIRST) or reqInTenure(req),
       not(rowComplete(d, req.exec)),
       val stamped = and { hasEntry(d), entryExec(d) == req.exec }
       val emptyReap = and { stamped, entryHeld(d) == Set() }
@@ -1510,7 +1693,10 @@ module logBufferLifecycle {
     all {
       pendingFinal.get(d) != NoFinal,
       reqInTenure(req),
-      not(rowComplete(d, req.exec)),
+      // Pre-44905298b there was no row consult: a second final for an
+      // already-finalized exec drained the residue and overwrote the
+      // finalized row with the residue's (smaller) span.
+      not(ENABLE_FINALIZE_REFUSAL and rowComplete(d, req.exec)),
       hasEntry(d),
       entryExec(d) == req.exec,
       entryHeld(d) != Set(),
@@ -1552,7 +1738,11 @@ module logBufferLifecycle {
     all {
       pendingFinal.get(d) != NoFinal,
       reqInTenure(req),
-      not(rowComplete(d, req.exec)),
+      // Same partition switch as flushFinalUpload's: pre-44905298b the
+      // complete-row empty drain routed here instead of the refusal arm
+      // (the modeled effects of the two arms coincide for an empty
+      // entry — drain, unseal, consume the request, leave stored alone).
+      not(ENABLE_FINALIZE_REFUSAL and rowComplete(d, req.exec)),
       hasEntry(d),
       entryExec(d) == req.exec,
       entryHeld(d) == Set(),
@@ -1585,7 +1775,9 @@ module logBufferLifecycle {
     all {
       pendingFinal.get(d) != NoFinal,
       reqInTenure(req),
-      not(rowComplete(d, req.exec)),
+      // Same partition switch as flushFinalUpload's (the complete-row
+      // no-entry case routes here when the refusal arm does not exist).
+      not(ENABLE_FINALIZE_REFUSAL and rowComplete(d, req.exec)),
       not(and { hasEntry(d), entryExec(d) == req.exec }),
       // No entry at all => defensive unseal; a live restamped entry's
       // seal belongs to the live execution and is left alone.
@@ -1796,13 +1988,38 @@ module logBufferLifecycle {
         if (en.exec == e)
           Entry({
             exec: e, executor: ex, held: en.held, accountedBelow: en.accountedBelow,
-            finalPending: false, prefix: PrefUnchecked,
+            // Pre-2f9a747d0 the same-exec arm kept the mark; the prior
+            // tenure's tenure-dropped final then never resolves it and
+            // the mark exempts the entry from terminal cleanup forever.
+            finalPending: if (ENABLE_SAME_EXEC_RESTAMP_CLEAR) false else en.finalPending,
+            prefix: PrefUnchecked,
           })
-        else
+        else if (ENABLE_CROSS_EXEC_LINE_CLEAR)
           Entry({
             exec: e, executor: ex, held: Set(), accountedBelow: 0,
             finalPending: false, prefix: PrefUnchecked,
           })
+        else
+          // Pre-6c26e85f8: set_exec overwrote only exec_id and
+          // assigned_executor; the prior execution's lines and accounted
+          // mark ride into the new execution's entry and the flusher
+          // uploads them under the new execution's S3 key and row.
+          Entry({
+            exec: e, executor: ex, held: en.held, accountedBelow: en.accountedBelow,
+            finalPending: false, prefix: PrefUnchecked,
+          })
+    }
+
+  /// Whether restamping `slot` against persisted exec `e` changes the
+  /// execution stamp (`restampDropsLines` minus the non-empty
+  /// conjunct) — the discriminator for the per-arm seal-clear
+  /// calibration switches: the cross-exec and same-exec restamp arms
+  /// acquired their seal-clearing behavior in separate fixes
+  /// (699ea1692 and 2f9a747d0) and are reverted separately.
+  pure def restampIsCrossExec(slot: EntrySlot, e: int): bool =
+    match slot {
+      | NoEntry => false
+      | Entry(en) => en.exec != e
     }
 
   /// Whether restamping `slot` against persisted exec `e` is a cross-exec
@@ -1822,7 +2039,11 @@ module logBufferLifecycle {
     match p {
       | PgLive(a) => restampEntry(slot, a.exec, a.executor)
       | PgNone =>
-        if (isSealed)
+        // Pre-e6c18add2 there was no sweep at all: acquisition-time
+        // reconciliation only restamped PG-live entries, so an entry
+        // whose drv went terminal under the interim was never
+        // discarded by any path (only the prefix re-arm applies).
+        if (isSealed or not(ENABLE_ACQUISITION_SWEEP))
           // Spared by the sweep; the prefix re-arm still applies.
           match slot {
             | NoEntry => NoEntry
@@ -1879,7 +2100,16 @@ module logBufferLifecycle {
     entries' = DRVS.mapBy(d => recoveredEntry(entries.get(d), pg.get(d), sealed.get(d))),
     // Every restamp (same- or cross-exec) clears the seal; a swept or
     // spared entry keeps it (the sweep skips sealed keys entirely).
-    sealed' = DRVS.mapBy(d => match pg.get(d) { | PgLive(a) => false | PgNone => sealed.get(d) }),
+    // Pre-699ea1692 the cross-exec arm kept the seal; pre-2f9a747d0 the
+    // same-exec arm kept it.
+    sealed' = DRVS.mapBy(d => match pg.get(d) {
+      | PgLive(a) =>
+        if (restampIsCrossExec(entries.get(d), a.exec))
+          and { not(ENABLE_CROSS_EXEC_UNSEAL), sealed.get(d) }
+        else
+          and { not(ENABLE_SAME_EXEC_RESTAMP_CLEAR), sealed.get(d) }
+      | PgNone => sealed.get(d)
+    }),
     wit' = if (DRVS.exists(d => match pg.get(d) {
         | PgLive(a) => restampDropsLines(entries.get(d), a.exec)
         | PgNone => false
@@ -1947,7 +2177,15 @@ module logBufferLifecycle {
     replica' = { ...replica, loadSucceeded: false },
     dag' = DRVS.mapBy(d => DagAbsent),
     entries' = DRVS.mapBy(d => recoveredEntry(entries.get(d), pg.get(d), sealed.get(d))),
-    sealed' = DRVS.mapBy(d => match pg.get(d) { | PgLive(a) => false | PgNone => sealed.get(d) }),
+    // The same per-arm seal-clear switches as recoveryOk's.
+    sealed' = DRVS.mapBy(d => match pg.get(d) {
+      | PgLive(a) =>
+        if (restampIsCrossExec(entries.get(d), a.exec))
+          and { not(ENABLE_CROSS_EXEC_UNSEAL), sealed.get(d) }
+        else
+          and { not(ENABLE_SAME_EXEC_RESTAMP_CLEAR), sealed.get(d) }
+      | PgNone => sealed.get(d)
+    }),
     wit' = if (DRVS.exists(d => match pg.get(d) {
         | PgLive(a) => restampDropsLines(entries.get(d), a.exec)
         | PgNone => false
@@ -2122,7 +2360,14 @@ module logBufferLifecycle {
   // Mirrors: handle_executor_disconnected (the seen_drvs loop) +
   //          LogBuffers::discard_if_owned_by.
   action executorDisconnects(ex: Executor): bool = all {
-    val gateOpen = isLeader and replica.loadSucceeded
+    // Pre-2c301438d the discard loop ran unconditionally: "not in the
+    // DAG" was read as "stale" even on a deposed leader whose DAG was
+    // just wiped, destroying the retained in-flight entries the
+    // lease-flap retention preserves.
+    val gateOpen = or {
+      not(ENABLE_DISCONNECT_DAG_GATE),
+      isLeader and replica.loadSucceeded,
+    }
     def reaped(d: Drv): bool = and {
       gateOpen,
       dag.get(d) == DagAbsent,
@@ -2405,7 +2650,24 @@ module logBufferLifecycleBase {
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = false,
-    ENABLE_ACCOUNTED_FLOOR = true
+    ENABLE_ACCOUNTED_FLOOR = true,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -2513,7 +2775,24 @@ module logBufferLifecycleFlap {
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = false,
-    ENABLE_ACCOUNTED_FLOOR = true
+    ENABLE_ACCOUNTED_FLOOR = true,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 
   /// Regression run for the obs.log.gap-span+2 falsification: the
@@ -2609,7 +2888,24 @@ module logBufferLifecycleFaultLocal {
     ENABLE_ENQUEUE_FAILURE = true,
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = false,
-    ENABLE_ACCOUNTED_FLOOR = true
+    ENABLE_ACCOUNTED_FLOOR = true,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 }
 
@@ -2635,7 +2931,24 @@ module logBufferLifecycleFaultRecovery {
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = false,
-    ENABLE_ACCOUNTED_FLOOR = true
+    ENABLE_ACCOUNTED_FLOOR = true,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 }
 
@@ -2678,7 +2991,24 @@ module logBufferLifecycleFaultPersist {
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = true,
     ENABLE_GUARD_FAILURE = false,
-    ENABLE_ACCOUNTED_FLOOR = true
+    ENABLE_ACCOUNTED_FLOOR = true,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 }
 
@@ -2711,7 +3041,24 @@ module logBufferLifecycleFaultGuard {
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = true,
-    ENABLE_ACCOUNTED_FLOOR = true
+    ENABLE_ACCOUNTED_FLOOR = true,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 }
 
@@ -2758,7 +3105,24 @@ module logBufferLifecycleUngated {
     ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = false,
-    ENABLE_ACCOUNTED_FLOOR = false
+    ENABLE_ACCOUNTED_FLOOR = false,
+    ENABLE_TENURE_PIN = true,
+    ENABLE_TENURE_PIN_FIRST = true,
+    ENABLE_CROSS_EXEC_LINE_CLEAR = true,
+    ENABLE_CROSS_EXEC_UNSEAL = true,
+    ENABLE_SAME_EXEC_RESTAMP_CLEAR = true,
+    ENABLE_REAP_REFUSED_UPSERT = true,
+    ENABLE_REAP_SEALED_EMPTY = true,
+    ENABLE_REAP_ENQUEUE_FAIL = true,
+    ENABLE_DROP_ARM_FINALIZED_CONSULT = false,
+    ENABLE_BINDING_GATE = true,
+    ENABLE_DISCONNECT_DAG_GATE = true,
+    ENABLE_ACQUISITION_SWEEP = true,
+    ENABLE_PERIODIC_FROZEN_ROW = true,
+    ENABLE_FINALIZE_REFUSAL = true,
+    ENABLE_TRUE_GAP_SPAN = true,
+    ENABLE_RING_SPAN = true,
+    ENABLE_OVERLAP_FOLD = true
   ).*
 
   /// The minimal reachable pre-fix counterexample. Steps 1-9 are
