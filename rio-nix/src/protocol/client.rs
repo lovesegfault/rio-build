@@ -8,7 +8,7 @@
 //! - Client reads the STDERR loop (log messages, activities, errors)
 //! - Client sends opcodes and reads results
 
-use super::build::{BuildMode, write_basic_derivation};
+use super::build::{BuildMode, BuildResult, read_build_result, write_basic_derivation};
 use super::handshake::{
     HandshakeError, HandshakeResult, PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2,
 };
@@ -429,14 +429,71 @@ pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// One entry of a `wopBuildPathsWithResults` (46) response.
+#[derive(Debug, Clone)]
+pub struct KeyedBuildResult {
+    /// The derived path exactly as echoed by the daemon (submission order).
+    pub derived_path: String,
+    /// The daemon's build result for that derived path.
+    pub result: BuildResult,
+}
+
+/// Send `wopBuildPathsWithResults` (46) with `buildMode = Normal`: build the
+/// given derived paths (`"<drvpath>!<out1>,<out2>"` or `"<drvpath>!*"`) and
+/// collect the daemon's per-path [`BuildResult`]s.
+///
+/// Build logs and activities arrive on the STDERR loop and are discarded by
+/// the typed drain; after `STDERR_LAST` the daemon replies with a count
+/// followed by one (echoed derived path, [`BuildResult`]) entry per requested
+/// path, in submission order.
+///
+/// `negotiated_version` comes from [`client_handshake`]; it gates
+/// version-dependent [`BuildResult`] fields (e.g. cpu stats at >= 1.37).
+pub async fn client_build_paths_with_results<R, W, S>(
+    reader: &mut R,
+    writer: &mut W,
+    derived_paths: &[S],
+    negotiated_version: u64,
+) -> std::result::Result<Vec<KeyedBuildResult>, ClientOpError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: AsRef<str>,
+{
+    wire::write_u64(writer, WorkerOp::BuildPathsWithResults as u64).await?;
+    wire::write_strings(writer, derived_paths).await?;
+    wire::write_u64(writer, BuildMode::Normal as u64).await?;
+    writer.flush().await.map_err(WireError::Io)?;
+
+    drain_stderr_typed(reader).await?;
+
+    let count = wire::read_u64(reader).await?;
+    if count > wire::MAX_COLLECTION_COUNT {
+        return Err(ClientOpError::Wire(WireError::CollectionTooLarge(count)));
+    }
+    let mut results = Vec::with_capacity(count.min(64) as usize);
+    for _ in 0..count {
+        let derived_path = wire::read_string(reader).await?;
+        let result = read_build_result(reader, negotiated_version).await?;
+        results.push(KeyedBuildResult {
+            derived_path,
+            result,
+        });
+    }
+    Ok(results)
+}
+
 /// Send `wopQueryValidPaths` (31): ask which of `paths` the daemon already
 /// has.
 ///
 /// `substitute = false` mirrors `nix copy` behaviour: answering the query
-/// must not trigger target-side substitution.
+/// must not trigger target-side substitution. With `substitute = true` the
+/// daemon may try to substitute missing paths from its configured
+/// substituters before answering, so paths it can fetch count as valid.
 ///
 /// The daemon replies (after the STDERR loop) with the subset of `paths` it
-/// considers valid, returned here as a set.
+/// considers valid, returned as a [`BTreeSet`] for deduplication and cheap
+/// membership checks against the queried chunk.
 pub async fn client_query_valid_paths<R, W, S>(
     reader: &mut R,
     writer: &mut W,
@@ -484,7 +541,8 @@ mod tests {
     use super::*;
     use crate::derivation::DerivationOutput;
     use crate::protocol::build::{
-        BuildResult, BuildStatus, read_basic_derivation, read_build_result, write_build_result,
+        BuildResult, BuildStatus, BuiltOutput, read_basic_derivation, read_build_result,
+        write_build_result,
     };
     use crate::protocol::handshake::{MIN_CLIENT_VERSION, encode_version, server_handshake_split};
     use crate::protocol::pathinfo::write_valid_path_info;
@@ -1257,6 +1315,115 @@ mod tests {
         let missing = client_query_path_info(&mut cr, &mut cw, missing_path).await?;
         assert!(missing.is_none(), "missing path must map to None");
         server.await??;
+        Ok(())
+    }
+
+    /// `substitute: true` is plumbed to the wire: the fake server reads the
+    /// flag after the path collection and asserts it arrives as true.
+    #[tokio::test]
+    async fn client_query_valid_paths_substitute_true_plumbed() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let path = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-subst";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::QueryValidPaths as u64);
+            let paths = wire::read_strings(&mut sr).await?;
+            assert_eq!(paths, vec![path.to_string()]);
+            let substitute = wire::read_bool(&mut sr).await?;
+            assert!(substitute, "substitute flag must reach the wire as true");
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            wire::write_strings(&mut sw, &[path]).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let valid = client_query_valid_paths(&mut cr, &mut cw, &[path], true).await?;
+        server.await??;
+        assert_eq!(valid, BTreeSet::from([path.to_string()]));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // client_build_paths_with_results
+    // -----------------------------------------------------------------------
+
+    /// client_build_paths_with_results wire layout round-trip: the request
+    /// carries the opcode, the derived-path collection, and buildMode Normal
+    /// in the order the gateway's `handle_build_paths_with_results` reads
+    /// them; the response (after STDERR_LAST) is a count followed by
+    /// per-entry (derived path echo, BuildResult) pairs whose statuses,
+    /// error message, and built outputs must be preserved.
+    #[tokio::test]
+    async fn client_build_paths_with_results_roundtrip() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let dp_all = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv!*";
+        let dp_out = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y.drv!out";
+        let built_out = BuiltOutput {
+            drv_output_id: "sha256:abcdef0123456789!out".to_string(),
+            out_path: "/nix/store/cccccccccccccccccccccccccccccccc-x".to_string(),
+        };
+
+        let server = tokio::spawn({
+            let built_out = built_out.clone();
+            async move {
+                let (mut sr, mut sw) = tokio::io::split(server_stream);
+                let op = wire::read_u64(&mut sr).await?;
+                assert_eq!(op, WorkerOp::BuildPathsWithResults as u64);
+                let paths = wire::read_strings(&mut sr).await?;
+                assert_eq!(paths, vec![dp_all.to_string(), dp_out.to_string()]);
+                let mode = wire::read_u64(&mut sr).await?;
+                assert_eq!(mode, BuildMode::Normal as u64);
+
+                // Build logs/activities stream on the STDERR loop first.
+                wire::write_u64(&mut sw, STDERR_NEXT).await?;
+                wire::write_string(&mut sw, "building x...").await?;
+                wire::write_u64(&mut sw, STDERR_LAST).await?;
+                // Then: count, and per entry the echoed derived path + result.
+                wire::write_u64(&mut sw, 2).await?;
+                wire::write_string(&mut sw, dp_all).await?;
+                write_build_result(
+                    &mut sw,
+                    &BuildResult {
+                        status: BuildStatus::Built,
+                        times_built: 1,
+                        built_outputs: vec![built_out],
+                        ..Default::default()
+                    },
+                    PROTOCOL_VERSION,
+                )
+                .await?;
+                wire::write_string(&mut sw, dp_out).await?;
+                write_build_result(
+                    &mut sw,
+                    &BuildResult::failure(BuildStatus::PermanentFailure, "boom"),
+                    PROTOCOL_VERSION,
+                )
+                .await?;
+                sw.flush().await?;
+                anyhow::Ok(())
+            }
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let results =
+            client_build_paths_with_results(&mut cr, &mut cw, &[dp_all, dp_out], PROTOCOL_VERSION)
+                .await?;
+        server.await??;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].derived_path, dp_all);
+        assert_eq!(results[0].result.status, BuildStatus::Built);
+        assert_eq!(
+            results[0].result.built_outputs,
+            vec![built_out],
+            "built output of the successful entry must be preserved"
+        );
+        assert_eq!(results[1].derived_path, dp_out);
+        assert_eq!(results[1].result.status, BuildStatus::PermanentFailure);
+        assert_eq!(results[1].result.error_msg, "boom");
         Ok(())
     }
 }
