@@ -256,21 +256,9 @@ pub(crate) async fn register_pending_chunks(
     // already past `CHUNK_GRACE_SECS` the moment the upload starts, and
     // a sweep + drain firing during the retry's upload window would
     // delete the S3 object underneath a commit that then references a
-    // missing key.
-    //
-    // TODO: the reset only protects uploads shorter than
-    // `CHUNK_GRACE_SECS` (300s). An upload still in its verify walk
-    // past that is sweep-eligible mid-flight (refcount 0, deleted
-    // false, created_at older than the grace window) — sweep tombstones
-    // the row, drain deletes the object, the commit then resurrects the
-    // row and produces a complete manifest whose chunk is gone from S3
-    // (surfaces as DATA_LOSS on GetPath; detectable by VerifyChunks).
-    // The legacy path is immune only because its write-ahead upsert
-    // bumps refcount to ≥1 before any S3 PUT. Closing this for the
-    // chunked path needs either an in-flight claim exclusion in the
-    // sweep's candidate query (e.g. a `claimed_until` column the
-    // placeholder heartbeat advances) or a provisional refcount that
-    // the commit converts and the placeholder reap decrements.
+    // missing key. Uploads that outlive the grace window are kept
+    // inside it by [`heartbeat_pending_chunks`], which the handler
+    // ticks every 30s for the lifetime of the request.
     sqlx::query(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
@@ -281,6 +269,47 @@ pub(crate) async fn register_pending_chunks(
     .bind(&hashes)
     .bind(vec![0i64; hashes.len()])
     .bind(&sizes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Keep an in-flight upload's pending (refcount-0) chunk rows inside
+/// the orphan-sweep grace window.
+///
+/// `sweep_orphan_chunks` collects `refcount = 0 AND NOT deleted AND
+/// created_at < now() - CHUNK_GRACE_SECS` (300s). A `PutPathChunked`
+/// whose verify walk outlives that window would otherwise have its
+/// not-yet-committed chunks tombstoned and their S3 objects drained
+/// mid-upload — the commit would then resurrect the rows and produce a
+/// complete manifest referencing missing S3 keys. The handler ticks
+/// this every 30s (the same cadence as the placeholder heartbeat, 10
+/// missed ticks of margin against the 300s grace) for the lifetime of
+/// the request, so a live upload's rows are never sweep candidates.
+/// The legacy path needs no equivalent because its write-ahead upsert
+/// takes refcount to ≥ 1 before any S3 PUT.
+///
+/// `AND refcount = 0` scopes the bump to rows still in the pending
+/// state: once the commit transaction (or a concurrent upload's)
+/// raises the refcount the row no longer needs grace-window protection
+/// and a chunk referenced by other manifests is not perturbed.
+/// Fire-and-forget from the heartbeat task — errors are logged by the
+/// caller and the next tick retries. Sorted per
+/// `r[store.chunk.lock-order]`.
+// r[impl store.chunk.grace-ttl]
+#[instrument(skip(pool, hashes), fields(count = hashes.len()))]
+pub(crate) async fn heartbeat_pending_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = hashes.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sqlx::query(
+        "UPDATE chunks SET created_at = now() \
+          WHERE blake3_hash = ANY($1) AND refcount = 0",
+    )
+    .bind(&sorted)
     .execute(pool)
     .await?;
     Ok(())

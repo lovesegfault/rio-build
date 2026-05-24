@@ -224,6 +224,35 @@ impl StoreServiceImpl {
         metadata::register_pending_chunks(&self.pool, &pending)
             .await
             .map_err(|e| putpath_metadata_status("PutPathChunked: register_pending_chunks", e))?;
+        // Keep the pending rows inside the orphan-sweep grace window
+        // for as long as this request is alive: an upload whose verify
+        // walk outlives CHUNK_GRACE_SECS (300s) would otherwise have
+        // its refcount-0 rows swept and their S3 objects drained
+        // mid-flight, and the commit would then reference missing keys.
+        // Every 30s tick re-stamps `created_at` on rows still at
+        // refcount 0; the task is aborted when the handler returns
+        // (committed, rejected, or dropped) so a dead upload's rows age
+        // into sweep eligibility normally. The same cadence-vs-grace
+        // margin as the placeholder heartbeat (10 missed ticks).
+        // r[impl store.chunk.grace-ttl]
+        let _chunk_heartbeat = scopeguard::guard(
+            {
+                let pool = self.pool.clone();
+                let hashes: Vec<Vec<u8>> = pending.iter().map(|(h, _)| h.clone()).collect();
+                rio_common::task::spawn_monitored("putpath-chunked-grace-heartbeat", async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.tick().await; // first tick fires immediately; skip it
+                    loop {
+                        tick.tick().await;
+                        if let Err(e) = metadata::heartbeat_pending_chunks(&pool, &hashes).await {
+                            warn!(error = %e, "pending-chunk grace heartbeat failed");
+                        }
+                    }
+                })
+            },
+            |h| h.abort(),
+        );
 
         // All outputs already complete: drain the remaining Chunk
         // frames (each verified + cas::put — idempotent content-
