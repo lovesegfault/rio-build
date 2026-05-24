@@ -44,6 +44,11 @@ const BATCH_MAX_ENTRIES: usize = 500;
 /// Byte budget (sum of NAR sizes) for one per-request batch upload.
 const BATCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Deadline for individually streamed (large) gap uploads — multi-GB relayed
+/// NARs legitimately need longer than the generic op deadline. Mirrors the
+/// prewarm phase's large-upload budget.
+const LARGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Pause before the single retry of a failed daemon-channel open.
 const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -54,8 +59,10 @@ const PROGRESS_EVERY_REQUESTS: usize = 25;
 /// `stop_offset_s` (scaled by the speedup like a recorded one).
 const DEFAULT_DISCONNECT_DELAY_S: f64 = 60.0;
 
-/// Lower bound on the disconnect timer so a high speedup cannot turn it into
-/// an instant drop before the build is even submitted.
+/// Lower bound on the disconnect delay still remaining when the build is
+/// submitted, so the build is always actually submitted before the channel is
+/// dropped (a high speedup or a slow supply phase cannot turn the replay into
+/// a no-op). Also floors the scheduled delay itself in [`build_schedule`].
 const DISCONNECT_FLOOR: Duration = Duration::from_secs(1);
 
 /// One recorded request, scheduled for replay.
@@ -137,7 +144,8 @@ fn disconnect_after_for(
 /// Pipeline stage a replayed request is currently in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestStage {
-    /// Scheduled; waiting for its due time and an admission slot.
+    /// Due (its recorded offset has passed) and waiting for an admission
+    /// slot. Requests still sleeping toward their offset are not tracked.
     Waiting,
     /// Walking the request's archive-side closure.
     Closure,
@@ -149,7 +157,7 @@ pub enum RequestStage {
     Build,
     /// Collecting replay-side output hashes.
     Collect,
-    /// Finished (kept for consumers that want a terminal stage label).
+    /// Finished; set momentarily before the entry is removed.
     Done,
 }
 
@@ -180,12 +188,15 @@ impl InFlightTracker {
 
     /// In-flight count plus the entry that has been in its current stage the
     /// longest: `(index, session, stage, time in stage)` — the heartbeat
-    /// line's "oldest" column.
+    /// line's "oldest" column. Entries that are actually executing are
+    /// preferred over [`RequestStage::Waiting`] ones, so the column points at
+    /// genuinely stuck work; a Waiting entry is reported only when nothing is
+    /// past admission.
     pub fn snapshot(&self) -> (usize, Option<(usize, i64, RequestStage, Duration)>) {
         let entries = self.lock();
         let oldest = entries
             .iter()
-            .min_by_key(|(_, (_, since, _))| *since)
+            .min_by_key(|(_, (stage, since, _))| (*stage == RequestStage::Waiting, *since))
             .map(|(&index, &(stage, since, session))| (index, session, stage, since.elapsed()));
         (entries.len(), oldest)
     }
@@ -215,6 +226,51 @@ pub struct DerivedOutcome {
     pub upload_rejected: Option<String>,
 }
 
+/// Coarse classification of a request-level failure — what stage of the
+/// replay broke, separating infrastructure problems from build outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestErrorKind {
+    /// No daemon channel could be opened (after the one retry).
+    ChannelOpen,
+    /// The target validity probe failed.
+    Probe,
+    /// The supply closure or upload plan could not be computed.
+    UploadPlan,
+    /// A gap upload failed at the transport level (not a daemon refusal).
+    UploadTransport,
+    /// The build exceeded its deadline.
+    BuildTimeout,
+    /// The daemon refused the build operation itself.
+    BuildRefused,
+    /// The build failed at the transport level.
+    BuildTransport,
+    /// The daemon answered with a different result count than submitted.
+    ResultCountMismatch,
+    /// Output-hash collection failed.
+    Collect,
+    /// The request task panicked.
+    Panic,
+}
+
+/// A request-level failure: which stage broke plus the human-readable detail.
+#[derive(Debug, Clone)]
+pub struct RequestError {
+    /// Coarse classification for the report.
+    pub kind: RequestErrorKind,
+    /// Human-readable detail (op name, daemon message, deadline, …).
+    pub message: String,
+}
+
+impl RequestError {
+    /// New error of `kind` carrying `message`.
+    fn new(kind: RequestErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 /// Everything the replay learned about one scheduled request.
 #[derive(Debug, Clone)]
 pub struct RequestOutcome {
@@ -224,13 +280,15 @@ pub struct RequestOutcome {
     pub request: ReplayRequest,
     /// One entry per requested derived path, in request order.
     pub results: Vec<DerivedOutcome>,
-    /// Build attempts made (1 = no confirmation retries needed).
+    /// Build attempts made (1 = no confirmation retries needed; 0 = the build
+    /// was never attempted — upload rejected, pre-build infra error, or
+    /// panic).
     pub attempts: u32,
     /// True when the request was replayed as a recorded client disconnect.
     pub disconnected: bool,
     /// Transport/infra error that prevented the request from completing
     /// normally (not a build failure).
-    pub error: Option<String>,
+    pub error: Option<RequestError>,
     /// How late dispatch was vs the schedule (admission/backpressure), for
     /// the report.
     pub dispatch_lateness: Duration,
@@ -333,33 +391,24 @@ pub async fn run_timeline(
         let handle = tasks.spawn(async move {
             let index = scheduled.index;
             let session = scheduled.request.ssh_session_id;
-            env.tracker.set(index, session, RequestStage::Waiting);
-
             let due_at = start + scheduled.due;
             tokio::time::sleep_until(due_at).await;
+            // Tracked only once due: "Waiting" means due-but-not-admitted, so
+            // the heartbeat's in-flight count reflects real backlog rather
+            // than the whole remaining schedule.
+            env.tracker.set(index, session, RequestStage::Waiting);
             // FIFO admission: requests that came due earlier get a session
             // slot first; lateness measures schedule slip from backpressure.
-            let permit = match Arc::clone(&admission).acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_closed) => {
-                    // The semaphore is never closed; degrade to an errored
-                    // outcome rather than panicking the task.
-                    env.tracker.remove(index);
-                    return RequestOutcome {
-                        index,
-                        request: scheduled.request.clone(),
-                        results: skeleton_results(&scheduled.request),
-                        attempts: 0,
-                        disconnected: false,
-                        error: Some("admission semaphore closed unexpectedly".to_string()),
-                        dispatch_lateness: Duration::ZERO,
-                    };
-                }
-            };
-            let dispatch_lateness = tokio::time::Instant::now().saturating_duration_since(due_at);
+            let permit = Arc::clone(&admission)
+                .acquire_owned()
+                .await
+                .expect("the admission semaphore is never closed");
+            let dispatch_at = tokio::time::Instant::now();
+            let dispatch_lateness = dispatch_at.saturating_duration_since(due_at);
 
-            let outcome = execute_request(&env, &scheduled, dispatch_lateness).await;
+            let outcome = execute_request(&env, &scheduled, dispatch_at, dispatch_lateness).await;
             drop(permit);
+            env.tracker.set(index, session, RequestStage::Done);
             env.tracker.remove(index);
             outcome
         });
@@ -369,7 +418,10 @@ pub async fn run_timeline(
     let mut outcomes: Vec<RequestOutcome> = Vec::with_capacity(total);
     while let Some(joined) = tasks.join_next_with_id().await {
         match joined {
-            Ok((_id, outcome)) => outcomes.push(outcome),
+            Ok((id, outcome)) => {
+                spawned.remove(&id);
+                outcomes.push(outcome);
+            }
             Err(join_error) => {
                 // A panicked request must not take down the run; account for
                 // it as an errored outcome so the report still sees it.
@@ -383,7 +435,10 @@ pub async fn run_timeline(
                         results,
                         attempts: 0,
                         disconnected: false,
-                        error: Some(format!("request task panicked: {join_error}")),
+                        error: Some(RequestError::new(
+                            RequestErrorKind::Panic,
+                            format!("request task panicked: {join_error}"),
+                        )),
                         dispatch_lateness: Duration::ZERO,
                     });
                 } else {
@@ -421,9 +476,13 @@ fn skeleton_results(request: &ReplayRequest) -> Vec<DerivedOutcome> {
 /// supply-gap upload, build (with disconnect replay and confirmation
 /// retries), and output-hash collection. Never returns an error — every
 /// failure mode is folded into the [`RequestOutcome`].
+///
+/// `dispatch_at` is when the request was admitted; the disconnect-replay
+/// deadline is anchored there.
 async fn execute_request(
     env: &TimelineEnv,
     scheduled: &ScheduledRequest,
+    dispatch_at: tokio::time::Instant,
     dispatch_lateness: Duration,
 ) -> RequestOutcome {
     let request = &scheduled.request;
@@ -453,12 +512,16 @@ async fn execute_request(
         match tokio::task::spawn_blocking(move || walk_closure(&archive, &roots)).await {
             Ok(Ok(closure)) => closure,
             Ok(Err(err)) => {
-                outcome.error = Some(format!("closure walk failed: {err:#}"));
+                outcome.error = Some(RequestError::new(
+                    RequestErrorKind::UploadPlan,
+                    format!("closure walk failed: {err:#}"),
+                ));
                 return outcome;
             }
             Err(err) => {
-                outcome.error = Some(format!(
-                    "closure walk task panicked or was cancelled: {err}"
+                outcome.error = Some(RequestError::new(
+                    RequestErrorKind::Panic,
+                    format!("closure walk task panicked or was cancelled: {err}"),
                 ));
                 return outcome;
             }
@@ -481,15 +544,18 @@ async fn execute_request(
     for chunk in to_probe.chunks(PROBE_CHUNK) {
         let channel = match slot.get().await {
             Ok(channel) => channel,
-            Err(message) => {
-                outcome.error = Some(message);
+            Err(error) => {
+                outcome.error = Some(error);
                 return outcome;
             }
         };
         match channel.query_valid_paths(chunk, env.cfg.op_timeout).await {
             Ok(found) => probed_valid.extend(found),
             Err(err) => {
-                outcome.error = Some(format!("target validity probe failed: {err}"));
+                outcome.error = Some(RequestError::new(
+                    RequestErrorKind::Probe,
+                    format!("target validity probe failed: {err}"),
+                ));
                 return outcome;
             }
         }
@@ -550,7 +616,10 @@ async fn execute_request(
     let plan = match plan_uploads(&closure, &sources, &valid, &env.archive) {
         Ok(plan) => plan,
         Err(err) => {
-            outcome.error = Some(format!("upload planning failed: {err:#}"));
+            outcome.error = Some(RequestError::new(
+                RequestErrorKind::UploadPlan,
+                format!("upload planning failed: {err:#}"),
+            ));
             return outcome;
         }
     };
@@ -580,8 +649,8 @@ async fn execute_request(
             }
             return outcome;
         }
-        GapUploadOutcome::Error(message) => {
-            outcome.error = Some(message);
+        GapUploadOutcome::Error(error) => {
+            outcome.error = Some(error);
             return outcome;
         }
     }
@@ -593,40 +662,31 @@ async fn execute_request(
         .iter()
         .map(|(drv_path, outputs)| format_derived(drv_path, outputs))
         .collect();
-    let build_timeout = build_timeout_for(env, request);
+    let build_timeout = build_timeout_for(env.archive.builds(), request, &env.cfg);
+    // Disconnect replay is anchored at dispatch: the recorded gap between
+    // request start and client disconnect elapses on the dispatch clock,
+    // however long the supply work above took.
+    let disconnect_deadline = scheduled.disconnect_after.map(|after| dispatch_at + after);
 
     let mut attempts: u32 = 1;
-    match run_build_attempt(
-        &mut slot,
-        &derived,
-        build_timeout,
-        scheduled.disconnect_after,
-    )
-    .await
-    {
+    match run_build_attempt(&mut slot, &derived, build_timeout, disconnect_deadline).await {
         BuildAttempt::Disconnected => {
             outcome.disconnected = true;
             outcome.attempts = attempts;
             tracing::debug!(session, "request replayed as a recorded client disconnect");
             return outcome;
         }
-        BuildAttempt::Error(message) => {
-            outcome.error = Some(message);
+        BuildAttempt::Error(error) => {
+            outcome.error = Some(error);
             outcome.attempts = attempts;
             return outcome;
         }
         BuildAttempt::Results(results) => {
-            if results.len() != derived.len() {
-                outcome.error = Some(format!(
-                    "daemon returned {} results for {} derived paths",
-                    results.len(),
-                    derived.len()
-                ));
+            let all_positions: Vec<usize> = (0..derived.len()).collect();
+            if let Err(error) = apply_build_results(&mut outcome.results, &all_positions, results) {
+                outcome.error = Some(error);
                 outcome.attempts = attempts;
                 return outcome;
-            }
-            for (derived_outcome, keyed) in outcome.results.iter_mut().zip(results) {
-                derived_outcome.result = Some(keyed.result);
             }
         }
     }
@@ -636,7 +696,7 @@ async fn execute_request(
     // the failure is allowed to stand as a regression.
     let max_attempts = env.cfg.confirm_regressions.max(1);
     loop {
-        let targets = regression_positions(&env.archive, request, &outcome.results);
+        let targets = regression_positions(env.archive.builds(), request, &outcome.results);
         if targets.is_empty() || attempts >= max_attempts {
             break;
         }
@@ -649,34 +709,35 @@ async fn execute_request(
             candidates = targets.len(),
             "re-running the build to confirm recorded-success regressions"
         );
-        match run_build_attempt(&mut slot, &derived, build_timeout, None).await {
-            // No disconnect timer is passed for confirmation attempts, so a
-            // Disconnected outcome cannot occur; treat it like one anyway
+        // Re-submit ONLY the regression candidates: the gateway applies one
+        // DAG-level result to every derived path of a request, so re-sending
+        // the full list would keep innocent recorded-success siblings
+        // correlated with a still-failing drv; alone, the candidates can
+        // build cleanly and be reclassified correctly.
+        let retry_derived: Vec<String> = targets
+            .iter()
+            .map(|&position| derived[position].clone())
+            .collect();
+        match run_build_attempt(&mut slot, &retry_derived, build_timeout, None).await {
+            // No disconnect deadline is passed for confirmation attempts, so
+            // a Disconnected outcome cannot occur; treat it like one anyway
             // rather than panicking if that ever changes.
             BuildAttempt::Disconnected => {
                 outcome.disconnected = true;
                 break;
             }
-            BuildAttempt::Error(message) => {
-                outcome.error = Some(message);
+            BuildAttempt::Error(error) => {
+                outcome.error = Some(error);
                 outcome.attempts = attempts;
                 return outcome;
             }
             BuildAttempt::Results(results) => {
-                if results.len() != derived.len() {
-                    outcome.error = Some(format!(
-                        "daemon returned {} results for {} derived paths",
-                        results.len(),
-                        derived.len()
-                    ));
+                // Only the resubmitted positions take the re-run's result;
+                // everything else keeps its first outcome.
+                if let Err(error) = apply_build_results(&mut outcome.results, &targets, results) {
+                    outcome.error = Some(error);
                     outcome.attempts = attempts;
                     return outcome;
-                }
-                // Only the regression candidates take the re-run's result;
-                // everything else keeps its first outcome (a path already
-                // built once would only come back as already valid now).
-                for position in targets {
-                    outcome.results[position].result = Some(results[position].result.clone());
                 }
             }
         }
@@ -685,10 +746,9 @@ async fn execute_request(
 
     // ---- Collect output hashes ----------------------------------------------
     env.tracker.set(index, session, RequestStage::Collect);
-    if let Err(message) =
-        collect_output_hashes(env, &mut slot, &closure, &mut outcome.results).await
+    if let Err(error) = collect_output_hashes(env, &mut slot, &closure, &mut outcome.results).await
     {
-        outcome.error = Some(message);
+        outcome.error = Some(error);
         return outcome;
     }
 
@@ -862,9 +922,9 @@ impl ChannelSlot {
     }
 
     /// The held channel, dialing one if needed. Channel-open failures are
-    /// infra errors: one retry after [`CHANNEL_RETRY_DELAY`], then an error
-    /// string for the request outcome.
-    async fn get(&mut self) -> std::result::Result<&mut DaemonChannel, String> {
+    /// infra errors: one retry after [`CHANNEL_RETRY_DELAY`], then a
+    /// [`RequestErrorKind::ChannelOpen`] error for the request outcome.
+    async fn get(&mut self) -> std::result::Result<&mut DaemonChannel, RequestError> {
         if self.current.is_none() {
             let channel = match self.pool.open_channel().await {
                 Ok(channel) => channel,
@@ -875,7 +935,10 @@ impl ChannelSlot {
                     );
                     tokio::time::sleep(CHANNEL_RETRY_DELAY).await;
                     self.pool.open_channel().await.map_err(|err| {
-                        format!("could not open a daemon channel (after one retry): {err:#}")
+                        RequestError::new(
+                            RequestErrorKind::ChannelOpen,
+                            format!("could not open a daemon channel (after one retry): {err:#}"),
+                        )
                     })?
                 }
             };
@@ -909,17 +972,28 @@ enum GapUploadOutcome {
     /// The daemon refused an upload even after one retry on a fresh channel.
     Rejected(String),
     /// Transport/infra failure — the request cannot proceed normally.
-    Error(String),
+    Error(RequestError),
 }
 
-/// Result of one wire upload (one streamed large item or one batch).
+/// Result of one upload (one streamed large item or one batch) after the
+/// refusal-retry policy.
 enum SendOutcome {
     /// The upload landed; claims completed and the context updated.
     Sent,
     /// Refused twice (original + one retry on a fresh channel).
     Rejected(String),
     /// Transport/infra failure.
-    Error(String),
+    Error(RequestError),
+}
+
+/// Result of a single wire attempt of an upload.
+enum SendAttempt {
+    /// The daemon accepted the entries.
+    Sent,
+    /// The daemon refused (or a transport error raced a refusal).
+    Refused(String),
+    /// Transport/infra failure (channel open or non-refusal op error).
+    Error(RequestError),
 }
 
 /// Upload this request's supply gaps: large relayed items individually
@@ -947,7 +1021,7 @@ async fn upload_request_gaps(
         match send_upload(env, slot, claim_guard, &[item], vec![nar], true).await {
             SendOutcome::Sent => {}
             SendOutcome::Rejected(message) => return GapUploadOutcome::Rejected(message),
-            SendOutcome::Error(message) => return GapUploadOutcome::Error(message),
+            SendOutcome::Error(error) => return GapUploadOutcome::Error(error),
         }
     }
 
@@ -968,6 +1042,9 @@ async fn upload_request_gaps(
             }
         };
         let nar_len = nar.len() as u64;
+        // Inline batch splitting on the same entry/byte caps as
+        // `prewarm::split_batches` (kept inline because payloads are
+        // materialized as the batch is walked, not planned up front).
         if !pending_items.is_empty()
             && (pending_items.len() >= BATCH_MAX_ENTRIES
                 || pending_bytes + nar_len > BATCH_MAX_BYTES)
@@ -984,7 +1061,7 @@ async fn upload_request_gaps(
             {
                 SendOutcome::Sent => {}
                 SendOutcome::Rejected(message) => return GapUploadOutcome::Rejected(message),
-                SendOutcome::Error(message) => return GapUploadOutcome::Error(message),
+                SendOutcome::Error(error) => return GapUploadOutcome::Error(error),
             }
             pending_items.clear();
             pending_bytes = 0;
@@ -997,7 +1074,7 @@ async fn upload_request_gaps(
         match send_upload(env, slot, claim_guard, &pending_items, pending_nars, false).await {
             SendOutcome::Sent => {}
             SendOutcome::Rejected(message) => return GapUploadOutcome::Rejected(message),
-            SendOutcome::Error(message) => return GapUploadOutcome::Error(message),
+            SendOutcome::Error(error) => return GapUploadOutcome::Error(error),
         }
     }
     GapUploadOutcome::Done
@@ -1005,104 +1082,168 @@ async fn upload_request_gaps(
 
 /// Send one upload (a single streamed large item, or one batch). A refusal
 /// releases the affected claims, swaps in a fresh channel, and retries
-/// exactly once — the refusal may be genuine or a transport error racing a
-/// refusal, and one retry distinguishes a flake from a real rejection. A
-/// successful send completes the claims and marks the paths valid in the
-/// shared supply context.
+/// exactly once with freshly materialized payloads — the refusal may be
+/// genuine or a transport error racing a refusal, and one retry
+/// distinguishes a flake from a real rejection. A successful send completes
+/// the claims and marks the paths valid in the shared supply context.
 async fn send_upload(
     env: &TimelineEnv,
     slot: &mut ChannelSlot,
     claim_guard: &mut ClaimGuard,
     items: &[&UploadItem],
-    mut nars: Vec<Vec<u8>>,
+    nars: Vec<Vec<u8>>,
     large: bool,
 ) -> SendOutcome {
     debug_assert_eq!(items.len(), nars.len());
     debug_assert!(!large || items.len() == 1);
-    let paths: Vec<String> = items.iter().map(|item| item.store_path.clone()).collect();
-    // Claims released because of a first refusal; completed after all if the
-    // retry lands the upload (the path is on the target then).
-    let mut released_for_retry: Vec<String> = Vec::new();
-    let mut last_refusal: Option<String> = None;
+    // Large relayed NARs legitimately take longer than the generic op
+    // deadline; mirror the prewarm phase's streaming budget for them.
+    let timeout = if large {
+        LARGE_UPLOAD_TIMEOUT
+    } else {
+        env.cfg.op_timeout
+    };
 
-    for attempt in 0..2u8 {
-        let channel = match slot.get().await {
-            Ok(channel) => channel,
-            Err(message) => return SendOutcome::Error(message),
-        };
-        // Per-request gap payloads are small (the bulk went through prewarm),
-        // so the first attempt clones the NAR bytes to keep a refusal retry
-        // possible without re-materializing; the second attempt moves them.
-        let mut entries: Vec<StoreEntry> = Vec::with_capacity(items.len());
-        for (position, item) in items.iter().enumerate() {
-            let nar = if attempt == 0 {
-                nars[position].clone()
-            } else {
-                std::mem::take(&mut nars[position])
-            };
-            entries.push(StoreEntry {
-                store_path: item.store_path.clone(),
-                info: item.info.clone(),
-                nar: NarPayload::Bytes(nar),
-            });
+    let first_paths: Vec<String> = items.iter().map(|item| item.store_path.clone()).collect();
+    let refusal = match send_entries(slot, items, nars, large, timeout).await {
+        SendAttempt::Sent => {
+            finish_successful_upload(env, claim_guard, &first_paths, &[]).await;
+            return SendOutcome::Sent;
         }
-        let op = if large {
-            format!("AddToStoreNar {}", paths[0])
-        } else {
-            format!("AddMultipleToStore ({} entries)", entries.len())
-        };
-        let sent = if large {
-            let entry = entries
-                .pop()
-                .expect("a large upload always carries exactly one entry");
-            channel.add_to_store_nar(entry, env.cfg.op_timeout).await
-        } else {
-            channel
-                .add_multiple_to_store(entries, env.cfg.op_timeout)
-                .await
-        };
-        match sent {
-            Ok(()) => {
-                for path in &paths {
-                    claim_guard.complete(path);
-                }
-                for path in &released_for_retry {
-                    env.claims.complete(path);
-                }
-                {
-                    // Brief write-lock; the network work is already done.
-                    let mut ctx = env.ctx.write().await;
-                    for path in &paths {
-                        ctx.target_valid.insert(path.clone());
-                    }
-                }
-                tracing::debug!(paths = paths.len(), "uploaded request supply gap");
-                return SendOutcome::Sent;
+        SendAttempt::Refused(message) => message,
+        SendAttempt::Error(error) => {
+            slot.discard();
+            return SendOutcome::Error(error);
+        }
+    };
+
+    // The wire position is unknown after a refusal, and the claims must not
+    // keep other requests waiting while this one retries (or gives up). The
+    // retry re-materializes its payloads instead of keeping a second copy of
+    // every NAR around for a case this rare.
+    slot.discard();
+    let mut released: Vec<String> = Vec::new();
+    for path in &first_paths {
+        if claim_guard.release(path) {
+            released.push(path.clone());
+        }
+    }
+    tracing::debug!(
+        %refusal,
+        paths = first_paths.len(),
+        "upload refused; retrying once on a fresh channel"
+    );
+    let mut retry_items: Vec<&UploadItem> = Vec::new();
+    let mut retry_nars: Vec<Vec<u8>> = Vec::new();
+    for &item in items {
+        match materialize_item(env, item).await {
+            Ok(nar) => {
+                retry_items.push(item);
+                retry_nars.push(nar);
             }
-            Err(ReplayClientError::Refused(message)) => {
-                // The wire position is unknown after a refusal, and the
-                // claims must not keep other requests waiting while this one
-                // retries (or gives up).
-                slot.discard();
-                for path in &paths {
-                    if claim_guard.release(path) {
-                        released_for_retry.push(path.clone());
-                    }
-                }
-                if attempt == 0 {
-                    tracing::debug!(%op, %message, "upload refused; retrying once on a fresh channel");
-                }
-                last_refusal = Some(message);
-            }
-            Err(err) => {
-                slot.discard();
-                return SendOutcome::Error(format!("{op} failed: {err}"));
+            Err(reason) => {
+                tracing::debug!(
+                    path = %item.store_path,
+                    %reason,
+                    "gap upload retry skipped: payload could not be re-materialized"
+                );
             }
         }
     }
-    SendOutcome::Rejected(
-        last_refusal.unwrap_or_else(|| "upload refused by the daemon".to_string()),
-    )
+    if retry_items.is_empty() {
+        return SendOutcome::Rejected(refusal);
+    }
+
+    let retry_paths: Vec<String> = retry_items
+        .iter()
+        .map(|item| item.store_path.clone())
+        .collect();
+    match send_entries(slot, &retry_items, retry_nars, large, timeout).await {
+        SendAttempt::Sent => {
+            finish_successful_upload(env, claim_guard, &retry_paths, &released).await;
+            SendOutcome::Sent
+        }
+        SendAttempt::Refused(message) => {
+            slot.discard();
+            SendOutcome::Rejected(message)
+        }
+        SendAttempt::Error(error) => {
+            slot.discard();
+            SendOutcome::Error(error)
+        }
+    }
+}
+
+/// One wire attempt of an upload: build the entries from the given payloads
+/// and run the matching daemon op.
+async fn send_entries(
+    slot: &mut ChannelSlot,
+    items: &[&UploadItem],
+    nars: Vec<Vec<u8>>,
+    large: bool,
+    timeout: Duration,
+) -> SendAttempt {
+    let channel = match slot.get().await {
+        Ok(channel) => channel,
+        Err(error) => return SendAttempt::Error(error),
+    };
+    let mut entries: Vec<StoreEntry> = Vec::with_capacity(items.len());
+    for (item, nar) in items.iter().zip(nars) {
+        entries.push(StoreEntry {
+            store_path: item.store_path.clone(),
+            info: item.info.clone(),
+            nar: NarPayload::Bytes(nar),
+        });
+    }
+    let op = if large {
+        format!("AddToStoreNar {}", items[0].store_path)
+    } else {
+        format!("AddMultipleToStore ({} entries)", entries.len())
+    };
+    let sent = if large {
+        let entry = entries
+            .pop()
+            .expect("a large upload always carries exactly one entry");
+        channel.add_to_store_nar(entry, timeout).await
+    } else {
+        channel.add_multiple_to_store(entries, timeout).await
+    };
+    match sent {
+        Ok(()) => SendAttempt::Sent,
+        Err(ReplayClientError::Refused(message)) => SendAttempt::Refused(message),
+        Err(err) => SendAttempt::Error(RequestError::new(
+            RequestErrorKind::UploadTransport,
+            format!("{op} failed: {err}"),
+        )),
+    }
+}
+
+/// Bookkeeping after an upload landed: complete the claims this request
+/// still holds for the sent paths, mark claims it had to release for the
+/// refusal retry as done when their path was re-sent, and record every sent
+/// path as valid on the target.
+async fn finish_successful_upload(
+    env: &TimelineEnv,
+    claim_guard: &mut ClaimGuard,
+    sent_paths: &[String],
+    released_paths: &[String],
+) {
+    for path in sent_paths {
+        claim_guard.complete(path);
+    }
+    for path in released_paths {
+        if sent_paths.contains(path) {
+            env.claims.complete(path);
+        }
+    }
+    {
+        // Brief write-lock; the network work is already done.
+        let mut ctx = env.ctx.write().await;
+        for path in sent_paths {
+            ctx.target_valid.insert(path.clone());
+        }
+    }
+    tracing::debug!(paths = sent_paths.len(), "uploaded request supply gap");
 }
 
 /// Produce the NAR bytes for one planned upload item, verifying the length
@@ -1169,13 +1310,16 @@ async fn materialize_item(
 /// Build deadline for one request: twice the slowest recorded duration among
 /// its build records, clamped to `[build_timeout_floor, build_timeout_cap]`;
 /// the floor alone when no matching record carries a duration.
-fn build_timeout_for(env: &TimelineEnv, request: &ReplayRequest) -> Duration {
+fn build_timeout_for(
+    builds: &HashMap<(i64, String), BuildRecord>,
+    request: &ReplayRequest,
+    cfg: &TimelineConfig,
+) -> Duration {
     let slowest = request
         .paths
         .iter()
         .filter_map(|(drv_path, _outputs)| {
-            env.archive
-                .builds()
+            builds
                 .get(&(request.ssh_session_id, drv_path.clone()))
                 .and_then(|record| record.duration_s)
         })
@@ -1186,50 +1330,59 @@ fn build_timeout_for(env: &TimelineEnv, request: &ReplayRequest) -> Duration {
         Some(duration) if duration.is_finite() && duration > 0.0 => {
             // Cap before converting so an absurd recorded duration cannot
             // overflow the conversion; then apply the floor.
-            let capped = (2.0 * duration).min(env.cfg.build_timeout_cap.as_secs_f64());
-            Duration::from_secs_f64(capped).max(env.cfg.build_timeout_floor)
+            let capped = (2.0 * duration).min(cfg.build_timeout_cap.as_secs_f64());
+            Duration::from_secs_f64(capped).max(cfg.build_timeout_floor)
         }
-        _ => env.cfg.build_timeout_floor,
+        _ => cfg.build_timeout_floor,
     }
 }
 
 /// One `BuildPathsWithResults` submission, optionally raced against the
-/// recorded disconnect timer.
+/// recorded disconnect deadline.
 enum BuildAttempt {
     /// The daemon answered with per-path results (count not yet verified).
     Results(Vec<KeyedBuildResult>),
-    /// The disconnect timer fired first; the channel was dropped abruptly.
+    /// The disconnect deadline passed first; the channel was dropped abruptly.
     Disconnected,
     /// The build could not be driven to completion.
-    Error(String),
+    Error(RequestError),
 }
 
 /// Submit the request's derived paths and wait for results, replaying a
-/// recorded client disconnect when `disconnect_after` is set: if the timer
-/// fires before the daemon answers, the channel is dropped abruptly (the
-/// gateway then cancels the session's builds, like the recorded client going
-/// away did).
+/// recorded client disconnect when `disconnect_deadline` is set: if the
+/// deadline (anchored at dispatch) passes before the daemon answers, the
+/// channel is dropped abruptly (the gateway then cancels the session's
+/// builds, like the recorded client going away did).
 async fn run_build_attempt(
     slot: &mut ChannelSlot,
     derived: &[String],
     build_timeout: Duration,
-    disconnect_after: Option<Duration>,
+    disconnect_deadline: Option<tokio::time::Instant>,
 ) -> BuildAttempt {
-    let op_timeout = build_timeout;
     let channel = match slot.get().await {
         Ok(channel) => channel,
-        Err(message) => return BuildAttempt::Error(message),
+        Err(error) => return BuildAttempt::Error(error),
     };
-    let outcome = match disconnect_after {
-        None => Some(channel.build_paths_with_results(derived, op_timeout).await),
-        Some(after) => {
+    let outcome = match disconnect_deadline {
+        None => Some(
+            channel
+                .build_paths_with_results(derived, build_timeout)
+                .await,
+        ),
+        Some(deadline) => {
+            // The supply phases may already have eaten into the recorded
+            // disconnect gap; the build is still always submitted, with the
+            // floor applied to whatever delay remains.
+            let remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .max(DISCONNECT_FLOOR);
             // Scope the build future so its borrow of the channel ends before
             // the disconnect path takes the channel out of the slot.
-            let build = channel.build_paths_with_results(derived, op_timeout);
+            let build = channel.build_paths_with_results(derived, build_timeout);
             tokio::pin!(build);
             tokio::select! {
                 result = &mut build => Some(result),
-                () = tokio::time::sleep(after) => None,
+                () = tokio::time::sleep(remaining) => None,
             }
         }
     };
@@ -1241,20 +1394,57 @@ async fn run_build_attempt(
         Some(Ok(results)) => BuildAttempt::Results(results),
         Some(Err(ReplayClientError::Timeout(deadline))) => {
             slot.discard();
-            BuildAttempt::Error(format!("build timed out after {}s", deadline.as_secs()))
+            BuildAttempt::Error(RequestError::new(
+                RequestErrorKind::BuildTimeout,
+                format!("build timed out after {}s", deadline.as_secs()),
+            ))
+        }
+        Some(Err(ReplayClientError::Refused(message))) => {
+            slot.discard();
+            BuildAttempt::Error(RequestError::new(
+                RequestErrorKind::BuildRefused,
+                format!("daemon refused BuildPathsWithResults: {message}"),
+            ))
         }
         Some(Err(err)) => {
             slot.discard();
-            BuildAttempt::Error(format!("BuildPathsWithResults failed: {err}"))
+            BuildAttempt::Error(RequestError::new(
+                RequestErrorKind::BuildTransport,
+                format!("BuildPathsWithResults failed: {err}"),
+            ))
         }
     }
+}
+
+/// Zip one build attempt's results onto the outcome positions they were
+/// submitted for (submission order). The daemon answering with a different
+/// count than submitted is a protocol-level fault, not a build failure.
+fn apply_build_results(
+    results: &mut [DerivedOutcome],
+    positions: &[usize],
+    keyed: Vec<KeyedBuildResult>,
+) -> std::result::Result<(), RequestError> {
+    if keyed.len() != positions.len() {
+        return Err(RequestError::new(
+            RequestErrorKind::ResultCountMismatch,
+            format!(
+                "daemon returned {} results for {} derived paths",
+                keyed.len(),
+                positions.len()
+            ),
+        ));
+    }
+    for (&position, keyed_result) in positions.iter().zip(keyed) {
+        results[position].result = Some(keyed_result.result);
+    }
+    Ok(())
 }
 
 /// Positions whose recorded outcome was a successful build but whose replay
 /// result is currently a failure — the candidates the confirmation loop
 /// re-runs.
 fn regression_positions(
-    archive: &ReplayArchive,
+    builds: &HashMap<(i64, String), BuildRecord>,
     request: &ReplayRequest,
     results: &[DerivedOutcome],
 ) -> Vec<usize> {
@@ -1262,8 +1452,7 @@ fn regression_positions(
         .iter()
         .enumerate()
         .filter(|(_, derived)| {
-            let recorded_success = archive
-                .builds()
+            let recorded_success = builds
                 .get(&(request.ssh_session_id, derived.drv_path.clone()))
                 .is_some_and(|record| record.status == prod_status::BUILT);
             let replay_failed = derived
@@ -1285,7 +1474,7 @@ async fn collect_output_hashes(
     slot: &mut ChannelSlot,
     closure: &Closure,
     results: &mut [DerivedOutcome],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), RequestError> {
     let nodes: HashMap<&str, &ClosureNode> = closure
         .topo
         .iter()
@@ -1308,7 +1497,7 @@ async fn collect_output_hashes(
             }
             let channel = match slot.get().await {
                 Ok(channel) => channel,
-                Err(message) => return Err(message),
+                Err(error) => return Err(error),
             };
             match channel
                 .query_path_info(output_path, env.cfg.op_timeout)
@@ -1325,7 +1514,12 @@ async fn collect_output_hashes(
                         "built output has no path info on the target; no replay hash collected"
                     );
                 }
-                Err(err) => return Err(format!("QueryPathInfo {output_path} failed: {err}")),
+                Err(err) => {
+                    return Err(RequestError::new(
+                        RequestErrorKind::Collect,
+                        format!("QueryPathInfo {output_path} failed: {err}"),
+                    ));
+                }
             }
         }
     }
@@ -1360,13 +1554,33 @@ mod tests {
     /// Minimal recorded client-disconnect build record.
     fn disconnect_record(session: i64, drv: &str, stop_offset_s: Option<f64>) -> BuildRecord {
         BuildRecord {
+            stop_offset_s,
+            ..build_record(session, drv, prod_status::CLIENT_DISCONNECT, None)
+        }
+    }
+
+    /// Recorded build record with an arbitrary status and optional duration.
+    fn build_record(session: i64, drv: &str, status: i32, duration_s: Option<f64>) -> BuildRecord {
+        BuildRecord {
             ssh_session_id: session,
             drv_path: drv.to_string(),
-            status: prod_status::CLIENT_DISCONNECT,
+            status,
             status_msg: None,
-            duration_s: None,
-            stop_offset_s,
+            duration_s,
+            stop_offset_s: None,
             outputs: BTreeMap::new(),
+        }
+    }
+
+    /// Replay-side derived outcome with just a drv path and an optional
+    /// build result.
+    fn derived_outcome(drv: &str, result: Option<BuildResult>) -> DerivedOutcome {
+        DerivedOutcome {
+            drv_path: drv.to_string(),
+            outputs: vec!["out".to_string()],
+            result,
+            replay_nar_hashes: BTreeMap::new(),
+            upload_rejected: None,
         }
     }
 
@@ -1508,5 +1722,143 @@ mod tests {
         tracker.remove(7);
         tracker.remove(9);
         assert_eq!(tracker.snapshot().0, 0);
+
+        // Waiting entries are reported as the oldest only when nothing is
+        // actually executing — an older Waiting entry must not hide a
+        // younger executing one.
+        tracker.set(1, 200, RequestStage::Waiting);
+        std::thread::sleep(Duration::from_millis(15));
+        tracker.set(2, 201, RequestStage::Build);
+        let (count, oldest) = tracker.snapshot();
+        assert_eq!(count, 2);
+        assert_eq!(oldest.expect("two entries in flight").0, 2);
+        tracker.remove(2);
+        let (_, oldest) = tracker.snapshot();
+        assert_eq!(oldest.expect("only the waiting entry remains").0, 1);
+        tracker.remove(1);
+    }
+
+    #[test]
+    fn regression_positions_pick_recorded_success_with_replay_failure() {
+        let session = 1_i64;
+        // One drv per recorded/replayed combination the confirmation loop
+        // must distinguish.
+        let recorded_built_failed = "/nix/store/r1111111111111111111111111111111-a.drv";
+        let recorded_failed_failed = "/nix/store/r2222222222222222222222222222222-b.drv";
+        let recorded_disconnect_failed = "/nix/store/r3333333333333333333333333333333-c.drv";
+        let recorded_built_succeeded = "/nix/store/r4444444444444444444444444444444-d.drv";
+        let recorded_built_no_result = "/nix/store/r5555555555555555555555555555555-e.drv";
+        let unrecorded_failed = "/nix/store/r6666666666666666666666666666666-f.drv";
+
+        let mut builds = HashMap::new();
+        for (drv, status) in [
+            (recorded_built_failed, prod_status::BUILT),
+            (recorded_failed_failed, 1),
+            (recorded_disconnect_failed, prod_status::CLIENT_DISCONNECT),
+            (recorded_built_succeeded, prod_status::BUILT),
+            (recorded_built_no_result, prod_status::BUILT),
+        ] {
+            builds.insert(
+                (session, drv.to_string()),
+                build_record(session, drv, status, None),
+            );
+        }
+        let request = ReplayRequest {
+            ssh_session_id: session,
+            offset_s: 0.0,
+            paths: [
+                recorded_built_failed,
+                recorded_failed_failed,
+                recorded_disconnect_failed,
+                recorded_built_succeeded,
+                recorded_built_no_result,
+                unrecorded_failed,
+            ]
+            .iter()
+            .map(|drv| (drv.to_string(), vec!["out".to_string()]))
+            .collect(),
+        };
+        let failed = || Some(BuildResult::failure(BuildStatus::PermanentFailure, "boom"));
+        let results = vec![
+            derived_outcome(recorded_built_failed, failed()),
+            derived_outcome(recorded_failed_failed, failed()),
+            derived_outcome(recorded_disconnect_failed, failed()),
+            derived_outcome(recorded_built_succeeded, Some(BuildResult::success())),
+            derived_outcome(recorded_built_no_result, None),
+            derived_outcome(unrecorded_failed, failed()),
+        ];
+
+        // Only the recorded-success drv whose replay actually failed is a
+        // confirmation candidate.
+        assert_eq!(regression_positions(&builds, &request, &results), vec![0]);
+
+        // Nothing to confirm when every replay result matches or is absent.
+        let all_clear = vec![
+            derived_outcome(recorded_built_failed, Some(BuildResult::success())),
+            derived_outcome(recorded_failed_failed, failed()),
+        ];
+        let request_clear = ReplayRequest {
+            ssh_session_id: session,
+            offset_s: 0.0,
+            paths: vec![
+                (recorded_built_failed.to_string(), vec!["out".to_string()]),
+                (recorded_failed_failed.to_string(), vec!["out".to_string()]),
+            ],
+        };
+        assert!(regression_positions(&builds, &request_clear, &all_clear).is_empty());
+    }
+
+    #[test]
+    fn build_timeout_scales_clamps_and_falls_back() {
+        let cfg = TimelineConfig::default();
+        let session = 7_i64;
+        let drv_a = "/nix/store/t1111111111111111111111111111111-a.drv";
+        let drv_b = "/nix/store/t2222222222222222222222222222222-b.drv";
+
+        let single = |duration: Option<f64>| {
+            let mut builds = HashMap::new();
+            builds.insert(
+                (session, drv_a.to_string()),
+                build_record(session, drv_a, prod_status::BUILT, duration),
+            );
+            build_timeout_for(&builds, &request(session, 0.0, drv_a), &cfg)
+        };
+
+        // Twice the recorded duration when that lands between the bounds.
+        assert_eq!(single(Some(1800.0)), Duration::from_secs(3600));
+        // Short recorded builds clamp up to the floor…
+        assert_eq!(single(Some(4.2)), cfg.build_timeout_floor);
+        // …massive ones clamp down to the cap…
+        assert_eq!(single(Some(100_000.0)), cfg.build_timeout_cap);
+        // …and a record without a duration falls back to the floor,
+        assert_eq!(single(None), cfg.build_timeout_floor);
+        // as does a request with no matching record at all.
+        assert_eq!(
+            build_timeout_for(&HashMap::new(), &request(session, 0.0, drv_a), &cfg),
+            cfg.build_timeout_floor
+        );
+
+        // Several derived paths: the slowest recorded duration wins.
+        let mut builds = HashMap::new();
+        builds.insert(
+            (session, drv_a.to_string()),
+            build_record(session, drv_a, prod_status::BUILT, Some(900.0)),
+        );
+        builds.insert(
+            (session, drv_b.to_string()),
+            build_record(session, drv_b, prod_status::BUILT, Some(2000.0)),
+        );
+        let request = ReplayRequest {
+            ssh_session_id: session,
+            offset_s: 0.0,
+            paths: vec![
+                (drv_a.to_string(), vec!["out".to_string()]),
+                (drv_b.to_string(), vec!["out".to_string()]),
+            ],
+        };
+        assert_eq!(
+            build_timeout_for(&builds, &request, &cfg),
+            Duration::from_secs(4000)
+        );
     }
 }
