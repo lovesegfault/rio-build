@@ -255,6 +255,15 @@ impl ActorHandle {
     /// dispatch's backoff + failed_builders exclusion. For retry/poison
     /// tests that drive multiple completion cycles. Returns `false` if
     /// the derivation couldn't be forced (terminal state, not found).
+    ///
+    /// CAVEAT: this is a reset+reassign shortcut, not a real dispatch —
+    /// it clears `state.exec_id` (via `reset_to_ready`) without minting
+    /// a new one. A test that force-assigns and then asserts on
+    /// exec-keyed terminal writes (`drv_executions`, the
+    /// `build_derivations.exec_id` correlation, log finalization)
+    /// silently exercises the no-carrier early-return instead of the
+    /// path it means to test. For those, merge against a connected idle
+    /// worker and let `dispatch_ready` perform the real assignment.
     pub async fn debug_force_assign(
         &self,
         drv_hash: &str,

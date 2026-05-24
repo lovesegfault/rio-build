@@ -106,7 +106,8 @@ const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 /// state-transition events (`r[gw.activity.stop-parity]`).
 pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 
-/// `Event::Log` broadcast ring size, per build. Separate from
+/// Display-only broadcast ring size, per build (`Event::Log` +
+/// `Event::SubstituteProgress`). Separate from
 /// [`BUILD_EVENT_BUFFER_SIZE`] so chatty parallel builds (chromium /
 /// firefox / rustc at ~20 batches/s each) cannot lag the state-event
 /// channel and drop `DerivationEvent::Completed`. The Apr-7 large-shallow
@@ -114,6 +115,20 @@ pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 /// `Lagged` skip-and-continue silently dropped 10 completions. Log loss
 /// is acceptable (S3 + AdminService is the authoritative path); state
 /// loss is not.
+///
+/// After the build-log data-plane cutover this ring carries ONLY
+/// `Event::SubstituteProgress` (display-only, sequence-reusing, never
+/// persisted): `Event::Log` stops being produced when builders stream
+/// log batches to rio-store instead of the scheduler, and the variant +
+/// its emit site are deleted with the rest of the in-scheduler log
+/// subsystem. **Do not delete this ring, `log_channels`, or the
+/// log half of `bridge_build_events` when deleting `Event::Log`** —
+/// substitute download progress bars (`r[gw.activity.subst-progress]`)
+/// ride the same ring and survive the cutover. The only shared code is
+/// the `display_only` `matches!` in `EventHub::emit`, which loses its
+/// `Event::Log(_)` arm. The 1024 size was chosen for log volume and
+/// becomes generous (SubstituteProgress is throttled per-path); it is
+/// not worth shrinking.
 pub(crate) const LOG_EVENT_BUFFER_SIZE: usize = 1024;
 
 /// Default cap on concurrent detached substitute-fetch tasks: an
@@ -1045,6 +1060,7 @@ impl DagActor {
                     node_name,
                     hw_class,
                     final_resources,
+                    final_line_count,
                 } => {
                     // r[impl sched.lease.standby-drops-writes]
                     // Defense-in-depth under the stream-reader's
@@ -1064,7 +1080,7 @@ impl DagActor {
                             result,
                             (peak_memory_bytes, peak_cpu_cores),
                             (node_name, hw_class),
-                            final_resources,
+                            (final_resources, final_line_count),
                         )
                         .await;
                     }

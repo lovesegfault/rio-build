@@ -611,7 +611,10 @@ impl DagActor {
             .node(drv_hash)
             .is_some_and(|s| self.has_buffered_exec_log(s))
         {
-            self.terminal_log_epilogue(drv_hash, "cancelled", interested_builds);
+            // No CompletionReport on the cancel path → no
+            // final_line_count → the row reads as incomplete (correct:
+            // a cancelled execution's log is truncated).
+            self.terminal_log_epilogue(drv_hash, "cancelled", interested_builds, None);
         }
     }
 
@@ -918,6 +921,13 @@ impl DagActor {
         drv_hash: &DrvHash,
         status: &'static str,
         interested_builds: &[Uuid],
+        // `CompletionReport.final_line_count` for the terminal paths
+        // that have a report (success today; failure/cancel/recovery
+        // pass `None`). `None` ⇒ `drv_executions.final_line_count`
+        // stays NULL ⇒ the store's completeness predicate reads the
+        // execution as incomplete — the conservative direction (never
+        // falsely claim a log is complete).
+        final_line_count: Option<i64>,
     ) {
         let Some(state) = self.dag.node(drv_hash) else {
             // Should be impossible at this call site (terminal handlers
@@ -988,6 +998,76 @@ impl DagActor {
             );
         }
         self.record_exec_correlation(drv_hash, exec_id, interested_builds);
+        self.stamp_drv_execution_terminal(drv_hash, exec_id, status, final_line_count);
+    }
+
+    /// Stamp the `drv_executions` lifecycle row terminal. Fire-and-forget
+    /// from the sync terminal chokepoint (the [`Self::record_exec_correlation`]
+    /// pattern): the actor must not block on PG in the completion path, and
+    /// a failed stamp degrades exactly one thing — the store's completeness
+    /// predicate keeps reading this execution as still-running until the
+    /// 30-day TTL — which is the same observable state as "the stamp hasn't
+    /// landed yet".
+    ///
+    /// The incoming `status` is `terminal_log_epilogue`'s `&'static str`
+    /// vocabulary (`"succeeded"` / `"failed"` / `"cancelled"`). It is
+    /// re-mapped onto the [`rio_migrations::schema`] `EXEC_STATUS_*`
+    /// constants rather than written through verbatim so that the value the
+    /// store's `EXEC_STATUS_TERMINAL.contains(..)` test sees can never
+    /// drift from the value this function writes — if the epilogue ever
+    /// grows a fourth status string, the match below fails loudly instead
+    /// of silently writing a vocabulary the predicate doesn't recognize.
+    ///
+    /// `AND status IS NULL` keeps the stamp monotone: a second terminal
+    /// event for the same execution (a completion racing a cancellation)
+    /// cannot overwrite the first verdict.
+    fn stamp_drv_execution_terminal(
+        &self,
+        drv_hash: &DrvHash,
+        exec_id: Uuid,
+        status: &'static str,
+        final_line_count: Option<i64>,
+    ) {
+        use rio_migrations::schema::{
+            EXEC_STATUS_CANCELLED, EXEC_STATUS_FAILED, EXEC_STATUS_SUCCEEDED,
+        };
+        let exec_status = match status {
+            "succeeded" => EXEC_STATUS_SUCCEEDED,
+            "failed" => EXEC_STATUS_FAILED,
+            "cancelled" => EXEC_STATUS_CANCELLED,
+            other => {
+                tracing::error!(
+                    drv_hash = %drv_hash,
+                    exec_id = %exec_id,
+                    status = other,
+                    "terminal_log_epilogue called with a status outside the \
+                     drv_executions vocabulary; lifecycle row left unstamped"
+                );
+                return;
+            }
+        };
+        let pool = self.db.pool().clone();
+        rio_common::task::spawn_monitored("drv-execution-terminal", async move {
+            if let Err(e) = sqlx::query(
+                "UPDATE drv_executions \
+                 SET status = $2, finished_at = now(), final_line_count = $3 \
+                 WHERE exec_id = $1 AND status IS NULL",
+            )
+            .bind(exec_id)
+            .bind(exec_status)
+            .bind(final_line_count)
+            .execute(&pool)
+            .await
+            {
+                warn!(
+                    exec_id = %exec_id,
+                    status = exec_status,
+                    error = %e,
+                    "drv_executions terminal stamp failed (best-effort; the \
+                     execution reads as still-running until the TTL sweep)"
+                );
+            }
+        });
     }
 
     /// Seal the log ring buffer for `drv_hash` so late `LogBatch`

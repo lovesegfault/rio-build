@@ -565,9 +565,9 @@ async fn epilogue_marks_enqueued_final_pending_and_cleanup_preserves_it() -> Tes
     }
 
     // A's epilogue: seal + enqueue (fills the only slot) → marked pending.
-    actor.terminal_log_epilogue(&DrvHash::from("r15qa"), "succeeded", &[build_id]);
+    actor.terminal_log_epilogue(&DrvHash::from("r15qa"), "succeeded", &[build_id], None);
     // B's epilogue: seal + enqueue fails (channel full) → NOT marked.
-    actor.terminal_log_epilogue(&DrvHash::from("r15qb"), "succeeded", &[build_id]);
+    actor.terminal_log_epilogue(&DrvHash::from("r15qb"), "succeeded", &[build_id], None);
 
     assert!(
         bufs.final_pending(path_a),

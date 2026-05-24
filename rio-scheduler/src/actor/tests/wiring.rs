@@ -232,6 +232,7 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;

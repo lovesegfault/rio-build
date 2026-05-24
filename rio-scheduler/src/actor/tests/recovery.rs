@@ -3259,6 +3259,7 @@ async fn ex_leader_drops_process_completion() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;

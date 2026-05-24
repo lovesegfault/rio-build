@@ -830,6 +830,7 @@ async fn built_outputs_membership_filter() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;
@@ -2393,6 +2394,7 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;
@@ -2468,6 +2470,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;
@@ -2529,6 +2532,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;
@@ -2625,6 +2629,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
             peak_cpu_cores: 1.5,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;
@@ -2711,6 +2716,7 @@ async fn test_completion_writes_hw_class_and_intent_cores() -> TestResult {
             hw_class: Some("aws-7-ebs".into()),
             // Cgroup says 99 cores — the intent-miss case where the pod
             // is bigger than the solve. Stored value must be `assigned`.
+            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_limit_cores: Some(99.0),
                 ..Default::default()
@@ -2773,6 +2779,7 @@ async fn test_completion_writes_hw_class_and_intent_cores() -> TestResult {
             peak_cpu_cores: 1.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_limit_cores: Some(cgroup2),
                 ..Default::default()
@@ -2880,6 +2887,7 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: None,
         })
         .await?;
@@ -2964,6 +2972,7 @@ async fn test_completion_infinite_peak_cpu_recorded_as_null() -> TestResult {
             peak_cpu_cores: f64::INFINITY,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_limit_cores: Some(f64::INFINITY),
                 cpu_seconds_total: Some(0.0),
@@ -3063,6 +3072,7 @@ async fn test_completion_nonfinite_final_resources_recorded_as_null() -> TestRes
             peak_cpu_cores: f64::NAN,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_limit_cores: Some(-3.0),
                 cpu_seconds_total: Some(f64::INFINITY),
@@ -3164,6 +3174,7 @@ async fn test_completion_out_of_domain_final_resources_recorded_as_null() -> Tes
             peak_cpu_cores: 5000.0,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_limit_cores: Some(0.0),
                 cpu_seconds_total: Some(-1.0),
@@ -3247,6 +3258,7 @@ async fn test_completion_valid_final_resources_round_trip() -> TestResult {
             peak_cpu_cores: 1.5,
             node_name: None,
             hw_class: None,
+            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_seconds_total: Some(12.5),
                 peak_io_pressure_pct: Some(42.5),
@@ -4117,7 +4129,7 @@ async fn flush_falls_back_to_buffer_exec_id_after_reset_to_ready() -> TestResult
     // trigger_log_flush). Pre-fix the resolution early-returned on
     // `state.exec_id == None`; post-fix it falls back to the buffer's
     // stamp and threads the value to the flush.
-    actor.terminal_log_epilogue(&DrvHash::from("fb-drv"), "failed", &[]);
+    actor.terminal_log_epilogue(&DrvHash::from("fb-drv"), "failed", &[], None);
 
     let req = flush_rx.try_recv().expect(
         "the epilogue's resolution should fall back to the LogBuffers \
@@ -4180,7 +4192,7 @@ async fn epilogue_skips_never_dispatched_drv() -> TestResult {
 
     // `interested_builds` deliberately non-empty so the correlate skip is
     // attributable to the exec_id gate, not the `is_empty()` early-return.
-    actor.terminal_log_epilogue(&DrvHash::from("nd-drv"), "failed", &[Uuid::new_v4()]);
+    actor.terminal_log_epilogue(&DrvHash::from("nd-drv"), "failed", &[Uuid::new_v4()], None);
 
     // (1) No FlushRequest. Also proves no bd.exec_id UPDATE was issued:
     // flush and correlate are gated by the same single resolution, so a
@@ -4278,7 +4290,7 @@ async fn exec_correlation_falls_back_to_buffer_exec_id() -> TestResult {
 
     // Drive the full epilogue. Pre-fix the per-step resolution
     // early-returned on `state.exec_id == None`, no UPDATE.
-    actor.terminal_log_epilogue(&DrvHash::from("ec-fb-drv"), "failed", &[build_id]);
+    actor.terminal_log_epilogue(&DrvHash::from("ec-fb-drv"), "failed", &[build_id], None);
 
     // Poll PG: the exec-correlation write is spawned (fire-and-forget).
     // Established 10ms × 100 pattern (see helpers::wait_for_status).
@@ -4632,6 +4644,367 @@ async fn cascade_finalizes_reset_ancestor_exec_log() -> TestResult {
         Some(exec_id),
         "cascade must record bd.exec_id for a swept ancestor's \
          observed execution, against the ancestor's own interested set"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// drv_executions lifecycle (harden-logs commit 3)
+//
+// One row per execution attempt: INSERTed by `record_assignment` at
+// dispatch, stamped terminal by `terminal_log_epilogue`. rio-store's
+// latest-exec resolution and log-completeness predicate read it; the
+// gateway keys its TailLog subscription on the `exec_id` the Started
+// event carries. These five tests pin the row's full lifecycle plus
+// the two NULL-vs-value subtleties (`status IS NULL` = still running;
+// `final_line_count IS NULL` = count not reported).
+// ---------------------------------------------------------------------------
+
+/// The `drv_executions` row a successful dispatch creates: keyed by the
+/// `drv_log_hash()` 32-char form of the *path* (not the DAG key), the
+/// assigned executor, a non-NULL `started_at`, and — until the
+/// execution terminates — a NULL `status` and NULL `final_line_count`.
+#[tokio::test]
+async fn dispatch_inserts_drv_executions_row() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("dexe-w", "x86_64-linux").await?;
+    let drv_hash = "dexe-drv";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    // The merge auto-dispatches to the connected idle worker
+    // (dispatch_ready runs at the end of MergeDag). Do NOT
+    // debug_force_assign here: it is a reset+reassign shortcut that
+    // clears the exec_id the real dispatch minted without minting a
+    // new one.
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Assigned,
+        "the merge must auto-dispatch to the idle worker"
+    );
+    barrier(&handle).await;
+
+    // The column holds drv_log_hash(<full drv path>) — the same value
+    // the logs/{hash}/… S3 keys use — so a store-side reader that
+    // normalizes its argument through the same helper finds this row.
+    let expected_hash = rio_nix::store_path::drv_log_hash(&test_drv_path(drv_hash));
+    let row: Option<(String, String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT drv_hash, executor_id, status, final_line_count \
+         FROM drv_executions WHERE drv_hash = $1",
+    )
+    .bind(&expected_hash)
+    .fetch_optional(&db.pool)
+    .await?;
+    let (got_hash, got_exec, got_status, got_count) =
+        row.expect("dispatch must insert a drv_executions row");
+    assert_eq!(got_hash, expected_hash);
+    assert_eq!(got_exec, "dexe-w");
+    assert_eq!(
+        got_status, None,
+        "a still-running execution's status must be NULL (the store's \
+         completeness predicate reads NULL as not-terminal)"
+    );
+    assert_eq!(
+        got_count, None,
+        "final_line_count is unknown until the CompletionReport arrives"
+    );
+    Ok(())
+}
+
+/// The terminal stamp: `status` becomes the EXEC_STATUS_* vocabulary's
+/// "succeeded" (NOT `assignments.status`'s "completed"), `finished_at`
+/// is set, and the report's `final_line_count` lands as-is.
+#[tokio::test]
+async fn terminal_stamps_drv_executions() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("texe-w", "x86_64-linux").await?;
+    let drv_hash = "texe-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    // The merge auto-dispatches to the connected idle worker
+    // (dispatch_ready runs at the end of MergeDag). Do NOT
+    // debug_force_assign here: it is a reset+reassign shortcut that
+    // clears the exec_id the real dispatch minted without minting a
+    // new one.
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Assigned,
+        "the merge must auto-dispatch to the idle worker"
+    );
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "texe-w".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("texe-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            node_name: None,
+            hw_class: None,
+            final_line_count: 405,
+            final_resources: None,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // The stamp is fire-and-forget (spawn_monitored) — poll PG.
+    // Established 10ms × 100 pattern.
+    let key = rio_nix::store_path::drv_log_hash(&drv_path);
+    let mut row: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
+    for _ in 0..100 {
+        row = sqlx::query_as(
+            "SELECT status, final_line_count, \
+             EXTRACT(EPOCH FROM finished_at)::bigint \
+             FROM drv_executions WHERE drv_hash = $1",
+        )
+        .bind(&key)
+        .fetch_optional(&db.pool)
+        .await?;
+        if matches!(&row, Some((Some(_), _, _))) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, count, finished_at) = row.expect("the dispatch-time row must exist");
+    assert_eq!(
+        status.as_deref(),
+        Some(rio_migrations::schema::EXEC_STATUS_SUCCEEDED),
+        "the terminal stamp must use the EXEC_STATUS_* vocabulary"
+    );
+    assert_eq!(
+        count,
+        Some(405),
+        "the report's final_line_count lands verbatim"
+    );
+    assert!(
+        finished_at.is_some(),
+        "finished_at must be stamped alongside status"
+    );
+    Ok(())
+}
+
+/// An unusable `CompletionReport.final_line_count` must land as SQL
+/// NULL ("not reported"), never as a literal value. Two unusable
+/// shapes:
+///
+/// - `0` — the proto's "not reported" sentinel (an old executor, or
+///   the count died with the build task). A literal 0 would tell the
+///   store's completeness predicate "a zero-line log is complete".
+/// - `> i64::MAX` — only a hostile or broken worker sends this. A
+///   wrapping `as i64` cast would write a NEGATIVE count, which the
+///   store's contiguity fold (`covered` starts at 0; complete ⇔
+///   `covered >= count`) reads as vacuously complete with an EMPTY
+///   manifest — sealing the log against any further append with zero
+///   chunks stored.
+#[tokio::test]
+async fn terminal_with_zero_line_count_writes_null() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    for (tag, reported_count) in [("zexe-zero", 0u64), ("zexe-overflow", u64::MAX)] {
+        // A fresh worker per case: an executor that has completed a
+        // build is excluded from re-dispatch
+        // (sched.ephemeral.no-redispatch-after-completion), so a single
+        // worker would leave the second case's node stuck at Ready.
+        let worker = format!("{tag}-w");
+        let _rx = connect_executor(&handle, &worker, "x86_64-linux").await?;
+        let drv_path = test_drv_path(tag);
+        let _ev = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
+        // The merge auto-dispatches to the connected idle worker
+        // (dispatch_ready runs at the end of MergeDag). Do NOT
+        // debug_force_assign here: it is a reset+reassign shortcut that
+        // clears the exec_id the real dispatch minted without minting a
+        // new one.
+        barrier(&handle).await;
+        assert_eq!(
+            expect_drv(&handle, tag).await.status,
+            DerivationStatus::Assigned,
+            "the merge must auto-dispatch {tag} to the idle worker"
+        );
+
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                executor_id: worker.as_str().into(),
+                drv_key: drv_path.clone(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    built_outputs: vec![rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: test_store_path(&format!("{tag}-out")),
+                        output_hash: vec![0u8; 32],
+                    }],
+                    ..Default::default()
+                },
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_line_count: reported_count,
+                final_resources: None,
+            })
+            .await?;
+        barrier(&handle).await;
+
+        let key = rio_nix::store_path::drv_log_hash(&drv_path);
+        let mut row: Option<(Option<String>, Option<i64>)> = None;
+        for _ in 0..100 {
+            row = sqlx::query_as(
+                "SELECT status, final_line_count FROM drv_executions WHERE drv_hash = $1",
+            )
+            .bind(&key)
+            .fetch_optional(&db.pool)
+            .await?;
+            if matches!(&row, Some((Some(_), _))) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (status, count) = row.expect("the dispatch-time row must exist");
+        assert_eq!(status.as_deref(), Some("succeeded"), "{tag}");
+        assert_eq!(
+            count, None,
+            "final_line_count = {reported_count} in the report is unusable \
+             and must become SQL NULL — never a literal 0 and never a \
+             wrapped negative"
+        );
+    }
+    Ok(())
+}
+
+/// The terminal stamp is monotone: `AND status IS NULL` means the first
+/// verdict wins. A second terminal for the same execution (a completion
+/// racing a cancellation) must not overwrite the first.
+#[tokio::test]
+async fn second_terminal_does_not_overwrite() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing::default(),
+    );
+
+    // A node with a stamped exec_id, exactly as assign_to_worker leaves
+    // it. The drv_executions row is seeded directly (the dispatch-time
+    // INSERT is dispatch_inserts_drv_executions_row's subject; this
+    // test isolates the UPDATE's monotone guard).
+    let drv_hash = "mono-drv";
+    let drv_path = test_drv_path(drv_hash);
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        drv_path: drv_path.clone(),
+        ..crate::db::RecoveryDerivationRow::test_default(drv_hash, "x86_64-linux")
+    });
+    let exec_id = Uuid::now_v7();
+    actor.dag.node_mut(drv_hash).expect("just injected").exec_id = Some(exec_id);
+    let key = rio_nix::store_path::drv_log_hash(&drv_path);
+    sqlx::query(
+        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at) \
+         VALUES ($1, $2, 'mono-w', now())",
+    )
+    .bind(exec_id)
+    .bind(&key)
+    .execute(&db.pool)
+    .await?;
+
+    // First verdict: succeeded with a real line count.
+    actor.terminal_log_epilogue(&DrvHash::from(drv_hash), "succeeded", &[], Some(10));
+    // Second verdict (a racing cancel): must be a no-op on the row.
+    actor.terminal_log_epilogue(&DrvHash::from(drv_hash), "cancelled", &[], None);
+
+    // Both stamps are fire-and-forget; poll until the FIRST lands, then
+    // give the second a beat to (incorrectly) land before asserting.
+    for _ in 0..100 {
+        let stamped: Option<String> =
+            sqlx::query_scalar("SELECT status FROM drv_executions WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        if stamped.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (status, count): (Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT status, final_line_count FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        status.as_deref(),
+        Some("succeeded"),
+        "the first terminal verdict must win (AND status IS NULL guard)"
+    );
+    assert_eq!(
+        count,
+        Some(10),
+        "the second verdict must not NULL out the first's final_line_count"
+    );
+    Ok(())
+}
+
+/// The DerivationStarted event carries the execution's exec_id — the
+/// value the gateway keys its per-execution TailLog subscription on.
+/// It must be the SAME execution the drv_executions row records, or the
+/// gateway subscribes to a log no writer is producing.
+#[tokio::test]
+async fn started_event_carries_exec_id() -> TestResult {
+    use rio_proto::types::build_event::Event;
+
+    let (db, handle, _task, _rx) = setup_with_worker("sexe-w", "x86_64-linux").await?;
+    let drv_hash = "sexe-drv";
+    let mut events =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    // The merge auto-dispatches to the connected idle worker
+    // (dispatch_ready runs at the end of MergeDag). Do NOT
+    // debug_force_assign here: it is a reset+reassign shortcut that
+    // clears the exec_id the real dispatch minted without minting a
+    // new one.
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Assigned,
+        "the merge must auto-dispatch to the idle worker"
+    );
+
+    // Drain until the DrvStarted event.
+    let started_exec_id = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("event within 5s")?;
+        match ev.event {
+            Some(Event::Derivation(d))
+                if d.kind() == rio_proto::types::DerivationEventKind::Started =>
+            {
+                break d.exec_id;
+            }
+            _ => {}
+        }
+    };
+    assert!(
+        !started_exec_id.is_empty(),
+        "DerivationStarted must carry the execution's exec_id"
+    );
+    let event_uuid = Uuid::parse_str(&started_exec_id)
+        .expect("the Started event's exec_id must be a well-formed UUID");
+
+    // Cross-check: the event names the same execution the lifecycle row
+    // records. (UUIDv7 — minted by this dispatch, not a stale one.)
+    let key = rio_nix::store_path::drv_log_hash(&test_drv_path(drv_hash));
+    let row_exec: Uuid =
+        sqlx::query_scalar("SELECT exec_id FROM drv_executions WHERE drv_hash = $1")
+            .bind(&key)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        event_uuid, row_exec,
+        "the Started event and the drv_executions row must name the same execution"
     );
     Ok(())
 }

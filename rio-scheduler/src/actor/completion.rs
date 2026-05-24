@@ -679,9 +679,13 @@ impl DagActor {
         // — both are pod-identity stamps that flow straight to
         // build_samples; bundling stays under clippy's 7-arg limit.
         (node_name, hw_class): (Option<String>, Option<String>),
-        // CompletionReport.final_resources — builder's last cgroup-poll
-        // snapshot. Feeds build_samples ADR-023 columns. None = old executor.
-        final_resources: Option<rio_proto::types::ResourceUsage>,
+        // CompletionReport's final-state metadata, tupled to stay under
+        // clippy's 7-arg limit. `final_resources` — builder's last
+        // cgroup-poll snapshot, feeds build_samples ADR-023 columns,
+        // None = old executor. `final_line_count` — total log lines
+        // emitted, feeds `drv_executions.final_line_count` at terminal,
+        // 0 = not reported.
+        (final_resources, final_line_count): (Option<rio_proto::types::ResourceUsage>, u64),
     ) {
         // Arch#13: proto→domain at the actor boundary. Status
         // normalization (raw i32 → enum, unknown → Unspecified) happens
@@ -893,7 +897,7 @@ impl DagActor {
                     executor_id,
                     (peak_memory_bytes, peak_cpu_cores),
                     (node_name, hw_class),
-                    final_resources,
+                    (final_resources, final_line_count),
                 )
                 .await;
             }
@@ -979,7 +983,7 @@ impl DagActor {
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
         (node_name, hw_class): (Option<String>, Option<String>),
-        final_resources: Option<rio_proto::types::ResourceUsage>,
+        (final_resources, final_line_count): (Option<rio_proto::types::ResourceUsage>, u64),
     ) {
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
         let t_total = std::time::Instant::now();
@@ -1127,7 +1131,22 @@ impl DagActor {
         // separate task), so AdminService.GetDerivationLogs can serve
         // from the ring buffer in the gap before the S3 upload lands.
         // r[impl sched.merge.exec-correlation+7]
-        self.terminal_log_epilogue(drv_hash, "succeeded", &interested_builds);
+        // 0 → None: the proto's "not reported" sentinel must become SQL
+        // NULL, not a literal 0 — the store's completeness predicate
+        // treats NULL as "can't judge yet" but 0 as "a zero-line log is
+        // complete". try_from, NOT `as`: the count is a worker-supplied
+        // u64, and a wrapping cast of a value > i64::MAX writes a
+        // NEGATIVE count — which the store's contiguity fold (`covered
+        // starts at 0; complete ⇔ covered >= count`) reads as vacuously
+        // complete with an EMPTY manifest, sealing the log against any
+        // further append. Out of range degrades to None ("not
+        // reported"), the same as every other unusable report field.
+        self.terminal_log_epilogue(
+            drv_hash,
+            "succeeded",
+            &interested_builds,
+            i64::try_from(final_line_count).ok().filter(|n| *n > 0),
+        );
         let _ = &mut t_phase;
         let total = t_total.elapsed();
         // IA-branch parity with the CA `info!` in `ca_insert_realisations`:
@@ -1975,7 +1994,15 @@ impl DagActor {
         // execution into the cascade.
         // r[impl sched.merge.exec-correlation+7]
         let trigger_builds = self.get_interested_builds(drv_hash);
-        self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds);
+        // `None`: this epilogue is reached from poison / retry-budget
+        // exhaustion / permanent failure, where the triggering
+        // CompletionReport (if there even was one — timeouts have
+        // none) is not threaded this far. The row reads as incomplete,
+        // which is the conservative direction for a failed build's
+        // log. Threading the report's final_line_count through the
+        // failure cascade is a possible follow-up if "(log
+        // incomplete)" on fully-uploaded failure logs proves annoying.
+        self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds, None);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {
             // r[impl gw.activity.progress-before-stop]

@@ -144,7 +144,10 @@ impl DagActor {
             // so the worker's late `rio: result cancelled` footer is
             // dropped — see terminal_log_epilogue's sequencing note.
             // r[impl sched.merge.exec-correlation+7]
-            self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id]);
+            // No CompletionReport on the cancel path → final_line_count
+            // stays NULL → the row reads as incomplete (correct: a
+            // cancelled execution's log is truncated).
+            self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id], None);
             transitioned.push(drv_hash.as_str());
             let Some(executor_id) = executor_id else {
                 continue;

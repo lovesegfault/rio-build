@@ -2171,6 +2171,29 @@ impl DagActor {
                    "failed to insert assignment record");
         }
 
+        // Lifecycle row for the log subsystem (rio-store's latest-exec
+        // resolution + completeness predicate read it; the terminal
+        // stamp lands in `terminal_log_epilogue`). Keyed by the
+        // `drv_log_hash()` 32-char form of the *path* — the same value
+        // the `drv_logs` row and the `logs/{hash}/…` S3 keys use — not
+        // the DAG key. Best-effort: a missing row degrades the
+        // unpinned-read latest-exec lookup for this execution, it does
+        // not affect the build. Written BEFORE the WorkAssignment send
+        // (same crash-consistency argument as `insert_assignment`
+        // above); `rollback_assignment` deletes it if the send fails.
+        if let Some(log_hash) = self
+            .dag
+            .path_for_hash(drv_hash)
+            .map(rio_nix::store_path::drv_log_hash)
+            && let Err(e) = self
+                .db
+                .insert_drv_execution(exec_id, &log_hash, executor_id)
+                .await
+        {
+            error!(drv_hash = %drv_hash, exec_id = %exec_id, error = %e,
+                   "failed to insert drv_executions lifecycle row");
+        }
+
         // has_capacity() (running_build.is_none()) was checked by
         // hard_filter, so this never overwrites a live assignment.
         if let Some(worker) = self.executors.get_mut(executor_id) {
@@ -2254,6 +2277,9 @@ impl DagActor {
         // lines) but never reap. Idempotent; the entry is empty (the
         // worker never started streaming because try_send failed).
         self.discard_log_buffer(drv_hash);
+        // Capture the exec_id BEFORE reset_to_ready clears it — the
+        // drv_executions cleanup at the bottom needs it.
+        let rolled_back_exec = self.dag.node(drv_hash).and_then(|s| s.exec_id);
         // Assigned -> Ready. Caller (dispatch_ready) defers; next pass
         // retries. `reset_to_ready` also clears `exec_id`.
         if let Some(state) = self.dag.node_mut(drv_hash)
@@ -2293,6 +2319,17 @@ impl DagActor {
             warn!(drv_hash = %drv_hash, error = %e,
                   "delete_latest_assignment failed during try_send rollback");
         }
+        //   - delete_drv_execution: insert_drv_execution wrote a
+        //     lifecycle row; the worker never ran this execution, so
+        //     leaving it would read as "still running" until the TTL
+        //     sweep (and it can never be stamped terminal — no
+        //     completion will ever arrive for it).
+        if let Some(exec_id) = rolled_back_exec
+            && let Err(e) = self.db.delete_drv_execution(exec_id).await
+        {
+            warn!(drv_hash = %drv_hash, exec_id = %exec_id, error = %e,
+                  "delete_drv_execution failed during try_send rollback");
+        }
         // Was Assigned (counted in running), now Ready (queued).
         for build_id in self.get_interested_builds(drv_hash) {
             self.emit_progress(build_id);
@@ -2303,6 +2340,20 @@ impl DagActor {
     /// `DerivationStarted` + progress to interested gateways.
     fn emit_assignment_started(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
         let drv_path = self.dag.path_or_hash_fallback(drv_hash);
+        // The execution this dispatch minted (`assign_to_worker` set
+        // `state.exec_id = Some(..)` before calling here). The gateway
+        // keys its per-execution TailLog subscription on this; a
+        // duplicate Started carrying a *different* exec_id tells it the
+        // derivation was re-dispatched and the old subscription is
+        // stale. Empty only on the unreachable node-vanished race
+        // (the event is then display-only noise for an already-dead
+        // derivation).
+        let exec_id = self
+            .dag
+            .node(drv_hash)
+            .and_then(|s| s.exec_id)
+            .map(|id| id.to_string())
+            .unwrap_or_default();
         for build_id in self.get_interested_builds(drv_hash) {
             self.events.emit(
                 build_id,
@@ -2310,10 +2361,7 @@ impl DagActor {
                     rio_proto::types::DerivationEvent::started(
                         drv_path.clone(),
                         executor_id.to_string(),
-                        // TODO: thread the real exec_id from assignment state
-                        // (harden-logs commit 3); the gateway keys its TailLog
-                        // subscriptions on it from commit 4.
-                        String::new(),
+                        exec_id.clone(),
                     ),
                 ),
             );

@@ -455,6 +455,17 @@ impl ExecutorService for SchedulerGrpc {
                                         .filter(|s| s.len() <= MAX_IDENT_LEN),
                                     hw_class: report.hw_class.filter(|s| s.len() <= MAX_IDENT_LEN),
                                     final_resources: report.final_resources,
+                                    // Worker-supplied u64, passed through
+                                    // raw. The actor's DB write is the
+                                    // bound: 0 and anything that does not
+                                    // fit in an i64 both degrade to SQL
+                                    // NULL ("not reported") via
+                                    // i64::try_from — never a wrapping
+                                    // cast, which would write a negative
+                                    // count the store's completeness
+                                    // predicate reads as vacuously
+                                    // satisfied.
+                                    final_line_count: report.final_line_count,
                                 })
                                 .await
                                 .is_err()

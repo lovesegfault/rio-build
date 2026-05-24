@@ -22,6 +22,7 @@ mod assignments;
 mod batch;
 mod builds;
 mod derivations;
+mod executions;
 mod history;
 mod live_pins;
 mod recovery;

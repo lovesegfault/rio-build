@@ -2226,7 +2226,11 @@ impl DagActor {
         // `terminal_log_epilogue`'s caller-list entry for the
         // fresh-standby empty-drain shape and the never-dispatched
         // self-gate.
-        self.terminal_log_epilogue(drv_hash, "succeeded", &interested);
+        // The adopted completion's CompletionReport (and its
+        // final_line_count) belonged to the interim leader's stream —
+        // this leader never saw it. NULL → the row reads as incomplete,
+        // which a recovered-across-failover log generally is.
+        self.terminal_log_epilogue(drv_hash, "succeeded", &interested, None);
         // Terminal → unpin. sweep_stale_live_pins ran BEFORE
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.

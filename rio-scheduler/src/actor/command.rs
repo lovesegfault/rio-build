@@ -133,6 +133,15 @@ pub enum ActorCommand {
         /// `peak_io_pressure_pct`, `peak_disk_bytes`) for the
         /// `build_samples` insert. `None` = old executor.
         final_resources: Option<rio_proto::types::ResourceUsage>,
+        /// `CompletionReport.final_line_count`: total log lines the
+        /// execution emitted (header + body + footer — the worker
+        /// line-number high-water mark after the footer). 0 = not
+        /// reported (old executor / the count died with the build
+        /// task). Stamped onto `drv_executions.final_line_count`
+        /// (0 → SQL NULL) at terminal; rio-store's log completeness
+        /// predicate is "the chunk manifest covers a contiguous
+        /// `[0, final_line_count)`".
+        final_line_count: u64,
     },
 
     /// A detached upstream-substitute fetch (spawned by
