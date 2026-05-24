@@ -725,12 +725,16 @@ pod's emptyDir.
     is done store-side.
 ]
 
-#r("builder.upload.references-scanned")[
-  Before the retry loop, `upload_output` performs a *pre-scan pass*: a single
-  extra disk read through `RefScanSink` only (no hash, no network). The NAR is
-  dumped via `dump_path_streaming` into the scanner, which finds every
-  candidate hash part embedded anywhere in the stream (including inside
-  binaries, RPATH strings, symlink targets, directory names). The candidate
+#r("builder.upload.references-scanned+2")[
+  The builder finds each output's runtime references by feeding the output's
+  *full canonical NAR byte sequence* --- framing, entry names, symlink
+  targets, and regular-file contents --- through a Boyer-Moore `RefScanSink`,
+  which finds every candidate hash part embedded anywhere in the stream
+  (including inside binaries, RPATH strings, symlink targets, directory
+  names). The scanner rides the fused single-pass output walk (ADR-022 §6.1,
+  `builder.upload.fused-walk`): the same disk read drives the NAR SHA-256,
+  the per-file FastCDC chunker, and the reference scan, so there is no
+  separate pre-scan pass. The candidate
   set is the *transitive input closure* ∪ `drv.outputs()`: every path
   reachable via BFS over store references from the derivation's inputs, plus
   all of this derivation's own outputs (for self-references and cross-output
@@ -739,7 +743,9 @@ pod's emptyDir.
   A build can legitimately embed any transitively-reachable path --- e.g.
   `hello-2.12.2` references `glibc`, which is not a direct input but arrives
   via `closure(stdenv)`. The resolved reference list is *sorted* (affects the
-  narinfo signature fingerprint --- must be deterministic).
+  narinfo signature fingerprint --- must be deterministic). The walk --- and
+  therefore the scan --- runs once per output BEFORE any byte is sent to the
+  store; retries do not re-scan.
 ]
 
 #r("builder.upload.deriver-populated")[
@@ -748,15 +754,30 @@ pod's emptyDir.
   multi-output derivation.
 ]
 
-#info(title: [Pre-scan cost])[
-  The scan is a separate disk read before the first upload attempt. Retries do
-  NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan
-  over the restricted @nixbase32 alphabet does \~memcpy speed on binary
-  sections (skips \~31/32 bytes); a 4 GiB output adds \~4s wall time on NVMe.
-  If this becomes measurable, the escape hatch is a trailer-refs protocol
-  extension (send refs in `PutPathTrailer` instead of the first `PathInfo`
-  message) --- deferred to a later phase.
+#info(title: [Refscan cost])[
+  The scan adds no disk read of its own: it consumes the same bytes the
+  fused walk is already reading for the NAR SHA-256 and the per-file FastCDC
+  chunker. The Boyer-Moore skip-scan over the restricted @nixbase32 alphabet
+  does \~memcpy speed on binary sections (skips \~31/32 bytes), so its CPU
+  cost is negligible next to the hashing that shares the read. Retries do
+  NOT re-walk (the walk result is deterministic). This closed `TODO(P0433)`:
+  the pre-fused-walk design needed a separate ref-scan disk pass because
+  references had to be known before the first `PutPath` message could be
+  sent.
 ]
+
+Since P0586, the builder's *primary* upload path --- for single- and
+multi-output derivations alike --- is `PutPathChunked` (ADR-022 §6,
+`store.put.chunked-wire`): the fused walk's per-output headers, deduplicated
+castore `Directory` bodies, and the `HasChunks`-missing chunk set stream on
+one RPC and commit atomically server-side. The `PutPathBatch` and independent
+`PutPath` paths described below are the *fallback*, selected at runtime when
+the store rejects `PutPathChunked` because it cannot accept chunked uploads
+(no chunk backend configured --- the `CHUNKED_REQUIRES_BACKEND_MSG`
+`FailedPrecondition` --- or a pre-ADR-022 store binary). The fallback reuses
+the fused walk's parse and reference results, so it costs no extra disk pass.
+P0583 (chunk backend required) and P0584 (legacy upload RPCs reject
+`role=Builder`) jointly retire it.
 
 #r("builder.upload.batch+2")[
   For *multi-output derivations (≥2 outputs)*, the builder uses
@@ -772,7 +793,7 @@ pod's emptyDir.
   `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity).
 ]
 
-For *single-output derivations*, the builder uses independent `PutPath`
+On the fallback path, single-output derivations use independent `PutPath`
 directly (atomicity is vacuous for one output).
 
 *Upload failure handling:* If the upload to rio-store fails (S3 unavailable,

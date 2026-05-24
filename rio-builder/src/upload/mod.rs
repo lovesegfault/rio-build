@@ -1035,7 +1035,7 @@ mod tests {
     const DEP_HASH_A: &str = "7rjj5xmrxb3n63wlk6mzlwxzxbvg7r3a";
     const DEP_HASH_B: &str = "v5sv61sszx301i0x6xysaqzla09nksnd";
 
-    /// r[verify builder.upload.references-scanned]
+    /// r[verify builder.upload.references-scanned+2]
     /// r[verify builder.upload.deriver-populated]
     ///
     /// End-to-end: output file embeds a store-path string → pre-scan finds

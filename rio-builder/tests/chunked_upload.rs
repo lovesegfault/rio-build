@@ -305,7 +305,7 @@ async fn real_store_identical_content_dedups_to_zero_novel() -> anyhow::Result<(
 /// References found by the fused walk are declared in `Begin`, the
 /// server's independent rescan agrees, and `narinfo.references`
 /// carries them after commit.
-// r[verify builder.upload.references-scanned]
+// r[verify builder.upload.references-scanned+2]
 #[tokio::test]
 async fn real_store_references_scanned_and_verified() -> anyhow::Result<()> {
     let s = Session::new().await?;

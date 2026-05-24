@@ -644,7 +644,7 @@ in
           # r[verify builder.upload.fused-walk]
           # r[verify builder.upload.chunked-manifest]
           # r[verify builder.upload.batch+2]
-          # r[verify builder.upload.references-scanned]
+          # r[verify builder.upload.references-scanned+2]
           # r[verify store.put.chunked]
           "roundtrip"
           # r[verify store.chunk.has-chunks-durable]
@@ -788,7 +788,7 @@ in
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
       "gc-sweep"
-      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"

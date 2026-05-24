@@ -190,7 +190,14 @@ impl WalkState {
 /// stream is materialized.
 ///
 /// `candidates` is the refscan candidate set (transitive input closure
-/// ∪ all declared output paths — see `collect_outputs`).
+/// ∪ all declared output paths — see `collect_outputs`). Every NAR byte
+/// the walk generates — framing, entry names, symlink targets, and
+/// regular-file contents — goes through the [`RefScanSink`] alongside
+/// the SHA-256 (see [`WalkState::absorb`]), so the scanner sees exactly
+/// the byte sequence `dump_path_streaming` would emit and the resolved
+/// reference list (sorted by [`CandidateSet::resolve`]) matches what
+/// the retired separate pre-scan pass would have found.
+// r[impl builder.upload.references-scanned+2]
 pub(super) fn fused_walk_output(
     upper_store: &Path,
     basename: &str,

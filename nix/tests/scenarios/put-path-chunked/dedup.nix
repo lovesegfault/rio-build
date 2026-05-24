@@ -25,18 +25,26 @@ scope: with scope; ''
       )
 
       # The blob bytes are identical to the roundtrip build's blob, so
-      # every blob content chunk already exists. The second commit must
-      # bump their refcount to 2 — the structural proof that the
-      # builder's HasChunks probe excluded them from `novel` and the
-      # store reused the existing rows instead of inserting new ones.
-      # (Worker-side novel/deduped counters are unobservable here:
-      # rio-builder is one-shot and its metrics reset on restart.)
+      # every blob content chunk resolves to an already-existing chunk
+      # row. The second commit must reference those rows (refcount 2)
+      # rather than insert duplicates — the SERVER-side proof that
+      # content addressing is shared across uploads and store paths.
+      # This does NOT by itself prove the builder excluded the chunks
+      # from `Begin.novel`: the server's chunk UPSERT produces the same
+      # observable refcount whether the builder skipped the bodies or
+      # re-sent them all. The builder-side zero-novel proof lives in
+      # test_chunked_upload_second_identical_output_sends_no_novel
+      # (upload/mod.rs, via the MockStore chunked_begins recorder) and
+      # real_store_identical_content_dedups_to_zero_novel
+      # (tests/chunked_upload.rs, via the backend object count).
+      # Worker-side novel/deduped counters are unobservable here:
+      # rio-builder is one-shot and its metrics reset on restart.
       shared = int(psql(${gatewayHost},
           "SELECT count(*) FROM chunks WHERE refcount >= 2"))
       assert shared > 0, (
           "no chunk reached refcount >= 2 after a second build with "
-          "identical blob content — dedup did not happen (every chunk "
-          "was re-uploaded as novel)"
+          "identical blob content — the second manifest did not share "
+          "the first one's chunk rows"
       )
 
       # The second build must not have re-created the shared content
