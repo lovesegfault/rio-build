@@ -305,11 +305,8 @@ impl DagActor {
             warn!(executor_id = %executor_id, silence_secs = HEARTBEAT_TIMEOUT_SECS,
                   "worker heartbeat timeout; disconnecting");
             // Current epoch — this is the actor itself deciding the
-            // worker is dead, not a late reader-task signal. No
-            // `seen_drvs`: heartbeat-timeout has no reader-task
-            // context; any buffer leak is bounded by
-            // `handle_cleanup_terminal_build`'s discard on DAG reap.
-            self.handle_executor_disconnected(&executor_id, stream_epoch, Vec::new())
+            // worker is dead, not a late reader-task signal.
+            self.handle_executor_disconnected(&executor_id, stream_epoch)
                 .await;
         }
     }
@@ -659,15 +656,6 @@ impl DagActor {
             // → total never reached. keep_going=false builds are
             // already terminal (failed fast at poison time).
             self.prune_interested_keep_going(&drv_hash);
-            // Discard any log buffer BEFORE remove_node drops the
-            // hash→path mapping. Reachable via 24h-TTL on a drv that
-            // never re-dispatched (so the reassign-path discard never
-            // fired) — defense-in-depth against a slow leak.
-            if let Some(bufs) = &self.log_buffers
-                && let Some(drv_path) = self.dag.path_for_hash(&drv_hash)
-            {
-                bufs.discard(drv_path);
-            }
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }

@@ -70,6 +70,7 @@ pub enum AddLineResult {
 
 /// Log batcher that collects log lines, emits `BuildLogBatch` messages,
 /// and enforces per-build log limits.
+// r[impl obs.log.batch-64-100ms]
 pub struct LogBatcher {
     /// Derivation path this batcher is collecting logs for.
     drv_path: String,
@@ -106,7 +107,8 @@ impl LogBatcher {
     ///
     /// `initial_line` seeds the line counter. The executor sends a
     /// `rio:` banner header (`crate::banner::HEADER_LINE_COUNT` lines)
-    /// directly on `log_tx` *before* `run_daemon_lifecycle` constructs
+    /// directly on the log upload channel *before* `run_daemon_lifecycle`
+    /// constructs
     /// the batcher; seeding the counter lets the build's real output
     /// start numbering after the header instead of colliding at line 0.
     /// On a daemon-transient retry the executor seeds at the prior
@@ -304,8 +306,8 @@ mod tests {
 
     /// `initial_line` seeds `next_line_number` so the first flush's
     /// `first_line_number` follows the worker's `rio:` banner header
-    /// (sent directly on `log_tx`, outside the batcher) instead of
-    /// colliding at line 0.
+    /// (sent directly on the log upload channel, outside the batcher)
+    /// instead of colliding at line 0.
     #[test]
     fn initial_line_offsets_first_batch() {
         let mut batcher = LogBatcher::new("drv".into(), "w".into(), LogLimits::UNLIMITED, 3);

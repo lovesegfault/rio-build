@@ -2577,7 +2577,6 @@ async fn test_worker_disconnect_unknown_noop() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "ghost".into(),
             stream_epoch: 0,
-            seen_drvs: vec![],
         })
         .await?;
 
@@ -3902,7 +3901,6 @@ async fn test_prefetch_complete_burst_capped() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "pfc-boot".into(),
             stream_epoch: stream_epoch_for("pfc-boot"),
-            seen_drvs: vec![],
         })
         .await?;
     drop(boot_rx);
@@ -4237,7 +4235,6 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "epoch-w".into(),
             stream_epoch: epoch1,
-            seen_drvs: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -4267,7 +4264,6 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "epoch-w".into(),
             stream_epoch: epoch2,
-            seen_drvs: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -4468,430 +4464,6 @@ async fn test_heartbeat_intent_id_change_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// merged_bug_039 / C2: `ExecutorDisconnected.seen_drvs` cleanup is
-/// epoch-gated, actor-serialized, and ownership-aware. Only paths the
-/// DAG has never heard of are discarded; real drvs (whose buffer the
-/// actor's seal/flusher machinery owns) are left alone — preventing a
-/// compromised worker from wiping a victim's in-memory log tail by
-/// sending one `LogBatch{derivation_path=D_victim}` then disconnecting.
-#[tokio::test]
-async fn test_disconnect_discards_only_unknown_drvs() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
-    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.log_buffers = Some(bufs_for_actor);
-    });
-
-    // One real drv "lbdisc" in the DAG; one fabricated path.
-    // `fake_path` needs a DISTINCT store-hash: G10's `LogBuffers` keys
-    // on `drv_log_hash` (the store-hash portion), so two
-    // `test_drv_path(...)` calls (same `TEST_HASH`) would alias to one
-    // buffer and discarding the fake would also discard the real.
-    let real_path = test_drv_path("lbdisc");
-    let fake_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-never-merged.drv".to_string();
-    let _rx = connect_executor(&handle, "lb-w", "x86_64-linux").await?;
-    merge_single_node(&handle, Uuid::new_v4(), "lbdisc", PriorityClass::Scheduled).await?;
-    barrier(&handle).await;
-
-    // Seed both buffers as `set_log_exec` + the recv task would: stamp
-    // the entry to "lb-w" so the ownership check in
-    // `discard_if_owned_by` lets the discard through. (The legacy
-    // `push()` path creates UNSTAMPED entries, which the ownership
-    // gate now refuses to remove — that's the security property, not a
-    // bug, but it's not the production-realistic seeding for this
-    // test.)
-    for p in [&real_path, &fake_path] {
-        log_buffers.set_exec(p, uuid::Uuid::now_v7(), "lb-w");
-        let batch = rio_proto::types::BuildLogBatch {
-            derivation_path: (*p).clone(),
-            lines: vec![b"line".to_vec()],
-            first_line_number: 0,
-            executor_id: "lb-w".into(),
-        };
-        assert!(log_buffers.push_for(p, &batch, "lb-w"));
-    }
-    assert!(log_buffers.read_since(&real_path, 0).is_some());
-    assert!(log_buffers.read_since(&fake_path, 0).is_some());
-
-    // Disconnect with both in seen_drvs. Epoch matches → cleanup runs.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "lb-w".into(),
-            stream_epoch: stream_epoch_for("lb-w"),
-            seen_drvs: vec![real_path.clone(), fake_path.clone()],
-        })
-        .await?;
-    barrier(&handle).await;
-
-    assert!(
-        log_buffers.read_since(&fake_path, 0).is_none(),
-        "fabricated path (DAG-unknown) discarded"
-    );
-    assert!(
-        log_buffers.read_since(&real_path, 0).is_some(),
-        "real DAG drv's buffer preserved — owned by seal/flusher, not \
-         the (untrusted) stream's seen_drvs"
-    );
-    Ok(())
-}
-
-/// bug_004: the disconnect-cleanup gate (`hash_for_path`, exact-string
-/// match on the full canonical path) and the action (`discard()`,
-/// normalized to the 32-char hash) operate on different key spaces. A
-/// compromised executor that gets a fabricated SUFFIX of a victim's hash
-/// into `seen_drvs` would otherwise have the gate fire (no exact match)
-/// and `discard()` re-normalize to the victim's key. The ownership
-/// check in `discard_if_owned_by` MUST refuse to remove an entry stamped
-/// to another executor.
-// r[verify sched.log.batch-binding]
-#[tokio::test]
-async fn test_disconnect_preserves_other_executor_buffer() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
-    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.log_buffers = Some(bufs_for_actor);
-    });
-
-    // Victim's buffer, stamped to "victim". Deliberately NOT merged into
-    // the DAG: this exercises the *ownership* gate when the DAG gate
-    // already fired (the worst case).
-    let victim_path = test_drv_path("victim");
-    log_buffers.set_exec(&victim_path, uuid::Uuid::now_v7(), "victim");
-    assert!(log_buffers.exec_id(&victim_path).is_some());
-
-    // Attacker's `seen_drvs` carries an alias: same TEST_HASH, different
-    // suffix. `hash_for_path(alias)` is `None` (not the canonical path),
-    // `drv_log_hash(alias)` normalizes to the same buffer key as
-    // `victim_path`. Pre-fix, `discard(alias)` would remove the victim's
-    // entry.
-    let alias = test_drv_path("attacker-renamed");
-    let _rx = connect_executor(&handle, "attacker", "x86_64-linux").await?;
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "attacker".into(),
-            stream_epoch: stream_epoch_for("attacker"),
-            seen_drvs: vec![alias],
-        })
-        .await?;
-    barrier(&handle).await;
-
-    assert!(
-        log_buffers.exec_id(&victim_path).is_some(),
-        "victim's buffer survives attacker disconnect with hash-aliased path"
-    );
-    Ok(())
-}
-
-/// merged_bug_039 / C2: a stale-epoch `ExecutorDisconnected` (I-056a
-/// late-disconnect from a prior stream) MUST NOT discard ANY buffer —
-/// the cleanup runs AFTER the epoch check.
-#[tokio::test]
-async fn test_stale_epoch_disconnect_preserves_buffer() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
-    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.log_buffers = Some(bufs_for_actor);
-    });
-
-    let _rx = connect_executor(&handle, "stale-lb", "x86_64-linux").await?;
-    let fake_path = test_drv_path("stale-fake");
-    // Stamp + push as `set_log_exec` + the recv task would in production.
-    // The legacy `push()` path creates an UNSTAMPED entry, which
-    // `discard_if_owned_by` refuses to remove regardless of the epoch
-    // check — seeded that way, the "survives" assertion below passes for
-    // the wrong reason and cannot catch a regression in the I-056a
-    // early-return. Same rationale as the seeding comment in
-    // test_disconnect_discards_only_unknown_drvs.
-    log_buffers.set_exec(&fake_path, uuid::Uuid::now_v7(), "stale-lb");
-    let batch = rio_proto::types::BuildLogBatch {
-        derivation_path: fake_path.clone(),
-        lines: vec![b"line".to_vec()],
-        first_line_number: 0,
-        executor_id: "stale-lb".into(),
-    };
-    assert!(log_buffers.push_for(&fake_path, &batch, "stale-lb"));
-
-    // Stale epoch (≠ the connected stream's) → early-return BEFORE
-    // cleanup. Even a DAG-unknown path survives.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "stale-lb".into(),
-            stream_epoch: 0, // never matches (epochs start at 1)
-            seen_drvs: vec![fake_path.clone()],
-        })
-        .await?;
-    barrier(&handle).await;
-
-    assert!(
-        log_buffers.read_since(&fake_path, 0).is_some(),
-        "stale-epoch disconnect is a no-op — nothing discarded"
-    );
-    Ok(())
-}
-
-/// bug_002 (r22): a deposed leader's disconnect cleanup must not discard
-/// the retained in-flight ring buffers the lease-flap design preserves.
-/// `LeaderLost` → `clear_persisted_state()` empties the DAG while
-/// deliberately retaining `log_buffers`; the worker's stream teardown
-/// (`ExecutorDisconnected{seen_drvs}`) typically lands seconds AFTER the
-/// fire-and-forgotten `LeaderLost`, so without the leader+recovery gate
-/// every retained, unsealed, this-executor-stamped entry fails the DAG
-/// gate ("not in the DAG" only implies "stale" when the DAG is
-/// authoritative) and is destroyed — exactly the entries the
-/// acquisition-time re-arm/restamp/sweep is supposed to reconcile at the
-/// next acquire.
-#[tokio::test]
-async fn test_deposed_leader_disconnect_preserves_retained_buffer() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
-    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
-    // Controllable LeaderState (default = leader + recovery complete) so
-    // the test can drive the lose transition the way the lease loop does.
-    let leader = crate::lease::LeaderState::default();
-    let leader_for_actor = leader.clone();
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.log_buffers = Some(bufs_for_actor);
-        p.leader = leader_for_actor;
-    });
-
-    // Tenure: worker connected, canonical drv in the DAG, its entry
-    // stamped to this worker and holding lines (the in-flight tail the
-    // periodic flusher has not uploaded yet).
-    let drv_path = test_drv_path("flapret-drv");
-    let _rx = connect_executor(&handle, "flapret-w", "x86_64-linux").await?;
-    merge_single_node(
-        &handle,
-        Uuid::new_v4(),
-        "flapret-drv",
-        PriorityClass::Scheduled,
-    )
-    .await?;
-    barrier(&handle).await;
-    let exec = uuid::Uuid::now_v7();
-    log_buffers.set_exec(&drv_path, exec, "flapret-w");
-    let batch = rio_proto::types::BuildLogBatch {
-        derivation_path: drv_path.clone(),
-        lines: vec![b"in-flight tail".to_vec()],
-        first_line_number: 0,
-        executor_id: "flapret-w".into(),
-    };
-    assert!(log_buffers.push_for(&drv_path, &batch, "flapret-w"));
-
-    // Lease lost: mirror the lease loop (on_lose flips the atomics, the
-    // LeaderLost command tells the actor). clear_persisted_state empties
-    // the DAG but retains log_buffers — preconditions asserted below.
-    leader.on_lose();
-    handle.send_unchecked(ActorCommand::LeaderLost).await?;
-    barrier(&handle).await;
-    assert!(
-        handle
-            .debug_query_derivation("flapret-drv")
-            .await?
-            .is_none(),
-        "precondition: LeaderLost cleared the DAG"
-    );
-    assert!(
-        log_buffers.read_since(&drv_path, 0).is_some(),
-        "precondition: clear_persisted_state retains log_buffers"
-    );
-
-    // The worker's stream teardown arrives after the lease flip (the
-    // production-normal ordering: the recv task only fires when the
-    // stream actually winds down). Epoch matches, worker entry retained
-    // → the handler runs.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "flapret-w".into(),
-            stream_epoch: stream_epoch_for("flapret-w"),
-            seen_drvs: vec![drv_path.clone()],
-        })
-        .await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        log_buffers.read_since(&drv_path, 0).map(|l| l.len()),
-        Some(1),
-        "deposed leader must keep the retained in-flight lines: the empty \
-         post-LeaderLost DAG is not authoritative; reconciliation belongs \
-         to the next acquisition's re-arm/restamp/sweep"
-    );
-    assert_eq!(
-        log_buffers.exec_id(&drv_path),
-        Some(exec),
-        "the exec stamp survives too (the same-exec restamp at the next \
-         acquisition must find the lines, not an empty entry)"
-    );
-    Ok(())
-}
-
-/// bug_002 (r22), recovery-window half: on an A→A flap the lease loop's
-/// `on_acquire()` flips `is_leader` immediately while `recovery_complete`
-/// stays false until the actor processes `LeaderAcquired` and rebuilds
-/// the DAG — a disconnect queued ahead of `LeaderAcquired` is therefore
-/// processed with `is_leader=true` against a still-empty DAG. A plain
-/// `is_leader()` gate would pass and discard the retained entry; the
-/// composite leader+recovery gate must skip the discard and leave the
-/// entry to the acquisition-time re-arm/restamp/sweep (that sweep's own
-/// behavior is covered by the recovery tests).
-#[tokio::test]
-async fn test_recovery_window_disconnect_preserves_retained_buffer() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
-    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
-    // is_leader=true + recovery_complete=false: the lease loop acquired
-    // (on_acquire) but the actor has not processed LeaderAcquired yet.
-    let leader = crate::lease::LeaderState::pending(std::sync::Arc::new(
-        std::sync::atomic::AtomicU64::new(1),
-    ));
-    leader.on_acquire(1);
-    let leader_for_actor = leader.clone();
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.log_buffers = Some(bufs_for_actor);
-        p.leader = leader_for_actor;
-    });
-
-    // Retained entry from the previous tenure: stamped to the worker,
-    // unsealed, non-empty. The DAG is empty (recovery has not rebuilt it
-    // yet) — exactly the post-re-acquire / pre-recovery window.
-    let drv_path = test_drv_path("recwin-drv");
-    let _rx = connect_executor(&handle, "recwin-w", "x86_64-linux").await?;
-    let exec = uuid::Uuid::now_v7();
-    log_buffers.set_exec(&drv_path, exec, "recwin-w");
-    let batch = rio_proto::types::BuildLogBatch {
-        derivation_path: drv_path.clone(),
-        lines: vec![b"previous-tenure tail".to_vec()],
-        first_line_number: 0,
-        executor_id: "recwin-w".into(),
-    };
-    assert!(log_buffers.push_for(&drv_path, &batch, "recwin-w"));
-
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "recwin-w".into(),
-            stream_epoch: stream_epoch_for("recwin-w"),
-            seen_drvs: vec![drv_path.clone()],
-        })
-        .await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        log_buffers.read_since(&drv_path, 0).map(|l| l.len()),
-        Some(1),
-        "recovery-window disconnect must not discard the retained entry: \
-         the DAG is not authoritative until recovery completes"
-    );
-    assert_eq!(
-        log_buffers.exec_id(&drv_path),
-        Some(exec),
-        "exec stamp survives the recovery-window disconnect"
-    );
-    Ok(())
-}
-
-/// bug_001 (r23): a FAILED recovery (PG down mid-recovery) sets
-/// `recovery_complete=true` with an EMPTY DAG (the Err arm's "degrade,
-/// don't block" — dispatch and the flusher deliberately want that), so
-/// `recovery_complete` does not mean "the DAG is authoritative". A
-/// worker that kept streaming through the degraded tenure and then
-/// disconnects would pass an `is_leader && recovery_complete` gate,
-/// every seen drv would be DAG-unknown against the empty DAG, and
-/// `discard_if_owned_by` would destroy the retained unsealed entry —
-/// the only copy of the lines the periodic flusher would have
-/// snapshotted once PG came back. The discard must instead gate on
-/// `dag_authoritative`, which only a SUCCESSFUL recovery sets.
-#[tokio::test]
-async fn test_failed_recovery_disconnect_preserves_retained_buffer() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
-    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
-    // K8s-shaped LeaderState: lease held (is_leader=true) but recovery
-    // not run yet (recovery_complete=false at construction). Same
-    // `from_parts` injection as test_recovery_failure_degrades_to_empty_dag
-    // so the test can observe the Err arm completing the recovery. With
-    // the pool closed the PG floor is unreadable too, so the term is
-    // confirmation-gated — keep a simulated lease loop confirming
-    // Leading rounds for the test's lifetime or the recovery would be
-    // discarded instead of degrading to the empty DAG.
-    let leader = crate::lease::LeaderState::from_parts(
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        false,
-    );
-    let _confirmations = spawn_leading_confirmations(leader.clone());
-    let leader_for_actor = leader.clone();
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.log_buffers = Some(bufs_for_actor);
-        p.leader = leader_for_actor;
-    });
-
-    // Retained entry from before the flap: stamped to the connected
-    // worker, unsealed, holding lines past the last snapshot.
-    let drv_path = test_drv_path("failrec-drv");
-    let _rx = connect_executor(&handle, "failrec-w", "x86_64-linux").await?;
-    let exec = uuid::Uuid::now_v7();
-    log_buffers.set_exec(&drv_path, exec, "failrec-w");
-    let batch = rio_proto::types::BuildLogBatch {
-        derivation_path: drv_path.clone(),
-        lines: vec![b"pg-outage tail".to_vec()],
-        first_line_number: 0,
-        executor_id: "failrec-w".into(),
-    };
-    assert!(log_buffers.push_for(&drv_path, &batch, "failrec-w"));
-
-    // PG goes down, then the acquisition is processed: recover_from_pg
-    // fails (pool closed — same injection as the recovery tests), the
-    // Err arm sets recovery_complete=true with an EMPTY DAG.
-    db.pool.close().await;
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
-    assert!(
-        leader.recovery_complete(),
-        "precondition: the Err arm sets recovery_complete=true (degrade, don't block)"
-    );
-    assert!(
-        handle
-            .debug_query_derivation("failrec-drv")
-            .await?
-            .is_none(),
-        "precondition: the DAG is empty after the failed recovery"
-    );
-    assert!(
-        log_buffers.read_since(&drv_path, 0).is_some(),
-        "precondition: the failed recovery retains the entry (the sweep \
-         never ran — the load failed before it)"
-    );
-
-    // The worker's stream closes during the degraded tenure (build
-    // finished / pod evicted / another blip). Epoch matches → the
-    // handler runs its log-buffer cleanup.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "failrec-w".into(),
-            stream_epoch: stream_epoch_for("failrec-w"),
-            seen_drvs: vec![drv_path.clone()],
-        })
-        .await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        log_buffers.read_since(&drv_path, 0).map(|l| l.len()),
-        Some(1),
-        "failed-recovery disconnect must keep the retained entry: \
-         recovery_complete=true with an empty DAG is NOT an authoritative \
-         DAG, and the periodic flusher would snapshot these lines once PG \
-         returns"
-    );
-    assert_eq!(
-        log_buffers.exec_id(&drv_path),
-        Some(exec),
-        "exec stamp survives the failed-recovery disconnect"
-    );
-    Ok(())
-}
-
 /// bug_008: a REJECTED reconnect must not corrupt `stream_epoch`. The
 /// gRPC handler unconditionally spawns a reader that fires
 /// `ExecutorDisconnected{stream_epoch}` on close — if the rejected
@@ -4938,7 +4510,6 @@ async fn test_rejected_reconnect_does_not_corrupt_epoch() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "epoch-v".into(),
             stream_epoch: epoch2,
-            seen_drvs: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -4955,7 +4526,6 @@ async fn test_rejected_reconnect_does_not_corrupt_epoch() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "epoch-v".into(),
             stream_epoch: epoch1,
-            seen_drvs: vec![],
         })
         .await?;
     barrier(&handle).await;

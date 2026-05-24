@@ -913,11 +913,6 @@
       "doc": "`AdminService.GetBuildGraph` implementation."
     },
     {
-      "path": "admin/logs.rs",
-      "depth": 1,
-      "doc": "`AdminService.GetDerivationLogs` implementation."
-    },
-    {
       "path": "admin/sla.rs",
       "depth": 1,
       "doc": "`AdminService.{Set,List,Clear}SlaOverride` / `ResetSlaModel` /"
@@ -1051,16 +1046,6 @@
       "path": "lib.rs",
       "depth": 0,
       "doc": "DAG-aware build scheduler for rio-build."
-    },
-    {
-      "path": "logs/",
-      "depth": 0,
-      "doc": "Per-derivation build-log ring buffers."
-    },
-    {
-      "path": "logs/flush.rs",
-      "depth": 1,
-      "doc": "Async S3 flush of log ring buffers."
     },
     {
       "path": "main.rs",

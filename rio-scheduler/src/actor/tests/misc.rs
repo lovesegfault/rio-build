@@ -311,7 +311,6 @@ async fn test_leader_lost_workers_active_stays_nonneg() -> TestResult {
             .send_unchecked(ActorCommand::ExecutorDisconnected {
                 executor_id: w.into(),
                 stream_epoch: stream_epoch_for(w),
-                seen_drvs: vec![],
             })
             .await?;
     }
@@ -1440,7 +1439,6 @@ async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "w-idiag".into(),
             stream_epoch: stream_epoch_for("w-idiag"),
-            seen_drvs: vec![],
         })
         .await?;
     let (_, live_after) = handle
@@ -2159,18 +2157,18 @@ async fn clear_persisted_state_clears_per_generation_maps() {
 }
 
 // ---------------------------------------------------------------------------
-// BuildEventBus: Log seq + try_log_flush Closed-vs-Full
+// BuildEventBus: display-only seq reuse
 // ---------------------------------------------------------------------------
 
-/// `Event::Log` is not persisted, so it MUST NOT consume a sequence
-/// number — otherwise the in-memory counter diverges from PG
+/// `Event::SubstituteProgress` is not persisted, so it MUST NOT consume
+/// a sequence number — otherwise the in-memory counter diverges from PG
 /// `MAX(sequence)` and the `since_sequence < last_seq` replay guard
 /// misfires after failover.
 #[tokio::test]
-async fn log_events_do_not_consume_sequence() {
+async fn display_only_events_do_not_consume_sequence() {
     use crate::actor::event::BuildEventBus;
     use rio_proto::types::build_event::Event;
-    let mut bus = BuildEventBus::new(None, None);
+    let mut bus = BuildEventBus::new(None);
     let build_id = Uuid::new_v4();
     let _rx = bus.register(build_id);
 
@@ -2182,10 +2180,14 @@ async fn log_events_do_not_consume_sequence() {
     for _ in 0..50 {
         bus.emit(
             build_id,
-            Event::Log(rio_proto::types::BuildLogBatch::default()),
+            Event::SubstituteProgress(rio_proto::types::SubstituteProgress::default()),
         );
     }
-    assert_eq!(bus.last_seq(build_id), 1, "Log must not consume seq");
+    assert_eq!(
+        bus.last_seq(build_id),
+        1,
+        "SubstituteProgress must not consume seq"
+    );
     bus.emit(
         build_id,
         Event::Derivation(rio_proto::types::DerivationEvent::default()),
@@ -2194,90 +2196,6 @@ async fn log_events_do_not_consume_sequence() {
         bus.last_seq(build_id),
         2,
         "next persisted event gets seq=2, not 52"
-    );
-}
-
-/// `try_log_flush` MUST NOT warn/count when the receiver is dropped
-/// (Closed) — only when Full. A dead flusher task is signalled by
-/// `spawn_monitored`; spamming "channel full ... periodic tick will
-/// snapshot" is doubly misleading (it's Closed, and the tick lives in
-/// the dead task).
-#[tokio::test]
-#[traced_test]
-async fn try_log_flush_silent_on_closed() {
-    use crate::actor::event::BuildEventBus;
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    drop(rx); // flusher died
-    let bus = BuildEventBus::new(None, Some(tx));
-    assert!(
-        !bus.try_log_flush(crate::logs::FlushRequest {
-            drv_path: "x".into(),
-            exec_id: uuid::Uuid::now_v7(),
-            status: None,
-            lease_generation: 1,
-            acquired_transitions: 0,
-        }),
-        "Closed must report not-enqueued"
-    );
-
-    assert_eq!(
-        recorder.get("rio_scheduler_log_flush_dropped_total{}"),
-        0,
-        "Closed must not increment dropped_total"
-    );
-    assert!(
-        !logs_contain("log flush channel full"),
-        "Closed must not warn 'channel full'"
-    );
-}
-
-/// The terminal epilogue's empty-buffer reap (bug_008) keys on this
-/// return value: `true` iff the request was handed to a live flusher.
-#[tokio::test]
-async fn try_log_flush_reports_enqueue_result() {
-    use crate::actor::event::BuildEventBus;
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    let mk_req = || crate::logs::FlushRequest {
-        drv_path: "x".into(),
-        exec_id: uuid::Uuid::now_v7(),
-        status: None,
-        lease_generation: 1,
-        acquired_transitions: 0,
-    };
-
-    // No flusher configured → false.
-    let no_flusher = BuildEventBus::new(None, None);
-    assert!(
-        !no_flusher.try_log_flush(mk_req()),
-        "no flusher must report not-enqueued"
-    );
-
-    // Live channel with capacity → true, and the request is actually there.
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    let bus = BuildEventBus::new(None, Some(tx));
-    assert!(
-        bus.try_log_flush(mk_req()),
-        "successful enqueue must report true"
-    );
-    assert!(
-        rx.try_recv().is_ok(),
-        "the enqueued request reached the channel"
-    );
-
-    // Full → false, and the existing dropped_total contract still holds.
-    assert!(bus.try_log_flush(mk_req()), "refill the single slot");
-    assert!(
-        !bus.try_log_flush(mk_req()),
-        "Full must report not-enqueued"
-    );
-    assert_eq!(
-        recorder.get("rio_scheduler_log_flush_dropped_total{}"),
-        1,
-        "Full still increments dropped_total exactly once"
     );
 }
 

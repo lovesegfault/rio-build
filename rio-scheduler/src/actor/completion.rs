@@ -832,8 +832,8 @@ impl DagActor {
         // Cancelled: scheduler transitioned BEFORE sending CancelSignal
         // (build.rs:cancel_build_derivations), so the executor's
         // Cancelled report finds the derivation already in this state.
-        // Expected; capacity was freed above. The drv_logs row was
-        // already finalized by terminal_log_epilogue at cancel time.
+        // Expected; capacity was freed above. The drv_executions row was
+        // already stamped by terminal_log_epilogue at cancel time.
         // No further action.
         if current_status == DerivationStatus::Cancelled {
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
@@ -1124,12 +1124,9 @@ impl DagActor {
         .await;
         phase!("5-newly-ready+per-build-counts");
 
-        // Finalize the drv_logs row AFTER the Completed event has gone
-        // out (now emitted inside release_downstream, after Progress).
-        // By the time the gateway sees Completed, the ring buffer still
-        // has the full log (flusher hasn't drained yet — async on a
-        // separate task), so AdminService.GetDerivationLogs can serve
-        // from the ring buffer in the gap before the S3 upload lands.
+        // Stamp the drv_executions row AFTER the Completed event has
+        // gone out (now emitted inside release_downstream, after
+        // Progress).
         // r[impl sched.merge.exec-correlation+7]
         // 0 → None: the proto's "not reported" sentinel must become SQL
         // NULL, not a literal 0 — the store's completeness predicate
@@ -1954,19 +1951,19 @@ impl DagActor {
     // r[impl sched.event.derivation-terminal]
     /// Shared tail of every terminal-failure path
     /// ([`poison_and_cascade`], `handle_permanent_failure`,
-    /// `handle_timeout_failure` cap-exhausted): seal+flush logs, emit
+    /// `handle_timeout_failure` cap-exhausted): stamp the execution
+    /// terminal, emit
     /// `DerivationFailed` for the trigger to its interested builds,
     /// cascade `DependencyFailed` to ancestors, emit `DerivationFailed
     /// {DependencyFailed}` for EACH cascaded node to ITS interested
     /// builds, then run `handle_derivation_failure` for the union.
     ///
-    /// Log-flush and the trigger's `DerivationFailed` event are
+    /// The terminal stamp and the trigger's `DerivationFailed` event are
     /// unconditional. The previous `Option` form let
     /// `poison_and_cascade` skip both with a wrong rationale ("retry
     /// paths already emitted per-attempt events" — they don't; this is
     /// the only `DerivationEvent::failed` emission in the actor), so
-    /// poison-via-exhaustion produced no S3 log upload and no client-
-    /// visible event.
+    /// poison-via-exhaustion produced no client-visible event.
     ///
     /// This was the I-213 bug-class area — three near-identical ~30L
     /// blocks that drifted on which side-effects ran. Keeping the
@@ -1980,18 +1977,13 @@ impl DagActor {
         error_msg: &str,
         status: rio_proto::types::BuildResultStatus,
     ) {
-        // Flush + emit use the trigger's interested set (those builds
+        // Stamp + emit use the trigger's interested set (those builds
         // saw THIS drv fail); handle_derivation_failure below uses the
         // union (those builds saw SOME drv fail, possibly a cascaded
-        // one). Finalize logs BEFORE handle_derivation_failure (which
+        // one). Stamp BEFORE handle_derivation_failure (which
         // may transition builds to terminal and schedule cleanup).
-        // The trigger's correlation uses the trigger's set; cascaded
-        // ancestors get their own per-node finalization in the loop
-        // below, gated on a retained buffer — most never dispatched,
-        // but a parent that was dispatched, reset on worker disconnect
-        // (reset_to_ready retains the stamped LogBuffers entry), and
-        // demoted by an I-047 dep reset carries an un-finalized
-        // execution into the cascade.
+        // Cascaded ancestors are bystanders swept from non-executing
+        // states — see terminal_log_epilogue's NOT-called-for note.
         // r[impl sched.merge.exec-correlation+7]
         let trigger_builds = self.get_interested_builds(drv_hash);
         // `None`: this epilogue is reached from poison / retry-budget
@@ -2040,16 +2032,6 @@ impl DagActor {
         let dep_msg = format!("dependency '{trigger_path}' failed: {error_msg}");
         for cascaded_hash in &cascaded {
             let interested = self.get_interested_builds(cascaded_hash);
-            // A cascaded ancestor that was dispatched, reset_to_ready()'d
-            // on worker disconnect, and demoted by an I-047 dep reset
-            // still carries a LogBuffers entry stamped with the reset
-            // execution's exec_id. Finalize it (same gated form as the
-            // build-cancel sweep's to_depfail arm) before the build is
-            // torn down, with this node's OWN interested set — a
-            // cascaded node may belong to a merged build the trigger
-            // does not.
-            // r[impl sched.merge.exec-correlation+7]
-            self.finalize_buffered_exec_log(cascaded_hash, &interested);
             let cascaded_path = self.dag.path_or_hash_fallback(cascaded_hash);
             for build_id in interested {
                 self.events.emit(

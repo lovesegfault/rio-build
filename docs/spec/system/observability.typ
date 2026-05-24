@@ -7,345 +7,75 @@ rio-build provides three pillars of observability: logs, metrics, and traces.
 = Build Log Storage
 
 Build logs are stored durably for post-build analysis and the dashboard log
-viewer.
+viewer. The data plane is owned by rio-store: builders stream log batches to
+`LogService.AppendLog`, the store cuts immutable zstd-compressed chunks to S3
+with a PostgreSQL line-range manifest, and every reader --- the gateway's
+live tail, the dashboard, the CLI --- reads back through `LogService.TailLog`.
+The scheduler never receives a log line: the `BuildExecution` stream carries
+control messages only, and the scheduler's only log-adjacent responsibility
+is the `drv_executions` lifecycle row (one per execution, stamped with the
+terminal status and the builder-reported final line count). The normative
+requirements on the store's ingest and read paths live in
+#xref(<store-log-service>, [the store component spec]); this section covers
+the cross-cutting properties: how logs are keyed, batched, and surfaced.
 
 == Storage Format
 
-Build logs are stored in S3 as zstd-compressed blobs, keyed by the derivation
-execution that produced them:
+Build logs are stored in S3 as immutable, append-only chunks:
 
 ```
-logs/{derivation_hash}/{exec_id}.log.zst          (final flush)
-logs/{derivation_hash}/{exec_id}.partial.log.zst  (periodic 30s snapshot)
+logs/{drv_hash}/{exec_id}/{session_id}/{chunk_seq}.zst
 ```
 
 `exec_id` is a per-execution UUIDv7 minted by the scheduler at dispatch
-(`assign_to_worker`). Time-sortability means "latest execution for a
-derivation" is a single index seek (`ORDER BY exec_id DESC LIMIT 1`).
-Metadata (S3 key, line counts, byte offsets, completion status, timestamps)
-is stored in the `drv_logs` PostgreSQL table for efficient seeking,
-pagination, and TTL retention.
+(`assign_to_worker`) and recorded in the `drv_executions` lifecycle row.
+Time-sortability means "latest execution for a derivation" is a single index
+seek (`ORDER BY exec_id DESC LIMIT 1`). `session_id` is minted per
+`AppendLog` stream, so a builder reconnect or a store-replica failover opens
+a new session whose chunk keys can never collide with a predecessor's. Each
+committed chunk has a `drv_log_chunks` manifest row recording its true
+worker-line range (`first_line`, `line_count`); reads are driven entirely by
+the manifest, fetch one chunk at a time, and deduplicate overlapping session
+ranges by line number.
 
 #r("obs.log.exec-keyed+2")[
-  Build logs MUST be stored at `logs/{drv_hash}/{exec_id}.log.zst` keyed by
-  per-execution UUIDv7. One blob and one PG row per execution regardless of
-  how many builds are interested in the derivation. The per-execution
-  isolation extends to the in-memory ring entry that feeds those artifacts:
-  re-stamping a derivation's entry with a different `exec_id` MUST clear the
-  prior execution's accumulated lines, seal, pending-final mark, and
-  recovered-prefix state rather than carry any of them into the new
-  execution's blob and row.
+  Build logs MUST be keyed by per-execution UUIDv7: one logical log per
+  execution regardless of how many builds are interested in the derivation,
+  materialized as that execution's `drv_log_chunks` manifest rows and the
+  immutable chunk objects they reference.
 ]
 
 A derivation is built once even if N builds want it (`sched.merge.dedup`), so
-keying by `(build_id, drv_hash)` would write N PG rows pointing at one blob ---
-or, in the prior model, N copies of the blob under N keys. Keying by
-`(drv_hash, exec_id)` stores the log once and lets `build_derivations.exec_id`
-carry the build↔execution correlation. The ring buffer is keyed by
-derivation, not by execution, so the per-execution keying of the stored
-artifacts is only as honest as the entry's stamp: the dispatch path discards
-the prior entry before stamping a fresh execution, but recovery re-stamps an
-ex-leader's *retained* entry in place, and an interim leader may have
-re-dispatched the derivation under a new `exec_id` in between --- carrying
-the retained lines across that restamp would hand one execution's output to
-another execution's S3 key and `drv_logs` row. A same-`exec_id` re-stamp
-keeps the lines (a single lease flap with no interim re-dispatch; the
-still-streaming worker's execution must keep accumulating across it).
-Periodic snapshots get the `.partial`
-suffix and a `drv_logs` row with `is_complete = false`; the final flush
-overwrites the row, writes the non-`.partial` key, and best-effort deletes the
-snapshot. Both are swept by the same TTL.
-A final flush whose ring buffer drained empty (a failover left the new
-leader holding a re-stamped but never-streamed-to entry) stamps `status` and
-`finished_at` in place but leaves `is_complete = false`: the `.partial` blob
---- neither re-keyed nor deleted, and the execution's only stored content ---
-is missing everything after the ex-leader's last periodic snapshot, so the
-incomplete indicator below stays visible.
-When the worker instead reconnects to a later tenure of the same execution
-and keeps streaming --- a fresh standby whose ring holds only the
-re-streamed suffix, or a re-acquiring ex-leader whose retained ring
-overlaps or has interior holes relative to what was stored in between ---
-that tenure's flusher fetches the execution's existing `.partial` snapshot
-once and folds it into every subsequent flush of that execution, so the
-periodic overwrite and the final blob keep covering output recorded by
-earlier tenures; stored coverage recorded by an earlier tenure is never
-reduced by a later flush. Lines emitted between the prior leader's last
-snapshot and the failover remain subject to the 30-second bound, and the
-gap between the folded prefix and the resumed stream is marked in-band
-with a `[rio: ~N earlier lines lost across scheduler failover]` line;
-lines an interim leader received but never flushed are within the same
-30-second bound but their absence is not separately marked.
+keying by `(build_id, drv_hash)` would store N copies of the same output.
+`build_derivations.exec_id` carries the build↔execution correlation for the
+dashboard; the gateway's live tail subscribes per execution and demultiplexes
+to its watching clients.
 
-#r("obs.log.gap-span+2")[
-  A `drv_logs` row recorded for a flush payload that does not physically
-  contain every line of the range it covers --- it folds a recovered
-  pre-failover prefix whose gap is collapsed to a single marker line, or its
-  ring lines carry an interior hole delivered only to an interim leader ---
-  MUST describe the execution's true line-number span: `first_line +
-  line_count` is one past the highest true worker line stored, with the lost
-  range counted even though the blob omits it or replaces it with a marker.
-  A `GetDerivationLogs` read with `since_line > 0` MUST NOT skip lines the
-  client has not received: when the stored blob's physical line count does
-  not match the row's claimed span, the server re-serves the blob from its
-  start unless the cursor is at or past the true end.
+The storage format provides by construction the properties the previous
+scheduler-side design (a per-derivation ring buffer periodically re-uploading
+a growing mutable `.partial` blob) needed several hundred lines of
+failure-mode protocol to approximate: chunks are immutable and session-keyed
+(#rref("store.log.chunk-immutable"), #rref("store.log.session-keyed")), so no
+writer can overwrite or regress coverage another writer already stored, and a
+scheduler failover, a store-replica failover, or a builder reconnect requires
+no reconciliation --- at worst it stores one chunk's worth of duplicate lines
+that the read path deduplicates. Completeness is computed from the manifest
+at read time (#rref("store.log.completeness-gate")), never latched in a row.
+
+#r("obs.log.incomplete-surfaced+2")[
+  A log read whose final chunk carries `is_complete = false` MUST be surfaced
+  to the user as incomplete: the CLI prints a trailing notice to stderr and
+  the dashboard log viewer renders an "incomplete" banner. The lines
+  themselves are served as-is --- the flag is display metadata, not a serving
+  gate.
 ]
 
-The marker collapses the lost range into one physical line (and an interior
-hole gets no marker at all), so blob index and true line number diverge once
-the blob omits two or more lines of the claimed range. Keeping the row's
-range in true line-number space keeps the `since_line` short-circuit and the
-next failover's prefix/gap computation honest; the read path detects the
-divergence by comparing the decoded blob's physical line count against the
-row's span, so gapless blobs (and a marker that replaced a single lost line)
-keep exact resume, and any mismatch is served in full --- bandwidth over
-silent loss. Recording the physical count instead --- for either shape ---
-would understate the execution's end: `s3_is_caught_up` would skip stored
-tail lines and the physical-vs-claimed re-serve could never fire because the
-counts would match, which is exactly the silent skip the read-path half
-forbids. A client that derives its resume cursor from chunk
-labels will re-download such a blob on each poll until the row is finalized;
-no first-party client does (the CLI and dashboard both read from line 0).
-Per-chunk `first_line_number` labels inside a gap-merged blob remain
-physical-index based --- exact labels would need per-segment metadata, which
-no current client justifies.
-
-#r("obs.log.line-conservation")[
-  Every log line a worker has delivered for an execution --- accepted by the
-  batch ingestion gates into that execution's ring-buffer entry --- MUST at
-  all times be present in the in-memory ring, present in the execution's
-  stored `drv_logs` coverage, or counted in the stored row's claimed line
-  span as a marked or unmarked gap. A delivered line MUST NOT leave all
-  three except through a loss channel the stored record itself discloses: a
-  recorded `first_line` above the execution's true first line (evicted or
-  superseded head loss), or an execution whose stored record never reaches
-  `is_complete = true` (an unflushed tail lost to a failover, a discarded
-  abandoned execution, or a retention-cap overflow).
-]
-
-This is the conservation law that the gap-span arithmetic, the ring's
-head-only eviction, the stored-coverage reconciliation, and the failover
-prefix recovery each preserve one piece of; the model phase checks the
-conjunction over the execution's delivered-so-far interval rather than any
-single piece. The pieces: the line/byte-cap eviction pops lines only off
-the ring's head, so the survivors stay a contiguous tail and the next
-flush's `first_line` reveals exactly what was evicted; the stored-coverage
-reconciliation drops ring lines only below a stored row's end --- where the
-durable copy supersedes them, or where a non-overlapping head falls below
-the folded prefix's own `first_line` and inside the failover budget; and
-the gap-merge fold counts every line between the folded prefix and the
-resumed ring in the row's span (marked in-band for the prefix-to-ring gap,
-unmarked for an interior hole), so the physical-vs-claimed divergence the
-read path answers with a full re-serve (`obs.log.gap-span`) and the
-incomplete indicator (`obs.log.incomplete-surfaced`) between them disclose
-every line the record does not physically hold. Lines a worker sends that
-the ingestion gates reject --- a sealed entry, a foreign executor,
-non-monotone numbering --- are never delivered into the entry and are
-outside this rule, as is the component telemetry covered by
-`obs.log.required-fields`.
-
-#r("obs.log.finalize-immutable")[
-  Once an execution's `drv_logs` row has `is_complete = true`, its stored final
-  blob and row content MUST NOT be overwritten or regressed by a later flush of
-  in-memory buffer state for that `exec_id`; a flusher holding retained lines
-  for an already-finalized execution MUST discard them instead of
-  re-finalizing.
-]
-
-Across an A→B→A lease flap the re-acquired ex-leader can still hold a ring
-entry stamped with an execution the interim leader already finalized --- the
-entry is pre-failover residue retained so that genuinely-abandoned executions
-can be finalized by the cancel/dependency-failure sweep. In-memory state alone
-cannot distinguish the two, so the flusher consults the row before uploading:
-an already-complete row means the durable record is authoritative, and any
-retained lines it lacks fall within the accepted periodic-flush failover-loss
-bound. The UPSERT latch alone is not sufficient --- it freezes a finalized
-row (any later flush write against it is refused, downgrade and
-re-finalization alike), but the S3 PUT precedes the row write entirely, so a
-stale re-finalization would still overwrite the final blob in place while the
-frozen row keeps pointing at it.
-When the row cannot be consulted at all (the lookup itself fails), the flusher
-fails closed: nothing is uploaded on that attempt. A deferral with a non-empty
-buffer is retained and retried (below); a deferral that finds only an empty
-restamped entry reaps it instead of retaining it (bookkeeping --- nothing any
-retry could upload, and `GetDerivationLogs` probes the execution's stored
-`.partial` whenever the ring entry it finds holds zero lines, so the reap does
-not gate reads). Either way the
-execution's row may remain `is_complete = false` (surfaced per
-`obs.log.incomplete-surfaced`) until a retry lands.
-
-#r("obs.log.deferred-final-retry+4")[
-  A final flush deferred because the finalize guard could not consult
-  `drv_logs` MUST be retained by the flusher --- up to a bounded retention
-  cap --- and retried while the execution's sealed ring-buffer entry remains
-  in memory, and terminal cleanup MUST NOT discard an entry whose final
-  flush is still pending --- enqueued at the terminal epilogue and not yet
-  resolved by the flusher, or retained for retry; a deferral beyond the cap
-  drops that execution's buffered entry instead of retaining it. A final
-  flush request --- first attempt or retained retry --- MUST NOT finalize
-  the execution under a leadership tenure other than the one that enqueued
-  it: the request carries the tenure's identity at enqueue time and the
-  flusher MUST drop it, uploading nothing, when the replica no longer holds
-  the lease or the recorded acquire-epoch --- the Lease `leaseTransitions`
-  count recorded at the most recent acquire edge or rebound --- has moved
-  past the request's enqueue-time stamp; the live tenure's own terminal
-  processing owns that execution's finalization.
-]
-
-This is what keeps a transient PG failure at final-flush time from losing
-buffered log content while S3 stays healthy. The retention is a fixed cap of
-in-flight deferrals and does not survive process exit; the retry --- like
-the first attempt of a queued final --- is pinned to the leadership tenure
-that enqueued it: a queued or deferred final is evidence PG was unreachable
-at terminal time, the same window in which the terminal-status persist fails
-and the lease lapses, so after a leadership change the execution may still
-be live and being extended by the tenure that now owns it, and a late stale
-final must not freeze that row (`obs.log.finalize-immutable`,
-`obs.log.stored-coverage-preserved`). The acquire-epoch is the
-discriminator because it is the one stamp that moves on every holder
-change the lease loop observes --- through an acquire edge or a rebound ---
-in every regime, while a same-count re-acquire (a self-fence false alarm
-followed by a successful renew, no holder change) leaves it in place and
-keeps the request resolvable by its own tenure. The request also carries
-the scheduler-lease generation at enqueue time, and the flusher breaks the
-tenure on a generation raise too (the recovery PG-floor seed can raise it
-mid-tenure with no holder change --- a conservative extra drop, not the
-discriminator): the generation alone cannot identify the tenure once the
-floor seed has saturated it past `leaseTransitions + 1` (the permanent
-state after a lease deletion), where `on_acquire`'s `fetch_max` is a no-op
-on every subsequent holder change and an A→B→A flap leaves the generation
-equal to the enqueue-time stamp while the tenure that enqueued the request
-has ended. Requests
-orphaned by a leadership
-change are dropped and counted
-(#(refs.metric)("rio_scheduler_log_flush_stale_tenure_total")); the
-execution then either gets finalized by the live tenure's own terminal flush
-or remains at its `.partial` coverage (surfaced per
-`obs.log.incomplete-surfaced`).
-The tenure check runs before the finalize guard's stored-row consult and is
-re-checked after the guard's stored-row consult and the stored-prefix
-reconcile --- the awaited steps that precede any destructive arm --- so a
-request orphaned before its attempt or during those awaits triggers no S3
-work, no drain, no row freeze, and no `.partial` delete; at most it reaps the
-seal-guarded residue of an entry whose execution the in-hand guard row
-already shows finalized. The destructive arms it is kept away from are
-execution-scoped but not tenure-scoped and could otherwise touch a ring
-entry that the new tenure's recovery has restamped onto the still-live
-execution. The post-drain window (compression, blob PUT, row upsert,
-`.partial` delete) is deliberately not re-checked --- the drained ring is the
-only copy of the terminal-observed lines; the accepted residual is a lease
-move during the upload freezing the row while the live tenure keeps extending
-the same execution elsewhere. The drop itself performs no PG work. When the orphaned
-request's entry is still sealed for that execution (no restamp in the current
-tenure adopted it), the drop reaps an empty entry outright (the terminal
-persisted under the old tenure, so nothing else will ever resolve it; reads do
-not depend on the reap --- `GetDerivationLogs` probes the execution's stored
-`.partial` whenever the ring entry it finds holds zero lines --- so removing
-the entry is memory hygiene); a sealed non-empty entry is left in place and
-reaped by the periodic
-flush instead --- once another tenure has finalized the execution, the
-snapshot's row UPSERT is refused by the frozen-row latch and the flusher
-discards the still-sealed entry on that refusal (the durable finalized record
-is authoritative and the retained lines are superseded by it), within one
-periodic tick of PG and leadership recovery. A sealed non-empty entry whose
-execution no tenure ever finalizes keeps being snapshotted at `.partial`
-coverage --- its ring lines are the best data available --- unless the
-per-tenure stored-coverage reconcile finds a prior tenure's row covering past
-the retained ring and empties it: an empty ring is never uploaded, so the
-refused-UPSERT chokepoint can no longer observe that entry, and the periodic
-flush instead reaps the sealed, now-empty entry at its empty-snapshot
-early-return as bookkeeping --- reads are already served from that stored
-`.partial`. Any other
-entry --- unsealed or restamped --- is left for its real owner: the live
-tenure's own final, the next dispatch discard, or process exit. (None of these
-reaps gates read availability: `GetDerivationLogs` probes the execution's
-stored `.partial` whenever the ring entry it finds holds zero lines, falling
-back to the empty re-poll chunk only when nothing is stored for that execution
-yet, or when the stored side cannot be consulted at all (PG query / S3 fetch
-failure) --- the read warns and degrades to the re-poll answer rather than
-erroring.)
-The protection starts at enqueue: a final still queued behind earlier stalled
-flushes during the same outage is protected exactly like one already
-attempted and deferred, and stays pinned until the flusher resolves the
-request (or the process exits --- the dead-flusher residual; or, for an entry
-that is empty --- it never held a line, or the stored-coverage reconcile
-emptied it --- the periodic sealed-empty reap may remove it first, the final
-then resolving via the no-entry arm with only the empty drain's
-status/finished_at stamp lost).
-
-#r("obs.log.entry-justified")[
-  A retained log-buffer entry MUST at all times be justified by at least one
-  of: its derivation is tracked in a non-terminal state by this replica's
-  authoritative DAG, a final flush for its stamped execution is marked
-  pending and not yet resolved, or this replica's DAG is not authoritative
-  for staleness decisions; an entry that has lost every justification MUST
-  be discarded by the next reap path that observes it.
-]
-
-The justifications are the three reasons an entry is worth memory: it is the
-live carrier for an execution that may still stream (including a buffer
-retained across a reset that the cancel-sweep finalization still needs to
-finalize), it holds the only copy of lines a not-yet-resolved final flush
-may still upload, or this replica cannot yet tell which entries are stale (a
-standby, a deposed leader, a tenure whose acquisition-time recovery has not
-completed or whose DAG load failed --- those entries are held for the next
-authoritative reconciliation). The reap paths each restore the invariant
-after a specific event breaks an entry's last justification. The
-acquisition-time sweep (`sched.recovery.log-buffer-sweep`), terminal
-cleanup's post-delay discard, the dispatch-time discard, the poison-TTL
-discard, and the disconnect-time discard cover entries whose derivation left
-the non-terminal DAG; the four flusher/epilogue reaps cover entries whose
-pending final resolves without an upload --- the tenure-orphan drop (the
-enqueueing tenure ended and the sealed entry is empty: the old tenure's
-terminal persisted and nothing remains to upload), the refused-UPSERT reap
-(another tenure already finalized the execution, so the durable record
-supersedes the retained lines), the sealed-empty reap (a silent build or the
-stored-coverage reconcile left nothing any flush could upload), and the
-enqueue-failure reap (the flusher will never see the request and an empty
-entry has nothing to lose). The model phase checks that this set of reaps is
-*complete*: there is no reachable entry state that is unjustified and that
-no reap path will ever observe. An entry whose final flush no tenure ever
-resolves stays justified indefinitely --- its ring lines are the best data
-available and the periodic flush keeps them durable at `.partial` coverage
---- which is the rule's intended fixed point, not a leak.
-
-#r("obs.log.incomplete-surfaced")[
-  A `GetDerivationLogs` response whose final chunk carries
-  `is_complete = false` MUST be surfaced to the user as incomplete: the CLI
-  prints a trailing notice to stderr and the dashboard log viewer renders an
-  "incomplete" banner. The lines themselves are served as-is --- the flag is
-  display metadata, not a serving gate.
-]
-
-A `.partial`-only row (leader failover before the final flush, a dropped
-completion `FlushRequest`, a final flush deferred because its `drv_logs`
-lookup failed, an abandoned execution) serves the periodic
-snapshot --- strictly more useful than `NotFound`, but the missing tail is
-usually the most interesting part of the log: the build error. Without an
-explicit indicator the user reads a truncated log as the whole thing.
-
-#r("obs.log.stored-coverage-preserved")[
-  Log content recorded in an execution's `drv_logs` row by a prior scheduler
-  tenure and not contiguously covered by the current tenure's in-memory ring
-  MUST NOT be overwritten by a later flush of that execution: the flusher MUST
-  fold the stored blob into the outgoing upload (superseding any overlapping
-  in-memory lines), and when the stored blob cannot be re-read it MUST skip the
-  periodic snapshot or preserve the `.partial` blob on the final flush.
-]
-
-The durable record of what other tenures did is the `drv_logs` row, so the
-"is this overwrite lossy?" decision consults the row --- not the shape of the
-local ring, whose latches and line ranges encode conclusions reached in a
-previous tenure. Three carve-outs bound the rule:
-
-- Same-tenure ring eviction (the ring's head outruns the periodic flush within
-  one tenure) is the pre-existing, accepted `RING_CAPACITY`-bounded loss and is
-  outside this rule --- the row in that shape was produced by this tenure from
-  this very ring after its reconciliation.
-- Lines an interim leader received but never flushed are not "stored content";
-  they remain subject to the 30-second periodic-flush bound and their absence
-  is not separately marked in-band.
-- The fetch-failure fallback preserves the *blob*; the row's terminal stamping
-  in that degraded case is unchanged from the pre-existing behavior.
+An incomplete log (the build is still running, the execution was cancelled,
+the builder abandoned its final drain after a long store outage, or the last
+chunk is still in flight) serves whatever the manifest covers --- strictly
+more useful than `NotFound`, but the missing tail is usually the most
+interesting part of the log: the build error. Without an explicit indicator
+the user reads a truncated log as the whole thing.
 
 #r("obs.log.worker-header")[
   The worker MUST write `rio: exec`, `rio: builder`, `rio: started` lines as
@@ -356,23 +86,17 @@ previous tenure. Three carve-outs bound the rule:
 
 The header/footer are written into the same untrusted byte stream as build
 output --- arbitrary build code can emit its own `rio: result ok` lines. The
-system's source of truth for `exec_id`, outcome, and sizing is `drv_logs` and
-`assignments`, not the log text. The `grep '^rio:'` extraction is a convenience
-for humans (the post-failure log tail Nix prints, the dashboard log viewer),
-not a protocol. On scheduler-initiated cancellation the footer may be absent or
-may disagree with the row. Cancelling an in-flight (`Assigned`/`Running`)
-execution seals and finalizes its log before the worker receives the
-`CancelSignal`, so the late footer is dropped and the log normally ends without
-a `rio: result` line. Cancelling a build whose derivation was already reset off
-a lost or force-drained worker --- or sweeping such a derivation into
-`DependencyFailed` when one of its dependencies permanently fails --- finalizes
-that prior execution's retained
-buffer, which may already hold the footer the worker pushed on its way out ---
-possibly `rio: result ok` when the success report was lost to the disconnect
---- so the stored line, if present, can disagree with the row. `drv_logs.status`
-carries the authoritative outcome in both cases. Pod and node
-identity are deliberately excluded --- the "cluster is one machine" abstraction
-holds at the log level too.
+system's source of truth for `exec_id`, outcome, and sizing is
+`drv_executions` and `assignments`, not the log text. The `grep '^rio:'`
+extraction is a convenience for humans (the post-failure log tail Nix prints,
+the dashboard log viewer), not a protocol. On scheduler-initiated
+cancellation the footer may be absent (the worker is torn down before it can
+emit one) or may disagree with the recorded outcome; `drv_executions.status`
+carries the authoritative verdict. The header and footer consume worker line
+numbers like any other output, so `CompletionReport.final_line_count` --- the
+post-footer high-water mark the completeness predicate checks the manifest
+against --- includes them. Pod and node identity are deliberately excluded
+--- the "cluster is one machine" abstraction holds at the log level too.
 
 == Log Lifecycle
 
@@ -381,72 +105,53 @@ holds at the log level too.
   `BuildLogBatch` messages.
 ]
 
-#r("obs.log.ring-byte-cap")[
-  The scheduler-side per-derivation ring buffer is bounded by both line count
-  (`RING_CAPACITY`) and bytes (`RING_BYTE_CAP`, 16 MiB). Individual lines are
-  truncated to `MAX_LINE_LEN` (64 KiB) before storage. Scheduler-side defense
-  against an untrusted worker pushing few-but-huge lines that the line-count
-  cap alone would not evict.
-]
-
-#r("obs.log.periodic-flush")[
-  The scheduler flushes buffers to S3 periodically (every 30s) during active
-  builds, not only on completion --- bounds log loss to at most 30s on
-  failover.
-]
-
 #figure(
   chronos.diagram({
     import chronos: *
     _par("Executor")
-    _par("Scheduler")
+    _par("rio-store")
     _par("S3")
     _seq(
       "Executor",
-      "Scheduler",
-      comment: [`BuildLogBatch` (batched, ≤64 lines or 100ms)],
+      "rio-store",
+      comment: [`AppendLog` (header, then batches ≤64 lines or 100ms)],
     )
     _note(
       "over",
-      [Buffer in memory\ (per-derivation ring buffer)],
-      pos: "Scheduler",
+      [Buffer in memory\ (per-stream ingest buffer)],
+      pos: "rio-store",
     )
-    _seq("Executor", "Scheduler", comment: [`CompletionReport`])
-    _seq("Scheduler", "S3", comment: [Async flush (zstd + upload)])
-    _note("over", [Write metadata to PG], pos: "Scheduler")
+    _seq("rio-store", "S3", comment: [Cut chunk (zstd) + manifest row])
+    _seq("rio-store", "Executor", comment: [Ack `durable_through_line`])
+    _note("over", [Trim retransmit buffer], pos: "Executor")
   }),
   caption: [Build-log lifecycle.],
 )
 
-+ Executors stream log lines to the scheduler via `BuildLogBatch` messages in
-  the `BuildExecution` stream. Lines are batched (up to 64 lines or 100ms,
-  whichever comes first) for efficiency.
-+ The scheduler buffers logs in an in-memory ring buffer per active
-  derivation.
-+ On derivation completion, the scheduler asynchronously flushes the buffer
-  to S3 as a zstd-compressed blob and upserts a `drv_logs` row keyed by
-  `exec_id` (S3 key, byte offsets, timestamps, completion status).
-+ The `AdminService.GetDerivationLogs` RPC reads from the in-memory buffer for
-  active builds and from S3 for completed builds, resolving the latest
-  execution when the caller does not pin one.
++ The builder opens one authenticated `AppendLog` stream per execution
+  (#rref("store.log.append-auth")), tees every batch into an in-memory
+  retransmit buffer, and sends it on the stream.
++ The store validates each batch (#rref("store.log.ingest-bounds")), buffers
+  it, and fans it out to any live-tail subscribers.
++ The store cuts a chunk when the buffer reaches a size threshold, on a
+  periodic tick, or at stream end; the chunk object is written before its
+  manifest row, and the ack carries the highest line number now durable.
++ The builder trims its retransmit buffer on each ack. On any stream failure
+  it reconnects and replays the un-acked tail into a new session; the
+  manifest's line-range union and the read path's deduplication absorb the
+  overlap. At build completion the upload task detaches from the build (the
+  `CompletionReport` is never delayed or failed by log persistence) and keeps
+  draining until everything is acked or a bounded deadline expires.
 
-#info(title: [Periodic flush])[
-  Logs are also flushed to S3 periodically (every 30s) during active builds,
-  not only on completion. This bounds log loss to at most 30s of output if
-  the scheduler fails over.
-]
-
-#memo(title: [Log durability tradeoff])[
-  The 30-second flush interval is a deliberate tradeoff between write
-  amplification and data loss. Flushing more frequently increases S3 PUT
-  costs and scheduler CPU usage; flushing less frequently increases the
-  window of log loss on crash. For most builds, 30s of lost logs is
-  acceptable --- the build itself will be retried and new logs will be
-  generated. For long-running builds where the final 30s of output is
-  critical for debugging, consider a future enhancement: executors could
-  write a local log file as a write-ahead log (WAL) that survives scheduler
-  restarts, with the scheduler draining the WAL on recovery. Not currently
-  planned.
+#info(title: [Loss budget])[
+  The component holding the only copy of a line determines what a crash
+  loses. A scheduler failover loses nothing (the scheduler holds no log
+  data). A store-replica failover loses nothing (the builder replays its
+  un-acked retransmit buffer to another replica). A builder crash loses only
+  the lines emitted but not yet streamed (~100ms). A store outage spanning a
+  build's completion loses the un-acked tail only if it outlasts the
+  builder's post-completion drain deadline. The previous design's 30-second
+  periodic-flush loss window on scheduler failover no longer exists.
 ]
 
 == Log Serving
@@ -455,10 +160,19 @@ holds at the log level too.
   columns: (auto, 1fr),
   align: (left, left),
   table.header([Build State], [Log Source]),
-  [Active (building)], [In-memory ring buffer on scheduler],
-  [Completed], [S3 blob (zstd), seekable via PG metadata],
-  [Failed], [S3 blob (flushed on failure as well)],
+  [Active (building)],
+  [Manifest-selected chunks, then the ingesting replica's live buffer and
+    subscription stream (`TailLog` with `follow`)],
+
+  [Completed], [Manifest-selected chunks from S3, deduplicated by line number],
+  [Failed], [Same --- the failed build's tail is the highest-value content],
 )
+
+The gateway opens a `TailLog` subscription per building derivation of a
+watched build and relays the lines to the `nix build -L` client; it owns
+re-subscription when a stream ends before the derivation is terminal
+(#rref("store.log.tail-reconnect")). The dashboard and the CLI issue one-shot
+(non-follow) reads.
 
 = Metrics
 

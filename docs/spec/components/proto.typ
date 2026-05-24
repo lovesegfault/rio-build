@@ -185,7 +185,6 @@ service AdminService {
   rpc ClusterStatus(Empty) returns (ClusterStatusResponse);
   rpc ListExecutors(ListExecutorsRequest) returns (ListExecutorsResponse);
   rpc ListBuilds(ListBuildsRequest) returns (ListBuildsResponse);
-  rpc GetDerivationLogs(GetDerivationLogsRequest) returns (stream DerivationLogChunk);
   rpc TriggerGC(GCRequest) returns (stream GCProgress);
   rpc DrainExecutor(DrainExecutorRequest) returns (DrainExecutorResponse);
   rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);  // operator override (caller_tenant=None); service-token gated
@@ -240,9 +239,10 @@ service AdminService {
 ```protobuf
 message ExecutorMessage {
   reserved 4;                         // was ProgressUpdate
+  reserved 2;                         // was BuildLogBatch log_batch — log lines now go
+                                      //   directly to rio-store's LogService.AppendLog
   oneof msg {
     WorkAssignmentAck ack = 1;       // Executor confirms receipt of assignment
-    BuildLogBatch log_batch = 2;      // Batched log lines (not per-line)
     CompletionReport completion = 3;  // Build result
     ExecutorRegister register = 5;    // First message on BuildExecution stream:
                                       //   executor_id identity. Scheduler reads this
@@ -279,14 +279,17 @@ message SchedulerMessage {
 `BuildPhase` carries a per-derivation phase change forwarded from the daemon's
 `STDERR_RESULT{SetPhase}` (e.g. `"unpackPhase"`, `"buildPhase"`). It is its
 *own* `oneof` arm on both `ExecutorMessage` and `BuildEvent` --- NOT
-piggybacked on `BuildLogBatch` --- so the scheduler relay stays a pure
-pass-through (no inspection of batch contents) and a phase edge isn't subject
-to the batcher's 100ms / 64-line buffering.
+piggybacked on `BuildLogBatch` --- because it is a control-plane state edge
+the scheduler consumes, while log batches are data-plane payload that no
+longer transits the scheduler at all, and a phase edge isn't subject to the
+batcher's 100ms / 64-line buffering.
 
 === BuildLogBatch
 
 Log lines are *batched* for efficiency rather than sent per-line. The executor
-buffers up to 64 lines or 100ms (whichever comes first) and sends a batch. Use
+buffers up to 64 lines or 100ms (whichever comes first) and sends a batch ---
+since the log-data-plane move, on the builder's `LogService.AppendLog` stream
+to rio-store rather than on the `BuildExecution` stream to the scheduler. Use
 `bytes` (not `string`) for log content since build output may contain non-UTF-8
 data.
 
@@ -372,7 +375,8 @@ message BuildEvent {
   oneof event {
     BuildStarted started = 4;
     BuildProgress progress = 5;
-    BuildLogBatch log = 6;
+    // 6 was BuildLogBatch log — the live tail now reaches the gateway via
+    // rio-store's LogService.TailLog, not the scheduler's event stream.
     DerivationEvent derivation = 7;        // Per-derivation status changes
     BuildCompleted completed = 8;
     BuildFailed failed = 9;

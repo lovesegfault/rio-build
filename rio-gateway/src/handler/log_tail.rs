@@ -248,6 +248,7 @@ enum StreamEnd {
     OutputClosed,
 }
 
+// r[impl store.log.tail-reconnect]
 /// One subscription's lifetime: open → drive → (backoff → re-open)*.
 async fn run_tail(
     mut client: LogServiceClient<Channel>,
@@ -742,6 +743,7 @@ mod tests {
         h.set.abort_all();
     }
 
+    // r[verify store.log.tail-reconnect]
     /// Rule 2: a stream that ends while the derivation is not terminal
     /// is re-opened with `since_line = last_relayed + 1`, and lines the
     /// store resends below that cursor (chunk granularity) are not

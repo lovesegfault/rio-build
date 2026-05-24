@@ -7,13 +7,14 @@
 # translate] at default.nix:vm-dashboard-k3s):
 #
 #   1. Unary ClusterStatus: DATA frame starts 0x00 (compression flag 0)
-#   2. Server-streaming GetDerivationLogs: trailer frame has 0x80 byte
+#   2. Server-streaming TriggerGC (no service token → in-stream
+#      PermissionDenied): trailer frame has 0x80 byte
 #
 # The 0x80 byte is the load-bearing assertion — proves tonic-web emits
 # trailers as a separate LENGTH-PREFIXED-MESSAGE with flag=0x80 per the
 # gRPC-Web spec (browsers can't read HTTP/2 trailers).
 #
-# Method-gate (r[verify dash.auth.method-gate]) is asserted at the
+# Method-gate (r[verify dash.auth.method-gate+4]) is asserted at the
 # routing layer: the rio-scheduler-mutating HTTPRoute MUST NOT exist
 # (helm fail-closed → operator never reconciles a path to ClearPoison).
 #
@@ -146,14 +147,15 @@ pkgs.testers.runNixOSTest {
                 "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
                 timeout=60,
             )
-            # Server-streaming: GetDerivationLogs{derivation_path:"nonexist"}
-            # → 0 log lines + trailer-as-body-frame (flag 0x80). Same
-            # encoding as dashboard.nix (field 1 wire-type 2, len 8).
+            # Server-streaming: TriggerGC with an empty GcRequest and NO
+            # x-rio-service-token (this curl bypasses nginx's njs token
+            # minter) → the service-caller gate yields an in-stream
+            # PermissionDenied → trailer-as-body-frame (flag 0x80).
             # Proves tonic-web's stream-trailer-to-0x80-frame, the
             # browser-readable bit; absent under native gRPC.
             k3s_server.wait_until_succeeds(
-                "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
-                "curl -sf -X POST http://localhost:19001/rio.admin.AdminService/GetDerivationLogs "
+                "printf '\\x00\\x00\\x00\\x00\\x00' | "
+                "curl -sf -X POST http://localhost:19001/rio.admin.AdminService/TriggerGC "
                 "-H 'content-type: application/grpc-web+proto' "
                 "-H 'x-grpc-web: 1' --data-binary @- "
                 "| ${pkgs.xxd}/bin/xxd | grep ' 80' >/dev/null",

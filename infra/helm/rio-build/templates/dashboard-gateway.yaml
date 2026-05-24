@@ -1,7 +1,7 @@
 {{- if .Values.dashboard.enabled }}
 {{- $ns := .Values.namespaces.system.name -}}
 # r[impl dash.envoy.grpc-web-translate+3]
-# r[impl dash.auth.method-gate+3]
+# r[impl dash.auth.method-gate+4]
 #   (markers are documentary — tracey does not scan yaml; the r[verify]
 #    for both lives at nix/tests/default.nix which IS scanned)
 #
@@ -40,7 +40,7 @@ spec:
           - kind: HTTPRoute
 ---
 # ── Read-only methods: routed unconditionally ─────────────────────────
-# r[dash.auth.method-gate+3] — the method split is here. Status/list/log/
+# r[dash.auth.method-gate+4] — the method split is here. Status/list/log/
 # graph RPCs are idempotent reads; the dashboard hits these on every
 # page load. Exposing them via gRPC-Web is low-risk (worst case: an
 # attacker learns cluster state they could also learn from /metrics).
@@ -72,7 +72,6 @@ spec:
         - path: { type: Exact, value: /rio.admin.AdminService/ListExecutors }
         - path: { type: Exact, value: /rio.admin.AdminService/ListPoisoned }
         - path: { type: Exact, value: /rio.admin.AdminService/ListBuilds }
-        - path: { type: Exact, value: /rio.admin.AdminService/GetDerivationLogs }
         - path: { type: Exact, value: /rio.admin.AdminService/ListTenants }
         - path: { type: Exact, value: /rio.admin.AdminService/GetBuildGraph }
         - path: { type: Exact, value: /rio.admin.AdminService/GetSpawnIntents }
@@ -88,8 +87,8 @@ spec:
 # HTTPRoute (not another match in rio-scheduler-readonly) because a
 # rule's backendRefs are all-or-nothing per rule and the store is a
 # different backend in a different namespace. Read-only and
-# unauthenticated (the same posture as the GetDerivationLogs route it
-# replaces); the method-gate parity check diffs this route's paths
+# unauthenticated (the same posture as the scheduler read-only route);
+# the method-gate parity check diffs this route's paths
 # against the nginx allow-list alongside rio-scheduler-readonly's.
 #
 # Cross-namespace backendRef (rio-system → rio-store) requires the

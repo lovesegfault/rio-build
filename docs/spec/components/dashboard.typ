@@ -138,7 +138,7 @@ visualization, `@dagrejs/dagre` for layout (falls back to a Web Worker above
     degrades to table >2000 nodes, polls 5s until all-terminal],
 
   [Build drawer · Logs tab],
-  [`AdminService.GetDerivationLogs` (server stream)],
+  [`LogService.TailLog` (server stream, rio-store)],
   [Live-tail build output, UTF-8-lossy decode, virtualized scroller; `drvPath`
     filter set by Graph node click],
 
@@ -183,11 +183,13 @@ stack can't give you.
   CRDs.
 ]
 
-#r("dash.auth.method-gate+3")[
+#r("dash.auth.method-gate+4")[
   The `GRPCRoute` splits `AdminService` methods by impact: read-only methods
   (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`,
-  `GetDerivationLogs`, `ListTenants`, `GetBuildGraph`, `GetSpawnIntents`) route
-  unconditionally; mutating methods (`ClearPoison`, `DrainExecutor`,
+  `ListTenants`, `GetBuildGraph`, `GetSpawnIntents`) route unconditionally, as
+  does the read-only store-backed `LogService/TailLog` route (a separate
+  `HTTPRoute` whose `backendRef` is `rio-store`); mutating methods
+  (`ClearPoison`, `DrainExecutor`,
   `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods`
   is true (default false). Until dashboard-native authz lands, mutating
   operations go through `rio-cli` over a `kubectl port-forward`. CORS
@@ -198,8 +200,10 @@ stack can't give you.
 #r("dash.journey.build-to-logs")[
   The killer journey: click build (Builds page) → drawer opens, DAG renders
   (Graph tab) → click running node (DrvNode) → log stream renders (Logs tab).
-  The nginx→Cilium Gateway→scheduler chain MUST support server-streaming
-  end-to-end (verified by the `0x80` trailer-frame byte in curl).
+  The nginx→Cilium Gateway→backend chain MUST support server-streaming
+  end-to-end for both backends (the scheduler for the DAG and build list,
+  rio-store for the log stream), verified by the `0x80` trailer-frame byte in
+  curl.
 ]
 
 #r("dash.graph.degrade-threshold")[
@@ -209,17 +213,17 @@ stack can't give you.
   nodes (`GetBuildGraphResponse.truncated`).
 ]
 
-#r("dash.stream.log-tail+2")[
-  `GetDerivationLogs` server-stream consumption MUST use
+#r("dash.stream.log-tail+3")[
+  `LogService.TailLog` server-stream consumption MUST use
   `TextDecoder('utf-8', {fatal: false})` --- build output can contain non-UTF-8
   bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx
   `proxy_buffering off` is required or the stream buffers entirely before
   reaching the browser.
 ]
 
-#r("dash.stream.idle-timeout+2")[
+#r("dash.stream.idle-timeout+3")[
   The streaming chain MUST tolerate ≥1h of silence on an open
-  `GetDerivationLogs`/`WatchBuild` stream (a build that prints nothing for 5 minutes
+  `TailLog`/`WatchBuild` stream (a build that prints nothing for 5 minutes
   is normal under LLVM-cold-ccache). nginx `proxy_read_timeout` is set to 1h
   (default 60s cuts first); the scheduler sends a 30s server-initiated h2
   keep-alive PING (`http2_keep_alive_interval`) so the Cilium Gateway envoy's

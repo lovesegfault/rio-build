@@ -46,7 +46,7 @@ pub fn output_path_name(drv_name: &str, output_name: &str) -> String {
 
 /// Extract the 32-char nixbase32 store-path hash from a derivation
 /// identifier for use as the per-derivation build-log key (the PG
-/// `drv_executions.drv_hash` / `drv_logs.drv_hash` column and the
+/// `drv_executions.drv_hash` column and the
 /// `{drv_hash}` component of the log S3 key).
 ///
 /// This is the SINGLE source of truth shared by every component that keys

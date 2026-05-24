@@ -28,9 +28,9 @@ service AdminService {
   // List builds with optional status filtering and pagination.
   rpc ListBuilds(rio.types.ListBuildsRequest) returns (rio.types.ListBuildsResponse);
 
-  // Stream a derivation execution's log. Storage is keyed by
-  // (drv_hash, exec_id); exec_id empty = latest execution.
-  rpc GetDerivationLogs(rio.types.GetDerivationLogsRequest) returns (stream rio.types.DerivationLogChunk);
+  // GetDerivationLogs was removed by the build-log data-plane cutover:
+  // build logs are read from rio-store's LogService.TailLog (the
+  // dashboard and rio-cli call it directly).
 
   // Trigger garbage collection (streaming progress updates).
   rpc TriggerGC(rio.types.GCRequest) returns (stream rio.types.GCProgress);

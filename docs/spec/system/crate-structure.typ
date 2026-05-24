@@ -355,7 +355,7 @@ directory, so a new proto file cannot ship without one.
   [`dashmap`],
   [Concurrent hash map],
   [2],
-  [Scheduler log ring buffers (written outside actor loop); @singleflight for concurrent S3 fetches.],
+  [rio-store's live log-ingest registry (`ActiveIngests`); @singleflight for concurrent S3 fetches.],
 
   [`ordered-float`],
   [`Ord` wrapper for floats],

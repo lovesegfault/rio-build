@@ -55,12 +55,6 @@ async fn main() -> anyhow::Result<()> {
     rio_scheduler::sla::check_reference_epoch(&db, &cfg.sla, cfg.allow_reference_change).await?;
     let store_client = connect_store_lazy(&cfg.store.addr);
 
-    // Shared log ring buffers. Written by the BuildExecution recv task
-    // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
-    // The flusher is spawned AFTER leader election so it can hold a
-    // leader gate — see `init_log_pipeline` below.
-    let log_buffers = std::sync::Arc::new(rio_scheduler::logs::LogBuffers::new());
-
     if !cfg.soft_features.is_empty() {
         info!(soft_features = ?cfg.soft_features, "soft-feature stripping enabled");
     }
@@ -126,33 +120,6 @@ async fn main() -> anyhow::Result<()> {
     let is_leader_for_health = leader.is_leader_arc();
     let is_leader_for_grpc = leader.is_leader_arc();
     let leader_for_admin = leader.clone();
-
-    // Spawn the log flusher AFTER the leader gate exists so it can
-    // hold one. The flusher's self-driven arms (`flush_periodic`,
-    // `sweep_expired_logs`, the channel-close sweep) no-op until this
-    // replica is leader AND its acquisition-time recovery — which
-    // re-arms the stored-coverage reconciliation — has completed
-    // (`LogFlusher::may_flush`): a standby's `LogBuffers` is
-    // structurally empty (no worker streams), but an *ex-leader* whose
-    // `LogBuffers` is still stamped from before a lease flap would
-    // otherwise keep writing stale `drv_logs` rows and `.partial` blobs
-    // every 30s — and in the gap before recovery re-arms the per-tenure
-    // prefix latches it could overwrite coverage an interim leader
-    // stored; the GC sweep would run hourly on every replica. In
-    // non-K8s mode `LeaderState::always_leader` has
-    // recovery_complete=true so behavior is unchanged. The
-    // completion-flush arm stays un-gated — completion flushes are
-    // downstream of actor decisions, and the actor is only fed
-    // `FlushRequest`s when it's the leader (the gateway routes builds
-    // to the leader).
-    let (log_flush_tx, admin_s3) = init_log_pipeline(
-        cfg.log_s3_bucket.as_deref(),
-        cfg.log_retention_days,
-        pool.clone(),
-        Arc::clone(&log_buffers),
-        leader.clone(),
-    )
-    .await;
 
     // Spawn the event-log persister. Bounded mpsc + single drain
     // task → FIFO write ordering (fire-and-forget spawns would
@@ -328,8 +295,6 @@ async fn main() -> anyhow::Result<()> {
         },
         rio_scheduler::actor::DagActorPlumbing {
             store_client,
-            log_flush_tx,
-            log_buffers: Some(Arc::clone(&log_buffers)),
             event_persist_tx: Some(event_persist_tx),
             hmac_signer,
             service_signer: service_signer.map(Arc::new),
@@ -430,14 +395,9 @@ async fn main() -> anyhow::Result<()> {
         shutdown.clone(),
     );
 
-    // Create gRPC services. All three get the SAME Arc<LogBuffers>:
-    // SchedulerGrpc writes, AdminService reads (live), LogFlusher drains
-    // (on completion). The test-only new_for_tests() constructor makes a
-    // SEPARATE buffer — it's cfg(test) gated so prod can't accidentally
-    // use it and silently break the pipeline.
-    let grpc_service = SchedulerGrpc::with_log_buffers(
+    // Create gRPC services.
+    let grpc_service = SchedulerGrpc::new(
         actor.clone(),
-        Arc::clone(&log_buffers),
         db,
         Arc::clone(&is_leader_for_grpc),
         Arc::clone(&generation),
@@ -482,8 +442,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let admin_service = AdminServiceImpl::new(
-        log_buffers,
-        admin_s3,
         pool,
         actor.clone(),
         cfg.store.addr.clone(),
@@ -547,7 +505,6 @@ async fn main() -> anyhow::Result<()> {
         listen_addr = %listen_addr,
         store_addr = %cfg.store.addr,
         max_message_size,
-        log_s3_bucket = ?cfg.log_s3_bucket,
         jwt = jwt_pubkey.is_some(),
         "starting gRPC server"
     );
@@ -556,9 +513,9 @@ async fn main() -> anyhow::Result<()> {
     // accept_http1: gRPC-Web arrives as HTTP/1.1 POST from browser
     // fetch(); GrpcWebLayer needs the h1 codec enabled. Native gRPC
     // clients keep negotiating h2 — both protocols on one port.
-    // r[impl dash.stream.idle-timeout+2]
+    // r[impl dash.stream.idle-timeout+3]
     // http2_keep_alive_interval: 30s server-initiated PING keeps
-    // long-lived server streams (GetDerivationLogs, WatchBuild) alive
+    // long-lived server streams (WatchBuild, TriggerGC) alive
     // through any proxy's idle-timeout. Replaces the Envoy Gateway
     // ClientTrafficPolicy `streamIdleTimeout: 1h` — the stream is
     // never idle from the proxy's view.
@@ -780,49 +737,6 @@ fn connect_store_lazy(
             None
         }
     }
-}
-
-type LogFlushTx = tokio::sync::mpsc::Sender<rio_scheduler::logs::FlushRequest>;
-type AdminS3 = (aws_sdk_s3::Client, String);
-
-/// Log flusher + AdminService S3 setup.
-///
-/// Both need the same S3 client (if configured) — build it once, clone
-/// where needed. Without `RIO_LOG_S3_BUCKET`, logs are ring-buffer-only
-/// (lost on restart, still live-servable while running) and
-/// AdminService can only serve active-derivation logs.
-async fn init_log_pipeline(
-    bucket: Option<&str>,
-    log_retention_days: u32,
-    pool: sqlx::PgPool,
-    log_buffers: Arc<rio_scheduler::logs::LogBuffers>,
-    leader: rio_scheduler::lease::LeaderState,
-) -> (Option<LogFlushTx>, Option<AdminS3>) {
-    let Some(bucket) = bucket else {
-        tracing::warn!(
-            "RIO_LOG_S3_BUCKET not set; build logs will be ring-buffer-only \
-             (lost on scheduler restart, AdminService can't serve completed logs)"
-        );
-        return (None, None);
-    };
-    // Same client builder as rio-store's chunk backend (raised retry
-    // attempts, stalled-stream protection OFF — compressed log batches
-    // are small pre-buffered bodies, exactly the case that trips the
-    // sdk's stall monitor on S3-compatible servers). One config home
-    // for both services. See rio_common::s3::default_client.
-    let s3 = rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
-    let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
-    let flusher = rio_scheduler::logs::LogFlusher::new(
-        s3.clone(),
-        bucket.to_owned(),
-        pool,
-        log_buffers,
-        log_retention_days,
-        leader,
-    );
-    flusher.spawn(flush_rx);
-    info!(%bucket, "log flusher spawned");
-    (Some(flush_tx), Some((s3, bucket.to_owned())))
 }
 
 /// Edge-triggered health-toggle loop: tracks `is_leader` every 1s and

@@ -60,7 +60,7 @@ fn accounted_len(line: &[u8]) -> u64 {
 }
 
 /// Default for [`IngestConfig::per_exec_byte_cap`]: 1 GiB of accepted
-/// bytes (post-truncation content plus [`PER_LINE_OVERHEAD`] per line)
+/// bytes (post-truncation content plus `PER_LINE_OVERHEAD` per line)
 /// over the lifetime of one execution's log. Closes the
 /// unbounded-stored-bytes hole the scheduler's 16 MiB ring cap used to
 /// bound only the *resident* portion of.
@@ -88,11 +88,11 @@ const MAX_CONSECUTIVE_CUT_FAILURES: u8 = 3;
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
     /// Abort the stream (`RESOURCE_EXHAUSTED`) once this many bytes
-    /// (post-truncation content + [`PER_LINE_OVERHEAD`] per line) have
+    /// (post-truncation content + `PER_LINE_OVERHEAD` per line) have
     /// been accepted for the execution.
     pub per_exec_byte_cap: u64,
     /// `accept` reports `cut_due` once the buffer holds this many bytes
-    /// (post-truncation content + [`PER_LINE_OVERHEAD`] per line,
+    /// (post-truncation content + `PER_LINE_OVERHEAD` per line,
     /// uncompressed).
     pub cut_threshold_bytes: u64,
     /// The handler's periodic cut cadence; `should_abort`'s staleness
@@ -139,7 +139,7 @@ pub enum AcceptOutcome {
 /// Why [`IngestSession::should_abort`] wants the stream torn down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortReason {
-    /// [`MAX_CONSECUTIVE_CUT_FAILURES`] cut attempts in a row failed:
+    /// `MAX_CONSECUTIVE_CUT_FAILURES` cut attempts in a row failed:
     /// the replica cannot commit chunks (S3 or PG partition). The
     /// builder should fail over to another replica and replay.
     ConsecutiveCutFailures,
@@ -378,6 +378,7 @@ impl IngestSession {
         self.shared.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    // r[impl store.log.ingest-bounds]
     /// Validate, buffer, and fan out one batch.
     ///
     /// `Ok(Accepted { cut_due })` / `Ok(Rejected*)` keep the stream
@@ -526,6 +527,7 @@ impl IngestSession {
         Ok(AcceptOutcome::Accepted { cut_due })
     }
 
+    // r[impl store.log.chunk-immutable]
     /// Cut the longest contiguous prefix of the buffer into one
     /// immutable chunk: compress, PUT, record the manifest row, and
     /// return the durable-through line number for the ack.
@@ -677,7 +679,7 @@ impl IngestSession {
     /// `UNAVAILABLE` so the builder fails over to a replica that can
     /// actually commit chunks?
     ///
-    /// Two triggers, either sufficient: [`MAX_CONSECUTIVE_CUT_FAILURES`]
+    /// Two triggers, either sufficient: `MAX_CONSECUTIVE_CUT_FAILURES`
     /// failed cuts in a row, or buffered lines older than 2x the cut
     /// interval (the backstop for a wedge that somehow is not producing
     /// countable cut failures). Aborting drops the in-memory buffer —
@@ -979,6 +981,7 @@ mod tests {
         );
     }
 
+    // r[verify store.log.ingest-bounds]
     #[tokio::test]
     async fn truncates_oversized_lines() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1093,6 +1096,7 @@ mod tests {
         assert!(store.inner.is_empty());
     }
 
+    // r[verify store.log.chunk-immutable]
     #[tokio::test]
     async fn failed_cut_burns_the_seq() {
         // The PutOutcome::Existed caller contract: a seq number is never

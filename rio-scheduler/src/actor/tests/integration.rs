@@ -337,7 +337,6 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "tight-worker".into(),
             stream_epoch: stream_epoch_for("tight-worker"),
-            seen_drvs: vec![],
         })
         .await?;
 
@@ -349,174 +348,11 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
     Ok(())
 }
 
-// -----------------------------------------------------------------------
-// Log forwarding (ForwardLogBatch → gateway via BuildEvent::Log)
-// -----------------------------------------------------------------------
-
-/// Subscribe to a build's *log* channel via WatchBuild. The merge
-/// helpers return only the state receiver; log-forwarding tests need
-/// the log receiver explicitly post-split.
-/// ForwardLogBatch with a drv_path the DAG knows → BuildEvent::Log arrives
-/// on the broadcast rx for the interested build.
-///
-/// This tests the actor-side half of the log pipeline. The ring buffer
-/// (LogBuffers) is written directly by the gRPC recv task, not tested here —
-/// see logs.rs tests. The end-to-end gRPC wire test is in grpc/tests.rs.
-///
-/// Uses `setup()` (no worker): we send ForwardLogBatch directly to the actor,
-/// not via the gRPC BuildExecution stream. With no worker, no dispatch happens,
-/// so the event stream is quiet after InputsResolved — makes the drain loop
-/// deterministic. (With a worker, DerivationStarted would arrive AFTER
-/// InputsResolved when dispatch fires, which is a perfectly valid ordering but
-/// complicates the drain.)
-#[tokio::test]
-async fn test_forward_log_batch_reaches_interested_build() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-    let build_id = Uuid::new_v4();
-    merge_single_node(&handle, build_id, "logtest", PriorityClass::Scheduled).await?;
-    let mut events = subscribe_log(&handle, build_id).await?;
-
-    let batch = rio_proto::types::BuildLogBatch {
-        derivation_path: test_drv_path("logtest"),
-        lines: vec![b"hello from worker".to_vec(), b"second line".to_vec()],
-        first_line_number: 0,
-        executor_id: "w1".into(),
-    };
-    handle
-        .send_unchecked(ActorCommand::ForwardLogBatch {
-            drv_path: test_drv_path("logtest"),
-            batch: batch.clone(),
-        })
-        .await?;
-
-    // The actor resolves drv_path → hash → interested_builds, then emits
-    // BuildEvent::Log on the broadcast channel. Bounded wait — if the
-    // event never arrives (bug), timeout after 5s rather than hanging.
-    let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await??;
-    match ev.event {
-        Some(rio_proto::types::build_event::Event::Log(got)) => {
-            assert_eq!(got.derivation_path, batch.derivation_path);
-            assert_eq!(got.lines, batch.lines);
-            assert_eq!(got.first_line_number, 0);
-        }
-        other => panic!("expected Log event, got {other:?}"),
-    }
-    assert_eq!(ev.build_id, build_id.to_string());
-    Ok(())
-}
-
-/// ForwardLogBatch with a drv_path the DAG does NOT know → silently dropped.
-/// No event emitted, no panic. See actor/mod.rs handler comment for the two
-/// legitimate causes (post-cleanup race, buggy worker).
-#[tokio::test]
-async fn test_forward_log_batch_unknown_drv_path_dropped() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-    let build_id = Uuid::new_v4();
-    merge_single_node(&handle, build_id, "knowndrv", PriorityClass::Scheduled).await?;
-    let mut events = subscribe_log(&handle, build_id).await?;
-
-    // Send a log batch for a drv_path that is NOT in the DAG.
-    handle
-        .send_unchecked(ActorCommand::ForwardLogBatch {
-            drv_path: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-not-in-dag.drv".into(),
-            batch: rio_proto::types::BuildLogBatch {
-                derivation_path: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-not-in-dag.drv"
-                    .into(),
-                lines: vec![b"orphan".to_vec()],
-                first_line_number: 0,
-                executor_id: "w1".into(),
-            },
-        })
-        .await?;
-
-    // Then send a log for the KNOWN drv to prove the actor is still alive
-    // and processing — if the unknown batch panicked it, this would hang.
-    handle
-        .send_unchecked(ActorCommand::ForwardLogBatch {
-            drv_path: test_drv_path("knowndrv"),
-            batch: rio_proto::types::BuildLogBatch {
-                derivation_path: test_drv_path("knowndrv"),
-                lines: vec![b"sentinel".to_vec()],
-                first_line_number: 0,
-                executor_id: "w1".into(),
-            },
-        })
-        .await?;
-
-    // Only the known-drv batch produces an event. If we got the orphan's
-    // event, it would have a different derivation_path.
-    let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await??;
-    match ev.event {
-        Some(rio_proto::types::build_event::Event::Log(got)) => {
-            assert_eq!(
-                got.derivation_path,
-                test_drv_path("knowndrv"),
-                "orphan batch should have been dropped, not forwarded"
-            );
-            assert_eq!(got.lines[0], b"sentinel");
-        }
-        other => panic!("expected Log event, got {other:?}"),
-    }
-    Ok(())
-}
-
-// r[verify sched.merge.dedup]
-/// Two builds interested in the same derivation (DAG-merged) → ForwardLogBatch
-/// emits on BOTH broadcast channels. This is the "derivation built once, N
-/// builds care" case that makes DAG merging valuable.
-#[tokio::test]
-async fn test_forward_log_batch_fanout_to_multiple_interested_builds() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    // Two builds, SAME derivation tag → DAG merge dedupes to one node with
-    // interested_builds = {build1, build2}.
-    let build1 = Uuid::new_v4();
-    merge_single_node(&handle, build1, "shared-drv", PriorityClass::Scheduled).await?;
-    let build2 = Uuid::new_v4();
-    merge_single_node(&handle, build2, "shared-drv", PriorityClass::Scheduled).await?;
-    let mut events1 = subscribe_log(&handle, build1).await?;
-    let mut events2 = subscribe_log(&handle, build2).await?;
-
-    handle
-        .send_unchecked(ActorCommand::ForwardLogBatch {
-            drv_path: test_drv_path("shared-drv"),
-            batch: rio_proto::types::BuildLogBatch {
-                derivation_path: test_drv_path("shared-drv"),
-                lines: vec![b"fanout-line".to_vec()],
-                first_line_number: 0,
-                executor_id: "w1".into(),
-            },
-        })
-        .await?;
-
-    // BOTH streams should receive the log.
-    for (label, events, expected_build) in [
-        ("build1", &mut events1, build1),
-        ("build2", &mut events2, build2),
-    ] {
-        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .unwrap_or_else(|_| panic!("{label} timed out waiting for Log event"))?;
-        match ev.event {
-            Some(rio_proto::types::build_event::Event::Log(got)) => {
-                assert_eq!(got.lines[0], b"fanout-line", "{label}");
-            }
-            other => panic!("{label}: expected Log event, got {other:?}"),
-        }
-        assert_eq!(
-            ev.build_id,
-            expected_build.to_string(),
-            "{label}: event should carry its own build_id, not the other's"
-        );
-    }
-    Ok(())
-}
-
 // r[verify sched.log.phase-binding]
 /// `ForwardPhase` from an executor not assigned the derivation MUST be
 /// dropped. `handle_forward_phase` checks `state.assigned_executor`
-/// before fanning the event out — the actor-side counterpart of
-/// `push_for`'s binding gate (`sched.log.batch-binding`), reading the
+/// before fanning the event out — the phase-path analogue of the
+/// store-side log binding gate (`store.log.append-auth`), reading the
 /// same authoritative record `ProcessCompletion`'s stale-report guard
 /// reads (`sched.completion.idempotent`). Without it, a compromised
 /// builder spoofs `BuildPhase{derivation_path: <victim>}` and the

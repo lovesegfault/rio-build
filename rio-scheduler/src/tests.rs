@@ -30,8 +30,6 @@ fn config_defaults_are_stable() {
     // Phase2a required these; no default.
     assert!(d.store.addr.is_empty());
     assert!(d.database_url.is_empty());
-    // Phase2b additions — off by default.
-    assert_eq!(d.log_s3_bucket, None);
     // Size-classes: optional feature, off by default.
     assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
     // Phase 4a (plan 21E): lease config via the config layer, not raw env.
@@ -299,9 +297,6 @@ fn test_valid_config() -> Config {
 #[case::negative_infra_window(|c: &mut Config| c.retry.infra_retry_window_secs = -300.0, &["infra_retry_window_secs", "-300"])]
 #[case::zero_infra_window(|c: &mut Config| c.retry.infra_retry_window_secs = 0.0, &["infra_retry_window_secs"])]
 #[case::nan_infra_window(|c: &mut Config| c.retry.infra_retry_window_secs = f64::NAN, &[])]
-// log_retention_days=0 → cutoff collapses to now() → GC sweep deletes
-// every log on every tick. Silent data loss, not "GC disabled."
-#[case::zero_log_retention(|c: &mut Config| c.log_retention_days = 0, &["log_retention_days", "set it high"])]
 fn config_rejects(#[case] mutate: fn(&mut Config), #[case] expected: &[&str]) {
     let mut cfg = test_valid_config();
     mutate(&mut cfg);

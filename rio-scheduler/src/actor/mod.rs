@@ -101,34 +101,29 @@ const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 /// initial burst; the bridge now also continues across `Lagged` instead
 /// of dropping the receiver (see `bridge_build_events`).
 ///
-/// `Event::Log` is NOT routed through this channel — it has its own
-/// [`LOG_EVENT_BUFFER_SIZE`]-sized ring so log volume cannot evict
-/// state-transition events (`r[gw.activity.stop-parity]`).
+/// Display-only events are NOT routed through this channel — they have
+/// their own [`LOG_EVENT_BUFFER_SIZE`]-sized ring so display volume
+/// cannot evict state-transition events (`r[gw.activity.stop-parity]`).
 pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 
-/// Display-only broadcast ring size, per build (`Event::Log` +
-/// `Event::SubstituteProgress`). Separate from
-/// [`BUILD_EVENT_BUFFER_SIZE`] so chatty parallel builds (chromium /
-/// firefox / rustc at ~20 batches/s each) cannot lag the state-event
+/// Display-only broadcast ring size, per build
+/// (`Event::SubstituteProgress`). Separate from
+/// [`BUILD_EVENT_BUFFER_SIZE`] so chatty parallel builds cannot lag the
+/// state-event
 /// channel and drop `DerivationEvent::Completed`. The Apr-7 large-shallow
 /// repro had 44 `start_activity` but only 34 `stop` on the wire —
-/// `Lagged` skip-and-continue silently dropped 10 completions. Log loss
-/// is acceptable (S3 + AdminService is the authoritative path); state
-/// loss is not.
+/// `Lagged` skip-and-continue silently dropped 10 completions. Display
+/// loss is acceptable (the terminal Cached/Completed covers a dropped
+/// progress emit); state loss is not.
 ///
-/// After the build-log data-plane cutover this ring carries ONLY
-/// `Event::SubstituteProgress` (display-only, sequence-reusing, never
-/// persisted): `Event::Log` stops being produced when builders stream
-/// log batches to rio-store instead of the scheduler, and the variant +
-/// its emit site are deleted with the rest of the in-scheduler log
-/// subsystem. **Do not delete this ring, `log_channels`, or the
-/// log half of `bridge_build_events` when deleting `Event::Log`** —
-/// substitute download progress bars (`r[gw.activity.subst-progress]`)
-/// ride the same ring and survive the cutover. The only shared code is
-/// the `display_only` `matches!` in `EventHub::emit`, which loses its
-/// `Event::Log(_)` arm. The 1024 size was chosen for log volume and
-/// becomes generous (SubstituteProgress is throttled per-path); it is
-/// not worth shrinking.
+/// This ring used to also carry `Event::Log` (the scheduler-relayed live
+/// log tail); the build-log data-plane cutover moved log batches to
+/// rio-store's `LogService` and deleted the variant. Substitute download
+/// progress bars (`r[gw.activity.subst-progress]`) still ride this ring.
+/// The only consumer-side split is the `display_only` `matches!` in
+/// `BuildEventBus::emit`. The 1024 size was chosen for log volume and is
+/// now generous (SubstituteProgress is throttled per-path); it is not
+/// worth shrinking.
 pub(crate) const LOG_EVENT_BUFFER_SIZE: usize = 1024;
 
 /// Default cap on concurrent detached substitute-fetch tasks: an
@@ -276,16 +271,8 @@ pub struct DagActor {
     /// Active builds indexed by build_id.
     builds: HashMap<Uuid, BuildInfo>,
     /// Per-build event broadcast channels + sequence/debounce state +
-    /// persister/flusher wires. See [`BuildEventBus`].
+    /// persister wire. See [`BuildEventBus`].
     events: BuildEventBus,
-    /// Shared log ring buffers. The actor only seals (via
-    /// [`Self::seal_log_buffer`]) on terminal completion so a late
-    /// `LogBatch` can't recreate an entry the flusher already drained,
-    /// and discards a zero-line entry at the epilogue when the terminal
-    /// `FlushRequest` cannot be enqueued (see
-    /// [`Self::discard_log_buffer_if_empty`]).
-    /// `None` in tests that don't exercise the log pipeline.
-    log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
     /// Hung-node names → last-detected-at, populated in `handle_tick`
@@ -471,10 +458,9 @@ pub struct DagActor {
     ///
     /// NOT the same thing as [`LeaderState::recovery_complete`]: that
     /// flag is deliberately set true even when recovery FAILS (empty
-    /// DAG — "degrade, don't block", which `dispatch_ready` and
-    /// `LogFlusher::may_flush` want). Destructive consumers that infer
-    /// "stale" from "not in the DAG" (the disconnect-time log-buffer
-    /// discard) must check THIS bit instead.
+    /// DAG — "degrade, don't block", which `dispatch_ready` wants).
+    /// Destructive consumers that infer "stale" from "not in the DAG"
+    /// must check THIS bit instead.
     ///
     /// Initialized from the `LeaderState` constructor semantics
     /// (`plumbing.leader.recovery_complete()`): `always_leader`
@@ -756,8 +742,7 @@ impl DagActor {
             dag,
             ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
-            events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
-            log_buffers: plumbing.log_buffers,
+            events: BuildEventBus::new(plumbing.event_persist_tx),
             executors: HashMap::new(),
             hung_nodes: HashMap::new(),
             authoritative_binding: HashMap::new(),
@@ -855,7 +840,6 @@ impl DagActor {
             authoritative_binding,
             dag_authoritative,
             // Retained: rationale below.
-            log_buffers: _,
             executors: _,
             retry_policy: _,
             poison_config: _,
@@ -944,21 +928,11 @@ impl DagActor {
         // next successful recovery (handle_leader_acquired's Ok arm)
         // re-asserts authoritativeness. Clearing HERE covers all four
         // callers — LeaderLost, recovery start, the TOCTOU flap
-        // discard, and the failed-recovery Err arm — so the
-        // disconnect-time log-buffer discard fails closed in every
-        // empty-DAG window.
+        // discard, and the failed-recovery Err arm — so destructive
+        // staleness inferences fail closed in every empty-DAG window.
         *dag_authoritative = false;
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).
-        // - `log_buffers`: retained so a still-streaming worker's in-flight
-        //   execution keeps its lines across a lease flap. Reconciled at the
-        //   next acquisition (three parts): `rearm_prefix_reconciliation`
-        //   clears every retained entry's per-tenure stored-coverage
-        //   bookkeeping, recovery restamps PG-`Assigned|Running` entries,
-        //   and `sweep_stale_log_buffers` discards entries whose drv is no
-        //   longer non-terminal in the rebuilt DAG — so retention cannot
-        //   leak terminal drvs' buffers across generations, and spared
-        //   entries cannot carry a previous tenure's prefix conclusions.
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
         // - `cache_breaker`: store availability is generation-independent.
         // - `sla_estimator`: cluster-wide fitted curves.
@@ -1128,18 +1102,13 @@ impl DagActor {
                 ActorCommand::ExecutorDisconnected {
                     executor_id,
                     stream_epoch,
-                    seen_drvs,
                 } => {
                     // r[sched.lease.standby-drops-writes]: arm stays ungated
                     // (executors-map/gauge bookkeeping must run on standby);
                     // the PG-writing tail (reassign_derivations →
-                    // poison/Ready/terminal-log writes) self-gates on
-                    // is_leader() in executor.rs, and the log-buffer discard
-                    // loop there additionally requires dag_authoritative —
-                    // a LeaderLost-cleared, not-yet-rebuilt, or
-                    // failed-recovery (empty) DAG cannot tell stale entries
-                    // from retained in-flight ones.
-                    self.handle_executor_disconnected(&executor_id, stream_epoch, seen_drvs)
+                    // poison/Ready/terminal writes) self-gates on
+                    // is_leader() in executor.rs.
+                    self.handle_executor_disconnected(&executor_id, stream_epoch)
                         .await;
                 }
                 ActorCommand::ReportExecutorTermination {
@@ -1283,14 +1252,10 @@ impl DagActor {
                     let result = self.handle_drain_executor(&executor_id, force).await;
                     let _ = reply.send(result);
                 }
-                // r[sched.lease.standby-drops-writes]: both forward arms
-                // stay ungated. ForwardLogBatch is broadcast-ring only;
-                // ForwardPhase DOES persist Event::Phase to build_event_log
-                // — a documented exception. See the spec block before
-                // assuming this arm is PG-free.
-                ActorCommand::ForwardLogBatch { drv_path, batch } => {
-                    self.handle_forward_log_batch(&drv_path, batch);
-                }
+                // r[sched.lease.standby-drops-writes]: the forward arm
+                // stays ungated. ForwardPhase DOES persist Event::Phase
+                // to build_event_log — a documented exception. See the
+                // spec block before assuming this arm is PG-free.
                 ActorCommand::ForwardPhase { phase, executor_id } => {
                     self.handle_forward_phase(phase, &executor_id);
                 }

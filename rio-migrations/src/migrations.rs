@@ -1265,6 +1265,26 @@ pub const M_065: () = ();
 /// schemas coexist.
 pub const M_066: () = ();
 
+/// `migrations/067_drop_drv_logs.sql`
+///
+/// Drops the table M_066 promised a "later migration" would drop. The
+/// build-log data plane now lives entirely in rio-store
+/// (`drv_executions` + `drv_log_chunks` + `log_ingest_sessions`, 066);
+/// the scheduler's ring buffers, flusher, `GetDerivationLogs`, and every
+/// query against `drv_logs` are deleted in the same commit this migration
+/// ships in, so the table outlives its last reader by zero deploys — the
+/// branch is landed as a clean cut onto a wiped data plane
+/// (`xtask k8s up --wipe`), not a rolling deploy, so there is no
+/// schema/code coexistence window to protect.
+///
+/// The rows are discarded without backfill (pre-prod greenfield, the same
+/// precedent as M_061's `DROP TABLE build_logs`). The `.log.zst` /
+/// `.partial.log.zst` S3 objects the dropped rows pointed at become
+/// unreferenced; they age out under the `logs/` prefix lifecycle rule
+/// added to the chunks bucket alongside this migration (infra/eks/s3.tf),
+/// which also collects the new chunk layout's orphans.
+pub const M_067: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

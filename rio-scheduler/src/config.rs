@@ -27,18 +27,6 @@ pub struct Config {
     #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub tick_interval: std::time::Duration,
-    /// S3 bucket for build-log flush. `None` = flush disabled.
-    /// Env: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().
-    pub log_s3_bucket: Option<String>,
-    /// Build log retention in days. The `LogFlusher`'s GC tick deletes
-    /// `drv_logs` rows (and their `.log.zst` + `.partial.log.zst` S3
-    /// blobs) older than this. Default 30. Set high to effectively
-    /// disable; do NOT set to 0 — that's "delete every log on every
-    /// sweep," not "disable." The age filter already excludes active
-    /// builds (no build runs 30 days; the daemon timeout is ~2h), so
-    /// there's no `is_complete` discriminator. Env:
-    /// `RIO_LOG_RETENTION_DAYS`. Helm: `scheduler.logRetentionDays`.
-    pub log_retention_days: u32,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
@@ -154,8 +142,6 @@ impl Default for Config {
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
-            log_s3_bucket: None,
-            log_retention_days: 30,
             soft_features: Vec::new(),
             hmac_key_path: None,
             service_hmac_key_path: None,
@@ -198,11 +184,6 @@ pub struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tick_interval_secs: Option<u64>,
 
-    /// S3 bucket for build-log zstd flush (unset = flush disabled)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_s3_bucket: Option<String>,
-
     /// Permit an `[sla].reference_hw_class` change vs persisted —
     /// DESTRUCTIVE: resets build_samples / hw_perf_samples /
     /// sla_ema_state. See `crate::sla::check_reference_epoch`.
@@ -237,19 +218,6 @@ impl rio_common::config::ValidateConfig for Config {
         anyhow::ensure!(
             !cfg.tick_interval.is_zero(),
             "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
-        );
-        // `LogFlusher::sweep_expired_logs` deletes `WHERE started_at <
-        // now() - $days * interval '1 day'`. `days=0` collapses the
-        // cutoff to `now()`, which is true for every row (`started_at`
-        // is the dispatch instant, always in the past) — the sweep
-        // would delete EVERY log on EVERY tick. That's a silent
-        // data-loss footgun, not "GC disabled." Disable by setting it
-        // high (3650 = ~10y), not zero.
-        anyhow::ensure!(
-            cfg.log_retention_days > 0,
-            "log_retention_days must be positive, got 0 \
-             (would delete every log on every GC sweep — to disable, \
-             set it high, e.g. 3650)"
         );
         // r[impl sched.retry.per-executor-budget]
         // `RetryPolicy::backoff_duration` computes

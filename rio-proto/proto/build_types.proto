@@ -36,13 +36,16 @@ enum ExecutorKind {
 // A build progress event, streamed from scheduler to gateway/dashboard.
 // The sequence field enables stream resumption via WatchBuild(since_sequence).
 message BuildEvent {
+  // 6 was `BuildLogBatch log` — the scheduler-relayed live log tail.
+  // Removed by the build-log data-plane cutover: the gateway sources the
+  // live tail from rio-store's LogService.TailLog instead.
+  reserved 6;
   string build_id = 1;
   uint64 sequence = 2;                      // Monotonic, for stream resumption
   google.protobuf.Timestamp timestamp = 3;
   oneof event {
     BuildStarted started = 4;
     BuildProgress progress = 5;
-    BuildLogBatch log = 6;
     DerivationEvent derivation = 7;         // Per-derivation status changes (dag.proto)
     BuildCompleted completed = 8;
     BuildFailed failed = 9;
@@ -59,8 +62,8 @@ message BuildEvent {
 // upstream. Gateway translates to `actCopyPath` + `resProgress` so nom
 // renders a download bar (r[gw.activity.subst-progress]).
 //
-// Display-only: NOT persisted to PG, reuses the last persisted sequence
-// (like Event::Log), routed via the log broadcast ring so a Lagged drop
+// Display-only: NOT persisted to PG, reuses the last persisted sequence,
+// routed via the log broadcast ring so a Lagged drop
 // is harmless (the terminal Cached/Completed stop_activity covers it).
 // Throttled at the source (rio-store fetch_nar emits per 1 MiB).
 message SubstituteProgress {
@@ -135,9 +138,12 @@ message BuildCancelled {
 // Executor -> Scheduler messages on the BuildExecution stream.
 message ExecutorMessage {
   reserved 4;  // was ProgressUpdate (mid-build ema; consumer removed with legacy sizer)
+  // 2 was `BuildLogBatch log_batch` — batched log lines. Removed by the
+  // build-log data-plane cutover: builders stream log batches to
+  // rio-store's LogService.AppendLog instead of the scheduler.
+  reserved 2;
   oneof msg {
     WorkAssignmentAck ack = 1;              // Executor confirms receipt of assignment
-    BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
     CompletionReport completion = 3;        // Build result
     BuildPhase phase = 7;                   // Build phase change (forwarded resSetPhase)
     ExecutorRegister register = 5;          // First message: identifies the executor

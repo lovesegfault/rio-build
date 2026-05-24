@@ -559,9 +559,10 @@ per-attempt: the daemon-transient retry loop
 the first attempt and the footer once after the loop with the most recent
 daemon-running attempt's outcome (overridden to `cancelled` by the assignment's
 cancel flag) --- re-emitting the banner per attempt would
-write conflicting `rio: result` lines and break the scheduler ring buffer's
-line-number monotonicity. Subsequent attempts seed the `LogBatcher` with the
-prior attempt's final line count so output line numbers continue. The normative
+write conflicting `rio: result` lines and violate the store's monotone
+line-number gate (#rref("store.log.ingest-bounds")). Subsequent attempts seed
+the `LogBatcher` with the prior attempt's final line count so output line
+numbers continue into the same `AppendLog` session. The normative
 requirement and the display-only / no-pod-identity rationale live in
 #rref("obs.log.worker-header") in the observability spec.
 

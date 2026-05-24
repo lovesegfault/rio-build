@@ -809,7 +809,7 @@ in
 
   # nginx allow-list (docker.nix dashboardReadonlyMethods) MUST equal
   # the Cilium Gateway rio-scheduler-readonly HTTPRoute's Exact paths.
-  # Both implement r[dash.auth.method-gate+3]; before this check the
+  # Both implement r[dash.auth.method-gate+4]; before this check the
   # nginx side was a deny-list that fail-OPENED 10 mutating RPCs.
   # Diffing the two closes the drift class — adding an RPC to either
   # side without the other fails CI.
@@ -856,7 +856,7 @@ in
         diff $TMPDIR/nginx-side $TMPDIR/gateway-side || {
           echo "FAIL: nginx readonly allow-list (docker.nix dashboardReadonly{Admin,Scheduler,StoreLogs})" >&2
           echo "      diverged from the readonly HTTPRoutes (dashboard-gateway.yaml)." >&2
-          echo "      Both implement r[dash.auth.method-gate+3] — keep them in sync." >&2
+          echo "      Both implement r[dash.auth.method-gate+4] — keep them in sync." >&2
           exit 1
         }
         touch $out

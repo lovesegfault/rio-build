@@ -5,8 +5,9 @@
 # automountServiceAccountToken is TOP-LEVEL (sibling of metadata), not
 # under metadata. Easy to mis-indent.
 #
-# IRSA: store (S3 chunk bucket) and scheduler (S3 build-log flush) get
-# eks.amazonaws.com/role-arn via projected token — NO static AWS keys.
+# IRSA: store (S3 chunks/ + logs/ in the chunk bucket) and scheduler
+# (EC2 spot-price polling, ADR-023) get eks.amazonaws.com/role-arn via
+# projected token — NO static AWS keys.
 #
 # builder/fetcher SAs always rendered (vmtest profile needs them even when
 # nothing else in this chart is enabled); the Pool reconciler references

@@ -83,7 +83,7 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // failure). Initialized `true` so a zero-chunk clean close
     // (unreachable today — every server path emits ≥1 chunk or an
     // error) stays silent.
-    // r[impl obs.log.incomplete-surfaced]
+    // r[impl obs.log.incomplete-surfaced+2]
     let mut last_complete = true;
     while let Some(chunk) = stream
         .message()

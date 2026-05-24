@@ -464,26 +464,15 @@ resource "aws_iam_policy" "rio_store_s3" {
   policy = data.aws_iam_policy_document.rio_store_s3.json
 }
 
-# IRSA for rio-scheduler: S3 object access scoped to the logs/ prefix
-# of the chunks bucket. The log flusher writes .partial snapshots and
-# final blobs there; GetDerivationLogs and the post-failover stored-
-# prefix merge read them back; the .partial cleanup and the TTL sweep
-# delete them. Narrower than the store policy: same actions, logs/* only.
+# IRSA for rio-scheduler. The name is historical: this policy carried
+# S3 object access on the chunks bucket's logs/ prefix while the
+# scheduler's log flusher owned build-log durability. That data plane
+# moved to rio-store (harden-logs: builders stream to the store's
+# LogService, the store writes logs/{drv}/{exec}/{session}/{seq}.zst
+# under its own bucket-wide policy above), the scheduler's S3 client
+# was deleted with it, and the logs/* + ListBucket grants were removed.
+# Only the EC2 spot-price poller remains.
 data "aws_iam_policy_document" "rio_scheduler_s3" {
-  statement {
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-    ]
-    resources = ["${aws_s3_bucket.chunks.arn}/logs/*"]
-  }
-  statement {
-    effect    = "Allow"
-    actions   = ["s3:ListBucket"]
-    resources = [aws_s3_bucket.chunks.arn]
-  }
   # ADR-023 spot-price poller (rio-scheduler/src/sla/cost.rs poll_spot_once).
   # EC2 Describe* doesn't support resource-level permissions.
   statement {

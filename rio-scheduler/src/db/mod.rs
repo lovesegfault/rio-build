@@ -288,8 +288,6 @@ pub(crate) struct RecoveryDerivationRow {
     /// stays open at `pending`, so "has an active assignment row" is NOT
     /// "has a live execution"; the JOIN filters on the builder column to
     /// preserve `reset_to_ready()`'s exec_id clear across failover.
-    /// Recovery re-stamps this onto `LogBuffers` so the new leader's
-    /// flusher keys the right S3 blob.
     pub exec_id: Option<Uuid>,
 }
 

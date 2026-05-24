@@ -82,19 +82,12 @@ rio-nix = { workspace = true }
 # OrderedFloat wraps it with a total ordering.
 ordered-float = { workspace = true }
 
-# phase2b: build-log S3 flush (zstd + PUT logs/{drv_hash}/{exec_id}[.partial].log.zst).
-# Client builder shared with rio-store via rio-common's `aws` feature;
-# aws-sdk-s3 stays a direct dep for ByteStream/PutObject types.
-# WONTFIX: not moving behind a rio-store PutLog RPC — see ADR-024.
-aws-sdk-s3 = { workspace = true }
 # ADR-023 phase-13: live spot-price poll (sla/cost.rs poll_spot_once).
-# Same `aws_config::from_env()` IRSA chain as the S3 client; aws-config
-# is already transitive via rio-common's `aws` feature, promoted to
-# direct here for the EC2 client builder.
+# aws-config is already transitive via rio-common's `aws` feature,
+# promoted to direct here for the EC2 client builder's IRSA chain.
 aws-sdk-ec2 = { workspace = true }
 aws-config = { workspace = true }
-zstd = { workspace = true }
-# phase2b: log ring buffer written from BuildExecution recv tasks
+# SLA cost tables + actor-side concurrent maps (sla/, actor/snapshot.rs)
 dashmap = { workspace = true }
 # §13a `dispatched_cells: SmallVec<[Cell;4]>` — full A' (bug_030).
 smallvec = { workspace = true }
@@ -142,7 +135,6 @@ aws-smithy-mocks = { workspace = true }
 # (zero lockfile churn); promoted to direct dev-dep for the
 # `debugging::DebuggingRecorder` snapshotter.
 metrics-util = { workspace = true }
-aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 aws-sdk-ec2 = { workspace = true, features = ["test-util"] }
 # grpc/tests.rs trace_id header test: needs the tracing→OTel bridge so
 # #[instrument] spans get a real TraceId. Already transitive via rio-common

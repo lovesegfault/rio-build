@@ -29,24 +29,6 @@ use super::SchedulerGrpc;
 /// per-connection and all clones must share the sequence.
 static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Upper bound on distinct *accepted* `derivation_path` values one
-/// `BuildExecution` stream may push to `LogBuffers`. Per
-/// `[Single build per pod, no knob]` a legitimate stream pushes for
-/// exactly ONE; 8 covers reassign/retry slop. With `push_for` (the
-/// `(executor, drv)` binding gate) a fabricated path never allocates
-/// a `LogBuffers` entry, and with the gated `seen_drvs.insert()` a
-/// rejected path never grows the recv task's per-stream `seen_drvs:
-/// HashSet<String>` either. The cap bounds the *accepted* population
-/// — exactly the set that round-trips to the actor's
-/// `handle_executor_disconnected` cleanup — and is a defense-in-depth
-/// tripwire: if `push_for` or the gated insert ever regressed, this
-/// is the only remaining bound on entry *count*. The bound on entry
-/// *bytes* is `MAX_DRVS_PER_STREAM * MAX_DERIVATION_PATH_LEN` — the
-/// count cap alone stopped bounding memory when `seen_drvs` switched
-/// from 32-char `drv_log_hash` keys to full paths (which the
-/// disconnect cleanup needs for its `dag.hash_for_path()` lookup).
-const MAX_DRVS_PER_STREAM: usize = 8;
-
 // ── Worker-supplied field bounds ─────────────────────────────────────
 // r[impl sched.executor.input-bounds+2]
 // EVERY string/bytes field a worker can set on the ExecutorService
@@ -58,15 +40,14 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 // or their nested messages, add a row — an unlisted field is a review
 // rejection. Three enforcement styles:
 //   reject   — drop the message / fail the RPC. For advisory messages
-//              (Phase, Ack, LogBatch), for the heartbeat (a rejected
+//              (Phase, Ack), for the heartbeat (a rejected
 //              heartbeat reaps the worker — the designed recovery), and for
 //              CompletionReport.drv_path (an over-bound path can never name
 //              a live assignment — see the comment at the recv arm).
 //   truncate — bound the field in place, keep the message. For
 //              CompletionReport payload fields (the report itself must reach
 //              the actor — a lost completion strands the derivation in
-//              Running) and for LogBatch fields that must still reach the
-//              ring/forward.
+//              Running).
 //   document — left at the gRPC decode cap, with the verified reason
 //              (decoded then dropped before any retention).
 //
@@ -74,18 +55,8 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 //   ExecutorRegister.executor_id      → executors-map key, log lines      → reject RPC > MAX_IDENT_LEN
 //   WorkAssignmentAck.drv_path        → info! interpolation only          → skip arm > MAX_DERIVATION_PATH_LEN
 //   WorkAssignmentAck.assignment_token→ never read in the recv arm        → document (decoded then dropped)
-//   BuildLogBatch.derivation_path     → seen_drvs, ring key, actor fwd    → reject batch > MAX_DERIVATION_PATH_LEN
-//   BuildLogBatch.lines[i]            → ring buffer + Event::Log ring     → truncate to logs::MAX_LINE_LEN
-//   BuildLogBatch.executor_id         → retained whole in Event::Log      → truncate to MAX_IDENT_LEN
-//   BuildLogBatch.first_line_number   → ring line numbering + drv_logs    → reject batch if below what the entry
-//                                       row span arithmetic                 already accounts for (the ring's last
-//                                                                           line or the cached stored prefix's end
-//                                                                           — push_for arms `non_monotonic` /
-//                                                                           `below_stored_prefix`) or if base+len
-//                                                                           would wrap u64 (`line_number_overflow`);
-//                                                                           flusher span arithmetic is total and the
-//                                                                           drv_logs binds clamp at i64::MAX as the
-//                                                                           magnitude backstop
+//   (ExecutorMessage.log_batch is reserved — log batches go to rio-store's
+//    LogService.AppendLog, whose ingest gates own those fields' bounds.)
 //   CompletionReport.drv_path         → actor hash_for_path lookup        → reject report > MAX_DERIVATION_PATH_LEN
 //   CompletionReport.assignment_token → never read in the recv arm        → document (decoded then dropped)
 //   CompletionReport.node_name        → build_samples.node_name           → None if > MAX_IDENT_LEN
@@ -119,19 +90,15 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 //   resources / kind / flags          → numeric                           → n/a
 
 /// Upper bound on the byte length of a worker-supplied
-/// `derivation_path` (`BuildLogBatch` and `BuildPhase`). A legitimate
+/// `derivation_path` (`BuildPhase`). A legitimate
 /// Nix store path is at most ~259 bytes — `/nix/store/` (11) + 32-char
 /// hash + `-` + ≤211-char name (the protocol-level store-path name
 /// limit) + `.drv` — so 512 is generous margin that never affects real
 /// traffic. The proto `string` field is otherwise bounded only by
 /// `max_decoding_message_size` (256 MiB): without this check a
-/// compromised worker assigned drv `{H}` can send
-/// `"/nix/store/{H}-" + ~255 MiB` aliases that pass `push_for`'s
-/// binding gate (`drv_log_hash` normalizes the alias back to `{H}`)
-/// and pin `MAX_DRVS_PER_STREAM × 255 MiB ≈ 2 GiB` of resident
-/// `String` in `seen_drvs` per stream — then ship the whole set to the
-/// actor's single-threaded mailbox on disconnect. Checked at the top
-/// of both recv arms, before the path is cloned, hashed, or forwarded.
+/// compromised worker can ship a ~255 MiB path into the actor's
+/// single-threaded mailbox. Checked at the top of the recv arm, before
+/// the path is cloned, hashed, or forwarded.
 pub(super) const MAX_DERIVATION_PATH_LEN: usize = 512;
 
 /// Upper bound on the byte length of a worker-supplied `BuildPhase.phase`.
@@ -283,7 +250,6 @@ impl ExecutorService for SchedulerGrpc {
 
         // Spawn a task to read worker messages and forward to the actor
         let actor_for_recv = self.actor.clone();
-        let log_buffers = Arc::clone(&self.log_buffers);
         let executor_id_for_recv = executor_id.clone();
         // r[impl sched.lease.standby-drops-writes]
         // Generation-fence the stream: capture the lease generation at
@@ -299,7 +265,6 @@ impl ExecutorService for SchedulerGrpc {
         let stream_gen = generation.load(std::sync::atomic::Ordering::Acquire);
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
-            let mut seen_drvs: std::collections::HashSet<String> = std::collections::HashSet::new();
             let stream_is_stale = || {
                 !is_leader.load(std::sync::atomic::Ordering::SeqCst)
                     || generation.load(std::sync::atomic::Ordering::Acquire) != stream_gen
@@ -384,7 +349,7 @@ impl ExecutorService for SchedulerGrpc {
                                 break;
                             }
                             // Bound the worker-supplied path before it crosses into
-                            // the actor (same threat as the Phase/LogBatch arms: one
+                            // the actor (same threat as the Phase arm: one
                             // ~255 MiB mailbox transit + one actor-thread hash). A
                             // real store path is ≤259 bytes, so a >512-byte path can
                             // never name a live assignment — the actor would drop
@@ -479,8 +444,8 @@ impl ExecutorService for SchedulerGrpc {
                             // crosses into the actor: `handle_forward_phase`
                             // hashes it for the `dag.hash_for_path()` lookup
                             // on the single-threaded event loop. Not
-                            // accumulated like `seen_drvs`, but the same
-                            // untrusted field. r[impl sched.log.path-length]
+                            // accumulated, but the same
+                            // untrusted field. r[impl sched.log.path-length+2]
                             if phase.derivation_path.len() > MAX_DERIVATION_PATH_LEN {
                                 tracing::debug!(
                                     len = phase.derivation_path.len(),
@@ -512,7 +477,7 @@ impl ExecutorService for SchedulerGrpc {
                                 .increment(1);
                                 continue;
                             }
-                            // Same try_send semantics as ForwardLogBatch:
+                            // try_send, not send_unchecked:
                             // a dropped phase update is cosmetic (nom
                             // misses one phase column refresh), not a hang.
                             //
@@ -527,145 +492,8 @@ impl ExecutorService for SchedulerGrpc {
                                 })
                                 .is_err()
                             {
-                                metrics::counter!("rio_scheduler_log_forward_dropped_total")
+                                metrics::counter!("rio_scheduler_phase_forward_dropped_total")
                                     .increment(1);
-                            }
-                        }
-                        rio_proto::types::executor_message::Msg::LogBatch(mut log) => {
-                            // Length-bound the worker-supplied path BEFORE the
-                            // cap check, the binding gate, and the
-                            // `seen_drvs.insert()` clone. The binding gate
-                            // verifies the path's *normalized hash component*
-                            // (`drv_log_hash` collapses `"{H}-<anything>"` to
-                            // `{H}`), so a `"{H}-" + 255 MiB` alias for an
-                            // assigned drv passes it — the length check is the
-                            // only thing standing between that alias and a
-                            // ~255 MiB resident `String` in `seen_drvs`.
-                            // r[impl sched.log.path-length]
-                            if log.derivation_path.len() > MAX_DERIVATION_PATH_LEN {
-                                tracing::debug!(
-                                    len = log.derivation_path.len(),
-                                    "rejected log batch: derivation_path too long"
-                                );
-                                metrics::counter!(
-                                    "rio_scheduler_log_batches_rejected_total",
-                                    "reason" => "path_too_long"
-                                )
-                                .increment(1);
-                                continue;
-                            }
-                            // Bound the batch's remaining worker-supplied fields
-                            // BEFORE both consumers (ring buffer + actor forward →
-                            // per-build log ring → WatchBuild wire). push_into()
-                            // also truncates lines, but (a) it clones the full
-                            // line first and Vec::truncate keeps the oversized
-                            // capacity, so the ring's byte cap counts 64 KiB while
-                            // holding a 255 MiB allocation, and (b) the
-                            // ForwardLogBatch → Event::Log path doesn't go through
-                            // push_into at all — it clones the ORIGINAL proto
-                            // (including executor_id, which nothing reads but
-                            // everything retains) per interested build.
-                            // r[impl sched.executor.input-bounds+2]
-                            for line in &mut log.lines {
-                                if line.len() > crate::logs::MAX_LINE_LEN {
-                                    line.truncate(crate::logs::MAX_LINE_LEN);
-                                    line.shrink_to_fit();
-                                }
-                            }
-                            rio_common::grpc::truncate_utf8(&mut log.executor_id, MAX_IDENT_LEN);
-                            // Two-step: buffer (never blocks on actor), then forward.
-                            //
-                            // 0. Per-stream distinct-path cap. The worker is NOT
-                            //    trusted. The cap is checked BEFORE `push_for`, but
-                            //    the INSERT is gated on `accepted` (below): a path the
-                            //    binding gate refused is unverified worker input and
-                            //    MUST NOT round-trip into the actor's
-                            //    `handle_executor_disconnected` cleanup — which would
-                            //    let a fabricated suffix for a victim's hash {H} fail
-                            //    the cleanup's `dag.hash_for_path()` exact-string gate
-                            //    while `discard()` re-normalizes to {H} and removes the
-                            //    victim's live buffer. r[impl sched.log.batch-binding]
-                            //
-                            //    Because rejected paths never enter `seen_drvs`, the
-                            //    cap no longer throttles a 100%-rejected flood — that
-                            //    flood is bounded only by `push_for`'s per-batch reject
-                            //    cost (string parse, DashMap lookup, debug log, metric;
-                            //    no allocation, no actor send), which a worker could
-                            //    already pay by re-sending the same 8 rejected paths
-                            //    under the old code. The cap bounds the *accepted*
-                            //    population, which is exactly what the cleanup acts on.
-                            //
-                            //    `seen_drvs` holds the FULL `derivation_path` (not the
-                            //    32-char `drv_log_hash`) because the cleanup looks
-                            //    each entry up via `dag.hash_for_path()` — a map keyed
-                            //    on full store paths. A bare hash would never match,
-                            //    degrading the cleanup to "discard EVERY path the
-                            //    stream touched."
-                            if !seen_drvs.contains(&log.derivation_path)
-                                && seen_drvs.len() >= MAX_DRVS_PER_STREAM
-                            {
-                                metrics::counter!("rio_scheduler_log_unknown_drv_dropped_total")
-                                    .increment(1);
-                                continue;
-                            }
-                            // 1. Ring buffer write — direct, no actor involvement.
-                            //    This is the durability path: even if the actor is
-                            //    backpressured or the gateway stream lags, the lines
-                            //    land here and are serveable via AdminService.
-                            //
-                            //    push_for, not push: enforces the (executor, drv)
-                            //    binding. Drops batches from executors not assigned
-                            //    this drv (compromised builder spamming a fabricated
-                            //    derivation_path; late batch after re-dispatch landing
-                            //    after discard_log_buffer, where push()'s or_default()
-                            //    would create an unstamped entry attributed to the
-                            //    NEXT exec_id). The `seen_drvs` MAX_DRVS_PER_STREAM cap
-                            //    above is a per-stream DoS bound; this is a per-batch
-                            //    correctness gate. They're complementary, not redundant.
-                            //    r[impl sched.log.batch-binding]
-                            let accepted = log_buffers.push_for(
-                                &log.derivation_path,
-                                &log,
-                                executor_id_for_recv.as_str(),
-                            );
-
-                            // 2. Gateway forward — via actor (it owns the
-                            //    drv_path→hash→interested_builds resolution and the
-                            //    broadcast senders). `try_send`, NOT send_unchecked:
-                            //    if the actor channel is backpressured (80% full,
-                            //    hysteresis), we drop the gateway-forward. The ring
-                            //    buffer already has the lines; the gateway misses
-                            //    *live* logs but can still get them via AdminService.
-                            //
-                            //    This is the opposite tradeoff from ProcessCompletion
-                            //    (which MUST use send_unchecked — a dropped completion
-                            //    leaves a derivation stuck Running forever). A dropped
-                            //    log batch is a degraded-mode nuisance, not a hang.
-                            //
-                            //    Gated on `accepted`: a batch the binding gate dropped
-                            //    is unverified worker input — fanning it out to
-                            //    interested builds' live `nix build -L` streams would
-                            //    let a compromised executor inject log lines into another
-                            //    drv's tail. Same `r[sched.log.batch-binding]` invariant
-                            //    as the ring-buffer write; both consumers of the
-                            //    worker-supplied `derivation_path` must respect the gate.
-                            if accepted {
-                                // Bind-gate verified ⟹ this path identifies an
-                                // assignment held by THIS stream. Safe to round-trip
-                                // through the disconnect cleanup. Idempotent on
-                                // already-seen.
-                                seen_drvs.insert(log.derivation_path.clone());
-                                let drv_path = log.derivation_path.clone();
-                                if actor_for_recv
-                                    .try_send(ActorCommand::ForwardLogBatch {
-                                        drv_path,
-                                        batch: log,
-                                    })
-                                    .is_err()
-                                {
-                                    metrics::counter!("rio_scheduler_log_forward_dropped_total")
-                                        .increment(1);
-                                }
                             }
                         }
                     }
@@ -674,18 +502,11 @@ impl ExecutorService for SchedulerGrpc {
 
             // Stream closed: worker disconnected. Use blocking send — if this
             // is dropped due to backpressure, running derivations won't be
-            // reassigned and will hang forever. `seen_drvs` is forwarded
-            // so the actor can do the log-buffer cleanup AFTER the epoch
-            // check and with DAG-ownership awareness — doing it here
-            // (pre-epoch-gate, branching on `is_sealed`) raced the
-            // actor's seal (TOCTOU), let a stale reader wipe a
-            // reconnected stream's fresh buffer, and let a compromised
-            // worker discard a victim's buffer.
+            // reassigned and will hang forever.
             if actor_for_recv
                 .send_unchecked(ActorCommand::ExecutorDisconnected {
                     executor_id: executor_id_for_recv.into(),
                     stream_epoch,
-                    seen_drvs: seen_drvs.into_iter().collect(),
                 })
                 .await
                 .is_err()

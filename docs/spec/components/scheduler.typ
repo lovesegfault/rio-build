@@ -160,33 +160,18 @@ any critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
-#r("sched.log.batch-binding")[
-  The `BuildLogBatch` ingestion path MUST drop batches whose `derivation_path`
-  does not match an active assignment held by the calling executor's stream. A
-  batch for an unsolicited derivation MUST NOT allocate a buffer entry.
-]
-
-This is the log-path analogue of #rref("sched.completion.output-membership").
-The completion check runs inside the actor with `state.assigned_executor` in
-scope; the log batch ingestion path deliberately bypasses the actor (so a
-chatty build can't fill the actor's bounded mpsc), so the gate is colocated
-with the data the recv task has --- the ring buffer entry, stamped with
-`(exec_id, assigned_executor)` at dispatch. Without it, a compromised builder
-spamming a fabricated `derivation_path` pollutes that drv's per-execution log
-blob, and a late batch from a heartbeat-timed-out executor lands after a
-re-dispatch and gets attributed to the *next* execution. Dropped batches
-increment #(refs.metric)("rio_scheduler_log_batches_rejected_total").
-
 #r("sched.log.phase-binding")[
   The `BuildPhase` ingestion path MUST drop phase updates whose
   `derivation_path` does not match an active assignment held by the calling
   executor.
 ]
 
-The third worker-supplied `derivation_path` consumer in the `BuildExecution`
-recv loop. Unlike #rref("sched.log.batch-binding"), whose check is colocated
-with the ring buffer in the recv task (because the durability write must
-bypass the actor's bounded mpsc), phase updates have no recv-task side effect
+The second worker-supplied `derivation_path` consumer in the `BuildExecution`
+recv loop, and the phase-path analogue of
+#rref("sched.completion.output-membership"). (Log batches no longer transit
+the scheduler at all --- the equivalent binding gate for the log data plane is
+#rref("store.log.append-auth"), enforced by rio-store against the assignment
+token.) Phase updates have no recv-task side effect
 --- every sink they reach is fed from inside the actor. The gate
 therefore runs in the actor against `(status, assigned_executor)`: the same
 `Assigned|Running` precondition + executor comparison as the
@@ -208,23 +193,23 @@ event). Dropped phase updates increment
 (`not_active` | `no_assignment` | `executor_mismatch` | `path_too_long` |
 `phase_too_long`).
 
-#r("sched.log.path-length")[
-  The `BuildExecution` recv loop MUST drop any `BuildLogBatch` or
-  `BuildPhase` whose `derivation_path` exceeds 512 bytes, before the path is
-  cloned, hashed, or forwarded to the actor.
+#r("sched.log.path-length+2")[
+  The `BuildExecution` recv loop MUST drop any `BuildPhase` whose
+  `derivation_path` exceeds 512 bytes, before the path is cloned, hashed, or
+  forwarded to the actor.
 ]
 
 A legitimate Nix store path is at most ~259 bytes (`/nix/store/` + 32-char
 hash + `-` + the 211-char name limit + `.drv`); the proto `string` field is
 otherwise bounded only by the 256 MiB `max_decoding_message_size`. The
-binding gates verify the path's _normalized hash component_ — `drv_log_hash`
+binding gate verifies the path's _normalized hash component_ — `drv_log_hash`
 collapses `"{hash}-<anything>"` back to `{hash}` — so a
-`"{hash}-" + 255 MiB` alias for a legitimately assigned derivation passes
-#rref("sched.log.batch-binding") and would otherwise be cloned whole into the
-recv task's per-stream `seen_drvs` set (pinning
-`MAX_DRVS_PER_STREAM × 255 MiB ≈ 2 GiB` resident per stream) and shipped to
-the actor's single-threaded mailbox on disconnect. Rejections increment the
-arm's rejection counter with reason `path_too_long`.
+`"{hash}-" + 255 MiB` alias for a legitimately assigned derivation would pass
+#rref("sched.log.phase-binding") and otherwise be cloned into the actor's
+single-threaded mailbox and rendered into every interested tenant's terminal.
+Rejections increment the arm's rejection counter with reason `path_too_long`.
+(The `BuildLogBatch` half of this bound moved to rio-store with the log data
+plane --- #rref("store.log.ingest-bounds").)
 
 #r("sched.executor.input-bounds+2")[
   Every worker-supplied string field on the `ExecutorService` surface MUST be
@@ -260,22 +245,18 @@ with reason `phase_too_long`; the unresolvable-path completion drop
 increments #(refs.metric)("rio_scheduler_completions_rejected_total") with
 reason `path_too_long`.
 
-`BuildLogBatch.first_line_number` is the motivating numeric field: it keys
-the ring buffer's line numbering and the `drv_logs` row span, so out-of-order
-or overflowing numbering would otherwise wrap the span subtraction into a
-negative `line_count` (corrupting `s3_is_caught_up` and the
-physical-vs-claimed re-serve for every interested build of the execution) or
-panic the flusher task in debug builds. Ordering violations are rejected
-per-batch at ingestion (reasons `non_monotonic` / `line_number_overflow` on
-#(refs.metric)("rio_scheduler_log_batches_rejected_total")); magnitude is
-deliberately NOT bounded at ingestion (forward gaps are legitimate and
-unbounded — see #rref("obs.log.gap-span")) and is instead handled under the
-rule's total-arithmetic branch: the flusher's span computation falls back to
-the physical line count (tripwire
-#(refs.metric)("rio_scheduler_log_flush_span_fallback_total")) and the
-`drv_logs` numeric binds clamp at `i64::MAX`, which keeps every recorded
-`(first_line, line_count)` pair non-negative and overflow-free for the read
-path. The `CompletionReport` resource telemetry persisted to `build_samples`
+`CompletionReport.final_line_count` is the motivating numeric field: the
+scheduler folds it into the `drv_executions` row that rio-store's log
+completeness predicate (#rref("store.log.completeness-gate")) compares the
+chunk manifest against, so a worker-supplied value past `i64::MAX` would wrap
+negative under a bare cast and make the contiguity check vacuously true ---
+vouching for an empty log as complete and sealing it against the very replay
+that could complete it. The bind site converts via `try_from` and records
+out-of-range (and zero, the proto's not-reported sentinel) values as SQL
+`NULL`, the same degradation as every other unusable report field.
+(`BuildLogBatch` no longer transits the scheduler; its line-number ordering
+and magnitude are bounded at rio-store's ingest path per
+#rref("store.log.ingest-bounds").) The `CompletionReport` resource telemetry persisted to `build_samples`
 (`peak_memory_bytes`, `peak_cpu_cores`, the duration derived from the
 `BuildResult` start/stop timestamps) and the `CompletionReport.final_resources`
 cgroup snapshot folded into the same row (`cpu_limit_cores`,
@@ -347,7 +328,7 @@ three steps (seal, flush, correlate) when *both* carriers are `None`, which
 covers every never-dispatched terminal regardless of its enum value.
 
 The build↔exec correlation lets the dashboard's build view fetch the *exact*
-log a build observed (`GetDerivationLogs(drv, exec_id)`) instead of falling
+log a build observed (`LogService.TailLog(drv, exec_id)`) instead of falling
 back to "latest execution for this derivation" --- which can differ if the drv
 was rebuilt by a later build. The write is best-effort fire-and-forget: a
 failed write degrades the dashboard view, not the build outcome. It runs in
@@ -1731,32 +1712,11 @@ confirmation is ever required there.
   live build that also links the parent.
 ]
 
-#r("sched.recovery.log-buffer-sweep+2")[
-  On lease acquisition, after re-stamping ring-buffer entries for
-  PG-`Assigned|Running` assignments, the scheduler MUST discard every other
-  retained, unsealed ring-buffer entry whose derivation is not present in the
-  rebuilt DAG in a non-terminal state.
-]
-
-An ex-leader re-acquiring the lease retains its ring buffers across the flap
-(so a still-streaming worker's in-flight execution keeps accumulating), but a
-derivation that reached a terminal state under an interim leader is either not
-loaded at recovery at all or loaded only as a Poisoned poison-TTL-tracking
-node, and no other cleanup path covers its retained entry --- the stale
-pre-flap lines would shadow the execution's stored log in `GetDerivationLogs`
-(the ring buffer is probed before S3) and the periodic flusher would re-upload
-its `.partial` snapshot every 30 seconds for the process lifetime. Poisoned
-derivations' executions were already finalized by whichever leader poisoned
-them, they are never re-dispatched while poisoned (a post-clear re-dispatch
-mints a fresh `exec_id` and discards the entry first), and the only other
-reaper is the 24-hour poison TTL --- so their retained entries are discarded
-as well. Entries for derivations the rebuilt DAG tracks in a non-terminal
-state survive regardless of which state (a post-reset retained buffer on a
-`Ready` node is finalized by the cancel-sweep paths, not discarded). Sealed
-entries are exempt: a seal marks a terminal this process already observed,
-whose final flush request may still be queued; the flusher owns their removal.
-The discarded entries' unflushed tails are accepted loss within the failover
-bound of `obs.log.periodic-flush`.
+Recovery carries no build-log state: the scheduler holds no log buffers, so a
+lease change requires no log reconciliation, discard, or re-stamping. (The
+log data plane lives in rio-store, whose ingest sessions are leased per
+execution, not per scheduler tenure --- see
+#xref(<store-log-service>, [the store component spec]).)
 
 Recovery sequence:
 
@@ -2052,9 +2012,10 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   [Per-completion telemetry rows feeding the ADR-023 SLA fit (ring-buffered per
     `(pname, system, tenant)`)],
 
-  [`drv_logs`],
-  [S3 blob metadata per execution (`exec_id` PK, `drv_hash`) --- `s3_key`,
-    `line_count`, `is_complete`, `started_at` for log-flush UPSERTs and TTL GC],
+  [`drv_executions`],
+  [Per-execution lifecycle row (`exec_id` PK, `drv_hash`, `status`,
+    `final_line_count`) --- written by the scheduler at dispatch and terminal,
+    read by rio-store's log completeness predicate and latest-exec resolution],
 
   [`build_event_log`],
   [Prost-encoded `BuildEvent` per (`build_id`, `sequence`) for gateway
@@ -2207,10 +2168,10 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 ```
 
 #info[
-  Auxiliary tables omitted from pseudo-DDL above: `drv_logs` (S3 blob
-  metadata per derivation execution, `exec_id` PK) and `build_event_log`
-  (Prost-encoded BuildEvent per sequence for gateway replay). See
-  `rio-migrations/migrations/` for full schema.
+  Auxiliary tables omitted from pseudo-DDL above: `drv_executions`
+  (per-execution lifecycle, `exec_id` PK; the log subsystem's anchor row) and
+  `build_event_log` (Prost-encoded BuildEvent per sequence for gateway
+  replay). See `rio-migrations/migrations/` for full schema.
 ]
 
 = Leader Election
@@ -3005,7 +2966,6 @@ entirely: a `requirements` edit takes effect on the next rollout.
   implementations
 - #src("rio-scheduler/src/db/") --- PostgreSQL persistence (derivations,
   assignments, build_samples telemetry; split into 9 domain modules per P0411)
-- #src("rio-scheduler/src/logs/") --- LogBuffers ring buffer + S3 LogFlusher
 - #src("rio-lease/src/") --- Kubernetes Lease leader-election loop
   (generation counter, `is_leader` flag, `recovery_complete` gate)
 - #src("rio-scheduler/src/actor/recovery.rs") --- State recovery: reload
@@ -3013,7 +2973,7 @@ entirely: a `requirements` edit takes effect on the next rollout.
 - #src("rio-scheduler/src/event_log.rs") --- PostgreSQL-backed
   `build_event_log` writes for gateway `since_sequence` replay
 - #src("rio-scheduler/src/admin/") --- AdminService gRPC (ClusterStatus,
-  DrainExecutor, GetDerivationLogs, TriggerGC)
+  DrainExecutor, TriggerGC)
 
 CA early cutoff is end-to-end: compare (#rref("sched.ca.cutoff-compare") ---
 completion-time content-index lookup), propagate
@@ -3167,47 +3127,48 @@ bandwidth even if the build is cancelled before starting, and the scheduler
 must compute or look up input closures to generate hints, adding scheduling
 overhead.
 
-== Build-log archival stays in scheduler // supersedes ADR-024
+== Build-log data plane lives in rio-store // supersedes ADR-024 and reverses the round-7 "stays in scheduler" decision
 <sched-rationale-logs>
 
-`rio-scheduler` writes build logs to S3 directly. The proposal to add a
-`StoreService.PutLog(stream LogChunk) → LogRef` RPC --- routing the flusher
-through it and dropping `aws-sdk-s3` from the scheduler's dependency tree ---
-was *rejected*.
+`rio-scheduler` holds no build-log data and links no S3 SDK. Builders stream
+log batches directly to rio-store's `LogService.AppendLog`; the store owns
+chunking, durability, retention, and serving
+(#xref(<store-log-service>, [the store component spec])). An earlier revision
+of this section *rejected* moving the log path out of the scheduler; that
+decision was reversed when the in-scheduler design's maintenance cost became
+undeniable --- a majority of all commits to the scheduler's log module were
+fixes for one bug class.
 
-Build logs are scheduler artifacts, not store artifacts. rio-store's domain is
-the content-addressed Nix store: @nar chunks, @narinfo, signatures, realisations,
-GC by reachability. Build logs are execution-addressed (`exec_id`, not
-content-addressed), mutable (periodic snapshots and the final flush UPSERT the
-same row), retained on a wall-clock TTL (not reachability), unsigned, and not
-deduplicated. They share nothing with `PutPath` except "bytes go to S3." Adding
-them to `StoreService` dilutes its single responsibility into "also a generic
-blob bucket." The `drv_logs` metadata table is correlated to scheduler state
-(`build_derivations.exec_id` records which execution each interested build
-observed); a `PutLog` RPC either leaves the PG write scheduler-side anyway or
-drags scheduler-private execution identity into store's vocabulary.
+*The hard part.* The previous design buffered logs in per-derivation ring
+buffers inside the leader-elected scheduler and periodically re-uploaded a
+growing, mutable `.partial` blob to S3. Both choices generated the dominant
+bug class: the leader's RAM was the system of record for up to 30 seconds,
+and a mutable blob means a stale tenure's flush can *reduce* coverage a prior
+tenure already stored. Every leadership change therefore required a
+reconciliation protocol (re-stamping, sealing, stored-coverage folding,
+tenure-pinned flush requests) whose failure modes were the majority of the
+log subsystem's bug history.
 
-Latency is not the problem; channel mixing is. The flush is fully async --- the
-actor `try_send`s and moves on --- but the periodic-snapshot bytes would ride
-the same scheduler→store gRPC channel that carries `FindMissingPaths` /
-`BatchQueryPathInfo`, the calls that I-110 identified as the scaling bottleneck
-under builder fan-out. Best-effort bulk log traffic competing for h2 stream
-slots and store CPU with latency-sensitive cache lookups is a regression.
-Direct scheduler→S3 keeps that traffic on a separate fault domain.
+*Alternatives considered.* Keeping the scheduler as the writer but switching
+to immutable append-only chunks fixes the overwrite half but leaves the
+leader's RAM as the only copy of un-flushed lines. Routing the flusher
+through a `StoreService.PutLog` RPC (the original ADR-024 proposal) was
+rejected for channel-mixing reasons that no longer apply: builders already
+hold an authenticated bulk-upload channel to the store (NAR uploads), so log
+ingest rides a builder→store stream that exists anyway rather than competing
+with the scheduler→store cache-lookup channel.
 
-The original concern --- two components hand-rolling AWS SDK config differently
---- was already fixed by `rio_common::s3::default_client` (one config home, one
-retry policy, one stalled-stream setting). What remains is "scheduler links
-`aws-sdk-s3`," which is a binary-size observation, not an architectural one.
-
-*Consequences.* `rio-scheduler` keeps `aws-sdk-s3` as a direct dependency.
-`rio_common::s3` remains the single S3-config home for both scheduler and
-store. `StoreService` stays scoped to Nix-store semantics. Log-loss-on-crash
-bound stays ≤30s per #rref("obs.log.periodic-flush"). Revisit if: store gains a
-generic blob tier for some other reason; multi-region deployment makes
-per-component @irsa roles materially expensive; or periodic-snapshot volume
-grows enough that scheduler→S3 egress becomes a cost line item (at which point
-the fix is delta-upload, not relocation).
+*Consequences.* The scheduler's log subsystem (ring buffers, flusher,
+leadership reconciliation, `GetDerivationLogs`) is deleted; the scheduler
+drops `aws-sdk-s3` entirely. The `BuildExecution` stream carries control
+messages only, so a chatty build cannot contend with completions for the
+scheduler's recv loop or mailbox. Log loss on scheduler failover is zero by
+construction (the scheduler holds no log data); the loss budget moves to the
+builder's retransmit buffer and the store's ingest path. The cost is that
+rio-store gains a position-addressed, TTL-retained object class that does not
+participate in the CAS --- scoped to its own `LogService` and the `logs/`
+prefix so the content-addressed store's single responsibility is diluted as
+little as possible.
 
 == In-memory DAG scalability
 <sched-rationale-dag-scale>

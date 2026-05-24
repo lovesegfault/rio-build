@@ -1,6 +1,6 @@
 // r[impl dash.envoy.grpc-web-translate+3]
-// r[impl dash.auth.method-gate+3]
-// r[impl dash.stream.idle-timeout+2]
+// r[impl dash.auth.method-gate+4]
+// r[impl dash.stream.idle-timeout+3]
 // Shared gRPC-Web transport for the AdminService client.
 //
 // gRPC-Web translation happens in-process at rio-scheduler via tonic-web

@@ -2,7 +2,7 @@ syntax = "proto3";
 package rio.types;
 
 // Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants,
-// GetDerivationLogs, DrainExecutor, ClearPoison, GetSpawnIntents. Data
+// DrainExecutor, ClearPoison, GetSpawnIntents. Data
 // types for the AdminService RPCs defined in admin.proto.
 //
 // Same `package rio.types;` — prost merges by package into a single
@@ -103,25 +103,9 @@ message BuildInfo {
   string error_summary = 11;
 }
 
-// Request a derivation execution's log. Storage is keyed by
-// (drv_hash, exec_id). exec_id empty = latest execution.
-message GetDerivationLogsRequest {
-  string derivation_path = 1;            // Full path / basename / bare hash; drv_log_hash() normalizes
-  string exec_id = 2;                    // Optional. Empty = latest (MAX(exec_id) for this drv)
-  uint64 since_line = 3;                 // Resume from this line number (0 = from start).
-                                         // For stored logs that span a scheduler failover the
-                                         // server may re-send from the start; clients must
-                                         // tolerate receiving lines before since_line.
-}
-
-// Chunk of derivation log data streamed from scheduler.
-message DerivationLogChunk {
-  string derivation_path = 1;
-  string exec_id = 2;                    // Resolved server-side when request had exec_id empty
-  repeated bytes lines = 3;              // Raw log lines (may be non-UTF-8)
-  uint64 first_line_number = 4;
-  bool is_complete = 5;                  // true if no more lines follow
-}
+// GetDerivationLogsRequest / DerivationLogChunk were removed by the
+// build-log data-plane cutover (build logs are read from rio-store's
+// LogService.TailLog; see store.proto's TailLogRequest / TailLogChunk).
 
 // ───────────────────────────────────────────────────────────────────────────
 // Drain / poison / tenants

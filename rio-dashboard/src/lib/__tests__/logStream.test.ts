@@ -1,4 +1,4 @@
-// r[verify dash.stream.log-tail+2]
+// r[verify dash.stream.log-tail+3]
 // Runes-in-module store driven by a mocked async-generator RPC. The
 // `.svelte.ts` compile pass means `$state` inside createLogStream works
 // under vitest too (the Svelte vite plugin handles the transform).
@@ -171,7 +171,7 @@ describe('createLogStream', () => {
     expect(s.done).toBe(true);
   });
 
-  // r[verify obs.log.incomplete-surfaced]
+  // r[verify obs.log.incomplete-surfaced+2]
   it('marks done when the generator exhausts without isComplete', async () => {
     // Server closed the stream early (shutdown, abort observed), the
     // build is still running (ring-buffer snapshot), or the stored blob

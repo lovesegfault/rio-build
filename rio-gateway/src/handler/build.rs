@@ -680,8 +680,8 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
 /// into STDERR protocol messages for the Nix client.
 ///
 /// Also consumes the build's log-tail output channel: build-log lines
-/// no longer arrive on the scheduler's event stream (`Event::Log` is a
-/// dead variant pending deletion) — they arrive from per-derivation
+/// do not arrive on the scheduler's event stream — they arrive from
+/// per-derivation
 /// `TailLog` subscriptions to rio-store, managed by `tails` and fed
 /// through `log_rx`. The two sources are `select!`ed so a quiet
 /// scheduler stream doesn't starve the live tail and vice versa.
@@ -759,15 +759,6 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
 
         use types::build_event::Event;
         match event.event {
-            // Build-log lines no longer travel on the scheduler stream.
-            // A legacy scheduler that still emits Event::Log (it cannot
-            // — the builder stopped producing the batches that fed it —
-            // but the variant exists until the proto cleanup) is
-            // ignored rather than double-relayed alongside the TailLog
-            // subscription for the same derivation.
-            Some(Event::Log(_)) => {
-                debug!("ignoring Event::Log from the scheduler (the log data plane is rio-store)");
-            }
             Some(Event::Phase(phase)) => {
                 // r[impl gw.stderr.result.set-phase]
                 // Builder forwarded the daemon's SetPhase. Attach to the

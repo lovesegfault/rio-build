@@ -36,6 +36,8 @@ const LOG_CHUNK_ZSTD_LEVEL: i32 = 6;
 /// `read_to_end` would let one bad object OOM the replica.
 const MAX_DECOMPRESSED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
+// r[impl store.log.chunk-immutable]
+// r[impl obs.log.exec-keyed+2]
 /// Build the S3 object key for one log chunk:
 /// `logs/{drv_hash}/{exec_id}/{session_id}/{chunk_seq:08}.zst`.
 ///
@@ -137,7 +139,7 @@ pub fn compress_lines(lines: &[Vec<u8>]) -> Result<Vec<u8>, LogChunkError> {
 /// decompressed payload is zero lines (not one empty line) — see
 /// `codec_roundtrips_single_empty_line_vs_no_lines`.
 ///
-/// Refuses to decompress past [`MAX_DECOMPRESSED_CHUNK_BYTES`] (a
+/// Refuses to decompress past `MAX_DECOMPRESSED_CHUNK_BYTES` (a
 /// `Codec` error) so a corrupt frame cannot balloon into an unbounded
 /// allocation.
 pub fn decompress_lines(blob: &[u8]) -> Result<Vec<Vec<u8>>, LogChunkError> {

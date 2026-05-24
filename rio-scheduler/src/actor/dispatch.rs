@@ -2036,24 +2036,15 @@ impl DagActor {
         if !self.transition_to_assigned(drv_hash, executor_id) {
             return false;
         }
-        // Fresh attempt → clean log buffer. Clears any stale partial
-        // from a transient-failure predecessor (whose lines would
-        // otherwise prefix this attempt's with overlapping numbers)
-        // and any stale seal from a poison-clear (which would silently
-        // drop this attempt's pushes). No-op for first dispatch.
-        self.discard_log_buffer(drv_hash);
-
         // Mint a fresh per-execution identifier. UUIDv7 — time-sortable,
-        // keys the `drv_logs` row and the `logs/{drv_hash}/{exec_id}.*`
-        // S3 blobs. Stamped on the ring-buffer entry (flusher carrier)
-        // and `DerivationState` (actor carrier); persisted to
+        // keys the `drv_executions` row and rio-store's
+        // `logs/{drv_hash}/{exec_id}/...` chunk objects. Stamped on
+        // `DerivationState` (actor carrier); persisted to
         // `assignments.exec_id` in `record_assignment` (recovery
         // carrier); sent in `WorkAssignment.exec_id` (worker echo).
-        // Minted AFTER discard so the buffer entry it stamps is fresh,
-        // and BEFORE record_assignment so the PG row is consistent
+        // Minted BEFORE record_assignment so the PG row is consistent
         // with the in-memory state.
         let exec_id = Uuid::now_v7();
-        self.set_log_exec(drv_hash, exec_id, executor_id);
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.exec_id = Some(exec_id);
         }
@@ -2175,7 +2166,7 @@ impl DagActor {
         // resolution + completeness predicate read it; the terminal
         // stamp lands in `terminal_log_epilogue`). Keyed by the
         // `drv_log_hash()` 32-char form of the *path* — the same value
-        // the `drv_logs` row and the `logs/{hash}/…` S3 keys use — not
+        // rio-store's `logs/{hash}/…` chunk keys use — not
         // the DAG key. Best-effort: a missing row degrades the
         // unpinned-read latest-exec lookup for this execution, it does
         // not affect the build. Written BEFORE the WorkAssignment send
@@ -2271,12 +2262,6 @@ impl DagActor {
         {
             worker.running_build = None;
         }
-        // Discard the ring-buffer entry that `set_log_exec` just
-        // created — without this, a failed dispatch leaks an empty
-        // stamped entry that the periodic flusher would skip (zero
-        // lines) but never reap. Idempotent; the entry is empty (the
-        // worker never started streaming because try_send failed).
-        self.discard_log_buffer(drv_hash);
         // Capture the exec_id BEFORE reset_to_ready clears it — the
         // drv_executions cleanup at the bottom needs it.
         let rolled_back_exec = self.dag.node(drv_hash).and_then(|s| s.exec_id);

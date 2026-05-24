@@ -85,24 +85,25 @@ async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
     assert_eq!(tx.receiver_count(), 1, "still subscribed after second send");
 }
 
-/// State events MUST survive log-channel flooding. Before the
-/// state/log channel split, `Event::Log` and `DerivationEvent` shared
+/// State events MUST survive display-channel flooding. Before the
+/// state/display channel split, display-only events and
+/// `DerivationEvent` shared
 /// one `broadcast(4096)` ring; chatty parallel builds (chromium /
 /// firefox / rustc) flooded it, the bridge's `Lagged` skip-and-continue
 /// silently dropped `DerivationEvent::Completed`, and the gateway never
 /// emitted `stop_activity` — repro JSON had 44 `start` / 34 `stop`.
 ///
-/// Asserts: emitting >> ring-capacity Log events on the log channel
-/// does NOT prevent a single `Derivation::Completed` on the state
-/// channel from reaching the bridge output.
+/// Asserts: emitting >> ring-capacity SubstituteProgress events on the
+/// display channel does NOT prevent a single `Derivation::Completed`
+/// on the state channel from reaching the bridge output.
 // r[verify gw.activity.stop-parity]
 #[tokio::test]
-async fn test_completed_event_survives_log_flood() {
+async fn test_completed_event_survives_display_flood() {
     use rio_proto::types::build_event::Event;
     let build_id = Uuid::new_v4();
 
-    // Log ring sized at the production LOG_EVENT_BUFFER_SIZE so the
-    // flood actually lags it. State ring sized at 16 — irrelevant,
+    // Display ring sized at the production LOG_EVENT_BUFFER_SIZE so
+    // the flood actually lags it. State ring sized at 16 — irrelevant,
     // only one state event is sent.
     let (state_tx, state_rx) = broadcast::channel(16);
     let (log_tx, log_rx) = broadcast::channel(crate::actor::LOG_EVENT_BUFFER_SIZE);
@@ -115,10 +116,11 @@ async fn test_completed_event_survives_log_flood() {
         None,
     );
 
-    // Flood the log channel well past its capacity so the log receiver
-    // is guaranteed Lagged. This is what emit() routes Event::Log to.
+    // Flood the display channel well past its capacity so its receiver
+    // is guaranteed Lagged. This is what emit() routes
+    // Event::SubstituteProgress to.
     for _ in 0..6000 {
-        let _ = log_tx.send(mk_log_event(build_id, 0));
+        let _ = log_tx.send(mk_display_event(build_id, 0));
     }
     // The state event under test: a per-derivation Completed.
     let _ = state_tx.send(rio_proto::types::BuildEvent {
@@ -137,9 +139,9 @@ async fn test_completed_event_survives_log_flood() {
     });
 
     // Drain until we see the Completed. A 2s budget at 6001 events is
-    // ample (in-process). Some Log events were evicted by Lagged —
+    // ample (in-process). Some display events were evicted by Lagged —
     // count how many reached the bridge to assert the flood actually
-    // overflowed the log ring (otherwise the test isn't proving the
+    // overflowed the display ring (otherwise the test isn't proving the
     // split, just that 6000 < capacity).
     let mut log_seen = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -148,7 +150,7 @@ async fn test_completed_event_survives_log_flood() {
             break false;
         };
         match ev.expect("Ok event").event {
-            Some(Event::Log(_)) => log_seen += 1,
+            Some(Event::SubstituteProgress(_)) => log_seen += 1,
             Some(Event::Derivation(d))
                 if d.kind == rio_proto::types::DerivationEventKind::Completed as i32 =>
             {
@@ -160,11 +162,11 @@ async fn test_completed_event_survives_log_flood() {
 
     assert!(
         saw_completed,
-        "DerivationEvent::Completed must reach the bridge despite log flood"
+        "DerivationEvent::Completed must reach the bridge despite the display flood"
     );
     assert!(
         log_seen < 6000,
-        "log channel should have lagged (saw {log_seen}/6000); \
+        "display channel should have lagged (saw {log_seen}/6000); \
          if all logs arrived, LOG_EVENT_BUFFER_SIZE >= 6000 and the test \
          isn't exercising the split"
     );
@@ -257,20 +259,21 @@ fn mk_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
     }
 }
 
-/// `Event::Log` at the given seq. Log reuses the last persisted seq
-/// (event.rs) — the dedup must NOT drop it (it's never in PG).
-fn mk_log_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
+/// `Event::SubstituteProgress` at the given seq. Display-only events
+/// reuse the last persisted seq (event.rs) — the dedup must NOT drop
+/// them (they're never in PG).
+fn mk_display_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
     use rio_proto::types::build_event::Event;
     rio_proto::types::BuildEvent {
         build_id: build_id.to_string(),
         sequence: seq,
         timestamp: None,
-        event: Some(Event::Log(rio_proto::types::BuildLogBatch {
-            derivation_path: "/nix/store/x".into(),
-            lines: vec![b"log-line".to_vec()],
-            first_line_number: 0,
-            executor_id: String::new(),
-        })),
+        event: Some(Event::SubstituteProgress(
+            rio_proto::types::SubstituteProgress {
+                derivation_path: "/nix/store/x".into(),
+                ..Default::default()
+            },
+        )),
     }
 }
 
@@ -361,15 +364,16 @@ async fn test_bridge_replays_from_pg_and_dedups_broadcast() -> anyhow::Result<()
     Ok(())
 }
 
-/// bug_125: `Event::Log` reuses the last persisted seq (event.rs Log
-/// arm) and is never written to PG. After a reconnect-with-replay,
-/// `dedup_watermark = last_seq` and a fresh Log arrives at `seq =
-/// last_seq` — the dedup MUST NOT drop it. Log now arrives on a
-/// separate channel that the bridge never dedups, so this is
-/// structural; the test pins that the split is wired and a Log at the
-/// watermark seq still reaches the client.
+/// bug_125: `Event::SubstituteProgress` reuses the last persisted seq
+/// (event.rs display-only arm) and is never written to PG. After a
+/// reconnect-with-replay, `dedup_watermark = last_seq` and a fresh
+/// display event arrives at `seq = last_seq` — the dedup MUST NOT drop
+/// it. Display events arrive on a separate channel that the bridge
+/// never dedups, so this is structural; the test pins that the split
+/// is wired and a display event at the watermark seq still reaches the
+/// client.
 #[tokio::test]
-async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<()> {
+async fn test_bridge_display_event_at_watermark_seq_not_deduped() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
     let build_id = Uuid::new_v4();
 
@@ -384,9 +388,10 @@ async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<
     for seq in 1..=3 {
         bcast_tx.send(mk_event(build_id, seq))?;
     }
-    // Log ring: a Log at seq=3 (emit() reuses the last persisted seq).
+    // Display ring: a SubstituteProgress at seq=3 (emit() reuses the
+    // last persisted seq).
     let (log_tx, log_rx) = broadcast::channel(16);
-    log_tx.send(mk_log_event(build_id, 3))?;
+    log_tx.send(mk_display_event(build_id, 3))?;
 
     // Gateway reconnects: saw nothing (since=0), actor's watermark is 3.
     let mut stream = bridge_build_events(
@@ -404,8 +409,8 @@ async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<
     );
 
     // Phase 1: PG replay yields seq 1,2,3. Phase 2: state-ring 1..3 all
-    // deduped (seq ≤ 3); Log@3 from log-ring passes (no dedup applied
-    // to log channel). 4 events total.
+    // deduped (seq ≤ 3); SubstituteProgress@3 from the display ring
+    // passes (no dedup applied to the display channel). 4 events total.
     let mut events = Vec::new();
     for _ in 0..4 {
         let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -416,12 +421,12 @@ async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<
     assert_eq!(
         events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
         vec![1, 2, 3, 3],
-        "PG replay 1..3 then Log@3 from log channel"
+        "PG replay 1..3 then SubstituteProgress@3 from the display channel"
     );
     use rio_proto::types::build_event::Event;
     assert!(
-        matches!(events[3].event, Some(Event::Log(_))),
-        "4th event is the Log (not a deduped duplicate of the persisted seq=3)"
+        matches!(events[3].event, Some(Event::SubstituteProgress(_))),
+        "4th event is the display event (not a deduped duplicate of the persisted seq=3)"
     );
     // The 3 persisted state-ring duplicates were skipped — no 5th event.
     let extra = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;

@@ -226,24 +226,6 @@ pub enum ActorCommand {
         /// `ExecutorState::stream_epoch`; mismatch → stale disconnect
         /// from a prior stream → no-op.
         stream_epoch: u64,
-        /// `derivation_path` keys this stream pushed into
-        /// `LogBuffers`. The actor — AFTER the epoch check, and only
-        /// when it is the leader AND this tenure's recovery succeeded
-        /// (`dag_authoritative`; `recovery_complete` alone is also
-        /// true after a FAILED recovery's empty DAG — otherwise
-        /// retained entries are left to the acquisition-time
-        /// re-arm/restamp/sweep) — discards
-        /// only those the DAG has never heard of (fabricated by an
-        /// untrusted worker, or post-cleanup). Real drvs are reaped by
-        /// the existing machinery: `seal()` on completion, `discard()`
-        /// on next `assign_to_worker`, `discard()` in
-        /// `handle_cleanup_terminal_build`. Moved out of the reader
-        /// task: branching on `is_sealed` there raced the actor's
-        /// `seal()` (TOCTOU under load), wasn't epoch-gated (stale
-        /// reader wiped the reconnected stream's fresh buffer), and
-        /// had no ownership check (compromised worker → discard a
-        /// victim's buffer).
-        seen_drvs: Vec<String>,
     },
 
     /// Controller observed a builder/fetcher Pod's container terminate
@@ -346,26 +328,11 @@ pub enum ActorCommand {
     /// a delay. Scheduled by complete_build/transition_build_to_failed/cancel.
     CleanupTerminalBuild { build_id: Uuid },
 
-    /// Forward a log batch to interested gateways via `emit_build_event`.
-    ///
-    /// Sent by the BuildExecution recv task via `try_send` (NOT
-    /// `send_unchecked`) — under backpressure this drops, which is
-    /// intentional: the ring buffer (written directly by the recv task,
-    /// not through here) still has the lines, so AdminService.GetDerivationLogs
-    /// can serve them even if the live gateway feed missed some.
-    /// Fire-and-forget; no reply.
-    ///
-    /// `drv_path` not `drv_hash` because that's what BuildLogBatch carries.
-    /// The actor resolves it via `DerivationDag::hash_for_path` (DAG reverse index).
-    ForwardLogBatch {
-        drv_path: String,
-        batch: rio_proto::types::BuildLogBatch,
-    },
-
     /// Forward a build-phase change to interested gateways via
-    /// `emit_build_event`. Same `try_send`-under-backpressure semantics
-    /// as [`ForwardLogBatch`](Self::ForwardLogBatch) — a dropped phase
-    /// is a cosmetic nom regression, not a hang. Fire-and-forget.
+    /// `emit_build_event`. Sent by the BuildExecution recv task via
+    /// `try_send` (NOT `send_unchecked`) — a dropped phase under
+    /// backpressure is a cosmetic nom regression, not a hang.
+    /// Fire-and-forget.
     ///
     /// `executor_id` is the calling stream's identity; `handle_forward_phase`
     /// gates on `(status, assigned_executor)` and drops on mismatch
@@ -759,7 +726,6 @@ impl ActorCommand {
             Self::QueryBuildStatus { .. } => "QueryBuildStatus",
             Self::WatchBuild { .. } => "WatchBuild",
             Self::CleanupTerminalBuild { .. } => "CleanupTerminalBuild",
-            Self::ForwardLogBatch { .. } => "ForwardLogBatch",
             Self::ForwardPhase { .. } => "ForwardPhase",
             Self::DrainExecutor { .. } => "DrainExecutor",
             Self::Admin(q) => q.name(),

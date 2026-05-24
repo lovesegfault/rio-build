@@ -58,10 +58,9 @@ use prost_types::FileDescriptorSet;
 /// pass-through.
 #[cfg(feature = "full")]
 const MANUAL_METHODS: &[&str] = &[
-    "GetDerivationLogs", // streaming — sends one is_complete=true chunk
-    "TriggerGC",         // streaming — sends one is_complete=true frame
-    "ClearPoison",       // records drv_hash to clear_poison_calls
-    "CreateTenant",      // echoes tenant_name back in TenantInfo
+    "TriggerGC",    // streaming — sends one is_complete=true frame
+    "ClearPoison",  // records drv_hash to clear_poison_calls
+    "CreateTenant", // echoes tenant_name back in TenantInfo
 ];
 
 #[cfg(feature = "full")]

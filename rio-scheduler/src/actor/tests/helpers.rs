@@ -826,7 +826,6 @@ pub(crate) async fn disconnect(handle: &ActorHandle, id: &str) -> anyhow::Result
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: id.into(),
             stream_epoch: stream_epoch_for(id),
-            seen_drvs: vec![],
         })
         .await?;
     barrier(handle).await;

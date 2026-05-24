@@ -18,7 +18,7 @@
 //!    exec_id)` pair into the execution to read.
 //!
 //! The completeness predicate (`TailLogChunk.is_complete`) is
-//! [`super::gate::log_is_complete`] — the same function that seals the
+//! `super::gate::log_is_complete` — the same function that seals the
 //! write path. It is deliberately not reimplemented here.
 //!
 //! No gRPC, no live-tail subscription, no cross-replica proxy — those
@@ -150,6 +150,7 @@ impl LineCursor {
     }
 }
 
+// r[impl store.log.session-keyed]
 /// Fetch, decompress, and dedup ONE chunk, returning its contribution
 /// above the cursor as `(line_number, bytes)` pairs in increasing
 /// line-number order.
@@ -283,6 +284,7 @@ async fn stream_chunks(
 /// or it expired) — because they have different audiences: the first is
 /// a dashboard deep-link gone stale, the second is `rio-cli logs` for a
 /// derivation that never built.
+// r[impl obs.log.exec-keyed+2]
 pub async fn resolve_exec(
     pool: &PgPool,
     derivation: &str,
@@ -458,6 +460,7 @@ mod tests {
         assert_eq!(out.len(), 150);
     }
 
+    // r[verify store.log.session-keyed]
     /// Session A covers [0,150), session B covers [100,300) with
     /// DIFFERENT bytes for the overlap. Every line 0..300 appears
     /// exactly once; lines 100-149 carry session A's bytes (the chunk

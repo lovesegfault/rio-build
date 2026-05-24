@@ -109,26 +109,11 @@
     "rio_scheduler_hung_detect_skipped_no_authoritative_total",
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
-    "rio_scheduler_log_batches_rejected_total",
-    "rio_scheduler_log_empty_drain_finalize_failures_total",
-    "rio_scheduler_log_flush_already_finalized_total",
-    "rio_scheduler_log_flush_dropped_total",
-    "rio_scheduler_log_flush_failures_total",
-    "rio_scheduler_log_flush_finalize_deferred_total",
-    "rio_scheduler_log_flush_span_fallback_total",
-    "rio_scheduler_log_flush_stale_tenure_total",
-    "rio_scheduler_log_flush_stale_total",
-    "rio_scheduler_log_flush_total",
-    "rio_scheduler_log_forward_dropped_total",
-    "rio_scheduler_log_gc_swept_total",
-    "rio_scheduler_log_lines_forwarded_total",
-    "rio_scheduler_log_prefix_fetch_failures_total",
-    "rio_scheduler_log_prefix_recovered_total",
-    "rio_scheduler_log_unknown_drv_dropped_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
+    "rio_scheduler_phase_forward_dropped_total",
     "rio_scheduler_phases_rejected_total",
     "rio_scheduler_poison_fleet_exhausted_total",
     "rio_scheduler_prefetch_hints_sent_total",
@@ -784,86 +769,6 @@
         "help": "K8s Lease losses (stepped down, partition, or preempted)"
       },
       {
-        "name": "rio_scheduler_log_batches_rejected_total",
-        "kind": "counter",
-        "help": "BuildLogBatch dropped by the (executor, drv) binding check, the derivation_path length bound, or the line-number sanity checks (non-monotone vs the ring buffer, below the stored coverage the entry already accounts for, or numbering that would overflow u64). Labeled by reason: no_assignment | unstamped | executor_mismatch | path_too_long | non_monotonic | below_stored_prefix | line_number_overflow."
-      },
-      {
-        "name": "rio_scheduler_log_empty_drain_finalize_failures_total",
-        "kind": "counter",
-        "help": "Empty final drains (zero lines drained — failover restamp where the worker never reconnected, or an execution that never streamed a line) whose metadata-only status/finished_at stamp UPDATE on the drv_logs row failed (transient PG error). Not data loss: nothing was drained, and any prior .partial blob and its row stay intact and served with is_complete=false. The stamp is not retried; the row (if any) ages out at the TTL sweep. The data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true."
-      },
-      {
-        "name": "rio_scheduler_log_flush_already_finalized_total",
-        "kind": "counter",
-        "help": "Final-flush requests dropped because the execution's drv_logs row is already is_complete=true (an interim leader finalized it across a lease flap); the retained ring-buffer entry was stale pre-failover residue and was discarded instead of re-finalizing. Alert if rate is sustained — it implies repeated lease flapping."
-      },
-      {
-        "name": "rio_scheduler_log_flush_dropped_total",
-        "kind": "counter",
-        "help": "Final-flush requests dropped due to flusher channel backpressure"
-      },
-      {
-        "name": "rio_scheduler_log_flush_failures_total",
-        "kind": "counter",
-        "help": "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false). is_final=true fires after the final drain (the drained data cannot be re-flushed); alert on is_final=true rate > 0 sustained. Pre-drain stored-coverage lookup failures are counted by rio_scheduler_log_prefix_fetch_failures_total, not here. Empty-drain finalization stamp failures (zero lines drained) are counted by rio_scheduler_log_empty_drain_finalize_failures_total, not here."
-      },
-      {
-        "name": "rio_scheduler_log_flush_finalize_deferred_total",
-        "kind": "counter",
-        "help": "Final-flush attempts deferred because the finalize guard could not read the execution's drv_logs row (transient PG error): nothing is uploaded on that attempt. A deferral with a non-empty buffer is retained by the flusher and retried each periodic tick until PG answers (terminal cleanup leaves the buffer to the retry; a request whose leadership tenure has ended by then is dropped instead — see rio_scheduler_log_flush_stale_tenure_total); an empty buffer is reaped as bookkeeping (reads already fall through to the stored .partial when the ring entry holds zero lines). Counted per attempt, so retries during one outage keep incrementing it. Sustained rate indicates PG trouble on the flush path; loss requires the retry retention cap to overflow, leadership to move before PG recovers, or the process to exit before PG recovers."
-      },
-      {
-        "name": "rio_scheduler_log_flush_span_fallback_total",
-        "kind": "counter",
-        "help": "Flush payloads whose ring lines carried non-monotone worker line numbers at span-recording time, so the drv_logs row recorded the physical line count instead of the line-number span (labeled kind: final|periodic). Should be zero — push_for rejects non-monotone batches at ingestion, so a non-zero rate means an ingestion-gate regression. Not a data-loss signal: the blob is still uploaded and served."
-      },
-      {
-        "name": "rio_scheduler_log_flush_stale_tenure_total",
-        "kind": "counter",
-        "help": "Final log-flush requests dropped because the scheduler leadership tenure that enqueued them ended before they were processed: the replica no longer holds the lease, its generation moved past the enqueue-time stamp, or the recorded acquire-epoch (the Lease's leaseTransitions count) moved — a holder change always breaks the tenure, even when the PG-floor-saturated generation does not move; a same-count re-acquire (self-fence false alarm) breaks neither and keeps the request. The live leadership tenure owns that execution's finalization, and uploading the stale ring would freeze a drv_logs row the live tenure may still be extending. Counted for first attempts and retained-deferral retries alike. The execution's log is finalized by the live tenure's own terminal flush; if its terminal had already persisted before the outage (or the drv was re-dispatched under a new exec_id), the row instead stays at its .partial (is_complete=false) coverage — the bounded pre-retry loss."
-      },
-      {
-        "name": "rio_scheduler_log_flush_stale_total",
-        "kind": "counter",
-        "help": "Final-flush requests dropped because the drv was re-dispatched while the request was queued (the live ring-buffer exec_id no longer matches the request's). The re-dispatched execution's log is preserved; the stale request's exec was already lost when assign_to_worker discarded its buffer."
-      },
-      {
-        "name": "rio_scheduler_log_flush_total",
-        "kind": "counter",
-        "help": "Successful S3 log flushes (labeled by kind: final/periodic)"
-      },
-      {
-        "name": "rio_scheduler_log_forward_dropped_total",
-        "kind": "counter",
-        "help": "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer."
-      },
-      {
-        "name": "rio_scheduler_log_gc_swept_total",
-        "kind": "counter",
-        "help": "drv_logs rows (and their .log.zst + .partial.log.zst S3 blobs) deleted by the LogFlusher TTL GC sweep. Cadence ~1h; threshold scheduler.logRetentionDays."
-      },
-      {
-        "name": "rio_scheduler_log_lines_forwarded_total",
-        "kind": "counter",
-        "help": "Log lines forwarded via BuildEvent::Log (worker -> scheduler -> gateway broadcast)"
-      },
-      {
-        "name": "rio_scheduler_log_prefix_fetch_failures_total",
-        "kind": "counter",
-        "help": "Stored-coverage lookups that failed during a flush's pre-drain reconciliation (labeled by phase: pg = drv_logs point-SELECT, s3 = prior .partial GET; is_final: true/false). Not data loss: the periodic snapshot skips the tick and retries next tick; the final flush uploads the drained ring without the stored prefix and preserves the .partial blob. Investigate if sustained (degraded log merges); the data-loss alert stays on rio_scheduler_log_flush_failures_total is_final=true."
-      },
-      {
-        "name": "rio_scheduler_log_prefix_recovered_total",
-        "kind": "counter",
-        "help": "Stored pre-failover log prefixes fetched from the prior leader's .partial blob and re-folded into this leader's flushes (failover with a reconnecting worker)."
-      },
-      {
-        "name": "rio_scheduler_log_unknown_drv_dropped_total",
-        "kind": "counter",
-        "help": "LogBatch dropped: stream already has MAX_DRVS_PER_STREAM distinct accepted derivation_path values. Defense-in-depth tripwire — only accepted paths grow the cap, so a flood of rejected/fabricated paths alone cannot fill it (those are counted by rio_scheduler_log_batches_rejected_total)."
-      },
-      {
         "name": "rio_scheduler_malformed_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
@@ -882,6 +787,11 @@
         "name": "rio_scheduler_phantom_assignments_drained_total",
         "kind": "counter",
         "help": "running_build entries drained after two consecutive heartbeats reported empty (lost completion / dead-stream-post-send). The slot was dead capacity until drained. Nonzero is the signal to look for I-032-class bugs upstream — the drain is the safety net, not the fix."
+      },
+      {
+        "name": "rio_scheduler_phase_forward_dropped_total",
+        "kind": "counter",
+        "help": "BuildPhase updates dropped because the actor mailbox was full at the recv arm's try_send. A dropped phase update is cosmetic (nom misses one phase-column refresh); a sustained rate is an actor-saturation signal — correlate with rio_scheduler_actor_cmd_seconds."
       },
       {
         "name": "rio_scheduler_phases_rejected_total",

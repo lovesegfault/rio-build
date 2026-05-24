@@ -139,8 +139,8 @@
   # appends a trailing LF, so any consumer that doesn't byte-trim it
   # (mirroring rio-auth load_key) computes a divergent HMAC and every
   # gated RPC returns PermissionDenied (Trailers-Only, first byte
-  # 0x80 not 0x00). ClusterStatus/GetDerivationLogs above are NOT gated,
-  # so they can't witness a bad token; this subtest is the tripwire.
+  # 0x80 not 0x00). ClusterStatus above is NOT gated,
+  # so it can't witness a bad token; this subtest is the tripwire.
       with subtest("service-token via nginx: njs HMAC verifies on gated RPC"):
           k3s_server.wait_until_succeeds(
               "printf '\\x00\\x00\\x00\\x00\\x00' | "
@@ -152,12 +152,15 @@
               timeout=60,
           )
 
-  # ── (4) gRPC-Web server-streaming THROUGH nginx ──────────────────
-  # THE proxy_buffering-off proof. GetDerivationLogs with a nonexistent
-  # drv_path → scheduler sends zero log lines + trailer frame
-  # (grpc-status: 5 NotFound). Envoy's grpc_web filter encodes the
-  # trailer as a length-prefixed message with flag 0x80 (distinct
-  # from HTTP/2 trailers which browsers can't read).
+  # ── (4) gRPC-Web server-streaming THROUGH nginx → rio-store ──────
+  # THE proxy_buffering-off proof. The dashboard's LogViewer reads
+  # build logs from rio-store's LogService.TailLog; this proves the
+  # rio_store nginx upstream (a cross-namespace Service FQDN) + its
+  # location block actually proxy gRPC-Web streaming.
+  # TailLogRequest{derivation:"nonexist"} → the store yields an
+  # in-stream NotFound → tonic-web encodes the trailer as a
+  # length-prefixed body frame with flag 0x80 (distinct from HTTP/2
+  # trailers, which browsers can't read).
   #
   # If nginx's proxy_buffering were on (the default), nginx would
   # buffer the entire upstream response before flushing to the
@@ -165,38 +168,16 @@
   # produce 0x80 (the stream is tiny) — but the pipe's shape would
   # be different: no incremental frames, one blob at close. The
   # real victim is a LONG-running stream (WatchBuild, a multi-minute
-  # GetDerivationLogs) where nothing arrives until completion. We can't
+  # TailLog) where nothing arrives until completion. We can't
   # easily probe that here without a real build; the 0x80-at-tail
   # grep combined with the nginx config assertion (proxy_buffering
   # off is hardcoded at docker.nix:357 and asserted by
   # checks.dashboard-nginx-conf-guard) is the practical gate.
   #
-  # Request body: GetDerivationLogsRequest{derivation_path:"nonexist"}
+  # Request body: TailLogRequest{derivation:"nonexist"}
   #   = 0x0a (field 1 wire-type 2) 0x08 (len 8) "nonexist" = 10 bytes
-  # → prefixed with 5-byte header (0x00,0x00,0x00,0x00,0x0a).
-  # derivation_path moved to field 1 (build_id removed; exec_id is
-  # field 2) — same encoding as dashboard-gateway.nix.
-      with subtest("gRPC-Web streaming via nginx: GetDerivationLogs 0x80 trailer"):
-          k3s_server.wait_until_succeeds(
-              "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
-              "curl -sf --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/GetDerivationLogs "
-              "-H 'content-type: application/grpc-web+proto' "
-              "-H 'x-grpc-web: 1' "
-              "--data-binary @- "
-              "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
-              timeout=60,
-          )
-
-  # ── (4b) gRPC-Web server-streaming THROUGH nginx → rio-store ─────
-  # The dashboard's LogViewer now reads build logs from rio-store's
-  # LogService.TailLog (the log data plane moved off the scheduler;
-  # GetDerivationLogs above survives only until the deletion commit).
-  # This is the proof that the SECOND nginx upstream (rio_store, a
-  # cross-namespace Service FQDN) + the new location block actually
-  # proxy gRPC-Web streaming: TailLogRequest{derivation:"nonexist"} →
-  # the store yields an in-stream NotFound → tonic-web encodes the
-  # trailer as a 0x80-flagged body frame. Same wire encoding as (4):
-  # field 1 is a string in both request messages.
+  # → prefixed with 5-byte header (0x00,0x00,0x00,0x00,0x0a) — the
+  # same encoding as dashboard-gateway.nix's request.
       with subtest("gRPC-Web streaming via nginx: store TailLog 0x80 trailer"):
           k3s_server.wait_until_succeeds(
               "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
@@ -260,8 +241,8 @@
           "http://localhost:18081/rio.scheduler.SchedulerService/CancelBuild -d x "
           "| grep -qx 404"
       )
-      # (Readonly methods reaching the scheduler is already proven by
-      # the ClusterStatus 0x00 + GetDerivationLogs 0x80 subtests above —
+      # (Readonly methods reaching the upstreams is already proven by
+      # the ClusterStatus 0x00 + TailLog 0x80 subtests above —
       # both use the proper grpc-web headers; a bare `-d x` curl here
       # would hit tonic-web's content-type check, not nginx.)
 

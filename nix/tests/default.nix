@@ -1019,24 +1019,23 @@ in
   #   curl with application/grpc-web+proto against the Cilium-
   #   provisioned Gateway Service; asserts DATA frame 0x00 prefix
   #   (unary ClusterStatus) + trailer frame prefix 80 00 00 00
-  #   (streaming GetDerivationLogs). The frame-prefix grep proves
+  #   (streaming TriggerGC). The frame-prefix grep proves
   #   tonic-web doesn't buffer server-streams — load-bearing for
   #   WatchBuild / live log tail. ~6min (k3s bring-up + Cilium
   #   Gateway reconcile). No separate Envoy Gateway operator —
   #   Cilium's embedded envoy handles the GRPCRoute.
-  # r[verify dash.auth.method-gate+3]
+  # r[verify dash.auth.method-gate+4]
   #   The fixture doesn't set dashboard.enableMutatingMethods so the
   #   rio-scheduler-mutating HTTPRoute is absent — `kubectl get
   #   httproute rio-scheduler-mutating` fails. Proves the helm-template
   #   fail-closed holds at runtime through the operator's reconcile.
   # r[verify dash.journey.build-to-logs]
-  #   The GetDerivationLogs 0x80 trailer assertion proves server-streaming
-  #   works through the nginx→Cilium Gateway→scheduler chain. Handler
-  #   returns errors as in-stream items (not tonic Trailers-Only) so
-  #   tonic-web encodes them as 0x80 body frames browser fetch can read.
-  #   The LogViewer's post-cutover log-read path (nginx → rio-store
+  #   The LogViewer's log-read path (nginx → rio-store
   #   LogService/TailLog, the second upstream + cross-namespace Service)
-  #   gets the same 0x80 assertion in dashboard.nix subtest (4b).
+  #   is asserted by the TailLog 0x80 trailer subtest in dashboard.nix:
+  #   the handler returns errors as in-stream items (not tonic
+  #   Trailers-Only) so tonic-web encodes them as 0x80 body frames
+  #   browser fetch can read.
   #
   #   Appended (when `dockerImages ? dashboard`): the nginx-pod curl
   #   assertions from dashboard.nix — SPA served + try_files fallback

@@ -171,41 +171,6 @@ impl DagActor {
         // worker connected to the standby is still connected.
         self.clear_persisted_state();
 
-        // Acquisition-time LogBuffers reconciliation, part 1 of 3 (part 2
-        // is the restamp loop inside load_dag_from_rows; part 3 is
-        // sweep_stale_log_buffers below): re-arm the stored-coverage
-        // reconciliation on every retained entry. The prefix bookkeeping
-        // (prefix_checked / recovered_prefix) encodes conclusions reached
-        // under a previous tenure; an interim leader may have extended the
-        // stored drv_logs row past what this ring holds, so the flusher
-        // must re-consult the row once per execution this tenure. This
-        // clears every retained entry; the restamp loop later performs a
-        // redundant second clear for the PG-`Assigned|Running` drvs it
-        // touches (set_exec's same-exec arm — the general restamp
-        // contract). The entries that depend on THIS step are the ones
-        // recovery does not restamp: entries the sweep spares because
-        // their drv is non-terminal in some other state (Ready/Queued/
-        // Substituting after an interim leader's reset) and sealed
-        // entries with a queued final flush. The flusher's self-driven
-        // arms additionally gate on `recovery_complete`
-        // (`LogFlusher::may_flush`), which is set only after this fn
-        // returns — so on the normal acquire path no self-driven flush
-        // runs until this re-arm (and the restamp + sweep below) have
-        // finished; keeping the re-arm first remains belt-and-suspenders.
-        // It still must precede `set_recovery_complete`, and still runs
-        // when the load below fails (the degraded empty-DAG tenure
-        // retains the entries).
-        // r[impl obs.log.stored-coverage-preserved]
-        if let Some(bufs) = &self.log_buffers {
-            let rearmed = bufs.rearm_prefix_reconciliation();
-            if rearmed > 0 {
-                info!(
-                    count = rearmed,
-                    "re-armed stored-coverage reconciliation on retained log buffers"
-                );
-            }
-        }
-
         // Test-only: deterministic DAG-load failure. Scoped to the load
         // phase — the caller's independent PG-floor read must stay
         // unaffected so the load-failure tests can exercise the floored
@@ -222,15 +187,6 @@ impl DagActor {
             build_drv_hashes,
             failed_dep_parents,
         } = self.load_dag_from_rows().await?;
-
-        // Acquisition-time LogBuffers reconciliation, part 3 of 3 (part 1 is
-        // the prefix re-arm above, part 2 is the restamp loop inside
-        // load_dag_from_rows): discard retained
-        // entries for derivations the rebuilt DAG does not track in a
-        // non-terminal state — they went terminal (or vanished) under an
-        // interim leader and no other reaper covers them (Poisoned: none
-        // before the 24h TTL). r[sched.recovery.log-buffer-sweep+2]
-        self.sweep_stale_log_buffers();
 
         self.restore_builds(build_rows, &build_ids, build_drv_hashes)
             .await?;
@@ -272,7 +228,6 @@ impl DagActor {
         // DAG alone cannot decide it — see that block's comment). Holed
         // rows are never enrolled — see the push site.
         let mut flagged: Vec<Uuid> = Vec::new();
-        let mut restamped_buffers = 0usize;
         for row in drv_rows {
             let derivation_id = row.derivation_id;
             let Ok(status) = row.status.parse::<DerivationStatus>() else {
@@ -288,17 +243,6 @@ impl DagActor {
                 }
             };
             let hash = state.drv_hash.clone();
-            // Capture before the move into the DAG. `set_log_exec`
-            // looks the drv path up FROM the DAG, so the node must be
-            // inserted before it's called.
-            let restamp = match (status, state.exec_id, state.assigned_executor.clone()) {
-                (
-                    DerivationStatus::Assigned | DerivationStatus::Running,
-                    Some(exec_id),
-                    Some(executor_id),
-                ) => Some((exec_id, executor_id)),
-                _ => None,
-            };
             // r[impl sched.merge.substitute-topdown+10]
             // The recovery-time consult of the persisted closure-hole
             // breadcrumb (`migrations/064`): a holed flagged parent is
@@ -316,35 +260,6 @@ impl DagActor {
             }
             id_to_hash.insert(derivation_id, hash.clone());
             self.dag.insert_recovered_node(state);
-            // Re-stamp the LogBuffers ring buffer for active
-            // assignments. `set_exec` otherwise runs only in
-            // `assign_to_worker` — which doesn't run for
-            // already-assigned drvs whose workers are still streaming.
-            // Without this, the flusher writes wrong/missing S3 keys
-            // after failover, and `push_for` rejects every batch from
-            // the still-connected worker (no entry → no_assignment).
-            // A fresh standby's `LogBuffers` is empty and this creates
-            // the entry; an ex-leader re-acquiring the lease RETAINS
-            // its buffers (`clear_persisted_state`), and `set_exec`
-            // clears the retained lines iff the assignment was re-issued
-            // under a different exec_id while we weren't leader.
-            // Retained entries whose drv is not loaded here as a live
-            // assignment (terminal under an interim leader — including
-            // Poisoned rows loaded only for TTL tracking) are reconciled
-            // by `sweep_stale_log_buffers` right after this load; entries
-            // this loop does not touch had their per-tenure prefix
-            // bookkeeping re-armed by `rearm_prefix_reconciliation`
-            // before this load (part 1 of the acquisition reconciliation).
-            if let Some((exec_id, executor_id)) = restamp {
-                self.set_log_exec(&hash, exec_id, &executor_id);
-                restamped_buffers += 1;
-            }
-        }
-        if restamped_buffers > 0 {
-            info!(
-                count = restamped_buffers,
-                "re-stamped log buffers for active assignments"
-            );
         }
 
         // --- Load poisoned derivations (separate query) ---
@@ -627,66 +542,6 @@ impl DagActor {
             build_drv_hashes,
             failed_dep_parents,
         })
-    }
-
-    /// Discard retained [`crate::logs::LogBuffers`] entries whose drv is
-    /// not tracked in a non-terminal state by the just-rebuilt DAG.
-    ///
-    /// An ex-leader re-acquiring the lease retains its `LogBuffers`
-    /// (`clear_persisted_state`) so a still-streaming worker's in-flight
-    /// execution keeps its lines across the flap; the restamp loop above
-    /// covers exactly those (PG-`Assigned|Running`) drvs. A drv that went
-    /// terminal under an interim leader is either not loaded at all, or
-    /// loaded only as a Poisoned TTL-tracking node — in both cases its
-    /// retained entry would otherwise survive (for Poisoned: until the 24h
-    /// TTL, since reap excludes Poisoned and a poisoned drv is never
-    /// re-dispatched): it shadows the execution's stored log in
-    /// `GetDerivationLogs` (ring buffer is probed before S3) and
-    /// `flush_periodic` re-uploads its `.partial` every 30s. Membership is
-    /// keyed on **non-terminal** presence in the rebuilt DAG (not on "was
-    /// restamped") so post-reset retained buffers on Ready/Queued nodes —
-    /// which the cancel-sweep finalization (`finalize_buffered_exec_log`)
-    /// needs — survive, while Poisoned TTL-tracking nodes do not keep an
-    /// entry alive. Sealed entries are the flusher's to drain and are
-    /// skipped (see `LogBuffers::discard_unsealed_not_in`). Spared
-    /// entries' per-tenure prefix bookkeeping was already re-armed by
-    /// `LogBuffers::rearm_prefix_reconciliation` (part 1 of the
-    /// acquisition reconciliation), so they cannot carry a previous
-    /// tenure's stored-coverage conclusions into this one.
-    ///
-    /// The unflushed tail of a discarded entry is accepted loss: it was
-    /// never durable, and it is within the ≤30s failover bound of
-    /// `r[obs.log.periodic-flush]` — the interim leader's final flush
-    /// already wrote the authoritative row for that execution.
-    ///
-    /// Called from `recover_from_pg` right after `load_dag_from_rows`
-    /// succeeds. Correctness depends only on that load having succeeded
-    /// (the discard decisions are keyed on the freshly loaded PG
-    /// snapshot); later recovery phases (`restore_builds`, the caller's
-    /// `max_known_generation` floor read) or the TOCTOU-discard arm may
-    /// still fail or run after the sweep, which is safe — swept entries
-    /// were terminal-or-absent in that snapshot, never a live stream's
-    /// buffer.
-    /// If the load itself fails, the sweep does not run and the
-    /// retain-everything degraded behavior is unchanged.
-    // r[impl sched.recovery.log-buffer-sweep+2]
-    fn sweep_stale_log_buffers(&self) {
-        let Some(bufs) = &self.log_buffers else {
-            return;
-        };
-        let live: HashSet<String> = self
-            .dag
-            .iter_values()
-            // Non-terminal nodes only. The sole terminal status loaded at
-            // recovery is Poisoned (TTL tracking): its execution was already
-            // finalized by whichever leader poisoned it and it is never
-            // re-dispatched while poisoned, so a retained entry is pure
-            // staleness; locally-poisoned drvs have sealed entries, which
-            // discard_unsealed_not_in skips regardless.
-            .filter(|s| !s.status().is_terminal())
-            .map(|s| crate::logs::drv_log_hash(s.drv_path().as_str()))
-            .collect();
-        bufs.discard_unsealed_not_in(&live);
     }
 
     /// Reconstruct `BuildInfo` + broadcast channels + `build_sequences`
@@ -1788,8 +1643,7 @@ impl DagActor {
         // next acquire moves `acquired_transitions`, the stale stamp no
         // longer matches, and `recovery_complete()` reads false again —
         // so the next tenure's pre-recovery gap stays gated for
-        // LogFlusher::may_flush() / dispatch_ready without any
-        // is_leader() special-casing here.
+        // dispatch_ready without any is_leader() special-casing here.
         //
         // Final disposition of this attempt: exactly one
         // rio_scheduler_recovery_total increment per attempt. The
@@ -1829,17 +1683,15 @@ impl DagActor {
             );
             // Explicitly re-clear: recovery may have partially
             // populated before failing. dag_authoritative stays false
-            // (clear_persisted_state keeps it cleared): the degraded
-            // empty-DAG tenure retains its log-buffer entries, and the
-            // disconnect-time discard must not treat "not in the
-            // (empty) DAG" as "stale".
+            // (clear_persisted_state keeps it cleared): destructive
+            // consumers must not treat "not in the (empty) DAG" as
+            // "stale".
             self.clear_persisted_state();
         }
         // Only on a successful load: the DAG was rebuilt from PG by
         // this tenure's recover_from_pg, so "not in the DAG" means
-        // "stale" again and the disconnect-time log-buffer discard
-        // may resume. On the Err path the clear_persisted_state above
-        // keeps the bit false.
+        // "stale" again. On the Err path the clear_persisted_state
+        // above keeps the bit false.
         if result.is_ok() {
             self.dag_authoritative = true;
         }
@@ -2158,16 +2010,13 @@ impl DagActor {
     /// Reconcile path for an orphaned assignment whose outputs ARE in
     /// the store: the build completed while the scheduler was down.
     /// Transition Completed, persist, attribute tenants, run the
-    /// terminal log epilogue (seal → flush → correlate — see its
-    /// caller-list entry for the fresh-standby vs ex-leader shapes),
+    /// terminal log epilogue (correlate + stamp — see its
+    /// caller-list entry),
     /// unpin, then reuse [`release_downstream`](Self::release_downstream)
     /// for the newly-ready cascade + per-build completion check. Skips
     /// the `handle_success_completion` steps that need worker-result
     /// data (build_samples, CA bookkeeping, ancestor priorities —
-    /// full_sweep on next tick handles the latter). The log epilogue
-    /// is NOT skipped: an ex-leader re-acquiring the lease retains the
-    /// prior leadership's unflushed tail for this execution, and it
-    /// must be flushed, not discarded.
+    /// full_sweep on next tick handles the latter).
     async fn adopt_orphan_completion(
         &mut self,
         drv_hash: &DrvHash,
@@ -2216,16 +2065,8 @@ impl DagActor {
         self.upsert_path_tenants_for(drv_hash).await;
         // r[impl sched.merge.exec-correlation+7]
         // Same gap as path-tenants above: `handle_success_completion`
-        // never fired for this drv, so the log-finalization chokepoint
-        // (seal → flush → correlate) must run here. It must be the
-        // epilogue, not a correlate + discard: an ex-leader
-        // re-acquiring the lease still holds the prior leadership's
-        // unflushed tail for this same execution (`set_exec` retains
-        // lines on a same-exec restamp), and that tail is the log of
-        // the execution whose outputs we just adopted. See
-        // `terminal_log_epilogue`'s caller-list entry for the
-        // fresh-standby empty-drain shape and the never-dispatched
-        // self-gate.
+        // never fired for this drv, so the terminal chokepoint
+        // (correlate + stamp) must run here.
         // The adopted completion's CompletionReport (and its
         // final_line_count) belonged to the interim leader's stream —
         // this leader never saw it. NULL → the row reads as incomplete,

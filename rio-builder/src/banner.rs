@@ -6,7 +6,7 @@
 //! arbitrary build code can emit its own `rio: result   ok` lines.
 //! Consumers MUST NOT parse the `rio:` markers for authoritative
 //! state; the system's source of truth for `exec_id` / outcome /
-//! sizing is `drv_logs` and `assignments`, not the log text. The
+//! sizing is `drv_executions` and `assignments`, not the log text. The
 //! `grep '^rio:'` extraction is a convenience for humans, not a
 //! protocol.
 //!

@@ -3,10 +3,10 @@
 //! CLI).
 //!
 //! This module is the wiring layer over the rest of `logs::*`: the
-//! [`gate`](super::gate) authorizes a stream open, [`sessions`]
+//! [`gate`] authorizes a stream open, [`sessions`]
 //! (super::sessions) bounds one live ingest per execution and routes
 //! readers to it, [`ingest`](super::ingest) owns the per-stream buffer
-//! and chunk cutter, and [`tail`](super::tail) reassembles a log from
+//! and chunk cutter, and [`tail`] reassembles a log from
 //! the chunk manifest. The handlers add: token verification, admission
 //! (the per-replica stream-count and buffer-byte budgets), the
 //! `select!` loop that drives ingest, the per-replica registry that
@@ -20,10 +20,11 @@
 //! authorized per-stream. `TailLog` is **not token-authenticated** —
 //! it is a read-only RPC gated by the same network-level access
 //! control (CiliumNetworkPolicy + the Gateway route allow-list) that
-//! gates the scheduler's `GetDerivationLogs` today, and it is reachable
+//! gated the scheduler's `GetDerivationLogs` before the cutover, and it
+//! is reachable
 //! over gRPC-Web for the dashboard. Build-log *content* is therefore
 //! readable by anything that can reach the store's port; that is the
-//! existing posture of the admin log API this RPC replaces, not a new
+//! existing posture of the admin log API this RPC replaced, not a new
 //! exposure. See `DESIGN.md §5.1`.
 
 use std::sync::Arc;
@@ -63,8 +64,9 @@ const MAX_DERIVATION_PATH_LEN: usize = 512;
 
 /// Max lines per `TailLogChunk` response message. Bounds the per-message
 /// allocation on both ends without changing the data (a reader
-/// concatenates messages). Matches the scheduler's `GetDerivationLogs`
-/// chunking so the dashboard's per-message handling carries over.
+/// concatenates messages). Matches the chunking of the scheduler's
+/// (removed) `GetDerivationLogs` so the dashboard's per-message
+/// handling carries over.
 const TAIL_CHUNK_LINES: usize = 256;
 
 /// Capacity of one TailLog subscriber's fan-out queue, in batches. At
@@ -481,7 +483,7 @@ impl LogService for LogServiceImpl {
     }
 
     /// Log read/follow. Errors are yielded **in-stream** (see
-    /// [`err_stream`]) so grpc-web clients can read them.
+    /// `err_stream`) so grpc-web clients can read them.
     #[instrument(skip_all, fields(rpc = "TailLog"))]
     async fn tail_log(
         &self,
@@ -1118,6 +1120,7 @@ type LiveSubscription = Option<(Vec<(u64, Vec<u8>)>, mpsc::Receiver<Arc<BuildLog
 ///
 /// Memory bound: one manifest chunk's decompressed lines, or one
 /// fan-out batch, resident at a time — never the whole log.
+// r[impl store.log.tail-reconnect]
 async fn serve_tail(
     pool: PgPool,
     store: Arc<dyn LogChunkStore>,
@@ -1703,6 +1706,7 @@ mod tests {
         assert!(saw_end, "the follow stream ends with a final-state message");
     }
 
+    // r[verify store.log.tail-reconnect]
     #[tokio::test]
     async fn tail_history_then_live_has_no_gap_or_duplicate() {
         let mut h = harness().await;

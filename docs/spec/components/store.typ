@@ -1098,6 +1098,127 @@ leaked chunks not covered by manifest-based cleanup.
   ls}`; #rref("store.substitute.upstream") consumes the resulting rows.
 ]
 
+= Build Log Service
+<store-log-service>
+
+rio-store owns the build-log data plane. `LogService.AppendLog` is the
+builder's authenticated bidirectional ingest stream; `LogService.TailLog` is
+the unauthenticated (route-gated) read/follow stream used by the gateway's
+live tail, the dashboard, and the CLI. Log chunks share the chunks bucket
+under the `logs/` prefix but are position-addressed, not content-addressed
+--- they do not participate in the CAS, refcounting, or reachability GC, and
+are retained on a wall-clock TTL enforced by an hourly sweep plus an S3
+lifecycle rule that collects orphans (objects whose manifest row was never
+written because the replica crashed between the PUT and the INSERT).
+
+#r("store.log.append-auth")[
+  An `AppendLog` stream MUST be authorized by the caller's HMAC assignment
+  token before any batch is accepted: the header's derivation MUST normalize
+  to the token's `drv_hash`, and the claimed `exec_id` and the token's
+  `executor_id` MUST both match the derivation's most recent assignment
+  attempt. A stream whose claimed execution has been superseded by a
+  re-dispatch MUST be rejected.
+]
+
+The token is a bearer credential --- the comparison is a token-currency check
+(is this token's attempt still the derivation's live assignment?), not a
+presenter-identity check. Matching the *latest* assignment row rather than
+only active rows deliberately admits the post-completion late replay (a
+builder draining its retransmit buffer after the build finished) while
+rejecting any executor whose derivation has since been handed to someone
+else. This is the relocated scheduler-side log-batch binding gate: a
+compromised builder spamming a fabricated `derivation_path` cannot pollute
+another execution's log, and a late batch from a timed-out executor cannot be
+attributed to the next execution.
+
+#r("store.log.completeness-gate")[
+  An execution's log is complete when its lifecycle row is terminal, its
+  builder-reported `final_line_count` is known, and its chunk manifest
+  contiguously covers `[0, final_line_count)`. Completeness MUST be computed
+  from the manifest at read time, never latched. A complete log MUST reject
+  further `AppendLog` opens, and accepted lines numbered at or past
+  `final_line_count` MUST be dropped.
+]
+
+One predicate serves both "is this log done" (the `is_complete` flag readers
+surface) and "may this log still be appended to" (the seal). It is monotone
+and self-healing: a delayed replay that fills the last gap flips the log to
+complete on the next read with no coordination, and the ingest-side rejection
+closes the post-terminal injection hole without breaking the legitimate
+late-replay path (an *incomplete* terminal log keeps accepting the replay
+that completes it).
+
+#r("store.log.chunk-immutable")[
+  A committed log chunk MUST never be overwritten: chunk keys are unique per
+  `(exec_id, session_id, chunk_seq)`, a chunk sequence number is consumed per
+  cut attempt (not per success), and the chunk object MUST be durably written
+  before the manifest row that makes it reachable.
+]
+
+Burning the sequence number on a failed cut means a retried cut --- whose
+buffer may have grown since the failed attempt --- can never re-PUT a key
+that a lost-response predecessor may have already committed with different
+content. Object-before-manifest ordering means a crash between the two leaves
+an unreachable orphan (collected by the lifecycle rule), never a manifest row
+pointing at a missing object (which would read as data loss).
+
+#r("store.log.session-keyed")[
+  Concurrent or successive ingest sessions for one execution MUST NOT collide:
+  each `AppendLog` stream mints a fresh `session_id` that namespaces its chunk
+  keys, at most one session per execution holds the ingest lease at a time,
+  and the read path MUST deduplicate overlapping session line ranges by line
+  number, deterministically.
+]
+
+The per-execution session lease is an admission and routing mechanism, not a
+mutual-exclusion guarantee: in the window between a lease steal and the
+deposed owner observing it, two sessions can ingest and cut chunks for the
+same execution concurrently. The system is correct under that overlap because
+the chunk keys cannot collide and the manifest's line ranges union --- the
+read path visits chunks in `(first_line, session_id)` order and keeps the
+first copy of each line number, so which copy wins is a function of stable
+column values, identical across reads, restarts, and replicas.
+
+#r("store.log.ingest-bounds")[
+  The `AppendLog` ingest path MUST truncate individual lines to a fixed
+  maximum length, reject batches whose line numbers are not monotonically
+  increasing within the stream or would overflow the manifest's integer
+  range, and abort the stream once a per-execution accepted-byte cap is
+  exceeded. Per-replica ingest is bounded by a byte budget and a
+  concurrent-stream cap.
+]
+
+The relocated scheduler-side ring-buffer bounds, enforced at the new trust
+boundary. Builders are untrusted; without the per-line and per-execution caps
+a compromised builder holding a valid token could exhaust the replica's
+memory, and without the monotone gate it could corrupt the manifest's line
+arithmetic for its own execution.
+
+#r("store.log.tail-reconnect")[
+  A `follow`-mode `TailLog` stream ends when the ingest session it is
+  attached to closes, which does not imply the execution is finished. A
+  reader whose follow stream ends while the execution is not yet terminal
+  MUST re-subscribe with `since_line` set to one past the last line it
+  relayed; the server MAY resend lines below the requested cursor (chunk
+  granularity) and the client MUST skip them.
+]
+
+Store deploys, replica crashes, and ingest-lease handoffs all close follow
+streams that a new ingest session immediately replaces; the server does not
+chase the new session across replicas, so the client owns re-subscription.
+The dedup floor advancing only on lines actually relayed is what makes the
+contract exactly-once on the client's wire: the store's at-least-once,
+chunk-granular delivery becomes a gapless, duplicate-free line stream.
+
+The live tail is served history-then-live from the ingesting replica: a
+subscriber registers and snapshots the in-memory buffer atomically with
+respect to chunk cuts, then reads the manifest, then drains the
+subscription --- a line is therefore observed at least once (possibly twice,
+deduplicated by the cursor) and never zero times across the
+stored-to-live seam. A `TailLog` reaching a replica that does not hold the
+execution's ingest session is proxied one hop to the owner; on proxy failure
+it degrades to the manifest-only view rather than erroring.
+
 = PostgreSQL Schema
 <store-schema>
 

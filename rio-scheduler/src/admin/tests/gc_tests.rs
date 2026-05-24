@@ -7,7 +7,7 @@ use super::*;
 use crate::admin::gc::forward_gc_progress;
 
 /// Unwrap an `Ok(Response)` whose `TriggerGCStream` yields exactly one
-/// `Err(Status)`. Mirror of [`expect_stream_err`] for `GcProgress`.
+/// `Err(Status)`.
 async fn expect_gc_stream_err(
     result: Result<Response<ReceiverStream<Result<GcProgress, Status>>>, Status>,
 ) -> Status {
@@ -24,7 +24,7 @@ async fn expect_gc_stream_err(
 /// The store_addr in setup_svc is `127.0.0.1:1` which never listens
 /// → store-admin connect fails → UNAVAILABLE. Handler now returns
 /// `Ok(stream-yielding-Err)` (grpc-web Trailers-Only constraint —
-/// see `logs::err_stream`), not `Err(Status)`.
+/// see `gc::err_stream`), not `Err(Status)`.
 #[tokio::test]
 async fn test_trigger_gc_store_unreachable() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
@@ -47,7 +47,7 @@ async fn test_trigger_gc_store_unreachable() -> anyhow::Result<()> {
 
 /// Regression: standby (`is_leader=false`) returning `Err(Status)`
 /// → tonic Trailers-Only → grpc-web dashboard sees silent 200. Now
-/// the leader guard is wrapped in `err_stream` so the status arrives
+/// the leader guard is wrapped in `gc::err_stream` so the status arrives
 /// as an in-stream `Err`.
 #[tokio::test]
 async fn test_trigger_gc_standby_yields_err_in_stream() -> anyhow::Result<()> {

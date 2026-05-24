@@ -31,7 +31,6 @@ use rio_common::tenant::NormalizedName;
 
 use crate::actor::{ActorCommand, ActorError, ActorHandle, BuildEventReceivers};
 use crate::db::SchedulerDb;
-use crate::logs::LogBuffers;
 
 /// Shared scheduler state passed to gRPC handlers.
 #[derive(Clone)]
@@ -42,12 +41,6 @@ pub struct SchedulerGrpc {
     // in a child module can't reach private fields of the parent
     // module's struct.
     pub(super) actor: ActorHandle,
-    /// Per-derivation log ring buffers. Written directly by the
-    /// BuildExecution recv task (bypasses the actor), read by
-    /// AdminService.GetDerivationLogs and drained by the S3 flusher on
-    /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
-    /// and all handlers + the spawned recv tasks need the same buffers.
-    pub(super) log_buffers: Arc<LogBuffers>,
     /// DB handle for tenant resolve / jti revocation / WatchBuild
     /// event-log replay. `Option` so `new_for_tests` can skip it
     /// (None → broadcast-only, no replay, no tenant resolve).
@@ -85,18 +78,11 @@ pub struct SchedulerGrpc {
 }
 
 impl SchedulerGrpc {
-    /// Test-only constructor: makes a FRESH `LogBuffers`, not shared with
-    /// any flusher. Production MUST use [`with_log_buffers`](Self::with_log_buffers)
-    /// — a fresh DashMap means the flusher drains an unrelated empty buffer
-    /// forever while real logs pile up here (silent total log loss).
-    ///
-    /// `#[cfg(test)]` makes prod misuse a compile error, not a runtime
-    /// footgun.
+    /// Test-only constructor. Production uses [`new`](Self::new).
     #[cfg(test)]
     pub fn new_for_tests(actor: ActorHandle) -> Self {
         Self {
             actor,
-            log_buffers: Arc::new(LogBuffers::new()),
             db: None,
             is_leader: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(1)),
@@ -111,7 +97,6 @@ impl SchedulerGrpc {
     pub fn new_for_tests_with_pool(actor: ActorHandle, pool: sqlx::PgPool) -> Self {
         Self {
             actor,
-            log_buffers: Arc::new(LogBuffers::new()),
             db: Some(SchedulerDb::new(pool)),
             is_leader: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(1)),
@@ -120,9 +105,7 @@ impl SchedulerGrpc {
         }
     }
 
-    /// Create with an externally-owned `LogBuffers`. Production `main.rs`
-    /// uses this so the LogFlusher (separate task) drains the SAME buffers
-    /// that the BuildExecution recv task writes to.
+    /// Production constructor.
     ///
     /// `pool`: for WatchBuild's PG event-log replay. main.rs already
     /// has it (same pool as `SchedulerDb`).
@@ -130,9 +113,8 @@ impl SchedulerGrpc {
     /// `jwt_mode`: whether a JWT pubkey is configured (drives
     /// `require_tenant`). `hmac_key`: assignment-HMAC key, reused as
     /// the executor-identity verifier (drives `require_executor`).
-    pub fn with_log_buffers(
+    pub fn new(
         actor: ActorHandle,
-        log_buffers: Arc<LogBuffers>,
         db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
         generation: Arc<AtomicU64>,
@@ -141,18 +123,12 @@ impl SchedulerGrpc {
     ) -> Self {
         Self {
             actor,
-            log_buffers,
             db: Some(db),
             is_leader,
             generation,
             jwt_mode,
             hmac_key,
         }
-    }
-
-    /// Access the shared log ring buffers. Exposed for `AdminService`.
-    pub fn log_buffers(&self) -> Arc<LogBuffers> {
-        Arc::clone(&self.log_buffers)
     }
 
     /// Check if the actor is alive; return UNAVAILABLE if dead (panicked).

@@ -235,17 +235,6 @@ spec:
                 secretKeyRef:
                   name: rio-postgres
                   key: url
-            {{- if $s.logS3Bucket }}
-            - name: RIO_LOG_S3_BUCKET
-              value: {{ $s.logS3Bucket | quote }}
-            {{- end }}
-            # TTL for the LogFlusher's GC sweep. Validated > 0 at config
-            # load (Config::validate). Always rendered (no if-guard): the
-            # default in values.yaml is 30, and a chart that omits it
-            # would silently inherit the Rust default — same number, but
-            # a single config home is one fewer drift surface.
-            - name: RIO_LOG_RETENTION_DAYS
-              value: {{ $s.logRetentionDays | quote }}
             # D3: scheduler serves gRPC-Web natively; CORS allow-origins
             # come from values.yaml dashboard.cors.allowOrigins (the same
             # list previously rendered into the Envoy SecurityPolicy CRD).

@@ -184,18 +184,6 @@
         "description": "Tick interval (seconds) for scheduler housekeeping."
       },
       {
-        "key": "log_s3_bucket",
-        "type": "string",
-        "default": "",
-        "description": "S3 bucket for build-log flush. `None` = flush disabled."
-      },
-      {
-        "key": "log_retention_days",
-        "type": "uint32",
-        "default": "30",
-        "description": "Build log retention in days."
-      },
-      {
         "key": "soft_features",
         "type": "list<string>",
         "default": "[]",

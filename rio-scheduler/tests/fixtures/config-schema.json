@@ -43,21 +43,6 @@
         "minimum": 0,
         "default": 10
       },
-      "log_s3_bucket": {
-        "description": "S3 bucket for build-log flush. `None` = flush disabled.\nEnv: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().",
-        "type": [
-          "string",
-          "null"
-        ],
-        "default": null
-      },
-      "log_retention_days": {
-        "description": "Build log retention in days. The `LogFlusher`'s GC tick deletes\n`drv_logs` rows (and their `.log.zst` + `.partial.log.zst` S3\nblobs) older than this. Default 30. Set high to effectively\ndisable; do NOT set to 0 — that's \"delete every log on every\nsweep,\" not \"disable.\" The age filter already excludes active\nbuilds (no build runs 30 days; the daemon timeout is ~2h), so\nthere's no `is_complete` discriminator. Env:\n`RIO_LOG_RETENTION_DAYS`. Helm: `scheduler.logRetentionDays`.",
-        "type": "integer",
-        "format": "uint32",
-        "minimum": 0,
-        "default": 30
-      },
       "soft_features": {
         "description": "I-204: `requiredSystemFeatures` values that are capability HINTS,\nnot hardware gates. Stripped from each derivation at DAG-insert so\nthey don't drive pool spawn or block dispatch. nixpkgs convention:\n`big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.",
         "type": "array",
@@ -302,8 +287,6 @@
     "metrics_addr": "[::]:9091",
     "drain_grace_secs": 6,
     "tick_interval_secs": 10,
-    "log_s3_bucket": null,
-    "log_retention_days": 30,
     "soft_features": [],
     "hmac_key_path": null,
     "service_hmac_key_path": null,

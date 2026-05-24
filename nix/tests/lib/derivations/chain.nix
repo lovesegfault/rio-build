@@ -8,8 +8,8 @@
 #
 # Each step echoes a distinctive marker to stderr. The VM test greps the
 # CLIENT's `nix-build` output for this marker, validating the full log
-# pipeline end-to-end: worker LogBatcher → scheduler ring buffer →
-# ForwardLogBatch → BuildEvent::Log → gateway STDERR_NEXT → SSH → client.
+# pipeline end-to-end: worker LogBatcher → rio-store LogService.AppendLog
+# → chunk store → gateway TailLog → STDERR_NEXT → SSH → client.
 { busybox }:
 let
   inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;

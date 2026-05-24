@@ -348,7 +348,6 @@ impl DagActor {
         &mut self,
         executor_id: &ExecutorId,
         stream_epoch: u64,
-        seen_drvs: Vec<String>,
     ) {
         let Some(worker) = self.executors.get(executor_id) else {
             return; // unknown worker, no-op (and no gauge decrement)
@@ -424,97 +423,6 @@ impl DagActor {
             metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
         }
         metrics::counter!("rio_scheduler_worker_disconnects_total").increment(1);
-
-        // Log-buffer cleanup, AFTER the epoch check above (a stale
-        // reader's `seen_drvs` reaches here only when the epoch
-        // matched). Runs only when this replica is the leader AND
-        // `dag_authoritative` — because the DAG gate below infers
-        // "stale" from "not in the DAG", which is only meaningful when
-        // the DAG reflects PG. NOT the `recovery_complete` composite
-        // `may_flush` and `dispatch_ready` use: that flag is true even
-        // after a FAILED recovery (the Err arm degrades to an empty
-        // DAG rather than blocking dispatch — fine for consumers that
-        // reconcile, fatal for one that deletes), so in a leader+PG-
-        // down tenure a reconnected worker's disconnect would pass it
-        // and destroy the retained entries the periodic flusher would
-        // have snapshotted once PG returned. Both halves of the gate
-        // are load-bearing: `dag_authoritative` covers LeaderLost-
-        // emptied DAGs, the pre-`LeaderAcquired` window of a just-
-        // re-acquired leader, and the failed-recovery tenure;
-        // `is_leader()` covers the windows where the bit is stale-true
-        // because it is an actor field — after the lease task's
-        // `on_lose()` but before this actor dequeues `LeaderLost`, and
-        // the lose-during-recovery corner where the Ok arm sets the
-        // bit while already deposed. In every one of those windows the
-        // unconditional discard would destroy exactly the retained
-        // in-flight entries the lease-flap retention preserves.
-        // Stale-entry reconciliation there belongs to the
-        // acquisition-time re-arm/restamp/sweep
-        // (`handle_leader_acquired`), not to a disconnect that raced
-        // the lease. Residual: a deposed leader that never re-acquires
-        // keeps the skipped entries until its own next acquisition or
-        // process exit — bounded by the per-entry ring caps; no flush
-        // churn (`may_flush` is leader-gated) and no read-path
-        // consequence (`GetDerivationLogs` is leader-gated) on a
-        // standby. Same residual for a degraded (failed-recovery)
-        // tenure: entries skipped there are reconciled by the next
-        // acquisition's sweep or kept until process exit.
-        //
-        // Two ownership gates, in order:
-        //
-        // 1. DAG gate: only consider paths the DAG has never heard of.
-        //    With the recv task only inserting *accepted* batches into
-        //    `seen_drvs` (rejected paths never round-trip here), every
-        //    entry corresponds to a buffer stamped to THIS executor at
-        //    accept time — and therefore to a DAG node *for that hash*.
-        //    The entry's *string* may be an accepted alias (different
-        //    suffix, same hash) that is not in `path_to_hash`, which is
-        //    exactly why this gate fires for it and gate 2 is needed.
-        //    Real (canonical-path) drvs are reaped by `assign_to_worker`
-        //    (re-dispatch), `handle_cleanup_terminal_build` (terminal),
-        //    and the flusher (`drain`); the gate keeps this loop from
-        //    racing them.
-        //
-        // 2. Buffer gate (`discard_if_owned_by`): never remove an entry
-        //    stamped to another executor or one that is sealed. Without
-        //    it, an accepted alias for the worker's own drv, reassigned
-        //    to `E_b` after a transient failure, then a disconnect from
-        //    the original worker, would remove `E_b`'s freshly-stamped
-        //    buffer. Sealed = `FlushRequest` in flight; reaping would
-        //    cause `flush_final` to drop the request as stale.
-        //
-        // For the full exploit chain that motivated the gated insert
-        // (gate 0) and this two-gate shape, see the recv task's
-        // `LogBatch` arm in `executor_service.rs`. This loop was
-        // previously in the reader task, branching on `is_sealed`; that
-        // raced the actor's `seal()` (TOCTOU under load → completed
-        // build's buffer discarded before flusher drained it) and had no
-        // ownership check at all.
-        if let Some(bufs) = &self.log_buffers {
-            if self.leader.is_leader() && self.dag_authoritative {
-                for drv in seen_drvs {
-                    if self.dag.hash_for_path(&drv).is_none()
-                        && bufs.discard_if_owned_by(&drv, executor_id.as_str())
-                    {
-                        debug!(
-                            executor_id = %executor_id, drv = %drv,
-                            "reaped DAG-unknown log buffer on disconnect"
-                        );
-                    }
-                }
-            } else {
-                debug!(
-                    executor_id = %executor_id,
-                    seen_drvs = seen_drvs.len(),
-                    "skipping disconnect log-buffer discard: not leader, or \
-                     this tenure has no successfully recovered DAG (recovery \
-                     pending or failed), so the DAG is not authoritative; \
-                     retained entries are reconciled at the next \
-                     acquisition's re-arm/restamp/sweep (or kept until \
-                     process exit)"
-                );
-            }
-        }
     }
 
     /// Reset a set of derivations to Ready and re-enqueue.
@@ -571,7 +479,7 @@ impl DagActor {
         // bookkeeping runs on standby). A deposed leader processing a
         // disconnect against its stale DAG would otherwise:
         //   - poison branch: persist_poisoned + terminal_failure_epilogue
-        //     → terminal_log_epilogue, which finalizes the drv_logs row and
+        //     → terminal_log_epilogue, which stamps the drv_executions row and
         //     pins the write-once build_derivations.exec_id for an execution
         //     the new leader is about to re-run (and, keep_going=false,
         //     fails/cancels the whole build from stale state);

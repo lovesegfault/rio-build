@@ -20450,10 +20450,6 @@
           "packageId": "aws-sdk-ec2"
         },
         {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
-        },
-        {
           "name": "base64",
           "packageId": "base64 0.22.1"
         },
@@ -20608,20 +20604,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
         }
       ],
       "devDependencies": [
         {
           "name": "aws-sdk-ec2",
           "packageId": "aws-sdk-ec2"
-        },
-        {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
         },
         {
           "name": "aws-smithy-mocks",

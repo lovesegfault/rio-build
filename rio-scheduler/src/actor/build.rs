@@ -123,26 +123,19 @@ impl DagActor {
                 }
                 state.assigned_executor = None;
             }
-            // Finalize the drv_logs row for the cancelled execution:
-            // seal + flush(status="cancelled") + correlate. The
-            // worker's eventual CompletionReport(Cancelled) is a no-op
-            // early-return at process_completion (completion.rs), so
-            // this is the only place that can finalize the cancelled
-            // exec's log — for any of cancel_build_derivations' callers
-            // (user cancel, per-build timeout, fail-fast, top-down
-            // substitute fail). Sole-interest filter at collect time
-            // means `&[build_id]` is the full interested set. Without
-            // this, every cancel of a ≥30s-running drv leaves a
-            // `drv_logs` row stuck at is_complete=false/status=NULL for
-            // the 30-day TTL and bd.exec_id NULL (dashboard shows the
-            // "approximate" banner for a log that was streamed).
-            //
-            // The not-yet-dispatched arms below and the
-            // dependency-failure cascade use `finalize_buffered_exec_log`
-            // instead — see its doc for the gate-carrier rationale.
-            // The seal here precedes the CancelSignal try_send below,
-            // so the worker's late `rio: result cancelled` footer is
-            // dropped — see terminal_log_epilogue's sequencing note.
+            // Stamp the cancelled execution's drv_executions row +
+            // bd.exec_id correlation. The worker's eventual
+            // CompletionReport(Cancelled) is a no-op early-return at
+            // process_completion (completion.rs), so this is the only
+            // place that can stamp the cancelled exec — for any of
+            // cancel_build_derivations' callers (user cancel, per-build
+            // timeout, fail-fast, top-down substitute fail).
+            // Sole-interest filter at collect time means `&[build_id]`
+            // is the full interested set. Without this, every cancel of
+            // a running drv leaves the `drv_executions` row at
+            // status=NULL until the TTL sweep and bd.exec_id NULL
+            // (dashboard shows the "approximate" banner for a log that
+            // was streamed).
             // r[impl sched.merge.exec-correlation+7]
             // No CompletionReport on the cancel path → final_line_count
             // stays NULL → the row reads as incomplete (correct: a
@@ -184,11 +177,6 @@ impl DagActor {
             if let Some(state) = self.dag.node_mut(drv_hash)
                 && state.transition(DerivationStatus::Cancelled).is_ok()
             {
-                // Finalize the prior (reset) execution's log if one is
-                // still buffered — see `finalize_buffered_exec_log` for
-                // the gate-carrier and status="cancelled" rationale.
-                // r[impl sched.merge.exec-correlation+7]
-                self.finalize_buffered_exec_log(drv_hash, &[build_id]);
                 transitioned.push(drv_hash.as_str());
             }
         }
@@ -222,13 +210,6 @@ impl DagActor {
                 && state.transition(DerivationStatus::DependencyFailed).is_ok()
             {
                 self.ready_queue.remove(drv_hash);
-                // Finalize the prior (reset) execution's log if one is
-                // still buffered — see `finalize_buffered_exec_log` for
-                // the gate-carrier rationale and why status is
-                // "cancelled" even though this drv's terminal is
-                // DependencyFailed.
-                // r[impl sched.merge.exec-correlation+7]
-                self.finalize_buffered_exec_log(drv_hash, &[build_id]);
                 depfailed.push(drv_hash.as_str());
             }
         }
@@ -728,60 +709,7 @@ impl DagActor {
         self.events.remove(build_id);
 
         // Remove build interest from DAG and reap orphaned+terminal nodes.
-        // Discard each reaped node's log buffer: in the happy path
-        // `flush_final` already drained it (no-op here), but if the
-        // completion `FlushRequest` was dropped (channel-full burst),
-        // the buffer would otherwise leak for the process lifetime and
-        // `flush_periodic` would re-upload it every 30s. This bounds
-        // that leak to TERMINAL_CLEANUP_DELAY (~60s). (Zero-line buffers
-        // are already reaped at the epilogue when the enqueue fails;
-        // this backstop matters for buffers holding lines.)
-        //
-        // Exception: an entry whose final flush is still pending with the
-        // flusher — enqueued by the terminal epilogue and not yet resolved
-        // (it may still be queued behind earlier flushes during a PG
-        // outage), or deferred by the finalize guard and retained for
-        // retry. Discarding it here would destroy the only copy of the log
-        // while the flusher is still going to process it; that request's
-        // drain/refusal/reap is the entry's reaper. Pending entries are
-        // pinned from enqueue until the flusher resolves the request —
-        // bounded by the flush channel's depth plus the retention cap
-        // (DEFERRED_FINALS_MAX; overflow now drops the entry itself) and
-        // by process restart — except an EMPTY pending entry, which the
-        // periodic flush's sealed-empty reap may remove before its final
-        // is processed (that final then takes the no-entry arm and only
-        // the empty drain's status stamp is lost). A request the flusher
-        // drops because
-        // leadership moved (tenure mismatch) leaves a possibly-live entry
-        // and this mark in place — on a re-acquired leader the same-exec
-        // restamp clears the seal and the mark so the entry serves as the
-        // live execution's buffer; an entry that is still sealed AND empty
-        // at that drop has no remaining owner and is reaped by the
-        // tenure-drop arm itself, while a sealed non-empty orphan whose
-        // execution another tenure already finalized in drv_logs is reaped
-        // by the periodic flush when its snapshot UPSERT is refused by the
-        // frozen row (the durable record supersedes it); one never
-        // finalized anywhere either keeps being snapshotted at `.partial`
-        // coverage until process restart, or — when the stored-coverage
-        // reconcile finds a prior tenure's row covering past the retained
-        // ring and empties it — is reaped by the periodic flush's
-        // sealed-empty empty-snapshot reap (bookkeeping; reads already
-        // fall through to that stored `.partial` once the ring is empty).
-        // r[impl obs.log.deferred-final-retry+4]
         let reap = self.dag.remove_build_interest_and_reap(build_id);
-        if let Some(bufs) = &self.log_buffers {
-            for path in &reap.reaped_paths {
-                if bufs.final_pending(path) {
-                    debug!(
-                        drv_path = %path,
-                        "skipping log-buffer discard at build cleanup: final \
-                         flush still pending with the flusher"
-                    );
-                    continue;
-                }
-                bufs.discard(path);
-            }
-        }
         if !reap.reaped_paths.is_empty() {
             debug!(build_id = %build_id, reaped = reap.reaped_paths.len(), "reaped orphaned terminal DAG nodes");
         }
@@ -837,8 +765,8 @@ impl DagActor {
         // r[impl sched.lease.standby-drops-writes]
         // Leader-gated like the `drain_phantoms` slice of the Heartbeat
         // arm: the rest of this handler stays ungated (in-memory build/
-        // event-map removal, the DAG reap, and log-buffer bookkeeping run
-        // on standby as before; the event-log GC below is its own
+        // event-map removal and the DAG reap run on standby as before;
+        // the event-log GC below is its own
         // fire-and-forget), but this block performs leader-class writes —
         // the closure-hole stamp, `persist_status`, the fail-fast's PG
         // mark clear, and terminal build failure — and
@@ -900,7 +828,6 @@ impl DagActor {
                     self.push_ready(parent.clone());
                     self.persist_status(&parent, DerivationStatus::Ready, None)
                         .await;
-                    self.dispatch_dirty = true;
                 }
             }
         }

@@ -186,3 +186,22 @@ pub(super) async fn forward_gc_progress<S>(
         }
     }
 }
+
+/// Wrap a Status in a stream that yields a single `Err(status)` then ends.
+///
+/// For server-streaming RPCs consumed via grpc-web (the dashboard),
+/// returning `Err(Status)` directly from the handler makes tonic emit a
+/// Trailers-Only response — `grpc-status` lives in the HTTP headers with
+/// zero body. Envoy's grpc_web filter passes that through as-is, and the
+/// browser fetch API can't read HTTP trailers — the dashboard sees a
+/// silent 200.
+///
+/// Yielding `Err` from the stream instead makes tonic emit a normal
+/// HEADERS frame followed by TRAILERS; Envoy encodes the trailers as a
+/// length-prefixed body frame with flag `0x80`, which fetch CAN read.
+pub(super) fn err_stream<T: Send + 'static>(status: Status) -> ReceiverStream<Result<T, Status>> {
+    let (tx, rx) = mpsc::channel(1);
+    // try_send: capacity is 1 and we're the sole sender, can't fail.
+    let _ = tx.try_send(Err(status));
+    ReceiverStream::new(rx)
+}

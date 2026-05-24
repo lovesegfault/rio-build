@@ -25,7 +25,7 @@ impl SchedulerDb {
     /// Create the lifecycle row for a freshly-minted execution.
     ///
     /// `drv_hash` is the `drv_log_hash()` 32-char form (the same value
-    /// the `drv_logs` row and the `logs/{drv_hash}/…` S3 keys use) —
+    /// the `logs/{drv_hash}/…` S3 chunk keys use) —
     /// NOT the `derivations.drv_hash` DAG key. rio-store normalizes a
     /// reader's derivation argument through the same helper before
     /// querying this column.

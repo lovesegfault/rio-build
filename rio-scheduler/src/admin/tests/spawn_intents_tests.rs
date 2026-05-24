@@ -22,8 +22,6 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
         c.sla = test_sla_config();
     });
     let svc = AdminServiceImpl::new(
-        Arc::new(LogBuffers::new()),
-        None,
         db.pool.clone(),
         actor.clone(),
         "127.0.0.1:1".into(),
@@ -94,8 +92,6 @@ async fn test_mint_executor_tokens_signs_per_intent() -> anyhow::Result<()> {
         }
     });
     let svc = AdminServiceImpl::new(
-        Arc::new(LogBuffers::new()),
-        None,
         db.pool.clone(),
         actor.clone(),
         "127.0.0.1:1".into(),

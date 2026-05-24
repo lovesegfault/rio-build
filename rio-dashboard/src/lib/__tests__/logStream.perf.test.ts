@@ -1,4 +1,4 @@
-// r[verify dash.stream.log-tail+2]
+// r[verify dash.stream.log-tail+3]
 // Structural perf guard: the prior spread-reassign
 // (`lines = [...lines, ...decoded]`) copied the entire existing array
 // per chunk — O(n²) total for n lines. For 20K lines in 100-line chunks
@@ -125,7 +125,7 @@ describe('createLogStream perf', () => {
     expect(s.lines.length).toBe(40_000);
   });
 
-  // r[verify dash.stream.log-tail+2]
+  // r[verify dash.stream.log-tail+3]
   // rev-p392 correctness: single giant chunk is bounded correctly.
   // Pre-fix a 70K-line chunk left lines at 60K (splice removed fixed
   // DROP_LINES, didn't re-check). Post-fix it's capped at

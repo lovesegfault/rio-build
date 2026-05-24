@@ -108,8 +108,8 @@ const RPC_MAX_ATTEMPTS: u32 = 3;
 ///
 /// **Unary only.** The `T: Default` bound rejects `Streaming<_>` at
 /// compile time (prost-generated messages and `()` derive `Default`;
-/// `tonic::Streaming` does not). Server-streaming RPCs (TriggerGC,
-/// GetDerivationLogs) need per-message progress, not a whole-call deadline,
+/// `tonic::Streaming` does not). Server-streaming RPCs (TriggerGC)
+/// need per-message progress, not a whole-call deadline,
 /// and re-issuing the call on retry would silently drop already-
 /// received messages — wrap the stream-drain loop instead.
 pub(crate) async fn rpc<T: Default>(

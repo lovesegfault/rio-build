@@ -86,6 +86,7 @@ pub enum HeartbeatOutcome {
     Lost,
 }
 
+// r[impl store.log.session-keyed]
 /// Take (or steal) the ingest lease for `exec_id`.
 ///
 /// One `INSERT … ON CONFLICT DO UPDATE … WHERE <stealable> RETURNING`

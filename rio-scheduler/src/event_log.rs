@@ -29,7 +29,7 @@ use uuid::Uuid;
 /// a mid-backlog reconnect loses it, which is already a degraded
 /// scenario).
 ///
-/// With Event::Log filtered out (S3 handles those), the rate is
+/// With display-only events filtered out, the rate is
 /// ~5 events/sec for a busy scheduler (one per derivation state
 /// transition). 1000 = 200 seconds of backlog. If the persister
 /// is 200s behind, PG is probably down and the drops don't matter

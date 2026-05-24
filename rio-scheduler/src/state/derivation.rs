@@ -766,32 +766,20 @@ pub struct DerivationState {
     /// Worker currently assigned/running this derivation.
     pub assigned_executor: Option<ExecutorId>,
     /// Per-execution identifier minted by `assign_to_worker` for the
-    /// active assignment. UUIDv7 — keys the `drv_logs` PG row and the
-    /// `logs/{drv_hash}/{exec_id}.log.zst` S3 blob. Mirrors the
-    /// `LogBuffers` ring-buffer entry's `exec_id` (the flusher's read
-    /// path) and `assignments.exec_id` (the recovery carrier). NOT the
-    /// flusher's read path — the actor and the flusher are deliberately
-    /// decoupled (see `logs/mod.rs` module header).
+    /// active assignment. UUIDv7 — keys the `drv_executions` PG row and
+    /// rio-store's `logs/{drv_hash}/{exec_id}/...` chunk objects.
+    /// Mirrors `assignments.exec_id` (the recovery carrier).
     ///
     /// `None` on construction. Set by `assign_to_worker`; cleared by
     /// `reset_to_ready` (worker disconnect, phantom drain, orphan
-    /// reconcile, infra/timeout retry below cap, and `rollback_assignment` —
-    /// that last one ALSO discards the `LogBuffers` entry, so neither
-    /// carrier survives a failed dispatch) and by `transition()` on any
+    /// reconcile, infra/timeout retry below cap, and `rollback_assignment`)
+    /// and by `transition()` on any
     /// terminal → non-terminal reset (I-094 reprobe, I-047 stale-output
     /// reset — the prior execution was already finalized at its
     /// terminal and must not be attributed to the node's next
     /// lifecycle). The reader is `terminal_log_epilogue` (which
     /// resolves once via `actor/event.rs::exec_id_for_terminal` and
-    /// threads the value to the seal/flush/correlate steps); the
-    /// resolution can run
-    /// between a `reset_to_ready` and the next `assign_to_worker` when
-    /// a poison-while-Ready path (I-065 fleet exhaustion,
-    /// max_infra/timeout_retries cap) reaches `terminal_failure_epilogue`
-    /// first, and falls back to the `LogBuffers` entry's stamped
-    /// exec_id, which `reset_to_ready` does NOT clear (the lines and
-    /// stamp are still needed by the periodic flusher in the
-    /// reset→re-dispatch window).
+    /// threads the value to the correlate/stamp steps).
     ///
     /// Recovery preserves the clear across leader failover: the recovery
     /// query only carries `assignments.exec_id` for currently-assigned
@@ -1169,8 +1157,7 @@ impl DerivationState {
             // From the active `assignments` row, scoped by the JOIN to
             // currently-assigned drvs (`load_nonterminal_derivations`) —
             // NULL for a drv whose dispatch was reset, so recovery
-            // preserves `reset_to_ready()`'s clear. Recovery re-stamps
-            // the LogBuffers ring buffer from this; see `load_dag_from_rows`.
+            // preserves `reset_to_ready()`'s clear.
             exec_id: row.exec_id,
             sched: SchedHint {
                 // M_044: persisted reactive floor. PG bigint → i64;
@@ -1474,18 +1461,14 @@ impl DerivationState {
         // r[impl sched.merge.exec-correlation+7]
         // A node leaving a terminal state (I-094 reprobe → Substituting/
         // Queued, I-047 stale-output reset → Ready/Queued) is starting a
-        // fresh lifecycle. The terminal's epilogue already finalized the
-        // prior execution's log and bd.exec_id correlation; carrying its
+        // fresh lifecycle. The terminal's epilogue already stamped the
+        // prior execution's row and bd.exec_id correlation; carrying its
         // exec_id forward makes `exec_id_for_terminal` attribute that
         // finalized execution to whatever build next terminates the
         // reset node — a build that never observed it. Same contract as
         // `reset_to_ready`'s clear, applied at the chokepoint every
         // terminal-exit carve-out goes through (including the currently
-        // uncalled Poisoned → Created one). The LogBuffers entry is
-        // deliberately NOT touched: for a finalized execution it is
-        // already gone (flush_final's drain), and for the
-        // substitute-success known gap (un-finalized buffer on a reset
-        // node) it must survive as the fallback carrier.
+        // uncalled Poisoned → Created one).
         if from.is_terminal() && !to.is_terminal() {
             self.exec_id = None;
         }

@@ -60,8 +60,8 @@ impl SchedulerDb {
     /// `exec_id` would re-stamp `state.exec_id` after failover, undoing
     /// `reset_to_ready()`'s documented clear. `assigned_builder_id IS
     /// NOT NULL` ⟺ currently dispatched (the only non-NULL writer is
-    /// `record_assignment`); this mirrors the LogBuffers restamp gate's
-    /// `Assigned|Running` filter in `load_dag_from_rows`. Full harm
+    /// `record_assignment`); this mirrors the recovery load.s
+    /// `Assigned|Running` filter. Full harm
     /// chain: `test_recovery_preserves_reset_exec_id_clear`.
     ///
     /// CAVEAT: this query has NO join to builds. A derivation whose

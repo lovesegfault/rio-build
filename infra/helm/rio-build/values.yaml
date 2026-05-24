@@ -352,22 +352,16 @@ scheduler:
   replicas: 2
   serviceAccount:
     # EKS IRSA: eks.amazonaws.com/role-arn set via --set from tofu output.
-    # Scheduler needs S3 PutObject for build-log flush.
+    # Scheduler needs EC2 DescribeSpotPriceHistory/DescribeInstanceTypes
+    # for the ADR-023 spot-price poller. (The S3 logs/* grant this role
+    # used to carry went away with the log flusher — build logs are
+    # written by rio-store now.)
     annotations: {}
   # All replicas contend for SAME Lease. Presence of this name ENABLES lease
   # mode (LeaseConfig::from_env returns None without RIO_LEASE_NAME →
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
-  # Build logs flush to S3 from the scheduler (log aggregation lives here,
-  # not the store). Empty → logs stay in PG only.
-  logS3Bucket: ""
-  # TTL for build logs (drv_logs rows + their .log.zst/.partial.log.zst
-  # S3 blobs). The LogFlusher GC tick (~1h cadence) deletes anything
-  # older. Default 30 days. Must be > 0 — the scheduler refuses to start
-  # on 0 (it would delete every log on every sweep). To effectively
-  # disable, set high (e.g. 3650).
-  logRetentionDays: 30
   # Scheduler-side substitute fan-out is DEFAULT_SUBSTITUTE_CONCURRENCY=256
   # (a memory-safety bound on detached tokio tasks, NOT a throughput knob).
   # Per-replica throttling lives in the store: r[store.substitute.admission].
@@ -1113,7 +1107,7 @@ dashboard:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 128Mi}
-  # ── Method-level authz (r[dash.auth.method-gate+3]) ───────────────────
+  # ── Method-level authz (r[dash.auth.method-gate+4]) ───────────────────
   # Expose ClearPoison/DrainExecutor/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating
   # methods is NOT rendered, so envoy returns 404 on those paths.

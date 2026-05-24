@@ -6442,7 +6442,6 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-ec2",
- "aws-sdk-s3",
  "aws-smithy-mocks",
  "base64 0.22.1",
  "clap",
@@ -6494,7 +6493,6 @@ dependencies = [
  "tracing-test",
  "uuid",
  "workspace-hack",
- "zstd",
 ]
 
 [[package]]

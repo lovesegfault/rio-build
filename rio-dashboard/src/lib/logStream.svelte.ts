@@ -16,7 +16,7 @@
 // AdminService — see api/logs.ts.
 import { logs } from '../api/logs';
 
-// r[impl dash.stream.log-tail+2]
+// r[impl dash.stream.log-tail+3]
 // r[impl dash.log.cap]
 // r[impl dash.log.virtualize]
 // (Virtualization itself lives in LogViewer.svelte — windowed slice over
@@ -135,12 +135,12 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
       // can render a banner — the missing tail is usually the build
       // error itself. The error path below does NOT set this: the err
       // banner already signals abnormal termination.
-      // r[impl obs.log.incomplete-surfaced]
+      // r[impl obs.log.incomplete-surfaced+2]
       incomplete = true;
       done = true;
     } catch (e) {
       // Swallow AbortError: that's our own destroy() firing. Anything
-      // else (transport failure, scheduler gone) surfaces as an error
+      // else (transport failure, store gone) surfaces as an error
       // the viewer can render inline.
       if (!ctrl.signal.aborted) {
         err = e instanceof Error ? e : new Error(String(e));

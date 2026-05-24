@@ -9,9 +9,9 @@
 //!
 //! This is the security boundary between untrusted builder pods (which
 //! run arbitrary derivation code) and the log store — the relocation of
-//! the scheduler's recv-task `(executor, drv)` binding gate
-//! (`sched.log.batch-binding`) plus the seal that used to live in the
-//! ring buffer's `is_complete` latch.
+//! the scheduler's recv-task `(executor, drv)` binding gate plus the
+//! seal that used to live in the scheduler ring buffer's `is_complete`
+//! latch (both deleted with the in-scheduler log path).
 //!
 //! The `builder_id` comparison is a *token-currency* check (is the
 //! attempt this token was minted for still the derivation's live
@@ -41,6 +41,7 @@ pub struct GateOk {
     pub exec_id: Uuid,
 }
 
+// r[impl store.log.append-auth]
 /// May this (already HMAC-verified) token open an `AppendLog` stream
 /// for this execution?
 ///
@@ -152,6 +153,7 @@ pub async fn check_append_open(
     })
 }
 
+// r[impl store.log.completeness-gate]
 /// The completeness predicate: terminal status ∧ known
 /// `final_line_count` ∧ a contiguous manifest covering
 /// `[0, final_line_count)`.
@@ -356,6 +358,7 @@ mod tests {
         assert_eq!(ok.drv_hash, "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm");
     }
 
+    // r[verify store.log.append-auth]
     #[tokio::test]
     async fn rejects_mismatched_exec_id() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -396,6 +399,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     }
 
+    // r[verify store.log.append-auth]
     #[tokio::test]
     async fn rejects_derivation_path_not_matching_token() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -416,6 +420,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     }
 
+    // r[verify store.log.completeness-gate]
     #[tokio::test]
     async fn accepts_terminal_but_incomplete_execution() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -444,6 +449,7 @@ mod tests {
             .expect("a terminal-but-incomplete execution must accept the late replay");
     }
 
+    // r[verify store.log.completeness-gate]
     #[tokio::test]
     async fn rejects_complete_execution() {
         let db = TestDb::new(&crate::MIGRATOR).await;

@@ -183,7 +183,7 @@ describe('LogViewer', () => {
     expect(screen.getByText(/12,340 earlier lines truncated/)).toBeInTheDocument();
   });
 
-  // r[verify obs.log.incomplete-surfaced]
+  // r[verify obs.log.incomplete-surfaced+2]
   it('renders incomplete banner when stream.incomplete is set', () => {
     // logStream flips `incomplete` when the server stream ends without an
     // is_complete=true terminal chunk — a `.partial` blob or a

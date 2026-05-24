@@ -227,7 +227,7 @@ impl LogUploader {
     }
 
     /// A clone of the input sender for the stderr loop. The channel is
-    /// bounded ([`INPUT_QUEUE_DEPTH`]); a full channel blocks the sender,
+    /// bounded (`INPUT_QUEUE_DEPTH`); a full channel blocks the sender,
     /// which is the designed backpressure path from the store all the way
     /// back to the build's stdout pipe.
     pub fn sender(&self) -> mpsc::Sender<BuildLogBatch> {

@@ -1,11 +1,11 @@
 //! AdminService gRPC implementation.
 //!
-//! All RPCs are fully implemented as of phase4a: `GetDerivationLogs`,
+//! All RPCs are fully implemented as of phase4a:
 //! `ClusterStatus`, `DrainExecutor`, `TriggerGC`, `ListExecutors`,
 //! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`,
 //! `GetBuildGraph`, `GetSpawnIntents`.
 //!
-//! Per-RPC bodies live in submodules (`logs`, `gc`, `tenants`,
+//! Per-RPC bodies live in submodules (`gc`, `tenants`,
 //! `builds`, `workers`, `graph`, `spawn_intents`). This file holds only the
 //! [`AdminServiceImpl`] state struct + thin wrapper methods that
 //! delegate into the submodules. Split from a single 861L file (P0383)
@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use aws_sdk_s3::Client as S3Client;
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -29,24 +28,22 @@ use rio_proto::types::{
     AckSpawnedIntentsRequest, AppendInterruptSampleRequest, CancelBuildRequest,
     CancelBuildResponse, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
-    DeleteTenantRequest, DeleteTenantResponse, DerivationLogChunk, DrainExecutorRequest,
-    DrainExecutorResponse, ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest,
-    GetBuildGraphRequest, GetBuildGraphResponse, GetDerivationLogsRequest,
-    GetHwClassConfigResponse, GetSlaMispredictorsRequest, GetSlaMispredictorsResponse,
-    GetSpawnIntentsRequest, GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse,
-    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
-    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
-    ListSlaOverridesResponse, ListTenantsResponse, MintExecutorTokensRequest,
-    MintExecutorTokensResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
-    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
-    SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
-    SlaStatusResponse, TerminationReason,
+    DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
+    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
+    GetBuildGraphResponse, GetHwClassConfigResponse, GetSlaMispredictorsRequest,
+    GetSlaMispredictorsResponse, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
+    HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
+    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
+    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
+    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse,
+    MintExecutorTokensRequest, MintExecutorTokensResponse, PoisonedDerivation,
+    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
+    SetSlaOverrideRequest, SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride,
+    SlaStatusRequest, SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
 use crate::actor::{ActorCommand, ActorHandle, AdminQuery};
-use crate::logs::LogBuffers;
 use crate::sla::types::ModelKey;
 
 /// `actor.query_unchecked` + `actor_error_to_status`. Every admin
@@ -68,7 +65,6 @@ mod builds;
 mod executors;
 mod gc;
 mod graph;
-mod logs;
 mod sla;
 mod spawn_intents;
 mod tenants;
@@ -77,12 +73,6 @@ pub use gc::spawn_store_size_refresh;
 pub use sla::duration_fit_from_status;
 
 pub struct AdminServiceImpl {
-    /// Shared with `SchedulerGrpc` — same Arc, same DashMap.
-    log_buffers: Arc<LogBuffers>,
-    /// `None` when `RIO_LOG_S3_BUCKET` is unset. In that case, completed-
-    /// build logs are unserveable (the flusher never wrote them). Ring
-    /// buffer still serves active builds.
-    s3: Option<(S3Client, String)>, // (client, bucket)
     pool: PgPool,
     /// For `ClusterStatus` / `DrainExecutor` — sends query commands into
     /// the actor event loop. `ClusterSnapshot` bypasses backpressure
@@ -151,8 +141,6 @@ pub struct AdminServiceImpl {
 impl AdminServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        log_buffers: Arc<LogBuffers>,
-        s3: Option<(S3Client, String)>,
         pool: PgPool,
         actor: ActorHandle,
         store_addr: String,
@@ -165,8 +153,6 @@ impl AdminServiceImpl {
         cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
     ) -> Self {
         Self {
-            log_buffers,
-            s3,
             pool,
             actor,
             started_at: Instant::now(),
@@ -240,32 +226,7 @@ impl AdminServiceImpl {
 
 #[tonic::async_trait]
 impl AdminService for AdminServiceImpl {
-    type GetDerivationLogsStream = ReceiverStream<Result<DerivationLogChunk, Status>>;
     type TriggerGCStream = ReceiverStream<Result<GcProgress, Status>>;
-
-    #[instrument(skip(self, request), fields(rpc = "GetDerivationLogs"))]
-    async fn get_derivation_logs(
-        &self,
-        request: Request<GetDerivationLogsRequest>,
-    ) -> Result<Response<Self::GetDerivationLogsStream>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-
-        // grpc-web compatibility: ALL error paths return Ok(stream-yielding-
-        // Err) instead of Err(Status). Returning Err makes tonic emit a
-        // Trailers-Only response (grpc-status in HEADERS, empty body).
-        // Envoy's grpc_web filter passes that through with zero body — and
-        // browser fetch can't read HTTP trailers, so the dashboard sees a
-        // 200 with no error signal. Yielding Err from the stream makes
-        // tonic emit HEADERS → TRAILERS, which Envoy encodes as a 0x80
-        // body frame the browser CAN read.
-        // r[impl dash.journey.build-to-logs]
-        if let Err(status) = self.ensure_leader() {
-            return Ok(Response::new(logs::err_stream(status)));
-        }
-        let req = request.into_inner();
-        let stream = logs::get_derivation_logs(&self.log_buffers, &self.s3, &self.pool, req).await;
-        Ok(Response::new(stream))
-    }
 
     /// Cluster-wide counts for the controller's autoscaling loop.
     ///
@@ -370,15 +331,16 @@ impl AdminService for AdminServiceImpl {
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        // grpc-web compatibility: same Trailers-Only constraint as
-        // get_derivation_logs above. ALL error paths return Ok(stream-
-        // yielding-Err); the handler never returns Err.
+        // grpc-web compatibility: returning Err(Status) from a
+        // server-streaming handler makes tonic emit a Trailers-Only
+        // response the browser can't read. ALL error paths return
+        // Ok(stream-yielding-Err); the handler never returns Err.
         if let Err(status) = self
             .ensure_service_caller(request.metadata(), &["rio-cli"])
             .and_then(|_| self.ensure_leader())
             .and_then(|_| self.check_actor_alive())
         {
-            return Ok(Response::new(logs::err_stream(status)));
+            return Ok(Response::new(gc::err_stream(status)));
         }
         let req = request.into_inner();
         // `service_verifier` doubles as the signer for OUTGOING calls
@@ -395,7 +357,7 @@ impl AdminService for AdminServiceImpl {
         .await
         {
             Ok(s) => s,
-            Err(s) => logs::err_stream(s),
+            Err(s) => gc::err_stream(s),
         };
         Ok(Response::new(stream))
     }

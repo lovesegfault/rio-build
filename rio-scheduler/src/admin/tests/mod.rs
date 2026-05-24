@@ -1,11 +1,11 @@
 //! AdminService test suite.
 //!
-//! Shared fixtures (`setup_svc`, `setup_svc_default`, `collect_stream`)
+//! Shared fixtures (`setup_svc`, `setup_svc_default`)
 //! live here and are `pub(super)` for the per-domain submodules. Tests
 //! for handlers that remain inline in `admin/mod.rs` post-P0383
 //! (`ClusterStatus`, `DrainExecutor`, `ClearPoison`, `admin_rpcs_are_wired`
 //! smoke test) stay in this file — everything else mirrors the
-//! `admin/{logs,gc,tenants,builds,workers,graph,sizeclass}.rs` submodule
+//! `admin/{gc,tenants,builds,workers,graph,sizeclass}.rs` submodule
 //! seams.
 
 use super::*;
@@ -17,15 +17,12 @@ use tokio_stream::StreamExt;
 mod builds_tests;
 mod gc_tests;
 mod graph_tests;
-mod logs_tests;
 mod spawn_intents_tests;
 mod tenants_tests;
 mod workers_tests;
 
-/// Set up `AdminServiceImpl` with a live actor but no S3.
+/// Set up `AdminServiceImpl` with a live actor.
 ///
-/// The GetDerivationLogs tests don't exercise the actor (they hit ring
-/// buffer or S3 directly), but the constructor needs a handle.
 /// `setup_actor` gives a real actor backed by the same PG — no
 /// mocks needed. The `_task` keeps the actor task alive; dropping
 /// the returned tuple drops the handle → channel closes → actor
@@ -33,10 +30,7 @@ mod workers_tests;
 ///
 /// Returns `(svc, actor_handle, task)`. The handle is separate so
 /// ClusterStatus tests can also send actor commands directly.
-pub(super) async fn setup_svc(
-    buffers: Arc<LogBuffers>,
-    s3: Option<(S3Client, String)>,
-) -> (
+pub(super) async fn setup_svc() -> (
     AdminServiceImpl,
     ActorHandle,
     tokio::task::JoinHandle<()>,
@@ -45,8 +39,6 @@ pub(super) async fn setup_svc(
     let db = TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor(db.pool.clone());
     let svc = AdminServiceImpl::new(
-        buffers,
-        s3,
         db.pool.clone(),
         actor.clone(),
         // store_addr: unreachable in tests. TriggerGC would fail
@@ -74,21 +66,14 @@ pub(super) async fn setup_svc(
     (svc, actor, task, db)
 }
 
-/// `setup_svc` with the common defaults (empty log buffers, no S3).
+/// `setup_svc` with the common defaults.
 pub(super) async fn setup_svc_default() -> (
     AdminServiceImpl,
     ActorHandle,
     tokio::task::JoinHandle<()>,
     TestDb,
 ) {
-    let buffers = Arc::new(LogBuffers::new());
-    setup_svc(buffers, None).await
-}
-
-pub(super) async fn collect_stream(
-    stream: ReceiverStream<Result<DerivationLogChunk, Status>>,
-) -> Vec<DerivationLogChunk> {
-    stream.filter_map(|r| r.ok()).collect::<Vec<_>>().await
+    setup_svc().await
 }
 
 /// `append_interrupt_sample` is idempotent on `event_uid`. The
@@ -230,8 +215,6 @@ async fn setup_svc_with_service_verifier() -> (
     let db = TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor(db.pool.clone());
     let svc = AdminServiceImpl::new(
-        Arc::new(LogBuffers::new()),
-        None,
         db.pool.clone(),
         actor,
         "127.0.0.1:1".into(),
@@ -308,7 +291,6 @@ const SERVICE_GATED: &[&str] = &[
     "GetHwClassConfig",
 ];
 const UNGATED_PUBLIC: &[&str] = &[
-    "GetDerivationLogs",
     "ClusterStatus",
     "ListExecutors",
     "ListBuilds",
@@ -817,28 +799,6 @@ async fn admin_cancel_build_gated_on_service_token() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
-}
-
-/// Unwrap an `Ok(Response)` whose stream yields exactly one `Err(Status)`.
-///
-/// `get_derivation_logs` returns errors as stream items (not handler-level
-/// `Err`) for grpc-web compatibility — see `err_stream` in `logs.rs`.
-pub(super) async fn expect_stream_err(
-    result: Result<Response<ReceiverStream<Result<DerivationLogChunk, Status>>>, Status>,
-) -> Status {
-    let mut stream = result
-        .expect("handler should return Ok(stream), error is in-stream")
-        .into_inner();
-    let status = stream
-        .next()
-        .await
-        .expect("stream should yield one item")
-        .expect_err("stream item should be Err(Status)");
-    assert!(
-        stream.next().await.is_none(),
-        "stream should end after the error"
-    );
-    status
 }
 
 #[tokio::test]

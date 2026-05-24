@@ -32,16 +32,6 @@ in
       description = "Housekeeping tick interval in seconds (`RIO_TICK_INTERVAL_SECS`).";
     };
 
-    logS3Bucket = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = ''
-        S3 bucket for build-log zstd flush (`RIO_LOG_S3_BUCKET`).
-        `null` = flush disabled; logs are ring-buffer-only (lost on restart,
-        but still live-servable while running).
-      '';
-    };
-
     extraConfig = lib.mkOption {
       type = lib.types.str;
       default = "";
@@ -124,9 +114,6 @@ in
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_TICK_INTERVAL_SECS = toString cfg.tickIntervalSecs;
-      }
-      // lib.optionalAttrs (cfg.logS3Bucket != null) {
-        RIO_LOG_S3_BUCKET = cfg.logS3Bucket;
       }
       // lib.optionalAttrs (cfg.lease != null) (
         {

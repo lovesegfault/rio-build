@@ -28,10 +28,10 @@ import { type Mock, vi } from 'vitest';
 // parity test in admin-mock.test.ts — add a method to the proto and
 // that test fails until this map grows the matching stub.
 //
-// Streaming RPCs (getDerivationLogs, triggerGC) get an empty-generator
-// default so `for await (const chunk of admin.getDerivationLogs(...))`
+// Streaming RPCs (triggerGC) get an empty-generator
+// default so `for await (const chunk of admin.triggerGC(...))`
 // doesn't throw `undefined is not iterable` when a page renders a
-// LogViewer child but the test doesn't care about the stream body.
+// child that drains the stream but the test doesn't care about the body.
 // vitest's mockReset() resets to a bare vi.fn() returning undefined
 // (it does NOT restore the constructor argument), so
 // teardownStandardAfterEach() re-applies these defaults explicitly
@@ -53,7 +53,6 @@ export const adminMock = {
   clusterStatus: vi.fn(),
   listExecutors: vi.fn(),
   listBuilds: vi.fn(),
-  getDerivationLogs: vi.fn(emptyStream) as Mock,
   triggerGC: vi.fn(emptyStream) as Mock,
   drainExecutor: vi.fn(),
   cancelBuild: vi.fn(),
@@ -145,7 +144,6 @@ export function setupStandardBeforeEach(
 // this a second-or-later test that mounts Graph/LogViewer without an
 // explicit stub would hit undefined.nodes / undefined-not-iterable.
 function applyDefaults(): void {
-  adminMock.getDerivationLogs.mockImplementation(emptyStream);
   adminMock.triggerGC.mockImplementation(emptyStream);
   adminMock.getBuildGraph.mockImplementation(emptyGraph);
   logsMock.tailLog.mockImplementation(emptyStream);

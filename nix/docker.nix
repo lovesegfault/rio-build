@@ -335,7 +335,7 @@ let
   # Gateway or moves it to a different namespace, this config needs
   # a matching rebuild.
   #
-  # r[dash.auth.method-gate+3] readonly allow-list. MUST match the
+  # r[dash.auth.method-gate+4] readonly allow-list. MUST match the
   # rio-scheduler-readonly + rio-store-logs-readonly HTTPRoutes in
   # dashboard-gateway.yaml — the dashboard-method-gate-parity check
   # (nix/misc-checks.nix) diffs the two and fails CI on divergence.
@@ -348,7 +348,6 @@ let
     "ListExecutors"
     "ListPoisoned"
     "ListBuilds"
-    "GetDerivationLogs"
     "ListTenants"
     "GetBuildGraph"
     "GetSpawnIntents"
@@ -434,7 +433,7 @@ rec {
   # Full /service/method paths for the readonly allow-list. Consumed
   # by the dashboard-method-gate-parity check (nix/misc-checks.nix) to
   # diff against the Cilium Gateway HTTPRoute — closes the drift class
-  # where nginx and the Gateway implement r[dash.auth.method-gate+3]
+  # where nginx and the Gateway implement r[dash.auth.method-gate+4]
   # independently.
   dashboardReadonlyMethods =
     map (m: "/rio.admin.AdminService/${m}") dashboardReadonlyAdmin
