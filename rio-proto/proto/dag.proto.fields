@@ -22,6 +22,7 @@ repeated string expected_output_paths = 8;
 repeated string output_names = 6;
 repeated string output_paths = 4;
 repeated string required_features = 5;
+repeated string wanted_output_names = 18;
 string assigned_executor_id = 5;
 string build_id = 1;
 string child_drv_path = 2;
