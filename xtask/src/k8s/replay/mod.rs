@@ -353,6 +353,17 @@ async fn run_live(
     }
     let mut src_substituters = Vec::new();
     for url in &archive.manifest().src_substituters {
+        // Plain-HTTP relay sources from the (untrusted) archive manifest are
+        // both an integrity downgrade for relayed NARs and the cheapest SSRF
+        // surface an archive could carry — only https:// and s3:// manifest
+        // sources are honored.
+        if url.trim_start().to_ascii_lowercase().starts_with("http://") {
+            tracing::warn!(
+                "ignoring recorded relay substituter {url}: plain http:// sources from the \
+                 archive manifest are not honored (https:// or s3:// only)"
+            );
+            continue;
+        }
         match Substituter::parse(url).await {
             Ok(substituter) => src_substituters.push(substituter),
             Err(err) => tracing::warn!(
@@ -360,6 +371,22 @@ async fn run_live(
                  cannot be relayed"
             ),
         }
+    }
+    // Announce the archive-sourced relay hosts up front, BEFORE any probe or
+    // fetch traffic is issued, so an operator can see exactly which hosts
+    // this archive will make the replay reach out to.
+    if src_substituters.is_empty() {
+        tracing::info!(
+            "no relay substituters from the archive manifest — gaps will only be filled from \
+             the archive itself or the target's own substituters"
+        );
+    } else {
+        let urls: Vec<String> = src_substituters.iter().map(Substituter::url).collect();
+        tracing::info!(
+            "relay sources from the archive manifest: {} — narinfo probes and NAR fetches will \
+             be issued to these hosts",
+            urls.join(", ")
+        );
     }
 
     // Schedule + run-wide supply context (closure walk, coverage probes,
@@ -422,6 +449,16 @@ async fn run_live(
     let connections = args
         .connections
         .unwrap_or_else(|| default_connections(args.max_sessions));
+    let pool_capacity = connections * client::CHANNELS_PER_CONNECTION;
+    if pool_capacity < args.max_sessions {
+        tracing::warn!(
+            "--connections {connections} gives only {pool_capacity} daemon channels \
+             ({} per connection); effective concurrency is capped there, below \
+             --max-sessions {}",
+            client::CHANNELS_PER_CONNECTION,
+            args.max_sessions
+        );
+    }
     let pool = ui::step(
         &format!("replay: connect to gateway {endpoint} ({connections} connections)"),
         || GatewayPool::connect(&endpoint, connections, &key_path, policy),

@@ -97,7 +97,10 @@ are tolerated where noted):
   used as live relay sources), `target_substituters` (list; non-empty only
   for "fat" archives), `fat` (bool, default false), `requests`, `drvs`,
   `embedded_srcs` (counts). Other fields are ignored. A missing manifest is
-  an error for `replay`.
+  an error for `replay`. Plain-HTTP `src_substituters` entries are ignored
+  at replay time (only `https://` and `s3://` relay sources are honored),
+  and the relay hosts that will be used are announced in the log before any
+  probe or fetch traffic is issued to them.
 - **requests.jsonl** — `ssh_session_id` (i64 client-session id from the
   recording), `offset_s` (f64 seconds from `from`; clamped at 0), `paths`
   (list of `[drvPath, [outputName...]]` pairs; `["*"]` and `[]` both mean
