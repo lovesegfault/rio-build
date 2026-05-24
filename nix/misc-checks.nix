@@ -48,6 +48,45 @@ let
       }
       touch $out
     '';
+
+  # Assert the node kernel's generated .config carries the ADR-022
+  # castore-FUSE prerequisites. Takes the kernel *package* and depends
+  # only on its `configfile` output (the `make olddefconfig` derivation)
+  # — a regular build input, NOT an eval-time `builtins.readFile` of a
+  # built path (the IFD × non-determinism trap from
+  # .claude/rules/ci-failure-patterns.md). Building configfile never
+  # builds the kernel.
+  #
+  # FUSE_PASSTHROUGH is a bool (=y or absent — it gates code inside
+  # fuse.ko, it is not itself tristate). FUSE_FS / OVERLAY_FS are
+  # tristate; either =y or =m satisfies nixos-node/kernel.nix's
+  # `boot.kernelModules = [ "fuse" "overlay" ]` early load.
+  mkKernelConfigCheck =
+    arch: kernel:
+    pkgs.runCommand "rio-node-kernel-config-${arch}"
+      {
+        inherit (kernel) configfile;
+      }
+      ''
+        echo "kernel ${kernel.version} (${arch}): $configfile"
+        fail=0
+        for want in 'CONFIG_FUSE_PASSTHROUGH=y' 'CONFIG_FUSE_FS=[ym]' 'CONFIG_OVERLAY_FS=[ym]'; do
+          if grep -E -q "^''${want}\$" "$configfile"; then
+            echo "  ok: $(grep -E "^''${want%%=*}=" "$configfile")"
+          else
+            # No ^ anchor on the diagnostic: `# CONFIG_X is not set`
+            # lines start with `#`, and showing that beats `<absent>`.
+            echo "  FAIL: wanted ^''${want}\$, got: $(grep -E "''${want%%=*}[ =]" "$configfile" || echo '<absent>')" >&2
+            fail=1
+          fi
+        done
+        if [ "$fail" -ne 0 ]; then
+          echo "FAIL: node kernel ${kernel.version} (${arch}) lost a castore-FUSE config" >&2
+          echo "      (r[infra.node.kernel-fuse-passthrough] — see nix/nixos-node/kernel.nix)" >&2
+          exit 1
+        fi
+        touch $out
+      '';
 in
 {
   # License + advisory audit. Policy: deny GPL-3.0 (project is
@@ -764,6 +803,31 @@ in
     ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { efi = false; }).drvPath}
     EOF
   '';
+
+  # ADR-022 castore-FUSE kernel tripwire (P0543). The builder stack
+  # needs FUSE_PASSTHROUGH=y (a Kconfig *default* since 6.9, not
+  # something nixos-node/kernel.nix sets — see its header comment) plus
+  # fuse + overlay as builtins or modules. A nixpkgs common-config
+  # change or an upstream Kconfig-default flip would silently ship an
+  # AMI whose kernel can't serve passthrough opens; the failure mode is
+  # every build on the new AMI erroring at mount time. These checks
+  # build only `kernel.configfile` (the `make olddefconfig` step, ~1min)
+  # — never the kernel itself — so the gate cost is eval + one tiny drv.
+  #
+  # x86_64 reads the configfile through the AMI module evaluation
+  # (`nodeAmi …`.nixosConfig.boot.kernelPackages) so a future module
+  # that overrides `boot.kernelPackages` is still covered. aarch64
+  # cannot: the native aarch64 nixosSystem's configfile is an
+  # aarch64-linux derivation the x86_64 CI host can't build, so it
+  # asserts on the `pkgsCross.aarch64-multiplatform` build of the same
+  # `linuxPackages_<pins.node.kernel_minor>` attr the module selects —
+  # identical structured config, buildable on x86_64.
+  node-kernel-config-x86_64 =
+    mkKernelConfigCheck "x86_64"
+      (nodeAmi "x86_64-linux" { }).nixosConfig.boot.kernelPackages.kernel;
+  node-kernel-config-aarch64 =
+    mkKernelConfigCheck "aarch64"
+      pkgs.pkgsCross.aarch64-multiplatform."linuxPackages_${(import ./pins.nix).node.kernel_minor}".kernel;
 
   # nginx allow-list (docker.nix dashboardReadonlyMethods) MUST equal
   # the Cilium Gateway rio-scheduler-readonly HTTPRoute's Exact paths.

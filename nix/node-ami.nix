@@ -24,31 +24,40 @@ nodeSystem:
   # virtualized + arm64 .metal.
   efi ? true,
 }:
-(nixpkgs.lib.nixosSystem {
-  system = nodeSystem;
-  specialArgs = {
-    pins = import ./pins.nix;
-    # Layer-cache warm for ephemeral executor pods
-    # (PLAN-PREBAKE / r[infra.node.prebake-layer-warm]).
-    # self.packages.${nodeSystem} is safe inside perSystem
-    # — flake-parts resolves the cross-arch attr without
-    # recursion (nodeSystem ≠ eval system is the common
-    # case: x86 host builds the aarch64 AMI).
-    rioSeedImages = [
-      self.packages.${nodeSystem}.dockerImages.executorSeed
+let
+  sys = nixpkgs.lib.nixosSystem {
+    system = nodeSystem;
+    specialArgs = {
+      pins = import ./pins.nix;
+      # Layer-cache warm for ephemeral executor pods
+      # (PLAN-PREBAKE / r[infra.node.prebake-layer-warm]).
+      # self.packages.${nodeSystem} is safe inside perSystem
+      # — flake-parts resolves the cross-arch attr without
+      # recursion (nodeSystem ≠ eval system is the common
+      # case: x86 host builds the aarch64 AMI).
+      rioSeedImages = [
+        self.packages.${nodeSystem}.dockerImages.executorSeed
+      ];
+    };
+    modules = [
+      (nixpkgs + "/nixos/maintainers/scripts/ec2/amazon-image.nix")
+      ./nixos-node
+      (if efi then ./nixos-node/uki-boot.nix else ./nixos-node/bios-boot.nix)
+      {
+        # raw → coldsnap uploads directly to an EBS snapshot
+        # via the EBS Direct API (no S3 / VM-Import round-trip,
+        # ~20min → ~2min for an 8 GB image).
+        amazonImage.format = "raw";
+        virtualisation.diskSize = "auto";
+        ec2.efi = efi;
+      }
     ];
   };
-  modules = [
-    (nixpkgs + "/nixos/maintainers/scripts/ec2/amazon-image.nix")
-    ./nixos-node
-    (if efi then ./nixos-node/uki-boot.nix else ./nixos-node/bios-boot.nix)
-    {
-      # raw → coldsnap uploads directly to an EBS snapshot
-      # via the EBS Direct API (no S3 / VM-Import round-trip,
-      # ~20min → ~2min for an 8 GB image).
-      amazonImage.format = "raw";
-      virtualisation.diskSize = "auto";
-      ec2.efi = efi;
-    }
-  ];
-}).config.system.build.amazonImage
+in
+# `// { nixosConfig = … }` (not a bare derivation) so consumers that
+# need the module-evaluated config — node-kernel-config-* asserts on
+# `boot.kernelPackages.kernel.configfile` — can reach it without
+# re-evaluating the module tree. outPath/drvPath/type survive the
+# update, so `nix build .#ami` and node-ami-eval's `.drvPath` are
+# unchanged.
+sys.config.system.build.amazonImage // { nixosConfig = sys.config; }
