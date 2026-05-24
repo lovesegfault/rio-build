@@ -211,6 +211,44 @@ pub(crate) async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> 
     ))))
 }
 
+/// Error from a client-side daemon operation: either the daemon refused the
+/// operation (STDERR_ERROR — the stream is still aligned and usable for a
+/// retry on a fresh channel), or the wire/transport itself failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientOpError {
+    /// The daemon refused the operation (STDERR_ERROR frame).
+    #[error("daemon refused operation: {}", .0.message)]
+    Daemon(StderrError),
+    /// Wire-level failure (I/O, framing, bounds).
+    #[error(transparent)]
+    Wire(#[from] WireError),
+}
+
+/// Drain the STDERR loop until `STDERR_LAST`, surfacing `STDERR_ERROR` as
+/// [`ClientOpError::Daemon`]. Log lines, activities, and results are
+/// discarded (build output is not collected by the callers of this path).
+/// `STDERR_READ`/`STDERR_WRITE` are protocol violations for the operations
+/// this is used with and map to [`ClientOpError::Wire`].
+pub async fn drain_stderr_typed<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> std::result::Result<(), ClientOpError> {
+    loop {
+        match read_stderr_message(r).await? {
+            StderrMessage::Last => return Ok(()),
+            StderrMessage::Error(e) => return Err(ClientOpError::Daemon(e)),
+            StderrMessage::Read(_) | StderrMessage::Write(_) => {
+                return Err(ClientOpError::Wire(WireError::Io(std::io::Error::other(
+                    "unexpected STDERR_READ/STDERR_WRITE during client operation",
+                ))));
+            }
+            StderrMessage::Next(_)
+            | StderrMessage::StartActivity { .. }
+            | StderrMessage::StopActivity { .. }
+            | StderrMessage::Result { .. } => continue,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client handshake
 // ---------------------------------------------------------------------------
@@ -799,6 +837,80 @@ mod tests {
             err.to_string()
                 .contains("unexpected STDERR_READ during drain")
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // drain_stderr_typed: daemon refusal vs wire failure
+    // -----------------------------------------------------------------------
+
+    /// A structured STDERR_ERROR from the daemon surfaces as
+    /// `ClientOpError::Daemon` with the daemon's message text intact, after
+    /// passing over a preceding log line.
+    #[tokio::test]
+    async fn drain_stderr_typed_surfaces_daemon_error() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (_sr, sw) = tokio::io::split(server_stream);
+            let mut w = StderrWriter::new(sw);
+            w.log("about to fail").await?;
+            w.error(&StderrError::simple("rio-build", "tenant quota exceeded"))
+                .await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, _cw) = tokio::io::split(client_stream);
+        let err = drain_stderr_typed(&mut cr)
+            .await
+            .expect_err("STDERR_ERROR must surface as an error");
+        match &err {
+            ClientOpError::Daemon(e) => {
+                assert_eq!(e.message, "tenant quota exceeded");
+            }
+            other => panic!("expected ClientOpError::Daemon, got {other:?}"),
+        }
+        // The daemon's text must survive into the human-readable Display.
+        assert!(
+            err.to_string().contains("tenant quota exceeded"),
+            "Display must carry the daemon message: {err}"
+        );
+        server.await??;
+        Ok(())
+    }
+
+    /// Activities, structured results, and log lines are discarded; the drain
+    /// completes with `Ok(())` at STDERR_LAST.
+    #[tokio::test]
+    async fn drain_stderr_typed_passes_activities_and_stops_at_last() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (_sr, sw) = tokio::io::split(server_stream);
+            let mut w = StderrWriter::new(sw);
+            let aid = w
+                .start_activity(
+                    crate::protocol::stderr::ActivityType::Build,
+                    "building foo",
+                    0,
+                    0,
+                    &[],
+                )
+                .await?;
+            w.result(
+                aid,
+                crate::protocol::stderr::ResultType::BuildLogLine,
+                &[ResultField::String("checking for gcc... yes".into())],
+            )
+            .await?;
+            w.stop_activity(aid).await?;
+            w.finish().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, _cw) = tokio::io::split(client_stream);
+        drain_stderr_typed(&mut cr).await?;
+        server.await??;
         Ok(())
     }
 
