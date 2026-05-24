@@ -20,10 +20,12 @@ model checking itself found.
 
 Verified by: `quint-log-base`, `quint-log-flap`, `quint-log-fault-local`,
 `quint-log-fault-recovery`, `quint-log-fault-persist`, `quint-log-fault-guard`
-(each asserts all five invariants plus the `boundsOK` ceiling tripwire over
-its regime's full reachable state space); non-vacuity pinned by the eleven
-`quint-log-witness-*` expect-violation checks plus
-`quint-log-witness-gap-span-ungated`.
+(each asserts all eight invariants — the five §3.4 model-A invariants plus the
+three Phase-3 calibration invariants — and the `boundsOK` ceiling tripwire
+over its regime's full reachable state space); non-vacuity pinned by the
+twelve `quint-log-witness-*` expect-violation checks,
+`quint-log-witness-gap-span-ungated`, and the four `quint-log-calib-*`
+permanent calibration witnesses.
 
 | Invariant | Rule(s) | Verdict | Audit finding |
 |---|---|---|---|
@@ -32,6 +34,9 @@ its regime's full reachable state space); non-vacuity pinned by the eleven
 | `BindingGateExcludesForeignExecutors` | `sched.log.batch-binding` | **COVERS** | "MUST drop batches whose `derivation_path` does not match an active assignment held by the calling executor's stream" is exactly the gate; `push_for` evaluates it under the entry's shard write-lock so the check and the append are atomic. `sched.log.path-length` and `sched.executor.input-bounds+2` bound the same ingestion surface (path length, monotone line numbering, overflow) — modelled as part of the accept/reject predicate in Task 2.3. |
 | `EveryRetainedEntryIsJustified` | `obs.log.entry-justified` | **COVERS** | Was a GAP: the four flusher/epilogue reaps (tenure-orphan, refused-UPSERT, sealed-empty, enqueue-failure) had no unifying rule; only the acquisition-time sweep (`sched.recovery.log-buffer-sweep+2`) and the poison-TTL backstop were normative. The new rule states the justification set (non-terminal in an authoritative DAG ∨ unresolved pending final ∨ DAG not authoritative) and the obligation that an entry that has lost every justification is reaped by the next path that observes it. The model's check is that the reap set is *complete* (no fifth orphan shape). |
 | `NoSilentLineLoss` (per-replica) | `obs.log.line-conservation` | **COVERS** | Was PARTIAL: the per-piece rules (`gap-span`, `ring-byte-cap`, `periodic-flush`, `incomplete-surfaced`, `stored-coverage-preserved`) each bound or surface one loss channel; no rule stated the conjunction. The new rule states it: a delivered line is in the ring, in the stored coverage, or counted in the recorded span as a gap, and may only leave all three through a loss channel the stored record itself discloses (a `first_line` above the true start, or a record that never claims completeness). |
+| `NoStaleSealOnLiveCarrier` *(Phase 3)* | `obs.log.exec-keyed+2` (the restamp-unseal half) | **COVERS** | Added by the Phase-3 calibration: the seal-clearing fixes (699ea1692, 2f9a747d0) protect a property the original five cannot state — an entry sealed while its derivation is DAG-live mutes a live execution, and the muting is invisible to the conservation law because a gate-rejected line never enters `delivered`. One safety invariant over existing state (`sealed × hasEntry × dag`), not a new state dimension. |
+| `FinalizedRowFrozen` *(Phase 3)* | `obs.log.finalize-immutable` (the model-A half) | **COVERS** | Added by the Phase-3 calibration: once a row is recorded complete, no later write changes any of its columns. Backed by the `storedHist.frozen` ghost (the first finalizing write's snapshot). The single-replica + abstract-interim half of `IsCompleteMonotone` / `AtMostOneFinalizingWrite`; the cross-replica blob/row split stays model B's. |
+| `StoredCoverageNeverRegresses` (single-writer) *(Phase 3)* | `obs.log.stored-coverage-preserved` | **COVERS** | Added by the Phase-3 calibration: a row's recorded span end never decreases across writes (the `storedHist.everEnd` ghost high-water). The model-A-observable half of the model-B invariant of the same name; the cross-replica conservation form (the interim's *delivered lines* survive into the finalized record) still needs model B. This is the invariant that re-finds both the stored-coverage reconcile fix (e1fd179b9) and — unexpectedly — the deferred-final tenure pin (3ce5d03e4). |
 
 ## Model B — cross-replica finalization
 
@@ -145,3 +150,191 @@ lease transition. A single reap pass that runs unconditionally on every
 periodic tick (or at every acquisition) and discards any entry that has lost
 every justification would collapse the case analysis and remove the
 rebound-window sensitivity entirely.
+
+## Findings (Phase-3 calibration against the historical-fix corpus)
+
+Phase 3 reverted each substantive protocol fix in the build-log subsystem's
+history *in the model* — one calibration switch per fix in
+`logBufferLifecycle.qnt`'s const block, one override module per reverted
+behavior in `docs/spec/models/calibration/` — and asked whether an invariant
+re-finds the bug the fix closed. Three new model-A invariants came out of it
+(each added because an override produced a harmful state none of the original
+five observed), one candidate was rejected as inexpressible, and the
+`reapEnabledFor` justification was tightened to scheduler-initiated reaps
+only. Four overrides are wired into CI as permanent expect-violation checks
+(`quint-log-calib-*`); the rest stay in `calibration/` as re-runnable
+evidence. Measured state counts, trace depths, and wall-clocks are in the
+introducing commits' messages and the check transcripts.
+
+### The invariant additions
+
+- **`noStaleSealOnLiveCarrier`** — the model sees *misattribution* (one
+  execution's data under another's key: `noCrossExecContamination`) but was
+  structurally blind to *muting* (a live execution's data refused at the
+  gate), because the conservation law deliberately quantifies over accepted
+  lines only and a rejected line never enters `delivered`. Two of the three
+  restamp fixes exist to prevent muting; both calibration overrides hold on
+  every original invariant over their full reverted state spaces and falsify
+  this one at 7 actions.
+- **`finalizedRowFrozen`** — `obs.log.finalize-immutable` had no model-A
+  invariant; both finalize-once overrides previously falsified only
+  `noSilentLineLoss`, two steps downstream of the overwrite, through a
+  two-tenure `delivered`-accumulation argument. The frozen-row ghost catches
+  the overwrite at the step it happens. Adding it required completing the
+  post-fix-interim environment assumption (`interimFinalizes` now refuses to
+  rewrite an already-finalized row, as the real interim's
+  `WHERE NOT drv_logs.is_complete` UPSERT does — without that guard the
+  abstract interim falsifies the invariant by doing something no real
+  replica can).
+- **`storedCoverageNeverRegresses`** (single-writer) — the recorded span end
+  of a `drv_logs` row never decreases. The lines a regression destroys were
+  delivered only to the interim leader, so they are outside the per-replica
+  conservation ghost by design; the ghost high-water is the cheap repair (no
+  new state dimension — the ghost is a function of the live row in every
+  shipped regime and adds zero distinct states).
+- **`liveDerivationHasCarrier` — REJECTED.** The tenure-pins dossier's
+  candidate ("a DAG-live derivation always has an unsealed carrier") is
+  reachably false on the post-fix model: an in-tenure final flush
+  legitimately drains the carrier of a derivation whose DAG node is live
+  only because the terminal's PG persist failed and recovery rebuilt the
+  node from the stale assignment row. The harmful instance (an
+  out-of-tenure or wrong-exec request did the draining) is state-identical
+  to that benign one — the distinguishing fact is the draining request's
+  tenure stamps, which the drain consumes. The carrier-destruction half of
+  the tenure-pins harm class is therefore a **transition property** model A
+  cannot state; its automated coverage is the rio-scheduler deferred-final
+  unit tests (the persist×guard correlated scenario the regime split
+  already pins on them). Falsification trace and the failed refinement
+  attempts: `phase3-falsification-liveDerivationHasCarrier.md` in the
+  campaign workspace and the comment at the val's would-be definition site.
+- **The `reapEnabledFor` scheduler/environment split** — the
+  "one step from reaped" justification disjunct no longer counts the
+  disconnect-time discard: that reap is environment-initiated (it fires only
+  if the owning worker's stream happens to close, which may never happen for
+  a long-lived connected worker), so its enabledness is not "the scheduler
+  will reap this". The tightening is what makes the acquisition-sweep
+  override falsifiable; all six shipped regimes stay green under the
+  stricter invariant, confirming the disjunct was dead in the post-fix state
+  space.
+
+### The calibration table
+
+Verdict legend: **F(inv, n)** = the override falsifies `inv` with an
+`n`-state counterexample (n includes the initial state; actions = n − 1);
+**H** = holds over the override's *full* reachable state space (the
+machine-checked statement that no listed invariant observes the reverted
+behavior). Class: **E** = encodable (an override module exists), **NE** =
+not encoded (the pre-fix/post-fix delta is not expressible at the model's
+granularity), **B** = out of scope for model A (a two-replica / shared-row
+concern).
+
+| Commit | Fix | Class | Module (`logBufferLifecycle…`) | Verdict | Disposition |
+|---|---|---|---|---|---|
+| `3a55474ac` | accounted-floor accept gate | E | `…Ungated` | **F**(lineSpanExact) | Calibration entry #0 — see its own findings section above. CI: `quint-log-witness-gap-span-ungated`. |
+| `496e6fb14` | recv-task (executor, drv) binding gate | E | `…Unbound` | **F**(bindingGateExcludesForeignExecutors, 2); the other eight **H** over the full space, which is *bit-for-bit the base regime's* — ungating adds zero reachable states because the executor parameter is guard-only | The only invariant that can falsify is the gate's own definition: the `Set[int]` line encoding erases the content/provenance harm (another worker's bytes under this execution's blob and banner), and an accepted foreign batch is state-identical to the bound executor pushing the same interval. Recorded decision: the price of the line encoding is worth paying; the gate's un-modeled consumers are display-only. Not wired into CI — the invariant is asserted in every regime check, so weakening `batchAccepted` already turns `quint-log-base` red. |
+| `496e6fb14` (residual) | legacy `push()`'s `or_default()` unstamped-entry allocation | NE | — | — | Missing dimension: the unstamped-entry state, excluded by design. Not worth adding — `assign_to_worker`'s discard clears a pre-staged entry at dispatch; the residual harm is a memory bound, not a lifecycle property. |
+| `7beb1ca00` #1 | gateway `ForwardLogBatch` gated on `push_for`'s verdict | NE | — | — | Missing dimension: the live fan-out sink (a second consumer of the accept decision). Content provenance on a write-only display stream — a turmoil/MBT candidate, not a model-A candidate. |
+| `7beb1ca00` #2 | `FlushRequest.exec_id` stale-drain pin | E (already encoded: every `flushFinal*` arm conjoins `entryExec == req.exec`) | not separately reverted | — | Its reversion is the same transition-property blindness as the tenure-pins family (a mis-drained entry's post-state is identical to a legitimately-drained one's); subsumed by that family's verdict and by the `flushFinalStaleOrMissing` arm's existence. |
+| `7beb1ca00` #3 | `LogFlusher` periodic arms leader-gated | B | — | — | Model-B handoff: ungating the periodic UPSERT should falsify the cross-replica `StoredCoverageNeverRegresses` (an ex-leader's stale `.partial` racing the new leader's fresher row needs two writers). |
+| `7ffbf1415` | `BuildPhase` actor-side executor gate | NE | — | — | No model footprint (no Phase message, no display sink, no actor-side `assigned_executor`); already listed above as not load-bearing for any §3.4 invariant. Conventional tests own it. |
+| `6c26e85f8` | cross-exec restamp clears the retained lines | E | `…CrossExecCarriesLines` | **F**(noCrossExecContamination, 8) | The one corpus row that falsifies an original model-A invariant outright. CI: `quint-log-calib-cross-exec-carries-lines`. |
+| `699ea1692` | cross-exec restamp clears the seal | E | `…CrossExecKeepsSeal` | **F**(noStaleSealOnLiveCarrier, 8); original five + the other two new **H** over the full 21.3M-state space | Resolved by the Phase-3 invariant. The full-space HOLDS is the machine-checked statement that the original invariant set cannot see the muting. |
+| `2f9a747d0` | same-exec restamp clears the seal + final-pending mark | E | `…SameExecKeepsSeal` | **F**(noStaleSealOnLiveCarrier, 8); original five + the other two new **H** over the full 24.8M-state space | Seal half: resolved by the Phase-3 invariant. Mark half: at the model's granularity genuinely redundant with justification disjunct (4) — the periodic flush keeps snapshotting the marked orphan; the leak it causes is a process-lifetime bound the model does not measure. |
+| `6aab70b47` | enqueue-failure reap | E | `…NoEnqueueFailReap` | **H** (all nine, full 36.0M-state fault-local exploration) | Redundant-with {terminal-cleanup discard, periodic sealed-empty reap} *as observed by the safety invariant*. NOT deletable from the code: its real justifications are the dead-flusher mode (in which the periodic reaps never run again — persistent component death is not a representable mode) and the `GetDerivationLogs` shadow-window latency, both NOT-ENCODED. Phase-6 ledger entry. |
+| `463090eb7` | one-shot finalized-elsewhere consult at the drop arm | E | shares `…NoRefusedUpsertReap`; its mechanism is restorable via `…OneShotConsult` | **F**(everyRetainedEntryIsJustified, 10) | The no-reap-at-all bug this commit's message describes. Phase-6 ledger: superseded the same day by f8ce10b8e; no code remains. |
+| `f8ce10b8e` | recurring refused-UPSERT reap | E | `…NoRefusedUpsertReap`, `…OneShotConsult` | **F**(everyRetainedEntryIsJustified, 10) in BOTH variants — with no reaper at all, and with 463090eb7's one-shot consult restored as the only reaper (the consult runs at request-drop time, before the interim finalizes the execution, and never re-runs) | Individually load-bearing: the reconcile never empties a finalized row's ring, terminal cleanup is blocked by the final-pending mark, the sweep and the disconnect discard skip sealed keys, and the drop arm already had its one chance. The OneShotConsult red is the machine-checked statement that moving the reap to the recurring periodic chokepoint was a correctness fix, not a performance refactor. CI: `quint-log-calib-no-refused-upsert-reap`. |
+| `81824cfbb` | periodic sealed-empty reap | E | `…NoSealedEmptyReap` | **F**(everyRetainedEntryIsJustified, 12) | Individually load-bearing: the only reaper of a sealed entry whose ring the stored-coverage reconcile empties after its pending final is consumed (TLC's counterexample needs no interim leader — a holey ring's own `.partial` covers past its physical content, so the next tenure's reconcile truncates the whole ring away). The deepest counterexample in the corpus; the Phase-2 finding's adjacent state was unreachable by 20k random 24-step traces. CI: `quint-log-calib-no-sealed-empty-reap`. |
+| `84ac79b84` | flush_final stale-request guard atomic with the drain | NE | — | — | Missing dimension: lock-granularity interleaving between two synchronous DashMap calls (the `exec_id()` read and the unconditional `drain()`); the model's per-arm action atomicity collapses it. Even with the split, the harm is the carrier-destruction transition property. §3.6 evidence. |
+| `3ce5d03e4` | deferred-final tenure pin | E | `…TenureUnpinned` | **F**(storedCoverageNeverRegresses, 9) — *the dossier predicted HOLDS-everything*; original five **H** over the full 9.6M-state space; noStaleSealOnLiveCarrier and finalizedRowFrozen also **H** | **The campaign's headline deviation.** The un-pinned final fires while deposed with a prefix latch settled before the flap and overwrites the row the interim leader extended past this replica's ring — the exact shape the dossier predicted but assigned to model B because "the property is a history property over `stored` that model A does not state". The Phase-3 ghost high-water states it, so the tenure pin is now justified by a model-A invariant. The *other* harms of an unpinned final (freezing a row another replica is extending; destroying the live restamped carrier) remain model B's and the transition-property gap respectively. |
+| `646022e37` | tenure pin hoisted before the destructive arms | E | `…PinAfterGuard` (the persist×guard product regime the shipped split deliberately excludes) | **H** (all nine, full 12.1M-state exploration) | The harm — an out-of-tenure request's guard-error arm reaps the live restamped carrier — produces a post-state identical to the legitimate in-tenure reap's: the rejected `liveDerivationHasCarrier` transition property. The rio-scheduler deferred-final unit tests are the only automated check standing between this fix and a regression. The third destructive arm it gated (the deferred-queue cap-overflow drain) is unmodeled. |
+| `825cdd478` | atomic tenure-drop reap + post-await tenure re-validation | NE | — | — | Missing dimensions: lock-granularity interleaving (the `is_sealed()` read vs the removal) and await-granularity interleaving (the entry-time pin vs the post-guard-SELECT destructive arms — the model header pre-registers exactly this gap). The commit's own regression tests (a held `LOCK TABLE` parking the guard SELECT while the lease flips) are the deterministic-simulation form. §3.6 evidence. |
+| `2c301438d` | disconnect-time discard gated on an authoritative DAG | E | `…DisconnectUngated` | **F**(noSilentLineLoss, 11) | The discarded lines were never stored, are not in the finalized record's claimed span, and are not disclosed by an incomplete indicator. `lineSpanExact` stays green on the same trace (the row is exact about the span it claims; it claims too little) — the clean separation between the span-arithmetic invariant and the conservation law. |
+| `e6c18add2` | acquisition-time stale-buffer sweep | E | `…Sweepless` | **F**(everyRetainedEntryIsJustified, 7) | Falsifiable **only after** the `reapEnabledFor` scheduler/environment split — the dossier's predicted HOLDS-as-written was an invariant-encoding artifact (the un-swept orphan was declared "one step from reaped" forever by the environment-initiated disconnect discard), not a property of the sweep. |
+| `8e97c2220` | sweep spares only non-terminal DAG entries (poisoned drvs) | NE | — | — | Missing dimension: a persisted terminal status that recovery loads back into the DAG as a non-live, reap-exempt node (`PgPoisoned`, a `DagTerminal` recovery outcome, and the poison-TTL backstop reap). Not worth the cost: the delta is a one-line filter pinned by the poisoned-under-interim-leader unit test; the failure class is a data property of `load_dag_from_rows` for conformance/MBT. |
+| `abfade4d5` | periodic frozen-row UPSERT latch | E (the latch); NE (the mid-sweep `is_leader()` staleness that motivated it — N1); B (the `IsCompleteMonotone` headline) | `…NoPeriodicLatch` | **F**(finalizedRowFrozen, 12) at the downgrade step; **F**(noSilentLineLoss, 14) two steps later (the downgrade un-freezes the row for a later legitimate final that re-finalizes with a smaller span) | Resolved by the Phase-3 invariant at the overwrite itself. The model reaches the unsafe write through the A→B→A retained-entry route, not the commit's mid-sweep race. |
+| `44905298b` | flush_final already-finalized consult (+ frozen-row tightening + empty-drain guard) | L1: E. L2's independence from L1 + the blob/row split: NE (N2). L3: NE (N3). Headline: B | `…NoFinalizeRefusal` | **F**(finalizedRowFrozen, 13); **F**(noSilentLineLoss, 13) | The model reaches the guard via the single-replica self-re-finalization route (a failed terminal persist leaves the assignment live across this replica's own finalization) — the commit's A→B→A reset-out-of-terminal route needs a reset-to-ready transition the model lacks (N4). The wired non-vacuity probe is `quint-log-witness-already-finalized-refusal` (the post-fix refusal arm is reachable). Model-B handoff: `AtMostOneFinalizingWrite` (the SELECT→PUT window under two real writers). |
+| `d8944727e` | gap-merge fold counts the gap, not the marker | E | `…MarkerCountedSpan` (flap constants with `MAX_LINE = 4`) | **F**(lineSpanExact, 10); **F**(noSilentLineLoss, 11) | **Bound finding:** the shipped `MAX_LINE = 3` caps the reachable prefix→ring gap at 1, where `marker(1) == gap(1)` and the pre-fix arithmetic is accidentally exact — the shipped flap regime's green `lineSpanExact` verdict over the gap-merge fold covers only the cases where this fix is invisible. The undershoot dual of calibration entry #0's overshoot. Table-only (the `MAX_LINE = 4` space is a one-shot cost). |
+| `effefb0a1` | flush span = line-number span, not physical count | E | `…PhysicalCountSpan` | **F**(lineSpanExact, 7); **F**(noSilentLineLoss, 7) | The cheapest falsification in the corpus (base regime, one holey ring, no failover) and the most plausible regression. CI: `quint-log-calib-physical-count-span`. |
+| `e1fd179b9` | stored-coverage reconcile folds any non-subsumed row | E | `…DisjointFoldOnly` | **F**(storedCoverageNeverRegresses, 10); original five + noStaleSealOnLiveCarrier + finalizedRowFrozen **H** over the full 5.3M-state space | The destroyed lines were delivered only to the interim leader — outside the per-replica `delivered` ghost by design — and the overwriting row is internally consistent, so neither conservation nor span-exactness can see the regression. Resolved by the Phase-3 ghost high-water; the cross-replica conservation form stays model B's. |
+| `e10deb9f6` | `req_in_tenure` keyed on the acquire-epoch | B | — | deferred | Phase 4's calibration entry #1 (model B's `TenurePinnedFinalization`). |
+
+### Phase-6 simplification ledger
+
+Entries the calibration *adds* to the simplification candidate list (the
+"four reaps → one ungated general reap" candidate above already stands and
+is strengthened by the two CI-wired reap witnesses, which define exactly
+what the unification must preserve):
+
+1. **The enqueue-failure reap is redundant for safety.** `…NoEnqueueFailReap`
+   holds all nine invariants over the full fault-local space. Deleting the
+   reap costs one periodic tick (≤30 s) of `GetDerivationLogs` shadowing per
+   orphan and loses the only reap that survives flusher death — both
+   properties the model does not encode. Flag for the reap unification;
+   do not delete on the model's evidence alone.
+2. **The tenure-drop reap (the drop arm's sealed-empty discard) is the same
+   shape.** It is the event-coupled twin of the periodic sealed-empty reap
+   (every state it fires in, the periodic reap's `reapEnabledFor` disjunct
+   also covers once recovery completes); the calibration's
+   `…PinAfterGuard` module disables it (along with the rest of the
+   pin-first ordering) and nothing falsifies. Same disposition as #1.
+3. **The binding-gate invariant is the gate's own definition.** Its
+   calibration value is non-vacuity of the quantifier, not a deeper
+   property; any future strengthening of the binding gate should be
+   accompanied by a *content/provenance* test at the turmoil/MBT layer, not
+   another model-A invariant.
+4. **463090eb7's one-shot consult is confirmed dead.** The `…OneShotConsult`
+   module proves the intermediate mechanism was insufficient (the orphan it
+   targets is still unjustified at 10 states with the consult as the only
+   reaper); no code remains to remove, but the history is worth keeping —
+   it is the corpus's one example of a fix that was superseded for
+   correctness rather than refactored for performance.
+
+### NOT-ENCODED dimensions (the §3.6 deterministic-simulation evidence)
+
+The corpus's six NOT-ENCODED rows group into two missing dimensions; the
+recommendation for the design's §3.6 turmoil decision follows from how
+little a model-A encoding of either would buy.
+
+**Await/lock-granularity interleaving** (`84ac79b84`, `825cdd478`,
+`abfade4d5`'s motivating race, `44905298b`'s L2-independence): the
+check-…-act-on-stale class inside one flusher attempt. Encoding it requires
+a per-derivation flusher program counter (`Idle | PinChecked |
+GuardReturned | …`) with every other action interleavable between its
+stages — multiplying the per-derivation state count by the stage count
+times the latched-request space on regimes already at the per-check budget.
+The decisive datum: for **every** row in this class, adding the
+interleaving split alone would *still not produce a falsification* — the
+reap/drain harms also need the inexpressible carrier-liveness transition
+property, and the success-path freeze harms also need model B. The fixes in
+this class are single `remove_if` calls whose regression tests already
+exist as deterministic mid-await fault-injection unit tests (a held
+`LOCK TABLE` parking the guard SELECT; `pg_terminate_backend` on the
+blocked SELECT). **Recommendation: do not add await granularity to model A.
+Cover the class with loom/deterministic-simulation over `LogBuffers` +
+`flush_final` against a scripted `LeaderState` — which the codebase already
+does by hand for the two known instances — and let model B's two-replica
+whole-action interleavings subsume the cross-replica half for free.**
+
+**Content/provenance and secondary sinks** (`496e6fb14`'s residual,
+`7beb1ca00` #1, `7ffbf1415`, `8e97c2220`): the live fan-out display stream,
+the unstamped-entry allocation, the phase message type, and the
+poisoned-DAG-resident state. Each would add a state variable whose only
+constraint is a restatement of an existing gate over a sink nothing in the
+protocol reads back. **Recommendation: conventional/MBT tests own these.**
+
+### Model-B handoff list
+
+Rows deferred to Phase 4, with the invariant each should falsify there:
+
+| Row | Model-B invariant | The two-replica ingredient model A lacks |
+|---|---|---|
+| `3ce5d03e4` (the freeze half) | `TenurePinnedFinalization` (definitionally), cross-replica `NoSilentLineLoss` | the lines only the live leader received, excluded from the frozen span when the deposed replica's stale final freezes the row |
+| `7beb1ca00` #3 | cross-replica `StoredCoverageNeverRegresses` | an ex-leader's periodic `.partial` UPSERT racing the new leader's fresher partial row for the same execution |
+| `44905298b` / `abfade4d5` (the headline) | `AtMostOneFinalizingWrite`, `IsCompleteMonotone` | two real writers whose guard SELECT → S3 PUT → row UPSERT windows interleave; a blob ghost distinct from the row |
+| `e1fd179b9` (the conservation half) | cross-replica `NoSilentLineLoss` | the union `delivered` over both replicas' rings |
+| `e10deb9f6` | `TenurePinnedFinalization` | already dispositioned as Phase 4's calibration entry #1 |
+
+The single-replica halves of the first and fourth rows are now covered by
+model A's `storedCoverageNeverRegresses`; model B's job for them narrows to
+the *delivered-lines* (rather than recorded-span) form of the conservation
+law.
