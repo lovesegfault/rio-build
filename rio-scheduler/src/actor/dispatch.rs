@@ -843,6 +843,29 @@ impl DagActor {
             ) {
                 state.retry.clear();
             }
+            // The forgivable seed subset: declared output paths whose
+            // name is OUTSIDE the node's (non-empty) wanted set. The
+            // walk still attempts them (opportunistic completeness)
+            // but their failure must not demote the derivation to a
+            // from-source build. Computed from the DAG state's
+            // post-merge wanted union — the same source the cache-hit
+            // classification uses — so a path is only forgiven when
+            // NO interested build wants it. Empty wanted set = all
+            // wanted = nothing forgivable (today's behaviour). Only
+            // paths positively identifiable as unwanted (declared in
+            // `expected_output_paths` but outside the wanted subset)
+            // qualify; a seed that matches no declared path (the
+            // realized floating-CA path from the reprobe lane) is
+            // never forgiven.
+            let forgivable: HashSet<String> = {
+                let wanted: HashSet<&String> = state.wanted_output_paths().collect();
+                state
+                    .expected_output_paths
+                    .iter()
+                    .filter(|p| !p.is_empty() && !wanted.contains(*p) && paths.contains(*p))
+                    .cloned()
+                    .collect()
+            };
             let drv_path = state.drv_path().to_string();
             let interested = state.interested_builds.clone();
             // Best-effort PG clear so recovery doesn't resurrect the
@@ -889,8 +912,15 @@ impl DagActor {
                         });
                     }
                 };
-                let ok =
-                    walk_substitute_closure(&store, paths, &auth, &shutdown, on_progress).await;
+                let ok = walk_substitute_closure(
+                    &store,
+                    paths,
+                    &forgivable,
+                    &auth,
+                    &shutdown,
+                    on_progress,
+                )
+                .await;
                 if let Some(tx) = weak_tx.upgrade() {
                     let _ = tx
                         .send(super::ActorCommand::SubstituteComplete { drv_hash: h, ok })
@@ -2514,9 +2544,27 @@ fn closure_cap_exceeded(visited: usize) -> bool {
 /// Any `Ok(None)` (upstream miss), non-transient `Err`, retry-exhaust,
 /// or `MAX_SUBSTITUTE_CLOSURE` cap → `false`. Self-references and
 /// diamonds dedup via `visited`.
+///
+/// **`forgivable`** is the subset of `seeds` whose failure must NOT
+/// fail the walk: the declared-but-unwanted output paths (no consumer's
+/// `inputDrvs` names them and the root didn't ask for them). The seeds
+/// stay ALL expected output paths — opportunistic completeness: fetch
+/// the `-debug` output if the upstream has it — but when the upstream
+/// definitively misses one, condemning the derivation (and its whole
+/// build-time closure) to a from-source rebuild over an output nothing
+/// consumes is the incident this gate exists to prevent. A failed
+/// WANTED seed and a failed reference-BFS-discovered path (a runtime
+/// reference of something already fetched — its absence is a hole in a
+/// closure we are about to declare complete) keep failing the walk;
+/// only unwanted seeds are in `forgivable` by construction. A wanted
+/// output that runtime-references an unwanted sibling output is served
+/// by the upstream's own closure invariant (it has the closure of
+/// whatever it substitutes), so the forgiven seed cannot leave a hole
+/// under a successfully fetched wanted path.
 pub(super) async fn walk_substitute_closure(
     store: &rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
     seeds: Vec<String>,
+    forgivable: &HashSet<String>,
     auth: &SubstituteAuth,
     shutdown: &rio_common::signal::Token,
     mut on_progress: impl FnMut(u64, u64, &str),
@@ -2681,6 +2729,16 @@ pub(super) async fn walk_substitute_closure(
                         continue 'paths;
                     }
                     Err(e) if e.code() == tonic::Code::NotFound => {
+                        // An unwanted seed the upstream definitively
+                        // misses is forgiven: not a failure (no
+                        // metric), the walk continues, the closure is
+                        // still complete for every output anything
+                        // consumes.
+                        if forgivable.contains(&p) {
+                            info!(path = %p,
+                                  "unwanted output not substituted; continuing without it");
+                            continue 'paths;
+                        }
                         // The consequence of this arm is "compile the
                         // derivation (and its build closure) from
                         // source", so the WHY must survive into the
@@ -2716,6 +2774,14 @@ pub(super) async fn walk_substitute_closure(
                         }
                     }
                     Err(e) => {
+                        // Same forgiveness as the NotFound arm: a
+                        // non-transient error on an unwanted seed is
+                        // not worth a from-source rebuild.
+                        if forgivable.contains(&p) {
+                            info!(path = %p, error = %e,
+                                  "unwanted output not substituted; continuing without it");
+                            continue 'paths;
+                        }
                         warn!(path = %p, error = %e,
                               "detached substitute fetch failed; demoting to cache-miss");
                         metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
@@ -2726,6 +2792,12 @@ pub(super) async fn walk_substitute_closure(
                 }
             }
             // Exhausted retries on transient errors.
+            if forgivable.contains(&p) {
+                info!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
+                      "unwanted output not substituted (retries exhausted); \
+                       continuing without it");
+                continue 'paths;
+            }
             warn!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
                   "detached substitute fetch exhausted retries; demoting to cache-miss");
             metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
