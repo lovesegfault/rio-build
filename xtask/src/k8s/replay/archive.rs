@@ -354,7 +354,9 @@ fn parse_builds(bytes: &[u8]) -> Result<HashMap<(i64, String), BuildRecord>> {
 
 /// The hash part of a store path: the basename characters before the first
 /// `-`. Accepts a full `/nix/store/...` path, a basename, or a bare hash.
-fn hash_part(path_or_name: &str) -> &str {
+/// Shared with the sibling replay modules (the prewarm probes key
+/// substituter lookups by hash part).
+pub(super) fn hash_part(path_or_name: &str) -> &str {
     let base = path_or_name.rsplit('/').next().unwrap_or(path_or_name);
     base.split('-').next().unwrap_or(base)
 }

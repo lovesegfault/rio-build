@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ use futures_util::StreamExt as _;
 use rio_nix::narinfo::NarInfo;
 use rio_nix::protocol::client::{NarPayload, StoreEntry};
 
-use super::archive::ReplayArchive;
+use super::archive::{ReplayArchive, hash_part};
 use super::client::{DaemonChannel, GatewayPool};
 use super::substituter::Substituter;
 use super::supply::{
@@ -47,6 +47,13 @@ const LARGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Emit a batch-upload progress line every this many completed sub-batches.
 const PROGRESS_EVERY: usize = 25;
+
+/// Emit a substituter-coverage progress line every this many probed paths.
+const COVERAGE_PROGRESS_EVERY: usize = 5000;
+
+/// Failure reason recorded for uploads abandoned after the dial circuit
+/// breaker ([`GatewayBreaker`]) trips.
+const GATEWAY_UNREACHABLE: &str = "gateway unreachable; not retried";
 
 /// Everything the supply ladder needs that is computed once per run and
 /// shared between prewarm and the per-request path.
@@ -72,6 +79,10 @@ pub struct SupplyContext {
 
 /// Tunables for the prewarm phase. [`Default`] matches the CLI defaults;
 /// [`PrewarmConfig::for_pool`] derives `upload_workers` from an actual pool.
+///
+/// Memory note: every batch worker buffers one materialized sub-batch, so
+/// the batch phase's peak resident set is roughly `upload_workers ×
+/// batch_max_bytes` (large relayed paths are streamed and don't add to it).
 #[derive(Debug, Clone)]
 pub struct PrewarmConfig {
     /// Paths per `QueryValidPaths` probe.
@@ -80,15 +91,20 @@ pub struct PrewarmConfig {
     pub probe_concurrency: usize,
     /// Concurrent substituter narinfo probes (coverage + relay resolution).
     pub coverage_concurrency: usize,
-    /// Concurrent batch-upload workers (one daemon channel each). Intended
-    /// default: half the pool's channel capacity, at least 1.
+    /// Concurrent batch-upload workers (one daemon channel each). Workers buy
+    /// upload round-trip overlap, not bandwidth — and each buffers up to
+    /// `batch_max_bytes`, so peak memory scales with `upload_workers ×
+    /// batch_max_bytes`.
     pub upload_workers: usize,
-    /// Byte budget (sum of NAR sizes) per batch upload.
+    /// Byte budget (sum of NAR sizes) per batch upload. Every worker buffers
+    /// one materialized batch, so peak memory is roughly `upload_workers ×`
+    /// this.
     pub batch_max_bytes: u64,
     /// Entry budget per batch upload.
     pub batch_max_entries: usize,
-    /// Deadline for probes and batch uploads; individually streamed large
-    /// paths get [`LARGE_UPLOAD_TIMEOUT`] instead.
+    /// Deadline for probes, payload materialization, and batch uploads;
+    /// individually streamed large paths get [`LARGE_UPLOAD_TIMEOUT`]
+    /// instead.
     pub op_timeout: Duration,
 }
 
@@ -98,9 +114,9 @@ impl Default for PrewarmConfig {
             probe_chunk: 2000,
             probe_concurrency: 3,
             coverage_concurrency: 16,
-            // Half the channel capacity of the default pool (32 sessions →
-            // 32 channels); use `for_pool` to derive it from the real pool.
-            upload_workers: 16,
+            // Workers buy round-trip overlap, not bytes in flight; 8 keeps
+            // the worst-case buffered payload (8 × 256 MiB = 2 GiB) sane.
+            upload_workers: 8,
             batch_max_bytes: 256 * 1024 * 1024,
             batch_max_entries: 500,
             op_timeout: Duration::from_secs(120),
@@ -110,11 +126,11 @@ impl Default for PrewarmConfig {
 
 impl PrewarmConfig {
     /// Defaults with `upload_workers` derived from the pool: half its channel
-    /// capacity (minimum 1), leaving headroom on the gateway while prewarm
-    /// runs.
+    /// capacity, at least 1 and at most 8 (more workers would only multiply
+    /// peak memory, not throughput).
     pub fn for_pool(pool: &GatewayPool) -> Self {
         Self {
-            upload_workers: (pool.capacity() / 2).max(1),
+            upload_workers: (pool.capacity() / 2).clamp(1, 8),
             ..Self::default()
         }
     }
@@ -142,13 +158,17 @@ pub struct PrewarmReport {
     /// `(path, reason)` pairs the planner could not place (from
     /// [`super::supply::UploadPlan::skipped`]).
     pub skipped: Vec<(String, String)>,
-    /// `(path, error)` pairs for failed uploads — degraded, not fatal.
+    /// `(path, error)` pairs for failed uploads — degraded, not fatal. A
+    /// batch that fails mid-stream records every entry of that batch,
+    /// including ones the daemon may already have ingested, so this can
+    /// over-count.
     pub upload_failures: Vec<(String, String)>,
     /// `(path, error)` pairs for failed relay fetches — degraded, not fatal.
     pub relay_failures: Vec<(String, String)>,
     /// Per-substituter probe failure counts (cache url → errors).
     pub probe_errors: BTreeMap<String, u64>,
-    /// Wall-clock duration of the prewarm phase.
+    /// Wall-clock duration of the upload half ([`run`]) only — building the
+    /// supply context is not included.
     pub elapsed_secs: f64,
 }
 
@@ -329,6 +349,21 @@ pub async fn run(
     let plan = plan_uploads(union_closure, &sources, &ctx.target_valid, archive)?;
     report.planned_uploads = plan.large.len() + plan.batch.len();
     report.skipped = plan.skipped.clone();
+    let planned_bytes: u64 = plan
+        .large
+        .iter()
+        .chain(plan.batch.iter())
+        .map(|item| item.info.nar_size)
+        .sum();
+    tracing::info!(
+        already_valid = report.already_valid,
+        target_substitutable = report.target_substitutable,
+        workload_withheld = report.workload_withheld,
+        planned_uploads = report.planned_uploads,
+        planned_mib = planned_bytes / (1024 * 1024),
+        skipped = report.skipped.len(),
+        "prewarm upload plan ready"
+    );
 
     // Look substituters up by the URL recorded in the relay narinfo map (the
     // same `Substituter::url()` string is stored there by the coverage pass).
@@ -336,17 +371,25 @@ pub async fn run(
         .iter()
         .map(|substituter| (substituter.url(), substituter))
         .collect();
+    // Planned paths whose upload failed so far; their dependents are skipped
+    // up front instead of being refused by the daemon one by one.
+    let mut failed_paths: BTreeSet<String> = BTreeSet::new();
+    // Stop dialing a gateway that is clearly gone instead of burning a
+    // connect timeout on every remaining sub-batch.
+    let breaker = GatewayBreaker::new(cfg.upload_workers.saturating_mul(2).max(6));
 
     // Phase 4: large relayed paths, streamed individually before the batch.
     if !plan.large.is_empty() {
         let outcome = ui::step(
             &format!("prewarm: stream {} large paths", plan.large.len()),
             || async {
-                Ok::<_, anyhow::Error>(upload_large(pool, &plan.large, &substituters_by_url).await)
+                Ok::<_, anyhow::Error>(
+                    upload_large(pool, &plan.large, &substituters_by_url, &breaker).await,
+                )
             },
         )
         .await?;
-        apply_outcome(outcome, ctx, &mut report);
+        apply_outcome(outcome, ctx, &mut report, &mut failed_paths);
     }
 
     // Phase 5: the batch, level by level — level n+1 starts only after every
@@ -366,12 +409,21 @@ pub async fn run(
             ),
             || async {
                 Ok::<_, anyhow::Error>(
-                    upload_level(archive, pool, &level_items, &substituters_by_url, cfg).await,
+                    upload_level(
+                        archive,
+                        pool,
+                        &level_items,
+                        &substituters_by_url,
+                        &failed_paths,
+                        &breaker,
+                        cfg,
+                    )
+                    .await,
                 )
             },
         )
         .await?;
-        apply_outcome(outcome, ctx, &mut report);
+        apply_outcome(outcome, ctx, &mut report, &mut failed_paths);
     }
 
     report.probe_errors = ctx.probe_errors.clone();
@@ -463,13 +515,6 @@ pub fn split_batches(items: &[&UploadItem], max_bytes: u64, max_entries: usize) 
         batches.push(current);
     }
     batches
-}
-
-/// The hash part of a store path: the basename characters before the first
-/// `-`. Accepts a full `/nix/store/...` path, a basename, or a bare hash.
-fn hash_part(store_path: &str) -> &str {
-    let base = store_path.rsplit('/').next().unwrap_or(store_path);
-    base.split('-').next().unwrap_or(base)
 }
 
 /// What the substituter coverage pass learned about one path.
@@ -564,6 +609,8 @@ async fn probe_coverage(
         errors: BTreeMap::new(),
     };
     let mut warned: BTreeSet<String> = BTreeSet::new();
+    let total = paths.len();
+    let mut done = 0usize;
 
     let mut probes = futures_util::stream::iter(paths.into_iter().map(|(path, embedded)| {
         probe_path_coverage(path, embedded, target_substituters, src_substituters)
@@ -571,6 +618,7 @@ async fn probe_coverage(
     .buffer_unordered(coverage_concurrency.max(1));
 
     while let Some(probe) = probes.next().await {
+        done += 1;
         for (cache, error) in probe.errors {
             *outcome.errors.entry(cache.clone()).or_insert(0) += 1;
             if warned.insert(cache.clone()) {
@@ -586,6 +634,17 @@ async fn probe_coverage(
             outcome.coverage.insert(probe.path);
         } else if let Some((cache, narinfo)) = probe.relay {
             outcome.relay.insert(probe.path, (cache, narinfo));
+        }
+        // This is the longest context-building phase on big archives; show a
+        // heartbeat so it doesn't read as a hang.
+        if done.is_multiple_of(COVERAGE_PROGRESS_EVERY) {
+            tracing::info!(
+                done,
+                total,
+                covered = outcome.coverage.len(),
+                relayable = outcome.relay.len(),
+                "substituter coverage probe progress"
+            );
         }
     }
     outcome
@@ -730,15 +789,82 @@ struct UploadOutcome {
     relay_failures: Vec<(String, String)>,
 }
 
-/// Fold an [`UploadOutcome`] into the shared context and the report.
-fn apply_outcome(outcome: UploadOutcome, ctx: &mut SupplyContext, report: &mut PrewarmReport) {
+/// Fold an [`UploadOutcome`] into the shared context, the report, and the
+/// set of planned paths whose upload failed (used to pre-skip dependents in
+/// later levels).
+fn apply_outcome(
+    outcome: UploadOutcome,
+    ctx: &mut SupplyContext,
+    report: &mut PrewarmReport,
+    failed_paths: &mut BTreeSet<String>,
+) {
     for (path, nar_size) in outcome.uploaded {
         report.uploaded_paths += 1;
         report.uploaded_bytes += nar_size;
         ctx.target_valid.insert(path);
     }
+    failed_paths.extend(
+        outcome
+            .upload_failures
+            .iter()
+            .chain(outcome.relay_failures.iter())
+            .map(|(path, _)| path.clone()),
+    );
     report.upload_failures.extend(outcome.upload_failures);
     report.relay_failures.extend(outcome.relay_failures);
+}
+
+/// Run-wide dial circuit breaker for the upload phases.
+///
+/// Channel-open failures are expected occasionally (the gateway drops idle
+/// connections), but when every dial attempt fails consecutively the gateway
+/// — or its port-forward — is gone, and without a breaker each remaining
+/// sub-batch would burn another connect timeout on a doomed re-dial. Any
+/// successful open resets the count; once tripped it stays tripped for the
+/// rest of the run and remaining work is marked failed without further dial
+/// attempts.
+struct GatewayBreaker {
+    /// Consecutive failed channel opens since the last success.
+    consecutive_failures: AtomicUsize,
+    /// Failure count at which the breaker trips.
+    threshold: usize,
+    /// Latched once the threshold is reached.
+    tripped: AtomicBool,
+}
+
+impl GatewayBreaker {
+    /// Breaker that trips after `threshold` consecutive failed channel opens.
+    fn new(threshold: usize) -> Self {
+        Self {
+            consecutive_failures: AtomicUsize::new(0),
+            threshold: threshold.max(1),
+            tripped: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the breaker has tripped (the gateway is considered gone).
+    fn is_tripped(&self) -> bool {
+        self.tripped.load(Ordering::Relaxed)
+    }
+
+    /// Record a successful channel open: the gateway is reachable, so the
+    /// consecutive-failure count starts over.
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a failed channel open; trips (and warns, exactly once) when the
+    /// threshold is reached.
+    fn record_failure(&self) {
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= self.threshold && !self.tripped.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                consecutive_failures = failures,
+                "prewarm dial circuit breaker tripped: the gateway looks unreachable; remaining \
+                 uploads are marked failed without further dial attempts"
+            );
+        }
+    }
 }
 
 /// Why a payload could not be materialized — decides which failure list of
@@ -795,10 +921,19 @@ async fn upload_large(
     pool: &GatewayPool,
     large: &[UploadItem],
     substituters_by_url: &HashMap<String, &Substituter>,
+    breaker: &GatewayBreaker,
 ) -> UploadOutcome {
     let mut outcome = UploadOutcome::default();
     let mut channel: Option<DaemonChannel> = None;
     for item in large {
+        // Once the gateway is declared unreachable there is no point fetching
+        // multi-GB NARs that cannot be delivered.
+        if channel.is_none() && breaker.is_tripped() {
+            outcome
+                .upload_failures
+                .push((item.store_path.clone(), GATEWAY_UNREACHABLE.to_string()));
+            continue;
+        }
         let UploadPayload::Relay {
             substituter_url,
             narinfo,
@@ -829,9 +964,19 @@ async fn upload_large(
             }
         };
         if channel.is_none() {
+            if breaker.is_tripped() {
+                outcome
+                    .upload_failures
+                    .push((item.store_path.clone(), GATEWAY_UNREACHABLE.to_string()));
+                continue;
+            }
             match pool.open_channel().await {
-                Ok(fresh) => channel = Some(fresh),
+                Ok(fresh) => {
+                    breaker.record_success();
+                    channel = Some(fresh);
+                }
                 Err(err) => {
+                    breaker.record_failure();
                     outcome.upload_failures.push((
                         item.store_path.clone(),
                         format!("no daemon channel for the streaming upload: {err:#}"),
@@ -861,6 +1006,11 @@ async fn upload_large(
                     .push((item.store_path.clone(), item.info.nar_size));
             }
             Err(err) => {
+                tracing::warn!(
+                    path = %item.store_path,
+                    error = %err,
+                    "prewarm large-path upload failed; it falls back to per-request supply"
+                );
                 outcome.upload_failures.push((
                     item.store_path.clone(),
                     format!("streaming upload failed: {err}"),
@@ -874,6 +1024,27 @@ async fn upload_large(
     outcome
 }
 
+/// Shared, read-only inputs for one level's upload workers.
+struct BatchUploadContext<'a> {
+    /// The opened replay archive (payload source for embedded paths).
+    archive: &'a Arc<ReplayArchive>,
+    /// Pool to open daemon channels from.
+    pool: &'a GatewayPool,
+    /// Recording substituters by canonical URL (relay payload source).
+    substituters_by_url: &'a HashMap<String, &'a Substituter>,
+    /// Planned paths whose upload already failed — their dependents are
+    /// skipped instead of being refused by the daemon.
+    failed_paths: &'a BTreeSet<String>,
+    /// Run-wide dial circuit breaker.
+    breaker: &'a GatewayBreaker,
+    /// Deadline for payload materialization and batch uploads.
+    op_timeout: Duration,
+    /// Completed sub-batch counter shared by the level's workers.
+    progress: &'a AtomicUsize,
+    /// Total sub-batches in the level (for progress lines).
+    total_sub_batches: usize,
+}
+
 /// Upload one topological level: split it into sub-batches, spread the
 /// sub-batches round-robin over the upload workers, and merge their results.
 async fn upload_level(
@@ -881,6 +1052,8 @@ async fn upload_level(
     pool: &GatewayPool,
     level_items: &[&UploadItem],
     substituters_by_url: &HashMap<String, &Substituter>,
+    failed_paths: &BTreeSet<String>,
+    breaker: &GatewayBreaker,
     cfg: &PrewarmConfig,
 ) -> UploadOutcome {
     let sub_batches = split_batches(level_items, cfg.batch_max_bytes, cfg.batch_max_entries);
@@ -905,18 +1078,19 @@ async fn upload_level(
     }
 
     let progress = AtomicUsize::new(0);
-    let total_sub_batches = sub_batches.len();
-    let workers = per_worker.into_iter().map(|worker_batches| {
-        upload_worker(
-            archive,
-            pool,
-            worker_batches,
-            substituters_by_url,
-            cfg.op_timeout,
-            &progress,
-            total_sub_batches,
-        )
-    });
+    let context = BatchUploadContext {
+        archive,
+        pool,
+        substituters_by_url,
+        failed_paths,
+        breaker,
+        op_timeout: cfg.op_timeout,
+        progress: &progress,
+        total_sub_batches: sub_batches.len(),
+    };
+    let workers = per_worker
+        .into_iter()
+        .map(|worker_batches| upload_worker(&context, worker_batches));
     let outcomes = futures_util::future::join_all(workers).await;
 
     let mut merged = UploadOutcome::default();
@@ -933,30 +1107,66 @@ async fn upload_level(
 /// `AddMultipleToStore`. A failed item drops out of its sub-batch; a failed
 /// sub-batch is recorded and the worker continues on a fresh channel.
 async fn upload_worker(
-    archive: &Arc<ReplayArchive>,
-    pool: &GatewayPool,
+    context: &BatchUploadContext<'_>,
     sub_batches: Vec<Vec<&UploadItem>>,
-    substituters_by_url: &HashMap<String, &Substituter>,
-    op_timeout: Duration,
-    progress: &AtomicUsize,
-    total_sub_batches: usize,
 ) -> UploadOutcome {
     let mut outcome = UploadOutcome::default();
     let mut channel: Option<DaemonChannel> = None;
     for sub_batch in sub_batches {
-        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+        let done = context.progress.fetch_add(1, Ordering::Relaxed) + 1;
         if done.is_multiple_of(PROGRESS_EVERY) {
             tracing::info!(
-                sub_batches = %format!("{done}/{total_sub_batches}"),
+                sub_batches = %format!("{done}/{}", context.total_sub_batches),
                 "prewarm batch upload progress"
             );
+        }
+
+        // The gateway has been declared unreachable and this worker holds no
+        // channel: don't waste relay fetches or dial attempts on the rest.
+        if channel.is_none() && context.breaker.is_tripped() {
+            outcome.upload_failures.extend(
+                sub_batch
+                    .iter()
+                    .map(|item| (item.store_path.clone(), GATEWAY_UNREACHABLE.to_string())),
+            );
+            continue;
         }
 
         // Materialize payloads; a failed item drops out individually.
         let mut entries: Vec<StoreEntry> = Vec::with_capacity(sub_batch.len());
         let mut entry_meta: Vec<(String, u64)> = Vec::with_capacity(sub_batch.len());
         for item in &sub_batch {
-            match materialize_payload(archive, item, substituters_by_url).await {
+            // An item whose reference already failed to upload would only be
+            // refused by the daemon; skip it up front naming the real
+            // culprit. Levels run in order, so this also covers transitive
+            // dependents in later levels.
+            let failed_reference = item.info.references.iter().find(|reference| {
+                reference.as_str() != item.store_path.as_str()
+                    && context.failed_paths.contains(reference.as_str())
+            });
+            if let Some(reference) = failed_reference {
+                outcome.upload_failures.push((
+                    item.store_path.clone(),
+                    format!("reference {reference} failed its earlier upload — skipped"),
+                ));
+                continue;
+            }
+            // The materialization deadline keeps a stalled cache connection
+            // from wedging the whole level (batch NARs are < 64 MiB by
+            // construction, so op_timeout is a fair ceiling).
+            let materialized = match tokio::time::timeout(
+                context.op_timeout,
+                materialize_payload(context.archive, item, context.substituters_by_url),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(MaterializeError::Relay(format!(
+                    "fetch timed out after {}s",
+                    context.op_timeout.as_secs()
+                ))),
+            };
+            match materialized {
                 Ok(nar) => {
                     if nar.len() as u64 != item.info.nar_size {
                         outcome.upload_failures.push((
@@ -994,12 +1204,25 @@ async fn upload_worker(
         }
 
         if channel.is_none() {
-            match pool.open_channel().await {
-                Ok(fresh) => channel = Some(fresh),
+            if context.breaker.is_tripped() {
+                outcome.upload_failures.extend(
+                    entry_meta
+                        .iter()
+                        .map(|(path, _)| (path.clone(), GATEWAY_UNREACHABLE.to_string())),
+                );
+                continue;
+            }
+            match context.pool.open_channel().await {
+                Ok(fresh) => {
+                    context.breaker.record_success();
+                    channel = Some(fresh);
+                }
                 Err(err) => {
+                    context.breaker.record_failure();
                     // A channel-open failure means the gateway (or this
                     // connection) is unavailable right now — record the
-                    // sub-batch and keep going; the next sub-batch retries.
+                    // sub-batch and keep going; the next sub-batch retries
+                    // (until the breaker trips).
                     let reason = format!("no daemon channel for the batch upload: {err:#}");
                     outcome.upload_failures.extend(
                         entry_meta
@@ -1012,7 +1235,7 @@ async fn upload_worker(
         }
         let open_channel = channel.as_mut().expect("channel was just ensured above");
         match open_channel
-            .add_multiple_to_store(entries, op_timeout)
+            .add_multiple_to_store(entries, context.op_timeout)
             .await
         {
             Ok(()) => outcome.uploaded.extend(entry_meta),
@@ -1101,6 +1324,27 @@ mod tests {
         // src + the independent drv at level 0 (batch order preserved), the
         // first output at level 1, the sibling-referencing output at level 2.
         assert_eq!(levels, vec![vec![0, 1], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn gateway_breaker_trips_after_consecutive_failures() {
+        let breaker = GatewayBreaker::new(3);
+        breaker.record_failure();
+        breaker.record_failure();
+        assert!(!breaker.is_tripped());
+
+        // A success in between starts the count over.
+        breaker.record_success();
+        breaker.record_failure();
+        breaker.record_failure();
+        assert!(!breaker.is_tripped());
+
+        // The third consecutive failure trips it, and it stays tripped (the
+        // upload phases never dial again afterwards).
+        breaker.record_failure();
+        assert!(breaker.is_tripped());
+        breaker.record_success();
+        assert!(breaker.is_tripped());
     }
 
     #[test]
