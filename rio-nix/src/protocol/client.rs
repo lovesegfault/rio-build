@@ -1,7 +1,16 @@
 //! Client-side Nix worker protocol implementation.
 //!
-//! Speaks the Nix worker protocol as a **client** to a local `nix-daemon --stdio`.
-//! Used by workers to drive nix-daemon --stdio in the build sandbox.
+//! Speaks the Nix worker protocol as a **client**, for two consumers:
+//! rio-builder driving a local `nix-daemon --stdio` inside the build
+//! sandbox, and operator tooling driving a remote daemon endpoint over a
+//! transport supplied by the caller (e.g. an SSH channel).
+//!
+//! Two expectations cut across the op functions here: callers bound each
+//! operation with their own deadline (`tokio::time::timeout`), since a
+//! silently stalled peer cannot be detected client-side; and after any error
+//! from an op that had started writing a framed payload, the
+//! channel/connection must be abandoned — the framed stream is left
+//! incomplete and cannot be resynchronized.
 //!
 //! The client protocol mirrors the server protocol in `handshake.rs` and `stderr.rs`:
 //! - Client sends `WORKER_MAGIC_1`, reads `WORKER_MAGIC_2` + server version
@@ -665,10 +674,18 @@ async fn write_nar_payload<W: AsyncWrite + Unpin>(
 /// The daemon may emit STDERR messages — including a refusal — while the
 /// payload is still being written; if they were left unread, both sides could
 /// deadlock on full buffers. The payload write and the STDERR drain therefore
-/// run concurrently, and the first error cancels the other side. On a daemon
-/// refusal this returns [`ClientOpError::Daemon`], but the framed upload is
-/// left incomplete: the connection MUST be abandoned afterwards (the same
-/// contract as [`wire::FramedWriter`]'s cancellation note).
+/// run concurrently, and the first error cancels the other side. On
+/// [`ClientOpError::Daemon`] (or any error after writing began) the framed
+/// upload is left incomplete: the connection MUST be abandoned afterwards
+/// (the same contract as [`wire::FramedWriter`]'s cancellation note). A
+/// refusal can also race the daemon tearing down the session, so the failure
+/// may surface as a [`Wire`](ClientOpError::Wire) I/O error instead of
+/// [`Daemon`](ClientOpError::Daemon) — treat both variants as "upload
+/// rejected/failed" rather than classifying on the variant alone.
+///
+/// As with [`drain_stderr_typed`], callers are expected to bound the call
+/// with their own deadline (e.g. `tokio::time::timeout`): a silently stalled
+/// peer cannot be detected client-side.
 pub async fn client_add_to_store_nar<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -721,6 +738,11 @@ where
 /// refuses to start (without writing anything) if any entry mismatches, since
 /// a wrong length would desync every entry that follows in the framed stream.
 ///
+/// Against a stock `nix-daemon`, entries should be sent in reference
+/// (dependency) order — each entry's references registered before its
+/// dependents; rio's gateway does not require any particular order, so
+/// callers that plan uploads topologically satisfy both.
+///
 /// `dont_check_sigs` asks the daemon not to require signatures on the
 /// uploaded path infos. rio-gateway reads and ignores the flag (signature
 /// policy is delegated to rio-store); a real nix-daemon skips its signature
@@ -732,7 +754,15 @@ where
 /// STDERR drain run concurrently so a mid-upload refusal cannot deadlock on
 /// full buffers, and the first error cancels the other side. On
 /// [`ClientOpError::Daemon`] (or any error after writing began) the framed
-/// stream is left incomplete and the connection MUST be abandoned.
+/// stream is left incomplete and the connection MUST be abandoned. A refusal
+/// can also race the daemon tearing down the session, so the failure may
+/// surface as a [`Wire`](ClientOpError::Wire) I/O error instead of
+/// [`Daemon`](ClientOpError::Daemon) — treat both variants as "upload
+/// rejected/failed" rather than classifying on the variant alone.
+///
+/// As with [`drain_stderr_typed`], callers are expected to bound the call
+/// with their own deadline (e.g. `tokio::time::timeout`): a silently stalled
+/// peer cannot be detected client-side.
 pub async fn client_add_multiple_to_store<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -1805,6 +1835,115 @@ mod tests {
         Ok(())
     }
 
+    /// A streaming (`NarPayload::Reader`) source that ends before its declared
+    /// `len` is a prompt `ClientOpError::Wire` failure: the local short read
+    /// must be reported without waiting on the (silent) daemon. The fake
+    /// server reads only the op-39 header, then parks on a oneshot without
+    /// writing anything and without reading the framed payload — as in the
+    /// refusal test, the duplex buffer is far smaller than the declared
+    /// payload. The bytes the source DOES yield are kept under one 256 KiB
+    /// frame so the short read is hit before any frame write would need the
+    /// non-reading peer to drain the transport; once a frame is in flight,
+    /// backpressure from a stalled peer is the caller-deadline's job per the
+    /// module docs.
+    #[tokio::test]
+    async fn client_add_to_store_nar_reader_short_source_is_prompt_wire_error() -> anyhow::Result<()>
+    {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let store_path = "/nix/store/gggggggggggggggggggggggggggggggg-short";
+        let declared_len = 1024 * 1024u64; // 1 MiB declared…
+        let provided = vec![0x77u8; 192 * 1024]; // …but the source ends early.
+        // Held until the client call returns so the server halves stay open:
+        // the failure must come from the short source, not a broken pipe.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (mut sr, _sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::AddToStoreNar as u64);
+            let path = wire::read_string(&mut sr).await?;
+            assert_eq!(path, store_path);
+            let info = read_valid_path_info(&mut sr).await?;
+            assert_eq!(info.nar_size, declared_len);
+            let _repair = wire::read_bool(&mut sr).await?;
+            let _dont_check_sigs = wire::read_bool(&mut sr).await?;
+            // Stay silent: no STDERR frames, no reads of the framed payload.
+            let _ = done_rx.await;
+            anyhow::Ok(())
+        });
+
+        let entry = StoreEntry {
+            store_path: store_path.to_string(),
+            info: ValidPathInfo {
+                nar_hash: vec![0xcd; 32],
+                nar_size: declared_len,
+                ..Default::default()
+            },
+            nar: NarPayload::Reader {
+                len: declared_len,
+                reader: Box::new(std::io::Cursor::new(provided)),
+            },
+        };
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_add_to_store_nar(&mut cr, &mut cw, entry, false, true),
+        )
+        .await
+        .expect("short source must fail promptly, not hang on the silent daemon");
+
+        let err = result.expect_err("short source must surface as an error");
+        assert!(matches!(err, ClientOpError::Wire(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("bytes short of the declared"),
+            "message must say the payload ended short: {err}"
+        );
+        drop(done_tx);
+        server.await??;
+        Ok(())
+    }
+
+    /// An entry whose `info.nar_size` disagrees with its payload length is
+    /// rejected by the upfront size check: the error names the mismatch and
+    /// nothing — not even the opcode — reaches the wire.
+    #[tokio::test]
+    async fn client_add_to_store_nar_size_mismatch_rejected_before_any_write() -> anyhow::Result<()>
+    {
+        let (client_stream, mut server_stream) = tokio::io::duplex(8192);
+        let entry = StoreEntry {
+            store_path: "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-mismatch".to_string(),
+            info: ValidPathInfo {
+                nar_hash: vec![0xee; 32],
+                nar_size: 100, // declared 100 bytes…
+                ..Default::default()
+            },
+            nar: NarPayload::Bytes(vec![0u8; 50]), // …but the payload is 50.
+        };
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let err = client_add_to_store_nar(&mut cr, &mut cw, entry, false, false)
+            .await
+            .expect_err("size mismatch must be rejected");
+        assert!(matches!(err, ClientOpError::Wire(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("nar size mismatch"),
+            "message must name the size mismatch: {err}"
+        );
+
+        // Nothing may have been written: dropping the client halves EOFs the
+        // server side, which must then observe zero buffered bytes.
+        drop(cr);
+        drop(cw);
+        let mut probe = [0u8; 1];
+        let n = server_stream.read(&mut probe).await?;
+        assert_eq!(
+            n, 0,
+            "no opcode/bytes may reach the wire on a size mismatch"
+        );
+        Ok(())
+    }
+
     /// client_add_multiple_to_store batch round-trip: two entries (one
     /// in-memory, one streaming) travel inside ONE framed stream whose
     /// decoded content is the count, then per entry the path string, the
@@ -1892,6 +2031,42 @@ mod tests {
         ];
         let (mut cr, mut cw) = tokio::io::split(client_stream);
         client_add_multiple_to_store(&mut cr, &mut cw, false, true, entries).await?;
+        server.await??;
+        Ok(())
+    }
+
+    /// An empty batch is a valid `wopAddMultipleToStore` request: the framed
+    /// stream carries just the count 0 (then the frame terminator), the
+    /// daemon answers with STDERR_LAST alone, and the client completes with
+    /// Ok(()).
+    #[tokio::test]
+    async fn client_add_multiple_to_store_empty_batch_roundtrip() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::AddMultipleToStore as u64);
+            let _repair = wire::read_bool(&mut sr).await?;
+            let _dont_check_sigs = wire::read_bool(&mut sr).await?;
+
+            // The framed stream still arrives, with just the zero count
+            // inside it.
+            let mut framed = wire::FramedStreamReader::new_unbounded(&mut sr);
+            let count = wire::read_u64(&mut framed).await?;
+            assert_eq!(count, 0, "empty batch must reach the wire as count 0");
+            // Nothing after the count but the frame terminator.
+            let mut probe = [0u8; 1];
+            let n = tokio::io::AsyncReadExt::read(&mut framed, &mut probe).await?;
+            assert_eq!(n, 0, "no trailing data after the zero count");
+
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        client_add_multiple_to_store(&mut cr, &mut cw, false, false, Vec::new()).await?;
         server.await??;
         Ok(())
     }
