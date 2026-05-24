@@ -365,6 +365,11 @@
       "path": "test_jail.rs",
       "depth": 0,
       "doc": "Private test-only env/cwd sandbox for rio-common's own tests."
+    },
+    {
+      "path": "wanted_outputs.rs",
+      "depth": 0,
+      "doc": "The wanted-output predicate family backing the demand-driven"
     }
   ],
   "rio-controller": [

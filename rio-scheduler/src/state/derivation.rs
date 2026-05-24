@@ -1235,26 +1235,12 @@ impl DerivationState {
         )
     }
 
-    /// Union a newly-merged consumer's wanted set into this node's. The
-    /// wanted set only ever grows — never shrink it while any
-    /// interested build is live, or build B's `{out}` could un-want
-    /// build A's still-needed `dev`.
-    ///
-    /// Empty is the "all declared outputs wanted" sentinel, so the
-    /// union saturates: `all ∪ X = all`. If either side is empty, the
-    /// result is empty (= all). Otherwise the result is the sorted,
-    /// deduplicated set union.
+    /// Union a newly-merged consumer's wanted set into this node's.
+    /// Delegates to [`union_wanted_saturating`] — see it for the
+    /// saturation algebra (empty = "all declared outputs wanted",
+    /// `all ∪ X = all`, otherwise sorted deduplicated set union).
     pub fn union_wanted(&mut self, incoming: &[String]) {
-        if self.wanted_output_names.is_empty() || incoming.is_empty() {
-            self.wanted_output_names.clear(); // all ∪ anything = all
-            return;
-        }
-        for n in incoming {
-            if !self.wanted_output_names.contains(n) {
-                self.wanted_output_names.push(n.clone());
-            }
-        }
-        self.wanted_output_names.sort_unstable();
+        union_wanted_saturating(&mut self.wanted_output_names, incoming);
     }
 
     /// The derivation's `name` attribute, as encoded in the `.drv`
@@ -1423,64 +1409,15 @@ impl DerivationState {
     }
 }
 
-/// The wanted subset of `expected_output_paths`, resolved by zipping the
-/// (`output_names` ↔ `expected_output_paths`) parallel arrays and keeping
-/// only the entries whose name is in `wanted`. Empty `wanted` ⇒ all
-/// declared outputs (yields every expected path) — the backward-compatible
-/// sentinel for pre-migration rows, the `BasicDerivation` fallback, and
-/// `^*` roots. A wanted name with no matching declared output is ignored
-/// (defensive — the gateway only unions declared names).
-///
-/// Free function (not just a [`DerivationState`] method) because the
-/// merge-time cache-hit classification operates on the proto-mirror
-/// `crate::domain::DerivationNode` before a `DerivationState` exists;
-/// both call sites MUST share one implementation or the hit criterion
-/// drifts between merge time and dispatch time.
-// r[impl sched.merge.wanted-outputs]
-pub fn wanted_subset<'a>(
-    output_names: &'a [String],
-    expected_output_paths: &'a [String],
-    wanted: &'a [String],
-) -> impl Iterator<Item = &'a String> {
-    let all = wanted.is_empty();
-    output_names
-        .iter()
-        .zip(expected_output_paths.iter())
-        .filter(move |(name, _)| all || wanted.contains(*name))
-        .map(|(_, path)| path)
-}
-
-/// The *verifiable* wanted subset of `expected_output_paths`: the
-/// non-empty concrete paths resolved by [`wanted_subset`], or `None`
-/// when the resolution yields zero non-empty paths — every wanted name
-/// unmatched against the declared outputs (a client sent `drv^bogus`
-/// and the gateway does not validate the root OutputsSpec against the
-/// declared outputs), or only floating-CA `""` placeholders.
-///
-/// THE single guard for every wanted-output completeness predicate.
-/// The empty case is unrepresentable in the `Some` branch by
-/// construction so that a `wanted.iter().all(present)` predicate can
-/// never be vacuously true: a vacuous "all wanted outputs present"
-/// verdict completes a derivation with zero outputs verified —
-/// dispatching its dependents against missing inputs, adopting an
-/// unfinished orphan as completed, or (in the top-down prune) dropping
-/// the dependency closure from the submission entirely. On `None` the
-/// caller MUST take its conservative branch: skip the classification,
-/// fall back to all declared paths, or treat the node as unavailable.
-/// Falling through to a from-source build / the full merge is always
-/// safe; a false "complete" is not.
-// r[impl sched.merge.wanted-outputs]
-pub fn verifiable_wanted_paths<'a>(
-    output_names: &'a [String],
-    expected_output_paths: &'a [String],
-    wanted_output_names: &'a [String],
-) -> Option<Vec<&'a str>> {
-    let paths: Vec<&str> = wanted_subset(output_names, expected_output_paths, wanted_output_names)
-        .map(String::as_str)
-        .filter(|p| !p.is_empty())
-        .collect();
-    (!paths.is_empty()).then_some(paths)
-}
+/// The wanted-output predicate family, canonically defined in
+/// [`rio_common::wanted_outputs`] and re-exported here so every
+/// existing `crate::state::{wanted_subset, verifiable_wanted_paths}`
+/// import keeps resolving. The gateway's will-dispatch prediction and
+/// DAG dedup call the same rio-common functions — the scheduler and
+/// gateway sides of the demand-driven cache-hit criterion cannot drift.
+pub use rio_common::wanted_outputs::{
+    union_wanted_saturating, verifiable_wanted_paths, wanted_subset,
+};
 
 /// Poison detection config. Replaces the former `POISON_THRESHOLD` const.
 ///

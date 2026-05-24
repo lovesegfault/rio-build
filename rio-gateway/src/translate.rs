@@ -738,30 +738,23 @@ pub async fn filter_and_inline_drv(
         // outputs are ones no consumer's inputDrvs names (and the root
         // didn't select) classifies as a hit / pending-substitute and
         // never dispatches, so inlining its drv_content is wasted
-        // budget. The wanted subset zips the (output_names ↔
-        // expected_output_paths) parallel arrays exactly like the
-        // scheduler's `wanted_subset`; empty `wanted_output_names` =
-        // every declared output. A wanted set that resolves to no
-        // concrete path (all floating-CA, or no declared name matches)
-        // falls back to the all-declared criterion — the conservative
-        // direction is "inline it": over-inlining costs bytes,
-        // under-inlining costs a worker→store round-trip on a node
-        // that DOES dispatch.
-        let all_wanted = node.wanted_output_names.is_empty();
-        let verifiable_wanted: Vec<&String> = node
-            .output_names
-            .iter()
-            .zip(node.expected_output_paths.iter())
-            .filter(|(name, _)| all_wanted || node.wanted_output_names.contains(name))
-            .map(|(_, path)| path)
-            .filter(|p| !p.is_empty())
-            .collect();
-        let will_dispatch = if verifiable_wanted.is_empty() {
-            node.expected_output_paths
+        // budget. The wanted subset is resolved by the SAME
+        // `verifiable_wanted_paths` the scheduler classifies with. Its
+        // `None` (no concrete wanted path: all floating-CA, or no
+        // declared name matches) falls back to the all-declared
+        // criterion — the conservative direction is "inline it":
+        // over-inlining costs bytes, under-inlining costs a
+        // worker→store round-trip on a node that DOES dispatch.
+        let will_dispatch = match rio_common::wanted_outputs::verifiable_wanted_paths(
+            &node.output_names,
+            &node.expected_output_paths,
+            &node.wanted_output_names,
+        ) {
+            None => node
+                .expected_output_paths
                 .iter()
-                .any(|p| p.is_empty() || missing.contains(p))
-        } else {
-            verifiable_wanted.iter().any(|p| missing.contains(*p))
+                .any(|p| p.is_empty() || missing.contains(p)),
+            Some(wanted) => wanted.iter().any(|p| missing.contains(*p)),
         };
         if !will_dispatch {
             continue;

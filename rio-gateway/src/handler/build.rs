@@ -1389,10 +1389,12 @@ async fn enrich_build_result_with_outputs(
 /// dropped duplicate's wanted set into the retained node: dropping it
 /// un-wants whatever the other root asked for (root A wants `child^out`,
 /// root B wants `child^dev` — keeping only A's copy would let the
-/// scheduler treat a missing `dev` output as ignorable). Empty
-/// saturates the union (empty = "all declared outputs wanted", and
-/// all ∪ X = all). Mirrors `DerivationState::union_wanted` and the PG
-/// upsert's union-on-conflict.
+/// scheduler treat a missing `dev` output as ignorable). The union is
+/// [`rio_common::wanted_outputs::union_wanted_saturating`] — the same
+/// saturating union (empty = "all declared outputs wanted", all ∪ X =
+/// all) that `DerivationState::union_wanted` and the PG upsert's
+/// union-on-conflict apply when the duplicates arrive as separate
+/// submissions instead.
 fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::DerivationEdge>) {
     let mut keep: HashMap<String, usize> = HashMap::new();
     let mut deduped: Vec<types::DerivationNode> = Vec::with_capacity(nodes.len());
@@ -1403,18 +1405,10 @@ fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::Deri
                 deduped.push(node);
             }
             std::collections::hash_map::Entry::Occupied(e) => {
-                let kept = &mut deduped[*e.get()].wanted_output_names;
-                if kept.is_empty() || node.wanted_output_names.is_empty() {
-                    // all ∪ anything = all.
-                    kept.clear();
-                } else {
-                    for name in node.wanted_output_names {
-                        if !kept.contains(&name) {
-                            kept.push(name);
-                        }
-                    }
-                    kept.sort_unstable();
-                }
+                rio_common::wanted_outputs::union_wanted_saturating(
+                    &mut deduped[*e.get()].wanted_output_names,
+                    &node.wanted_output_names,
+                );
             }
         }
     }
