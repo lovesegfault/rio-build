@@ -43,8 +43,12 @@ pub mod backend;
 pub mod cas;
 #[cfg(feature = "server")]
 pub mod castore;
+// pub (not pub(crate)) so rio-builder's `chunker_constants_match_rio_store`
+// test can assert its mirrored CHUNK_MIN/AVG/MAX against the source of
+// truth — drift there silently splits the dedup namespace between
+// builder-chunked and store-chunked content.
 #[cfg(feature = "server")]
-pub(crate) mod chunker;
+pub mod chunker;
 #[cfg(feature = "server")]
 pub mod config;
 #[cfg(feature = "server")]

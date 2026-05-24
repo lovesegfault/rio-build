@@ -37,13 +37,14 @@ const BANDWIDTH_BYTES_PER_SEC: f64 = 125_000_000.0;
 const FIRST_CHUNK_LATENCY_SECS: f64 = 0.010;
 
 /// FastCDC parameters for the V11 chunk-reuse scan. These mirror
-/// `rio-store/src/chunker.rs` (`CHUNK_MIN`/`CHUNK_AVG`/`CHUNK_MAX`) —
-/// the chunker module is `pub(crate)` behind the `server` feature, and
-/// pulling rio-store's full server dep tree into xtask for three
-/// constants is not worth it for an offline measurement tool. If the
-/// store's chunking parameters change, re-run V11 with these updated
-/// to match or the reuse number describes a chunker that no longer
-/// exists.
+/// `rio-store/src/chunker.rs` (`CHUNK_MIN`/`CHUNK_AVG`/`CHUNK_MAX`,
+/// the source of truth) — pulling rio-store's full server dep tree
+/// into xtask for three constants is not worth it for an offline
+/// measurement tool, so unlike rio-builder's mirror (pinned by its
+/// `chunker_constants_match_rio_store` test) this one is documented
+/// only. If the store's chunking parameters change, re-run V11 with
+/// these updated to match or the reuse number describes a chunker
+/// that no longer exists.
 const CHUNK_MIN: usize = 16 * 1024;
 const CHUNK_AVG: usize = 64 * 1024;
 const CHUNK_MAX: usize = 256 * 1024;

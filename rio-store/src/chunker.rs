@@ -25,6 +25,22 @@
 //! for this workload and has the same collision resistance. The
 //! `store.typ` "hash domain separation" table makes this explicit: SHA-256
 //! for everything Nix-facing, BLAKE3 for chunks only.
+//!
+//! # Mirrors
+//!
+//! `CHUNK_MIN`/`CHUNK_AVG`/`CHUNK_MAX` are re-declared (not imported) in
+//! two places that cannot link this crate's server dependency tree. This
+//! module is the source of truth; change the values here first.
+//!
+//! - `rio-builder/src/upload/chunked.rs` — the builder-side fused-walk
+//!   chunker (`PutPathChunked`). Pinned by that crate's
+//!   `chunker_constants_match_rio_store` test: drift in any of the three
+//!   silently stops builder-chunked and store-chunked content from
+//!   deduplicating against each other (same bytes, different boundaries,
+//!   different digests).
+//! - `xtask/src/k8s/measure.rs` — the offline V11 chunk-reuse
+//!   measurement. Documented mirror only; drift skews the measurement,
+//!   not production.
 
 use fastcdc::v2020::FastCDC;
 

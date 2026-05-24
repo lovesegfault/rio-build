@@ -56,11 +56,15 @@ use super::common::{
 };
 
 /// FastCDC size parameters. MUST match `rio-store/src/chunker.rs`
-/// (`CHUNK_MIN`/`CHUNK_AVG`/`CHUNK_MAX`) — the spec pins 16/64/256 KiB
-/// (`r[store.cas.fastcdc]`) and the server rejects any
-/// `chunk_manifest` entry whose size exceeds its own `CHUNK_MAX`.
-/// Duplicated rather than imported because rio-builder cannot depend
-/// on rio-store (the store links the whole S3/PG dep tree).
+/// (`CHUNK_MIN`/`CHUNK_AVG`/`CHUNK_MAX`, the source of truth) — the
+/// spec pins 16/64/256 KiB (`r[store.cas.fastcdc]`), the server
+/// rejects any `chunk_manifest` entry whose size exceeds its own
+/// `CHUNK_MAX`, and a divergence in `CHUNK_MIN`/`CHUNK_AVG` silently
+/// stops builder-chunked and store-chunked content from deduplicating
+/// against each other. Duplicated rather than imported because
+/// rio-builder cannot depend on rio-store (the store links the whole
+/// S3/PG dep tree); the `chunker_constants_match_rio_store` test below
+/// pins the mirror via the dev-dependency.
 // r[impl store.cas.fastcdc]
 const CHUNK_MIN: usize = 16 * 1024;
 const CHUNK_AVG: usize = 64 * 1024;
@@ -741,8 +745,24 @@ async fn put_path_chunked_once(
     // already spent concurrently above.
     let producer_result = await_dump_after_rx_drop("chunked producer", producer).await?;
 
-    // Error priority: gRPC status first (it's the actionable one),
-    // then a producer-side disk error.
+    // Error priority. A producer failure (send-phase re-read ENOENT,
+    // truncation, the BLAKE3 mismatch that names a mutated file) drops
+    // `tx`; the server sees the stream end before `novel` is exhausted
+    // and returns a generic incomplete-stream `FailedPrecondition` — a
+    // downstream symptom of the producer's root cause. Always log the
+    // producer's diagnostic so it survives whichever error wins, and
+    // when the server's verdict is that symptom, return the producer's
+    // error instead (it carries the file + offset the operator needs).
+    // Other server errors (Unavailable, InvalidArgument, a transport
+    // failure) are independent faults and keep priority.
+    if let Err(producer_err) = &producer_result {
+        tracing::warn!(error = %producer_err, "chunked upload producer failed");
+        if let Err(status) = &put_result
+            && status.code() == tonic::Code::FailedPrecondition
+        {
+            return Err(producer_err.clone());
+        }
+    }
     let resp = put_result?;
     producer_result?;
 
@@ -984,6 +1004,22 @@ mod tests {
         assert_eq!(walked.nar_hash, expected, "nar_hash");
     }
 
+    /// The FastCDC parameters mirrored at the top of this module MUST
+    /// equal `rio-store/src/chunker.rs`'s (the source of truth,
+    /// reachable here via the dev-dependency). The production code
+    /// cannot import them — rio-builder does not link the store's
+    /// server dependency tree — so this test is the only thing that
+    /// catches a drift, and a drift in `CHUNK_MIN`/`CHUNK_AVG` is
+    /// silent in production: every upload still verifies and commits,
+    /// but builder-chunked and store-chunked content stop sharing
+    /// chunk digests.
+    #[test]
+    fn chunker_constants_match_rio_store() {
+        assert_eq!(CHUNK_MIN, rio_store::chunker::CHUNK_MIN, "CHUNK_MIN");
+        assert_eq!(CHUNK_AVG, rio_store::chunker::CHUNK_AVG, "CHUNK_AVG");
+        assert_eq!(CHUNK_MAX, rio_store::chunker::CHUNK_MAX, "CHUNK_MAX");
+    }
+
     /// Per-file alignment: each regular file's contiguous chunk run
     /// sums to exactly that file's size, in canonical NAR walk order.
     /// The server's chunk-run validation rejects anything else.
@@ -1087,13 +1123,18 @@ mod tests {
         );
     }
 
-    /// FIFO in the output → walk fails loudly instead of hanging in
-    /// `open(2)` (same contract as `dump_path_streaming`).
+    /// The walk must reject anything that is not a regular file,
+    /// symlink, or directory (same contract as `dump_path_streaming`).
+    /// The motivating case is a FIFO (`mkfifo $out/pipe` in a hostile
+    /// derivation), which would hang `File::open` in `open(O_RDONLY)`
+    /// forever; the test binds a Unix-domain socket instead because it
+    /// exercises the same metadata-type rejection branch without
+    /// needing an extra dependency to create a FIFO.
     #[test]
     fn fused_walk_rejects_unsupported_file_type() {
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("nix/store");
-        let basename = rio_test_support::fixtures::test_store_basename("fifo");
+        let basename = rio_test_support::fixtures::test_store_basename("unsupported");
         let root = store_dir.join(&basename);
         std::fs::create_dir_all(&root).unwrap();
         let _sock = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
