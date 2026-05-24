@@ -212,7 +212,10 @@ access reuses `reqwest` and `aws-sdk-s3` already used by xtask.
 ## Robustness requirements
 
 - Every daemon operation runs under a deadline; SSH keepalives are enabled;
-  a dead connection fails its in-flight requests and is not reused.
+  a dead connection fails its in-flight requests and is not reused as-is: the
+  pool skips closed connections and re-dials them lazily, because the gateway
+  drops a connection whenever its last channel closes — routine, not
+  exceptional.
 - Validity probes and uploads are chunked; a refusal poisons only its channel.
 - When a request depends on a path another in-flight request is currently
   uploading, it waits (bounded) for that upload to land before sending its

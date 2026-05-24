@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,10 +36,15 @@ use rio_nix::protocol::pathinfo::ValidPathInfo;
 use russh::keys::ssh_key::Fingerprint;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{BufWriter, ReadHalf, WriteHalf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 /// Channels the gateway accepts per SSH connection; further opens (or execs)
 /// are rejected until one closes.
+///
+/// Mirrors `MAX_CHANNELS_PER_CONNECTION` in
+/// `rio-gateway/src/server/connection.rs` — there is no wire-level way to
+/// discover the budget, so if the gateway's constant changes this one must
+/// change with it.
 pub const CHANNELS_PER_CONNECTION: usize = 4;
 
 /// The exec command the gateway expects (it requires the command string to
@@ -69,6 +74,27 @@ pub fn default_connections(max_sessions: usize) -> usize {
 /// Total daemon-channel capacity of a pool with `connections` connections.
 fn pool_capacity(connections: usize) -> usize {
     connections * CHANNELS_PER_CONNECTION
+}
+
+/// Pick the connection to try first for a new channel: among connections
+/// that are `open` and have at least one free slot, the one with the most
+/// free slots (ties keep the lowest index).
+///
+/// Closed connections are never picked — a connection the gateway has
+/// dropped reads as having a full budget of free slots, which would
+/// otherwise make the most-free heuristic prefer exactly the connections
+/// that cannot take a channel.
+fn pick_connection(open: &[bool], free_slots: &[usize]) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (index, (&is_open, &free)) in open.iter().zip(free_slots).enumerate() {
+        if !is_open || free == 0 {
+            continue;
+        }
+        if best.is_none_or(|(_, best_free)| free > best_free) {
+            best = Some((index, free));
+        }
+    }
+    best.map(|(index, _)| index)
 }
 
 /// How to verify the gateway's host key.
@@ -295,8 +321,17 @@ impl russh::client::Handler for ReplayHandler {
 
 /// One authenticated SSH connection plus its channel-slot budget.
 struct PoolConnection {
-    handle: russh::client::Handle<ReplayHandler>,
+    /// The authenticated SSH connection. Behind an `RwLock` so a connection
+    /// the gateway has dropped can be replaced (re-dialed) in place: liveness
+    /// checks and channel opens take the read side, a re-dial takes the
+    /// write side.
+    handle: RwLock<russh::client::Handle<ReplayHandler>>,
+    /// Free channel slots on this connection (the gateway's per-connection
+    /// budget). Slots are held by [`DaemonChannel`]s — including ones whose
+    /// underlying connection has died; those free up as their ops fail and
+    /// the channels get dropped.
     slots: Arc<Semaphore>,
+    /// Position in [`GatewayPool::connections`], for logs and errors.
     index: usize,
 }
 
@@ -304,15 +339,31 @@ struct PoolConnection {
 ///
 /// Every connection carries a [`CHANNELS_PER_CONNECTION`]-permit semaphore
 /// mirroring the gateway's per-connection channel cap. [`Self::open_channel`]
-/// prefers the connection with the most free slots and waits (without
+/// prefers the open connection with the most free slots and waits (without
 /// deadlocking) when all `connections × 4` slots are in use; the slot is
 /// released when the returned [`DaemonChannel`] is dropped or
 /// [abandoned](DaemonChannel::abandon).
+///
+/// The gateway disconnects an SSH connection as soon as its last channel
+/// closes, so pool connections routinely go dead between requests. The pool
+/// treats that as normal: closed connections are skipped when picking a slot
+/// and re-dialed lazily (one attempt per acquisition) when they are needed
+/// again. In-flight operations on a connection that dies still fail — the
+/// caller's retry-on-a-fresh-channel path is the recovery mechanism, not a
+/// transparent transport retry.
 ///
 /// The pool owns the SSH connections: keep it alive for as long as any
 /// [`DaemonChannel`] handed out from it is in use.
 pub struct GatewayPool {
     connections: Vec<PoolConnection>,
+    /// Gateway endpoint, kept for lazy re-dials and error messages.
+    endpoint: Endpoint,
+    /// Decoded client key, kept for lazy re-dials.
+    key: Arc<russh::keys::PrivateKey>,
+    /// Where `key` was loaded from — error messages only.
+    key_path: PathBuf,
+    /// Host-key policy, applied again on every re-dial.
+    policy: Arc<HostKeyPolicy>,
 }
 
 impl GatewayPool {
@@ -345,65 +396,15 @@ impl GatewayPool {
             )),
         })?;
         let key = Arc::new(key);
-
-        let config = Arc::new(russh::client::Config {
-            keepalive_interval: Some(KEEPALIVE_INTERVAL),
-            keepalive_max: KEEPALIVE_MAX,
-            nodelay: true,
-            ..Default::default()
-        });
         let policy = Arc::new(policy);
 
         let connections = futures_util::future::try_join_all((0..connections).map(|index| {
-            let config = config.clone();
             let key = key.clone();
             let policy = policy.clone();
             async move {
-                let handler = ReplayHandler {
-                    policy,
-                    host: endpoint.host.clone(),
-                    port: endpoint.port,
-                };
-                let mut handle = russh::client::connect(
-                    config,
-                    (endpoint.host.as_str(), endpoint.port),
-                    handler,
-                )
-                .await
-                .with_context(|| {
-                    format!("failed to establish SSH connection {index} to {endpoint}")
-                })?;
-
-                // The gateway only advertises publickey auth. For RSA keys ask
-                // which rsa-sha2 variant the server supports; for anything
-                // else (ed25519 in practice) the hash parameter is ignored.
-                let hash_alg = if key.algorithm().is_rsa() {
-                    handle
-                        .best_supported_rsa_hash()
-                        .await
-                        .context("failed to query the gateway's supported RSA signature hashes")?
-                        .flatten()
-                } else {
-                    None
-                };
-                let auth = handle
-                    .authenticate_publickey(
-                        "rio",
-                        PrivateKeyWithHashAlg::new(key.clone(), hash_alg),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("publickey authentication failed on connection {index} to {endpoint}")
-                    })?;
-                ensure!(
-                    auth.success(),
-                    "the gateway rejected the SSH key {} (is its public half in the gateway's \
-                     authorized keys, with the comment naming the tenant?)",
-                    key_path.display()
-                );
-                tracing::debug!(index, endpoint = %endpoint, "gateway SSH connection authenticated");
-                Ok(PoolConnection {
-                    handle,
+                let handle = connect_one(endpoint, &key, &policy, key_path, index).await?;
+                Ok::<_, anyhow::Error>(PoolConnection {
+                    handle: RwLock::new(handle),
                     slots: Arc::new(Semaphore::new(CHANNELS_PER_CONNECTION)),
                     index,
                 })
@@ -417,7 +418,13 @@ impl GatewayPool {
             endpoint = %endpoint,
             "gateway pool connected"
         );
-        Ok(Self { connections })
+        Ok(Self {
+            connections,
+            endpoint: endpoint.clone(),
+            key,
+            key_path: key_path.to_path_buf(),
+            policy,
+        })
     }
 
     /// Total channel capacity (connections × 4).
@@ -427,14 +434,20 @@ impl GatewayPool {
 
     /// Open a daemon session: pick a connection with a free channel slot,
     /// open a channel, exec `nix-daemon --stdio`, run the worker-protocol
-    /// handshake, and return the channel. Waits if all slots are momentarily
-    /// busy; the wait cannot deadlock because every slot is released when its
-    /// [`DaemonChannel`] drops.
+    /// handshake, and return the channel.
+    ///
+    /// Waits if all slots are momentarily busy. The wait is unbounded by
+    /// design — callers are expected to do their own admission control (the
+    /// replay engine bounds concurrency before asking for a channel). It
+    /// cannot deadlock because every slot is released when its
+    /// [`DaemonChannel`] drops. Connections the gateway has closed in the
+    /// meantime (it disconnects whenever a connection's last channel closes)
+    /// are skipped and re-dialed lazily.
     pub async fn open_channel(&self) -> Result<DaemonChannel> {
         let (connection, slot) = self.acquire_slot().await?;
 
         let setup = async {
-            let channel = exec_daemon(&connection.handle).await?;
+            let channel = exec_daemon(connection, &self.endpoint).await?;
             let (mut reader, write_half) = tokio::io::split(channel.into_stream());
             // The rio-nix wire helpers issue many small writes (3 per
             // string); buffer them so each opcode goes out in a few packets.
@@ -449,14 +462,17 @@ impl GatewayPool {
             .await
             .map_err(|_| {
                 anyhow!(
-                    "daemon session setup (exec + handshake) timed out after {}s",
+                    "daemon session setup (exec + handshake) on SSH connection {} to {} \
+                     timed out after {}s",
+                    connection.index,
+                    self.endpoint,
                     SETUP_TIMEOUT.as_secs()
                 )
             })?
             .with_context(|| {
                 format!(
-                    "failed to open a daemon session on SSH connection {}",
-                    connection.index
+                    "failed to open a daemon session on SSH connection {} to {}",
+                    connection.index, self.endpoint
                 )
             })?;
 
@@ -469,56 +485,258 @@ impl GatewayPool {
             reader,
             writer,
             negotiated_version: handshake.negotiated_version(),
+            connection_index: connection.index,
             _slot: slot,
         })
     }
 
-    /// Acquire one channel slot, preferring the connection with the most free
-    /// slots; when everything is busy, wait for the first slot to free on any
-    /// connection.
+    /// Acquire one channel slot.
+    ///
+    /// Preference order: an open connection with the most free slots; then
+    /// closed connections (the gateway drops a connection whenever its last
+    /// channel closes, so finding some is routine), each re-dialed at most
+    /// once per pass; finally, when every usable connection is fully busy,
+    /// wait for the first slot to free anywhere and re-validate. Errors only
+    /// when no connection is open and every re-dial failed.
     async fn acquire_slot(&self) -> Result<(&PoolConnection, OwnedSemaphorePermit)> {
-        // Fast path: most-free connection with an immediately available slot.
-        let mut by_free: Vec<&PoolConnection> = self.connections.iter().collect();
-        by_free.sort_by_key(|connection| std::cmp::Reverse(connection.slots.available_permits()));
-        for connection in by_free {
-            if let Ok(permit) = connection.slots.clone().try_acquire_owned() {
-                return Ok((connection, permit));
+        let mut last_redial_error: Option<anyhow::Error> = None;
+        loop {
+            // Snapshot free slots and liveness. `try_read` so a re-dial in
+            // progress (write-locked) counts as closed for this pass instead
+            // of stalling it; the revival path below waits for it if needed.
+            let free: Vec<usize> = self
+                .connections
+                .iter()
+                .map(|connection| connection.slots.available_permits())
+                .collect();
+            let open: Vec<bool> = self
+                .connections
+                .iter()
+                .map(|connection| {
+                    connection
+                        .handle
+                        .try_read()
+                        .map(|handle| !handle.is_closed())
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            // Fast path: an open connection with a free slot, most free first.
+            if let Some(index) = pick_connection(&open, &free) {
+                let connection = self
+                    .connections
+                    .get(index)
+                    .context("pick_connection returned an out-of-range index")?;
+                if let Ok(permit) = connection.slots.clone().try_acquire_owned() {
+                    return Ok((connection, permit));
+                }
+                // Lost the race for that slot; re-snapshot.
+                continue;
+            }
+
+            // No open connection has a free slot. Revive closed connections
+            // (most free slots first), one dial attempt each; collect
+            // everything usable for the waiting path below.
+            let mut usable: Vec<&PoolConnection> = self
+                .connections
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| open.get(*index).copied().unwrap_or(false))
+                .map(|(_, connection)| connection)
+                .collect();
+            let mut closed: Vec<usize> = (0..self.connections.len())
+                .filter(|index| !open.get(*index).copied().unwrap_or(false))
+                .collect();
+            closed.sort_by_key(|index| std::cmp::Reverse(free.get(*index).copied().unwrap_or(0)));
+            for index in closed {
+                let Some(connection) = self.connections.get(index) else {
+                    continue;
+                };
+                match self.ensure_open(connection).await {
+                    Ok(()) => {
+                        if let Ok(permit) = connection.slots.clone().try_acquire_owned() {
+                            return Ok((connection, permit));
+                        }
+                        // Re-dialed, but its slots are still held by stale
+                        // channels that have not been dropped yet.
+                        usable.push(connection);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            connection = index,
+                            error = %format!("{err:#}"),
+                            "re-dial of closed SSH connection failed; skipping it for this slot"
+                        );
+                        last_redial_error = Some(err);
+                    }
+                }
+            }
+
+            if usable.is_empty() {
+                let detail = last_redial_error
+                    .as_ref()
+                    .map(|err| format!("{err:#}"))
+                    .unwrap_or_else(|| "no re-dial was attempted".to_string());
+                bail!(
+                    "all {} SSH connections to {} are closed (the gateway disconnects a \
+                     connection when its last channel closes); re-dial failed: {detail}",
+                    self.connections.len(),
+                    self.endpoint
+                );
+            }
+
+            // Every usable connection is fully busy: wait for the first slot
+            // to free on any of them, then re-validate — the winner may have
+            // been closed by the gateway while we waited. Each semaphore
+            // queue is FIFO, so waiters cannot starve; losing acquire futures
+            // are dropped without consuming a permit.
+            let waiters: Vec<_> = usable
+                .iter()
+                .map(|connection| Box::pin(connection.slots.clone().acquire_owned()))
+                .collect();
+            let (permit, winner, _rest) = futures_util::future::select_all(waiters).await;
+            let permit = permit.context("gateway pool slot semaphore closed")?;
+            let connection = *usable
+                .get(winner)
+                .context("gateway pool slot index out of range")?;
+            match self.ensure_open(connection).await {
+                Ok(()) => return Ok((connection, permit)),
+                Err(err) => {
+                    tracing::warn!(
+                        connection = connection.index,
+                        error = %format!("{err:#}"),
+                        "connection closed while waiting for a slot and its re-dial failed"
+                    );
+                    last_redial_error = Some(err);
+                    // Other connections may still be usable; take another pass.
+                }
             }
         }
+    }
 
-        // All slots busy: wait on every connection's semaphore and take
-        // whichever frees first (each queue is FIFO, so waiters cannot
-        // starve; losing acquire futures are dropped without consuming a
-        // permit).
-        let waiters: Vec<_> = self
-            .connections
-            .iter()
-            .map(|connection| Box::pin(connection.slots.clone().acquire_owned()))
-            .collect();
-        let (permit, index, _rest) = futures_util::future::select_all(waiters).await;
-        let permit = permit.context("gateway pool slot semaphore closed")?;
-        let connection = self
-            .connections
-            .get(index)
-            .context("gateway pool slot index out of range")?;
-        Ok((connection, permit))
+    /// Make sure `connection` has a live SSH connection, re-dialing it once
+    /// if the gateway has dropped it. Concurrent callers serialize on the
+    /// connection's write lock; whoever loses that race finds a fresh handle
+    /// and skips its own re-dial.
+    async fn ensure_open(&self, connection: &PoolConnection) -> Result<()> {
+        if !connection.handle.read().await.is_closed() {
+            return Ok(());
+        }
+        let mut handle = connection.handle.write().await;
+        // Re-check under the write lock: another acquirer may have re-dialed
+        // while we waited for it.
+        if !handle.is_closed() {
+            return Ok(());
+        }
+        tracing::debug!(
+            connection = connection.index,
+            endpoint = %self.endpoint,
+            "SSH connection closed (gateway disconnects on last channel close); re-dialing"
+        );
+        *handle = connect_one(
+            &self.endpoint,
+            &self.key,
+            &self.policy,
+            &self.key_path,
+            connection.index,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "re-dial of SSH connection {} to {} failed",
+                connection.index, self.endpoint
+            )
+        })?;
+        Ok(())
     }
 }
 
-/// Open one session channel on `handle`, exec the daemon command, and wait
-/// for the gateway to confirm it. `exec` only sends the request; the
+/// Dial and authenticate one SSH connection to the gateway. Used for the
+/// initial pool dial and for lazily re-dialing a connection the gateway has
+/// closed (it disconnects a connection whenever its last channel closes).
+async fn connect_one(
+    endpoint: &Endpoint,
+    key: &Arc<russh::keys::PrivateKey>,
+    policy: &Arc<HostKeyPolicy>,
+    key_path: &Path,
+    index: usize,
+) -> Result<russh::client::Handle<ReplayHandler>> {
+    let config = Arc::new(russh::client::Config {
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        nodelay: true,
+        ..Default::default()
+    });
+    let handler = ReplayHandler {
+        policy: policy.clone(),
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+    };
+    let mut handle =
+        russh::client::connect(config, (endpoint.host.as_str(), endpoint.port), handler)
+            .await
+            .with_context(|| format!("failed to establish SSH connection {index} to {endpoint}"))?;
+
+    // The gateway only advertises publickey auth. For RSA keys ask which
+    // rsa-sha2 variant the server supports; for anything else (ed25519 in
+    // practice) the hash parameter is ignored.
+    let hash_alg = if key.algorithm().is_rsa() {
+        handle
+            .best_supported_rsa_hash()
+            .await
+            .context("failed to query the gateway's supported RSA signature hashes")?
+            .flatten()
+    } else {
+        None
+    };
+    let auth = handle
+        .authenticate_publickey("rio", PrivateKeyWithHashAlg::new(key.clone(), hash_alg))
+        .await
+        .with_context(|| {
+            format!("publickey authentication failed on connection {index} to {endpoint}")
+        })?;
+    ensure!(
+        auth.success(),
+        "the gateway rejected the SSH key {} — its public half must be in the gateway's \
+         authorized keys with the comment naming the tenant; grant it with \
+         `cargo xtask k8s grant <pubkey> --tenant <name>`, or use the key `deploy` installed \
+         (the private half of RIO_SSH_PUBKEY)",
+        key_path.display()
+    );
+    tracing::debug!(index, endpoint = %endpoint, "gateway SSH connection authenticated");
+    Ok(handle)
+}
+
+/// Open one session channel on `connection`, exec the daemon command, and
+/// wait for the gateway to confirm it. `exec` only sends the request; the
 /// accept/reject verdict arrives as a channel message (the gateway re-checks
 /// its 4-channel budget at exec time).
 async fn exec_daemon(
-    handle: &russh::client::Handle<ReplayHandler>,
+    connection: &PoolConnection,
+    endpoint: &Endpoint,
 ) -> Result<russh::Channel<russh::client::Msg>> {
-    let mut channel = handle.channel_open_session().await.context(
-        "failed to open an SSH session channel (the gateway allows at most 4 per connection)",
-    )?;
+    let mut channel = {
+        let handle = connection.handle.read().await;
+        if handle.is_closed() {
+            bail!(
+                "SSH connection {} to {endpoint} is closed (gateway disconnect or keepalive \
+                 timeout)",
+                connection.index
+            );
+        }
+        handle
+            .channel_open_session()
+            .await
+            .context("failed to open an SSH session channel")?
+    };
     channel
         .exec(true, DAEMON_COMMAND)
         .await
         .context("failed to send the nix-daemon exec request")?;
+    // Bailing on any arm below (or later, before the handshake completes)
+    // does not leak the server-side slot: our dropped channel sends an SSH
+    // close, and the gateway's own 30s handshake reaper tears down sessions
+    // that never complete the worker-protocol handshake.
     loop {
         match channel.wait().await {
             Some(russh::ChannelMsg::Success) => return Ok(channel),
@@ -559,6 +777,8 @@ pub struct DaemonChannel {
     reader: ReadHalf<GatewayStream>,
     writer: BufWriter<WriteHalf<GatewayStream>>,
     negotiated_version: u64,
+    /// Index of the pool connection this channel runs on (for triage logs).
+    connection_index: usize,
     /// Slot on the owning connection; released on drop.
     _slot: OwnedSemaphorePermit,
 }
@@ -567,6 +787,12 @@ impl DaemonChannel {
     /// Worker-protocol version negotiated during the handshake.
     pub fn negotiated_version(&self) -> u64 {
         self.negotiated_version
+    }
+
+    /// Index (within the pool) of the SSH connection this channel runs on —
+    /// for correlating channel failures with a specific connection in logs.
+    pub fn connection_index(&self) -> usize {
+        self.connection_index
     }
 
     /// `wopQueryValidPaths`: which of `paths` does the target already have?
@@ -787,6 +1013,22 @@ mod tests {
         // Capacity: connections × 4.
         assert_eq!(pool_capacity(8), 32);
         assert_eq!(pool_capacity(1), 4);
+    }
+
+    #[test]
+    fn pick_connection_skips_closed_and_prefers_most_free() {
+        // A closed connection is never picked, even though the gateway
+        // dropping it left it with the most free slots.
+        assert_eq!(pick_connection(&[false, true], &[4, 2]), Some(1));
+        // Among open connections the most free slots win; ties keep the
+        // lowest index.
+        assert_eq!(pick_connection(&[true, true, true], &[1, 3, 3]), Some(1));
+        // Open but fully busy connections are not picked.
+        assert_eq!(pick_connection(&[true, true], &[0, 0]), None);
+        // All closed (or an empty pool) yields None — the caller then tries
+        // to re-dial closed connections instead.
+        assert_eq!(pick_connection(&[false, false], &[4, 4]), None);
+        assert_eq!(pick_connection(&[], &[]), None);
     }
 
     #[test]
