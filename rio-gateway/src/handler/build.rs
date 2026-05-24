@@ -19,6 +19,7 @@ use tonic::transport::Channel;
 use tracing::{debug, instrument, warn};
 
 use super::grpc::{grpc_is_valid_path, resolve_floating_outputs};
+use super::log_tail::{LogTailSet, TaggedLogChunk};
 use super::{GatewayError, PROGRAM_NAME, SessionContext, with_jwt};
 use crate::drv_cache::resolve_derivation;
 use crate::quota::{QuotaCache, QuotaVerdict, human_bytes};
@@ -266,7 +267,12 @@ async fn stop_subst_pair<W: AsyncWrite + Unpin>(
 /// `--log-format bar` show the last line under the owning build;
 /// fallback to `STDERR_NEXT` when no activity exists for this drv
 /// (logs arriving before `Derivation::Started`, or gateway-originated
-/// diagnostics like the `trace_id` line).
+/// diagnostics like the `trace_id` line). Lines arriving in the
+/// 0–2 s post-terminal drain window also take the fallback: the
+/// activity is stopped in the same `Completed`/`Failed` iteration that
+/// arms the tail's drain grace, so a failed build's final lines print
+/// inline rather than under a (now-closed) activity — the designed
+/// cost of draining the log tail rather than cancelling it.
 async fn relay_log_batch<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     act: &BuildActivityState,
@@ -673,6 +679,13 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
 /// Process a BuildEvent stream from the scheduler and translate events
 /// into STDERR protocol messages for the Nix client.
 ///
+/// Also consumes the build's log-tail output channel: build-log lines
+/// no longer arrive on the scheduler's event stream (`Event::Log` is a
+/// dead variant pending deletion) — they arrive from per-derivation
+/// `TailLog` subscriptions to rio-store, managed by `tails` and fed
+/// through `log_rx`. The two sources are `select!`ed so a quiet
+/// scheduler stream doesn't starve the live tail and vice versa.
+///
 /// Returns the final BuildResult on success, or a typed error.
 #[instrument(skip_all)]
 async fn process_build_events<W: AsyncWrite + Unpin>(
@@ -681,12 +694,54 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
     active_build_ids: &mut HashMap<String, u64>,
     reconnect_attempts: &mut u32,
     act: &mut BuildActivityState,
+    tails: &mut LogTailSet,
+    log_rx: &mut tokio::sync::mpsc::Receiver<TaggedLogChunk>,
 ) -> Result<BuildEventOutcome, StreamProcessError> {
-    while let Some(event) = event_stream
-        .message()
-        .await
-        .map_err(StreamProcessError::Transport)?
-    {
+    // Disarms the log-tail branch if the channel ever closes. `None`
+    // is unreachable while the LogTailSet (which holds a sender clone
+    // for the build's lifetime) is alive — but without this guard,
+    // `recv()` on a closed drained channel returns `Ready(None)`
+    // immediately, that branch wins every `select!` iteration, and the
+    // loop spins at 100% CPU. The guard makes the failure mode "no
+    // live tail" instead.
+    let mut log_open = true;
+    loop {
+        // Both arms are cancel-safe: `Streaming::message` keeps its
+        // decode state in the stream itself (a partially-received
+        // frame resumes on the next poll), and `Receiver::recv` is
+        // documented cancel-safe.
+        let event = tokio::select! {
+            msg = event_stream.message() => {
+                match msg.map_err(StreamProcessError::Transport)? {
+                    Some(event) => event,
+                    // Stream ended without a terminal event (scheduler
+                    // disconnected). Do NOT send STDERR_ERROR here:
+                    // submit_and_process_build catches this Err and
+                    // converts it to Ok(BuildResult::failure), which
+                    // callers then send via STDERR_LAST + BuildResult.
+                    // Sending STDERR_ERROR first would produce an
+                    // invalid STDERR_ERROR -> STDERR_LAST sequence.
+                    //
+                    // EofWithoutTerminal: clean stream close (Ok(None)).
+                    // This IS what a scheduler failover looks like —
+                    // k8s pod kill → SIGTERM → graceful shutdown → TCP
+                    // FIN. The caller's reconnect loop retries this the
+                    // same as Transport.
+                    None => return Err(StreamProcessError::EofWithoutTerminal),
+                }
+            }
+            chunk = log_rx.recv(), if log_open => {
+                match chunk {
+                    Some(chunk) => relay_log_batch(stderr, act, chunk.into_batch()).await?,
+                    None => {
+                        debug!("log-tail channel closed while the build is still running");
+                        log_open = false;
+                    }
+                }
+                continue;
+            }
+        };
+
         // Reset reconnect counter on first SUCCESSFUL event from
         // the stream (not on WatchBuild Ok() — that only proves
         // the scheduler accepted the RPC, not that the stream is
@@ -704,7 +759,15 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
 
         use types::build_event::Event;
         match event.event {
-            Some(Event::Log(log_batch)) => relay_log_batch(stderr, act, log_batch).await?,
+            // Build-log lines no longer travel on the scheduler stream.
+            // A legacy scheduler that still emits Event::Log (it cannot
+            // — the builder stopped producing the batches that fed it —
+            // but the variant exists until the proto cleanup) is
+            // ignored rather than double-relayed alongside the TailLog
+            // subscription for the same derivation.
+            Some(Event::Log(_)) => {
+                debug!("ignoring Event::Log from the scheduler (the log data plane is rio-store)");
+            }
             Some(Event::Phase(phase)) => {
                 // r[impl gw.stderr.result.set-phase]
                 // Builder forwarded the daemon's SetPhase. Attach to the
@@ -720,6 +783,22 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                 }
             }
             Some(Event::Derivation(drv_event)) => {
+                // The live-tail subscription lifecycle keys off the
+                // same events that drive the actBuild activities, but
+                // BEFORE relay_derivation_status: its Started arm
+                // early-returns on a duplicate Started (re-using the
+                // existing activity id), while a duplicate Started
+                // carrying a NEW exec_id must still replace the
+                // subscription (the old execution's log is dead).
+                match drv_event.kind() {
+                    types::DerivationEventKind::Started => {
+                        tails.on_started(&drv_event.derivation_path, &drv_event.exec_id);
+                    }
+                    types::DerivationEventKind::Completed | types::DerivationEventKind::Failed => {
+                        tails.on_terminal(&drv_event.derivation_path);
+                    }
+                    _ => {}
+                }
                 relay_derivation_status(stderr, act, drv_event).await?;
             }
             Some(Event::SubstituteProgress(p)) => {
@@ -749,18 +828,6 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
             None => {}
         }
     }
-
-    // Stream ended without a terminal event (scheduler disconnected).
-    // Do NOT send STDERR_ERROR here: submit_and_process_build catches this
-    // Err and converts it to Ok(BuildResult::failure), which callers then
-    // send via STDERR_LAST + BuildResult. Sending STDERR_ERROR here first
-    // would produce an invalid STDERR_ERROR -> STDERR_LAST frame sequence.
-    //
-    // EofWithoutTerminal: clean stream close (Ok(None)). This IS
-    // what a scheduler failover looks like — k8s pod kill → SIGTERM
-    // → graceful shutdown → TCP FIN. The caller's reconnect loop
-    // retries this the same as Transport.
-    Err(StreamProcessError::EofWithoutTerminal)
 }
 
 /// Outcome of processing a build event stream.
@@ -903,6 +970,7 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
 async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
+    log_client: &rio_proto::LogServiceClient<Channel>,
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashMap<String, u64>,
     jwt_token: Option<&str>,
@@ -945,6 +1013,12 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // stop_activity derivations whose Started arrived on the prior
     // stream and keep attaching log lines / phase to the right aid.
     let mut act = BuildActivityState::default();
+    // Live-tail subscriptions to rio-store, one per building
+    // derivation. Like `act`, the set survives scheduler-stream
+    // reconnects — the subscriptions are independent of the scheduler
+    // connection (a scheduler failover must not restart the log tail
+    // from line 0).
+    let (mut tails, mut log_rx) = LogTailSet::new(log_client.clone());
 
     let outcome = loop {
         match process_build_events(
@@ -953,6 +1027,8 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             active_build_ids,
             &mut reconnect_attempts,
             &mut act,
+            &mut tails,
+            &mut log_rx,
         )
         .await
         {
@@ -1089,6 +1165,22 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         active_build_ids.remove(&build_id);
     }
 
+    // Build terminus for the live tail: relay any log chunks that have
+    // already reached the gateway (the per-derivation drain grace may
+    // still be delivering a failed build's final lines), then
+    // hard-cancel the subscription tasks. Non-blocking — the user is
+    // about to receive their BuildResult and a bounded wait here would
+    // delay it; lines that have not yet crossed the store→gateway hop
+    // are dropped (they remain durable and readable via `rio-cli
+    // logs`). Skipped on a Wire error for the same reason as the
+    // activity drain below: the client is gone.
+    if !matches!(outcome, Err(StreamProcessError::Wire(_))) {
+        while let Ok(chunk) = log_rx.try_recv() {
+            let _ = relay_log_batch(stderr, &act, chunk.into_batch()).await;
+        }
+    }
+    tails.abort_all();
+
     // Best-effort terminal drain: a Wire error means the client is
     // gone (write would BrokenPipe), and the writer may already be
     // poisoned. nom tolerates unstopped activities (closes on EOF),
@@ -1141,6 +1233,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let negotiated_version = ctx.negotiated_version;
     let SessionContext {
         store_client,
+        log_client,
         scheduler_client,
         drv_cache,
         has_seen_build_paths_with_results,
@@ -1272,6 +1365,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let mut build_result = match submit_and_process_build(
         stderr,
         scheduler_client,
+        log_client,
         request,
         active_build_ids,
         jwt.token(),
@@ -1687,6 +1781,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 ) -> anyhow::Result<DagSubmitOutcome> {
     let SessionContext {
         store_client,
+        log_client,
         scheduler_client,
         drv_cache,
         active_build_ids,
@@ -1725,6 +1820,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     let result = submit_and_process_build(
         stderr,
         scheduler_client,
+        log_client,
         request,
         active_build_ids,
         jwt.token(),

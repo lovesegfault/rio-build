@@ -7,10 +7,14 @@
 // connect-web's server-streaming client returns an async iterable; we
 // drive it with a `for await` IIFE and push decoded lines into the
 // reactive array. The AbortController gives callers a destroy() that
-// cancels the underlying fetch — Envoy sees the client going away and
-// closes the upstream h2 stream, which the scheduler's tonic handler
+// cancels the underlying fetch — the proxy sees the client going away
+// and closes the upstream h2 stream, which the store's tonic handler
 // observes as a dropped receiver.
-import { admin } from '../api/admin';
+//
+// The stream comes from rio-store's LogService (build logs live in the
+// store as immutable chunks + a PG manifest), not the scheduler's
+// AdminService — see api/logs.ts.
+import { logs } from '../api/logs';
 
 // r[impl dash.stream.log-tail+2]
 // r[impl dash.log.cap]
@@ -71,8 +75,14 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
       // owns it — would ride along with a P0392-adjacent virtualization
       // follow-on if one is written). For now the stream lives and dies
       // with the component.
-      const stream = admin.getDerivationLogs(
-        { derivationPath: drvPath ?? '', execId, sinceLine: 0n },
+      //
+      // follow: false — one-shot drain of the stored chunks (plus the
+      // live in-memory buffer if the execution is still ingesting).
+      // The TailLog reconnect contract (re-open at last_received+1 on
+      // premature end) is what a future follow-mode would implement;
+      // the one-shot read doesn't need it.
+      const stream = logs.tailLog(
+        { derivation: drvPath ?? '', execId, sinceLine: 0n, follow: false },
         { signal: ctrl.signal },
       );
       for await (const chunk of stream) {
@@ -105,25 +115,26 @@ export function createLogStream(drvPath?: string, execId = ''): LogStream {
           truncated = true;
           droppedLines += excess;
         }
-        // The scheduler sets is_complete on the final chunk once the
-        // build terminates (success or failure). We stop iterating
-        // rather than waiting for the server to close the stream — the
-        // two happen near-simultaneously but this lets the UI flip the
-        // "done" indicator one chunk sooner.
+        // The store stamps is_complete on the final chunk when the
+        // execution is terminal AND the chunk manifest contiguously
+        // covers [0, final_line_count). We stop iterating rather than
+        // waiting for the server to close the stream — the two happen
+        // near-simultaneously but this lets the UI flip the "done"
+        // indicator one chunk sooner.
         if (chunk.isComplete) {
           done = true;
           return;
         }
       }
       // Generator exhausted without isComplete — the build is still
-      // running (ring-buffer snapshot), the stored blob is a `.partial`
-      // periodic snapshot whose final flush never landed (leader
-      // failover, dropped FlushRequest), or the server shut down
-      // mid-stream. Treat as done so the spinner doesn't lie, but flag
-      // the content as incomplete so LogViewer can render a banner —
-      // the missing tail is usually the build error itself. The error
-      // path below does NOT set this: the err banner already signals
-      // abnormal termination.
+      // running (the live ingest buffer was drained), the execution was
+      // cancelled, the final lines never reached the store (the
+      // builder's drain deadline expired during a store outage), or the
+      // server shut down mid-stream. Treat as done so the spinner
+      // doesn't lie, but flag the content as incomplete so LogViewer
+      // can render a banner — the missing tail is usually the build
+      // error itself. The error path below does NOT set this: the err
+      // banner already signals abnormal termination.
       // r[impl obs.log.incomplete-surfaced]
       incomplete = true;
       done = true;

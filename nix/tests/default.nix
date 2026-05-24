@@ -1034,10 +1034,14 @@ in
   #   works through the nginx→Cilium Gateway→scheduler chain. Handler
   #   returns errors as in-stream items (not tonic Trailers-Only) so
   #   tonic-web encodes them as 0x80 body frames browser fetch can read.
+  #   The LogViewer's post-cutover log-read path (nginx → rio-store
+  #   LogService/TailLog, the second upstream + cross-namespace Service)
+  #   gets the same 0x80 assertion in dashboard.nix subtest (4b).
   #
   #   Appended (when `dockerImages ? dashboard`): the nginx-pod curl
   #   assertions from dashboard.nix — SPA served + try_files fallback
-  #   + gRPC-Web 0x00/0x80 THROUGH nginx + method-gate 404. Coverage
+  #   + gRPC-Web 0x00/0x80 THROUGH nginx (scheduler AND store upstreams)
+  #   + method-gate 404. Coverage
   #   mode (no rio-dashboard image) runs the gateway/EDS/tonic-web
   #   subtests only; the nginx pod is absent so its curls are skipped.
   vm-dashboard-k3s = dashboard-gateway {

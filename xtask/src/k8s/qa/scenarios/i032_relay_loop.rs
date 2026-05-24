@@ -36,23 +36,34 @@ impl Scenario for RelayLoop {
         );
         ctx.nix_build_via_gateway(0, &tag, 3, 1).await?;
 
-        // The builder's stdout is relayed via scheduler→gateway. The
-        // direct user-facing assert (captured `nix build` stdout)
-        // would be tighter, but `smoke_build` swallows it. Leader log
-        // is the next-best observable: GetDerivationLogs / relay traces
-        // include the line.
+        // The tag is embedded in the derivation NAME
+        // (`rio-smoke-<tag>-…`), so it appears in the scheduler
+        // leader's dispatch/completion trace lines for the build. That
+        // is the control-plane evidence I-032 actually protects: the
+        // relay pump delivering the WorkAssignmentAck/CompletionReport
+        // (the messages that were lost when the pump didn't watch
+        // `target.changed()`). The builder's log *content* no longer
+        // transits the scheduler at all — it goes builder → rio-store
+        // AppendLog and is read back via TailLog (asserted by the
+        // vm-observability/log-service scenarios).
+        // TODO: once QaCtx exposes the built .drv path, additionally
+        // assert `rio-cli logs <drv>` (against RIO_STORE_ADDR) contains
+        // the tag — the user-facing "my build's output is readable"
+        // property for the post-cutover data plane.
         let leader = ctx.scheduler_leader().await?;
         let logs = ctx.kubectl(&["-n", crate::k8s::NS, "logs", &leader, "--since=60s"])?;
         if logs.contains(&tag) {
             Ok(Verdict::Pass)
         } else {
             // Fail-closed: if the tag isn't in scheduler logs, the
-            // relay either dropped it or scheduler logging changed.
-            // Distinguishable via the build itself succeeding (it did,
-            // or `?` above would've propagated).
+            // relay either dropped the completion or scheduler logging
+            // changed. Distinguishable via the build itself succeeding
+            // (it did, or `?` above would've propagated).
             Ok(Verdict::Fail(format!(
                 "build completed but tag '{tag}' absent from scheduler-leader \
-                 logs — relay pump may not be forwarding builder stdout"
+                 logs — the relay pump may not be forwarding builder \
+                 control messages (the drv name appears in dispatch/\
+                 completion traces)"
             )))
         }
     }

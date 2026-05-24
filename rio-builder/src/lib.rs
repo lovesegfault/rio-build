@@ -36,6 +36,7 @@ pub mod health;
 pub mod hw_bench;
 pub mod hw_class;
 pub mod log_stream;
+pub mod log_upload;
 pub(crate) mod overlay;
 pub mod quota;
 pub mod runtime;
@@ -252,5 +253,19 @@ pub fn describe_metrics() {
          pseudo-dirs under /sys/fs/cgroup; pod restart clears them. \
          Sustained rate = builds not reaping cleanly (investigate \
          cgroup.kill timing or zombie builders)."
+    );
+    describe_counter!(
+        "rio_builder_log_append_reconnects_total",
+        "AppendLog stream reconnects (the log stream to rio-store died and \
+         the un-acked tail was replayed into a fresh session). Nonzero \
+         during store deploys is expected; sustained = the store is \
+         flapping or a replica cannot commit chunks."
+    );
+    describe_counter!(
+        "rio_builder_log_drain_abandoned_total",
+        "Builds whose log upload gave up with un-acked lines after the \
+         post-completion drain deadline (10 min of store unavailability). \
+         Each increment is durable log loss for one build — the lines \
+         exist nowhere. Alert on any increase."
     );
 }

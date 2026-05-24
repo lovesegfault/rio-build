@@ -292,6 +292,8 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     let (_store, store_addr, store_handle) = spawn_mock_store().await?;
     let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
     let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     // Build SessionContext directly and seed the map. This is the
@@ -299,6 +301,7 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     // constructs a fresh (empty-map) context internally.
     let mut ctx = SessionContext::new(
         store_client,
+        log_client,
         scheduler_client,
         None,                                     // tenant
         rio_gateway::handler::SessionJwt::none(), // jwt
@@ -392,10 +395,13 @@ async fn test_read_error_cancels_active_builds() -> anyhow::Result<()> {
     let (_store, store_addr, store_handle) = spawn_mock_store().await?;
     let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
     let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let mut ctx = SessionContext::new(
         store_client,
+        log_client,
         scheduler_client,
         None,
         rio_gateway::handler::SessionJwt::none(),

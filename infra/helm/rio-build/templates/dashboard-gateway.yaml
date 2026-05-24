@@ -81,6 +81,59 @@ spec:
       backendRefs:
         - name: rio-scheduler
           port: 9001
+---
+# ── Build logs: rio-store's LogService ────────────────────────────────
+# The one dashboard RPC that doesn't go to the scheduler — build logs
+# live in rio-store (immutable chunks + a PG manifest). A separate
+# HTTPRoute (not another match in rio-scheduler-readonly) because a
+# rule's backendRefs are all-or-nothing per rule and the store is a
+# different backend in a different namespace. Read-only and
+# unauthenticated (the same posture as the GetDerivationLogs route it
+# replaces); the method-gate parity check diffs this route's paths
+# against the nginx allow-list alongside rio-scheduler-readonly's.
+#
+# Cross-namespace backendRef (rio-system → rio-store) requires the
+# ReferenceGrant below in the TARGET namespace — without it the
+# Gateway controller sets ResolvedRefs=False/RefNotPermitted and the
+# route 500s.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rio-store-logs-readonly
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  parentRefs:
+    - name: rio-dashboard
+  rules:
+    - matches:
+        - path: { type: Exact, value: /rio.store.LogService/TailLog }
+      backendRefs:
+        - name: rio-store
+          namespace: {{ .Values.namespaces.store.name }}
+          port: 9002
+---
+# Allows the HTTPRoute above (in {{ $ns }}) to reference the rio-store
+# Service (in {{ .Values.namespaces.store.name }}). Scoped to exactly
+# one (from-kind, from-namespace) → (to-kind, to-name) pair — this does
+# NOT open the store namespace to arbitrary cross-namespace refs.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: rio-dashboard-logs-to-store
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ $ns }}
+  to:
+    - group: ""
+      kind: Service
+      name: rio-store
 {{- if .Values.dashboard.enableMutatingMethods }}
 ---
 # ── Mutating methods: gated behind values flag ────────────────────────

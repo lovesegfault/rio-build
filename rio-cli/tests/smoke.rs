@@ -18,7 +18,7 @@
 
 use std::process::Command;
 
-use rio_test_support::grpc::spawn_mock_admin;
+use rio_test_support::grpc::{spawn_mock_admin, spawn_mock_store};
 
 /// Invoke rio-cli with `args` pointed at `addr`. Returns (status, stdout, stderr).
 ///
@@ -35,11 +35,24 @@ fn run_cli(
     addr: &std::net::SocketAddr,
     args: &[&str],
 ) -> (std::process::ExitStatus, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rio-cli"))
-        .args(args)
-        .env("RIO_SCHEDULER_ADDR", addr.to_string())
-        .output()
-        .expect("spawn rio-cli");
+    run_cli_env(addr, args, &[])
+}
+
+/// [`run_cli`] with extra env vars. The `logs` subcommand talks to the
+/// STORE's LogService (build logs live in rio-store), so its tests pass
+/// `RIO_STORE_ADDR` pointing at a [`spawn_mock_store`] alongside the
+/// scheduler mock every other subcommand uses.
+fn run_cli_env(
+    addr: &std::net::SocketAddr,
+    args: &[&str],
+    extra_env: &[(&str, String)],
+) -> (std::process::ExitStatus, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rio-cli"));
+    cmd.args(args).env("RIO_SCHEDULER_ADDR", addr.to_string());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn rio-cli");
     (
         out.status,
         String::from_utf8(out.stdout).expect("rio-cli stdout is utf8"),
@@ -209,36 +222,62 @@ async fn status_human_output_has_all_sections() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn logs_drains_stream_and_prints_bytes() -> anyhow::Result<()> {
+    // `logs` is a store-only subcommand (build logs live in rio-store's
+    // LogService, not on the scheduler) — it needs RIO_STORE_ADDR
+    // pointing at a mock store; the scheduler mock is irrelevant to it
+    // but run_cli always sets RIO_SCHEDULER_ADDR.
     let (_admin, addr, _handle) = spawn_mock_admin().await?;
+    let (store, store_addr, _store_handle) = spawn_mock_store().await?;
 
-    // MockAdmin's get_derivation_logs sends one chunk with b"mock log line"
-    // and is_complete=true. The CLI writes each line raw + newline and,
-    // because the terminal chunk is complete, must NOT emit the
-    // "(log incomplete …)" stderr warning.
-    let (status, stdout, stderr) = run_cli(&addr, &["logs", "/nix/store/abc-foo.drv"]);
+    // One chunk with b"mock log line" and is_complete=true. The CLI
+    // writes each line raw + newline and, because the terminal chunk is
+    // complete, must NOT emit the "(log incomplete …)" stderr warning.
+    let mut chunk = rio_test_support::grpc::MockStore::tail_chunk(0, &["mock log line"]);
+    chunk.is_complete = true;
+    store.seed_tail_log("/nix/store/abc-foo.drv", vec![chunk]);
+
+    let (status, stdout, stderr) = run_cli_env(
+        &addr,
+        &["logs", "/nix/store/abc-foo.drv"],
+        &[("RIO_STORE_ADDR", store_addr.to_string())],
+    );
     assert!(status.success(), "logs: {stderr}");
     assert_eq!(stdout, "mock log line\n");
     assert!(
         !stderr.contains("log incomplete"),
         "unexpected incomplete warning for a complete log: {stderr:?}"
     );
+    // The CLI's one-shot drain sends follow=false — a follow=true here
+    // would hold the stream open and hang the drain loop forever.
+    let calls = store.calls.tail_calls.read().unwrap();
+    assert_eq!(calls.len(), 1, "expected exactly one TailLog call");
+    assert!(!calls[0].follow, "rio-cli logs must send follow=false");
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn logs_warns_on_incomplete_terminal_chunk() -> anyhow::Result<()> {
-    let (admin, addr, _handle) = spawn_mock_admin().await?;
-    // Flip the mock so its single chunk carries is_complete=false — the
-    // shape try_s3 produces for a `.partial` blob (periodic snapshot whose
-    // final flush never landed) and try_ring_buffer for a still-running
-    // build. The lines must still print to stdout, the incompleteness must
-    // be flagged on stderr, and the exit code stays 0 (an incomplete log
+    let (_admin, addr, _handle) = spawn_mock_admin().await?;
+    let (store, store_addr, _store_handle) = spawn_mock_store().await?;
+    // The single chunk carries is_complete=false (tail_chunk's default)
+    // — the shape the store produces for a still-running build, a
+    // cancelled execution, or a log whose final lines never landed. The
+    // lines must still print to stdout, the incompleteness must be
+    // flagged on stderr, and the exit code stays 0 (an incomplete log
     // is not a command failure — the build may simply still be running).
-    admin
-        .log_incomplete
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    store.seed_tail_log(
+        "/nix/store/abc-foo.drv",
+        vec![rio_test_support::grpc::MockStore::tail_chunk(
+            0,
+            &["mock log line"],
+        )],
+    );
 
-    let (status, stdout, stderr) = run_cli(&addr, &["logs", "/nix/store/abc-foo.drv"]);
+    let (status, stdout, stderr) = run_cli_env(
+        &addr,
+        &["logs", "/nix/store/abc-foo.drv"],
+        &[("RIO_STORE_ADDR", store_addr.to_string())],
+    );
     assert!(status.success(), "logs: {stderr}");
     assert_eq!(stdout, "mock log line\n");
     assert!(

@@ -336,12 +336,13 @@ let
   # a matching rebuild.
   #
   # r[dash.auth.method-gate+3] readonly allow-list. MUST match the
-  # rio-scheduler-readonly HTTPRoute in dashboard-gateway.yaml — the
-  # dashboard-method-gate-parity check (nix/misc-checks.nix) diffs the
-  # two and fails CI on divergence. nginx is reached via `kubectl
-  # port-forward svc/rio-dashboard` (in-cluster, hits nginx directly,
-  # NOT the Gateway), so it must enforce the same allow-list or
-  # mutating RPCs are fail-OPEN to any port-forwarded browser.
+  # rio-scheduler-readonly + rio-store-logs-readonly HTTPRoutes in
+  # dashboard-gateway.yaml — the dashboard-method-gate-parity check
+  # (nix/misc-checks.nix) diffs the two and fails CI on divergence.
+  # nginx is reached via `kubectl port-forward svc/rio-dashboard`
+  # (in-cluster, hits nginx directly, NOT the Gateway), so it must
+  # enforce the same allow-list or mutating RPCs are fail-OPEN to any
+  # port-forwarded browser.
   dashboardReadonlyAdmin = [
     "ClusterStatus"
     "ListExecutors"
@@ -355,6 +356,11 @@ let
   dashboardReadonlyScheduler = [
     "WatchBuild"
     "QueryBuildStatus"
+  ];
+  # rio-store's LogService — the build-log read path. Routed to the
+  # rio_store upstream (rio-store.rio-store:9002), not the scheduler.
+  dashboardReadonlyStoreLogs = [
+    "TailLog"
   ];
   # nginx with njs: r[sched.sla.threat.read-path-auth] gates
   # ListPoisoned/ListTenants/GetBuildGraph on a service token. The
@@ -380,6 +386,7 @@ let
     spaRoot = rioDashboard;
     readonlyAdminAlt = lib.concatStringsSep "|" dashboardReadonlyAdmin;
     readonlySchedulerAlt = lib.concatStringsSep "|" dashboardReadonlyScheduler;
+    readonlyStoreLogsAlt = lib.concatStringsSep "|" dashboardReadonlyStoreLogs;
   };
 
   mkImage =
@@ -431,7 +438,8 @@ rec {
   # independently.
   dashboardReadonlyMethods =
     map (m: "/rio.admin.AdminService/${m}") dashboardReadonlyAdmin
-    ++ map (m: "/rio.scheduler.SchedulerService/${m}") dashboardReadonlyScheduler;
+    ++ map (m: "/rio.scheduler.SchedulerService/${m}") dashboardReadonlyScheduler
+    ++ map (m: "/rio.store.LogService/${m}") dashboardReadonlyStoreLogs;
 
   # Exported for checks.dashboard-nginx-conf-guard (misc-checks.nix).
   inherit dashboardNginxConf dashboardNginx;

@@ -58,6 +58,7 @@ pub(in crate::executor) async fn run_daemon_build(
     opts: DaemonBuildOpts,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
+    upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
 ) -> (Result<BuildResult, ExecutorError>, u64) {
     // Returned alongside the result on every path so the caller can set
     // the footer banner's `first_line_number`. Setup failures (stdin/
@@ -115,7 +116,7 @@ pub(in crate::executor) async fn run_daemon_build(
     // byte-limit, msg-cap) live INSIDE read_build_stderr_loop's select!
     // and `break Ok(Some(BuildResult::failure(..)))`. That converges
     // them on `state.final_flush()` (so the trailing ≤63 buffered lines
-    // reach log_tx) AND maps each to a non-reassignable proto status.
+    // reach upload_tx) AND maps each to a non-reassignable proto status.
     // Timeout is a BUILD OUTCOME, not an executor error: returning Err
     // would land in runtime.rs's InfrastructureFailure arm →
     // reassignment storm (same build, same inputs, same timeout,
@@ -138,6 +139,7 @@ pub(in crate::executor) async fn run_daemon_build(
         negotiated_version,
         batcher,
         log_tx,
+        upload_tx,
     )
     .await;
 
@@ -166,7 +168,26 @@ type LoopOutcome = Result<Option<BuildResult>, wire::WireError>;
 /// the actual work lives next to the state it mutates.
 struct StderrLoop<'a> {
     batcher: LogBatcher,
+    /// Control-plane channel to the scheduler. Carries `BuildPhase`
+    /// state edges only — log batches go to `upload_tx`. Closure means
+    /// the scheduler stream is gone (the build's completion can't be
+    /// reported either), so phase-send failure still aborts the loop.
     log_tx: &'a mpsc::Sender<ExecutorMessage>,
+    /// Data-plane channel to the per-build [`crate::log_upload::LogUploader`]
+    /// (which streams to rio-store's `AppendLog`). Bounded (256) as
+    /// ordinary queue slack between the loop and the uploader task. Store
+    /// slowness does NOT backpressure this channel — the uploader absorbs
+    /// it into its in-memory retransmit buffer (see `log_upload.rs`'s
+    /// module doc for the real memory bound: the per-build log-size cap
+    /// plus per-line overhead, inside the pod's memory limit). Closure
+    /// means the uploader task exited (it only does so by panicking while
+    /// input is open) — the build continues and discards log output rather
+    /// than failing, per "a build is never failed because its log could
+    /// not be persisted".
+    upload_tx: &'a mpsc::Sender<rio_proto::types::BuildLogBatch>,
+    /// Set after the first failed send to `upload_tx` so the
+    /// degraded-to-discarding warning fires once, not per batch.
+    upload_lost: bool,
     /// Count of STDERR messages seen so far; bounded by
     /// [`MAX_BUILD_STDERR_MESSAGES`].
     msg_count: u64,
@@ -182,14 +203,35 @@ impl<'a> StderrLoop<'a> {
     fn new(
         batcher: LogBatcher,
         log_tx: &'a mpsc::Sender<ExecutorMessage>,
+        upload_tx: &'a mpsc::Sender<rio_proto::types::BuildLogBatch>,
         silence: Duration,
     ) -> Self {
         Self {
             batcher,
             log_tx,
+            upload_tx,
+            upload_lost: false,
             msg_count: 0,
             last_output: Instant::now(),
             silence,
+        }
+    }
+
+    /// Send a log batch to the per-build uploader. Never aborts the
+    /// loop: a closed upload channel means the uploader task panicked,
+    /// and a build is never failed because its log could not be
+    /// persisted — degrade to discarding output and warn once.
+    async fn send_log_batch(&mut self, batch: rio_proto::types::BuildLogBatch) {
+        if self.upload_lost {
+            return;
+        }
+        if self.upload_tx.send(batch).await.is_err() {
+            self.upload_lost = true;
+            tracing::warn!(
+                drv_path = %self.batcher.drv_path(),
+                "log upload channel closed (uploader task died); \
+                 discarding further log output for this build"
+            );
         }
     }
 
@@ -204,25 +246,19 @@ impl<'a> StderrLoop<'a> {
                 Continue(())
             }
             AddLineResult::BatchReady(batch) => {
-                if send_batch(self.log_tx, batch).await {
-                    self.last_output = Instant::now();
-                    Continue(())
-                } else {
-                    Break(Ok(Some(misc_fail(
-                        "log channel closed during build (scheduler stream gone)",
-                    ))))
-                }
+                self.send_log_batch(batch).await;
+                self.last_output = Instant::now();
+                Continue(())
             }
             // r[impl builder.log-limit+2]
             AddLineResult::LimitExceeded { reason } => {
                 // Flush what's buffered so client sees output up to
                 // the limit. final_flush() also drains
                 // lines_dropped_this_window (has_pending() doesn't
-                // cover that). Best-effort: channel-closed is moot,
-                // we're breaking anyway.
+                // cover that). Best-effort — we're breaking anyway.
                 let batch = self.batcher.final_flush();
                 if !batch.lines.is_empty() {
-                    let _ = send_batch(self.log_tx, batch).await;
+                    self.send_log_batch(batch).await;
                 }
                 tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
                 Break(Ok(Some(BuildResult::failure(
@@ -241,17 +277,16 @@ impl<'a> StderrLoop<'a> {
     /// emits phase markers but no actual output is still "silent" by
     /// the maxSilentTime contract — same rule as Progress chatter).
     ///
-    /// Flushes any buffered log lines first: `BuildPhase` carries no
-    /// `first_line_number`, so if the phase marker overtook the ≤63
-    /// lines awaiting `flush_tick` on `log_tx` the gateway/nom could
-    /// not reorder them. This is the only `Continue` path that sends
-    /// directly on `log_tx` instead of going through the batcher; the
-    /// pre-flush keeps the channel's order monotone.
+    /// Flushes any buffered log lines first: a phase marker is the
+    /// human-readable boundary between log sections, so the ≤63 lines
+    /// awaiting `flush_tick` should reach the store before the phase
+    /// edge reaches the scheduler. (The two now travel on different
+    /// channels to different services, so this is best-effort ordering
+    /// for a human tailing the log, not a protocol invariant.)
     async fn forward_phase(&mut self, phase: &str) -> std::ops::ControlFlow<LoopOutcome> {
-        if self.batcher.has_pending() && !send_batch(self.log_tx, self.batcher.flush()).await {
-            return std::ops::ControlFlow::Break(Ok(Some(misc_fail(
-                "log channel closed during build (scheduler stream gone)",
-            ))));
+        if self.batcher.has_pending() {
+            let batch = self.batcher.flush();
+            self.send_log_batch(batch).await;
         }
         let msg = ExecutorMessage {
             msg: Some(executor_message::Msg::Phase(rio_proto::types::BuildPhase {
@@ -347,17 +382,15 @@ impl<'a> StderrLoop<'a> {
     /// paused-time test mode. The tick already proved 100ms of
     /// tokio-time elapsed.
     async fn flush_tick(&mut self) -> std::ops::ControlFlow<LoopOutcome> {
-        if self.batcher.has_pending() && !send_batch(self.log_tx, self.batcher.flush()).await {
-            std::ops::ControlFlow::Break(Ok(Some(misc_fail(
-                "log channel closed during build (scheduler stream gone)",
-            ))))
-        } else {
-            std::ops::ControlFlow::Continue(())
+        if self.batcher.has_pending() {
+            let batch = self.batcher.flush();
+            self.send_log_batch(batch).await;
         }
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Best-effort final flush after the loop exits. The build result is
-    /// already determined; if the log channel is closed, just drop.
+    /// already determined; if the upload channel is closed, just drop.
     async fn final_flush(&mut self) {
         // Unconditional: final_flush() drains lines_dropped_this_window
         // even when self.lines is empty (the case has_pending()
@@ -365,7 +398,7 @@ impl<'a> StderrLoop<'a> {
         // nothing came out.
         let batch = self.batcher.final_flush();
         if !batch.lines.is_empty() {
-            let _ = send_batch(self.log_tx, batch).await;
+            self.send_log_batch(batch).await;
         }
     }
 
@@ -376,20 +409,6 @@ impl<'a> StderrLoop<'a> {
     fn line_count(&self) -> u64 {
         self.batcher.line_count()
     }
-}
-
-/// Send a log batch on the executor stream. Returns `false` if the
-/// channel is closed (scheduler stream gone). Free fn (not a method on
-/// `StderrLoop`) so callers can `batcher.flush()` (mutable self.batcher)
-/// in the same expression without a split-borrow dance.
-async fn send_batch(
-    log_tx: &mpsc::Sender<ExecutorMessage>,
-    batch: rio_proto::types::BuildLogBatch,
-) -> bool {
-    let msg = ExecutorMessage {
-        msg: Some(executor_message::Msg::LogBatch(batch)),
-    };
-    log_tx.send(msg).await.is_ok()
 }
 
 fn misc_fail(m: &str) -> BuildResult {
@@ -412,9 +431,11 @@ fn misc_fail(m: &str) -> BuildResult {
 /// task means the read future is never cancelled; only the `recv()` side
 /// of the channel is — and `mpsc::Receiver::recv()` is cancel-safe.
 ///
-/// If the log channel closes during the build, returns `MiscFailure` —
+/// If the scheduler control channel (`log_tx`, which now carries only
+/// `BuildPhase` edges) closes during the build, returns `MiscFailure` —
 /// the scheduler stream is gone, so there's no way to report completion
-/// anyway.
+/// anyway. The log-batch channel (`upload_tx`) closing does NOT fail the
+/// build; see [`StderrLoop::send_log_batch`].
 async fn read_build_stderr_loop<R>(
     reader: R,
     max_silent_time: u64,
@@ -422,6 +443,7 @@ async fn read_build_stderr_loop<R>(
     negotiated_version: u64,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
+    upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
 ) -> (Result<BuildResult, wire::WireError>, u64)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -442,7 +464,12 @@ where
     // tokio::time::advance and the error message can name the
     // configured seconds.
     let build_deadline = Instant::now() + build_timeout;
-    let mut state = StderrLoop::new(batcher, log_tx, Duration::from_secs(max_silent_time));
+    let mut state = StderrLoop::new(
+        batcher,
+        log_tx,
+        upload_tx,
+        Duration::from_secs(max_silent_time),
+    );
 
     // Spawn the owned reader task. It reads one StderrMessage at a time and
     // pushes to `msg_tx`. Terminal messages (Last, Error, wire Err) break the
@@ -540,7 +567,7 @@ where
             // (or the silence arm) wins on the same iteration; this is
             // the absolute backstop. Breaking out of the loop reaches
             // final_flush below — symmetric with the silence arm so the
-            // last ≤63 buffered lines reach log_tx instead of being
+            // last ≤63 buffered lines reach upload_tx instead of being
             // dropped with the future (the previous outer-timeout shape).
             _ = tokio::time::sleep_until(build_deadline) => {
                 tracing::warn!(
@@ -623,40 +650,21 @@ mod tests {
     }
 
     /// Run read_build_stderr_loop against a Cursor of `input` bytes with a
-    /// fresh batcher. Returns (result, all batches received on log_rx).
+    /// fresh batcher. Returns (result, control messages received on the
+    /// scheduler channel, log batches received on the upload channel).
     async fn run_loop(
         input: Vec<u8>,
-    ) -> (Result<BuildResult, wire::WireError>, Vec<ExecutorMessage>) {
-        let batcher = LogBatcher::new(
-            "/nix/store/test.drv".into(),
-            "test-worker".into(),
-            crate::log_stream::LogLimits::UNLIMITED,
-            0,
-        );
-        let (tx, mut rx) = mpsc::channel(128);
-        let cursor = std::io::Cursor::new(input);
-        // Discard the final line count — these tests assert on the
-        // BuildResult and batch contents, not the footer offset.
-        let (result, _final_line_count) =
-            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
-                .await;
-        drop(tx);
-        let mut batches = Vec::new();
-        while let Some(m) = rx.recv().await {
-            batches.push(m);
-        }
-        (result, batches)
+    ) -> (
+        Result<BuildResult, wire::WireError>,
+        Vec<ExecutorMessage>,
+        Vec<rio_proto::types::BuildLogBatch>,
+    ) {
+        run_loop_with_limits(input, crate::log_stream::LogLimits::UNLIMITED).await
     }
 
     /// Count total log lines across all received BuildLogBatch messages.
-    fn count_log_lines(batches: &[ExecutorMessage]) -> usize {
-        batches
-            .iter()
-            .filter_map(|m| match &m.msg {
-                Some(executor_message::Msg::LogBatch(b)) => Some(b.lines.len()),
-                _ => None,
-            })
-            .sum()
+    fn count_log_lines(batches: &[rio_proto::types::BuildLogBatch]) -> usize {
+        batches.iter().map(|b| b.lines.len()).sum()
     }
 
     /// Happy path: STDERR_NEXT ×2, STDERR_LAST, BuildResult{Built}.
@@ -671,7 +679,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, batches) = run_loop(buf).await;
+        let (result, _msgs, batches) = run_loop(buf).await;
         let br = result.expect("loop should succeed");
         assert_eq!(br.status, BuildStatus::Built);
         // The loop owns the batcher and does a final flush after
@@ -693,7 +701,7 @@ mod tests {
             // NO finish() — STDERR_ERROR terminates the loop.
         }
 
-        let (result, _batches) = run_loop(buf).await;
+        let (result, _msgs, _batches) = run_loop(buf).await;
         let br = result.expect("daemon error is Ok(failure), not Err");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert_eq!(br.error_msg, "compile error: missing ;");
@@ -707,7 +715,7 @@ mod tests {
         wire::write_u64(&mut buf, STDERR_READ).await?;
         wire::write_u64(&mut buf, 42).await?;
 
-        let (result, _) = run_loop(buf).await;
+        let (result, _, _) = run_loop(buf).await;
         let br = result.expect("STDERR_READ is Ok(failure), not Err");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert!(
@@ -718,20 +726,28 @@ mod tests {
         Ok(())
     }
 
-    /// Log channel closed mid-build → MiscFailure. The scheduler stream is
-    /// gone so there's no way to report completion anyway.
+    /// Upload channel closed mid-build → the build CONTINUES and the log
+    /// output is discarded. The upload channel only closes if the
+    /// uploader task panicked; a build is never failed because its log
+    /// could not be persisted. (Before the log data plane moved to
+    /// rio-store, log batches and the completion report shared the
+    /// scheduler stream, so a closed log channel doomed the build
+    /// anyway and failing fast was correct. They no longer share a
+    /// fate.)
     #[tokio::test]
-    async fn test_stderr_loop_log_channel_closed_returns_failure() -> anyhow::Result<()> {
+    async fn test_stderr_loop_upload_channel_closed_continues_build() -> anyhow::Result<()> {
         // Feed enough STDERR_NEXT to force a batch flush (MAX_BATCH_LINES=64).
-        // The 65th add_line returns Some(batch); send_batch fails because rx
-        // is dropped.
+        // The 65th add_line returns a full batch; the send fails because
+        // upload_rx is dropped — the loop must keep going to STDERR_LAST.
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
             for i in 0..65 {
                 w.log(&format!("line {i}")).await?;
             }
+            w.finish().await?;
         }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         let batcher = LogBatcher::new(
             "/nix/store/test.drv".into(),
@@ -739,20 +755,32 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx); // channel closed before loop starts
+        let (tx, _rx) = mpsc::channel(8);
+        let (upload_tx, upload_rx) = mpsc::channel(1);
+        drop(upload_rx); // uploader task "died" before the loop starts
         let cursor = std::io::Cursor::new(buf);
 
-        let (result, _) =
-            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
-                .await;
-        let br = result.expect("channel-closed is Ok(failure)");
-        assert_eq!(br.status, BuildStatus::MiscFailure);
-        assert!(
-            br.error_msg.contains("log channel closed"),
-            "got: {}",
-            br.error_msg
+        let (result, final_line_count) = read_build_stderr_loop(
+            cursor,
+            0,
+            NO_BUILD_TIMEOUT,
+            PROTOCOL_VERSION,
+            batcher,
+            &tx,
+            &upload_tx,
+        )
+        .await;
+        let br = result.expect("upload-channel-closed must not fail the build");
+        assert_eq!(
+            br.status,
+            BuildStatus::Built,
+            "the build's own outcome is unaffected by log-persistence loss"
         );
+        // The batcher still accounted for every line even though none
+        // were delivered — the footer offset and the CompletionReport's
+        // final_line_count must not regress just because the uploader
+        // died.
+        assert_eq!(final_line_count, 65);
         Ok(())
     }
 
@@ -788,7 +816,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, batches) = run_loop(buf).await;
+        let (result, _msgs, batches) = run_loop(buf).await;
         let br = result.expect("should succeed");
         assert_eq!(br.status, BuildStatus::Built);
         // None of these messages produce log lines.
@@ -818,10 +846,12 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, mut log_rx) = mpsc::channel(8);
+        let (log_tx, _log_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (upload_tx, mut log_rx) = mpsc::channel(8);
 
         // Spawn the loop. It will read from read_half (which we write to).
         let loop_handle = tokio::spawn(async move {
+            let _keep = _log_rx;
             read_build_stderr_loop(
                 read_half,
                 0,
@@ -829,6 +859,7 @@ mod tests {
                 PROTOCOL_VERSION,
                 batcher,
                 &log_tx,
+                &upload_tx,
             )
             .await
             // Discard the final line count — these tests assert on the
@@ -862,12 +893,9 @@ mod tests {
         }
 
         // After the tick: batch with our one line should have arrived.
-        let msg = log_rx
+        let batch = log_rx
             .try_recv()
             .expect("batch should be flushed by the interval tick during silence");
-        let Some(executor_message::Msg::LogBatch(batch)) = msg.msg else {
-            panic!("expected LogBatch, got {:?}", msg.msg);
-        };
         assert_eq!(batch.lines.len(), 1);
         assert_eq!(batch.lines[0], b"line before silence");
 
@@ -907,9 +935,11 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, mut log_rx) = mpsc::channel(8);
+        let (log_tx, _log_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (upload_tx, mut log_rx) = mpsc::channel(8);
 
         let loop_handle = tokio::spawn(async move {
+            let _keep = _log_rx;
             read_build_stderr_loop(
                 read_half,
                 0,
@@ -917,6 +947,7 @@ mod tests {
                 PROTOCOL_VERSION,
                 batcher,
                 &log_tx,
+                &upload_tx,
             )
             .await
             // Discard the final line count — these tests assert on the
@@ -962,12 +993,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let msg = log_rx.try_recv().expect(
+        let batch = log_rx.try_recv().expect(
             "protocol should be intact: partial-then-complete write across a tick must not desync",
         );
-        let Some(executor_message::Msg::LogBatch(batch)) = msg.msg else {
-            panic!("expected LogBatch, got {:?}", msg.msg);
-        };
         assert_eq!(batch.lines.len(), 1);
         assert_eq!(
             batch.lines[0], b"intact-payload",
@@ -995,14 +1023,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Spawn read_build_stderr_loop with the given silence timeout.
-    /// Returns (write_half, log_rx, loop_handle) for paused-time
-    /// orchestration.
+    /// Returns (write_half, upload_rx, loop_handle) for paused-time
+    /// orchestration. The control channel (phases) is created internally
+    /// and discarded — the silence/deadline tests assert on log batches.
     #[allow(clippy::type_complexity)]
     fn spawn_loop_with_silence(
         max_silent_time: u64,
     ) -> (
         tokio::io::DuplexStream,
-        mpsc::Receiver<ExecutorMessage>,
+        mpsc::Receiver<rio_proto::types::BuildLogBatch>,
         tokio::task::JoinHandle<Result<BuildResult, wire::WireError>>,
     ) {
         let (write_half, read_half) = tokio::io::duplex(4096);
@@ -1012,8 +1041,13 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, log_rx) = mpsc::channel(8);
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let (upload_tx, upload_rx) = mpsc::channel(8);
         let handle = tokio::spawn(async move {
+            // Keep the control receiver alive for the loop's lifetime so
+            // a phase forward (none of these tests send one) wouldn't
+            // spuriously abort.
+            let _keep = _log_rx;
             read_build_stderr_loop(
                 read_half,
                 max_silent_time,
@@ -1021,13 +1055,14 @@ mod tests {
                 PROTOCOL_VERSION,
                 batcher,
                 &log_tx,
+                &upload_tx,
             )
             .await
             // Discard the final line count — these tests assert on the
             // BuildResult and batch contents, not the footer offset.
             .0
         });
-        (write_half, log_rx, handle)
+        (write_half, upload_rx, handle)
     }
 
     /// Yield a few times so spawned tasks drain mpsc channels. Under
@@ -1181,7 +1216,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, batches) = run_loop(buf).await;
+        let (result, _msgs, batches) = run_loop(buf).await;
         result.expect("should succeed");
         // The 3 lines MUST be in the batches (final flush fired).
         assert_eq!(
@@ -1201,7 +1236,11 @@ mod tests {
     async fn run_loop_with_limits(
         input: Vec<u8>,
         limits: crate::log_stream::LogLimits,
-    ) -> (Result<BuildResult, wire::WireError>, Vec<ExecutorMessage>) {
+    ) -> (
+        Result<BuildResult, wire::WireError>,
+        Vec<ExecutorMessage>,
+        Vec<rio_proto::types::BuildLogBatch>,
+    ) {
         let batcher = LogBatcher::new(
             "/nix/store/test.drv".into(),
             "test-worker".into(),
@@ -1209,18 +1248,31 @@ mod tests {
             0,
         );
         let (tx, mut rx) = mpsc::channel(128);
+        let (upload_tx, mut upload_rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
         // Discard the final line count — these tests assert on the
         // BuildResult and batch contents, not the footer offset.
-        let (result, _final_line_count) =
-            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
-                .await;
+        let (result, _final_line_count) = read_build_stderr_loop(
+            cursor,
+            0,
+            NO_BUILD_TIMEOUT,
+            PROTOCOL_VERSION,
+            batcher,
+            &tx,
+            &upload_tx,
+        )
+        .await;
         drop(tx);
-        let mut batches = Vec::new();
+        drop(upload_tx);
+        let mut msgs = Vec::new();
         while let Some(m) = rx.recv().await {
-            batches.push(m);
+            msgs.push(m);
         }
-        (result, batches)
+        let mut batches = Vec::new();
+        while let Some(b) = upload_rx.recv().await {
+            batches.push(b);
+        }
+        (result, msgs, batches)
     }
 
     /// Rate limit suppresses excess lines; build continues to completion.
@@ -1237,7 +1289,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, batches) = run_loop_with_limits(
+        let (result, _msgs, batches) = run_loop_with_limits(
             buf,
             crate::log_stream::LogLimits {
                 rate_lines_per_sec: 5,
@@ -1276,7 +1328,7 @@ mod tests {
             w.log("line-3").await?;
         }
 
-        let (result, batches) = run_loop_with_limits(
+        let (result, _msgs, batches) = run_loop_with_limits(
             buf,
             crate::log_stream::LogLimits {
                 rate_lines_per_sec: 0,
@@ -1313,7 +1365,7 @@ mod tests {
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         // run_loop uses UNLIMITED internally.
-        let (result, batches) = run_loop(buf).await;
+        let (result, _msgs, batches) = run_loop(buf).await;
         let br = result.expect("should succeed");
         assert_eq!(br.status, BuildStatus::Built);
         assert_eq!(count_log_lines(&batches), 200);
@@ -1405,7 +1457,7 @@ mod tests {
         // triggers on the failure shape (which we've argued is
         // impossible since the parser is status-agnostic, but the
         // test makes that argument executable).
-        let (result, batches) = tokio::time::timeout(Duration::from_secs(5), run_loop(buf))
+        let (result, _msgs, batches) = tokio::time::timeout(Duration::from_secs(5), run_loop(buf))
             .await
             .expect("stderr loop should return promptly on failure BuildResult, not hang");
 
@@ -1454,7 +1506,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, msgs) = run_loop(buf).await;
+        let (result, msgs, batches) = run_loop(buf).await;
         result.expect("should succeed");
         // Phase arrives as its own ExecutorMessage::Phase, separate from
         // the LogBatch containing "compiling".
@@ -1469,7 +1521,7 @@ mod tests {
         assert_eq!(phases[0].phase, "buildPhase");
         assert_eq!(phases[0].derivation_path, "/nix/store/test.drv");
         // The log line still lands in a LogBatch.
-        assert_eq!(count_log_lines(&msgs), 1);
+        assert_eq!(count_log_lines(&batches), 1);
         Ok(())
     }
 
@@ -1515,7 +1567,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, batches) = run_loop(buf).await;
+        let (result, _msgs, batches) = run_loop(buf).await;
         let br = result.expect("should succeed");
         assert_eq!(br.status, BuildStatus::Built);
         // 3 log lines captured (101×2 + 107×1). Progress (105) NOT captured.
@@ -1547,7 +1599,7 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, batches) = run_loop_with_limits(
+        let (result, _msgs, batches) = run_loop_with_limits(
             buf,
             crate::log_stream::LogLimits {
                 rate_lines_per_sec: 5,
@@ -1571,14 +1623,17 @@ mod tests {
     // variants. Regression: forward_phase / discard arm previously bypassed.
     // -----------------------------------------------------------------------
 
-    fn mk_stderr_loop(tx: &mpsc::Sender<ExecutorMessage>) -> StderrLoop<'_> {
+    fn mk_stderr_loop<'a>(
+        tx: &'a mpsc::Sender<ExecutorMessage>,
+        upload_tx: &'a mpsc::Sender<rio_proto::types::BuildLogBatch>,
+    ) -> StderrLoop<'a> {
         let batcher = LogBatcher::new(
             "/nix/store/t.drv".into(),
             "w".into(),
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        StderrLoop::new(batcher, tx, Duration::ZERO)
+        StderrLoop::new(batcher, tx, upload_tx, Duration::ZERO)
     }
 
     /// Hitting the cap MUST be a build outcome (`LogLimitExceeded`),
@@ -1605,7 +1660,8 @@ mod tests {
     async fn test_dispatch_msg_cap_covers_set_phase() {
         use std::ops::ControlFlow::*;
         let (tx, _rx) = mpsc::channel(8);
-        let mut state = mk_stderr_loop(&tx);
+        let (upload_tx, _upload_rx) = mpsc::channel(8);
+        let mut state = mk_stderr_loop(&tx, &upload_tx);
         state.msg_count = MAX_BUILD_STDERR_MESSAGES - 2;
         let phase_msg = || StderrMessage::Result {
             activity_id: 0,
@@ -1623,7 +1679,8 @@ mod tests {
     async fn test_dispatch_msg_cap_covers_discard_arm() {
         use std::ops::ControlFlow::*;
         let (tx, _rx) = mpsc::channel(8);
-        let mut state = mk_stderr_loop(&tx);
+        let (upload_tx, _upload_rx) = mpsc::channel(8);
+        let mut state = mk_stderr_loop(&tx, &upload_tx);
         state.msg_count = MAX_BUILD_STDERR_MESSAGES - 2;
         let act_msg = || StderrMessage::StartActivity {
             id: 1,
@@ -1643,7 +1700,8 @@ mod tests {
     async fn test_dispatch_msg_cap_covers_next() {
         use std::ops::ControlFlow::*;
         let (tx, _rx) = mpsc::channel(8);
-        let mut state = mk_stderr_loop(&tx);
+        let (upload_tx, _upload_rx) = mpsc::channel(8);
+        let mut state = mk_stderr_loop(&tx, &upload_tx);
         state.msg_count = MAX_BUILD_STDERR_MESSAGES - 2;
         assert!(matches!(
             state.dispatch(StderrMessage::Next("a".into())).await,
@@ -1677,8 +1735,10 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, mut log_rx) = mpsc::channel(8);
+        let (log_tx, _log_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (upload_tx, mut log_rx) = mpsc::channel(8);
         let loop_handle = tokio::spawn(async move {
+            let _keep = _log_rx;
             read_build_stderr_loop(
                 read_half,
                 0,
@@ -1686,6 +1746,7 @@ mod tests {
                 PROTOCOL_VERSION,
                 batcher,
                 &log_tx,
+                &upload_tx,
             )
             .await
             // Discard the final line count — these tests assert on the
@@ -1736,10 +1797,13 @@ mod tests {
 
     // r[verify builder.stderr.forward-set-phase]
     /// A `SetPhase` arriving immediately after a buffered log line MUST
-    /// NOT overtake it on `log_tx`: `forward_phase` flushes the batcher
-    /// first. Regression: previously the line stayed in the batcher
-    /// until `final_flush` (after STDERR_LAST), so the receiver saw
-    /// `Phase` at index 0 and `LogBatch` at index 1.
+    /// flush that line to the upload channel before the phase edge is
+    /// forwarded to the scheduler. The two now travel on different
+    /// channels (log batches → the per-build uploader → rio-store;
+    /// phase edges → the scheduler stream), so the observable property
+    /// is "the buffered line is not held until final_flush" — the
+    /// pre-phase flush produces a dedicated batch — rather than a
+    /// single-channel index ordering.
     #[tokio::test]
     async fn test_stderr_loop_phase_after_buffered_line_preserves_order() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::{ResultField, ResultType};
@@ -1762,25 +1826,25 @@ mod tests {
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
-        let (result, msgs) = run_loop(buf).await;
+        let (result, msgs, batches) = run_loop(buf).await;
         result.expect("should succeed");
-        assert_eq!(msgs.len(), 2, "one LogBatch + one Phase: {msgs:?}");
+        assert_eq!(msgs.len(), 1, "exactly one Phase control message: {msgs:?}");
         assert!(
             matches!(
                 &msgs[0].msg,
-                Some(executor_message::Msg::LogBatch(b)) if b.lines == [b"configuring...".to_vec()]
-            ),
-            "msgs[0] must be the buffered log line, got: {:?}",
-            msgs[0]
-        );
-        assert!(
-            matches!(
-                &msgs[1].msg,
                 Some(executor_message::Msg::Phase(p)) if p.phase == "buildPhase"
             ),
-            "msgs[1] must be the phase marker, got: {:?}",
-            msgs[1]
+            "the control channel carries the phase marker, got: {:?}",
+            msgs[0]
         );
+        // The pre-phase flush emits the buffered line as its own batch
+        // (it would otherwise sit in the batcher until final_flush).
+        assert_eq!(
+            batches.len(),
+            1,
+            "the buffered line is flushed by forward_phase, not held: {batches:?}"
+        );
+        assert_eq!(batches[0].lines, [b"configuring...".to_vec()]);
         Ok(())
     }
 
@@ -1808,11 +1872,13 @@ mod tests {
             0,
         );
         let (tx, _rx) = mpsc::channel(8);
+        let (upload_tx, _upload_rx) = mpsc::channel(8);
         let cursor = std::io::Cursor::new(buf);
-        let br = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, v136, batcher, &tx)
-            .await
-            .0
-            .expect("1.36-serialized BuildResult must parse at negotiated_version=1.36");
+        let br =
+            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, v136, batcher, &tx, &upload_tx)
+                .await
+                .0
+                .expect("1.36-serialized BuildResult must parse at negotiated_version=1.36");
         assert_eq!(br.status, BuildStatus::Built);
         assert_eq!(br.times_built, 1);
         Ok(())

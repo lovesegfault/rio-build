@@ -61,7 +61,8 @@ async fn run(kind: ExecutorKind, drv: &[u8], assignment_flag: bool) -> Result<()
     // dead_channel: never dials — the gate fires before any gRPC call.
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
-    execute_build(&assignment, &env, &mut store, &log_tx, 0)
+    let (upload_tx, _upload_rx) = tokio::sync::mpsc::channel(1);
+    execute_build(&assignment, &env, &mut store, &log_tx, &upload_tx, 0)
         .await
         .result
         .map(|_| ())
@@ -185,17 +186,18 @@ async fn wrong_kind_gate_ignores_lying_scheduler_flag_builder() {
 // r[verify obs.log.worker-header]
 #[tokio::test]
 async fn banner_header_gated_on_first_attempt() {
-    use rio_proto::types::executor_message;
-
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(ExecutorKind::Builder, dir.path());
     let assignment = make_assignment(NON_FOD_DRV, false);
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
 
-    // First attempt (`first_line == 0`): header at line 0.
-    let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 0).await;
-    drop(log_tx);
+    // First attempt (`first_line == 0`): header at line 0. The banner
+    // travels on the log-upload channel (to rio-store), not the
+    // scheduler control channel.
+    let (log_tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (upload_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, &upload_tx, 0).await;
+    drop(upload_tx);
     assert!(
         outcome.result.is_err(),
         "test layout has no overlay-capable filesystem; build must not proceed"
@@ -208,14 +210,10 @@ async fn banner_header_gated_on_first_attempt() {
         outcome.footer_result.is_none(),
         "no daemon ran; runtime must not send a footer"
     );
-    let msg = rx
+    let batch = rx
         .recv()
         .await
-        .expect("header batch must be on the channel");
-    let batch = match msg.msg.unwrap() {
-        executor_message::Msg::LogBatch(b) => b,
-        other => panic!("expected LogBatch, got {other:?}"),
-    };
+        .expect("header batch must be on the upload channel");
     assert_eq!(batch.first_line_number, 0);
     assert_eq!(batch.lines.len(), 3);
     assert!(
@@ -230,9 +228,10 @@ async fn banner_header_gated_on_first_attempt() {
     );
 
     // Retry attempt (`first_line > 0`): no header re-sent; offset held.
-    let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 3).await;
-    drop(log_tx);
+    let (log_tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (upload_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, &upload_tx, 3).await;
+    drop(upload_tx);
     assert!(outcome.result.is_err());
     assert_eq!(
         outcome.final_line_count, 3,
@@ -243,6 +242,7 @@ async fn banner_header_gated_on_first_attempt() {
         rx.recv().await.is_none(),
         "header must NOT be re-sent on a retried attempt"
     );
+    drop(log_tx);
 }
 
 /// Pre-header early returns (drv parse failure, WrongKind) never emit a
@@ -260,9 +260,19 @@ async fn pre_header_error_carries_caller_offset() {
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
 
     for first_line in [0u64, 7u64] {
-        let (log_tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let outcome = execute_build(&assignment, &env, &mut store, &log_tx, first_line).await;
+        let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (upload_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let outcome = execute_build(
+            &assignment,
+            &env,
+            &mut store,
+            &log_tx,
+            &upload_tx,
+            first_line,
+        )
+        .await;
         drop(log_tx);
+        drop(upload_tx);
         assert!(matches!(
             outcome.result,
             Err(ExecutorError::WrongKind { .. })

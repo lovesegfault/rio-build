@@ -153,6 +153,11 @@
       "doc": "Build log streaming via gRPC."
     },
     {
+      "path": "log_upload.rs",
+      "depth": 0,
+      "doc": "Per-build `AppendLog` client: streams log batches to rio-store with an"
+    },
+    {
       "path": "main.rs",
       "depth": 0,
       "doc": "rio-builder binary entry point."
@@ -536,6 +541,11 @@
       "path": "handler/grpc.rs",
       "depth": 1,
       "doc": "Store-query helpers using gRPC."
+    },
+    {
+      "path": "handler/log_tail.rs",
+      "depth": 1,
+      "doc": "Per-derivation live-tail subscriptions to rio-store's"
     },
     {
       "path": "handler/opcodes_read.rs",
@@ -976,6 +986,11 @@
       "path": "db/derivations.rs",
       "depth": 1,
       "doc": "Per-derivation state + poison tracking — `derivations` table."
+    },
+    {
+      "path": "db/executions.rs",
+      "depth": 1,
+      "doc": "Execution-lifecycle CRUD — `drv_executions` table."
     },
     {
       "path": "db/history.rs",

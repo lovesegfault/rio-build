@@ -89,6 +89,17 @@ export const adminMock = {
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;
 
+// rio-store LogService mock surface. The build-log read path moved off
+// AdminService — logs live in rio-store and logStream.svelte.ts calls
+// `logs.tailLog` (api/logs.ts) instead of `admin.getDerivationLogs`.
+// Tests that mount a LogViewer (directly or via BuildDrawer) add
+// `vi.mock('../../api/logs', () => ({ logs: logsMock }))` alongside the
+// admin mock; the empty-generator default keeps the `for await` from
+// crashing when the test doesn't care about the stream body.
+export const logsMock = {
+  tailLog: vi.fn(emptyStream) as Mock,
+} satisfies Record<string, Mock>;
+
 // toast.info/error stubs for components that surface RPC success/failure
 // via the toast portal. Tests that exercise those paths vi.mock the
 // toast module against this object (see DrainButton.test.ts). Tests
@@ -137,6 +148,7 @@ function applyDefaults(): void {
   adminMock.getDerivationLogs.mockImplementation(emptyStream);
   adminMock.triggerGC.mockImplementation(emptyStream);
   adminMock.getBuildGraph.mockImplementation(emptyGraph);
+  logsMock.tailLog.mockImplementation(emptyStream);
 }
 
 /**
@@ -150,6 +162,7 @@ function applyDefaults(): void {
 export function teardownStandardAfterEach(): void {
   vi.unstubAllGlobals();
   for (const fn of Object.values(adminMock)) fn.mockReset();
+  for (const fn of Object.values(logsMock)) fn.mockReset();
   applyDefaults();
   toastMock.info.mockReset();
   toastMock.error.mockReset();

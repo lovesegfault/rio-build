@@ -3,6 +3,7 @@
 use rio_common::signal::Token as CancellationToken;
 use rio_common::tenant::NormalizedName;
 use rio_gateway::session;
+use rio_proto::LogServiceClient;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use rio_test_support::grpc::{MockScheduler, MockStore, spawn_mock_scheduler, spawn_mock_store};
@@ -25,6 +26,7 @@ use tonic::transport::Channel;
 /// `StoreServiceImpl`-backed one.
 pub fn spawn_session_task(
     mut store_client: StoreServiceClient<Channel>,
+    mut log_client: LogServiceClient<Channel>,
     mut sched_client: SchedulerServiceClient<Channel>,
     tenant: Option<NormalizedName>,
     jwt: rio_gateway::handler::SessionJwt,
@@ -37,6 +39,7 @@ pub fn spawn_session_task(
             &mut r,
             &mut w,
             &mut store_client,
+            &mut log_client,
             &mut sched_client,
             tenant,
             jwt,
@@ -184,6 +187,10 @@ impl GatewaySession {
 
         let store_client: StoreServiceClient<Channel> =
             rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        // The log client shares the mock store's address — the mock
+        // serves LogService on the same port, mirroring production.
+        let log_client: LogServiceClient<Channel> =
+            rio_proto::client::connect_single(&store_addr.to_string()).await?;
         let scheduler_client: SchedulerServiceClient<Channel> =
             rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
@@ -195,6 +202,7 @@ impl GatewaySession {
         let shutdown = CancellationToken::new();
         let (stream, server_task) = spawn_session_task(
             store_client.clone(),
+            log_client,
             scheduler_client.clone(),
             tenant,
             jwt,

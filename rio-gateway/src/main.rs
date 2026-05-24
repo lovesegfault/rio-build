@@ -75,11 +75,22 @@ async fn main() -> anyhow::Result<()> {
     // - Single (non-K8s): plain connect. VM tests and local dev.
     //
     // `connect_forever` → `None` only on shutdown (clean exit).
-    let Some((store_client, scheduler_client, _balance_guard)) =
+    //
+    // The store connect uses `connect_raw` so the ONE balanced channel
+    // can back both store-side clients (`StoreService` for path/NAR
+    // ops, `LogService` for the build-log live tail) — the generated
+    // clients don't expose their inner channel for re-wrapping. Same
+    // pattern as the builder's `StoreClients`.
+    let Some((store_client, log_client, scheduler_client, _balance_guard)) =
         rio_proto::client::connect_forever(&shutdown, || async {
-            let (store, _) = rio_proto::client::connect(&cfg.store).await?;
+            use rio_proto::client::ProtoClient;
+            let (store_ch, _) =
+                rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store)
+                    .await?;
+            let store = rio_proto::StoreServiceClient::wrap(store_ch.clone());
+            let logs = rio_proto::LogServiceClient::wrap(store_ch);
             let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-            anyhow::Ok((store, sched, guard))
+            anyhow::Ok((store, logs, sched, guard))
         })
         .await
     else {
@@ -151,12 +162,17 @@ async fn main() -> anyhow::Result<()> {
         info!("x-rio-service-token minting enabled on store PutPath");
     }
 
-    let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
-        .with_rate_limiter(limiter)
-        .with_max_connections(cfg.max_connections)
-        .with_max_sessions(cfg.max_sessions)
-        .with_max_channels_per_connection(cfg.max_channels_per_connection)
-        .with_resolve_timeout(std::time::Duration::from_millis(cfg.resolve_timeout_ms));
+    let server = rio_gateway::GatewayServer::new(
+        store_client,
+        log_client,
+        scheduler_client,
+        authorized_keys,
+    )
+    .with_rate_limiter(limiter)
+    .with_max_connections(cfg.max_connections)
+    .with_max_sessions(cfg.max_sessions)
+    .with_max_channels_per_connection(cfg.max_channels_per_connection)
+    .with_resolve_timeout(std::time::Duration::from_millis(cfg.resolve_timeout_ms));
     let server = match service_signer {
         Some(s) => server.with_service_hmac_signer(s),
         None => server,

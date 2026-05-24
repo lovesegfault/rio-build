@@ -64,6 +64,16 @@ pub struct MockStoreState {
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
     /// `ChunkService.GetChunk` impl. Seed via [`MockStore::seed_chunked`].
     pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
+    /// `TailLog` script: derivation (verbatim request key — the mock
+    /// does no hash normalization) → the chunks one subscription
+    /// receives. The stream serves the scripted chunks then, mirroring
+    /// the real server, either ends (`follow: false` — the CLI's /
+    /// dashboard's one-shot drain) or stays open (`follow: true` — a
+    /// live subscription); an unscripted `follow: true` derivation gets
+    /// an empty held-open stream so background subscriptions for
+    /// derivations a test doesn't care about neither error nor spin in
+    /// a reconnect loop. Seed via [`MockStore::seed_tail_log`].
+    pub tail_logs: Arc<RwLock<HashMap<String, Vec<rio_proto::store::TailLogChunk>>>>,
 }
 
 /// Call recorders. The [`StoreService`] / [`ChunkService`] impls write
@@ -109,6 +119,10 @@ pub struct MockStoreCalls {
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
     pub query_realisation_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// Every `TailLog` request received, in arrival order. For
+    /// asserting the gateway's per-derivation subscription lifecycle
+    /// (one open per Started, `since_line` resumption, exec_id keying).
+    pub tail_calls: Arc<RwLock<Vec<rio_proto::store::TailLogRequest>>>,
 }
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
@@ -1085,5 +1099,95 @@ impl StoreService for MockStore {
         // SCHEDULER (HwTable::load), not anything that goes through
         // MockStore. Accept and discard.
         Ok(Response::new(()))
+    }
+}
+
+// r[impl ts.mock.store-chunk]
+/// `LogService` half of the mock store: a scriptable `TailLog` for the
+/// gateway's live-tail subscriptions. `AppendLog` is unimplemented —
+/// the builder's upload client has its own purpose-built mock
+/// (`rio-builder/src/log_upload.rs`) that needs ack-level control this
+/// shared mock doesn't.
+#[tonic::async_trait]
+impl rio_proto::store::log_service_server::LogService for MockStore {
+    type AppendLogStream =
+        tokio_stream::wrappers::ReceiverStream<Result<rio_proto::store::AppendLogAck, Status>>;
+    type TailLogStream =
+        tokio_stream::wrappers::ReceiverStream<Result<rio_proto::store::TailLogChunk, Status>>;
+
+    async fn append_log(
+        &self,
+        _request: Request<Streaming<rio_proto::store::AppendLogRequest>>,
+    ) -> Result<Response<Self::AppendLogStream>, Status> {
+        Err(Status::unimplemented(
+            "MockStore does not accept log appends",
+        ))
+    }
+
+    async fn tail_log(
+        &self,
+        request: Request<rio_proto::store::TailLogRequest>,
+    ) -> Result<Response<Self::TailLogStream>, Status> {
+        let req = request.into_inner();
+        let chunks = self
+            .state
+            .tail_logs
+            .read()
+            .unwrap()
+            .get(&req.derivation)
+            .cloned()
+            .unwrap_or_default();
+        let follow = req.follow;
+        self.calls.tail_calls.write().unwrap().push(req);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return;
+                }
+            }
+            // follow=false (the CLI / dashboard one-shot drain): the
+            // real server ends the stream after the stored chunks.
+            // Returning drops `tx` → the client's `message()` yields
+            // `None` → the drain loop completes.
+            if !follow {
+                return;
+            }
+            // follow=true: hold the stream open — a live subscription
+            // against a still-running build. Dropping the client side
+            // (the gateway aborting the subscription at build terminus)
+            // tears it down; the server task parks on the closed
+            // notification rather than leaking a busy loop.
+            tx.closed().await;
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+impl MockStore {
+    /// Script the chunks one `TailLog` subscription for `derivation`
+    /// receives. The subscription serves them in order and then stays
+    /// open (a live `follow` stream). The key is matched verbatim
+    /// against `TailLogRequest.derivation` — the gateway sends the full
+    /// drv path, so seed with the full drv path.
+    pub fn seed_tail_log(&self, derivation: &str, chunks: Vec<rio_proto::store::TailLogChunk>) {
+        self.state
+            .tail_logs
+            .write()
+            .unwrap()
+            .insert(derivation.to_string(), chunks);
+    }
+
+    /// One `TailLogChunk` of UTF-8 lines starting at `first_line`.
+    /// Convenience for [`Self::seed_tail_log`] callers.
+    pub fn tail_chunk(first_line: u64, lines: &[&str]) -> rio_proto::store::TailLogChunk {
+        rio_proto::store::TailLogChunk {
+            exec_id: String::new(),
+            lines: lines.iter().map(|l| l.as_bytes().to_vec()).collect(),
+            first_line_number: first_line,
+            is_complete: false,
+        }
     }
 }

@@ -431,6 +431,7 @@ pub async fn execute_build(
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
     log_tx: &mpsc::Sender<ExecutorMessage>,
+    upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
     first_line: u64,
 ) -> ExecuteOutcome {
     let drv_path = &assignment.drv_path;
@@ -525,17 +526,19 @@ pub async fn execute_build(
 
     // r[impl obs.log.worker-header]
     // Banner header — the first thing in the build log, ahead of any
-    // build output. Sent directly on `log_tx` (not through `LogBatcher`
-    // — that's created inside `run_daemon_lifecycle`, three call frames
-    // down); the batcher is seeded with `batcher_seed`
-    // (`HEADER_LINE_COUNT` on the first attempt, the prior attempt's
-    // `final_line_count` on a retry) so the build's real output numbers
-    // continue past the header instead of colliding at line 0.
+    // build output. Sent directly on the per-build log-upload channel
+    // (not through `LogBatcher` — that's created inside
+    // `run_daemon_lifecycle`, three call frames down); the batcher is
+    // seeded with `batcher_seed` (`HEADER_LINE_COUNT` on the first
+    // attempt, the prior attempt's `final_line_count` on a retry) so
+    // the build's real output numbers continue past the header instead
+    // of colliding at line 0.
     //
     // Display-only: see `banner.rs`'s module doc. The lines flow
-    // through the normal `BuildLogBatch` → scheduler ring buffer →
-    // S3 pipeline and are visible in `nix build -L`, `rio-cli logs`,
-    // the dashboard, and Nix's post-failure log tail.
+    // through the normal `BuildLogBatch` → rio-store `AppendLog` →
+    // chunked-S3 pipeline and are visible in `rio-cli logs`, the
+    // dashboard, and (via the gateway's `TailLog` subscription)
+    // `nix build -L` and Nix's post-failure log tail.
     //
     // Sent AFTER the wrong-kind gate so a misroute (FOD → builder pod)
     // doesn't pollute the log with a header for a build that was never
@@ -555,7 +558,7 @@ pub async fn execute_build(
     // log header is the only place the worker echoes it.
     let batcher_seed = if first_line == 0 {
         send_banner_batch(
-            log_tx,
+            upload_tx,
             drv_path,
             &env.executor_id,
             0,
@@ -712,6 +715,7 @@ pub async fn execute_build(
                 &basic_drv,
                 opts,
                 log_tx,
+                upload_tx,
             )
             .await?;
 
@@ -982,6 +986,7 @@ struct DaemonOutcome {
 /// in `DaemonOutcome.build_result` so the caller can propagate it AFTER
 /// the cgroup has been torn down.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon_lifecycle(
     overlay_mount: &overlay::OverlayMount,
     env: &ExecutorEnv,
@@ -990,6 +995,7 @@ async fn run_daemon_lifecycle(
     basic_drv: &rio_nix::derivation::BasicDerivation,
     opts: BuildOpts,
     log_tx: &mpsc::Sender<ExecutorMessage>,
+    upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
 ) -> Result<DaemonOutcome, ExecutorError> {
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
     let mut daemon = spawn_daemon_in_namespace(overlay_mount).await?;
@@ -1069,6 +1075,7 @@ async fn run_daemon_lifecycle(
         },
         batcher,
         log_tx,
+        upload_tx,
     )
     .await;
 
@@ -1377,21 +1384,20 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 }
 
 /// Send a worker banner (header or footer) as a `BuildLogBatch`
-/// directly on `log_tx`, bypassing the [`LogBatcher`] (which is
-/// created inside [`run_daemon_lifecycle`] and consumed by the stderr
-/// loop — not in scope at the call sites).
+/// directly on the per-build log-upload channel, bypassing the
+/// [`LogBatcher`] (which is created inside [`run_daemon_lifecycle`]
+/// and consumed by the stderr loop — not in scope at the call sites).
 ///
-/// Best-effort: a closed channel means the scheduler stream is gone,
-/// in which case the build's `CompletionReport` won't reach the
-/// scheduler either — `runtime/` handles that. The banner is
-/// display-only; dropping it is harmless.
+/// Best-effort: a closed channel means the uploader task died
+/// (panicked); the build continues without log persistence. The banner
+/// is display-only; dropping it is harmless.
 ///
 /// `pub(crate)` because the banner footer is sent from
 /// `runtime::spawn_build_task` (after the daemon-transient retry loop —
 /// once per assignment) rather than from `execute_build` (once per
 /// attempt). See `execute_build`'s `first_line` param doc and bug_013.
 pub(crate) async fn send_banner_batch(
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
     drv_path: &str,
     executor_id: &str,
     first_line_number: u64,
@@ -1403,13 +1409,10 @@ pub(crate) async fn send_banner_batch(
         first_line_number,
         lines,
     };
-    let msg = ExecutorMessage {
-        msg: Some(rio_proto::types::executor_message::Msg::LogBatch(batch)),
-    };
-    if log_tx.send(msg).await.is_err() {
+    if upload_tx.send(batch).await.is_err() {
         tracing::debug!(
             drv_path = %drv_path,
-            "banner batch dropped: log channel closed (scheduler stream gone)"
+            "banner batch dropped: log upload channel closed (uploader task died)"
         );
     }
 }

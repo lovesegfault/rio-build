@@ -121,10 +121,15 @@ pkgs.testers.runNixOSTest {
             "rio_scheduler_builds_total",
             "rio_scheduler_builds_active",
             "rio_scheduler_assignments_total",
-            "rio_scheduler_log_lines_forwarded_total",
         ],
         (${gatewayHost}, 9092, "store"): [
             "rio_store_put_path_total",
+            # Build-log data plane: the builder streams log batches to
+            # the store's LogService.AppendLog (not to the scheduler).
+            # Presence after the chain build proves the ingest path is
+            # wired end-to-end; the floor assertion below proves the
+            # marker lines actually arrived.
+            "rio_store_log_ingest_lines_total",
         ],
     }
     with subtest("metrics-registered: spec'd metrics present on /metrics"):
@@ -159,35 +164,35 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # log-pipeline: worker LogBatcher → scheduler → gateway STDERR_NEXT
+    # log-pipeline: worker LogBatcher → rio-store LogService.AppendLog
     # ══════════════════════════════════════════════════════════════════
     #
     # Each chain step echoes `PHASE2B-LOG-MARKER: building <name>` to
-    # stderr (chain.nix:30). Flow:
-    #   worker LogBatcher → BuildExecution gRPC stream → scheduler recv
-    #   task LogBuffers push + ForwardLogBatch → actor resolves drv_path
-    #   → interested_builds → emit_build_event(Log) → broadcast → bridge
-    #   → gateway → STDERR_NEXT → client.
+    # stderr (chain.nix:30). Flow (post log-data-plane cutover):
+    #   worker LogBatcher → per-build LogUploader → AppendLog gRPC
+    #   stream → rio-store ingest (accept + buffer + chunk cut to the
+    #   chunk backend + drv_log_chunks manifest row). The live tail the
+    #   gateway relays to the nix client comes from the store's TailLog,
+    #   not from the scheduler — the scheduler never sees a log line.
     #
-    # We assert on the PENULTIMATE hop via the metric. The final
-    # gateway→client STDERR_NEXT leg depends on the Nix client's
-    # rendering (modern Nix filters raw STDERR_NEXT outside activity
-    # results). `rio_scheduler_log_lines_forwarded_total` increments
-    # inside the actor's ForwardLogBatch handler — ≥3 (one per step)
-    # proves the full internal pipeline works. The ring buffer +
-    # AdminService.GetDerivationLogs give the authoritative log-serving path
-    # for the dashboard; the STDERR_NEXT tail is a best-effort
-    # convenience whose rendering we don't control.
+    # We assert on the store-side ingest metric.
+    # `rio_store_log_ingest_lines_total` increments when the store
+    # ACCEPTS a line from a builder's AppendLog stream — ≥3 (one marker
+    # per chain step) proves the builder→store data plane works end to
+    # end with real builds, real assignment tokens, and real network.
+    # The TailLog read-back path is covered by vm-log-service-standalone
+    # (synthetic ingest, restart survival, cross-session dedup) and the
+    # gateway's unit tests (the relay).
     #
     # `output` captured above for debugging — not asserted on for
     # markers (would make the test fragile against Nix client changes).
 
-    with subtest("log-pipeline: marker lines reach scheduler actor"):
+    with subtest("log-pipeline: marker lines reach the store's AppendLog ingest"):
         # ≥3: one PHASE2B-LOG-MARKER per chain step. Might be more
         # (busybox sh also writes to stderr, chain.nix does `ls -la`).
         assert_metric_ge(
-            ${gatewayHost}, 9091,
-            "rio_scheduler_log_lines_forwarded_total",
+            ${gatewayHost}, 9092,
+            "rio_store_log_ingest_lines_total",
             floor=3,
         )
         _ = output  # captured for debugging; see rationale above

@@ -15,6 +15,7 @@
   fixture,
 }:
 let
+  inherit (fixture) nsStore;
   # Store-path interpolation pulls the binary into the VM closure.
   # rio-cli is a Rust binary, linked to glibc (which the NixOS VM has).
   rioCli = "${common.rio-workspace}/bin/rio-cli";
@@ -24,7 +25,13 @@ let
   # below (NOT fixture.hmacKeys: the keys are deterministic now, but
   # signing with the bytes the cluster actually mounted can never
   # diverge from what the scheduler verifies).
-  cliEnv = "RIO_SCHEDULER_ADDR=localhost:19001 " + "RIO_SERVICE_HMAC_KEY_PATH=/tmp/service-hmac.key ";
+  # RIO_STORE_ADDR: `rio-cli logs` reads build logs from rio-store's
+  # LogService.TailLog (the log data plane moved off the scheduler);
+  # every other subcommand still talks to the scheduler's AdminService.
+  cliEnv =
+    "RIO_SCHEDULER_ADDR=localhost:19001 "
+    + "RIO_STORE_ADDR=localhost:19002 "
+    + "RIO_SERVICE_HMAC_KEY_PATH=/tmp/service-hmac.key ";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";
@@ -42,6 +49,11 @@ pkgs.testers.runNixOSTest {
     # lifecycle.nix's per-call pf_exec, this stays up for the whole
     # test — all CLI calls go through localhost:19001.
     pf_open(leader_pod(), 19001, 9001, tag="pf-cli")
+
+    # Port-forward the store's gRPC port (9002): `rio-cli logs` reads
+    # from rio-store's LogService.TailLog (the log data plane moved off
+    # the scheduler). Same svc/-level forward substitute-scale.nix uses.
+    pf_open("svc/rio-store", 19002, 9002, ns="${nsStore}", tag="pf-cli-store")
 
     # Fetch the service-HMAC key from the chart Secret so rio-cli signs
     # with the exact bytes the scheduler verifies against.
@@ -209,16 +221,15 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # logs — GetDerivationLogs streaming (error-path: no execution recorded)
+    # logs — LogService.TailLog streaming (error-path: no execution recorded)
     # ══════════════════════════════════════════════════════════════════
-    # No build running → no ring buffer entry → server falls through
-    # to the completed-log (S3) path. Empty exec_id is the "latest
-    # execution" sentinel, not a required field. This fixture has no
-    # log S3 bucket and the fake hash has no recorded execution, so
-    # the fallback yields nothing → NotFound ("no log found for
-    # derivation ... (no execution recorded, or all expired)").
-    # Deliberate error-path: proves the CLI surfaces the stream-open
-    # gRPC Status correctly (not the same as stream-message errors).
+    # `rio-cli logs` reads from rio-store's LogService.TailLog (not the
+    # scheduler). Empty exec_id is the "latest execution" sentinel, not
+    # a required field. The fake hash has no drv_executions row and no
+    # drv_log_chunks rows, so resolve_exec yields NotFound ("no
+    # executions recorded for derivation ...").
+    # Deliberate error-path: proves the CLI surfaces the stream gRPC
+    # Status correctly through the new store-backed path.
     #
     # cli() uses k3s_server.succeed which asserts exit 0; for this
     # one call, use .fail() directly. 2>&1 captures the anyhow error

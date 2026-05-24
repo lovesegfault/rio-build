@@ -171,6 +171,8 @@ async fn spawn_ssh_server_with(
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
     let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
@@ -183,6 +185,7 @@ async fn spawn_ssh_server_with(
 
     let server = configure(GatewayServer::new(
         store_client,
+        log_client,
         scheduler_client,
         vec![client_pub],
     ));
@@ -1659,6 +1662,8 @@ async fn spawn_ssh_server_with_tenant_auth(
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
     let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let tenant_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
@@ -1676,8 +1681,13 @@ async fn spawn_ssh_server_with_tenant_auth(
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let server = configure(
-        GatewayServer::new(store_client, scheduler_client, vec![tenant_pub, plain_pub])
-            .with_jwt_signing_key(signing_key, rio_common::config::JwtConfig::default()),
+        GatewayServer::new(
+            store_client,
+            log_client,
+            scheduler_client,
+            vec![tenant_pub, plain_pub],
+        )
+        .with_jwt_signing_key(signing_key, rio_common::config::JwtConfig::default()),
     );
     let srv_handle = tokio::spawn(async move {
         if let Err(e) = server
@@ -1896,6 +1906,8 @@ async fn spawn_ssh_server_watching(
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
     let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let initial = rio_gateway::load_authorized_keys(&path)?;
@@ -1906,7 +1918,7 @@ async fn spawn_ssh_server_watching(
     let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = socket.local_addr()?;
 
-    let mut server = GatewayServer::new(store_client, scheduler_client, initial);
+    let mut server = GatewayServer::new(store_client, log_client, scheduler_client, initial);
     let shutdown = rio_common::signal::Token::new();
     rio_gateway::spawn_authorized_keys_watcher(
         server.authorized_keys_handle(),

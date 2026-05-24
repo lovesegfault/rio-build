@@ -155,6 +155,7 @@ pub async fn run_protocol<R, W>(
     reader: &mut R,
     writer: &mut W,
     store_client: &mut StoreServiceClient<Channel>,
+    log_client: &mut rio_proto::LogServiceClient<Channel>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: Option<NormalizedName>,
     jwt: crate::handler::SessionJwt,
@@ -184,6 +185,7 @@ where
 {
     let mut ctx = SessionContext::new(
         store_client.clone(),
+        log_client.clone(),
         scheduler_client.clone(),
         tenant_name,
         jwt,

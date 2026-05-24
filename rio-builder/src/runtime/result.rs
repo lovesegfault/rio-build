@@ -44,10 +44,12 @@ pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> Compl
         node_name: stamp.node_name,
         hw_class: stamp.hw_class,
         final_resources: r.fixture_resources.or(stamp.final_resources),
-        // 0 = not reported. The real count (the worker line-number high-water
-        // mark after the footer — i.e. header + body + footer, per the proto
-        // field's contract) is threaded in harden-logs commit 4; until then
-        // the store treats 0 as "completeness unknown".
+        // Placeholder. `spawn_build_task` overwrites this with the
+        // worker line-number high-water mark after the footer (header +
+        // body + footer) before sending — the count isn't known until
+        // the once-per-assignment footer send, which happens after this
+        // function runs. 0 survives only on paths that never emitted a
+        // line ("not reported"; the store maps it to SQL NULL).
         final_line_count: 0,
     }
 }
@@ -120,7 +122,7 @@ pub(super) fn err_completion(
         // and peak_disk_bytes from a build that OOMed are exactly what
         // the SLA model needs to bump resource_floor next time.
         final_resources: stamp.final_resources,
-        // 0 = not reported (see ok_completion).
+        // Placeholder; overwritten by the caller (see ok_completion).
         final_line_count: 0,
     }
 }

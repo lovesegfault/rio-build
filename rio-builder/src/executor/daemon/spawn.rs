@@ -358,6 +358,7 @@ mod tests {
             0,
         );
         let (log_tx, _log_rx) = mpsc::channel(4);
+        let (upload_tx, _upload_rx) = mpsc::channel(4);
 
         // run_daemon_build should fail quickly (handshake reads EOF from closed stdout).
         let result = tokio::time::timeout(
@@ -374,6 +375,7 @@ mod tests {
                 },
                 batcher,
                 &log_tx,
+                &upload_tx,
             ),
         )
         .await

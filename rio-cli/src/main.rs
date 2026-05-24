@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use rio_common::backoff::{self, Backoff, Jitter, RetryError};
 use rio_common::signal::Token;
 
-use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
+use rio_proto::{AdminServiceClient, LogServiceClient, StoreAdminServiceClient};
 use tonic::transport::Channel;
 
 /// `AdminServiceClient` shape for all rio-cli→scheduler calls: a
@@ -42,6 +42,11 @@ pub(crate) type StoreAdminClient = StoreAdminServiceClient<
         rio_auth::hmac::ServiceTokenInterceptor,
     >,
 >;
+
+/// `LogService` client for `rio-cli logs`. Bare channel — `TailLog` is
+/// the store's unauthenticated read-only RPC (route-gated, mirroring
+/// the admin log API it replaced), so no service-token interceptor.
+pub(crate) type LogsClient = LogServiceClient<Channel>;
 
 // Subcommand handlers. Each module owns its `#[derive(Args)]` struct
 // and `run*` fn so `main.rs` deltas for a new subcommand stay at enum
@@ -143,11 +148,12 @@ pub(crate) async fn rpc<T: Default>(
 #[serde(default)]
 pub(crate) struct Config {
     scheduler_addr: String,
-    /// Store gRPC address. Only used by the `upstream` subcommand —
-    /// StoreAdminService is hosted on the store's port, not the
-    /// scheduler's. In-pod default targets the rio-store Service DNS
-    /// (scheduler pod is in rio-system; store pod is in rio-store
-    /// namespace since P0454's four-namespace split).
+    /// Store gRPC address. Used by the `upstream`, `verify-chunks`,
+    /// and `logs` subcommands — StoreAdminService and LogService are
+    /// hosted on the store's port, not the scheduler's. In-pod default
+    /// targets the rio-store Service DNS (scheduler pod is in
+    /// rio-system; store pod is in rio-store namespace since P0454's
+    /// four-namespace split).
     store_addr: String,
     /// HMAC key for minting `x-rio-service-token`. Same file as
     /// gateway/scheduler/store/controller (one shared `rio-service-hmac`
@@ -201,6 +207,20 @@ impl Config {
         .max_encoding_message_size(rio_common::grpc::max_message_size()))
     }
 
+    /// Connect to the store's `LogService` for `rio-cli logs`. Build
+    /// logs live in rio-store (immutable chunks + a PG manifest), not
+    /// on the scheduler — `logs` is a store-only subcommand and works
+    /// when the scheduler is down. No interceptor: `TailLog` is the
+    /// store's unauthenticated read-only RPC.
+    async fn connect_store_logs(&self) -> anyhow::Result<LogsClient> {
+        let ch = rio_proto::client::connect_channel(&self.store_addr)
+            .await
+            .map_err(|e| anyhow!("connect to store at {}: {e}", self.store_addr))?;
+        Ok(LogServiceClient::new(ch)
+            .max_decoding_message_size(rio_common::grpc::max_message_size())
+            .max_encoding_message_size(rio_common::grpc::max_message_size()))
+    }
+
     /// Connect to the store's `StoreAdminService`. Only `upstream` /
     /// `verify-chunks` need this; called per-arm so scheduler-only
     /// subcommands don't fail on an unreachable store. Wraps with
@@ -233,9 +253,9 @@ struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_addr: Option<String>,
 
-    /// Store gRPC address (host:port). Only used by `upstream` — the
-    /// StoreAdminService lives on the store's port, not the
-    /// scheduler's.
+    /// Store gRPC address (host:port). Used by `upstream`,
+    /// `verify-chunks`, and `logs` — StoreAdminService and LogService
+    /// live on the store's port, not the scheduler's.
     #[arg(long, global = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     store_addr: Option<String>,
@@ -297,7 +317,9 @@ enum Cmd {
     ///
     /// Storage is keyed by `(drv_hash, exec_id)`. The positional is
     /// the .drv path (or basename or bare hash). `--exec-id` selects
-    /// a specific execution; default is the latest.
+    /// a specific execution; default is the latest. Talks to the
+    /// store's LogService directly (build logs live in rio-store) —
+    /// `--store-addr` or `RIO_STORE_ADDR` must reach the store.
     Logs(logs::Args),
     /// Trigger garbage collection. Scheduler proxies to the store
     /// after populating `extra_roots` from live builds, so in-flight
@@ -390,6 +412,10 @@ async fn main() -> anyhow::Result<()> {
             upstream::run(as_json, &mut sc, &cfg, cmd).await
         }
         Cmd::VerifyChunks(a) => verify_chunks::run(&mut cfg.connect_store_admin().await?, a).await,
+        // store-only — build logs live in rio-store. Works when the
+        // scheduler is down (e.g. to read the log of the build that
+        // took the scheduler down).
+        Cmd::Logs(a) => logs::run(&mut cfg.connect_store_logs().await?, a).await,
         // Everything else talks to AdminService — connect once.
         admin => {
             let mut c = cfg.connect_admin().await?;
@@ -402,13 +428,12 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::Builds(a) => builds::run_list(as_json, &mut c, a).await,
                 Cmd::CancelBuild(a) => builds::run_cancel(as_json, &mut c, a).await,
                 Cmd::Derivations(a) => derivations::run(as_json, &mut c, a).await,
-                Cmd::Logs(a) => logs::run(&mut c, a).await,
                 Cmd::Gc(a) => gc::run(&mut c, a).await,
                 Cmd::PoisonClear(a) => poison::run_clear(as_json, &mut c, a).await,
                 Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
                 Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
                 Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
-                Cmd::Pool { .. } | Cmd::Upstream { .. } | Cmd::VerifyChunks(_) => {
+                Cmd::Pool { .. } | Cmd::Upstream { .. } | Cmd::VerifyChunks(_) | Cmd::Logs(_) => {
                     unreachable!("handled above")
                 }
             }

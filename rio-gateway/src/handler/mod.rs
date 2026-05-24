@@ -17,6 +17,7 @@ use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
+use rio_proto::LogServiceClient;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -313,6 +314,13 @@ impl SessionJwt {
 /// in [`crate::session::run_protocol`].
 pub struct SessionContext {
     pub store_client: StoreServiceClient<Channel>,
+    /// Client for rio-store's `LogService` (the build-log data plane).
+    /// Same upstream as [`Self::store_client`] — in production both wrap
+    /// the same balanced channel to the store's port 9002 — but a
+    /// separate generated client type. The build handlers open one
+    /// `TailLog` subscription per building derivation of a watched
+    /// build; nothing else touches it.
+    pub log_client: LogServiceClient<Channel>,
     pub scheduler_client: SchedulerServiceClient<Channel>,
     pub drv_cache: HashMap<StorePath, Derivation>,
     /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
@@ -368,8 +376,14 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
+    // 8 args is one over clippy's default of 7 — same trade-off as
+    // `session::run_protocol` (the only production caller): three gRPC
+    // clients + five session-scoped knobs, and a builder/struct-param
+    // wrapper would add more noise than the extra arg costs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store_client: StoreServiceClient<Channel>,
+        log_client: LogServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
         tenant_name: Option<NormalizedName>,
         jwt: SessionJwt,
@@ -379,6 +393,7 @@ impl SessionContext {
     ) -> Self {
         Self {
             store_client,
+            log_client,
             scheduler_client,
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
@@ -482,6 +497,7 @@ where
 
 mod build;
 pub(crate) mod grpc;
+mod log_tail;
 mod opcodes_read;
 mod opcodes_write;
 

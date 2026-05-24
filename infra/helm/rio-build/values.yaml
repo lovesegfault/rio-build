@@ -240,6 +240,12 @@ store:
     endpoint: ""
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
+  # Cross-replica TailLog proxy dial template. {pod} is replaced with
+  # the owning replica's RIO_STORE_REPLICA_ID (status.podIP via the
+  # downward API — see store.yaml). Bracketed for v6-only pod IPs. Only
+  # override if the store stops being a Deployment (a StatefulSet's
+  # per-pod DNS names would let this go back to a name-based template).
+  logPeerUrlTemplate: "http://[{pod}]:9002"
   # Upstream binary-cache egress allowlist. Each entry opens 443/TCP
   # to the given FQDN from the rio-store pod via CiliumNetworkPolicy
   # `toFQDNs` (DNS-aware — Cilium's L7 DNS proxy resolves and tracks

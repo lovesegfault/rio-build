@@ -236,11 +236,25 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(MemoryLogChunkStore::default())
         }
     };
-    // The pod name routes cross-replica TailLog readers to the replica
-    // holding an execution's live ingest buffer. Kubelet sets HOSTNAME
-    // to the pod name in every container; outside k8s (dev) the
-    // machine hostname is a fine stand-in (there is only one replica).
-    let replica_pod = std::env::var("HOSTNAME").unwrap_or_else(|_| "rio-store-dev".to_string());
+    // The replica identity routes cross-replica TailLog readers to the
+    // replica holding an execution's live ingest buffer: it is written
+    // into `log_ingest_sessions.replica_pod` and substituted into
+    // `log_peer_url_template`'s `{pod}` by the reader's replica, so it
+    // must be something the template turns into a DIALABLE URL.
+    //
+    // RIO_STORE_REPLICA_ID is preferred: the helm chart injects
+    // `status.podIP` via the downward API and pairs it with an
+    // IP-based template (`http://[{pod}]:9002`) — a Deployment's pods
+    // get no per-pod DNS A records (no `hostname`/`subdomain` in the
+    // pod spec), so the HOSTNAME pod name is registrable but not
+    // resolvable. Fallback to HOSTNAME (kubelet sets it to the pod
+    // name) keeps single-replica and dev deployments working: with one
+    // replica the proxy path never fires, so resolvability doesn't
+    // matter. NOT a Config field: this is pod identity injected by the
+    // orchestrator, not operator-tunable configuration.
+    let replica_pod = std::env::var("RIO_STORE_REPLICA_ID")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "rio-store-dev".to_string());
     let mut log_service = LogServiceImpl::new(
         pool.clone(),
         Arc::clone(&log_chunk_store),

@@ -99,9 +99,14 @@ impl RioStack {
 
         // Functional tests don't exercise the shutdown-signal or tenant
         // paths — those are wire_opcodes concerns. Never-cancelled token,
-        // single-tenant mode.
+        // single-tenant mode. The live-tail log client gets a dead
+        // channel: `spawn_store_service` doesn't expose its address and
+        // the functional tier never asserts on the live tail —
+        // subscriptions fail to open and retry in the background, which
+        // is the designed degradation for an unreachable LogService.
         let (stream, server_task) = spawn_session_task(
             store_client.clone(),
+            rio_proto::LogServiceClient::new(rio_test_support::grpc::dead_channel()),
             sched_client,
             None,
             rio_gateway::handler::SessionJwt::none(),

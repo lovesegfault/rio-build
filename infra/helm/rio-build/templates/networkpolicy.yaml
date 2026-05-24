@@ -279,7 +279,10 @@ spec:
             - {port: "9091", protocol: TCP}
 ---
 # Store ingress: GetPath/PutPath/FindMissingPaths from rio components
-# across three namespaces.
+# across three namespaces, plus store↔store for the cross-replica
+# TailLog proxy (a reader that lands on a replica that doesn't hold an
+# execution's live ingest session relays the stream from the replica
+# that does — store pods dial each other's pod IPs on 9002).
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -295,6 +298,11 @@ spec:
     - fromEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+        # store↔store: the cross-replica TailLog proxy. Same-namespace
+        # bare label match (CNP fromEndpoints without a namespace key
+        # is implicitly the policy's own namespace, which is exactly
+        # where the other store replicas live).
+        - matchLabels: {app.kubernetes.io/name: rio-store}
         # See scheduler-ingress D3a comment — bare label match is
         # same-namespace-only under CNP; Exists opens cluster-wide.
         - matchLabels: {app.kubernetes.io/component: rio-builder}
@@ -352,6 +360,15 @@ spec:
       toPorts:
         - ports:
             - {port: "443", protocol: TCP}
+    # store↔store: the cross-replica TailLog proxy dials the replica
+    # holding an execution's live ingest session by pod IP on 9002.
+    # Same-namespace bare label match (the other replicas of this same
+    # Deployment). Pairs with the store-ingress rule above; without
+    # BOTH, the proxy connect times out and every cross-replica live
+    # tail silently degrades to the history-only view.
+    - toEndpoints:
+        - matchLabels: {app.kubernetes.io/name: rio-store}
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     # In-cluster postgres (bitnami chart, VM tests / dev). Subchart
     # deploys into the helm release namespace (system), not store.
     - toEndpoints:
@@ -415,13 +432,18 @@ spec:
 {{- end }}
 {{- if .Values.dashboard.enabled }}
 ---
-# Dashboard egress: DNS + the Cilium per-Gateway envoy. nginx proxies
-# /rio.* to the Gateway's listener; Cilium's envoy forwards to
-# rio-scheduler (same-ns, plaintext-over-WireGuard). The dashboard pod
-# never talks to scheduler directly — a compromised SPA container
-# can't speak gRPC to anything. Cilium creates the envoy Deployment in
-# the Gateway's OWN namespace with label `gateway.networking.k8s.io/
-# gateway-name: <name>` — same-ns, so no cross-ns selector needed.
+# Dashboard egress: DNS + the Cilium per-Gateway envoy + rio-store
+# (build logs). nginx proxies /rio.* to the Gateway's listener;
+# Cilium's envoy forwards to rio-scheduler (same-ns, plaintext-over-
+# WireGuard). Cilium creates the envoy Deployment in the Gateway's OWN
+# namespace with label `gateway.networking.k8s.io/gateway-name:
+# <name>` — same-ns, so no cross-ns selector needed.
+#
+# rio-store:9002 is dialed DIRECTLY by nginx (the rio_store upstream in
+# dashboard-nginx.conf) for /rio.store.LogService/TailLog — build logs
+# live in the store, and in-cluster traffic can't reach the Cilium
+# Gateway ClusterIP (selectorless Service; the L7 redirect fires only
+# on the LoadBalancer IP).
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -446,5 +468,13 @@ spec:
         - matchLabels:
             gateway.networking.k8s.io/gateway-name: rio-dashboard
       toPorts: [{ports: [{port: "8080", protocol: TCP}]}]
+    # Build logs: the nginx rio_store upstream → rio-store:9002
+    # (cross-namespace; the auto-injected pod.namespace label scopes
+    # the match to the store namespace).
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:app.kubernetes.io/name: rio-store
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
 {{- end }}
 {{- end }}

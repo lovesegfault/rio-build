@@ -5,10 +5,12 @@
 // an RPC — no per-page createClient boilerplate, and the transport is
 // shared (connection pooling, interceptors land in one place).
 //
-// All three legs of the killer journey (Builds list → Graph → LogViewer)
-// call through this one client: ListBuilds → GetBuildGraph → GetDerivationLogs.
-// ClearPoisonButton and the Executors-page kind filter likewise call
-// ClearPoison/ListExecutors through this client. The journey pages carry
+// The first two legs of the killer journey (Builds list → Graph) call
+// through this client: ListBuilds → GetBuildGraph. The third leg
+// (LogViewer) calls rio-store's LogService/TailLog via api/logs.ts —
+// build logs live in the store, not on the scheduler. ClearPoisonButton
+// and the Executors-page kind filter likewise call ClearPoison/
+// ListExecutors through this client. The journey pages carry
 // documentary tracey markers in .svelte (which tracey doesn't parse);
 // this .ts entry point is the scannable impl anchor.
 //

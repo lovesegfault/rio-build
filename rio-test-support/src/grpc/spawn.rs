@@ -121,7 +121,13 @@ pub async fn spawn_mock_store()
         // dataplane2: ChunkService on the same port (mirrors the real
         // store, which serves both on 9002). Existing callers that
         // never touch chunk RPCs are unaffected.
-        .add_service(ChunkServiceServer::new(store.clone()));
+        .add_service(ChunkServiceServer::new(store.clone()))
+        // Build-log data plane: LogService on the same port (mirrors
+        // the real store). Backs the gateway's TailLog live-tail
+        // subscriptions; callers that never tail logs are unaffected.
+        .add_service(rio_proto::store::log_service_server::LogServiceServer::new(
+            store.clone(),
+        ));
     let (addr, handle) = spawn_grpc_server(router).await;
     Ok((store, addr, handle))
 }

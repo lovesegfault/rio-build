@@ -97,4 +97,14 @@ pub fn describe_metrics() {
          attempt=PUT_PATH_ABORTED_MAX_ATTEMPTS means budget exhausted and the \
          error surfaced to the client (I-168)."
     );
+    describe_counter!(
+        "rio_gateway_log_tail_reconnects_total",
+        "Build-log TailLog subscriptions re-opened against rio-store (labeled by \
+         reason: open_failed = the TailLog RPC itself was rejected, the live \
+         tail is dark until the store is reachable; stream_ended = an \
+         established stream closed before the derivation finished, normal \
+         during a store deploy). A sustained open_failed rate means every \
+         watched build's live tail is degraded fleet-wide; the lines remain \
+         durable in the store and readable via `rio-cli logs` regardless."
+    );
 }

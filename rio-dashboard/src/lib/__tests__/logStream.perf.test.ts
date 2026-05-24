@@ -16,8 +16,8 @@
 // alongside the push() refactor.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { getDerivationLogs } = vi.hoisted(() => ({ getDerivationLogs: vi.fn() }));
-vi.mock('../../api/admin', () => ({ admin: { getDerivationLogs } }));
+const { tailLog } = vi.hoisted(() => ({ tailLog: vi.fn() }));
+vi.mock('../../api/logs', () => ({ logs: { tailLog } }));
 
 import { createLogStream } from '../logStream.svelte';
 
@@ -44,7 +44,7 @@ function chunk(width: number, isComplete = false) {
   const lines: Uint8Array[] = [];
   for (let i = 0; i < width; i++) lines.push(LINE);
   return {
-    derivationPath: '/nix/store/perf-test.drv',
+    execId: '',
     lines,
     firstLineNumber: 0n,
     isComplete,
@@ -53,14 +53,14 @@ function chunk(width: number, isComplete = false) {
 
 describe('createLogStream perf', () => {
   afterEach(() => {
-    getDerivationLogs.mockReset();
+    tailLog.mockReset();
   });
 
   it('drains 20K lines in linear-ish time (not O(n²) spread-reassign)', async () => {
     // 200 chunks × 100 lines = 20_000 lines.
     const CHUNKS = 200;
     const WIDTH = 100;
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       for (let i = 0; i < CHUNKS - 1; i++) yield chunk(WIDTH);
       yield chunk(WIDTH, true);
     });
@@ -89,7 +89,7 @@ describe('createLogStream perf', () => {
     // (b) truncated flips.
     const CHUNKS = 550;
     const WIDTH = 100;
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       for (let i = 0; i < CHUNKS - 1; i++) yield chunk(WIDTH);
       yield chunk(WIDTH, true);
     });
@@ -113,7 +113,7 @@ describe('createLogStream perf', () => {
     // splice(0, 20K) → 40K. Truncated flips. A builder dumping a huge
     // final burst (cat of a large file) hits this path — the cap holds
     // at the MAX_LINES - DROP_LINES target, not just -DROP_LINES.
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk(60_000, true);
     });
 
@@ -131,7 +131,7 @@ describe('createLogStream perf', () => {
   // DROP_LINES, didn't re-check). Post-fix it's capped at
   // MAX_LINES - DROP_LINES = 40K regardless of chunk magnitude.
   it('caps a single oversized chunk to the target, not just -DROP_LINES', async () => {
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk(70_000, true);
     });
 
@@ -151,7 +151,7 @@ describe('createLogStream perf', () => {
   // no ceiling. This test proves no exception surfaces as err; the cap
   // assertion proves the result is bounded.
   it('handles a 100K-line chunk without RangeError', async () => {
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk(100_000, true);
     });
 

@@ -7,14 +7,17 @@ import { tick } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   adminMock,
+  logsMock,
   teardownStandardAfterEach,
 } from '../../test-support/admin-mock';
 
-// The drawer embeds LogViewer (P0279), which fires getDerivationLogs on
-// mount — adminMock's empty-generator default keeps the `for await`
-// from crashing on `undefined is not iterable`. The log stream itself
-// is covered in lib/__tests__/logStream.test.ts.
+// The drawer embeds LogViewer (P0279), which fires logs.tailLog on
+// mount (build logs live in rio-store, not AdminService) — logsMock's
+// empty-generator default keeps the `for await` from crashing on
+// `undefined is not iterable`. The log stream itself is covered in
+// lib/__tests__/logStream.test.ts.
 vi.mock('../../api/admin', () => ({ admin: adminMock }));
+vi.mock('../../api/logs', () => ({ logs: logsMock }));
 
 import Builds from '../Builds.svelte';
 

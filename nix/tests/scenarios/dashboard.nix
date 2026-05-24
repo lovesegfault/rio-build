@@ -12,7 +12,10 @@
 #   2b. rio-scheduler-leader EndpointSlice has exactly 1 ready endpoint
 #       (the lease holder labeled its own pod — nginx's upstream)
 #   3. Unary gRPC-Web THROUGH nginx — 0x00 DATA frame prefix
-#   4. Server-streaming THROUGH nginx — 0x80 trailer byte
+#   4. Server-streaming THROUGH nginx → scheduler — 0x80 trailer byte
+#   4b. Server-streaming THROUGH nginx → rio-store TailLog — 0x80
+#       trailer byte (the LogViewer's post-cutover log-read path; the
+#       second upstream + cross-namespace Service FQDN)
 #   5. method-gate via nginx — allow-list fail-closed
 #
 # (4) is the streaming-through-nginx proof. proxy_buffering-off itself
@@ -177,6 +180,27 @@
           k3s_server.wait_until_succeeds(
               "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
               "curl -sf --max-time 5 -X POST http://localhost:18081/rio.admin.AdminService/GetDerivationLogs "
+              "-H 'content-type: application/grpc-web+proto' "
+              "-H 'x-grpc-web: 1' "
+              "--data-binary @- "
+              "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
+              timeout=60,
+          )
+
+  # ── (4b) gRPC-Web server-streaming THROUGH nginx → rio-store ─────
+  # The dashboard's LogViewer now reads build logs from rio-store's
+  # LogService.TailLog (the log data plane moved off the scheduler;
+  # GetDerivationLogs above survives only until the deletion commit).
+  # This is the proof that the SECOND nginx upstream (rio_store, a
+  # cross-namespace Service FQDN) + the new location block actually
+  # proxy gRPC-Web streaming: TailLogRequest{derivation:"nonexist"} →
+  # the store yields an in-stream NotFound → tonic-web encodes the
+  # trailer as a 0x80-flagged body frame. Same wire encoding as (4):
+  # field 1 is a string in both request messages.
+      with subtest("gRPC-Web streaming via nginx: store TailLog 0x80 trailer"):
+          k3s_server.wait_until_succeeds(
+              "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
+              "curl -sf --max-time 5 -X POST http://localhost:18081/rio.store.LogService/TailLog "
               "-H 'content-type: application/grpc-web+proto' "
               "-H 'x-grpc-web: 1' "
               "--data-binary @- "

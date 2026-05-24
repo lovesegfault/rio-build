@@ -326,7 +326,7 @@ in
 
   # proxy_buffering off in dashboardNginxConf is LOAD-BEARING
   # (docker.nix:349): nginx default-buffers upstream → WatchBuild /
-  # GetDerivationLogs streams arrive as one blob at close. The config is a
+  # TailLog streams arrive as one blob at close. The config is a
   # writeText baked into the dashboard image, invisible to helm-lint.
   # vm-dashboard-k3s's 0x80-at-tail grep can't distinguish (NotFound is
   # tiny either way) — this is the structural backstop.
@@ -338,12 +338,14 @@ in
     # Syntax check: njs js_import/js_set wiring is easy to get wrong
     # and vm-dashboard-k3s is the only other place nginx parses this.
     # `nginx -t` resolves upstreams and open()s the error_log/access_log
-    # targets after parsing — sed the cluster FQDN (the leader-only
-    # rio-scheduler-leader Service) to a resolvable address and
-    # /dev/std{err,out} to TMPDIR (a remote build sandbox may not
-    # provide /dev/std*). Everything else is checked verbatim.
+    # targets after parsing — sed the cluster FQDNs (one per upstream;
+    # the scheduler one is the leader-only rio-scheduler-leader
+    # Service) to a resolvable address and /dev/std{err,out} to TMPDIR
+    # (a remote build sandbox may not provide /dev/std*). Everything
+    # else is checked verbatim.
     mkdir -p $TMPDIR/logs
     sed -e 's/rio-scheduler-leader\.rio-system\.svc\.cluster\.local/127.0.0.1/' \
+        -e 's/rio-store\.rio-store\.svc\.cluster\.local/127.0.0.1/' \
         -e "s#/dev/stderr#$TMPDIR/logs/error.log#" \
         -e "s#/dev/stdout#$TMPDIR/logs/access.log#" \
       ${dockerImages.dashboardNginxConf} > $TMPDIR/nginx.conf
@@ -833,19 +835,27 @@ in
         mkdir -p charts
         ln -s ${subcharts.postgresql} charts/postgresql
 
+        # Both readonly HTTPRoutes: rio-scheduler-readonly (AdminService
+        # + SchedulerService → rio-scheduler:9001) and
+        # rio-store-logs-readonly (LogService/TailLog → rio-store:9002,
+        # a separate route because a rule's backendRefs are
+        # all-or-nothing and the store is a different backend in a
+        # different namespace).
         helm template rio . \
           --set dashboard.enabled=true \
           --set global.image.tag=test \
           --set postgresql.enabled=false \
-          | yq 'select(.kind=="HTTPRoute" and .metadata.name=="rio-scheduler-readonly")
+          | yq --no-doc 'select(.kind=="HTTPRoute" and
+                       (.metadata.name=="rio-scheduler-readonly" or
+                        .metadata.name=="rio-store-logs-readonly"))
                 | .spec.rules[].matches[].path.value' \
           | sort > $TMPDIR/gateway-side
 
         sort ${nginxSide} > $TMPDIR/nginx-side
 
         diff $TMPDIR/nginx-side $TMPDIR/gateway-side || {
-          echo "FAIL: nginx readonly allow-list (docker.nix dashboardReadonly{Admin,Scheduler})" >&2
-          echo "      diverged from rio-scheduler-readonly HTTPRoute (dashboard-gateway.yaml)." >&2
+          echo "FAIL: nginx readonly allow-list (docker.nix dashboardReadonly{Admin,Scheduler,StoreLogs})" >&2
+          echo "      diverged from the readonly HTTPRoutes (dashboard-gateway.yaml)." >&2
           echo "      Both implement r[dash.auth.method-gate+3] — keep them in sync." >&2
           exit 1
         }

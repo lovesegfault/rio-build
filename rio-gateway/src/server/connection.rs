@@ -642,6 +642,7 @@ fn reject_exec(
 pub struct ConnectionHandler {
     pub(super) peer_addr: Option<SocketAddr>,
     pub(super) store_client: StoreServiceClient<Channel>,
+    pub(super) log_client: rio_proto::LogServiceClient<Channel>,
     pub(super) scheduler_client: SchedulerServiceClient<Channel>,
     /// Shared with `GatewayServer` + the watcher task. `.load()` per
     /// auth attempt — NOT snapshotted at connection-accept, so a key
@@ -1551,6 +1552,7 @@ impl Handler for ConnectionHandler {
 
         // Task: run the protocol handler with gRPC clients
         let mut store_client = self.store_client.clone();
+        let mut log_client = self.log_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
         // One token per SSH connection, shared across all channels.
@@ -1585,6 +1587,7 @@ impl Handler for ConnectionHandler {
                     &mut reader,
                     &mut writer,
                     &mut store_client,
+                    &mut log_client,
                     &mut scheduler_client,
                     tenant_name,
                     jwt,
@@ -1743,10 +1746,12 @@ mod tests {
         let (_s, store_addr, _sh) = spawn_mock_store().await?;
         let (_d, sched_addr, _dh) = spawn_mock_scheduler().await?;
         let store = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let logs: rio_proto::LogServiceClient<_> =
+            rio_proto::client::connect_single(&store_addr.to_string()).await?;
         let sched = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
         // Server with ZERO authorized keys — every offer is rejected.
-        let mut server = super::super::GatewayServer::new(store, sched, vec![]);
+        let mut server = super::super::GatewayServer::new(store, logs, sched, vec![]);
         let mut handler = server.new_client(None);
 
         assert!(!handler.auth_attempted, "precondition: fresh handler");
@@ -1808,8 +1813,9 @@ mod tests {
         let (_s, store_addr, _sh) = spawn_mock_store().await?;
         let (_d, sched_addr, _dh) = spawn_mock_scheduler().await?;
         let store = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let log = rio_proto::client::connect_single(&store_addr.to_string()).await?;
         let sched = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
-        let mut server = super::super::GatewayServer::new(store, sched, vec![]);
+        let mut server = super::super::GatewayServer::new(store, log, sched, vec![]);
         let mut handler = server.new_client(None);
 
         let real = channel_id(1);
@@ -1881,8 +1887,9 @@ mod tests {
         let (_s, store_addr, _sh) = spawn_mock_store().await?;
         let (_d, sched_addr, _dh) = spawn_mock_scheduler().await?;
         let store = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let log = rio_proto::client::connect_single(&store_addr.to_string()).await?;
         let sched = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
-        let mut server = super::super::GatewayServer::new(store, sched, vec![]);
+        let mut server = super::super::GatewayServer::new(store, log, sched, vec![]);
         let handler = server.new_client(None);
 
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;

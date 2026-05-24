@@ -827,25 +827,57 @@ async fn test_build_paths_emits_build_id_preamble() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// BuildLogBatch lines become STDERR_NEXT frames.
+/// Build-log lines from the store's `TailLog` reach the nix client.
+///
+/// The log data plane is rio-store: a `DerivationEvent::Started`
+/// carrying an `exec_id` opens a `TailLog` subscription against the
+/// store, and the served lines are relayed to the client. This test
+/// asserts the lines *arrive* and in *order*; the framing-level
+/// assertion (BuildLogLine result attached to the right activity, never
+/// a bare STDERR_NEXT while the activity is alive) is
+/// `test_build_paths_log_and_phase_attached_to_activity`'s job.
+///
+/// Timing: the scripted scheduler events are spaced 150 ms apart so the
+/// gateway's TailLog subscription (opened on the Started event) has
+/// time to connect to the in-process mock store and relay the seeded
+/// lines before the build-level Completed event tears the build down.
+/// 150 ms for an in-process TCP gRPC round trip is a >50x margin; the
+/// same interval-based determinism is used by the mid-opcode-disconnect
+/// tests in this file.
 #[tokio::test]
 async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
-        ev(build_event::Event::Started(types::BuildStarted {
-            total_derivations: 1,
-            cached_derivations: 0,
-        })),
-        ev(build_event::Event::Log(types::BuildLogBatch {
-            derivation_path: String::new(),
-            executor_id: String::new(),
-            lines: vec![b"building foo".to_vec(), b"linking".to_vec()],
-            first_line_number: 0,
-        })),
-        ev(build_event::Event::Completed(types::BuildCompleted {
-            output_paths: vec![],
-        })),
-    ]));
+    let target = "/nix/store/bbb-tailed-lines.drv".to_string();
+    h.store.seed_tail_log(
+        &target,
+        vec![rio_test_support::grpc::MockStore::tail_chunk(
+            0,
+            &["building foo", "linking"],
+        )],
+    );
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::started(
+                    target.clone(),
+                    "rio-builder-x86-64-abc".into(),
+                    "01900000-0000-7000-8000-000000000001".into(),
+                ),
+            )),
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::completed(target.clone(), vec![]),
+            )),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ],
+        error_after_n: None,
+        interval: Some(std::time::Duration::from_millis(150)),
+    });
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -855,14 +887,39 @@ async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> 
     );
 
     let frames = collect_stderr_frames(&mut h.stream).await;
-    let logs: Vec<&str> = frames
+    // The lines arrive as BuildLogLine results (the activity exists for
+    // the whole window the lines can arrive in). Collect every log-line
+    // rendering — Result{BuildLogLine} or STDERR_NEXT — and assert the
+    // content + order.
+    let logs: Vec<String> = frames
         .iter()
         .filter_map(|m| match m {
-            StderrMessage::Next(s) => Some(s.as_str()),
+            StderrMessage::Result {
+                result_type: 101,
+                fields,
+                ..
+            } => match fields.first() {
+                Some(rio_nix::protocol::stderr::ResultField::String(s)) => Some(s.clone()),
+                _ => None,
+            },
+            StderrMessage::Next(s) if s == "building foo" || s == "linking" => Some(s.clone()),
             _ => None,
         })
         .collect();
-    assert_eq!(logs, vec!["building foo", "linking"]);
+    assert_eq!(
+        logs,
+        vec!["building foo".to_string(), "linking".to_string()],
+        "tail-log lines must reach the client in order; frames: {frames:?}"
+    );
+
+    // The gateway opened exactly one TailLog subscription, keyed on the
+    // derivation and its execution, from line 0.
+    let tails = h.store.calls.tail_calls.read().unwrap().clone();
+    assert_eq!(tails.len(), 1, "one Started → one TailLog subscription");
+    assert_eq!(tails[0].derivation, target);
+    assert_eq!(tails[0].exec_id, "01900000-0000-7000-8000-000000000001");
+    assert_eq!(tails[0].since_line, 0);
+    assert!(tails[0].follow);
 
     // Opcode 9 response: u64(1) on success
     let result = wire::read_u64(&mut h.stream).await?;
@@ -1359,39 +1416,52 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
 /// `STDERR_RESULT{aid, BuildLogLine}`; phase events become
 /// `STDERR_RESULT{aid, SetPhase}`. PLAN-NOM fixes 3+5: previously
 /// logs went to unattributed STDERR_NEXT and phase was dropped.
+///
+/// The log lines arrive via the store's `TailLog` (seeded on the mock
+/// store, subscribed on the Started event); the phase still arrives via
+/// the scheduler's event stream. The 150 ms inter-event interval gives
+/// the in-process TailLog subscription time to connect and relay before
+/// the per-derivation Completed removes the activity — see
+/// `test_build_paths_log_events_become_stderr_next` for the timing
+/// rationale.
 #[tokio::test]
 async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/ccc-loglines.drv".to_string();
-    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
-        ev(build_event::Event::Started(types::BuildStarted {
-            total_derivations: 1,
-            cached_derivations: 0,
-        })),
-        ev(build_event::Event::Derivation(
-            types::DerivationEvent::started(
-                target.clone(),
-                "rio-builder-x86-64-abc".into(),
-                String::new(),
-            ),
-        )),
-        ev(build_event::Event::Phase(types::BuildPhase {
-            derivation_path: target.clone(),
-            phase: "unpackPhase".into(),
-        })),
-        ev(build_event::Event::Log(types::BuildLogBatch {
-            derivation_path: target.clone(),
-            executor_id: String::new(),
-            lines: vec![b"unpacking source".to_vec()],
-            first_line_number: 0,
-        })),
-        ev(build_event::Event::Derivation(
-            types::DerivationEvent::completed(target.clone(), vec![]),
-        )),
-        ev(build_event::Event::Completed(types::BuildCompleted {
-            output_paths: vec![],
-        })),
-    ]));
+    h.store.seed_tail_log(
+        &target,
+        vec![rio_test_support::grpc::MockStore::tail_chunk(
+            0,
+            &["unpacking source"],
+        )],
+    );
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::started(
+                    target.clone(),
+                    "rio-builder-x86-64-abc".into(),
+                    "01900000-0000-7000-8000-000000000002".into(),
+                ),
+            )),
+            ev(build_event::Event::Phase(types::BuildPhase {
+                derivation_path: target.clone(),
+                phase: "unpackPhase".into(),
+            })),
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::completed(target.clone(), vec![]),
+            )),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ],
+        error_after_n: None,
+        interval: Some(std::time::Duration::from_millis(150)),
+    });
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1947,12 +2017,18 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
     // line → a STDERR_NEXT frame on the wire.
     let log_events: Vec<types::BuildEvent> = (0..50)
         .map(|i| {
-            ev(build_event::Event::Log(types::BuildLogBatch {
-                derivation_path: String::new(),
-                executor_id: String::new(),
-                lines: vec![format!("building step {i}").into_bytes()],
-                first_line_number: 0,
-            }))
+            // One STDERR_NEXT per event, via the Failed arm's
+            // failure log line. Replaces the old Event::Log traffic
+            // generator: build-log lines no longer travel on the
+            // scheduler stream, but these tests only need a slow
+            // stream of stderr-producing events to race against.
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::failed(
+                    format!("/nix/store/{i:032}-step.drv"),
+                    format!("building step {i}"),
+                    types::BuildResultStatus::TransientFailure,
+                ),
+            ))
         })
         .collect();
 
@@ -2092,12 +2168,18 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
     // above — 50 events at 20ms gives a 1s window to drop mid-stream.
     let log_events: Vec<types::BuildEvent> = (0..50)
         .map(|i| {
-            ev(build_event::Event::Log(types::BuildLogBatch {
-                derivation_path: String::new(),
-                executor_id: String::new(),
-                lines: vec![format!("building step {i}").into_bytes()],
-                first_line_number: 0,
-            }))
+            // One STDERR_NEXT per event, via the Failed arm's
+            // failure log line. Replaces the old Event::Log traffic
+            // generator: build-log lines no longer travel on the
+            // scheduler stream, but these tests only need a slow
+            // stream of stderr-producing events to race against.
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::failed(
+                    format!("/nix/store/{i:032}-step.drv"),
+                    format!("building step {i}"),
+                    types::BuildResultStatus::TransientFailure,
+                ),
+            ))
         })
         .collect();
 
@@ -2197,12 +2279,18 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
 async fn test_shutdown_signal_mid_build_no_pipe_break_cancels() -> anyhow::Result<()> {
     let log_events: Vec<types::BuildEvent> = (0..50)
         .map(|i| {
-            ev(build_event::Event::Log(types::BuildLogBatch {
-                derivation_path: String::new(),
-                executor_id: String::new(),
-                lines: vec![format!("building step {i}").into_bytes()],
-                first_line_number: 0,
-            }))
+            // One STDERR_NEXT per event, via the Failed arm's
+            // failure log line. Replaces the old Event::Log traffic
+            // generator: build-log lines no longer travel on the
+            // scheduler stream, but these tests only need a slow
+            // stream of stderr-producing events to race against.
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::failed(
+                    format!("/nix/store/{i:032}-step.drv"),
+                    format!("building step {i}"),
+                    types::BuildResultStatus::TransientFailure,
+                ),
+            ))
         })
         .collect();
 
@@ -2575,12 +2663,18 @@ async fn test_reconnect_propagates_jwt() -> anyhow::Result<()> {
 async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
     let log_events: Vec<types::BuildEvent> = (0..50)
         .map(|i| {
-            ev(build_event::Event::Log(types::BuildLogBatch {
-                derivation_path: String::new(),
-                executor_id: String::new(),
-                lines: vec![format!("building step {i}").into_bytes()],
-                first_line_number: 0,
-            }))
+            // One STDERR_NEXT per event, via the Failed arm's
+            // failure log line. Replaces the old Event::Log traffic
+            // generator: build-log lines no longer travel on the
+            // scheduler stream, but these tests only need a slow
+            // stream of stderr-producing events to race against.
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::failed(
+                    format!("/nix/store/{i:032}-step.drv"),
+                    format!("building step {i}"),
+                    types::BuildResultStatus::TransientFailure,
+                ),
+            ))
         })
         .collect();
 

@@ -174,6 +174,10 @@ proto_client!(
     crate::StoreAdminServiceClient<Channel>,
     balance::STORE_HEALTH_SERVICE
 );
+proto_client!(
+    crate::LogServiceClient<Channel>,
+    balance::STORE_HEALTH_SERVICE
+);
 
 /// Connect to a single-channel `addr` and wrap in a typed client.
 ///

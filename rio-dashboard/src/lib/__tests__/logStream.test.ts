@@ -9,8 +9,8 @@
 // microtask, so `await Promise.resolve()` steps the for-await one chunk.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { getDerivationLogs } = vi.hoisted(() => ({ getDerivationLogs: vi.fn() }));
-vi.mock('../../api/admin', () => ({ admin: { getDerivationLogs } }));
+const { tailLog } = vi.hoisted(() => ({ tailLog: vi.fn() }));
+vi.mock('../../api/logs', () => ({ logs: { tailLog } }));
 
 import { createLogStream } from '../logStream.svelte';
 
@@ -32,12 +32,11 @@ function u8(...bytes: number[]): Uint8Array {
   return Uint8Array.from(bytes);
 }
 
-// Structural-shape fixture for DerivationLogChunk. The generated type is a
+// Structural-shape fixture for TailLogChunk. The generated type is a
 // branded Message<...> intersection; tests only hit the iteration path
 // so a plain object matching the field layout is sufficient.
 function chunk(lines: Uint8Array[], isComplete = false) {
   return {
-    derivationPath: '/nix/store/aaaa-test.drv',
     execId: '',
     lines,
     firstLineNumber: 0n,
@@ -47,11 +46,11 @@ function chunk(lines: Uint8Array[], isComplete = false) {
 
 describe('createLogStream', () => {
   afterEach(() => {
-    getDerivationLogs.mockReset();
+    tailLog.mockReset();
   });
 
   it('accumulates lines across chunks and flips done on isComplete', async () => {
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk([u8(0x68, 0x65, 0x6c, 0x6c, 0x6f)]); // "hello"
       yield chunk(
         [u8(0x77, 0x6f, 0x72, 0x6c, 0x64), u8(0x21)], // "world", "!"
@@ -75,12 +74,16 @@ describe('createLogStream', () => {
     // bigint zero so we check the field directly rather than .toEqual
     // (bigint equality in nested objects has been flaky across vitest
     // minors — the point is "we sent 0n, not undefined").
-    const [req, opts] = getDerivationLogs.mock.calls[0];
+    const [req, opts] = tailLog.mock.calls[0];
     // buildId is no longer part of the request — storage is keyed by
     // (drv_hash, exec_id); execId empty resolves to the latest execution.
     expect(req.execId).toBe('');
-    expect(req.derivationPath).toBe('');
+    expect(req.derivation).toBe('');
     expect(req.sinceLine).toBe(0n);
+    // One-shot drain, not a live follow — the viewer's stream lives and
+    // dies with the component; a follow-mode would re-open on premature
+    // end with sinceLine = last_received + 1.
+    expect(req.follow).toBe(false);
     expect(opts.signal).toBeInstanceOf(AbortSignal);
   });
 
@@ -88,7 +91,7 @@ describe('createLogStream', () => {
     // 0x48 0x69 = "Hi". 0xff 0xfe 0x21 = two invalid continuation-less
     // high bytes followed by "!". With {fatal:false} the decoder emits
     // U+FFFD per invalid sequence rather than throwing a TypeError.
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk(
         [u8(0x48, 0x69), u8(0xff, 0xfe, 0x21)],
         true,
@@ -113,7 +116,7 @@ describe('createLogStream', () => {
   });
 
   it('surfaces transport errors when not self-aborted', async () => {
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk([u8(0x61)]);
       throw new Error('upstream reset');
     });
@@ -130,7 +133,7 @@ describe('createLogStream', () => {
 
   it('destroy() flips the AbortSignal and swallows the resulting error', async () => {
     let seenSignal: AbortSignal | undefined;
-    getDerivationLogs.mockImplementation(async function* (
+    tailLog.mockImplementation(async function* (
       _req: unknown,
       opts: { signal?: AbortSignal },
     ) {
@@ -176,7 +179,7 @@ describe('createLogStream', () => {
     // the spinner spinning, but the content is incomplete — the viewer
     // renders a banner so the missing tail (usually the build error)
     // isn't read as the whole log.
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk([u8(0x7a)]);
       // No isComplete chunk, just end.
     });
@@ -191,15 +194,15 @@ describe('createLogStream', () => {
   });
 
   it('passes drvPath through when provided', async () => {
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk([], true);
     });
 
     createLogStream('/nix/store/xyz-foo.drv');
     await flush(2);
 
-    const [req] = getDerivationLogs.mock.calls[0];
-    expect(req.derivationPath).toBe('/nix/store/xyz-foo.drv');
+    const [req] = tailLog.mock.calls[0];
+    expect(req.derivation).toBe('/nix/store/xyz-foo.drv');
     // No execId passed → empty string sent → server resolves the
     // latest execution for the drv. The dashboard's "approximate"
     // banner is the LogViewer's concern, not this store's.
@@ -207,7 +210,7 @@ describe('createLogStream', () => {
   });
 
   it('passes execId through when provided', async () => {
-    getDerivationLogs.mockImplementation(async function* () {
+    tailLog.mockImplementation(async function* () {
       yield chunk([], true);
     });
 
@@ -217,8 +220,8 @@ describe('createLogStream', () => {
     createLogStream('/nix/store/xyz-foo.drv', '01976e8b-test-exec');
     await flush(2);
 
-    const [req] = getDerivationLogs.mock.calls[0];
-    expect(req.derivationPath).toBe('/nix/store/xyz-foo.drv');
+    const [req] = tailLog.mock.calls[0];
+    expect(req.derivation).toBe('/nix/store/xyz-foo.drv');
     expect(req.execId).toBe('01976e8b-test-exec');
   });
 });

@@ -53,6 +53,26 @@ spec:
             {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:9002"
+            # Cross-replica TailLog proxy identity. The replica
+            # registers this value in log_ingest_sessions.replica_pod;
+            # a reader replica substitutes it into
+            # RIO_LOG_PEER_URL_TEMPLATE's {pod} to dial the replica
+            # holding an execution's live ingest buffer. status.podIP,
+            # NOT the pod name: a Deployment's pods get no per-pod DNS
+            # A records (no hostname/subdomain in the pod spec), so
+            # `<pod>.rio-store-headless` does not resolve — the IP is
+            # the only thing another replica can actually dial. The
+            # template brackets {pod} for the v6-only pod IPs
+            # (RFC 2732 host literal). Without this pairing the proxy
+            # never connects and every cross-replica live tail silently
+            # serves the history-only view (observable only via
+            # rio_store_log_tail_proxy_failures_total).
+            - name: RIO_STORE_REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RIO_LOG_PEER_URL_TEMPLATE
+              value: {{ $s.logPeerUrlTemplate | default "http://[{pod}]:9002" | quote }}
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
             # the default endpoint is v4-only. Without this, v6-only
             # pods reach S3 via DNS64+NAT64 (works, but adds a hop).

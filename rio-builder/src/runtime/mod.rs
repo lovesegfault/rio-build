@@ -56,6 +56,15 @@ use rio_proto::types::{
 
 use crate::{executor, log_stream};
 
+/// How long the build-completion path waits for the log uploader to
+/// drain (every line acked durable by rio-store) before detaching it
+/// and sending the `CompletionReport` anyway. The house style for
+/// bounded teardown. Past this the upload task keeps reconnecting and
+/// replaying in the background for up to its 10-minute drain deadline;
+/// the build slot frees immediately. A build is never failed or delayed
+/// because its log could not be persisted.
+const LOG_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Generation fence: should this assignment be rejected as stale?
 ///
 /// Separate from the event-loop handler for testability — main.rs's
@@ -442,6 +451,32 @@ pub async fn spawn_build_task(
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
 
+        // Per-assignment log uploader: streams every BuildLogBatch this
+        // assignment produces (banner header, build output, banner
+        // footer — across every daemon-transient retry attempt) to
+        // rio-store's `AppendLog` under the assignment's exec_id. ONE
+        // uploader spans the whole retry loop: a daemon-transient retry
+        // is the same execution (same exec_id, same token) with line
+        // numbers continuing from the prior attempt's count, so the
+        // same `AppendLog` session keeps accepting them — the store's
+        // monotone-line gate sees one forward-moving stream. Only a
+        // scheduler re-dispatch mints a new exec_id, and that arrives
+        // as a fresh WorkAssignment → a fresh spawn_build_task → a
+        // fresh uploader.
+        //
+        // `upload_tx` is the ONLY sender clone outside the uploader
+        // itself; everything below borrows it. It is explicitly dropped
+        // before `uploader.finish()` so the uploader's drain deadline
+        // can start (the input channel only closes once every sender is
+        // gone).
+        let uploader = crate::log_upload::LogUploader::spawn(
+            ctx.store_clients.log.clone(),
+            assignment.exec_id.clone(),
+            drv_path.clone(),
+            assignment_token.clone(),
+        );
+        let upload_tx = uploader.sender();
+
         // Daemon-transient retry: if nix-daemon crashes mid-handshake
         // (core dump, OOM-kill) the error surfaces as early-EOF on the
         // wire. Retrying locally is cheaper than a scheduler round-trip
@@ -508,6 +543,7 @@ pub async fn spawn_build_task(
                 &build_env,
                 &mut store_client,
                 &ctx.stream_tx,
+                &upload_tx,
                 prev_line_count,
             )
             .await;
@@ -579,25 +615,98 @@ pub async fn spawn_build_task(
         // existing VM scenarios; a `RIO_BUILDER_SCRIPT` VM test
         // asserting "exactly one rio: result line per exec_id" would
         // close the gap.
-        if let Some(footer_result) = final_footer_result(
+        let report_line_count = if let Some(footer_result) = final_footer_result(
             last_footer_result.as_deref(),
             cancelled.load(std::sync::atomic::Ordering::Acquire),
         ) {
+            let footer = crate::banner::footer_lines(
+                &assignment.exec_id,
+                footer_result,
+                assignment_start.elapsed(),
+            );
+            // The footer occupies line numbers [final_line_count,
+            // final_line_count + footer.len()); the post-footer
+            // high-water mark is the CompletionReport's
+            // final_line_count (the store's completeness predicate is
+            // "the manifest covers a contiguous [0, final_line_count)").
+            let after_footer = final_line_count + footer.len() as u64;
             executor::send_banner_batch(
-                &ctx.stream_tx,
+                &upload_tx,
                 &drv_path,
                 &build_env.executor_id,
                 final_line_count,
-                crate::banner::footer_lines(
-                    &assignment.exec_id,
-                    footer_result,
-                    assignment_start.elapsed(),
-                ),
+                footer,
             )
             .await;
+            after_footer
+        } else {
+            // No footer: either nothing was ever emitted
+            // (final_line_count == 0, a pre-header setup failure → the
+            // store reads 0 as "not reported") or the log ends at the
+            // last line the batcher accounted for (header-only or
+            // header+output, both already counted).
+            final_line_count
+        };
+
+        // Drop the last sender clone outside the uploader, then drain.
+        // Every other holder (the stderr loop, the banner sends)
+        // borrowed `upload_tx` and has returned by now, so this drop is
+        // what lets the uploader observe its input channel closing and
+        // start the drain. `finish()` waits up to the grace period for
+        // every line to be acked durable by rio-store; past that the
+        // upload task detaches and keeps draining in the background
+        // while the build slot frees and the CompletionReport goes out
+        // — a build is never failed or delayed because its log could
+        // not be persisted.
+        drop(upload_tx);
+        let mut drain_progress = uploader.progress();
+        match uploader.finish(LOG_DRAIN_GRACE).await {
+            crate::log_upload::DrainStatus::Drained { .. } => {}
+            crate::log_upload::DrainStatus::Detached { unacked_lines, .. } => {
+                tracing::info!(
+                    drv_path = %drv_path,
+                    unacked_lines,
+                    "log upload still draining; detached (build completion proceeds)"
+                );
+                // Log the detached drain's eventual outcome — without
+                // this, a detached-then-drained upload leaves no trace
+                // and a detached-then-abandoned one is only visible as
+                // an un-correlated counter + the uploader's own error.
+                let detached_drv = drv_path.clone();
+                rio_common::task::spawn_monitored("log-drain-watch", async move {
+                    while drain_progress.changed().await.is_ok() {
+                        let p = *drain_progress.borrow();
+                        if p.done {
+                            tracing::info!(
+                                drv_path = %detached_drv,
+                                last_acked_line = ?p.last_acked_line,
+                                unacked_lines = p.unacked_lines,
+                                "detached log drain finished"
+                            );
+                            break;
+                        }
+                    }
+                });
+            }
+            crate::log_upload::DrainStatus::Abandoned {
+                unacked_lines,
+                rejected,
+                ..
+            } => {
+                // The uploader already logged (error! for real loss,
+                // warn! for a permanent store rejection); this is just
+                // the build-scoped breadcrumb.
+                tracing::debug!(
+                    drv_path = %drv_path,
+                    unacked_lines,
+                    rejected,
+                    "log upload ended without draining"
+                );
+            }
         }
+
         let stamp = ctx.completion_stamp(peak_disk_bytes);
-        let completion = match result {
+        let mut completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
             Err(e) => err_completion(
                 &e,
@@ -609,6 +718,14 @@ pub async fn spawn_build_task(
                 peak_cpu_cores,
             ),
         };
+        // The worker line-number high-water mark after the footer —
+        // header(3) + body + footer(2) for a build that ran a daemon.
+        // The store's completeness predicate tests "the manifest covers
+        // a contiguous [0, final_line_count)"; an undercount here makes
+        // it pass while stored lines sit beyond it, an overcount makes
+        // every log read as incomplete forever. 0 = never emitted
+        // anything = "not reported" (the scheduler maps it to SQL NULL).
+        completion.final_line_count = report_line_count;
 
         send_completion(&ctx.stream_tx, &ctx.completion_pending, completion).await;
     };
@@ -1320,6 +1437,59 @@ mod tests {
     use super::*;
     use rio_proto::types::ExecutorRegister;
     use rstest::rstest;
+
+    /// `CompletionReport.final_line_count` is the worker line-number
+    /// high-water mark AFTER the footer — header(3) + body + footer(2)
+    /// — i.e. `last_emitted_line_number + 1`. The store's completeness
+    /// predicate is "the manifest covers a contiguous
+    /// `[0, final_line_count)`": an undercount (e.g. counting only the
+    /// lines the `LogBatcher` processed, which excludes the 3 header
+    /// lines that bypass it) makes the predicate pass while stored
+    /// lines sit beyond it; an overcount makes every log read as
+    /// incomplete forever.
+    ///
+    /// This composes the real pieces the way `spawn_build_task` does:
+    /// the batcher seeded at `HEADER_LINE_COUNT`, N body lines flushed,
+    /// `line_count()` as the footer's `first_line_number`, and the
+    /// footer's own length added on top.
+    #[test]
+    fn final_line_count_is_the_post_footer_high_water_mark() {
+        const N: u64 = 7;
+        let mut batcher = log_stream::LogBatcher::new(
+            "/nix/store/x.drv".into(),
+            "w".into(),
+            log_stream::LogLimits::UNLIMITED,
+            crate::banner::HEADER_LINE_COUNT,
+        );
+        for i in 0..N {
+            // UNLIMITED + < 64 lines → always Buffered, never a batch.
+            assert!(matches!(
+                batcher.add_line(format!("body {i}").into_bytes()),
+                log_stream::AddLineResult::Buffered
+            ));
+        }
+        let last_body_batch = batcher.final_flush();
+        assert_eq!(last_body_batch.first_line_number, 3);
+        assert_eq!(last_body_batch.lines.len() as u64, N);
+
+        // What `run_daemon_lifecycle` returns as `final_line_count`.
+        let final_line_count = batcher.line_count();
+        assert_eq!(final_line_count, crate::banner::HEADER_LINE_COUNT + N);
+
+        // What the runtime sends as the footer and reports on the
+        // CompletionReport.
+        let footer =
+            crate::banner::footer_lines("exec-id", "ok", std::time::Duration::from_secs(1));
+        let report_line_count = final_line_count + footer.len() as u64;
+        let last_emitted_line_number = final_line_count + footer.len() as u64 - 1;
+
+        assert_eq!(report_line_count, N + 5, "header(3) + body(N) + footer(2)");
+        assert_eq!(
+            report_line_count,
+            last_emitted_line_number + 1,
+            "final_line_count is the high-water mark, not a processed-line count"
+        );
+    }
 
     /// bug_014 (helper truth table, happy shape): a resolved class with a
     /// bench factor is stored in the cell and forwarded for the RPC. The

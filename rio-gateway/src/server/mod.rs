@@ -170,6 +170,11 @@ const TCP_USER_TIMEOUT: Duration = Duration::from_secs(300);
 /// The SSH server that accepts connections and spawns protocol sessions.
 pub struct GatewayServer {
     store_client: StoreServiceClient<Channel>,
+    /// `LogService` client for the build-log live tail. Same upstream
+    /// (the store's port 9002) as `store_client`; threaded separately
+    /// because tonic's generated clients don't expose their inner
+    /// channel for re-wrapping.
+    log_client: rio_proto::LogServiceClient<Channel>,
     scheduler_client: SchedulerServiceClient<Channel>,
     /// Hot-swappable key set. [`spawn_authorized_keys_watcher`] holds
     /// another `Arc` to the same `ArcSwap` and `.store()`s a fresh
@@ -262,6 +267,7 @@ pub struct GatewayServer {
 impl GatewayServer {
     pub fn new(
         store_client: StoreServiceClient<Channel>,
+        log_client: rio_proto::LogServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
         authorized_keys: Vec<PublicKey>,
     ) -> Self {
@@ -270,6 +276,7 @@ impl GatewayServer {
         }
         GatewayServer {
             store_client,
+            log_client,
             scheduler_client,
             authorized_keys: Arc::new(ArcSwap::from_pointee(authorized_keys)),
             jwt_signing_key: None,
@@ -1130,6 +1137,7 @@ impl russh::server::Server for GatewayServer {
         ConnectionHandler {
             peer_addr,
             store_client: self.store_client.clone(),
+            log_client: self.log_client.clone(),
             scheduler_client: self.scheduler_client.clone(),
             authorized_keys: Arc::clone(&self.authorized_keys),
             jwt_signing_key: self.jwt_signing_key.clone(),

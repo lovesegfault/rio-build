@@ -49,6 +49,8 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
     let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await?;
 
     let mut store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let mut log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let mut scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
@@ -61,6 +63,7 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
             &mut reader,
             &mut writer,
             &mut store_client,
+            &mut log_client,
             &mut scheduler_client,
             None, // golden conformance is tenant-agnostic
             rio_gateway::handler::SessionJwt::none(),
@@ -180,6 +183,8 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
         .expect("daemon exchange failed");
 
     let mut store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let mut log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
     let mut scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
@@ -191,6 +196,7 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
             &mut reader,
             &mut writer,
             &mut store_client,
+            &mut log_client,
             &mut scheduler_client,
             None, // golden conformance is tenant-agnostic
             rio_gateway::handler::SessionJwt::none(),
