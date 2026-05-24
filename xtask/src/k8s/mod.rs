@@ -13,6 +13,7 @@ pub(crate) mod chaos;
 pub mod client;
 pub(crate) mod eks;
 mod k3s;
+pub(crate) mod measure;
 mod phases;
 mod probe_boot;
 pub mod provider;

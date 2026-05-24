@@ -55,6 +55,10 @@ enum Cmd {
     NewMigration(migration::MigrationArgs),
     /// Kubernetes deploy (--provider {k3s,eks}).
     K8s(k8s::K8sArgs),
+    /// ADR-022 measurement tooling (P0543): V11 chunk-reuse, V12
+    /// STREAM_THRESHOLD tuning, closure path counts. Writes
+    /// `.stress-test/metrics/v11-v12.json`. Informational — not a gate.
+    Measure(k8s::measure::MeasureArgs),
     /// Workspace-level invariant checks ("lints that can't be lints").
     /// With no subcommand, runs every lint.
     Lint {
@@ -101,6 +105,7 @@ async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {
         Cmd::Fuzz(args) => fuzz::run(args),
         Cmd::NewMigration(args) => migration::run(args),
         Cmd::K8s(args) => k8s::run(args, &cfg).await,
+        Cmd::Measure(args) => k8s::measure::run(args).await,
         Cmd::Lint { which: Some(l) } => lint::run(&l),
         Cmd::Lint { which: None } => lint::run_all(),
     }

@@ -67,6 +67,11 @@ serde_json.workspace = true
 serde-saphyr.workspace = true
 
 # Crypto / encoding
+# blake3 + fastcdc: `measure v11` chunks NARs with the store's CDC
+# parameters (mirrored from rio-store/src/chunker.rs — the chunker
+# module is pub(crate) behind the `server` feature).
+blake3.workspace = true
+fastcdc.workspace = true
 sha2.workspace = true
 heck.workspace = true
 hex.workspace = true
