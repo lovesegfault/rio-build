@@ -778,9 +778,10 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   upsert --- and MUST never shrink while any interested build is live. The
   assignment-token output allowlist, the GC pin set, and the client-facing
   output report MUST continue to cover every declared output. A wanted set
-  that resolves to no verifiable concrete path MUST fall through to the
-  conservative all-declared criterion rather than vacuously classifying the
-  derivation as available.
+  that resolves to no verifiable concrete path MUST take a conservative
+  branch --- fall back to the all-declared criterion, or treat the derivation
+  as unavailable/unclassifiable --- rather than vacuously classifying it as
+  available.
 ]
 A missing output that nothing consumes (the `-debug` output of a multi-output
 derivation) must not condemn the derivation --- and, through dependency
@@ -936,7 +937,11 @@ predicates filter by the wanted subset.
   completed. `Substituting` is NOT terminal (`all_deps_completed` returns false
   → dependents stay gated); on `ok=true` the handler transitions `Substituting
   → Completed` (safe even if inputDrvs aren't yet Completed in the DAG --- the
-  BFS fetched the full reference set); on `ok=false` it reverts to
+  BFS fetched every wanted seed and the reachable reference closure of
+  everything it successfully fetched; a forgiven unwanted seed can leave its
+  own path absent, including when a wanted sibling's references name it ---
+  see the residual-hole caveat at the implementation site); on `ok=false` it
+  reverts to
   `Ready`/`Queued` for normal scheduling and sets `substitute_tried` so
   subsequent dispatch passes skip substitution and route to a worker (one-shot
   fall-through --- a `FindMissingPaths` HEAD probe that disagrees with

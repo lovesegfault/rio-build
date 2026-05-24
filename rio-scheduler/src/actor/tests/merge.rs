@@ -1135,6 +1135,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
 /// Top-down negative: a root whose `wanted_output_names` matches NO
 /// declared output (a client sending `drv^bogus` — the gateway does
 /// not validate the root OutputsSpec against the drv's declared
