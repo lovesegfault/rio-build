@@ -65,6 +65,13 @@ pub struct MergeResult {
     /// permanently stick (subsequent submitters would see `is_empty()
     /// == false` and never link THEIR trace).
     pub traceparent_upgraded: Vec<DrvHash>,
+    /// Pre-union `wanted_output_names` of pre-existing nodes whose
+    /// wanted set was grown by this merge's `union_wanted`. Rollback
+    /// restores the prior value — a leaked union is only ever
+    /// conservative (the empty "all wanted" sentinel saturates) but
+    /// would still let a rejected build's wanted set permanently widen
+    /// the cache-hit criterion for everyone else.
+    pub wanted_grown: Vec<(DrvHash, Vec<String>)>,
 }
 
 /// The global derivation DAG maintained by the actor.
@@ -272,6 +279,12 @@ impl DerivationDag {
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
         let mut interest_added: Vec<DrvHash> = Vec::new();
+        // Pre-union wanted_output_names of pre-existing nodes whose
+        // wanted set was grown by this merge, so rollback can restore
+        // them. A leaked union is only ever conservative (more outputs
+        // required for a cache hit) but would still violate the
+        // exact-pre-merge-DAG restore invariant.
+        let mut wanted_grown: Vec<(DrvHash, Vec<String>)> = Vec::new();
         // Full prior state of retriable nodes destructively removed below
         // for resubmit-reset. rollback_merge restores these so a failed
         // merge leaves the DAG exactly as it was (status, interest set,
@@ -320,7 +333,11 @@ impl DerivationDag {
                 .is_some_and(DerivationState::is_retriable_on_resubmit)
             {
                 let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
-                let carry = (old.interested_builds.clone(), old.retry.resubmit_cycles);
+                let carry = (
+                    old.interested_builds.clone(),
+                    old.retry.resubmit_cycles,
+                    old.wanted_output_names.clone(),
+                );
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
             } else {
@@ -330,13 +347,26 @@ impl DerivationDag {
             // Every mutation in this branch MUST be tracked for
             // `rollback_merge` — a failed merge restores the exact
             // pre-merge DAG. Currently: `interested_builds` (via
-            // `interest_added`) and `traceparent` (via
-            // `traceparent_upgraded`).
+            // `interest_added`), `traceparent` (via
+            // `traceparent_upgraded`), and `wanted_output_names` (via
+            // `wanted_grown`).
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
                 if existing.interested_builds.insert(build_id) {
                     interest_added.push(drv_hash.clone());
+                }
+                // Demand-driven completeness: a second build wanting
+                // MORE outputs of an already-known node grows the
+                // in-memory wanted set (union; empty = "all" saturates).
+                // Never shrink — build B's `{out}` must not un-want
+                // build A's still-needed `dev`.
+                if existing.wanted_output_names != node.wanted_output_names {
+                    let prior = existing.wanted_output_names.clone();
+                    existing.union_wanted(&node.wanted_output_names);
+                    if existing.wanted_output_names != prior {
+                        wanted_grown.push((drv_hash.clone(), prior));
+                    }
                 }
                 // First submitter's traceparent wins — but recovery/
                 // poison-reset set "", which isn't a submitter. Upgrade
@@ -363,6 +393,7 @@ impl DerivationDag {
                             &new_edges,
                             &interest_added,
                             &traceparent_upgraded,
+                            &wanted_grown,
                             build_id,
                             removed_retriable,
                         );
@@ -388,9 +419,13 @@ impl DerivationDag {
                 // POISON_RESUBMIT_RETRY_LIMIT bound accumulates.
                 // retry.count stays at the fresh-state default (0) → full
                 // per-cycle max_retries budget restored on every resubmit.
-                if let Some((prior_interest, prior_cycles)) = prior {
+                // The prior wanted set is unioned in too — the carried-over
+                // interested builds still want their outputs; replacing the
+                // set with only the resubmitter's would shrink it.
+                if let Some((prior_interest, prior_cycles, prior_wanted)) = prior {
                     state.interested_builds.extend(prior_interest);
                     state.retry.resubmit_cycles = prior_cycles + 1;
+                    state.union_wanted(&prior_wanted);
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
@@ -463,6 +498,7 @@ impl DerivationDag {
                     &new_edges,
                     &interest_added,
                     &traceparent_upgraded,
+                    &wanted_grown,
                     build_id,
                     removed_retriable,
                 );
@@ -477,6 +513,7 @@ impl DerivationDag {
             interest_added,
             removed_retriable,
             traceparent_upgraded,
+            wanted_grown,
         })
     }
 
@@ -555,12 +592,17 @@ impl DerivationDag {
     /// this merge (but not from nodes where build_id was already present),
     /// and restore any retriable nodes that the resubmit-reset path
     /// destructively removed.
+    // The parameters mirror `MergeResult`'s fields one-to-one (the two
+    // inline callers in `merge()` hold them as locals, not as a
+    // `MergeResult`); a struct param would just rename the args.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rollback_merge(
         &mut self,
         newly_inserted: &HashSet<DrvHash>,
         new_edges: &[(DrvHash, DrvHash)],
         interest_added: &[DrvHash],
         traceparent_upgraded: &[DrvHash],
+        wanted_grown: &[(DrvHash, Vec<String>)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
     ) {
@@ -625,6 +667,14 @@ impl DerivationDag {
         for hash in traceparent_upgraded {
             if let Some(state) = self.nodes.get_mut(hash) {
                 state.traceparent.clear();
+            }
+        }
+
+        // Restore the pre-union wanted set of pre-existing nodes whose
+        // wanted set this merge grew.
+        for (hash, prior) in wanted_grown {
+            if let Some(state) = self.nodes.get_mut(hash) {
+                state.wanted_output_names = prior.clone();
             }
         }
     }

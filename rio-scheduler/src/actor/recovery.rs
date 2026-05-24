@@ -1107,19 +1107,22 @@ impl DagActor {
         // trip FMP's InvalidArgument.
         let all_outputs: Vec<String> = orphaned
             .iter()
-            .flat_map(|(_, _, outs)| outs.iter())
+            .flat_map(|(_, _, outs, _)| outs.iter())
             .filter(|p| !p.is_empty())
             .cloned()
             .collect();
         let missing = self.batch_probe_orphan_outputs(all_outputs).await;
 
-        for (drv_hash, executor_id, expected_outputs) in orphaned {
+        for (drv_hash, executor_id, expected_outputs, wanted_outputs) in orphaned {
             // Did the build complete while the scheduler was down
-            // (orphan completion)? All-present = none in `missing`.
-            // Conservative reset for: empty verifiable set (CA
-            // pre-completion), or no missing-set (RPC failed/timed
-            // out).
-            let verifiable: Vec<&str> = expected_outputs
+            // (orphan completion)? All WANTED present = none in
+            // `missing` (the probe set stays all expected paths; an
+            // absent output nothing wants must not force the orphan
+            // back to a from-source re-dispatch). Conservative reset
+            // for: empty verifiable set (CA pre-completion, or a
+            // wanted set that resolves to no concrete path), or no
+            // missing-set (RPC failed/timed out).
+            let verifiable: Vec<&str> = wanted_outputs
                 .iter()
                 .map(String::as_str)
                 .filter(|p| !p.is_empty())
@@ -1140,9 +1143,9 @@ impl DagActor {
         self.dispatch_ready().await;
     }
 
-    /// Collect `(drv_hash, assigned_executor, expected_outputs)` for
-    /// every Assigned/Running derivation whose worker is no longer
-    /// live — the liveness-check input set for
+    /// Collect `(drv_hash, assigned_executor, expected_outputs,
+    /// wanted_outputs)` for every Assigned/Running derivation whose
+    /// worker is no longer live — the liveness-check input set for
     /// [`handle_reconcile_assignments`](Self::handle_reconcile_assignments).
     ///
     /// Cloned out of the DAG before any mutation (the per-row
@@ -1154,7 +1157,17 @@ impl DagActor {
     /// We still reconcile it (check store for outputs → Completed,
     /// else Ready) rather than silently skipping and leaving it stuck
     /// forever.
-    fn collect_orphaned_assignments(&self) -> Vec<(DrvHash, Option<ExecutorId>, Vec<String>)> {
+    ///
+    /// The third tuple element is ALL expected output paths (the probe
+    /// set and the adopted node's recorded `output_paths`); the fourth
+    /// is the recovered row's WANTED subset — the all-present decision
+    /// in [`Self::handle_reconcile_assignments`] is evaluated over the
+    /// wanted subset only, so an orphaned build whose only missing
+    /// output is one nothing wants still adopts as completed.
+    #[allow(clippy::type_complexity)]
+    fn collect_orphaned_assignments(
+        &self,
+    ) -> Vec<(DrvHash, Option<ExecutorId>, Vec<String>, Vec<String>)> {
         self.dag
             .iter_nodes()
             .filter(|(_, s)| {
@@ -1185,7 +1198,12 @@ impl DagActor {
                     } else {
                         warn!(drv_hash = %hash, executor_id = %w,
                               "reconcile: worker reconnected but phantom Assigned (not in worker.running_build) — reconciling");
-                        Some((hash, Some(w.clone()), s.expected_output_paths.clone()))
+                        Some((
+                            hash,
+                            Some(w.clone()),
+                            s.expected_output_paths.clone(),
+                            s.wanted_output_paths().cloned().collect(),
+                        ))
                     }
                 }
                 // Stream connected but no heartbeat yet — running_build
@@ -1203,11 +1221,21 @@ impl DagActor {
                            "reconcile: worker stream-connected but not yet heartbeated — deferring");
                     None
                 }
-                Some(w) => Some((h.into(), Some(w.clone()), s.expected_output_paths.clone())),
+                Some(w) => Some((
+                    h.into(),
+                    Some(w.clone()),
+                    s.expected_output_paths.clone(),
+                    s.wanted_output_paths().cloned().collect(),
+                )),
                 None => {
                     warn!(drv_hash = ?h, status = ?s.status(),
                           "reconcile: Assigned/Running drv with NULL worker — reconciling anyway");
-                    Some((h.into(), None, s.expected_output_paths.clone()))
+                    Some((
+                        h.into(),
+                        None,
+                        s.expected_output_paths.clone(),
+                        s.wanted_output_paths().cloned().collect(),
+                    ))
                 }
             })
             .collect()

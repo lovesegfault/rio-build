@@ -675,7 +675,25 @@ impl DagActor {
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
             let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
-            if paths.iter().all(|p| !missing.contains(p)) {
+            // Demand-driven completeness: only the WANTED outputs must
+            // be present (→ complete inline) or present-or-
+            // substitutable (→ detached fetch). A missing output
+            // nothing consumes must not force a from-source dispatch.
+            // Degrades to all of `paths` for an empty wanted set, for
+            // a node that vanished from the DAG mid-probe, and for a
+            // wanted set that resolves to no concrete path (defensive
+            // — a vacuously-true `all()` would complete the node with
+            // zero outputs verified). The probe set and the `to_spawn`
+            // walk seeds stay ALL expected paths (opportunistic
+            // completeness — fetch the unwanted output too if the
+            // upstream has it).
+            let wanted: Vec<String> = self
+                .dag
+                .node(&drv_hash)
+                .map(|s| s.wanted_output_paths().cloned().collect())
+                .filter(|w: &Vec<String>| !w.is_empty())
+                .unwrap_or_else(|| paths.clone());
+            if wanted.iter().all(|p| !missing.contains(p)) {
                 // `substitute_tried` ⇒ the closure walk ingested the
                 // seed (output) then failed on a ref — output-present
                 // in PG does NOT imply closure-complete. FMP probes
@@ -686,7 +704,7 @@ impl DagActor {
                     locally_present.push(drv_hash);
                 }
             } else if !substitute_tried
-                && paths.iter().all(|p| {
+                && wanted.iter().all(|p| {
                     !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
                 })
             {
@@ -1127,7 +1145,7 @@ impl DagActor {
     /// (an earlier dispatch on another scheduler/build uploaded it).
     async fn ready_check_or_spawn(&mut self, drv_hash: &DrvHash) -> bool {
         let probe_gen = self.probe_generation;
-        let (paths, substitute_tried, mut store) = {
+        let (paths, wanted, substitute_tried, mut store) = {
             let Some(state) = self.dag.node_mut(drv_hash) else {
                 return false;
             };
@@ -1146,11 +1164,22 @@ impl DagActor {
             }
             state.probed_generation = probe_gen;
             let substitute_tried = state.substitute_tried;
+            // Demand-driven completeness: the probe set stays ALL
+            // expected paths, but the present/substitutable verdicts
+            // below are evaluated over the WANTED subset only. Falls
+            // back to all expected paths when the wanted set resolves
+            // to nothing (defensive — a vacuously-true `all()` would
+            // complete the node with zero outputs verified).
+            let mut wanted: Vec<String> = state.wanted_output_paths().cloned().collect();
+            if wanted.is_empty() {
+                wanted = state.expected_output_paths.clone();
+            }
             let Some(store) = &self.store_client else {
                 return false;
             };
             (
                 state.expected_output_paths.clone(),
+                wanted,
                 substitute_tried,
                 store.clone(),
             )
@@ -1172,7 +1201,13 @@ impl DagActor {
             Ok(Ok(r)) => {
                 self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 let resp = r.into_inner();
-                if resp.missing_paths.is_empty() {
+                // Demand-driven completeness: only the WANTED outputs
+                // must be present / present-or-substitutable. The
+                // missing set is keyed off the full probe (all
+                // expected paths); intersect it with the wanted
+                // subset before deciding.
+                let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
+                if wanted.iter().all(|p| !missing.contains(p)) {
                     // Same partial-closure gate as
                     // `batch_probe_cached_ready`: substitute_tried ⇒
                     // walk ingested seed then failed; output-present
@@ -1189,10 +1224,9 @@ impl DagActor {
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
                 let ind: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
                 if !substitute_tried
-                    && resp
-                        .missing_paths
+                    && wanted
                         .iter()
-                        .all(|p| sub.contains(p) || ind.contains(p))
+                        .all(|p| !missing.contains(p) || sub.contains(p) || ind.contains(p))
                 {
                     self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], auth)
                         .await;

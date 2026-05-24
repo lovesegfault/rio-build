@@ -1228,12 +1228,11 @@ impl DerivationState {
     /// expected path). A wanted name with no matching declared output
     /// is ignored (defensive — the gateway only unions declared names).
     pub fn wanted_output_paths(&self) -> impl Iterator<Item = &String> {
-        let all = self.wanted_output_names.is_empty();
-        self.output_names
-            .iter()
-            .zip(self.expected_output_paths.iter())
-            .filter(move |(name, _)| all || self.wanted_output_names.contains(*name))
-            .map(|(_, path)| path)
+        wanted_subset(
+            &self.output_names,
+            &self.expected_output_paths,
+            &self.wanted_output_names,
+        )
     }
 
     /// Union a newly-merged consumer's wanted set into this node's. The
@@ -1422,6 +1421,32 @@ impl DerivationState {
     pub(crate) fn set_status_for_test(&mut self, status: DerivationStatus) {
         self.status = status;
     }
+}
+
+/// The wanted subset of `expected_output_paths`, resolved by zipping the
+/// (`output_names` ↔ `expected_output_paths`) parallel arrays and keeping
+/// only the entries whose name is in `wanted`. Empty `wanted` ⇒ all
+/// declared outputs (yields every expected path) — the backward-compatible
+/// sentinel for pre-migration rows, the `BasicDerivation` fallback, and
+/// `^*` roots. A wanted name with no matching declared output is ignored
+/// (defensive — the gateway only unions declared names).
+///
+/// Free function (not just a [`DerivationState`] method) because the
+/// merge-time cache-hit classification operates on the proto-mirror
+/// `crate::domain::DerivationNode` before a `DerivationState` exists;
+/// both call sites MUST share one implementation or the hit criterion
+/// drifts between merge time and dispatch time.
+pub fn wanted_subset<'a>(
+    output_names: &'a [String],
+    expected_output_paths: &'a [String],
+    wanted: &'a [String],
+) -> impl Iterator<Item = &'a String> {
+    let all = wanted.is_empty();
+    output_names
+        .iter()
+        .zip(expected_output_paths.iter())
+        .filter(move |(name, _)| all || wanted.contains(*name))
+        .map(|(_, path)| path)
 }
 
 /// Poison detection config. Replaces the former `POISON_THRESHOLD` const.

@@ -66,6 +66,55 @@ fn test_merge_dedup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A second build merging an already-known node UNIONs its wanted set
+/// into the existing node's (it must never shrink — build B's `{out}`
+/// must not un-want build A's still-needed `dev`), the empty "all
+/// wanted" sentinel saturates the union, and a rolled-back merge
+/// restores the pre-merge wanted set.
+#[test]
+fn test_merge_unions_wanted_outputs_on_existing_node() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let mut node = make_node("hashW", "x86_64-linux");
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(Uuid::new_v4(), &[node.clone()], &[], "")?;
+    assert_eq!(dag.nodes["hashW"].wanted_output_names, vec!["out"]);
+
+    // Second build wants a different output → union.
+    node.wanted_output_names = vec!["dev".into()];
+    dag.merge(Uuid::new_v4(), &[node.clone()], &[], "")?;
+    assert_eq!(
+        dag.nodes["hashW"].wanted_output_names,
+        vec!["dev", "out"],
+        "second build's wanted set must UNION into the existing node, not replace it"
+    );
+
+    // Third build wants everything (empty sentinel) → saturates to all.
+    node.wanted_output_names = vec![];
+    dag.merge(Uuid::new_v4(), &[node.clone()], &[], "")?;
+    assert!(
+        dag.nodes["hashW"].wanted_output_names.is_empty(),
+        "all ∪ anything = all (the empty sentinel saturates the union)"
+    );
+
+    // A failed merge (cycle) must restore the pre-merge wanted set —
+    // the rejected build's wanted growth must not stick.
+    let mut dag = DerivationDag::new();
+    let mut a = make_node("hashWA", "x86_64-linux");
+    a.wanted_output_names = vec!["out".into()];
+    dag.merge(Uuid::new_v4(), &[a.clone()], &[], "")?;
+    let mut b = make_node("hashWB", "x86_64-linux");
+    b.wanted_output_names = vec![];
+    a.wanted_output_names = vec!["dev".into()];
+    let cycle = vec![make_edge("hashWA", "hashWB"), make_edge("hashWB", "hashWA")];
+    assert!(dag.merge(Uuid::new_v4(), &[a, b], &cycle, "").is_err());
+    assert_eq!(
+        dag.nodes["hashWA"].wanted_output_names,
+        vec!["out"],
+        "rollback must restore the pre-merge wanted set"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_edges_and_deps() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
