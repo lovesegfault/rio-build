@@ -1517,6 +1517,13 @@ impl DagActor {
                     output_names: node.output_names.clone(),
                     is_fixed_output: node.is_fixed_output,
                     is_ca: node.is_content_addressed,
+                    // THIS submission's wanted set. The upsert UNIONs
+                    // it into the existing row (empty saturates to
+                    // empty = "all wanted"), so the persisted set is
+                    // the union across every build that ever merged
+                    // this drv — same monotonic-growth semantics as
+                    // the in-memory `DerivationState::union_wanted`.
+                    wanted_output_names: node.wanted_output_names.clone(),
                 }
             })
             .collect();

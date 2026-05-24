@@ -1018,6 +1018,36 @@ pub const M_060: () = ();
 /// Greenfield drop+recreate, no backfill.
 pub const M_061: () = ();
 
+/// `migrations/062_derivation_wanted_outputs.sql`
+///
+/// Demand-driven cache-hit criterion: `derivations.wanted_output_names`
+/// is the subset of `output_names` that any consumer actually references
+/// (union over every parent's `inputDrvs` output-name set for this drv,
+/// ∪ the root request's `OutputsSpec`). The scheduler consults it ONLY
+/// for the cache-hit / substitutability classification — a missing
+/// output nothing consumes (`glibc-debug`) must not condemn the
+/// derivation and its build-time closure to a from-source rebuild. The
+/// assignment-token allowlist, GC pins, and the client-facing output
+/// report keep using the full `output_names`/`expected_output_paths`
+/// pair.
+///
+/// `'{}'` (the column DEFAULT) means "all declared outputs wanted":
+/// pre-migration rows, the `wopBuildDerivation` inline-`BasicDerivation`
+/// fallback, and `^*` roots all degrade to the old conservative
+/// all-outputs criterion.
+///
+/// Upserted with **union-on-conflict + empty-saturation** semantics
+/// (see `rio-scheduler/src/db/batch.rs`): the wanted set only ever
+/// grows for a given `drv_hash`. Overwrite would let a later build's
+/// narrower set un-want an output an earlier, still-live build needs.
+/// Because empty is the "all" sentinel, `all ∪ X = all`: if either the
+/// existing array or the incoming array is empty the result is `'{}'`,
+/// otherwise the sorted distinct union. Mirrors
+/// `DerivationState::union_wanted`.
+///
+/// Read/written by **rio-scheduler** only.
+pub const M_062: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
