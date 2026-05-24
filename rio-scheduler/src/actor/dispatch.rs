@@ -933,7 +933,7 @@ impl DagActor {
                         });
                     }
                 };
-                let ok = walk_substitute_closure(
+                let (ok, forgiven) = walk_substitute_closure(
                     &store,
                     paths,
                     &forgivable,
@@ -944,7 +944,11 @@ impl DagActor {
                 .await;
                 if let Some(tx) = weak_tx.upgrade() {
                     let _ = tx
-                        .send(super::ActorCommand::SubstituteComplete { drv_hash: h, ok })
+                        .send(super::ActorCommand::SubstituteComplete {
+                            drv_hash: h,
+                            ok,
+                            forgiven,
+                        })
                         .await;
                 }
             });
@@ -997,7 +1001,16 @@ impl DagActor {
     /// it), so `Substituting → Completed` is safe even if inputDrvs
     /// aren't yet Completed in the DAG. `ok=false` → revert to
     /// `Ready`/`Queued` for normal scheduling.
-    pub(super) async fn handle_substitute_complete(&mut self, drv_hash: &DrvHash, ok: bool) {
+    ///
+    /// `forgiven` is the set of seeds the walk forgave against the
+    /// wanted set *as snapshotted at spawn time*; see the re-check
+    /// below for why it must be re-evaluated here.
+    pub(super) async fn handle_substitute_complete(
+        &mut self,
+        drv_hash: &DrvHash,
+        ok: bool,
+        forgiven: &[String],
+    ) {
         // r[impl sched.substitute.leader-gate]
         // `on_lose` only flips atomics; the detached `substitute-fetch`
         // task survives lease loss and posts here on the standby. The
@@ -1020,6 +1033,25 @@ impl DagActor {
             return;
         }
         let topdown_pruned = state.topdown_pruned;
+        // r[impl sched.merge.wanted-outputs]
+        // The walk's forgiveness verdict was computed against the
+        // wanted set as of SPAWN time. A build that merged during the
+        // (potentially minutes-long) detached fetch can have grown the
+        // node's wanted union to include a seed the walk forgave —
+        // completing now would hand that build a node missing an
+        // output it wants. Downgrade to a revert WITHOUT setting
+        // `substitute_tried`: the next dispatch pass re-probes and
+        // re-spawns the walk with the corrected forgivable set, so the
+        // delta is re-substituted (and a genuine miss then fails the
+        // walk → `substitute_tried` → from-source build).
+        let forgiven_now_wanted =
+            ok && !forgiven.is_empty() && state.wanted_output_paths().any(|p| forgiven.contains(p));
+        let ok = ok && !forgiven_now_wanted;
+        if forgiven_now_wanted {
+            info!(%drv_hash,
+                  "substitute walk forgave a seed that became wanted \
+                   mid-fetch; reverting for re-substitution of the delta");
+        }
         if ok {
             // complete_ready_from_store does Substituting→Completed
             // (valid transition) + the full post-completion machinery
@@ -1061,6 +1093,14 @@ impl DagActor {
         // build even though R IS now buildable. If R has children the
         // "deps were dropped" invariant no longer holds — clear the
         // flag and fall through to normal Ready/Queued handling.
+        //
+        // Also gate on `!forgiven_now_wanted`: that downgrade means
+        // the fetch did NOT definitively fail — it forgave a seed
+        // that has since become wanted. Failing the build here would
+        // be premature; fall through to the revert so the next pass
+        // re-substitutes with the corrected forgivable set. A genuine
+        // failure on that second walk lands back here with
+        // `forgiven_now_wanted = false` and fails the build then.
         if topdown_pruned && !self.dag.get_children(drv_hash).is_empty() {
             debug!(%drv_hash,
                    "topdown-pruned root gained DAG children via later \
@@ -1068,7 +1108,7 @@ impl DagActor {
             if let Some(s) = self.dag.node_mut(drv_hash) {
                 s.topdown_pruned = false;
             }
-        } else if topdown_pruned {
+        } else if topdown_pruned && !forgiven_now_wanted {
             warn!(%drv_hash,
                   "topdown-pruned root: detached substitute fetch failed; \
                    deps were dropped from DAG — failing build (resubmit \
@@ -1122,7 +1162,17 @@ impl DagActor {
         // Next dispatch pass skips substitution and routes to a worker
         // — without this the partition re-includes it every Tick (~1/s
         // livelock; never reaches `find_executor`).
-        state.substitute_tried = true;
+        //
+        // EXCEPT for the forgiven-seed-became-wanted downgrade: there
+        // the fetch did not definitively fail a wanted path (it never
+        // tried the now-wanted one as wanted), so the next pass MUST
+        // re-substitute with the corrected forgivable set. Bounded:
+        // that second walk either succeeds or fails the now-unforgiven
+        // seed → lands back here with `forgiven_now_wanted = false` →
+        // sets the one-shot flag.
+        if !forgiven_now_wanted {
+            state.substitute_tried = true;
+        }
         if let Err(e) = state.transition(to) {
             warn!(%drv_hash, %e, "SubstituteComplete fail: revert rejected");
             return;
@@ -2598,6 +2648,15 @@ fn closure_cap_exceeded(visited: usize) -> bool {
 /// build-time closure, versus a POSSIBLE FUSE ENOENT on one path in
 /// one dependent's build, whose retry re-queries the path and
 /// re-triggers substitution.
+///
+/// Returns `(ok, forgiven)`: `forgiven` is the subset of `forgivable`
+/// seeds that actually FAILED and were forgiven (not the ones that
+/// substituted fine). `forgivable` is a snapshot of the wanted set at
+/// spawn time; a build that merges during the (potentially minutes-
+/// long) walk can grow the node's wanted set to include a forgiven
+/// seed. `handle_substitute_complete` re-checks `forgiven` against the
+/// node's CURRENT wanted set and downgrades a stale `ok=true` to a
+/// revert.
 pub(super) async fn walk_substitute_closure(
     store: &rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
     seeds: Vec<String>,
@@ -2605,10 +2664,11 @@ pub(super) async fn walk_substitute_closure(
     auth: &SubstituteAuth,
     shutdown: &rio_common::signal::Token,
     mut on_progress: impl FnMut(u64, u64, &str),
-) -> bool {
+) -> (bool, Vec<String>) {
     let mut visited: HashSet<String> = seeds.iter().cloned().collect();
     let mut frontier: VecDeque<String> = seeds.into_iter().collect();
     let mut ok = true;
+    let mut forgiven: Vec<String> = Vec::new();
     // Aggregate across the closure for `r[gw.activity.subst-progress]`.
     // `done_base` accumulates completed-path nar_sizes; the per-path
     // callback adds its in-flight `done` on top. `expected` grows as
@@ -2625,10 +2685,10 @@ pub(super) async fn walk_substitute_closure(
     let mut seen_expected: HashSet<String> = HashSet::new();
     while !frontier.is_empty() {
         if shutdown.is_cancelled() {
-            return false;
+            return (false, forgiven);
         }
         if closure_cap_exceeded(visited.len()) {
-            return false;
+            return (false, forgiven);
         }
         // Re-mint per layer: dispatch-time `Service` tokens are
         // short-lived; minting once at spawn meant a ghc-sized walk or
@@ -2670,7 +2730,7 @@ pub(super) async fn walk_substitute_closure(
                                 }
                             }
                             if closure_cap_exceeded(visited.len()) {
-                                return false;
+                                return (false, forgiven);
                             }
                         }
                         None => absent.push(path),
@@ -2715,7 +2775,7 @@ pub(super) async fn walk_substitute_closure(
                 meta_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
             for attempt in 0..super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
                 if shutdown.is_cancelled() {
-                    return false;
+                    return (false, forgiven);
                 }
                 let mut c = store.clone();
                 // r[impl gw.activity.subst-progress]
@@ -2761,7 +2821,7 @@ pub(super) async fn walk_substitute_closure(
                             }
                         }
                         if closure_cap_exceeded(visited.len()) {
-                            return false;
+                            return (false, forgiven);
                         }
                         continue 'paths;
                     }
@@ -2778,6 +2838,7 @@ pub(super) async fn walk_substitute_closure(
                         if forgivable.contains(&p) {
                             info!(path = %p, store_msg = e.message(),
                                   "unwanted output not substituted; continuing without it");
+                            forgiven.push(p.clone());
                             continue 'paths;
                         }
                         // The consequence of this arm is "compile the
@@ -2808,7 +2869,7 @@ pub(super) async fn walk_substitute_closure(
                             break;
                         }
                         tokio::select! {
-                            _ = shutdown.cancelled() => return false,
+                            _ = shutdown.cancelled() => return (false, forgiven),
                             _ = tokio::time::sleep(
                                 super::SUBSTITUTE_FETCH_BACKOFF.duration(attempt)
                             ) => {}
@@ -2821,6 +2882,7 @@ pub(super) async fn walk_substitute_closure(
                         if forgivable.contains(&p) {
                             info!(path = %p, error = %e,
                                   "unwanted output not substituted; continuing without it");
+                            forgiven.push(p.clone());
                             continue 'paths;
                         }
                         warn!(path = %p, error = %e,
@@ -2837,6 +2899,7 @@ pub(super) async fn walk_substitute_closure(
                 info!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
                       "unwanted output not substituted (retries exhausted); \
                        continuing without it");
+                forgiven.push(p.clone());
                 continue 'paths;
             }
             warn!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
@@ -2845,7 +2908,7 @@ pub(super) async fn walk_substitute_closure(
             ok = false;
         }
     }
-    ok
+    (ok, forgiven)
 }
 
 #[cfg(test)]

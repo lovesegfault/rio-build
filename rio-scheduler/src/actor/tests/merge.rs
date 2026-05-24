@@ -1050,6 +1050,7 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "tdp-r".into(),
             ok: false,
+            forgiven: vec![],
         })
         .await?;
     barrier(&handle).await;
