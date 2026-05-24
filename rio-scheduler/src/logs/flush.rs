@@ -1786,17 +1786,18 @@ impl LogFlusher {
         // Ring contribution to the row span, in TRUE line-number space
         // (last − first + 1; exceeds the physical count exactly when the ring
         // carries an interior hole — see above). Ingestion enforces monotone
-        // numbering per entry (`LogBuffers::push_for` rejects non-monotone
-        // and overflowing batches), so for a non-empty payload
-        // last_line ≥ first_line always holds in production. Computed totally
-        // anyway: the ingestion gate only constrains a batch against the
-        // ring's CURRENT contents (it resets when the ring empties), so if a
-        // future ingestion gap lets out-of-order numbering through, the span
-        // must degrade to the physical line count (the well-formed
-        // pre-hole-aware behavior) rather than wrap into a negative BIGINT in
-        // drv_logs.line_count — which corrupts s3_is_caught_up and the
-        // physical-vs-claimed re-serve for every interested build — or panic
-        // the only flusher task.
+        // numbering per entry (`LogBuffers::push_for` rejects overflowing
+        // batches and batches below the entry's accounted high-water mark —
+        // a floor that survives the ring emptying and the stored-coverage
+        // truncation), so for a non-empty payload last_line ≥ first_line
+        // always holds in production. Computed totally anyway: the gate is
+        // a different function's promise, the legacy `push()` path bypasses
+        // it entirely, and if a future ingestion gap lets out-of-order
+        // numbering through, the span must degrade to the physical line
+        // count (the well-formed pre-hole-aware behavior) rather than wrap
+        // into a negative BIGINT in drv_logs.line_count — which corrupts
+        // s3_is_caught_up and the physical-vs-claimed re-serve for every
+        // interested build — or panic the only flusher task.
         // r[impl sched.executor.input-bounds+2]
         let ring_span = match last_line.checked_sub(first_line) {
             Some(d) => d.saturating_add(1),
@@ -7974,6 +7975,203 @@ mod tests {
             gets.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "stored blob fetched once, then served from the entry cache"
+        );
+        Ok(())
+    }
+
+    /// A worker re-delivery numbered below the cached stored prefix's end
+    /// must be rejected even though the stored-coverage reconcile emptied
+    /// the ring (the shape that used to reset the monotone ingestion gate).
+    /// Pre-fix, the re-delivered line landed in the empty ring and the
+    /// final's gap-merge fold double-counted it: `line_count` = prefix(2) +
+    /// saturating gap(0) + ring span(1) = 3 over a true span of 2, and the
+    /// blob physically held line 1 twice (the second copy served as a
+    /// "line 2" the build never produced).
+    // r[verify obs.log.gap-span+2]
+    // r[verify sched.executor.input-bounds+2]
+    #[tokio::test]
+    async fn redelivery_below_stored_prefix_rejected_after_ring_emptied() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let stored: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r20gate1-redeliver-below-prefix.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // Tenure A stores [0,2) incomplete; the fresh standby's recovery
+        // restamps an empty entry with the same exec.
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &stored).await;
+
+        // The worker re-delivers line 1 (a line the stored row already
+        // covers). The restamped entry is empty, so this first batch is
+        // accepted; the reconcile on the next tick classifies the ring as
+        // not subsuming the row, fetches the blob, truncates the ring back
+        // to empty, and caches the prefix [0,2).
+        assert!(buffers.push_for(drv_path, &mk_batch(drv_path, 1, &[b"dup-1"]), "test-worker"));
+        flusher.flush_periodic().await;
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                buffers.prefix_state(drv_path, exec_id),
+                PrefixState::Cached(_)
+            ),
+            "fixture: the reconcile cached the stored prefix"
+        );
+        assert_eq!(
+            buffers.read_since(drv_path, 0),
+            Some(vec![]),
+            "fixture: the reconcile truncated the superseded ring to empty"
+        );
+
+        // The worker re-delivers line 1 AGAIN into the now-empty ring. The
+        // entry has already accounted for everything below 2 (the cached
+        // stored prefix); accepting this batch would hand the fold a ring
+        // line below the prefix end and double-count it.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let accepted = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            buffers.push_for(drv_path, &mk_batch(drv_path, 1, &[b"dup-1"]), "test-worker")
+        };
+        assert!(
+            !accepted,
+            "a re-delivered line below the cached stored prefix's end must be \
+             rejected even when the ring is empty"
+        );
+        let counters = all_counters(&snap);
+        assert!(
+            counters.iter().any(|(n, l, v)| {
+                n == "rio_scheduler_log_batches_rejected_total"
+                    && l.contains(&("reason".to_string(), "below_stored_prefix".to_string()))
+                    && *v == 1
+            }),
+            "rejection must be counted once under its own reason: {counters:?}"
+        );
+
+        // The final flush must not inflate the recorded span past the
+        // execution's true end (2).
+        buffers.seal(drv_path);
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+                lease_generation: 1,
+                acquired_transitions: 0,
+            })
+            .await;
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT first_line, line_count FROM drv_logs WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(
+            (row.0, row.1),
+            (0, 2),
+            "the recorded span must stay at the execution's true end; a \
+             double-counted overlap inflates line_count past it"
+        );
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "only tenure A's .partial: the rejected re-delivery leaves the \
+             final drain empty, so no final blob is uploaded"
+        );
+        Ok(())
+    }
+
+    /// The stored-prefix cache must ADVANCE the entry's accept floor, not
+    /// merely survive the truncation: a stored row extended past anything
+    /// this replica ever held (an interim leader kept flushing) caches a
+    /// prefix whose end exceeds every line this entry has accepted, and a
+    /// subsequent batch between the highest accepted line and the stored
+    /// end must still be rejected. Pre-fix the fold counted those ring
+    /// lines on top of the prefix span that already covers them
+    /// (`line_count` = 4 + 0 + 3 = 7 over a true span of 5).
+    // r[verify obs.log.gap-span+2]
+    #[tokio::test]
+    async fn stored_prefix_cache_advances_accept_floor_past_prior_pushes() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let stored: Vec<&[u8]> = vec![b"pfx-0", b"pfx-1", b"pfx-2", b"pfx-3"];
+        let stored_zst = compress_lines(&stored.iter().map(|l| l.to_vec()).collect::<Vec<_>>())?;
+        let (s3, puts, _deletes, gets) = mock_s3_capturing_with_get(Ok(stored_zst));
+        let buffers = Arc::new(LogBuffers::new());
+        let drv_path = "/nix/store/r20gate2-prefix-advances-floor.drv";
+
+        let flusher = LogFlusher::new(
+            s3,
+            "test-bucket".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+            30,
+            always_leader(),
+        );
+        // The stored row covers [0,4); the restamped entry is empty.
+        let exec_id = failover_restamp_after_periodic(&flusher, &buffers, drv_path, &stored).await;
+
+        // The worker re-delivers only line 1 before the reconcile: the
+        // highest line this entry has ever accepted is 1, strictly below
+        // the stored end (4).
+        assert!(buffers.push_for(drv_path, &mk_batch(drv_path, 1, &[b"dup-1"]), "test-worker"));
+        flusher.flush_periodic().await;
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            buffers.read_since(drv_path, 0),
+            Some(vec![]),
+            "fixture: the reconcile truncated the superseded ring to empty"
+        );
+
+        // [2,4) is above every line this entry ever accepted but below the
+        // cached prefix's end — only the prefix-cache advancement of the
+        // accept floor rejects it.
+        assert!(
+            !buffers.push_for(
+                drv_path,
+                &mk_batch(drv_path, 2, &[b"dup-2", b"dup-3"]),
+                "test-worker"
+            ),
+            "a batch below the cached stored prefix's end must be rejected \
+             even when it is above every line this replica accepted"
+        );
+        // The first genuinely new line (at the stored end) is accepted.
+        assert!(buffers.push_for(drv_path, &mk_batch(drv_path, 4, &[b"new-4"]), "test-worker"));
+
+        buffers.seal(drv_path);
+        flusher
+            .flush_final(FlushRequest {
+                drv_path: drv_path.into(),
+                exec_id,
+                status: Some("succeeded".into()),
+                lease_generation: 1,
+                acquired_transitions: 0,
+            })
+            .await;
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM drv_logs WHERE exec_id = $1",
+        )
+        .bind(exec_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (row.0, row.1, row.2),
+            (0, 5, true),
+            "the recorded span is prefix(4) + new tail(1); a double-counted \
+             overlap inflates it"
+        );
+        let captured: Vec<CapturedPut> = puts.lock().unwrap().clone();
+        let (_key, body) = captured.last().expect("final merged PUT");
+        assert_eq!(
+            String::from_utf8(zstd::decode_all(&body[..])?)?,
+            "pfx-0\npfx-1\npfx-2\npfx-3\nnew-4\n",
+            "the final blob holds each line exactly once"
         );
         Ok(())
     }

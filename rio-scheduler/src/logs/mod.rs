@@ -181,6 +181,29 @@ struct RingBuf {
     /// content stays covered regardless because it lives in
     /// `recovered_prefix`, not the ring.
     prefix_checked: bool,
+    /// One past the highest worker line number this entry has ever
+    /// accounted for, under its current execution stamp: the high-water
+    /// mark of every accepted push (`last_line + 1`), the cached stored
+    /// prefix's end (`first_line + line_count` — content a prior tenure
+    /// already persisted for this execution), and the stored-coverage
+    /// truncation threshold (the same end, applied one lock acquisition
+    /// earlier so a batch racing the reconcile between its truncation and
+    /// its prefix-cache write cannot slip below it). 0 = nothing accounted
+    /// yet.
+    ///
+    /// [`LogBuffers::push_for`] rejects a batch whose `first_line_number`
+    /// is below this mark. Unlike the ring's own `lines.back()`, the mark
+    /// is NEVER lowered: not by `truncate_below`, not by eviction, not by
+    /// the ring emptying — so the accept floor survives the
+    /// stored-coverage reconcile emptying the ring, which is exactly when
+    /// the gap-merge fold's "the ring starts at or after the cached
+    /// prefix's end" precondition would otherwise be violated by a
+    /// re-delivered (or fabricated) line the stored row already covers.
+    /// Reset only where the entry's execution identity resets (the
+    /// cross-exec arm of [`LogBuffers::set_exec`] — a new execution
+    /// restarts its numbering at 0); a same-exec restamp keeps it, like
+    /// the lines it accounts for.
+    accounted_below: u64,
     /// A final `FlushRequest` for this entry's execution is pending with the
     /// flusher: enqueued by the actor's `terminal_log_epilogue` and not yet
     /// resolved, or deferred (finalize guard could not read `drv_logs`) and
@@ -293,6 +316,18 @@ impl LogBuffers {
             // (tests, future callers); production batches are pre-validated
             // by `push_for`'s overflow arm.
             buf.lines.push_back((base.saturating_add(i as u64), l));
+        }
+
+        // Advance the accounted high-water mark to one past the batch's
+        // last line. `max`, not assignment: the legacy `push()` path has no
+        // ordering gate, so a test (or future caller) pushing out of order
+        // must not regress the mark below content already accounted for.
+        // Saturating for the same legacy-path reason as the line numbers
+        // above; `push_for` pre-validates `base + len` against u64.
+        if !batch.lines.is_empty() {
+            buf.accounted_below = buf
+                .accounted_below
+                .max(base.saturating_add(batch.lines.len() as u64));
         }
 
         // Evict oldest lines if over capacity (line count OR bytes).
@@ -529,6 +564,11 @@ impl LogBuffers {
             );
             entry.lines.clear();
             entry.bytes = 0;
+            // The accounted high-water mark belongs to the previous
+            // execution's numbering: a new execution restarts at line 0,
+            // and carrying the old mark across would silently mute the new
+            // execution's entire stream.
+            entry.accounted_below = 0;
             // The recovered prefix (and the "already looked" flag) belong
             // to the previous execution — a different exec_id keys a
             // different drv_logs row and S3 blob, so carrying them across
@@ -612,6 +652,15 @@ impl LogBuffers {
     /// when the entry is gone or stamped with a different exec — the
     /// caller still holds the `Arc` and can use it for the in-flight
     /// flush, it just won't be reused on later ticks.
+    ///
+    /// Also raises the entry's accounted high-water mark to the prefix's
+    /// end: every line below it is now durably accounted for by the stored
+    /// row, so a later batch numbered below it must be rejected by
+    /// [`Self::push_for`] rather than re-entering the ring and being
+    /// double-counted by the gap-merge fold on top of the prefix span that
+    /// already covers it. This is what gives a fresh standby (whose entry
+    /// never held the stored lines, so no push ever raised the mark that
+    /// high) an accept floor at the stored end.
     pub(crate) fn set_recovered_prefix(
         &self,
         drv_path: &str,
@@ -620,6 +669,9 @@ impl LogBuffers {
     ) -> bool {
         match self.buffers.get_mut(&drv_log_hash(drv_path)) {
             Some(mut e) if e.exec_id == Some(exec_id) => {
+                e.accounted_below = e
+                    .accounted_below
+                    .max(prefix.first_line.saturating_add(prefix.line_count));
                 e.recovered_prefix = Some(prefix);
                 e.prefix_checked = true;
                 true
@@ -766,14 +818,21 @@ impl LogBuffers {
     ///   not match `executor` (`reason="executor_mismatch"`). Each
     ///   binding-gate reject increments
     ///   `rio_scheduler_log_batches_rejected_total` and emits a `debug!`, or
-    /// - the line-numbering gate rejects it: the batch starts at or below
-    ///   the ring's highest stored line number (`reason="non_monotonic"`),
-    ///   or `first_line_number + lines.len()` would overflow u64
-    ///   (`reason="line_number_overflow"`). Same counter, same `debug!`
-    ///   discipline. This is what makes the ring's documented
-    ///   monotone-numbering invariant (`truncate_below`, `read_since`)
-    ///   enforced rather than assumed; upward gaps of any size remain
-    ///   accepted.
+    /// - the line-numbering gate rejects it: the batch starts below what
+    ///   the entry has already accounted for — at or below the ring's
+    ///   highest stored line number (`reason="non_monotonic"`), or below
+    ///   the entry's accounted high-water mark while the ring holds
+    ///   nothing at or above it (`reason="below_stored_prefix"` — the
+    ///   lines it would re-number were yielded to a stored prefix by the
+    ///   stored-coverage reconcile, or the ring is empty after that
+    ///   truncation) — or `first_line_number + lines.len()` would
+    ///   overflow u64 (`reason="line_number_overflow"`). Same counter,
+    ///   same `debug!` discipline; the reasons partition the rejections
+    ///   (exactly one series per rejected batch). This is what makes the
+    ///   ring's documented monotone-numbering invariant (`truncate_below`,
+    ///   `read_since`) and the gap-merge fold's ring-starts-at-or-after-
+    ///   the-prefix-end precondition enforced rather than assumed; upward
+    ///   gaps of any size remain accepted.
     ///
     /// **The caller MUST gate any sibling consumer on the return value.**
     /// `r[sched.log.batch-binding]` requires the *ingestion path* to drop
@@ -849,22 +908,31 @@ impl LogBuffers {
         // daemon-transient retries reseed at the prior attempt's
         // final_line_count, reconnects resume after the last delivered line —
         // see rio-builder log_stream.rs / executor mod.rs, bug_013), so a
-        // batch that would wrap u64 numbering or that starts at/below the
-        // ring's highest stored line number is malformed worker input. Reject
+        // batch that would wrap u64 numbering or that starts below what this
+        // entry has already accounted for is malformed worker input. Reject
         // the batch — do NOT renumber it: the field's only purpose is
         // ordering, and every downstream consumer (read_since's monotone
         // scan, truncate_below's front-truncation, the flusher's span and
         // stored-coverage subsumption arithmetic, drv_logs.line_count) relies
         // on ring numbering being monotone. Per-batch, like the binding arms
         // above: an in-order batch after a rejected one is accepted again.
-        // Scope: the comparison is against the CURRENT ring contents only
-        // (it resets when the ring empties — drain, failover truncate_below,
-        // discard), and absolute magnitude is deliberately unbounded —
-        // upward gaps of any size stay accepted (interior holes are
-        // legitimate, obs.log.gap-span). Whatever passes here is made
-        // harmless at the recording site: the flusher's span computation is
-        // total and the drv_logs numeric binds clamp at i64::MAX.
+        // Scope: the comparison is against the entry's accounted high-water
+        // mark (`accounted_below` — the max of every accepted line and the
+        // cached stored prefix's end), which is NEVER reset by the ring
+        // emptying — drain and discard remove the whole entry, and the
+        // stored-coverage reconcile's truncate-to-empty deliberately leaves
+        // the mark at the stored end so a re-delivered (or fabricated) line
+        // the stored row already covers cannot re-enter the ring and be
+        // double-counted by the gap-merge fold (obs.log.gap-span: the fold
+        // assumes the ring starts at or after the cached prefix's end; this
+        // arm is what makes that precondition hold at the trust boundary).
+        // Absolute magnitude is deliberately unbounded — upward gaps of any
+        // size stay accepted (interior holes are legitimate,
+        // obs.log.gap-span). Whatever passes here is made harmless at the
+        // recording site: the flusher's span computation is total and the
+        // drv_logs numeric binds clamp at i64::MAX.
         // r[impl sched.executor.input-bounds+2]
+        // r[impl obs.log.gap-span+2]
         if !batch.lines.is_empty() {
             if batch
                 .first_line_number
@@ -884,19 +952,37 @@ impl LogBuffers {
                 .increment(1);
                 return false;
             }
-            if let Some((last_line, _)) = entry.lines.back()
-                && batch.first_line_number <= *last_line
-            {
+            if batch.first_line_number < entry.accounted_below {
+                // Two reasons partition this arm so the pre-existing
+                // `non_monotonic` series keeps its exact meaning (at or
+                // below the ring's CURRENT highest line — the label
+                // dashboards already watch) and the new rejections are
+                // visible on their own: a batch below the mark but not
+                // below the ring's tail is one the ring no longer holds
+                // evidence for — its lines were truncated in favor of a
+                // stored prefix (or the ring is empty). Exactly one series
+                // is incremented per rejected batch.
+                let below_ring_tail = entry
+                    .lines
+                    .back()
+                    .is_some_and(|(last_line, _)| batch.first_line_number <= *last_line);
+                let reason = if below_ring_tail {
+                    "non_monotonic"
+                } else {
+                    "below_stored_prefix"
+                };
                 tracing::debug!(
                     drv = %drv_path, executor,
                     first_line_number = batch.first_line_number,
-                    ring_last_line = last_line,
-                    "rejected log batch: non-monotone first_line_number \
-                     (ring already holds an equal or higher line number)"
+                    accounted_below = entry.accounted_below,
+                    ring_last_line = ?entry.lines.back().map(|(n, _)| *n),
+                    reason,
+                    "rejected log batch: first_line_number is below what this \
+                     execution's entry has already accounted for"
                 );
                 metrics::counter!(
                     "rio_scheduler_log_batches_rejected_total",
-                    "reason" => "non_monotonic"
+                    "reason" => reason
                 )
                 .increment(1);
                 return false;
@@ -993,8 +1079,17 @@ impl LogBuffers {
     /// stored `.partial` once the entry is drained.
     ///
     /// Line numbers in the ring are monotone (batches arrive in order and
-    /// the worker never re-streams below what this leader already holds),
-    /// so a one-time front-truncation stays valid for the execution.
+    /// the ingestion gate rejects anything at or below what the entry has
+    /// already accounted for), so a one-time front-truncation stays valid
+    /// for the execution.
+    ///
+    /// Also raises the entry's accounted high-water mark to `threshold`:
+    /// the lines yielded here are accounted for by the stored coverage the
+    /// caller is about to cache, and raising the mark under the same entry
+    /// lock as the truncation closes the window in which a batch landing
+    /// between the truncation and the prefix-cache write would see an
+    /// empty ring, a not-yet-raised mark, and be accepted below the stored
+    /// end.
     pub(crate) fn truncate_below(
         &self,
         drv_path: &str,
@@ -1007,6 +1102,7 @@ impl LogBuffers {
         if buf.exec_id != Some(exec_id) {
             return (0, 0);
         }
+        buf.accounted_below = buf.accounted_below.max(threshold);
         let (mut dropped_lines, mut dropped_bytes) = (0u64, 0u64);
         while buf.lines.front().is_some_and(|(n, _)| *n < threshold) {
             let (_, l) = buf.lines.pop_front().expect("front checked above");
@@ -2505,6 +2601,63 @@ mod tests {
         // Rejection is per-batch: the next in-order batch is accepted.
         assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 1001, &[b"l1001"]), "executor-1"));
         assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 2);
+    }
+
+    /// The accept floor is the entry's accounted high-water mark, not the
+    /// ring's current tail: it survives the stored-coverage truncation
+    /// emptying the ring, is raised to the cached stored prefix's end, is
+    /// kept by a same-exec restamp, and is reset only by a cross-exec
+    /// restamp (a new execution restarts its numbering at 0).
+    // r[verify obs.log.gap-span+2]
+    // r[verify sched.executor.input-bounds+2]
+    #[test]
+    fn push_for_accept_floor_survives_truncation_and_resets_on_cross_exec() {
+        let bufs = LogBuffers::new();
+        let exec = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"l0", b"l1"]),
+            "executor-1"
+        ));
+
+        // The stored-coverage reconcile yields the whole ring to a stored
+        // row ending at 4 and caches that row as the prefix.
+        assert_eq!(bufs.truncate_below("drv-a", exec, 4), (2, 4));
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]), "ring emptied");
+        assert!(bufs.set_recovered_prefix(
+            "drv-a",
+            exec,
+            std::sync::Arc::new(RecoveredPrefix {
+                first_line: 0,
+                line_count: 4,
+                total_bytes: 8,
+                compressed: vec![1, 2, 3],
+            })
+        ));
+
+        // Below the stored end → rejected even though the ring is empty.
+        assert!(!bufs.push_for("drv-a", &mk_batch("drv-a", 1, &[b"dup"]), "executor-1"));
+        assert!(!bufs.push_for("drv-a", &mk_batch("drv-a", 3, &[b"dup"]), "executor-1"));
+        assert_eq!(bufs.read_since("drv-a", 0), Some(vec![]));
+
+        // A same-exec restamp (lease re-acquisition) keeps the floor along
+        // with the lines it accounts for: the ring is still empty, so only
+        // the surviving floor rejects this.
+        bufs.set_exec("drv-a", exec, "executor-1");
+        assert!(!bufs.push_for("drv-a", &mk_batch("drv-a", 2, &[b"dup"]), "executor-1"));
+        // At the stored end → accepted (the next genuinely new line).
+        assert!(bufs.push_for("drv-a", &mk_batch("drv-a", 4, &[b"l4"]), "executor-1"));
+
+        // A cross-exec restamp resets it: the new execution's line 0 must
+        // not be muted by the previous execution's coverage.
+        let exec2 = Uuid::now_v7();
+        bufs.set_exec("drv-a", exec2, "executor-1");
+        assert!(bufs.push_for(
+            "drv-a",
+            &mk_batch("drv-a", 0, &[b"new-exec-l0"]),
+            "executor-1"
+        ));
     }
 
     /// Upward gaps stay accepted — that is the legitimate interior-hole /

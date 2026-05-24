@@ -412,9 +412,11 @@ pub fn describe_metrics() {
         "rio_scheduler_log_batches_rejected_total",
         "BuildLogBatch dropped by the (executor, drv) binding check, the \
          derivation_path length bound, or the line-number sanity checks \
-         (non-monotone vs the ring buffer, or numbering that would overflow u64). \
+         (non-monotone vs the ring buffer, below the stored coverage the entry \
+         already accounts for, or numbering that would overflow u64). \
          Labeled by reason: no_assignment | unstamped | executor_mismatch | \
-         path_too_long | non_monotonic | line_number_overflow."
+         path_too_long | non_monotonic | below_stored_prefix | \
+         line_number_overflow."
     );
     describe_counter!(
         "rio_scheduler_log_flush_span_fallback_total",

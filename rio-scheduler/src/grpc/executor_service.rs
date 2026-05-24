@@ -77,12 +77,14 @@ const MAX_DRVS_PER_STREAM: usize = 8;
 //   BuildLogBatch.derivation_path     → seen_drvs, ring key, actor fwd    → reject batch > MAX_DERIVATION_PATH_LEN
 //   BuildLogBatch.lines[i]            → ring buffer + Event::Log ring     → truncate to logs::MAX_LINE_LEN
 //   BuildLogBatch.executor_id         → retained whole in Event::Log      → truncate to MAX_IDENT_LEN
-//   BuildLogBatch.first_line_number   → ring line numbering + drv_logs    → reject batch if non-monotone vs the
-//                                       row span arithmetic                 ring's last line or if base+len would
-//                                                                           wrap u64 (push_for arms `non_monotonic`
-//                                                                           / `line_number_overflow`); flusher span
-//                                                                           arithmetic is total and the drv_logs
-//                                                                           binds clamp at i64::MAX as the
+//   BuildLogBatch.first_line_number   → ring line numbering + drv_logs    → reject batch if below what the entry
+//                                       row span arithmetic                 already accounts for (the ring's last
+//                                                                           line or the cached stored prefix's end
+//                                                                           — push_for arms `non_monotonic` /
+//                                                                           `below_stored_prefix`) or if base+len
+//                                                                           would wrap u64 (`line_number_overflow`);
+//                                                                           flusher span arithmetic is total and the
+//                                                                           drv_logs binds clamp at i64::MAX as the
 //                                                                           magnitude backstop
 //   CompletionReport.drv_path         → actor hash_for_path lookup        → reject report > MAX_DERIVATION_PATH_LEN
 //   CompletionReport.assignment_token → never read in the recv arm        → document (decoded then dropped)
