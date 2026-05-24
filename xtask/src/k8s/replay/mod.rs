@@ -102,7 +102,7 @@ pub struct ReplayArgs {
     pub fail_on: FailOn,
 
     /// Directory for run artifacts (log, divergences.jsonl, summary.json).
-    /// Default: .stress-test/replay/<unix-ts>/
+    /// Default: `.stress-test/replay/<unix-ts>/`
     #[arg(long)]
     pub report_dir: Option<PathBuf>,
 }

@@ -194,7 +194,9 @@ impl ReplayArchive {
                 .and_then(|text| NarInfo::parse(text).map_err(anyhow::Error::from));
             match parsed {
                 Ok(narinfo) => {
-                    narinfos.insert(stem.to_string(), narinfo);
+                    // Key by the hash part so `<hash>-<name>.narinfo` sidecar
+                    // naming resolves the same as the canonical `<hash>.narinfo`.
+                    narinfos.insert(hash_part(stem).to_string(), narinfo);
                 }
                 Err(err) => tracing::warn!("skipping unparseable {rel}: {err:#}"),
             }
@@ -282,6 +284,11 @@ impl ReplayArchive {
 
     /// NAR-serialize an embedded store path (used as upload payload).
     /// Accepts a full store path or a basename.
+    ///
+    /// The call is synchronous (file I/O plus decompression), and on the
+    /// DwarFS backend all content reads serialize on an internal lock.
+    /// Async callers should wrap it in [`tokio::task::spawn_blocking`] and
+    /// not expect parallel-dump throughput.
     pub fn dump_nar(&self, store_path: &str) -> Result<Vec<u8>> {
         let entry = self
             .store_entries
@@ -411,7 +418,7 @@ impl Backend {
         let file = std::fs::File::open(path)
             .with_context(|| format!("open replay archive {}", path.display()))?;
         let (index, archive) = dwarfs::Archive::new(file)
-            .with_context(|| format!("{}: not a readable DwarFS image", path.display()))?;
+            .with_context(|| format!("failed to open {} as a DwarFS image", path.display()))?;
         Ok(Backend::Dwarfs(Box::new(DwarfsBackend {
             index,
             archive: Mutex::new(archive),
@@ -436,7 +443,9 @@ impl Backend {
                 let file = inode
                     .as_file()
                     .ok_or_else(|| anyhow!("{rel}: not a regular file in the DwarFS image"))?;
-                let mut archive = dw.archive.lock().expect("dwarfs reader lock poisoned");
+                // A panic during a read can't corrupt the block cache;
+                // recovering from poisoning keeps later reads working.
+                let mut archive = dw.archive.lock().unwrap_or_else(|e| e.into_inner());
                 let bytes = file
                     .read_to_vec(&mut *archive)
                     .with_context(|| format!("read {rel} from the DwarFS image"))?;

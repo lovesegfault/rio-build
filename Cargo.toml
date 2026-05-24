@@ -437,8 +437,10 @@ clap-verbosity-flag = { version = "3", default-features = false, features = [
 ] }
 console = "0.16"
 filetime = "0.2"
-# Read-only DwarFS image reader (xtask k8s replay archives).
-dwarfs = "0.2"
+# Read-only DwarFS image reader (xtask k8s replay archives). lzma + lz4 on
+# top of the default zstd: real archives may be packed with mkdwarfs LZMA
+# presets, and the reader should open whatever mkdwarfs produces.
+dwarfs = { version = "0.2", features = ["lzma", "lz4"] }
 
 [profile.release]
 incremental = false

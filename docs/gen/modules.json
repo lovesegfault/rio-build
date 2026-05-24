@@ -1809,6 +1809,11 @@
       "doc": "`xtask k8s replay` — replay a recorded build-load archive against a rio"
     },
     {
+      "path": "k8s/replay/archive.rs",
+      "depth": 2,
+      "doc": "Replay archive reader — the recorded build load consumed by `xtask k8s"
+    },
+    {
       "path": "k8s/shared.rs",
       "depth": 1,
       "doc": "Helpers both providers (k3s/eks) use."
