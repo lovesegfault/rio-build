@@ -421,7 +421,7 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// Write the `wopBuildDerivation` request payload (opcode + path + drv + mode) and flush.
 ///
 /// Read side is left to the caller: loop on [`read_stderr_message`] until
-/// [`StderrMessage::Last`], then call [`read_build_result`](super::build::read_build_result).
+/// [`StderrMessage::Last`], then call [`read_build_result`].
 /// rio-builder's `run_daemon_build` does this with cancel-safe batching and a
 /// silence deadline layered on top of the protocol read.
 pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
