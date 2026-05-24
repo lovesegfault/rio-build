@@ -143,8 +143,19 @@ pub enum ActorCommand {
     /// `walk_substitute_closure`); handler completes the derivation.
     /// `ok=false` → a wanted seed or a discovered reference failed;
     /// handler reverts to Ready/Queued for normal scheduling.
+    ///
+    /// `forgiven` is the set of seed paths whose fetch FAILED but was
+    /// forgiven because they were outside the wanted set *as of spawn
+    /// time*. The handler re-checks them against the node's CURRENT
+    /// wanted set — a build that merged during the walk can have grown
+    /// the wanted union to include one — and downgrades a stale
+    /// `ok=true` to a revert so the delta gets re-substituted.
     /// r[sched.substitute.detached+3]
-    SubstituteComplete { drv_hash: DrvHash, ok: bool },
+    SubstituteComplete {
+        drv_hash: DrvHash,
+        ok: bool,
+        forgiven: Vec<String>,
+    },
 
     /// Byte-level progress from a detached substitute fetch's closure
     /// walk. `bytes_done`/`bytes_expected` are AGGREGATE across all

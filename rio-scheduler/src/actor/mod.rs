@@ -1264,10 +1264,15 @@ impl DagActor {
                         self.handle_reconcile_assignments().await;
                     }
                 }
-                ActorCommand::SubstituteComplete { drv_hash, ok } => {
+                ActorCommand::SubstituteComplete {
+                    drv_hash,
+                    ok,
+                    forgiven,
+                } => {
                     // r[impl sched.lease.standby-drops-writes]
                     if self.leader.is_leader() {
-                        self.handle_substitute_complete(&drv_hash, ok).await;
+                        self.handle_substitute_complete(&drv_hash, ok, &forgiven)
+                            .await;
                     }
                 }
                 ActorCommand::SubstituteProgress {

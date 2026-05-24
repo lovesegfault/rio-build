@@ -1635,6 +1635,7 @@ async fn substitute_complete_inline_probes_dependents() -> TestResult {
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "sub-chain-dep".into(),
             ok: true,
+            forgiven: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -2840,6 +2841,7 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "sub-standby".into(),
             ok: true,
+            forgiven: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -3412,6 +3414,7 @@ async fn substitute_fail_with_poisoned_dep_goes_dependency_failed() -> TestResul
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "sfp-x".into(),
             ok: false,
+            forgiven: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -3581,7 +3584,7 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
         &Default::default(),
@@ -3629,7 +3632,7 @@ async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
         &Default::default(),
@@ -3654,7 +3657,11 @@ async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
 /// definitively misses must NOT fail the walk: the wanted seed
 /// substitutes, the unwanted one is skipped with a log line, and the
 /// walk returns ok=true. The unwanted seed is still ATTEMPTED
-/// (opportunistic completeness — it stays in the seed list).
+/// (opportunistic completeness — it stays in the seed list). The
+/// returned `forgiven` set reports exactly the seeds that FAILED and
+/// were forgiven — not the ones that substituted fine — so
+/// `handle_substitute_complete` can re-check them against a wanted set
+/// that grew mid-walk.
 #[tokio::test]
 async fn walk_forgives_unwanted_seed_not_found() -> TestResult {
     let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
@@ -3667,7 +3674,7 @@ async fn walk_forgives_unwanted_seed_not_found() -> TestResult {
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
     let forgivable: HashSet<String> = [dbg.clone()].into();
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, forgiven) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![out.clone(), dbg.clone()],
         &forgivable,
@@ -3679,6 +3686,12 @@ async fn walk_forgives_unwanted_seed_not_found() -> TestResult {
     assert!(
         ok,
         "an unwanted seed the upstream misses must be forgiven → ok=true"
+    );
+    assert_eq!(
+        forgiven,
+        vec![dbg.clone()],
+        "the forgiven set must report exactly the seeds whose failure \
+         was forgiven (not the wanted seed that substituted fine)"
     );
     let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
@@ -3700,7 +3713,7 @@ async fn walk_fails_on_wanted_seed_not_found() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![out.clone(), dbg.clone()],
         &HashSet::new(),
@@ -3744,7 +3757,7 @@ async fn walk_forgives_unwanted_seed_non_transient_error() -> TestResult {
         } else {
             HashSet::new()
         };
-        let ok = crate::actor::dispatch::walk_substitute_closure(
+        let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
             &client,
             vec![dbg.clone()],
             &forgivable,
@@ -3804,7 +3817,7 @@ async fn walk_forgives_unwanted_seed_retry_exhaust() -> TestResult {
         } else {
             HashSet::new()
         };
-        let ok = crate::actor::dispatch::walk_substitute_closure(
+        let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
             &client,
             vec![dbg.clone()],
             &forgivable,
@@ -3856,7 +3869,7 @@ async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
     let forgivable: HashSet<String> = [dbg.clone()].into();
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![out.clone(), dbg.clone()],
         &forgivable,
@@ -3977,6 +3990,75 @@ async fn substitute_walk_unresolvable_wanted_set_forgives_nothing() -> TestResul
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
+// r[verify sched.substitute.detached+3]
+/// The forgivable set is snapshotted at spawn time, but a detached
+/// fetch can run for minutes — a second build merging during that
+/// window can grow the node's wanted union to include an output the
+/// in-flight walk is about to forgive. `handle_substitute_complete`
+/// MUST re-check the walk's forgiven set against the node's CURRENT
+/// wanted set and downgrade a stale `ok=true` to a revert; otherwise
+/// the node Completes without an output build B positively wants.
+///
+/// The QPI gate parks the detached walk before its first fetch so the
+/// second merge lands deterministically inside the spawn→complete
+/// window.
+#[tokio::test]
+async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("fgv-race-out");
+    let dbg = test_store_path("fgv-race-debug");
+    // out: substitutable (probe + GET agree). dbg: indeterminate at
+    // probe time but the GET definitively misses — the seed the walk
+    // forgives against the spawn-time wanted set {out}.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store.state.indeterminate.write().unwrap().push(dbg.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("fgv-race");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // Build A wants only {out} → forgivable = {P_debug} at spawn time.
+    // The detached walk parks at the QPI gate.
+    merge_dag(&handle, Uuid::new_v4(), vec![mk(&["out"])], vec![], false).await?;
+    wait_for_status(&handle, "fgv-race", DerivationStatus::Substituting).await;
+
+    // Build B merges mid-fetch and wants {debug} → the union grows to
+    // {debug, out} while the walk still holds the spawn-time snapshot.
+    merge_dag(&handle, Uuid::new_v4(), vec![mk(&["debug"])], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Release the walk: P_out substitutes, P_debug GETs NotFound and is
+    // forgiven against the STALE forgivable set → the task posts
+    // ok=true with forgiven=[P_debug].
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    settle_substituting(&handle, &["fgv-race"]).await;
+
+    assert_ne!(
+        expect_drv(&handle, "fgv-race").await.status,
+        DerivationStatus::Completed,
+        "a seed forgiven against the spawn-time wanted set that became \
+         wanted mid-fetch must downgrade the completion to a revert — \
+         build B would otherwise observe a Completed node missing an \
+         output it asked for"
+    );
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+3]
 /// Cold path: A is NOT in `state.paths` (batch returns None) but IS
 /// in `state.substitutable` (per-path QPI materializes it with
@@ -3997,7 +4079,7 @@ async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
         &Default::default(),
@@ -4056,7 +4138,7 @@ async fn walk_substitute_closure_progress_monotone_and_bounded() -> TestResult {
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
     let mut emits: Vec<(u64, u64)> = Vec::new();
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a, b, c],
         &Default::default(),
@@ -4106,7 +4188,7 @@ async fn walk_closure_hostile_refs_bounds_memory() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok = crate::actor::dispatch::walk_substitute_closure(
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
         &Default::default(),
