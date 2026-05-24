@@ -37,6 +37,12 @@ mod substituter;
 // the prewarm and timeline modules drive it; the allow goes away with them.
 #[allow(dead_code)]
 mod supply;
+// The timeline engine (request pacing at recorded offsets, per-request
+// execution, confirmation retries, disconnect replay) also lands ahead of its
+// consumer — the orchestration wiring in `run` drives it; the allow goes away
+// with that.
+#[allow(dead_code)]
+mod timeline;
 
 /// Exit-code policy for a replay run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
