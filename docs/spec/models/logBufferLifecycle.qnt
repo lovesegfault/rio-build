@@ -715,6 +715,22 @@ module logBufferLifecycle {
       lo < hi,
       hi <= MAX_LINE,
       batchAccepted(d, ex, lo),
+      // ENVIRONMENT ASSUMPTION (not a code guard — push_for accepts such
+      // a batch): a worker's line numbers for an execution never reach a
+      // finalized record's recorded end. The worker numbers lines
+      // monotonically per execution and delivers every line before its
+      // completion report on the same ordered stream; whichever tenure
+      // observes that report finalizes with a recorded span that covers
+      // the execution's true end (obs.log.gap-span+2), so a line at or
+      // above a finalized end is one the build never produced. Without
+      // this assumption the adversarial worker fabricates lines above a
+      // finalized record's end and noSilentLineLoss is falsified by
+      // content that never existed. A malicious worker that does
+      // fabricate such lines loses them silently — the conservation law
+      // is a promise about real build output, and the fabricated-input
+      // surface is the fuzz target's and sched.executor.input-bounds'
+      // subject, not this model's.
+      not(rowComplete(d, e)) or hi <= rowEnd(d, e),
       entries' = entries.put(d,
         entryWith(d, entryHeld(d).union(lines), entryFinalPending(d), entryPrefix(d))),
       delivered' = delivered.put(d,
@@ -1598,11 +1614,19 @@ module logBufferLifecycle {
   action recoveryOk: bool = all {
     isLeader,
     not(recoveryComplete),
-    // The floor seed: 0 = the floor vouches for the entry generation
-    // (the ordinary failover), 1 = the durable floor exceeded it and the
-    // claim target bumped past it (the post-deletion saturation). The
+    // The floor seed: 0 = the durable floor vouches for the entry
+    // generation (the ordinary failover — in a deletion-free history the
+    // floor never exceeds the lease-derived generation, so this is the
+    // only real outcome there); 1..2 = the floor exceeded it and the
+    // claim target bumped past it. A positive bump is only reachable in
+    // production after a `kubectl delete lease` reset the transition
+    // count while the PG floor persisted; the model does not re-derive
+    // that mechanism (it is leaderElection.qnt's deletion regime) — it
+    // takes the resulting "the generation may move without the
+    // acquire-epoch moving, and may then be a no-op on the next holder
+    // change" guarantee as the §3.3 interface's nondeterminism. The
     // ceiling is a precondition, never a clamp.
-    nondet seedBump = Set(0, 1).oneOf()
+    nondet seedBump = Set(0, 1, 2).oneOf()
     all {
       generation + seedBump <= MAX_GEN,
       replica' = {
@@ -2021,9 +2045,38 @@ module logBufferLifecycle {
 }
 
 // =========================================================================
-// Smoke-test instantiation: the base regime's constants. Replaced by the
-// real regime modules in the regimes task; present from the first commit
-// so `quint typecheck` and `quint run` have a concrete module to act on.
+// THE BASE REGIME: no lease transitions, no faults, no evictions. The
+// replica holds the lease for the whole trace with its recovery complete;
+// the only adversaries are the worker (batch ordering, gaps, foreign
+// executors) and the unbiased scheduling of the flusher against the
+// actor (a periodic tick can race a queued final). A regression in the
+// core entry lifecycle — the binding gate, the span arithmetic, the
+// seal/drain ordering, the sealed-empty reap — surfaces in this small
+// fast check instead of buried in the lease-transition regimes.
+//
+// Constants are chosen for COVERAGE — the smallest state space that
+// still reaches every interleaving class the invariants are about:
+//   - 1 derivation: entries for distinct derivations share no state
+//     except the lease and the flusher loop (neither of which is
+//     contended at these bounds — the deferred-retry cap is 64 and the
+//     flush channel 1000-deep), so a second derivation squares the state
+//     space without adding an interleaving class. The binding gate's
+//     foreign-executor rejection needs a foreign EXECUTOR, not a second
+//     derivation.
+//   - 2 executors: the bound one and the foreign one.
+//   - 2 executions: the re-dispatch, the stale-request guard, and the
+//     cross-exec restamp all need a second execution of the same
+//     derivation.
+//   - 3 line numbers: an interior hole ({0,2}), a head eviction
+//     ({0,1}→{1}), and a gap-merge fold (prefix [0,1) + ring {2}) are
+//     the smallest shapes that exercise the span arithmetic's three
+//     branches.
+//
+// NON-VACUITY at these constants (machine-checked by the
+// quint-log-witness-* checks in nix/quint.nix): a row is completed
+// (noCompletedRow violated — noSilentLineLoss and lineSpanExact are not
+// vacuous), a non-monotone batch is rejected, and the sealed-empty reap
+// fires.
 // =========================================================================
 module logBufferLifecycleBase {
   import logBufferLifecycle(
@@ -2107,5 +2160,148 @@ module logBufferLifecycleBase {
       .expect(all {
         entryHeld("d1") == Set(0, 1),
         wit.rejectedNonMonotone,
+      })
+}
+
+// =========================================================================
+// THE LEASE-FLAP REGIME: lease transitions enabled (foreign steals,
+// lose/re-acquire edges, same-epoch re-acquires, rebounds), recovery
+// re-runs at every acquire edge, and the interim leader's PG-visible
+// effects (finalizing an execution's row, re-dispatching a derivation
+// under a fresh exec) are injected while this replica is deposed. No
+// local faults — the PG persists succeed, the flush channel never fills,
+// the guard SELECTs answer.
+//
+// MAX_TRANSITIONS = 2 admits exactly one full A→B→A holder-change cycle
+// (foreign steal to count 1, our re-steal to count 2) plus the
+// same-epoch re-acquire and the rebound shapes; the saturated-generation
+// state (a holder change whose generation fetch_max is a no-op) is
+// reachable through the recovery floor seed of an earlier same-epoch
+// tenure (see recoveryOk's seedBump). MAX_GEN = 4 covers the seeded
+// generation at these transition counts.
+//
+// This is the regime where the deferred-final tenure pin, the cross-exec
+// restamp, the acquisition sweep, the stored-coverage reconciliation,
+// the tenure-orphan reap, and the refused-UPSERT reap are all
+// load-bearing; the witness checks pin each as reachable.
+// =========================================================================
+module logBufferLifecycleFlap {
+  import logBufferLifecycle(
+    DRVS = Set("d1"),
+    EXECUTORS = Set("e1", "e2"),
+    MAX_EXECS = 2,
+    MAX_LINE = 3,
+    MAX_TRANSITIONS = 2,
+    MAX_GEN = 4,
+    ENABLE_EVICTION = false,
+    ENABLE_LOAD_FAILURE = false,
+    ENABLE_DISCARDED_RECOVERY = false,
+    ENABLE_ENQUEUE_FAILURE = false,
+    ENABLE_PERSIST_FAILURE = false,
+    ENABLE_GUARD_FAILURE = false
+  ).*
+}
+
+// =========================================================================
+// THE FAULT REGIME: every local fault-injection branch enabled on top of
+// the flap regime's lease budget — ring evictions (the byte-cap
+// over-approximation), DAG-load failures and TOCTOU-discarded
+// recoveries, flush-channel-full enqueue failures, terminal-status
+// persist failures (the correlated failure that leaves PG saying a
+// terminal derivation is still running), and finalize-guard SELECT
+// failures (the deferral path). The lease budget is retained because the
+// recovery faults are only reachable after an acquire edge and the
+// persist-failure fault is only interesting when a later recovery
+// reloads the stale assignment.
+//
+// This is the regime where the deferred-final retention, the
+// enqueue-failure reap, the eviction's head-loss disclosure, and the
+// degraded (non-authoritative-DAG) tenure's retain-everything posture
+// are load-bearing.
+// =========================================================================
+module logBufferLifecycleFault {
+  import logBufferLifecycle(
+    DRVS = Set("d1"),
+    EXECUTORS = Set("e1", "e2"),
+    MAX_EXECS = 2,
+    MAX_LINE = 3,
+    MAX_TRANSITIONS = 2,
+    MAX_GEN = 4,
+    ENABLE_EVICTION = true,
+    ENABLE_LOAD_FAILURE = true,
+    ENABLE_DISCARDED_RECOVERY = true,
+    ENABLE_ENQUEUE_FAILURE = true,
+    ENABLE_PERSIST_FAILURE = true,
+    ENABLE_GUARD_FAILURE = true
+  ).*
+}
+
+// =========================================================================
+// FALSIFICATION REPRODUCER — lineSpanExact is VIOLATED on this trace.
+//
+// This module is the captured counterexample of an open falsification of
+// obs.log.gap-span+2, awaiting adjudication (a real protocol bug in the
+// gap-merge fold vs. a worker-contract assumption to be added to the
+// model). The analysis lives in the campaign's
+// phase2-falsification-lineSpanExact.md report. The run's final .expect
+// asserts not(lineSpanExact) — it PASSES while the bug exists and will
+// FAIL (flagging this module for removal or inversion into a regression
+// run) once either the code's fold arithmetic or the model's ingestion
+// assumptions change.
+//
+// The trace: a periodic flush records [0,2), the ring evicts its head to
+// {1}, a self-fence false alarm re-runs recovery, the stored-coverage
+// reconcile fetches the [0,2) prefix and truncates the ring to empty
+// (resetting the monotone ingestion gate), the worker re-delivers line 1
+// (accepted — the empty ring has no high-water mark), and the final
+// flush's gap-merge fold double-counts the overlapping line:
+// line_count = prefix(2) + saturated-gap(0) + ring_span(1) = 3 over a
+// true span of 2, so first_line + line_count lands two past the highest
+// true worker line stored instead of one.
+//
+// NOT wired as a CI check: no regime check is wired until the
+// falsification is adjudicated (a red invariant check on the merge gate
+// would block unrelated work on a known, reported, owned issue).
+// =========================================================================
+module lineSpanExactRepro {
+  import logBufferLifecycle(
+    DRVS = Set("d1"),
+    EXECUTORS = Set("e1", "e2"),
+    MAX_EXECS = 2,
+    MAX_LINE = 3,
+    MAX_TRANSITIONS = 2,
+    MAX_GEN = 4,
+    ENABLE_EVICTION = true,
+    ENABLE_LOAD_FAILURE = false,
+    ENABLE_DISCARDED_RECOVERY = false,
+    ENABLE_ENQUEUE_FAILURE = false,
+    ENABLE_PERSIST_FAILURE = false,
+    ENABLE_GUARD_FAILURE = false
+  ).*
+
+  run lineSpanExactFalsificationRun =
+    init
+      .then(dispatch("d1", "e1"))
+      .then(pushBatchAccepted("d1", "e1", 0, 2))
+      .then(reconcileStoredPrefix("d1"))
+      .then(flushPeriodicUpload("d1"))
+      .expect(rowLo("d1", 1) == 0 and rowCnt("d1", 1) == 2 and not(rowComplete("d1", 1)))
+      .then(evict("d1"))
+      .expect(entryHeld("d1") == Set(1))
+      .then(loseLease)
+      .then(reacquireSameEpoch)
+      .then(recoveryOk)
+      .expect(entryHeld("d1") == Set(1) and entryPrefix("d1") == PrefUnchecked)
+      .then(reconcileStoredPrefix("d1"))
+      .expect(entryHeld("d1") == Set() and entryPrefix("d1") == PrefCached({ lo: 0, cnt: 2 }))
+      .then(pushBatchAccepted("d1", "e1", 1, 2))
+      .expect(entryHeld("d1") == Set(1))
+      .then(terminalEnqueued("d1"))
+      .then(flushFinalUpload("d1"))
+      .expect(all {
+        rowComplete("d1", 1),
+        rowLo("d1", 1) == 0,
+        rowCnt("d1", 1) == 3,
+        not(lineSpanExact),
       })
 }
