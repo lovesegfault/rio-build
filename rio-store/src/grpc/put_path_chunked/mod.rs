@@ -449,6 +449,11 @@ impl StoreServiceImpl {
         backend: &Arc<dyn ChunkBackend>,
     ) -> Result<WalkOutcome, Status> {
         let mut seen: HashSet<[u8; 32]> = HashSet::with_capacity(validated.novel.len());
+        // Framing chunks track their own seen-set: sharing `seen` with
+        // the novel cursor would let a framing run whose bytes happen
+        // to equal a novel content chunk poison the "first occurrence"
+        // test and desynchronize the stream.
+        let mut seen_framing: HashSet<[u8; 32]> = HashSet::new();
         let mut next_novel = 0usize;
 
         // Bounded prefetch of upcoming non-novel chunk fetches into the
@@ -463,7 +468,25 @@ impl StoreServiceImpl {
             let mut cursor = 0usize; // position in out.chunk_manifest
             for seg in &out.segments {
                 match seg {
-                    NarSegment::Framing(bytes) => {
+                    NarSegment::Framing { bytes, digest } => {
+                        // Server-generated framing runs are persisted
+                        // as ordinary CAS chunks so the manifest's
+                        // chunk list concatenates to the full NAR (the
+                        // GetPath / GC invariant). Deduped per stream;
+                        // identical framing across uploads dedups by
+                        // content key in S3. Skipped outputs don't
+                        // commit a manifest, so their framing isn't
+                        // persisted (a non-skipped output sharing the
+                        // same framing bytes uploads its own copy).
+                        if accs[out_idx].is_some()
+                            && seen_framing.insert(*digest)
+                            && let Err(e) = backend.put(digest, Bytes::copy_from_slice(bytes)).await
+                        {
+                            return Ok(WalkOutcome::Unavailable(format!(
+                                "cas::put(framing {}): {e}",
+                                hex::encode(digest)
+                            )));
+                        }
                         if let Some(acc) = &mut accs[out_idx] {
                             acc.hasher.update(bytes);
                             // RefScanSink::write never fails.

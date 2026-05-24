@@ -59,8 +59,17 @@ const MAX_TARGET_LEN: usize = 4096;
 pub(super) enum NarSegment {
     /// Literal framing bytes (magic, parens, type tags, entry names,
     /// symlink targets, length prefixes, padding). Adjacent framing
-    /// between two file-content runs is coalesced into one buffer.
-    Framing(Vec<u8>),
+    /// between two file-content runs is coalesced into one buffer,
+    /// split at [`CHUNK_MAX`].
+    ///
+    /// Framing runs are persisted to the CAS as ordinary chunks (keyed
+    /// by `digest = blake3(bytes)`) and interleaved into
+    /// `manifest_data.chunk_list` at their positions, so the existing
+    /// "concatenating the chunk list yields the NAR" invariant that
+    /// `GetPath`, `nar_index::reassemble`, and the GC sweep all rely on
+    /// holds for chunked uploads too. The builder never sends these —
+    /// the server generates and uploads them itself.
+    Framing { bytes: Vec<u8>, digest: [u8; 32] },
     /// A regular file's contents: the next `n_chunks` entries of this
     /// output's `chunk_manifest`. The verify task splices the chunk
     /// bodies in here.
@@ -363,25 +372,48 @@ pub(super) fn validate_begin(
         }
 
         // The serialized Manifest is the reassembly source of truth for
-        // GetPath; build it now so an over-cap manifest is rejected
-        // before any placeholder exists.
-        let chunk_list_bytes = Manifest {
-            entries: chunk_manifest
-                .iter()
-                .map(|(h, s)| ManifestEntry { hash: *h, size: *s })
-                .collect(),
+        // GetPath and the GC sweep's refcount decrement: the FULL
+        // interleaved framing + content sequence, whose concatenation
+        // is exactly the NAR. Built by replaying the segments so the
+        // manifest order matches the byte order.
+        let mut full_list: Vec<ManifestEntry> =
+            Vec::with_capacity(chunk_manifest.len() + walk.segments.len());
+        {
+            let mut cursor = 0usize;
+            for seg in &walk.segments {
+                match seg {
+                    NarSegment::Framing { bytes, digest } => full_list.push(ManifestEntry {
+                        hash: *digest,
+                        size: bytes.len() as u32,
+                    }),
+                    NarSegment::FileContents { n_chunks } => {
+                        for _ in 0..*n_chunks {
+                            let (h, s) = chunk_manifest[cursor];
+                            cursor += 1;
+                            full_list.push(ManifestEntry { hash: h, size: s });
+                        }
+                    }
+                }
+            }
         }
-        .serialize();
-
+        if full_list.len() > manifest::MAX_CHUNKS {
+            return Err(invalid(format!(
+                "{ctx}: manifest would have {} entries (content + framing), exceeds \
+                 MAX_CHUNKS {}",
+                full_list.len(),
+                manifest::MAX_CHUNKS
+            )));
+        }
         let mut unique_chunks: Vec<([u8; 32], u32)> = {
             let mut seen = HashSet::new();
-            chunk_manifest
+            full_list
                 .iter()
-                .filter(|(h, _)| seen.insert(*h))
-                .copied()
+                .filter(|e| seen.insert(e.hash))
+                .map(|e| (e.hash, e.size))
                 .collect()
         };
         unique_chunks.sort_unstable_by_key(|(h, _)| *h);
+        let chunk_list_bytes = Manifest { entries: full_list }.serialize();
 
         let info = ValidatedPathInfo {
             store_path_hash: store_path.sha256_digest().to_vec(),
@@ -476,7 +508,7 @@ pub(super) fn validate_begin(
         .iter()
         .flat_map(|o| &o.segments)
         .map(|s| match s {
-            NarSegment::Framing(b) => b.len() as u64,
+            NarSegment::Framing { bytes, .. } => bytes.len() as u64,
             NarSegment::FileContents { .. } => 0,
         })
         .sum();
@@ -807,11 +839,9 @@ fn walk_output(
                 // segments + the pending framing including the length
                 // prefix just written). Matches `nar_ls`'s definition.
                 let content_offset = flushed + framing.len() as u64;
-                if !framing.is_empty() {
-                    flushed += framing.len() as u64;
-                    framing_flushed += framing.len() as u64;
-                    segments.push(NarSegment::Framing(std::mem::take(&mut framing)));
-                }
+                flushed += framing.len() as u64;
+                framing_flushed += framing.len() as u64;
+                flush_framing(&mut segments, &mut framing);
                 segments.push(NarSegment::FileContents {
                     n_chunks: cursor - run_start,
                 });
@@ -903,9 +933,7 @@ fn walk_output(
         )));
     }
     let nar_size = flushed + framing.len() as u64;
-    if !framing.is_empty() {
-        segments.push(NarSegment::Framing(std::mem::take(&mut framing)));
-    }
+    flush_framing(&mut segments, &mut framing);
 
     let mut dir_digests: Vec<[u8; 32]> = dir_digest_set.into_iter().collect();
     dir_digests.sort_unstable();
@@ -922,6 +950,22 @@ fn walk_output(
         file_blobs,
         index_entries,
     });
+
+    /// Flush the pending framing buffer into one or more
+    /// [`NarSegment::Framing`] segments, each ≤ [`CHUNK_MAX`] bytes
+    /// (the framing runs become CAS chunks; the read path's per-chunk
+    /// buffers assume the chunker's max). No-op on an empty buffer.
+    fn flush_framing(segments: &mut Vec<NarSegment>, framing: &mut Vec<u8>) {
+        if framing.is_empty() {
+            return;
+        }
+        for piece in std::mem::take(framing).chunks(CHUNK_MAX) {
+            segments.push(NarSegment::Framing {
+                digest: *blake3::hash(piece).as_bytes(),
+                bytes: piece.to_vec(),
+            });
+        }
+    }
 
     /// Merge a directory's three sorted entry lists into canonical NAR
     /// order (byte-lexicographic by name). Names are globally unique

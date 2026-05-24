@@ -22,8 +22,15 @@ fn reassemble(
     let mut cursor = 0usize;
     for seg in &out.segments {
         match seg {
-            NarSegment::Framing(b) => nar.extend_from_slice(b),
-            NarSegment::FileContents { n_chunks, .. } => {
+            NarSegment::Framing { bytes, digest } => {
+                assert_eq!(
+                    *digest,
+                    *blake3::hash(bytes).as_bytes(),
+                    "framing segment digest must match its bytes"
+                );
+                nar.extend_from_slice(bytes);
+            }
+            NarSegment::FileContents { n_chunks } => {
                 for _ in 0..*n_chunks {
                     let (d, _) = out.chunk_manifest[cursor];
                     cursor += 1;
@@ -50,62 +57,9 @@ pub(super) fn begin_for_tree(
     store_path: &str,
     chunk_size: usize,
 ) -> (PutPathChunkedBegin, HashMap<[u8; 32], Vec<u8>>, Vec<u8>) {
-    let mut nar = Vec::new();
-    rio_nix::nar::dump_path_streaming(root, &mut nar).expect("dump_path_streaming");
-    let entries = rio_nix::nar::nar_ls(std::io::Cursor::new(&nar)).expect("nar_ls");
-    let dag = crate::castore::build(&entries);
-
-    // Per-file chunking at fixed boundaries, in nar_ls order (which is
-    // canonical NAR walk order). Each file's chunk run is contiguous
-    // and per-file-aligned, exactly as the builder's FastCDC restart-
-    // per-file produces.
-    let mut chunk_manifest: Vec<ChunkRef> = Vec::new();
-    let mut chunks: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
-    for e in &entries {
-        if e.kind != rio_nix::nar::NarEntryKind::Regular {
-            continue;
-        }
-        let contents = &nar[e.nar_offset as usize..(e.nar_offset + e.size) as usize];
-        for piece in contents.chunks(chunk_size.max(1)) {
-            let digest = *blake3::hash(piece).as_bytes();
-            chunks.insert(digest, piece.to_vec());
-            chunk_manifest.push(ChunkRef {
-                hash: digest.to_vec(),
-                size: piece.len() as u32,
-            });
-        }
-    }
-
-    // Global first-occurrence order over the (single) output.
-    let mut seen = std::collections::HashSet::new();
-    let novel: Vec<Vec<u8>> = chunk_manifest
-        .iter()
-        .filter(|c| seen.insert(c.hash.clone()))
-        .map(|c| c.hash.clone())
-        .collect();
-
-    let directories: Vec<Directory> = dag
-        .directories
-        .iter()
-        .map(|(_, body)| {
-            Directory::decode(body.as_slice()).expect("castore::build emits valid bodies")
-        })
-        .collect();
-
-    let begin = PutPathChunkedBegin {
-        deriver: String::new(),
-        outputs: vec![ChunkedOutputHeader {
-            store_path: store_path.to_owned(),
-            nar_hash: <sha2::Sha256 as sha2::Digest>::digest(&nar).to_vec(),
-            nar_size: nar.len() as u64,
-            refs: vec![],
-            root_node: Some(RootNode::decode(dag.root_node.as_slice()).expect("valid root node")),
-            chunk_manifest,
-        }],
-        directories,
-        novel,
-        input_closure: vec![],
-    };
+    let (header, dirs, chunks, nar) =
+        crate::test_helpers::chunked_output_for_tree(root, store_path, chunk_size);
+    let begin = crate::test_helpers::assemble_begin(vec![header], vec![dirs]);
     (begin, chunks, nar)
 }
 
@@ -148,6 +102,49 @@ fn reconstructed_nar_matches_dump_path_streaming() {
         // validate_begin against the declared value, which came from
         // the real NAR's length).
         assert_eq!(validated.outputs[0].info.nar_size, nar.len() as u64);
+    }
+}
+
+/// The serialized `manifest_data.chunk_list` (framing chunks
+/// interleaved with content chunks) concatenates to the exact NAR —
+/// the invariant `GetPath`, `nar_index::reassemble`, and the GC sweep
+/// rely on. The framing chunk bodies are reproduced from the segments
+/// (which is where the verify walk uploads them from).
+#[test]
+fn chunk_list_concatenates_to_nar() {
+    let tmp = fixture_tree();
+    let store_path = rio_test_support::fixtures::test_store_path("chunklist");
+    let (begin, chunks, nar) = begin_for_tree(tmp.path(), &store_path, 7);
+    let validated = validate_begin(&begin, None).expect("valid");
+    let out = &validated.outputs[0];
+
+    // Collect every chunk body the verify walk would persist: the
+    // builder-sent content chunks plus the server-generated framing
+    // runs.
+    let mut bodies: HashMap<[u8; 32], Vec<u8>> = chunks.clone();
+    for seg in &out.segments {
+        if let NarSegment::Framing { bytes, digest } = seg {
+            bodies.insert(*digest, bytes.clone());
+        }
+    }
+
+    let manifest = crate::manifest::Manifest::deserialize(&out.chunk_list_bytes)
+        .expect("chunk_list deserializes");
+    let mut rebuilt = Vec::new();
+    for e in &manifest.entries {
+        let body = &bodies[&e.hash];
+        assert_eq!(
+            body.len(),
+            e.size as usize,
+            "manifest entry size matches body"
+        );
+        rebuilt.extend_from_slice(body);
+    }
+    assert_eq!(rebuilt, nar, "chunk_list concatenation must equal the NAR");
+    // Every unique_chunks entry has a persisted body (refcount
+    // symmetry: what we count is what exists).
+    for (h, s) in &out.unique_chunks {
+        assert_eq!(bodies[h].len(), *s as usize);
     }
 }
 
