@@ -356,6 +356,67 @@ async fn narhash_mismatch_rejected_and_nothing_committed() -> TestResult {
     Ok(())
 }
 
+/// Every S3 object a failed upload wrote has a refcount-0 `chunks` row,
+/// and the orphan-chunk sweep can therefore find and collect it. ADR-022
+/// §6.3: non-committed novel chunks "are refcount-0 orphans for the
+/// grace-TTL sweep" — without the write-ahead row they would be
+/// untracked S3 garbage forever.
+// r[verify store.chunk.grace-ttl]
+#[tokio::test]
+async fn failed_upload_leaves_sweepable_orphan_chunk_rows() -> TestResult {
+    let mut s = ChunkedSession::new().await?;
+    let tree = fixture_tree();
+    let path = test_store_path("chunked-orphan");
+    let (mut out, dirs, chunks, _) = chunked_output_for_tree(tree.path(), &path, 1024);
+    // Force a verify failure AFTER every chunk has been received and
+    // written to the backend: a wrong claimed nar_hash.
+    out.nar_hash = vec![0xEE; 32];
+    let begin = assemble_begin(vec![out], vec![dirs]);
+    let n_novel = begin.novel.len();
+    assert!(n_novel >= 2);
+    put_path_chunked(&mut s.store, begin, &chunks, None, |_, c| Some(c))
+        .await
+        .expect_err("wrong nar_hash must be rejected");
+
+    // The backend holds objects (novel content + server framing)…
+    let objects = s.backend.len();
+    assert!(
+        objects > n_novel,
+        "novel chunks + framing runs were written"
+    );
+    // …and EVERY one of them has a chunks row at refcount 0,
+    // deleted = false, durable = false — the exact shape
+    // `sweep_orphan_chunks` scans for.
+    let (rows, sweepable): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), \
+                count(*) FILTER (WHERE refcount = 0 AND NOT deleted AND NOT durable) \
+           FROM chunks",
+    )
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert_eq!(
+        rows as usize, objects,
+        "every S3 object written by the failed upload is tracked by a chunks row"
+    );
+    assert_eq!(
+        rows, sweepable,
+        "every row is in the orphan-sweepable state"
+    );
+
+    // Run the orphan sweep with zero grace: it must tombstone every row
+    // and enqueue every S3 key for deletion.
+    let backend_dyn: Arc<dyn ChunkBackend> = Arc::clone(&s.backend) as Arc<dyn ChunkBackend>;
+    let (swept, _bytes) =
+        rio_store::gc::sweep::sweep_orphan_chunks(&s.db.pool, Some(&backend_dyn), 0)
+            .await
+            .expect("orphan sweep");
+    assert_eq!(
+        swept as usize, objects,
+        "the orphan sweep collects every chunk the failed upload wrote"
+    );
+    Ok(())
+}
+
 /// Tampered chunk body (bytes don't hash to the declared digest) →
 /// INVALID_ARGUMENT.
 #[tokio::test]

@@ -213,6 +213,58 @@ pub(crate) async fn upgrade_manifest_to_chunked(
     Ok((needs_upload, token))
 }
 
+/// Write-ahead registration of chunk rows at refcount 0, BEFORE the
+/// first S3 `PutObject` for any of them.
+///
+/// `PutPathChunked` writes novel and framing chunks to the backend
+/// during its verify walk but only takes their refcounts to ≥ 1 in the
+/// commit transaction. Without a row existing first, a non-commit
+/// outcome (mismatch, incomplete, transient backend error, crash)
+/// leaves S3 objects with no `chunks` row — invisible to
+/// `sweep_orphan_chunks`' `WHERE refcount = 0` scan and therefore
+/// leaked forever. ADR-022 §6.3 promises non-committed novel chunks
+/// are "refcount-0 orphans for the grace-TTL sweep"; this is what
+/// makes that true. Same write-ahead ordering as the legacy path's
+/// `upgrade_manifest_to_chunked` (row first, object second): a crash
+/// between the two leaves a row with no object, and the sweep's S3
+/// delete of a nonexistent key is a no-op.
+///
+/// `ON CONFLICT DO UPDATE SET deleted = false` (rather than
+/// `DO NOTHING`) resurrects a swept-but-not-yet-drained row so the
+/// drain's `deleted AND refcount = 0` re-check skips the S3 object the
+/// caller is about to (re)write — the same resurrection contract as
+/// the legacy upsert, minus the refcount increment (which belongs to
+/// the commit transaction). Existing refcounts, `durable`, and
+/// `uploaded_at` are untouched. Input is deduplicated and sorted per
+/// `r[store.chunk.lock-order]`.
+// r[impl store.chunk.grace-ttl]
+#[instrument(skip(pool, chunks), fields(count = chunks.len()))]
+pub(crate) async fn register_pending_chunks(
+    pool: &PgPool,
+    chunks: &[(Vec<u8>, i64)],
+) -> Result<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = chunks.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup_by(|a, b| a.0 == b.0);
+    let (hashes, sizes): (Vec<Vec<u8>>, Vec<i64>) = sorted.into_iter().unzip();
+    sqlx::query(
+        r#"
+        INSERT INTO chunks (blake3_hash, refcount, size)
+        SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[]) AS t(hash, zero, size)
+        ON CONFLICT (blake3_hash) DO UPDATE SET deleted = false
+        "#,
+    )
+    .bind(&hashes)
+    .bind(vec![0i64; hashes.len()])
+    .bind(&sizes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Record that the given chunk hashes are now durably present in the
 /// backend. Called by `cas::put_chunked` AFTER `do_upload` succeeds,
 /// BEFORE the manifest is flipped to `complete`.

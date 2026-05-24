@@ -187,6 +187,38 @@ impl StoreServiceImpl {
             }
         }
 
+        // Write-ahead chunk registration: every digest the drain or the
+        // verify walk may S3-PUT (novel chunks from the stream +
+        // server-generated framing runs of non-skipped outputs) gets a
+        // refcount-0 `chunks` row BEFORE the first PutObject. On any
+        // non-commit outcome those objects are then visible to
+        // `sweep_orphan_chunks`' `refcount = 0` scan instead of being
+        // leaked with no row at all. The commit transaction's refcount
+        // UPSERT takes them from 0 to their real count.
+        // r[impl store.chunk.grace-ttl]
+        let pending: Vec<(Vec<u8>, i64)> = validated
+            .novel
+            .iter()
+            .map(|d| (d.to_vec(), i64::from(validated.manifest_len[d])))
+            .chain(
+                validated
+                    .outputs
+                    .iter()
+                    .zip(&skipped)
+                    .filter(|(_, skip)| !**skip)
+                    .flat_map(|(o, _)| o.segments.iter())
+                    .filter_map(|seg| match seg {
+                        NarSegment::Framing { bytes, digest } => {
+                            Some((digest.to_vec(), bytes.len() as i64))
+                        }
+                        NarSegment::FileContents { .. } => None,
+                    }),
+            )
+            .collect();
+        metadata::register_pending_chunks(&self.pool, &pending)
+            .await
+            .map_err(|e| putpath_metadata_status("PutPathChunked: register_pending_chunks", e))?;
+
         // All outputs already complete: drain the remaining Chunk
         // frames (each verified + cas::put — idempotent content-
         // addressed writes that a re-driven builder already computed)

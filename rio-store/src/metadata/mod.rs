@@ -52,7 +52,8 @@ pub(crate) mod upstreams;
 // surface as `unused` instead of being silently exported.
 pub(crate) use chunked::{
     PlaceholderToken, complete_manifest_chunked, delete_manifest_chunked_uploading,
-    mark_chunks_durable, mark_chunks_uploaded, upgrade_manifest_to_chunked,
+    mark_chunks_durable, mark_chunks_uploaded, register_pending_chunks,
+    upgrade_manifest_to_chunked,
 };
 pub(crate) use cluster_key_history::load_cluster_key_history;
 pub(crate) use inline::{
