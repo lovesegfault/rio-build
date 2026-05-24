@@ -636,7 +636,15 @@ mod tests {
     use super::*;
 
     fn fixture() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/replay/basic")
+        // Runtime env var, NOT compile-time env!(): under the per-member nextest
+        // check the compile-time value is the crate2nix build sandbox, which no
+        // longer exists when the test binary runs; nextest's --workspace-remap
+        // points the runtime variable at the workspace copy that carries
+        // tests/fixtures/.
+        PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo/nextest"),
+        )
+        .join("tests/fixtures/replay/basic")
     }
 
     /// Recursive copy of the fixture into `dst` so tests can delete or edit

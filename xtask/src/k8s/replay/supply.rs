@@ -771,7 +771,7 @@ impl UploadClaims {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -784,7 +784,11 @@ mod tests {
     const APP_OUT: &str = "/nix/store/c2222222222222222222222222222222-app";
 
     fn fixture() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/replay/basic")
+        // Runtime env var, not compile-time env!() — see `fixture()` in archive.rs's tests.
+        PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo/nextest"),
+        )
+        .join("tests/fixtures/replay/basic")
     }
 
     fn open_fixture() -> ReplayArchive {

@@ -830,8 +830,11 @@ mod tests {
     /// offline, writes a parseable summary.json, and reports zero verdicts.
     #[tokio::test]
     async fn dry_run_on_fixture_completes_offline() {
-        let fixture =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/replay/basic");
+        // Runtime env var, not compile-time env!() — see `fixture()` in archive.rs's tests.
+        let fixture = std::path::PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo/nextest"),
+        )
+        .join("tests/fixtures/replay/basic");
         let report_dir = tempfile::tempdir().unwrap();
         let h = Harness::parse_from([
             "x",
@@ -875,8 +878,11 @@ mod tests {
     fn fixture_archive_matches_rio_nix_parsers() {
         use sha2::{Digest, Sha256};
 
-        let basic =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/replay/basic");
+        // Runtime env var, not compile-time env!() — see `fixture()` in archive.rs's tests.
+        let basic = std::path::PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo/nextest"),
+        )
+        .join("tests/fixtures/replay/basic");
 
         // Embedded source store path → NAR hash/size for the narinfo.
         let src = basic.join("nix/store/b1111111111111111111111111111111-src.txt");
