@@ -460,8 +460,10 @@ impl StoreServiceImpl {
         // shared moka LRU so S3 reads overlap with `stream.next()`
         // waits. Purely an optimization: the walk's own `get_verified`
         // is authoritative and the prefetch task's errors are ignored.
-        // Aborted on drop (when this function returns).
-        let prefetch = spawn_prefetch(validated, cache);
+        // Aborted on drop (when this function returns). Skipped
+        // outputs' chunks are excluded — the walk never fetches them.
+        let verified: Vec<bool> = accs.iter().map(|a| a.is_some()).collect();
+        let prefetch = spawn_prefetch(validated, &verified, cache);
         let _abort_prefetch = scopeguard::guard(prefetch, |h| h.abort());
 
         for (out_idx, out) in validated.outputs.iter().enumerate() {
@@ -528,7 +530,18 @@ impl StoreServiceImpl {
                                 // output) is a memory hit instead of a
                                 // backend round-trip.
                                 cache.insert_local(&digest, bytes.clone()).await;
-                                bytes
+                                Some(bytes)
+                            } else if accs[out_idx].is_none() {
+                                // Idempotent-skipped output: nothing to
+                                // verify, so don't fetch the body. The
+                                // already-complete manifest may have
+                                // been chunked differently (legacy
+                                // whole-NAR FastCDC), in which case
+                                // these per-file digests don't exist in
+                                // the CAS — fetching them would fail an
+                                // upload that has nothing to do with
+                                // this output.
+                                None
                             } else {
                                 // Deduped or repeat: fetch from the
                                 // CAS. `get_verified` BLAKE3-checks the
@@ -544,7 +557,7 @@ impl StoreServiceImpl {
                                                 len
                                             )));
                                         }
-                                        b
+                                        Some(b)
                                     }
                                     Err(e) => {
                                         return Ok(WalkOutcome::Unavailable(format!(
@@ -554,7 +567,7 @@ impl StoreServiceImpl {
                                     }
                                 }
                             };
-                            if let Some(acc) = &mut accs[out_idx] {
+                            if let (Some(acc), Some(body)) = (&mut accs[out_idx], body) {
                                 acc.hasher.update(&body);
                                 let _ = acc.scanner.write_all(&body);
                             }
@@ -670,14 +683,18 @@ fn check_novel_frame(
 /// fetch is authoritative).
 fn spawn_prefetch(
     validated: &ValidatedBegin,
+    verified: &[bool],
     cache: &Arc<ChunkCache>,
 ) -> tokio::task::JoinHandle<()> {
-    // The digests to prefetch, in walk order, first occurrence only.
+    // The digests to prefetch, in walk order, first occurrence only,
+    // restricted to outputs the walk will actually verify.
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let to_fetch: Vec<[u8; 32]> = validated
         .outputs
         .iter()
-        .flat_map(|o| o.chunk_manifest.iter())
+        .zip(verified)
+        .filter(|(_, v)| **v)
+        .flat_map(|(o, _)| o.chunk_manifest.iter())
         .filter(|(d, _)| !validated.novel_set.contains(d) && seen.insert(*d))
         .map(|(d, _)| *d)
         .collect();

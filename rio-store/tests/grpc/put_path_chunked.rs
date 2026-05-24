@@ -681,6 +681,56 @@ async fn bounds_violations_rejected_before_any_write() -> TestResult {
     Ok(())
 }
 
+/// Partial idempotency: one output is already `'complete'` (uploaded
+/// via the LEGACY whole-NAR path, so its per-file chunk digests do not
+/// exist in the CAS) and a second, new output rides in the same Begin.
+/// The skipped output must not poison the new one's verify — the walk
+/// must not try to fetch the skipped output's nonexistent chunks.
+// r[verify store.put.idempotent]
+#[tokio::test]
+async fn partial_skip_does_not_block_new_outputs() -> TestResult {
+    let mut s = ChunkedSession::new().await?;
+
+    // Output A: committed via the legacy inline path (small NAR, no
+    // chunk rows at all — the most hostile case for a re-drive that
+    // assumes A's chunks exist).
+    let tree_a = tempfile::tempdir()?;
+    std::fs::write(tree_a.path().join("old"), b"legacy-uploaded contents")?;
+    let path_a = test_store_path("chunked-partial-a");
+    let (out_a, dirs_a, chunks_a, nar_a) = chunked_output_for_tree(tree_a.path(), &path_a, 7);
+    let info_a = rio_test_support::fixtures::make_path_info_for_nar(&path_a, &nar_a);
+    assert!(put_path(&mut s.store, info_a, nar_a).await?);
+
+    // Output B: genuinely new.
+    let tree_b = tempfile::tempdir()?;
+    std::fs::write(tree_b.path().join("new"), vec![0x3Cu8; 5000])?;
+    let path_b = test_store_path("chunked-partial-b");
+    let (out_b, dirs_b, chunks_b, nar_b) = chunked_output_for_tree(tree_b.path(), &path_b, 1024);
+
+    // The builder re-drives both outputs in one Begin (it does not
+    // know A is already complete) and — the hostile half — declares
+    // A's chunks NOT novel, as a HasChunks probe that raced another
+    // uploader would. Those digests exist nowhere in the CAS (A went
+    // through the inline path); the walk must not try to fetch them
+    // for an output it is skipping anyway.
+    let mut begin = assemble_begin(vec![out_a, out_b], vec![dirs_a, dirs_b]);
+    let a_digests: std::collections::HashSet<Vec<u8>> =
+        chunks_a.keys().map(|k| k.to_vec()).collect();
+    begin.novel.retain(|d| !a_digests.contains(d));
+    let chunks = chunks_b;
+    let created = put_path_chunked(&mut s.store, begin, &chunks, None, |_, c| Some(c))
+        .await
+        .expect("partial-skip upload must succeed");
+    assert!(created, "output B is newly created");
+    assert_eq!(
+        s.manifest_status(&path_b).await.as_deref(),
+        Some("complete"),
+        "the new output commits even though its sibling was skipped"
+    );
+    assert_eq!(s.get_nar(&path_b).await?, nar_b, "output B round-trips");
+    Ok(())
+}
+
 /// The legacy whole-NAR PutPath also marks its chunks durable in its
 /// completion transaction, so HasChunks covers content uploaded either
 /// way.
