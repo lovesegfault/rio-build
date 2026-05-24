@@ -30103,6 +30103,10 @@
           "packageId": "tokio"
         },
         {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
+        },
+        {
           "name": "toml",
           "packageId": "toml"
         },

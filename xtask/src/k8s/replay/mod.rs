@@ -17,6 +17,11 @@ use crate::k8s::provider::{Provider, ProviderKind};
 // first real caller.
 #[allow(dead_code)]
 mod archive;
+// Substituter access (narinfo probe + NAR fetch over HTTPS/S3) also lands
+// ahead of its consumers — the supply planner and prewarm phases are the
+// first callers; the allow goes away with them.
+#[allow(dead_code)]
+mod substituter;
 
 /// Exit-code policy for a replay run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

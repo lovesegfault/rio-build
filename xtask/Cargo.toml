@@ -37,6 +37,9 @@ dotenvy.workspace = true
 # Async
 tokio = { workspace = true, features = ["full"] }
 futures-util.workspace = true
+# StreamReader: turns the substituter HTTP/S3 NAR body stream into an
+# AsyncRead feeding async-compression (k8s replay relay fetch).
+tokio-util.workspace = true
 async-trait.workspace = true
 
 # gRPC (qa scenarios: i026 health probe)
@@ -62,7 +65,9 @@ kube = { workspace = true, features = ["runtime", "client", "ws"] }
 k8s-openapi.workspace = true
 
 # HTTP
-reqwest.workspace = true
+# `stream` for Response::bytes_stream(): the replay substituter streams NAR
+# bodies through streaming decompression instead of buffering them whole.
+reqwest = { workspace = true, features = ["stream"] }
 
 # Serialization
 serde.workspace = true
