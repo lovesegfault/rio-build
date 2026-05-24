@@ -67,12 +67,16 @@ pub fn workload_set(archive: &ReplayArchive) -> WorkloadSet {
 }
 
 /// One derivation in a request closure.
+///
+/// The parsed [`Derivation`] is deliberately not retained: at prewarm-union
+/// scale (hundreds of thousands to millions of derivations) the parsed env
+/// maps would dominate memory, while everything the planner needs fits in
+/// the few small fields below. Re-read the ATerm from the archive if a
+/// future consumer needs more than these.
 #[derive(Debug, Clone)]
 pub struct ClosureNode {
     /// Full `.drv` store path.
     pub drv_path: String,
-    /// The parsed derivation.
-    pub drv: Derivation,
     /// Output name → store path (empty for floating/CA outputs whose path is
     /// only known post-build).
     pub outputs: BTreeMap<String, String>,
@@ -127,7 +131,6 @@ pub fn walk_closure(archive: &ReplayArchive, roots: &[String]) -> Result<Closure
         Ok(Frame {
             node: ClosureNode {
                 drv_path: drv_path.to_string(),
-                drv,
                 outputs,
                 input_srcs,
                 input_drvs,
@@ -365,10 +368,20 @@ pub fn plan_uploads(
                     PathSource::TargetSubstituter | PathSource::NotSupplied { workload: true },
                 ) => {}
                 Some(PathSource::NotSupplied { workload: false }) => {
-                    skipped.push((path.clone(), "no source available".to_string()));
+                    skipped.push((
+                        path.clone(),
+                        "not a workload output, not in any target substituter, not embedded \
+                         in the archive, and no recording substituter has it"
+                            .to_string(),
+                    ));
                 }
                 None => {
-                    skipped.push((path.clone(), "no resolved source for this path".to_string()));
+                    skipped.push((
+                        path.clone(),
+                        "path was never resolved by the supply phase (planner input gap) — \
+                         not uploaded"
+                            .to_string(),
+                    ));
                 }
                 Some(PathSource::Archive) => match archive_upload_item(archive, path) {
                     Ok(item) => candidates.push(Candidate {
@@ -425,6 +438,12 @@ pub fn plan_uploads(
     let mut pending = candidates;
     let mut batch: Vec<UploadItem> = Vec::new();
 
+    // Settle passes. Candidates are seeded in topo (children-first) order, so
+    // cross-node references are already satisfied within pass 1; only
+    // same-node sibling-output references can miss it. Expect 1–3 passes in
+    // practice — the quadratic worst case needs an adversarial reference
+    // graph that real store paths do not produce — so this loop does not
+    // need (or want) a smarter scheduler.
     while !pending.is_empty() {
         let mut progressed = false;
         let mut still_pending = Vec::with_capacity(pending.len());
@@ -726,7 +745,16 @@ impl UploadClaims {
             match self.lock().get(path) {
                 Some(ClaimState::Done) => return true,
                 None => return false,
-                Some(ClaimState::Pending(_)) => {}
+                Some(ClaimState::Pending(current)) => {
+                    // The claim may have been released and re-claimed since
+                    // the snapshot above. In that case `notify` belongs to
+                    // the dead claim and will never fire again — loop to
+                    // re-register on the live one (the deadline still bounds
+                    // the total wait).
+                    if !Arc::ptr_eq(current, &notify) {
+                        continue;
+                    }
+                }
             }
 
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -763,21 +791,57 @@ mod tests {
         ReplayArchive::open(&fixture()).unwrap()
     }
 
-    /// Fabricate a relay narinfo for `store_path` (valid nixbase32 NarHash,
-    /// no references).
-    fn fake_narinfo(store_path: &str, nar_size: u64) -> NarInfo {
+    /// Fabricate a relay narinfo for `store_path` (valid nixbase32 NarHash;
+    /// `references` are basenames, like the narinfo text format).
+    fn fake_narinfo(store_path: &str, nar_size: u64, references: &[&str]) -> NarInfo {
         NarInfo {
             store_path: store_path.to_string(),
             url: "nar/fabricated.nar".to_string(),
             compression: "none".to_string(),
             nar_hash: format!("sha256:{}", nixbase32::encode(&[0x42u8; 32])),
             nar_size,
-            references: Vec::new(),
+            references: references.iter().map(|r| r.to_string()).collect(),
             deriver: None,
             sigs: Vec::new(),
             ca: None,
             file_hash: None,
             file_size: None,
+        }
+    }
+
+    /// Skip reason recorded for `path`, or a panic naming what IS skipped.
+    fn skip_reason(plan: &UploadPlan, path: &str) -> String {
+        plan.skipped
+            .iter()
+            .find(|(skipped_path, _)| skipped_path == path)
+            .map(|(_, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("{path} should be skipped, skipped = {:?}", plan.skipped))
+    }
+
+    /// The module's core ordering invariant: every reference of a batch item
+    /// that is also uploaded by the plan must land before it — earlier in
+    /// `batch`, or anywhere in `large` (large items stream before the batch).
+    fn assert_batch_reference_safe(plan: &UploadPlan) {
+        let large: BTreeSet<&str> = plan.large.iter().map(|i| i.store_path.as_str()).collect();
+        let planned: BTreeSet<&str> = plan
+            .batch
+            .iter()
+            .map(|i| i.store_path.as_str())
+            .chain(large.iter().copied())
+            .collect();
+        let mut uploaded: BTreeSet<&str> = large.clone();
+        for item in &plan.batch {
+            for reference in &item.info.references {
+                if reference == &item.store_path || !planned.contains(reference.as_str()) {
+                    continue;
+                }
+                assert!(
+                    uploaded.contains(reference.as_str()),
+                    "{} is uploaded before its reference {reference}",
+                    item.store_path
+                );
+            }
+            uploaded.insert(item.store_path.as_str());
         }
     }
 
@@ -848,14 +912,14 @@ mod tests {
             DEP_OUT.to_string(),
             (
                 "https://cache.example.org".to_string(),
-                fake_narinfo(DEP_OUT, 120),
+                fake_narinfo(DEP_OUT, 120, &[]),
             ),
         );
         relay.insert(
             relay_only.to_string(),
             (
                 "https://relay.example.org".to_string(),
-                fake_narinfo(relay_only, 64),
+                fake_narinfo(relay_only, 64, &[]),
             ),
         );
 
@@ -918,7 +982,7 @@ mod tests {
             DEP_OUT.to_string(),
             PathSource::Relay {
                 substituter_url: "https://cache.example.org".to_string(),
-                narinfo: fake_narinfo(DEP_OUT, big),
+                narinfo: fake_narinfo(DEP_OUT, big, &[]),
             },
         );
         sources.insert(
@@ -929,6 +993,7 @@ mod tests {
         let plan = plan_uploads(&closure, &sources, &BTreeSet::new(), &archive).unwrap();
 
         assert!(plan.skipped.is_empty(), "skipped: {:?}", plan.skipped);
+        assert_batch_reference_safe(&plan);
 
         // Large routing: the 65 MiB relay item streams individually.
         assert_eq!(plan.large.len(), 1);
@@ -1000,6 +1065,98 @@ mod tests {
             assert!(item.info.signatures.is_empty());
             assert!(!item.info.ultimate);
         }
+    }
+
+    #[test]
+    fn plan_uploads_skips_unsatisfiable_cycle_but_never_drvs() {
+        let archive = open_fixture();
+        let closure = walk_closure(&archive, &[APP_DRV.to_string()]).unwrap();
+
+        // Fabricate a reference cycle between the two relay-supplied outputs
+        // (narinfo references are basenames). Real store paths cannot do
+        // this, but the planner must degrade to skips, not hang or abort.
+        let dep_out_base = DEP_OUT.strip_prefix("/nix/store/").unwrap();
+        let app_out_base = APP_OUT.strip_prefix("/nix/store/").unwrap();
+        let mut sources: HashMap<String, PathSource> = HashMap::new();
+        sources.insert(SRC.to_string(), PathSource::Archive);
+        sources.insert(
+            DEP_OUT.to_string(),
+            PathSource::Relay {
+                substituter_url: "https://cache.example.org".to_string(),
+                narinfo: fake_narinfo(DEP_OUT, 120, &[app_out_base]),
+            },
+        );
+        sources.insert(
+            APP_OUT.to_string(),
+            PathSource::Relay {
+                substituter_url: "https://cache.example.org".to_string(),
+                narinfo: fake_narinfo(APP_OUT, 200, &[dep_out_base]),
+            },
+        );
+
+        let plan = plan_uploads(&closure, &sources, &BTreeSet::new(), &archive).unwrap();
+
+        // Both cycle members degrade to skips naming the reference that
+        // could not be satisfied; nothing else is skipped.
+        assert_eq!(plan.skipped.len(), 2, "skipped: {:?}", plan.skipped);
+        let dep_reason = skip_reason(&plan, DEP_OUT);
+        assert!(
+            dep_reason.contains("unsatisfied upload reference"),
+            "{dep_reason}"
+        );
+        assert!(dep_reason.contains(APP_OUT), "{dep_reason}");
+        let app_reason = skip_reason(&plan, APP_OUT);
+        assert!(
+            app_reason.contains("unsatisfied upload reference"),
+            "{app_reason}"
+        );
+        assert!(app_reason.contains(DEP_OUT), "{app_reason}");
+
+        // Derivation texts are never skipped: both are still placed, in
+        // reference-safe order, alongside the archive-embedded source.
+        let batch_paths: Vec<&str> = plan.batch.iter().map(|i| i.store_path.as_str()).collect();
+        assert_eq!(batch_paths, vec![SRC, DEP_DRV, APP_DRV]);
+        assert!(plan.large.is_empty());
+        assert_batch_reference_safe(&plan);
+    }
+
+    #[test]
+    fn plan_uploads_target_valid_and_skip_reasons() {
+        let archive = open_fixture();
+        let closure = walk_closure(&archive, &[APP_DRV.to_string()]).unwrap();
+
+        // The target already has the embedded source; dep's output resolved
+        // to "nothing has it"; app's output was never resolved at all.
+        let target_valid: BTreeSet<String> = [SRC.to_string()].into_iter().collect();
+        let mut sources: HashMap<String, PathSource> = HashMap::new();
+        sources.insert(
+            DEP_OUT.to_string(),
+            PathSource::NotSupplied { workload: false },
+        );
+        // APP_OUT deliberately absent from the sources map.
+
+        let plan = plan_uploads(&closure, &sources, &target_valid, &archive).unwrap();
+
+        // The already-valid source is not planned, and its absence does not
+        // constrain ordering: both derivation texts are still placed.
+        assert!(plan.large.is_empty());
+        let batch_paths: Vec<&str> = plan.batch.iter().map(|i| i.store_path.as_str()).collect();
+        assert!(!batch_paths.contains(&SRC), "{batch_paths:?}");
+        assert_eq!(batch_paths, vec![DEP_DRV, APP_DRV]);
+        assert_batch_reference_safe(&plan);
+
+        // Skip reasons spell out what was tried and what is actually missing.
+        assert!(
+            skip_reason(&plan, DEP_OUT).contains("not embedded in the archive"),
+            "{:?}",
+            plan.skipped
+        );
+        assert!(
+            skip_reason(&plan, APP_OUT).contains("never resolved by the supply phase"),
+            "{:?}",
+            plan.skipped
+        );
+        assert_eq!(plan.skipped.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
