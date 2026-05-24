@@ -1564,6 +1564,12 @@ async fn test_preexisting_completed_gc_matrix(
 #[case::missing_unwanted_not_reset(&["out"], DerivationStatus::Completed, 1)]
 // P_debug missing and build B wants everything (empty sentinel) → reset.
 #[case::missing_wanted_resets(&[], DerivationStatus::Ready, 0)]
+// P_debug missing and build B's wanted set resolves to no declared
+// output (a `drv^bogus` root) → nothing is POSITIVELY identifiable as
+// unwanted, so nothing is forgiven → reset. The complement of an
+// unresolvable wanted subset must be empty, not every declared path —
+// otherwise a GC'd output is never re-opened.
+#[case::missing_unresolvable_wanted_resets(&["bogus"], DerivationStatus::Ready, 0)]
 #[tokio::test]
 async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     #[case] wanted: &[&str],

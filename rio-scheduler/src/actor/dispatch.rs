@@ -859,14 +859,33 @@ impl DagActor {
             // qualify; a seed that matches no declared path (the
             // realized floating-CA path from the reprobe lane) is
             // never forgiven.
-            let forgivable: HashSet<String> = {
-                let wanted: HashSet<&String> = state.wanted_output_paths().collect();
-                state
-                    .expected_output_paths
-                    .iter()
-                    .filter(|p| !p.is_empty() && !wanted.contains(*p) && paths.contains(*p))
-                    .cloned()
-                    .collect()
+            //
+            // The complement MUST be taken against the *verifiable*
+            // wanted subset. A wanted set that resolves to no
+            // verifiable path (`drv^bogus`) yields an EMPTY wanted set
+            // here — and the complement of nothing is every declared
+            // path, which forgives every seed failure and lets the
+            // walk return ok=true having fetched NOTHING. On `None`
+            // nothing is positively identifiable as unwanted, so
+            // nothing is forgivable: every seed failure fails the walk
+            // (the conservative pre-feature behaviour).
+            let forgivable: HashSet<String> = match verifiable_wanted_paths(
+                &state.output_names,
+                &state.expected_output_paths,
+                &state.wanted_output_names,
+            ) {
+                Some(wanted) => {
+                    let wanted: HashSet<&str> = wanted.into_iter().collect();
+                    state
+                        .expected_output_paths
+                        .iter()
+                        .filter(|p| {
+                            !p.is_empty() && !wanted.contains(p.as_str()) && paths.contains(*p)
+                        })
+                        .cloned()
+                        .collect()
+                }
+                None => HashSet::new(),
             };
             let drv_path = state.drv_path().to_string();
             let interested = state.interested_builds.clone();
