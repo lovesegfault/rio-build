@@ -530,13 +530,15 @@ module logBufferLifecycle {
   /// retained entry is at all times either justified — its derivation is
   /// tracked non-terminal by this replica's DAG, a final flush for its
   /// stamped execution is pending and unresolved, the DAG is not
-  /// authoritative for staleness decisions, or it holds the only copy of
-  /// lines no finalized durable record supersedes (the rule's intended
-  /// fixed point: the periodic flush keeps them durable at `.partial`
-  /// coverage) — or one reap path's discard branch is already enabled
-  /// for it. The check is that the reap set is COMPLETE: there is no
-  /// reachable entry state that is unjustified and that no reap path
-  /// will ever observe (no fifth orphan shape).
+  /// authoritative for staleness decisions, its periodic reaper is
+  /// suspended behind a recovery that is pending and will re-enable it,
+  /// or it holds the only copy of lines no finalized durable record
+  /// supersedes (the rule's intended fixed point: the periodic flush
+  /// keeps them durable at `.partial` coverage) — or one reap path's
+  /// discard branch is already enabled for it. The check is that the
+  /// reap set is COMPLETE: there is no reachable entry state that is
+  /// unjustified and that no reap path will ever observe (no fifth
+  /// orphan shape).
   val everyRetainedEntryIsJustified = DRVS.forall(d =>
     hasEntry(d) implies or {
       // (1) The live carrier: tracked non-terminal by this replica's DAG.
@@ -551,10 +553,37 @@ module logBufferLifecycle {
         },
       },
       // (3) The DAG is not authoritative for staleness decisions: a
-      // standby, a deposed leader, a pre-recovery window, or a
-      // failed-load tenure. Entries are held for the next authoritative
-      // reconciliation.
+      // standby, a deposed leader, or a failed-load tenure. Entries are
+      // held for the next authoritative reconciliation.
       not(isLeader and replica.loadSucceeded),
+      // (3b) The periodic reaps' subject while their gate is closed and
+      // the recovery that re-opens it is pending: a sealed entry in a
+      // shape one of the two recovery-gated periodic reaps would discard
+      // (empty -> the sealed-empty reap; non-empty with a finalized row
+      // -> the refused-UPSERT reap), on a leader whose recovery
+      // completion stamp has been cleared for the current acquire-epoch.
+      // Keyed on the reap's own gate (`may_flush()`'s recovery_complete
+      // half), NOT on `dag_authoritative`: a rebound — a foreign term
+      // observed late on a still-leading round — is the one transition
+      // that clears the completion stamp (suspending both periodic
+      // reaps) while leaving is_leader, the DAG, and dag_authoritative
+      // in place, so disjunct (3) does not fire and disjunct (5)'s reap
+      // set goes empty for exactly these entries. The window is bounded
+      // by one recovery cycle: `isLeader and not(recoveryComplete)` is
+      // precisely the recovery actions' enabling condition (the code's
+      // re-fired LeaderAcquired is already queued by on_rebound's
+      // caller), the re-run re-stamps the completion for the new
+      // acquire-epoch, may_flush() re-opens, and the next periodic tick
+      // reaps the entry. Without the entry-shape conjuncts this would
+      // accept ANY entry during the window, including one orphaned for
+      // an unrelated reason; with them it accepts exactly the entries
+      // whose only reaper is the suspended one.
+      and {
+        isLeader,
+        not(recoveryComplete),
+        sealed.get(d),
+        or { entryHeld(d) == Set(), rowComplete(d, entryExec(d)) },
+      },
       // (4) The best-data-available fixed point: a non-empty ring whose
       // execution no tenure has finalized holds the only copy of those
       // lines.
