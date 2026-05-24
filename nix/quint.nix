@@ -104,6 +104,19 @@ let
     fileset = modelsDir + "/leaderElection.qnt";
   };
 
+  # The invariant set every log-buffer lifecycle regime check asserts:
+  # the five model-A invariants of the build-log verification design plus
+  # the boundsOK ceiling tripwire. One list so the three regimes cannot
+  # silently drift apart on which properties they prove.
+  logInvariants = [
+    "boundsOK"
+    "noCrossExecContamination"
+    "lineSpanExact"
+    "bindingGateExcludesForeignExecutors"
+    "everyRetainedEntryIsJustified"
+    "noSilentLineLoss"
+  ];
+
   # One `quint verify` run per (model, main-module, invariant-set,
   # backend) tuple. `main` selects the module within the file — a model
   # with several fault regimes declares one core module plus one thin
@@ -530,6 +543,256 @@ in
       spec = "leaderElection";
       main = "leaderElectionPgFaults";
       witness = "noReclaimAfterRestore";
+    };
+
+    # ---------------------------------------------------------------------
+    # rio-scheduler's build-log buffer lifecycle (LogBuffers + LogFlusher
+    # + the actor paths that drive them), modeled as a single replica
+    # against an adversarial environment of worker batches, lease
+    # transitions, recovery runs, flusher ticks, terminals, and reaps
+    # (docs/spec/models/logBufferLifecycle.qnt). Three regimes share one
+    # core module and one invariant set — the five model-A invariants of
+    # the build-log verification design plus the boundsOK ceiling
+    # tripwire; each regime is its own check so a regression in the core
+    # entry lifecycle surfaces in the small fast check instead of buried
+    # in the fault-injection ones. The state counts, depths, and
+    # wall-clocks are in each check's output transcript and the
+    # introducing commit's message.
+
+    # The base regime: no lease transitions, no faults, no evictions. The
+    # replica holds the lease for the whole trace; the adversaries are
+    # the worker (batch ordering, gaps, foreign executors, re-deliveries)
+    # and the unbiased scheduling of the flusher against the actor. The
+    # load-bearing verification of the binding gate, the span arithmetic
+    # over plain and interior-hole payloads, the seal/drain ordering, and
+    # the sealed-empty + cleanup reaps.
+    # r[verify sched.log.batch-binding]
+    # r[verify obs.log.gap-span+2]
+    # r[verify obs.log.entry-justified]
+    # r[verify obs.log.line-conservation]
+    quint-log-base = mkQuintCheck {
+      name = "log-base";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleBase";
+      invariants = logInvariants;
+    };
+
+    # The lease-flap regime: foreign steals, lose/re-acquire edges,
+    # same-epoch re-acquires, rebounds, recovery re-runs, and the interim
+    # leader's PG-visible effects (finalizing a row, extending a row past
+    # this replica's retained ring, re-dispatching under a fresh exec).
+    # The load-bearing verification of the cross-exec restamp clearing
+    # (exec-keyed), the stored-coverage reconciliation and the gap-merge
+    # fold's span arithmetic (the recovered-prefix branch is only
+    # reachable here), the deferred-final tenure pin, the tenure-orphan
+    # reap, and the conservation law across failovers.
+    # r[verify obs.log.exec-keyed+2]
+    # r[verify obs.log.gap-span+2]
+    # r[verify obs.log.entry-justified]
+    # r[verify obs.log.line-conservation]
+    quint-log-flap = mkQuintCheck {
+      name = "log-flap";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFlap";
+      invariants = logInvariants;
+    };
+
+    # The fault regimes: the local fault-injection branches on top of the
+    # flap regime's lease budget, split into three checks by fault class
+    # (the all-faults product regime multiplies the flap regime's state
+    # count by every fault class's branching factor at once and blows the
+    # per-check budget; the split keeps each within the same order as the
+    # largest leader-election checks while every fault switch stays
+    # exercised against the full lease budget in exactly one of the three
+    # — see the regime modules' header for what the split costs and why
+    # that is acceptable).
+    #
+    # Local faults: push-coupled ring evictions and flush-channel-full
+    # enqueue failures. The load-bearing verification of the eviction's
+    # disclosed head loss and the enqueue-failure reap.
+    # r[verify obs.log.entry-justified]
+    # r[verify obs.log.line-conservation]
+    quint-log-fault-local = mkQuintCheck {
+      name = "log-fault-local";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultLocal";
+      invariants = logInvariants;
+    };
+
+    # Recovery faults: DAG-load failures and TOCTOU-discarded recoveries.
+    # The load-bearing verification of the degraded-tenure
+    # retain-everything posture.
+    # r[verify obs.log.entry-justified]
+    # r[verify obs.log.line-conservation]
+    quint-log-fault-recovery = mkQuintCheck {
+      name = "log-fault-recovery";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultRecovery";
+      invariants = logInvariants;
+    };
+
+    # The terminal-persist fault: PG keeps the assignment live after a
+    # terminal, unlocking the post-terminal interim subtree. The
+    # load-bearing verification of the refused-UPSERT reap and the
+    # sealed-entry cross-exec restamp.
+    # r[verify obs.log.entry-justified]
+    # r[verify obs.log.line-conservation]
+    quint-log-fault-persist = mkQuintCheck {
+      name = "log-fault-persist";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultPersist";
+      invariants = logInvariants;
+    };
+
+    # The finalize-guard fault: the deferral path. The load-bearing
+    # verification of the deferred-final retention against the tenure
+    # pin.
+    # r[verify obs.log.entry-justified]
+    # r[verify obs.log.line-conservation]
+    quint-log-fault-guard = mkQuintCheck {
+      name = "log-fault-guard";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultGuard";
+      invariants = logInvariants;
+    };
+
+    # Non-vacuity witnesses for the log-buffer lifecycle regimes. Same
+    # discipline as the leader-election witnesses above: each check
+    # passes only when the checker VIOLATES its witness, proving the
+    # scenario the regime's invariants constrain is actually reachable in
+    # that regime's explored space. Each witness is wired in the regime
+    # whose constants make it reachable; a witness that stops being
+    # violated means that regime's invariants have gone vacuous for the
+    # behavior it probes.
+
+    # A row is completed in the base regime — the headline non-vacuity
+    # probe: noSilentLineLoss only bites for finalized records and
+    # lineSpanExact only bites for written rows.
+    quint-log-witness-completed-row = mkQuintWitnessCheck {
+      name = "log-witness-completed-row";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleBase";
+      witness = "noCompletedRow";
+    };
+
+    # The ingestion gate rejects a batch numbered below what the entry
+    # has already accounted for — the rejection arm of
+    # sched.executor.input-bounds is exercised, not merely encoded.
+    quint-log-witness-non-monotone-rejection = mkQuintWitnessCheck {
+      name = "log-witness-non-monotone-rejection";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleBase";
+      witness = "noNonMonotoneRejection";
+    };
+
+    # The periodic sealed-empty reap fires (orphan shape 1 of 4): a
+    # sealed entry whose ring is empty at a periodic tick is discarded.
+    quint-log-witness-sealed-empty-reap = mkQuintWitnessCheck {
+      name = "log-witness-sealed-empty-reap";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleBase";
+      witness = "noSealedEmptyReap";
+    };
+
+    # The stored-coverage reconciliation caches a recovered prefix in the
+    # flap regime — the gap-merge fold (the span arithmetic's hard case)
+    # is actually exercised. Without this the lineSpanExact verdict is
+    # about plain contiguous payloads only.
+    quint-log-witness-recovered-prefix = mkQuintWitnessCheck {
+      name = "log-witness-recovered-prefix";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFlap";
+      witness = "noRecoveredPrefix";
+    };
+
+    # A final flush request outlives the leadership tenure that enqueued
+    # it — the state the deferred-final tenure pin
+    # (obs.log.deferred-final-retry's drop obligation) exists to catch.
+    quint-log-witness-final-across-tenures = mkQuintWitnessCheck {
+      name = "log-witness-final-across-tenures";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFlap";
+      witness = "noFinalPendingAcrossTenures";
+    };
+
+    # A cross-exec restamp clears a NON-empty ring — the clearing
+    # noCrossExecContamination depends on is load-bearing, not merely
+    # reachable on empty rings.
+    quint-log-witness-cross-exec-clear = mkQuintWitnessCheck {
+      name = "log-witness-cross-exec-clear";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFlap";
+      witness = "noCrossExecRestampClear";
+    };
+
+    # flush_final's out-of-tenure drop arm reaps a sealed empty entry
+    # (orphan shape 2 of 4).
+    quint-log-witness-tenure-drop-reap = mkQuintWitnessCheck {
+      name = "log-witness-tenure-drop-reap";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFlap";
+      witness = "noTenureDropReap";
+    };
+
+    # A holder change is re-acquired with the generation unchanged — the
+    # saturated regime in which the generation alone cannot identify the
+    # tenure and the acquire-epoch half of req_in_tenure is load-bearing.
+    quint-log-witness-gen-pinned = mkQuintWitnessCheck {
+      name = "log-witness-gen-pinned";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFlap";
+      witness = "noGenPinnedHolderChange";
+    };
+
+    # The periodic refused-UPSERT reap fires (orphan shape 3 of 4):
+    # another tenure finalized the execution, the frozen row refuses the
+    # snapshot UPSERT, and the sealed orphan is discarded. Persist-fault
+    # regime, not flap: the shape needs a sealed entry whose execution
+    # another tenure finalizes, a terminal that seals also persists the
+    # terminal status (which removes the live assignment the interim's
+    # finalization is keyed on), and only the terminal-persist FAILURE
+    # leaves the assignment live for the interim to finalize behind the
+    # seal.
+    quint-log-witness-refused-upsert-reap = mkQuintWitnessCheck {
+      name = "log-witness-refused-upsert-reap";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultPersist";
+      witness = "noRefusedUpsertReap";
+    };
+
+    # An accepting push's eviction drops a non-empty head prefix — the
+    # disclosed head-loss channel of the conservation law actually fires.
+    quint-log-witness-eviction = mkQuintWitnessCheck {
+      name = "log-witness-eviction";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultLocal";
+      witness = "noEviction";
+    };
+
+    # The terminal epilogue's enqueue-failure reap fires (orphan shape 4
+    # of 4).
+    quint-log-witness-enqueue-fail-reap = mkQuintWitnessCheck {
+      name = "log-witness-enqueue-fail-reap";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultLocal";
+      witness = "noEnqueueFailReap";
+    };
+
+    # Calibration entry #0: the accept gate is the load-bearing fix for
+    # the obs.log.gap-span+2 falsification. The Ungated module is the
+    # flap regime with ENABLE_ACCOUNTED_FLOOR = false (the batch accept
+    # predicate degrades to the pre-fix comparison against the ring's
+    # current tail, which resets when the stored-coverage reconcile
+    # empties the ring); lineSpanExact MUST be violated there. A green
+    # exhaustive quint-log-flap plus a red lineSpanExact here is the
+    # machine-checked statement "the gate is necessary and sufficient at
+    # these bounds" — if this check ever stops finding the violation,
+    # the gate has stopped being the thing that prevents it.
+    quint-log-witness-gap-span-ungated = mkQuintWitnessCheck {
+      name = "log-witness-gap-span-ungated";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleUngated";
+      witness = "lineSpanExact";
     };
 
     # Implementation conformance (model-based testing). The regime checks

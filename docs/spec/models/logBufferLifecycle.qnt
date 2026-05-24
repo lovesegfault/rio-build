@@ -2411,23 +2411,35 @@ module logBufferLifecycleFlap {
 }
 
 // =========================================================================
-// THE FAULT REGIME: every local fault-injection branch enabled on top of
-// the flap regime's lease budget — ring evictions (the push-coupled
-// byte-cap eviction), DAG-load failures and TOCTOU-discarded
-// recoveries, flush-channel-full enqueue failures, terminal-status
-// persist failures (the correlated failure that leaves PG saying a
-// terminal derivation is still running), and finalize-guard SELECT
-// failures (the deferral path). The lease budget is retained because the
-// recovery faults are only reachable after an acquire edge and the
-// persist-failure fault is only interesting when a later recovery
-// reloads the stale assignment.
-//
-// This is the regime where the deferred-final retention, the
-// enqueue-failure reap, the eviction's head-loss disclosure, and the
-// degraded (non-authoritative-DAG) tenure's retain-everything posture
-// are load-bearing.
+// THE FAULT REGIMES: the local fault-injection branches enabled on top of
+// the flap regime's lease budget, split into four checks by fault class
+// (local = eviction + enqueue failure; recovery = load failure +
+// discarded recovery; persist; guard). The single all-faults product
+// regime converges but multiplies the flap regime's distinct-state count
+// by every fault class's branching factor at once, blowing past the
+// per-check state/wall-clock budget — as did the recovery+persist+guard
+// and persist+guard intermediate groupings; the four-way split keeps
+// each check within the same order as the largest checks already in the
+// gate while every fault switch (and therefore every fault-dependent
+// reap path and witness) remains exercised against the full lease budget
+// in exactly one of the four. The cost of the split is the loss of
+// cross-fault-class interactions (an eviction interleaved with a load
+// failure, a persist failure interleaved with a guard failure); no
+// invariant or documented residual depends on such an interaction beyond
+// the persist x guard correlation, which is pinned by the rio-scheduler
+// deferred-final unit tests (see logBufferLifecycleFaultGuard's header);
+// a newly suspected interaction gets its own targeted regime rather than
+// a return to the product.
 // =========================================================================
-module logBufferLifecycleFault {
+
+// The LOCAL fault regime: ring evictions (the push-coupled byte-cap
+// eviction) and flush-channel-full enqueue failures. The lease budget is
+// retained because the eviction's interaction with the stored-coverage
+// reconciliation (an evicted head makes the ring stop subsuming the row
+// this replica itself wrote, forcing the fold branch) is only reachable
+// across a re-acquisition. This is the regime where the eviction's
+// head-loss disclosure and the enqueue-failure reap are load-bearing.
+module logBufferLifecycleFaultLocal {
   import logBufferLifecycle(
     DRVS = Set("d1"),
     EXECUTORS = Set("e1", "e2"),
@@ -2436,10 +2448,112 @@ module logBufferLifecycleFault {
     MAX_TRANSITIONS = 2,
     MAX_GEN = 4,
     ENABLE_EVICTION = true,
+    ENABLE_LOAD_FAILURE = false,
+    ENABLE_DISCARDED_RECOVERY = false,
+    ENABLE_ENQUEUE_FAILURE = true,
+    ENABLE_PERSIST_FAILURE = false,
+    ENABLE_GUARD_FAILURE = false,
+    ENABLE_ACCOUNTED_FLOOR = true
+  ).*
+}
+
+// The RECOVERY fault regime: DAG-load failures and TOCTOU-discarded
+// recoveries. The lease budget is retained because the recovery faults
+// are only reachable after an acquire edge and their interesting
+// interleavings are with the interim leader's PG mutations (a failed
+// load retaining a cross-exec-stale entry until the next successful
+// recovery clears it). This is the regime where the degraded
+// (non-authoritative-DAG) tenure's retain-everything posture is
+// load-bearing.
+module logBufferLifecycleFaultRecovery {
+  import logBufferLifecycle(
+    DRVS = Set("d1"),
+    EXECUTORS = Set("e1", "e2"),
+    MAX_EXECS = 2,
+    MAX_LINE = 3,
+    MAX_TRANSITIONS = 2,
+    MAX_GEN = 4,
+    ENABLE_EVICTION = false,
     ENABLE_LOAD_FAILURE = true,
     ENABLE_DISCARDED_RECOVERY = true,
-    ENABLE_ENQUEUE_FAILURE = true,
+    ENABLE_ENQUEUE_FAILURE = false,
+    ENABLE_PERSIST_FAILURE = false,
+    ENABLE_GUARD_FAILURE = false,
+    ENABLE_ACCOUNTED_FLOOR = true
+  ).*
+}
+
+// The TERMINAL-PERSIST fault regime: the terminal-status persist
+// failure — the correlated failure that leaves PG saying a terminal
+// derivation is still running. The lease budget is retained because the
+// fault's payoff is what the NEXT tenure does with the stale
+// assignment: reload and same-exec-restamp the sealed entry as the live
+// carrier, let an interim leader finalize the still-live execution
+// behind this replica's seal (the refused-UPSERT reap's trigger), or
+// let an interim re-dispatch it (the only path to a sealed entry
+// meeting a cross-exec restamp — the seal-clearing that arm performs is
+// load-bearing exactly here). This fault unlocks the entire
+// post-terminal interim subtree (every interim action requires a live
+// assignment, and a successful terminal persist removes it), which is
+// why it gets its own regime.
+//
+// MAX_LINE is 2, not 3: this regime's subject is the entry / seal /
+// assignment lifecycle under a stale persisted terminal, which is
+// line-count-independent — 2 lines suffice for a non-empty ring, a
+// non-empty delivered set, a row with a non-trivial span, and every
+// reap predicate. The line-arithmetic shapes that need 3 lines (the
+// interior hole, the gap-merge fold with a non-zero gap, the head
+// eviction) are the base, flap, and fault-local regimes' subject. At
+// MAX_LINE = 3 the post-terminal interim subtree this fault unlocks
+// pushes the regime several times past the per-check budget without
+// adding an interleaving class any of its invariants or witnesses
+// depend on.
+module logBufferLifecycleFaultPersist {
+  import logBufferLifecycle(
+    DRVS = Set("d1"),
+    EXECUTORS = Set("e1", "e2"),
+    MAX_EXECS = 2,
+    MAX_LINE = 2,
+    MAX_TRANSITIONS = 2,
+    MAX_GEN = 4,
+    ENABLE_EVICTION = false,
+    ENABLE_LOAD_FAILURE = false,
+    ENABLE_DISCARDED_RECOVERY = false,
+    ENABLE_ENQUEUE_FAILURE = false,
     ENABLE_PERSIST_FAILURE = true,
+    ENABLE_GUARD_FAILURE = false,
+    ENABLE_ACCOUNTED_FLOOR = true
+  ).*
+}
+
+// The FINALIZE-GUARD fault regime: the finalize-guard SELECT failure
+// (the deferral path — the flusher cannot rule out an existing
+// finalization, so the final is retained and retried instead of
+// uploaded). The lease budget is retained because the deferral is only
+// interesting against the tenure pin (a request deferred under one
+// tenure must be dropped, not retried, once the tenure ends). This is
+// the regime where the deferred-final retention is load-bearing. The
+// persist-failure x guard-failure product (the same PG outage causing
+// both) is deliberately not explored as a single regime — it multiplies
+// the two faults' subtrees into a state space several times the
+// per-check budget; the correlated scenario's specific interleaving
+// (persist fails, the final defers, the lease lapses, the next tenure
+// restamps the same exec, the deferred final must be dropped) is pinned
+// by the rio-scheduler deferred-final unit tests cited at
+// obs.log.deferred-final-retry.
+module logBufferLifecycleFaultGuard {
+  import logBufferLifecycle(
+    DRVS = Set("d1"),
+    EXECUTORS = Set("e1", "e2"),
+    MAX_EXECS = 2,
+    MAX_LINE = 3,
+    MAX_TRANSITIONS = 2,
+    MAX_GEN = 4,
+    ENABLE_EVICTION = false,
+    ENABLE_LOAD_FAILURE = false,
+    ENABLE_DISCARDED_RECOVERY = false,
+    ENABLE_ENQUEUE_FAILURE = false,
+    ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = true,
     ENABLE_ACCOUNTED_FLOOR = true
   ).*
