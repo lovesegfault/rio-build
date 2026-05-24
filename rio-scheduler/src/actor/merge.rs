@@ -2304,16 +2304,28 @@ impl DagActor {
             .filter(|p| !substitutable.contains(p))
             .collect();
         if roots.iter().any(|n| {
-            wanted_subset(
+            let mut wanted = wanted_subset(
                 &n.output_names,
                 &n.expected_output_paths,
                 &n.wanted_output_names,
             )
-            .any(|p| truly_missing.contains(p.as_str()))
+            .filter(|p| !p.is_empty())
+            .peekable();
+            // Defensive: a wanted set that resolves to no non-empty
+            // concrete path (every wanted name unmatched — a client
+            // sent `drv^bogus` and the gateway doesn't validate the
+            // root OutputsSpec against the declared outputs) must
+            // never vacuously satisfy a completeness predicate. Treat
+            // it as "unavailable" so the prune doesn't fire and drop a
+            // dependency closure the root actually needs — same
+            // conservative direction as the check_cached_outputs
+            // guard; falling through to the full merge is always safe.
+            wanted.peek().is_none() || wanted.any(|p| truly_missing.contains(p.as_str()))
         }) {
             debug!(
                 missing = truly_missing.len(),
-                "top-down: wanted root output(s) unavailable; falling through to full merge"
+                "top-down: wanted root output(s) unavailable or unresolvable; \
+                 falling through to full merge"
             );
             return None;
         }

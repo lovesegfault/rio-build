@@ -1134,6 +1134,59 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     Ok(())
 }
 
+/// Top-down negative: a root whose `wanted_output_names` matches NO
+/// declared output (a client sending `drv^bogus` — the gateway does
+/// not validate the root OutputsSpec against the drv's declared
+/// outputs) resolves to an EMPTY wanted subset. The all-roots-
+/// available check must NOT treat that as vacuously satisfied: the
+/// root's output is missing from the store, so pruning would drop the
+/// dependency closure from the submission and dispatch the root to a
+/// builder whose inputs were never scheduled. A wanted set that
+/// resolves to nothing must fall through to the full merge.
+#[tokio::test]
+async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Root output deliberately NOT seeded and NOT substitutable: with
+    // an honest criterion the prune cannot fire. The bogus wanted name
+    // matches no declared output, so the wanted subset is empty — a
+    // vacuous `.any(missing)` would report "all available" and prune.
+    let mut root = make_node("vac-app");
+    root.output_names = vec!["out".into()];
+    root.expected_output_paths = vec![test_store_path("vac-app-out")];
+    root.wanted_output_names = vec!["bogus".into()];
+    let mut dep = make_node("vac-dep");
+    dep.expected_output_paths = vec![test_store_path("vac-dep-out")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![root, dep],
+        vec![make_test_edge("vac-app", "vac-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Full DAG merged — the dependency closure must survive.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.total_derivations, 2,
+        "a root wanted set that resolves to no declared output must NOT \
+         vacuously satisfy the all-roots-available prune — the dep \
+         closure would be dropped and the root dispatched without its \
+         inputs"
+    );
+    assert_eq!(
+        expect_drv(&handle, "vac-dep").await.status,
+        DerivationStatus::Ready,
+        "the dep survived into the merged DAG and is schedulable"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+2]
 /// Substitutable nodes go `Substituting` (detached fetch spawned),
 /// not synchronously `Completed` at merge. The closure-invariant
