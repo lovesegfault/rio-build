@@ -437,6 +437,8 @@ clap-verbosity-flag = { version = "3", default-features = false, features = [
 ] }
 console = "0.16"
 filetime = "0.2"
+# Read-only DwarFS image reader (xtask k8s replay archives).
+dwarfs = "0.2"
 
 [profile.release]
 incremental = false

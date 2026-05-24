@@ -17,6 +17,7 @@ mod phases;
 mod probe_boot;
 pub mod provider;
 pub(crate) mod qa;
+pub mod replay;
 pub mod shared;
 mod sla_gates;
 pub(crate) mod status;
@@ -255,6 +256,9 @@ pub enum K8sCmd {
     /// Live-cluster QA: lint → health → scenarios → load → fault.
     /// Stage flags select a subset (mirrors `up`).
     Qa(qa::QaOpts),
+    /// Replay a recorded build-load archive against the cluster's gateway
+    /// and compare outcomes.
+    Replay(replay::ReplayArgs),
     /// helm rollback to REV (0 = previous).
     Rollback {
         #[arg(default_value_t = 0)]
@@ -442,6 +446,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
     match args.cmd {
         K8sCmd::Up(opts) => run_up(p, kind, cfg, opts).await,
         K8sCmd::Qa(opts) => qa::run(opts, &*p, kind, cfg).await,
+        K8sCmd::Replay(args) => replay::run(args, &*p, kind, cfg).await,
         K8sCmd::Rollback { rev } => {
             let rev = if rev > 0 {
                 rev

@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/c2222222222222222222222222222222-app","","")],[("/nix/store/a1111111111111111111111111111111-dep.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","exit 1"],[("builder","/bin/sh"),("name","app"),("out","/nix/store/c2222222222222222222222222222222-app"),("system","x86_64-linux")])

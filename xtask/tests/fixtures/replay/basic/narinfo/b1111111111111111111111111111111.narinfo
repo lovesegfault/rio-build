@@ -1,0 +1,6 @@
+StorePath: /nix/store/b1111111111111111111111111111111-src.txt
+URL: nar/b1111111111111111111111111111111.nar
+Compression: none
+NarHash: sha256:1g8hvik0fpkrrza5fz8935fsd0607qk7i63z2rzz0db51cmc30dh
+NarSize: 304
+References:

@@ -731,7 +731,7 @@
     {
       "path": "protocol/wire/framed.rs",
       "depth": 2,
-      "doc": "Streaming framed reader for Nix framed byte streams."
+      "doc": "Streaming framed reader and writer for Nix framed byte streams."
     },
     {
       "path": "refscan.rs",
@@ -1802,6 +1802,11 @@
       "path": "k8s/qa/scheduler.rs",
       "depth": 2,
       "doc": "Two-phase scenario scheduler."
+    },
+    {
+      "path": "k8s/replay/",
+      "depth": 1,
+      "doc": "`xtask k8s replay` — replay a recorded build-load archive against a rio"
     },
     {
       "path": "k8s/shared.rs",

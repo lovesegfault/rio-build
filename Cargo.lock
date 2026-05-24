@@ -1894,6 +1894,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "dwarfs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f3693d0282f0db67b1a113d74ea641e530fbe7b5e535c200b6ebcba5e6b2ab5"
+dependencies = [
+ "bstr",
+ "log",
+ "lru 0.14.0",
+ "measure_time",
+ "positioned-io",
+ "serde",
+ "sha2 0.10.9",
+ "xxhash-rust",
+ "zerocopy",
+ "zstd-safe",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3593,6 +3611,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -4561,6 +4581,15 @@ dependencies = [
 
 [[package]]
 name = "lru"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f8cc7106155f10bdf99a6f379688f543ad6596a415375b36a59a054ceda1198"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "lru"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
@@ -4634,6 +4663,15 @@ name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
+name = "measure_time"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51c55d61e72fc3ab704396c5fa16f4c184db37978ae4e94ca8959693a235fc0e"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "memchr"
@@ -5493,6 +5531,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "positioned-io"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4ec4b80060f033312b99b6874025d9503d2af87aef2dd4c516e253fbfcdada7"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -8991,19 +9039,17 @@ dependencies = [
 name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anstyle",
  "aws-lc-rs",
  "aws-smithy-types",
- "base16ct 1.0.0",
  "base64 0.22.1",
  "bitflags",
  "byteorder",
  "bytes",
  "chacha20",
- "cipher",
  "crossbeam-epoch",
  "crossbeam-utils",
- "crypto-bigint 0.7.3",
  "crypto-common 0.1.6",
  "crypto-common 0.2.2",
  "ctutils",
@@ -9011,11 +9057,9 @@ dependencies = [
  "der 0.8.0",
  "digest 0.10.7",
  "digest 0.11.3",
- "ecdsa 0.17.0-rc.18",
  "ed25519",
  "ed25519-dalek",
  "either",
- "elliptic-curve 0.14.0-rc.32",
  "event-listener-strategy",
  "fastrand",
  "futures",
@@ -9026,15 +9070,14 @@ dependencies = [
  "generic-array 0.14.9",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
+ "hashbrown 0.15.5",
  "hashbrown 0.16.1",
  "hashbrown 0.17.1",
- "hex",
  "hybrid-array",
  "hyper 1.9.0",
  "hyper-rustls",
  "hyper-util",
  "indexmap",
- "inout 0.2.2",
  "jiff",
  "k8s-openapi",
  "kube",
@@ -9045,20 +9088,15 @@ dependencies = [
  "log",
  "memchr",
  "metrics-util",
- "miniz_oxide",
  "nix 0.31.3",
  "num-integer",
  "num-traits",
  "once_cell",
  "ordered-float 5.3.0",
- "p256 0.14.0-rc.9",
- "p384",
- "p521",
  "percent-encoding",
  "pkcs8 0.11.0",
  "portable-atomic",
  "ppv-lite86",
- "primeorder 0.14.0-rc.9",
  "prost",
  "quanta",
  "rand 0.10.1",
@@ -9068,20 +9106,15 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "reqwest",
- "rsa",
- "rustcrypto-ff",
- "rustcrypto-group",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
  "scopeguard",
- "sec1 0.8.1",
  "serde",
  "serde_core",
  "serde_json",
  "serde_spanned",
  "sha1 0.10.6",
- "sha1 0.11.0",
  "sha2 0.10.9",
  "sha2 0.11.0",
  "signature 3.0.0",
@@ -9090,9 +9123,6 @@ dependencies = [
  "spki 0.8.0",
  "sqlx-core",
  "sqlx-sqlite",
- "ssh-cipher",
- "ssh-encoding",
- "ssh-key",
  "subtle",
  "syn",
  "sync_wrapper",
@@ -9150,6 +9180,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compression",
  "async-trait",
  "aws-config",
  "aws-sdk-ec2",
@@ -9163,6 +9194,7 @@ dependencies = [
  "config",
  "console",
  "dotenvy",
+ "dwarfs",
  "ed25519-dalek",
  "filetime",
  "futures-util",
@@ -9180,9 +9212,11 @@ dependencies = [
  "reqwest",
  "rio-common",
  "rio-crds",
+ "rio-nix",
  "rio-proto",
  "rio-scheduler",
  "rio-test-support",
+ "russh",
  "rustls",
  "scopeguard",
  "serde",
@@ -9200,6 +9234,12 @@ dependencies = [
  "tracing-subscriber",
  "xshell",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yansi"

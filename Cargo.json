@@ -3709,11 +3709,16 @@
         {
           "name": "regex-automata",
           "packageId": "regex-automata"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
         }
       ],
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "serde",
         "std",
         "unicode"
       ],
@@ -5901,6 +5906,65 @@
       ],
       "authors": [
         "Kornel <kornel@geekhood.net>"
+      ]
+    },
+    "dwarfs": {
+      "crateName": "dwarfs",
+      "version": "0.2.1",
+      "edition": "2024",
+      "sha256": "1d9addgbmg3f1ch5qlsygfz0ylqyckm78g8i39xvc39g53896dkg",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "lru",
+          "packageId": "lru 0.14.0"
+        },
+        {
+          "name": "measure_time",
+          "packageId": "measure_time"
+        },
+        {
+          "name": "positioned-io",
+          "packageId": "positioned-io"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "xxhash-rust",
+          "packageId": "xxhash-rust"
+        },
+        {
+          "name": "zerocopy",
+          "packageId": "zerocopy"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "log",
+        "zstd"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "dyn-clone": {
@@ -11319,13 +11383,25 @@
       },
       "dependencies": [
         {
+          "name": "allocator-api2",
+          "packageId": "allocator-api2"
+        },
+        {
+          "name": "equivalent",
+          "packageId": "equivalent"
+        },
+        {
           "name": "foldhash",
           "packageId": "foldhash 0.1.5"
         }
       ],
       "resolvedDefaultFeatures": [
+        "allocator-api2",
+        "default",
         "default-hasher",
-        "inline-more"
+        "equivalent",
+        "inline-more",
+        "raw-entry"
       ],
       "libCrateTypes": [
         "lib"
@@ -14345,6 +14421,31 @@
         "Carl Lerche <me@carllerche.com>"
       ]
     },
+    "lru 0.14.0": {
+      "crateName": "lru",
+      "version": "0.14.0",
+      "edition": "2015",
+      "sha256": "160ivb75982rdarpals1d9cxcfjlixl7kwx6k7ghpwamc48cg34z",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "hashbrown"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jerome Froelich <jeromefroelic@hotmail.com>"
+      ]
+    },
     "lru 0.16.4": {
       "crateName": "lru",
       "version": "0.16.4",
@@ -14567,6 +14668,27 @@
         "Tony Arcieri <bascule@gmail.com>",
         "Wim de With <register@dewith.io>",
         "Yosef Dinerstein <yosefdi@gmail.com>"
+      ]
+    },
+    "measure_time": {
+      "crateName": "measure_time",
+      "version": "0.9.0",
+      "edition": "2021",
+      "sha256": "03pw6ni975lmm16fkr4ajwvxp161yhbgmicn8dqaphrgwxhmviai",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "log",
+          "packageId": "log"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Pascal Seitz <pascal.seitz@gmail.com>"
       ]
     },
     "memchr": {
@@ -17211,6 +17333,34 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "positioned-io": {
+      "crateName": "positioned-io",
+      "version": "0.3.5",
+      "edition": "2021",
+      "sha256": "19xdrnzky9bfa56dvwmfhypx40wmbl178s4vp49360qg0s04pv6l",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(unix)"
+        },
+        {
+          "name": "winapi",
+          "packageId": "winapi",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Dave Vasilevsky <dave@vasilevsky.ca>",
+        "Niklas Fiekas <niklas.fiekas@backscattering.de>"
       ]
     },
     "potential_utf": {
@@ -27474,18 +27624,23 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "basetsd",
         "cfg",
         "evntrace",
+        "fileapi",
         "handleapi",
         "in6addr",
         "inaddr",
+        "memoryapi",
         "minwinbase",
+        "minwindef",
         "ntsecapi",
         "profileapi",
         "std",
         "sysinfoapi",
         "windef",
         "winioctl",
+        "winnt",
         "winsock2"
       ],
       "libCrateTypes": [
@@ -28609,6 +28764,10 @@
       },
       "dependencies": [
         {
+          "name": "aes",
+          "packageId": "aes"
+        },
+        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -28619,10 +28778,6 @@
         {
           "name": "aws-smithy-types",
           "packageId": "aws-smithy-types"
-        },
-        {
-          "name": "base16ct",
-          "packageId": "base16ct 1.0.0"
         },
         {
           "name": "base64",
@@ -28651,20 +28806,12 @@
           "packageId": "chacha20"
         },
         {
-          "name": "cipher",
-          "packageId": "cipher"
-        },
-        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
         {
           "name": "crossbeam-utils",
           "packageId": "crossbeam-utils"
-        },
-        {
-          "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
         },
         {
           "name": "crypto-common",
@@ -28699,10 +28846,6 @@
           "rename": "digest_a6292c17cd707f01"
         },
         {
-          "name": "ecdsa",
-          "packageId": "ecdsa 0.17.0-rc.18"
-        },
-        {
           "name": "ed25519",
           "packageId": "ed25519"
         },
@@ -28713,10 +28856,6 @@
         {
           "name": "either",
           "packageId": "either"
-        },
-        {
-          "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
         },
         {
           "name": "event-listener-strategy",
@@ -28769,6 +28908,11 @@
         },
         {
           "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
           "packageId": "hashbrown 0.16.1",
           "rename": "hashbrown_986da7b5efc2b80e"
         },
@@ -28776,10 +28920,6 @@
           "name": "hashbrown",
           "packageId": "hashbrown 0.17.1",
           "rename": "hashbrown_9067fe90e8c1f593"
-        },
-        {
-          "name": "hex",
-          "packageId": "hex"
         },
         {
           "name": "hybrid-array",
@@ -28816,10 +28956,6 @@
         {
           "name": "indexmap",
           "packageId": "indexmap"
-        },
-        {
-          "name": "inout",
-          "packageId": "inout 0.2.2"
         },
         {
           "name": "jiff",
@@ -28862,16 +28998,6 @@
           "packageId": "metrics-util"
         },
         {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
           "name": "nix",
           "packageId": "nix 0.31.3",
           "target": "aarch64-unknown-linux-gnu"
@@ -28898,18 +29024,6 @@
           "packageId": "ordered-float 5.3.0"
         },
         {
-          "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
-        },
-        {
-          "name": "p384",
-          "packageId": "p384"
-        },
-        {
-          "name": "p521",
-          "packageId": "p521"
-        },
-        {
           "name": "percent-encoding",
           "packageId": "percent-encoding"
         },
@@ -28924,10 +29038,6 @@
         {
           "name": "ppv-lite86",
           "packageId": "ppv-lite86"
-        },
-        {
-          "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
         },
         {
           "name": "prost",
@@ -28968,18 +29078,6 @@
           "packageId": "reqwest"
         },
         {
-          "name": "rsa",
-          "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
-        },
-        {
           "name": "rustls",
           "packageId": "rustls"
         },
@@ -28994,10 +29092,6 @@
         {
           "name": "scopeguard",
           "packageId": "scopeguard"
-        },
-        {
-          "name": "sec1",
-          "packageId": "sec1 0.8.1"
         },
         {
           "name": "serde",
@@ -29017,13 +29111,7 @@
         },
         {
           "name": "sha1",
-          "packageId": "sha1 0.10.6",
-          "rename": "sha1_93f6ce9d446188ac"
-        },
-        {
-          "name": "sha1",
-          "packageId": "sha1 0.11.0",
-          "rename": "sha1_a6292c17cd707f01"
+          "packageId": "sha1 0.10.6"
         },
         {
           "name": "sha2",
@@ -29058,18 +29146,6 @@
         {
           "name": "sqlx-sqlite",
           "packageId": "sqlx-sqlite"
-        },
-        {
-          "name": "ssh-cipher",
-          "packageId": "ssh-cipher"
-        },
-        {
-          "name": "ssh-encoding",
-          "packageId": "ssh-encoding"
-        },
-        {
-          "name": "ssh-key",
-          "packageId": "ssh-key"
         },
         {
           "name": "subtle",
@@ -29188,6 +29264,10 @@
       ],
       "buildDependencies": [
         {
+          "name": "aes",
+          "packageId": "aes"
+        },
+        {
           "name": "anstyle",
           "packageId": "anstyle"
         },
@@ -29198,10 +29278,6 @@
         {
           "name": "aws-smithy-types",
           "packageId": "aws-smithy-types"
-        },
-        {
-          "name": "base16ct",
-          "packageId": "base16ct 1.0.0"
         },
         {
           "name": "base64",
@@ -29230,20 +29306,12 @@
           "packageId": "chacha20"
         },
         {
-          "name": "cipher",
-          "packageId": "cipher"
-        },
-        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
         {
           "name": "crossbeam-utils",
           "packageId": "crossbeam-utils"
-        },
-        {
-          "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
         },
         {
           "name": "crypto-common",
@@ -29278,10 +29346,6 @@
           "rename": "digest_a6292c17cd707f01"
         },
         {
-          "name": "ecdsa",
-          "packageId": "ecdsa 0.17.0-rc.18"
-        },
-        {
           "name": "ed25519",
           "packageId": "ed25519"
         },
@@ -29292,10 +29356,6 @@
         {
           "name": "either",
           "packageId": "either"
-        },
-        {
-          "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
         },
         {
           "name": "event-listener-strategy",
@@ -29348,6 +29408,11 @@
         },
         {
           "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
           "packageId": "hashbrown 0.16.1",
           "rename": "hashbrown_986da7b5efc2b80e"
         },
@@ -29355,10 +29420,6 @@
           "name": "hashbrown",
           "packageId": "hashbrown 0.17.1",
           "rename": "hashbrown_9067fe90e8c1f593"
-        },
-        {
-          "name": "hex",
-          "packageId": "hex"
         },
         {
           "name": "hybrid-array",
@@ -29395,10 +29456,6 @@
         {
           "name": "indexmap",
           "packageId": "indexmap"
-        },
-        {
-          "name": "inout",
-          "packageId": "inout 0.2.2"
         },
         {
           "name": "jiff",
@@ -29441,16 +29498,6 @@
           "packageId": "metrics-util"
         },
         {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
           "name": "nix",
           "packageId": "nix 0.31.3",
           "target": "aarch64-unknown-linux-gnu"
@@ -29477,18 +29524,6 @@
           "packageId": "ordered-float 5.3.0"
         },
         {
-          "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
-        },
-        {
-          "name": "p384",
-          "packageId": "p384"
-        },
-        {
-          "name": "p521",
-          "packageId": "p521"
-        },
-        {
           "name": "percent-encoding",
           "packageId": "percent-encoding"
         },
@@ -29503,10 +29538,6 @@
         {
           "name": "ppv-lite86",
           "packageId": "ppv-lite86"
-        },
-        {
-          "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
         },
         {
           "name": "prost",
@@ -29547,18 +29578,6 @@
           "packageId": "reqwest"
         },
         {
-          "name": "rsa",
-          "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
-        },
-        {
           "name": "rustls",
           "packageId": "rustls"
         },
@@ -29573,10 +29592,6 @@
         {
           "name": "scopeguard",
           "packageId": "scopeguard"
-        },
-        {
-          "name": "sec1",
-          "packageId": "sec1 0.8.1"
         },
         {
           "name": "serde",
@@ -29596,13 +29611,7 @@
         },
         {
           "name": "sha1",
-          "packageId": "sha1 0.10.6",
-          "rename": "sha1_93f6ce9d446188ac"
-        },
-        {
-          "name": "sha1",
-          "packageId": "sha1 0.11.0",
-          "rename": "sha1_a6292c17cd707f01"
+          "packageId": "sha1 0.10.6"
         },
         {
           "name": "sha2",
@@ -29637,18 +29646,6 @@
         {
           "name": "sqlx-sqlite",
           "packageId": "sqlx-sqlite"
-        },
-        {
-          "name": "ssh-cipher",
-          "packageId": "ssh-cipher"
-        },
-        {
-          "name": "ssh-encoding",
-          "packageId": "ssh-encoding"
-        },
-        {
-          "name": "ssh-key",
-          "packageId": "ssh-key"
         },
         {
           "name": "subtle",
@@ -29855,6 +29852,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "async-compression",
+          "packageId": "async-compression"
+        },
+        {
           "name": "async-trait",
           "packageId": "async-trait"
         },
@@ -29905,6 +29906,10 @@
         {
           "name": "dotenvy",
           "packageId": "dotenvy"
+        },
+        {
+          "name": "dwarfs",
+          "packageId": "dwarfs"
         },
         {
           "name": "ed25519-dalek",
@@ -29975,6 +29980,10 @@
           "packageId": "rio-crds"
         },
         {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },
@@ -29985,6 +29994,10 @@
         {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
+        },
+        {
+          "name": "russh",
+          "packageId": "russh"
         },
         {
           "name": "rustls",
@@ -30056,6 +30069,24 @@
           "name": "xtask",
           "path": "src/main.rs"
         }
+      ]
+    },
+    "xxhash-rust": {
+      "crateName": "xxhash-rust",
+      "version": "0.8.15",
+      "edition": "2018",
+      "sha256": "1lrmffpn45d967afw7f1p300rsx7ill66irrskxpcm1p41a0rlpx",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "xxh3"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Douman <douman@gmx.se>"
       ]
     },
     "yansi": {
@@ -30162,8 +30193,10 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "alloc",
         "derive",
         "simd",
+        "std",
         "zerocopy-derive"
       ],
       "libCrateTypes": [

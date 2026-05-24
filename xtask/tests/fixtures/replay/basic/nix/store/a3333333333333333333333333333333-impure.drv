@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/c3333333333333333333333333333333-impure","","")],[("/nix/store/a1111111111111111111111111111111-dep.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","env"],[("builder","/bin/sh"),("impureEnvVars","NIX_SECRET_TOKEN"),("name","impure"),("out","/nix/store/c3333333333333333333333333333333-impure"),("system","x86_64-linux")])

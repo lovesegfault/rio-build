@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/c1111111111111111111111111111111-dep","","")],[],["/nix/store/b1111111111111111111111111111111-src.txt"],"x86_64-linux","/bin/sh",["-c","cp -r $src $out"],[("builder","/bin/sh"),("name","dep"),("out","/nix/store/c1111111111111111111111111111111-dep"),("src","/nix/store/b1111111111111111111111111111111-src.txt"),("system","x86_64-linux")])

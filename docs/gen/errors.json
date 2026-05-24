@@ -407,6 +407,20 @@
       "doc": "Error writing STDERR to the client (WireError). The Nix client disconnected or the SSH channel closed. NOT reconnect-worthy — scheduler is fine, client is gone."
     },
     {
+      "enum": "ClientOpError",
+      "name": "Daemon",
+      "crate": "rio-nix",
+      "msg": "daemon refused operation: {}",
+      "doc": "The daemon refused the operation (STDERR_ERROR frame)."
+    },
+    {
+      "enum": "ClientOpError",
+      "name": "Wire",
+      "crate": "rio-nix",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": "Wire-level failure (I/O, framing, bounds)."
+    },
+    {
       "enum": "DerivationError",
       "name": "CollectionTooLarge",
       "crate": "rio-nix",
@@ -1369,6 +1383,11 @@
       "name": "StreamProcessError",
       "crate": "rio-gateway",
       "doc": "Error from `process_build_events`. Distinguishes transport errors and stream EOF-without-terminal (both reconnect-worthy failover signatures — see the per-variant docs) from `Wire` (client-side disconnect — not retried)."
+    },
+    {
+      "name": "ClientOpError",
+      "crate": "rio-nix",
+      "doc": "Error from a client-side daemon operation. [`Daemon`](ClientOpError::Daemon) is the daemon's verdict on the operation, delivered as an STDERR_ERROR frame with protocol framing intact (the transport is not corrupted) — callers may report it as a daemon-side rejection or retry the operation. [`Wire`](ClientOpError::Wire) means the channel itself is suspect and must be abandoned."
     },
     {
       "name": "DerivationError",
