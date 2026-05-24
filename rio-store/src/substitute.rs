@@ -531,7 +531,28 @@ impl Substituter {
                 // `list_for_tenant` is one indexed PG read; far cheaper
                 // than the permit's potential 25 s queue.
                 let Some(http) = &self.http else {
-                    return Ok(None); // sandbox: client build failed
+                    // Sandbox / startup regression: the reqwest client
+                    // failed to build, so EVERY substitution on this
+                    // replica degrades to "build it from source" — and
+                    // a skip that leaves no trace is indistinguishable
+                    // from "the upstream really doesn't have it" (the
+                    // 2026-05-23 incident class; see the no_upstreams
+                    // branch below). debug! not warn! — this fires on
+                    // every cache miss process-wide; the construction
+                    // site already warned once and the counter is the
+                    // alertable signal. Counted once per singleflight
+                    // leader, same granularity as `result=hit|miss`.
+                    debug!(
+                        tenant = %tenant_id,
+                        path = store_path,
+                        "substitute skipped: no HTTP client (reqwest client build failed at startup)"
+                    );
+                    metrics::counter!(
+                        "rio_store_substitute_skipped_total",
+                        "reason" => "no_http_client"
+                    )
+                    .increment(1);
+                    return Ok(None);
                 };
                 let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
                 if upstreams.is_empty() {
@@ -2475,6 +2496,41 @@ mod tests {
             1,
             "a no-upstreams skip must increment \
              rio_store_substitute_skipped_total{{reason=no_upstreams}}, \
+             not silently no-op; keys={:?}",
+            rec.all_keys()
+        );
+    }
+
+    /// `http: None` (the reqwest client failed to build at startup —
+    /// no CA bundle in the sandbox, or a future builder regression)
+    /// degrades EVERY substitution on this replica to `Ok(None)` =
+    /// build-from-source. Same incident class as the `no_upstreams`
+    /// branch two lines below it: a skip that leaves no trace is
+    /// indistinguishable from "the upstream really doesn't have it".
+    /// Counted once per singleflight leader. The `http` field is
+    /// private and only ever `None` when `Client::builder().build()`
+    /// fails, so the test reaches into the field directly (the test
+    /// module is a child of the defining module) rather than adding a
+    /// test-only constructor to production code.
+    #[tokio::test]
+    async fn substitute_skip_no_http_client_is_counted() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-no-http-counted").await;
+        let (path, _) = make_path();
+        let mut sub = test_substituter(db.pool.clone());
+        sub.http = None;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_none(), "no http client → None");
+        assert_eq!(
+            rec.get("rio_store_substitute_skipped_total{reason=no_http_client}"),
+            1,
+            "a no-http-client skip must increment \
+             rio_store_substitute_skipped_total{{reason=no_http_client}}, \
              not silently no-op; keys={:?}",
             rec.all_keys()
         );
