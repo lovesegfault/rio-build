@@ -373,6 +373,259 @@ module logBufferLifecycle {
       prefix: pref,
     })
 
+  // --- 7. invariants ----------------------------------------------------
+  //
+  // The five model-A invariants of the build-log verification design
+  // (§3.4), each carrying the spec rule it verifies; the rule ↔ invariant
+  // correspondence is docs/spec/models/log-invariant-map.md and the
+  // r[verify ...] markers live at the check wiring points in
+  // nix/quint.nix. Defined after the actions they constrain so they can
+  // reference the accessor defs; Quint definitions are order-independent.
+
+  /// The runtime residual of TypeOK: the integer ranges the ceiling
+  /// preconditions are supposed to enforce. A ceiling precondition that
+  /// is dropped shows up here before it shows up as a non-terminating
+  /// TLC run.
+  val boundsOK = and {
+    DRVS.forall(d => dispatched.get(d) >= 0 and dispatched.get(d) <= MAX_EXECS),
+    DRVS.forall(d => entryHeld(d).forall(n => n >= 0 and n < MAX_LINE)),
+    DRVS.forall(d => 1.to(MAX_EXECS).forall(e =>
+      delivered.get(d).get(e).forall(n => n >= 0 and n < MAX_LINE))),
+    DRVS.forall(d => hasEntry(d) implies
+      (entryExec(d) >= 1 and entryExec(d) <= dispatched.get(d))),
+    leaseTransitions >= 0,
+    leaseTransitions <= MAX_TRANSITIONS,
+    acquiredTransitions >= 0,
+    acquiredTransitions <= leaseTransitions,
+    generation >= 1,
+    generation <= MAX_GEN,
+  }
+
+  /// `NoCrossExecContamination` (obs.log.exec-keyed+2 — the in-memory
+  /// half; sched.log.batch-binding covers the ingress half): an entry
+  /// stamped for execution E holds only lines delivered under E. A
+  /// cross-exec restamp that carried the prior execution's lines into the
+  /// new execution's entry would hand them to the flusher under the new
+  /// execution's S3 key and `drv_logs` row; this is the invariant that
+  /// falsifies if `set_exec`'s cross-exec arm stops clearing the ring.
+  ///
+  /// Non-vacuity: the `noCrossExecRestampClear` witness proves a
+  /// cross-exec restamp of a NON-EMPTY ring is reachable in the flap
+  /// regime — the case where the clearing is load-bearing.
+  val noCrossExecContamination = DRVS.forall(d =>
+    hasEntry(d) implies
+      entryHeld(d).subseteq(delivered.get(d).get(entryExec(d))))
+
+  /// `LineSpanExact` (obs.log.gap-span+2): a `drv_logs` row's recorded
+  /// `first_line + line_count` is one past the highest true worker line
+  /// the row's content covers — across gap-merged prefixes, interior
+  /// holes, and plain contiguous payloads. Recording the physical line
+  /// count instead (prefix physical + marker + ring physical) understates
+  /// the end by the collapsed gap and breaks the read path's
+  /// caught-up/re-serve decisions and the next failover's subsumption
+  /// arithmetic. The recorded span is computed by the flush actions per
+  /// the code's arithmetic; `trueEnd` is the ghost truth recorded
+  /// alongside it.
+  ///
+  /// Non-vacuity: the `noRecoveredPrefix` witness proves the gap-merge
+  /// fold (the arithmetic's hard case) is reachable in the flap regime;
+  /// the `interiorHoleRun` deterministic run pins the holey-ring case.
+  val lineSpanExact = DRVS.forall(d =>
+    1.to(MAX_EXECS).forall(e =>
+      match rowOf(d, e) {
+        | NoRow => true
+        | Stored(r) => r.lo + r.cnt == r.trueEnd
+      }))
+
+  /// `BindingGateExcludesForeignExecutors` (sched.log.batch-binding): the
+  /// batch accept predicate admits a `(derivation, executor)` pair only
+  /// when an entry exists for the derivation (a fabricated
+  /// derivation_path must not allocate a buffer) and the calling
+  /// executor is the one bound to the derivation's current execution.
+  /// Quantified over the predicate's inputs rather than over a
+  /// provenance ghost: the invariant falsifies if the executor or
+  /// existence conjunct is dropped from `batchAccepted`, which is the
+  /// model-side regression the rule guards against (the code-side TOCTOU
+  /// — check the executor, then append after a restamp — is closed by
+  /// the single shard write-lock and is a Kani/MBT obligation, not a
+  /// protocol one).
+  val bindingGateExcludesForeignExecutors = DRVS.forall(d =>
+    EXECUTORS.forall(ex =>
+      0.to(MAX_LINE - 1).forall(lo =>
+        batchAccepted(d, ex, lo) implies and {
+          hasEntry(d),
+          entryExecutor(d) == ex,
+        })))
+
+  /// One reap path's discard branch is enabled for `d`'s entry in this
+  /// state — the entry has lost every justification and the next reap
+  /// that observes it will discard it (the "one step from reaped" half of
+  /// obs.log.entry-justified). The disjuncts are exactly the reap
+  /// actions' discard-branch preconditions.
+  def reapEnabledFor(d: Drv): bool = or {
+    // Terminal cleanup's post-delay discard (skips final-pending
+    // entries).
+    and { dag.get(d) == DagTerminal, not(entryFinalPending(d)) },
+    // The disconnect-time discard: DAG-unknown, owned, unsealed, behind
+    // the is_leader && dag_authoritative gate. A disconnect may fire at
+    // any time.
+    and {
+      isLeader, replica.loadSucceeded,
+      dag.get(d) == DagAbsent, not(sealed.get(d)),
+    },
+    // The acquisition sweep: unsealed and not live in the DAG the next
+    // successful recovery rebuilds. Enabled only when a recovery is due.
+    and {
+      isLeader, not(recoveryComplete), not(sealed.get(d)),
+      pg.get(d) == PgNone,
+    },
+    // The periodic sealed-empty reap.
+    and { mayFlush, sealed.get(d), entryHeld(d) == Set() },
+    // The periodic refused-UPSERT reap (the row is already finalized, so
+    // the durable record supersedes the retained lines).
+    and {
+      mayFlush, sealed.get(d), entryHeld(d) != Set(),
+      rowComplete(d, entryExec(d)),
+    },
+    // The pending final's own resolution arms: the tenure-drop reap
+    // (sealed + empty), the already-finalized drain, the empty drain,
+    // and the upload all remove the entry when the request names its
+    // stamped execution.
+    match pendingFinal.get(d) {
+      | NoFinal => false
+      | Final(req) => req.exec == entryExec(d)
+    },
+  }
+
+  /// `EveryRetainedEntryIsJustified` (obs.log.entry-justified): a
+  /// retained entry is at all times either justified — its derivation is
+  /// tracked non-terminal by this replica's DAG, a final flush for its
+  /// stamped execution is pending and unresolved, the DAG is not
+  /// authoritative for staleness decisions, or it holds the only copy of
+  /// lines no finalized durable record supersedes (the rule's intended
+  /// fixed point: the periodic flush keeps them durable at `.partial`
+  /// coverage) — or one reap path's discard branch is already enabled
+  /// for it. The check is that the reap set is COMPLETE: there is no
+  /// reachable entry state that is unjustified and that no reap path
+  /// will ever observe (no fifth orphan shape).
+  val everyRetainedEntryIsJustified = DRVS.forall(d =>
+    hasEntry(d) implies or {
+      // (1) The live carrier: tracked non-terminal by this replica's DAG.
+      dag.get(d) == DagLive,
+      // (2) A final flush for its stamped execution is pending and not
+      // yet resolved.
+      and {
+        entryFinalPending(d),
+        match pendingFinal.get(d) {
+          | NoFinal => false
+          | Final(req) => req.exec == entryExec(d)
+        },
+      },
+      // (3) The DAG is not authoritative for staleness decisions: a
+      // standby, a deposed leader, a pre-recovery window, or a
+      // failed-load tenure. Entries are held for the next authoritative
+      // reconciliation.
+      not(isLeader and replica.loadSucceeded),
+      // (4) The best-data-available fixed point: a non-empty ring whose
+      // execution no tenure has finalized holds the only copy of those
+      // lines.
+      and { entryHeld(d) != Set(), not(rowComplete(d, entryExec(d))) },
+      // (5) A reap that discards it is enabled now.
+      reapEnabledFor(d),
+    })
+
+  /// `NoSilentLineLoss` (obs.log.line-conservation), the per-replica
+  /// form: every line the ingestion gate accepted for an execution is, at
+  /// all times, present in the in-memory ring, present in the execution's
+  /// stored coverage, or counted in the stored row's claimed span as a
+  /// marked or unmarked gap — and may only leave all three through a loss
+  /// channel the stored record itself discloses: a recorded `first_line`
+  /// above the line (head loss disclosed by the row's own start), or a
+  /// record that never reaches `is_complete = true` (the incomplete
+  /// indicator). The four disjuncts collapse arithmetically — every line
+  /// below the recorded span's end is either in the span or below its
+  /// start — so the bite is: a FINALIZED record's claimed span covers
+  /// every line ever accepted, except those still held in a ring (which a
+  /// finalizing drain empties).
+  ///
+  /// Non-vacuity: the `noCompletedRow` witness proves a finalized record
+  /// is reachable in every regime — without it every disjunct but the
+  /// last is dead and the invariant is vacuous.
+  val noSilentLineLoss = DRVS.forall(d =>
+    1.to(MAX_EXECS).forall(e =>
+      delivered.get(d).get(e).forall(n => or {
+        // In the in-memory ring of the entry stamped with this execution.
+        heldFor(d, e).contains(n),
+        // In the stored coverage, counted in the claimed span as a gap,
+        // or below the recorded first_line (disclosed head loss).
+        and { rowExists(d, e), n < rowEnd(d, e) },
+        // The record never claims completeness: the incomplete indicator
+        // is the disclosure (obs.log.incomplete-surfaced).
+        not(rowComplete(d, e)),
+      })))
+
+  // --- expect-violation witnesses (non-vacuity probes) ------------------
+  //
+  // The vals below are NOT invariants and must never be added to a
+  // regime check's invariant list. Each states "the interesting thing
+  // never happens"; the quint-log-witness-* checks in nix/quint.nix
+  // verify one each and PASS only when the checker reports a violation —
+  // machine-checked evidence that the scenario a regime's headline
+  // invariant constrains is actually reachable in that regime's explored
+  // space. A witness that stops being violated means the model (or a
+  // regime's constants) no longer reaches the behavior the code can
+  // exhibit — a model bug, not a reason to delete the witness.
+
+  /// Violated when a final flush completes a `drv_logs` row. The
+  /// headline non-vacuity probe: `noSilentLineLoss` only bites for
+  /// finalized records and `lineSpanExact` only bites for written rows,
+  /// so a regime that never completes a row proves nothing.
+  val noCompletedRow = not(DRVS.exists(d =>
+    1.to(MAX_EXECS).exists(e => rowComplete(d, e))))
+
+  /// Violated when the stored-coverage reconciliation caches a recovered
+  /// prefix — the gap-merge fold (the span arithmetic's hard case) is
+  /// actually exercised, not merely encoded.
+  val noRecoveredPrefix = not(DRVS.exists(d =>
+    match entryPrefix(d) { | PrefCached(p) => true | PrefUnchecked => false | PrefChecked => false }))
+
+  /// Violated when a final flush request is pending while the leadership
+  /// tenure that enqueued it has ended — the state the deferred-final
+  /// tenure pin exists to catch (obs.log.deferred-final-retry+4's drop
+  /// obligation is about exactly this request).
+  val noFinalPendingAcrossTenures = not(DRVS.exists(d =>
+    match pendingFinal.get(d) {
+      | NoFinal => false
+      | Final(req) => not(reqInTenure(req))
+    }))
+
+  /// Violated when an eviction drops a non-empty head prefix of a held
+  /// ring (the byte-cap over-approximation actually fires).
+  val noEviction = not(wit.evicted)
+  /// Violated when the ingestion gate rejects a non-monotone batch.
+  val noNonMonotoneRejection = not(wit.rejectedNonMonotone)
+  /// Violated when a cross-exec restamp clears a non-empty ring (the
+  /// clearing `noCrossExecContamination` depends on is load-bearing, not
+  /// merely reachable on empty rings).
+  val noCrossExecRestampClear = not(wit.crossExecCleared)
+  /// Violated when `flush_final`'s out-of-tenure drop arm reaps a sealed
+  /// empty entry (orphan shape 1 of 4).
+  val noTenureDropReap = not(wit.tenureDropReap)
+  /// Violated when the periodic refused-UPSERT reap fires (orphan shape
+  /// 2 of 4).
+  val noRefusedUpsertReap = not(wit.refusedUpsertReap)
+  /// Violated when the periodic sealed-empty reap fires (orphan shape 3
+  /// of 4).
+  val noSealedEmptyReap = not(wit.sealedEmptyReap)
+  /// Violated when the terminal epilogue's enqueue-failure reap fires
+  /// (orphan shape 4 of 4).
+  val noEnqueueFailReap = not(wit.enqueueFailReap)
+  /// Violated when a holder change is re-acquired with the generation
+  /// unchanged — the saturated regime in which the generation alone
+  /// cannot identify the tenure and the acquire-epoch half of
+  /// `req_in_tenure` is load-bearing.
+  val noGenPinnedHolderChange = not(wit.genPinnedAcrossHolderChange)
+
   // --- 6. actions -------------------------------------------------------
   //
   // Each action's precondition is the corresponding code path's guard and
