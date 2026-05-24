@@ -442,6 +442,60 @@
         "type": "integer",
         "default": "",
         "description": "Per-replica cap on concurrent `try_substitute` calls."
+      },
+      {
+        "key": "log_bytes_budget",
+        "type": "uint64",
+        "default": "1073741824",
+        "description": "Per-replica budget for resident build-log ingest buffer bytes across all concurrent `LogService.AppendLog` streams."
+      },
+      {
+        "key": "log_max_streams",
+        "type": "uint",
+        "default": "256",
+        "description": "Per-replica cap on concurrent `LogService.AppendLog` streams."
+      },
+      {
+        "key": "log_ingest_byte_cap",
+        "type": "uint64",
+        "default": "1073741824",
+        "description": "Per-execution cap on accepted log bytes (post-truncation content plus a per-line overhead charge) over the lifetime of one execution's log."
+      },
+      {
+        "key": "log_max_chunks_per_exec",
+        "type": "uint32",
+        "default": "100000",
+        "description": "Per-execution cap on durably committed log chunks."
+      },
+      {
+        "key": "log_cut_interval_secs",
+        "type": "uint64",
+        "default": "60",
+        "description": "Periodic chunk-cut cadence for `AppendLog` streams: a non-empty ingest buffer is flushed to S3 at least this often, so a scheduler-visible log is never more than this far behind the builder."
+      },
+      {
+        "key": "log_cut_threshold_bytes",
+        "type": "uint64",
+        "default": "8388608",
+        "description": "Size-triggered chunk cut: a chunk is cut as soon as the ingest buffer holds this many uncompressed bytes, without waiting for the periodic timer."
+      },
+      {
+        "key": "log_cors_allow_origins",
+        "type": "string",
+        "default": "",
+        "description": "Comma-separated CORS allowed origins for gRPC-Web `TailLog` requests from the dashboard SPA."
+      },
+      {
+        "key": "log_peer_url_template",
+        "type": "string",
+        "default": "http://{pod}.rio-store-headless.rio-store.svc:9002",
+        "description": "URL template the cross-replica `TailLog` proxy uses to dial the store replica holding an execution's live ingest stream."
+      },
+      {
+        "key": "log_retention_days",
+        "type": "uint32",
+        "default": "30",
+        "description": "Build-log retention, in days since the execution *started* (`drv_executions.started_at` — the only timestamp every execution has)."
       }
     ],
     "builder": [

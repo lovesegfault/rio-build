@@ -6517,6 +6517,7 @@ dependencies = [
  "fastcdc",
  "futures-util",
  "hex",
+ "http 1.4.0",
  "httpdate",
  "metrics",
  "moka",
@@ -6543,10 +6544,13 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
+ "tonic-web",
+ "tower-http",
  "tracing",
  "tracing-test",
  "uuid",
  "workspace-hack",
+ "zstd",
 ]
 
 [[package]]
@@ -9274,9 +9278,6 @@ dependencies = [
  "winnow",
  "zerocopy",
  "zeroize",
- "zstd",
- "zstd-safe",
- "zstd-sys",
 ]
 
 [[package]]

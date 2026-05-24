@@ -1107,6 +1107,55 @@
       "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
     },
     {
+      "enum": "CutError",
+      "name": "Compress",
+      "crate": "rio-store",
+      "msg": "compressing log chunk: {0}",
+      "doc": "zstd compression failed (effectively unreachable for in-memory I/O, but the encoder API is fallible)."
+    },
+    {
+      "enum": "CutError",
+      "name": "Join",
+      "crate": "rio-store",
+      "msg": "log chunk compression task failed: {0}",
+      "doc": "The compression task was cancelled or panicked."
+    },
+    {
+      "enum": "CutError",
+      "name": "Manifest",
+      "crate": "rio-store",
+      "msg": "recording log chunk manifest row: {0}",
+      "doc": "The `drv_log_chunks` manifest INSERT failed. The object may already be durable in S3 — that is fine, the retry burns a new seq and the unreferenced object is invisible to readers (the S3 lifecycle rule collects it)."
+    },
+    {
+      "enum": "CutError",
+      "name": "Store",
+      "crate": "rio-store",
+      "msg": "storing log chunk: {0}",
+      "doc": "The S3 PUT failed."
+    },
+    {
+      "enum": "LogChunkError",
+      "name": "Backend",
+      "crate": "rio-store",
+      "msg": "log chunk backend error: {0:#}",
+      "doc": "Backend I/O failure (S3 unreachable, throttled, auth denied). Permanent auth failures root the chain at [`crate::backend::BackendAuthError`]."
+    },
+    {
+      "enum": "LogChunkError",
+      "name": "Codec",
+      "crate": "rio-store",
+      "msg": "log chunk codec error: {0}",
+      "doc": "The blob is not valid zstd / not a valid line payload."
+    },
+    {
+      "enum": "LogChunkError",
+      "name": "NotFound",
+      "crate": "rio-store",
+      "msg": "log chunk not found: {key}",
+      "doc": "The object is not in the backend. When the key came from a `drv_log_chunks` manifest row this is a data-loss condition, not a cache miss — the caller decides how loudly to surface it."
+    },
+    {
       "enum": "ManifestError",
       "name": "BadLength",
       "crate": "rio-store",
@@ -1449,6 +1498,16 @@
       "name": "ChunkError",
       "crate": "rio-store",
       "doc": "Error from `ChunkCache::get_verified`."
+    },
+    {
+      "name": "CutError",
+      "crate": "rio-store",
+      "doc": "A chunk-cut failure. The handler logs it, lets the failure counter (already incremented by [`IngestSession::cut`]) feed [`IngestSession::should_abort`], and keeps the stream open until the abort threshold is reached — every failure mode here is either transient (S3/PG blips, retried by the next cut) or terminal for the replica (in which case the abort hands the builder to a healthier one)."
+    },
+    {
+      "name": "LogChunkError",
+      "crate": "rio-store",
+      "doc": "Errors from the log-chunk codec and storage backends. A typed enum (not `anyhow`) so the gRPC layer can map each failure class to a precise status code, mirroring [`crate::error::MetadataError`]: `NotFound` → the manifest points at a missing object (data loss, surfaced loudly, not retried); `Backend` → transient or auth S3 failure (the inner `anyhow` chain roots at [`crate::backend::BackendAuthError`] for permanent auth errors, so the existing `grpc::storage_error` downcast keeps working); `Codec` → the stored blob is not valid zstd (corruption)."
     },
     {
       "name": "ManifestError",

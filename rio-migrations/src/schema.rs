@@ -57,6 +57,25 @@ pub struct TenantRow {
     pub created_at: i64,
 }
 
+/// The `drv_executions.status` vocabulary. The scheduler's terminal UPDATE
+/// writes one of these; the store's completeness predicate tests membership
+/// in [`EXEC_STATUS_TERMINAL`]. This is deliberately NOT the same vocabulary
+/// as `assignments.status` (which spells success "completed") — do not
+/// unify them by accident.
+pub const EXEC_STATUS_SUCCEEDED: &str = "succeeded";
+/// See [`EXEC_STATUS_SUCCEEDED`].
+pub const EXEC_STATUS_FAILED: &str = "failed";
+/// See [`EXEC_STATUS_SUCCEEDED`].
+pub const EXEC_STATUS_CANCELLED: &str = "cancelled";
+/// The statuses that mean "this execution will never produce another log
+/// line". The store's completeness predicate tests `status` membership
+/// here; a NULL or unlisted status reads as still-running (incomplete).
+pub const EXEC_STATUS_TERMINAL: &[&str] = &[
+    EXEC_STATUS_SUCCEEDED,
+    EXEC_STATUS_FAILED,
+    EXEC_STATUS_CANCELLED,
+];
+
 /// `drv_executions` row (063).
 ///
 /// Scheduler-OWNED, store-READ: rio-scheduler INSERTs at dispatch and
@@ -81,7 +100,9 @@ pub struct DrvExecutionRow {
     pub executor_id: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,
-    /// `succeeded` | `failed` | `cancelled`; NULL while running.
+    /// One of [`EXEC_STATUS_SUCCEEDED`] | [`EXEC_STATUS_FAILED`] |
+    /// [`EXEC_STATUS_CANCELLED`]; NULL while running. Writers MUST use
+    /// the constants — see [`EXEC_STATUS_TERMINAL`].
     pub status: Option<String>,
     /// Total lines incl. the banner header/footer; NULL until the
     /// builder's CompletionReport carries it. The completeness

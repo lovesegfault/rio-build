@@ -147,6 +147,78 @@ pub struct Config {
     /// 128)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.
     #[serde(default)]
     pub substitute_admission_permits: Option<usize>,
+    /// Per-replica budget for resident build-log ingest buffer bytes
+    /// across all concurrent `LogService.AppendLog` streams. Each stream
+    /// reserves `2 × log_cut_threshold_bytes` (its worst-case resident
+    /// buffer: one chunk mid-cut plus one refilling) at open and holds
+    /// the reservation for the stream's lifetime; a stream that cannot
+    /// reserve is rejected with `RESOURCE_EXHAUSTED` and the builder
+    /// retries against another replica. Deliberately separate from
+    /// `nar_buffer_budget_bytes` so log ingest and NAR ingest cannot
+    /// starve each other. Default 1 GiB. Env: `RIO_LOG_BYTES_BUDGET`.
+    pub log_bytes_budget: u64,
+    /// Per-replica cap on concurrent `LogService.AppendLog` streams.
+    /// The count twin of `log_bytes_budget` (whichever is exhausted
+    /// first wins). Default 256. Env: `RIO_LOG_MAX_STREAMS`.
+    pub log_max_streams: usize,
+    /// Per-execution cap on accepted log bytes (post-truncation content
+    /// plus a per-line overhead charge) over the lifetime of one
+    /// execution's log. Stream-fatal (`RESOURCE_EXHAUSTED`) when
+    /// exceeded. Default 1 GiB. Env: `RIO_LOG_INGEST_BYTE_CAP`.
+    pub log_ingest_byte_cap: u64,
+    /// Per-execution cap on durably committed log chunks. A builder
+    /// fabricating forward line-number gaps gets one S3 object per
+    /// contiguous run; the byte cap already bounds the total but this
+    /// caps the object count directly. Stream-fatal when exceeded.
+    /// Default 100000. Env: `RIO_LOG_MAX_CHUNKS_PER_EXEC`.
+    pub log_max_chunks_per_exec: u32,
+    /// Periodic chunk-cut cadence for `AppendLog` streams: a non-empty
+    /// ingest buffer is flushed to S3 at least this often, so a
+    /// scheduler-visible log is never more than this far behind the
+    /// builder. Also the basis for the gray-failure staleness abort
+    /// (2× this). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.
+    #[serde(rename = "log_cut_interval_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
+    pub log_cut_interval: std::time::Duration,
+    /// Size-triggered chunk cut: a chunk is cut as soon as the ingest
+    /// buffer holds this many uncompressed bytes, without waiting for
+    /// the periodic timer. Default 8 MiB (≈2 MiB compressed at the
+    /// typical 4:1 log ratio). Env: `RIO_LOG_CUT_THRESHOLD_BYTES`.
+    pub log_cut_threshold_bytes: u64,
+    /// Comma-separated CORS allowed origins for gRPC-Web `TailLog`
+    /// requests from the dashboard SPA. Same format and rationale as the
+    /// scheduler's `dashboard.cors_allow_origins` (the store now serves
+    /// one browser-facing RPC). Empty (default) = no browser origin is
+    /// allowed; native gRPC callers are unaffected. Env:
+    /// `RIO_LOG_CORS_ALLOW_ORIGINS`.
+    pub log_cors_allow_origins: String,
+    /// URL template the cross-replica `TailLog` proxy uses to dial the
+    /// store replica holding an execution's live ingest stream. Every
+    /// `{pod}` is replaced with the owning replica's
+    /// `log_ingest_sessions.replica_pod` value (its `HOSTNAME`, i.e.
+    /// the pod name). Default
+    /// `http://{pod}.rio-store-headless.rio-store.svc:9002` — the
+    /// store's headless Service. NOTE: named per-pod A records under a
+    /// headless Service require the pod spec to set BOTH `hostname` and
+    /// `subdomain`, and a Deployment cannot give each replica a
+    /// distinct `hostname` — so the practical production configuration
+    /// is an IP-based template (e.g. `http://{pod}:9002`) with the
+    /// replica registering `status.podIP` (via the downward API) as its
+    /// identity instead of `HOSTNAME`. The helm chart owns that
+    /// pairing. A
+    /// template that does not resolve degrades cross-replica live
+    /// tails to the history-only view (counted by
+    /// `rio_store_log_tail_proxy_failures_total`); it never fails a
+    /// read. Env: `RIO_LOG_PEER_URL_TEMPLATE`.
+    pub log_peer_url_template: String,
+    /// Build-log retention, in days since the execution *started*
+    /// (`drv_executions.started_at` — the only timestamp every
+    /// execution has). The hourly TTL sweep deletes older executions'
+    /// manifest rows and chunk objects. The S3 lifecycle rule on the
+    /// `logs/` prefix is the orphan backstop and should be set to this
+    /// value plus a few days of slack. Default 30. Env:
+    /// `RIO_LOG_RETENTION_DAYS`.
+    pub log_retention_days: u32,
 }
 
 impl Default for Config {
@@ -173,6 +245,15 @@ impl Default for Config {
             stream_drain: std::time::Duration::from_secs(90),
             pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
             substitute_admission_permits: None,
+            log_bytes_budget: 1024 * 1024 * 1024,
+            log_max_streams: 256,
+            log_ingest_byte_cap: crate::logs::ingest::DEFAULT_PER_EXEC_BYTE_CAP,
+            log_max_chunks_per_exec: 100_000,
+            log_cut_interval: crate::logs::ingest::DEFAULT_CUT_INTERVAL,
+            log_cut_threshold_bytes: crate::logs::ingest::DEFAULT_CUT_THRESHOLD_BYTES,
+            log_cors_allow_origins: String::new(),
+            log_peer_url_template: crate::logs::DEFAULT_PEER_URL_TEMPLATE.to_string(),
+            log_retention_days: 30,
         }
     }
 }
@@ -268,6 +349,75 @@ impl rio_common::config::ValidateConfig for Config {
             self.substitute_admission_permits.is_none_or(|n| n >= 1),
             "substitute_admission_permits must be >= 1; unset \
              RIO_SUBSTITUTE_ADMISSION_PERMITS to derive from pg_max_connections"
+        );
+        // 0 → Semaphore::new(0) → every AppendLog open is rejected with
+        // RESOURCE_EXHAUSTED: build logs silently stop being stored.
+        anyhow::ensure!(
+            self.log_max_streams >= 1,
+            "log_max_streams must be >= 1; set RIO_LOG_MAX_STREAMS"
+        );
+        // 0 → contiguous_prefix drains degenerate to per-batch chunks
+        // and the per-stream byte reservation is 0 (every stream
+        // admitted, no memory bound).
+        anyhow::ensure!(
+            self.log_cut_threshold_bytes >= 1,
+            "log_cut_threshold_bytes must be >= 1; set RIO_LOG_CUT_THRESHOLD_BYTES"
+        );
+        // The byte budget must admit at least one stream's reservation
+        // (2 × cut threshold), or every AppendLog open is rejected and
+        // build logs silently stop being stored.
+        anyhow::ensure!(
+            self.log_bytes_budget >= self.log_cut_threshold_bytes.saturating_mul(2),
+            "log_bytes_budget ({}) must be >= 2 × log_cut_threshold_bytes ({}) \
+             or no AppendLog stream can ever be admitted; set RIO_LOG_BYTES_BUDGET",
+            self.log_bytes_budget,
+            self.log_cut_threshold_bytes
+        );
+        // 0 → the periodic cut interval is zero → a busy-loop of empty
+        // cuts; and the gray-failure staleness bound (2×) is zero → every
+        // stream aborts on its first tick.
+        anyhow::ensure!(
+            !self.log_cut_interval.is_zero(),
+            "log_cut_interval_secs must be >= 1; set RIO_LOG_CUT_INTERVAL_SECS"
+        );
+        // 0 → every stream hits the chunk cap at its FIRST cut and
+        // aborts: build logs silently stop being stored.
+        anyhow::ensure!(
+            self.log_max_chunks_per_exec >= 1,
+            "log_max_chunks_per_exec must be >= 1; set RIO_LOG_MAX_CHUNKS_PER_EXEC"
+        );
+        // The byte cap bounds an execution's TOTAL log; the cut
+        // threshold is ONE chunk's target size. A total cap below one
+        // chunk's worth means the threshold is unreachable dead config
+        // and any log that size aborts at the cap before a
+        // threshold-triggered cut — at the degenerate end (cap 0),
+        // every stream aborts on its first batch.
+        anyhow::ensure!(
+            self.log_ingest_byte_cap >= self.log_cut_threshold_bytes,
+            "log_ingest_byte_cap ({}) must be >= log_cut_threshold_bytes ({}): \
+             a per-execution total-log cap smaller than one chunk's cut \
+             threshold aborts streams at the cap before they can cut a \
+             chunk; set RIO_LOG_INGEST_BYTE_CAP",
+            self.log_ingest_byte_cap,
+            self.log_cut_threshold_bytes
+        );
+        // 0 → the sweep deletes every log on its first tick. The
+        // scheduler's equivalent knob has carried the same guard since
+        // it shipped; a store that retains nothing is always a
+        // misconfiguration.
+        anyhow::ensure!(
+            self.log_retention_days >= 1,
+            "log_retention_days must be >= 1; set RIO_LOG_RETENTION_DAYS"
+        );
+        // Without `{pod}` every peer resolves to the same URI, so every
+        // cross-replica tail relays to one (probably wrong) pod —
+        // a confusing misroute that looks like it works in a
+        // single-replica deployment and silently breaks at two.
+        anyhow::ensure!(
+            self.log_peer_url_template.contains("{pod}"),
+            "log_peer_url_template must contain the literal `{{pod}}` \
+             placeholder (got {:?}); set RIO_LOG_PEER_URL_TEMPLATE",
+            self.log_peer_url_template
         );
         Ok(())
     }
@@ -488,6 +638,112 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_log_max_streams() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_max_streams: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_max_streams"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_log_cut_threshold() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_cut_threshold_bytes: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_cut_threshold_bytes"), "got: {err}");
+    }
+
+    /// A budget that cannot admit even one stream's reservation
+    /// (2 × cut threshold) silently rejects every AppendLog open.
+    #[test]
+    fn validate_rejects_log_budget_below_one_reservation() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_bytes_budget: 1024,
+            log_cut_threshold_bytes: 4096,
+            // Keep the cap ≥ threshold so only the budget rule fires.
+            log_ingest_byte_cap: 4096,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_bytes_budget"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_log_cut_interval() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_cut_interval: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_cut_interval_secs"), "got: {err}");
+    }
+
+    /// `RIO_LOG_MAX_CHUNKS_PER_EXEC=0` would make every stream abort at
+    /// its FIRST cut: build logs silently stop being stored.
+    #[test]
+    fn validate_rejects_zero_log_max_chunks() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_max_chunks_per_exec: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_max_chunks_per_exec"), "got: {err}");
+    }
+
+    /// A per-execution total-log cap below one chunk's cut threshold
+    /// makes the threshold unreachable and aborts any log that size at
+    /// the cap before it can cut a chunk.
+    #[test]
+    fn validate_rejects_log_byte_cap_below_cut_threshold() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_ingest_byte_cap: 1024,
+            log_cut_threshold_bytes: 4096,
+            // Keep the budget ≥ 2× threshold so only the cap rule fires.
+            log_bytes_budget: 8192,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_ingest_byte_cap"), "got: {err}");
+    }
+
+    /// `RIO_LOG_RETENTION_DAYS=0` would make the hourly sweep delete
+    /// every build log on its first tick.
+    #[test]
+    fn validate_rejects_zero_log_retention() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_retention_days: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_retention_days"), "got: {err}");
+    }
+
+    /// A peer URL template without `{pod}` resolves every peer to the
+    /// same URI — every cross-replica tail relays to one (probably
+    /// wrong) pod.
+    #[test]
+    fn validate_rejects_peer_template_without_pod_placeholder() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            log_peer_url_template: "http://rio-store:9002".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("log_peer_url_template"), "got: {err}");
     }
 
     // r[verify store.cas.s3-retry]

@@ -32,11 +32,15 @@ server = [
   "dep:tonic",
   "dep:tokio-stream",
   "dep:tonic-health",
+  "dep:tonic-web",
+  "dep:tower-http",
+  "dep:http",
   "dep:async-compression",
   "dep:tokio-util",
   "dep:uuid",
   "dep:aws-sdk-s3",
   "dep:bytes",
+  "dep:zstd",
   "dep:sha2",
   "dep:ed25519-dalek",
   "dep:base64",
@@ -98,6 +102,12 @@ tokio-stream = { workspace = true, optional = true }
 # grpc.health.v1.Health for K8s readiness probes. SERVING after PG
 # migrations complete — before that, every store RPC would fail.
 tonic-health = { workspace = true, optional = true }
+# gRPC-Web translation + CORS for the dashboard's browser-side
+# LogService.TailLog calls (the store's first browser-facing RPC).
+# Same layer stack as the scheduler's admin server.
+tonic-web = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 # Streaming xz/zstd decode for upstream substitution (substitute.rs
 # pipes the upstream NAR body through XzDecoder/ZstdDecoder).
 async-compression = { workspace = true, optional = true }
@@ -113,6 +123,10 @@ aws-sdk-s3 = { workspace = true, optional = true }
 
 # Byte buffers
 bytes = { workspace = true, optional = true }
+
+# Build-log chunk codec (logs/chunks.rs). Same workspace zstd the
+# scheduler's flusher uses; the level-6 setting is ported from there.
+zstd = { workspace = true, optional = true }
 
 # Crypto
 sha2 = { workspace = true, optional = true }

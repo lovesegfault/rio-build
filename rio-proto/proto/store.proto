@@ -187,6 +187,14 @@ service LogService {
   // ingest session holds this execution; RESOURCE_EXHAUSTED past the
   // per-execution byte cap; UNAVAILABLE when the replica cannot commit
   // chunks (the client should reconnect and replay).
+  //
+  // Clients MUST write the AppendLogHeader into the request stream before
+  // awaiting the RPC; the server does not return response headers until the
+  // header message has been read and validated. Awaiting the call first
+  // deadlocks: the client waits for headers the server will not send until
+  // it receives the AppendLogHeader the client has not sent. All open-time
+  // errors (token, binding, admission, lease) are returned from the call
+  // itself, before the ack stream exists.
   rpc AppendLog(stream AppendLogRequest) returns (stream AppendLogAck);
 
   // Unauthenticated read/follow. Errors are yielded in-stream (grpc-web

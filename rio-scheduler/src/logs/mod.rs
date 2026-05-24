@@ -25,47 +25,19 @@
 use std::collections::VecDeque;
 
 use dashmap::{DashMap, DashSet};
-use rio_nix::store_path::StorePath;
 use rio_proto::types::BuildLogBatch;
 use uuid::Uuid;
 
 mod flush;
 pub use flush::{FlushRequest, LogFlusher};
 
-/// Extract the 32-char nixbase32 store-path hash from a derivation
-/// identifier for use as the PG `drv_logs.drv_hash` column and the
-/// `{drv_hash}` component of the S3 key.
-///
-/// This is the SINGLE source of truth shared by the flusher (write side,
-/// [`log_s3_key`] + `upsert_drv_log`) and `AdminService.GetDerivationLogs`
-/// (read side, PG lookup) so the derivation can never drift. Before this
-/// helper existed, the write side keyed on the full `/nix/store/...` path
-/// while the read side keyed on the basename — the PG lookup never matched
-/// and S3 keys had embedded `//nix/store/` (double-slash from
-/// `format!("{prefix}/.../{full_path}")`).
-///
-/// Accepts any of:
-/// - full store path `/nix/store/{hash}-{name}.drv` → `{hash}`
-/// - basename `{hash}-{name}.drv` → `{hash}`
-/// - bare hash `{hash}` → unchanged
-///
-/// Idempotent: `drv_log_hash(drv_log_hash(s)) == drv_log_hash(s)`.
-/// [`LogBuffers`] keys on this hash for both push and read so the
-/// ring-buffer and S3 paths resolve client input identically.
-pub fn drv_log_hash(s: &str) -> String {
-    // Full store path → parsed hash_part. Validates nixbase32 + length.
-    if let Ok(sp) = StorePath::parse(s) {
-        return sp.hash_part();
-    }
-    // Not a parseable store path (no prefix, short test hash, or invalid
-    // name char). Best-effort: strip `/nix/store/` if present, then take
-    // the part before the first `-`. No `-` → already hash-shaped.
-    let base = rio_nix::store_path::basename(s).unwrap_or(s);
-    base.split_once('-')
-        .map(|(h, _)| h)
-        .unwrap_or(base)
-        .to_string()
-}
+/// Normalize a derivation identifier to the 32-char log key. Moved to
+/// `rio-nix` so rio-store's log ingest/read paths share the exact same
+/// normalization as the flusher's write side and
+/// `AdminService.GetDerivationLogs`'s read side; re-exported here so the
+/// scheduler's existing callers (and [`LogBuffers`], which keys on it for
+/// both push and read) are unchanged.
+pub use rio_nix::store_path::drv_log_hash;
 
 /// Construct the canonical S3 key for a derivation execution's log blob:
 /// `logs/{drv_hash}/{exec_id}.log.zst` (or `.partial.log.zst` for periodic

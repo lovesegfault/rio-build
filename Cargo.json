@@ -20763,6 +20763,10 @@
           "packageId": "hex"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "httpdate",
           "packageId": "httpdate"
         },
@@ -20851,6 +20855,14 @@
           "packageId": "tonic-health"
         },
         {
+          "name": "tonic-web",
+          "packageId": "tonic-web"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -20861,6 +20873,10 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "devDependencies": [
@@ -29633,18 +29649,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
@@ -30216,18 +30220,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [

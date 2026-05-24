@@ -58,6 +58,7 @@ let
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
+  log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
@@ -454,6 +455,34 @@ in
         ];
       };
     };
+
+  # ── log-service (standalone fixture, no workers) ─────────────────────
+  # rio-store LogService end-to-end: authenticated AppendLog ingest →
+  # filesystem-backed chunks + PG manifest → TailLog read-back → store
+  # restart survival → a second session resuming the same execution →
+  # cross-session dedup. No workers: grpcurl drives the store's gRPC
+  # port directly the way the builder will from the cutover commit on.
+  # withHmac so the binding gate verifies a REAL assignment token
+  # against a seeded assignments/derivations row — the dev-mode path
+  # would skip the gate entirely.
+  vm-log-service-standalone = log-service {
+    inherit pkgs common;
+    fixture = standalone {
+      workers = { };
+      withHmac = true;
+      extraStoreConfig = {
+        extraConfig = ''
+          [chunk_backend]
+          kind = "filesystem"
+          base_dir = "/var/lib/rio/store/chunks"
+        '';
+      };
+      extraPackages = [
+        pkgs.grpcurl
+        pkgs.postgresql_18
+      ];
+    };
+  };
 
   # ── sla-sizing (standalone fixture, scripted-telemetry worker) ───────
   vm-sla-sizing-standalone =

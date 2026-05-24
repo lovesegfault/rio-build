@@ -188,6 +188,21 @@
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
     "rio_store_integrity_failures_total",
+    "rio_store_log_active_ingest_sessions",
+    "rio_store_log_chunk_write_failures_total",
+    "rio_store_log_chunks_written_total",
+    "rio_store_log_ingest_bytes_total",
+    "rio_store_log_ingest_lines_total",
+    "rio_store_log_ingest_rejected_total",
+    "rio_store_log_ingest_streams_aborted_total",
+    "rio_store_log_read_data_loss_total",
+    "rio_store_log_sweep_chunks_deleted_total",
+    "rio_store_log_sweep_executions_deleted_total",
+    "rio_store_log_sweep_objects_deleted_total",
+    "rio_store_log_tail_dropped_total",
+    "rio_store_log_tail_proxied_total",
+    "rio_store_log_tail_proxy_failures_total",
+    "rio_store_log_tail_subscribers",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
@@ -1161,6 +1176,81 @@
         "name": "rio_store_integrity_failures_total",
         "kind": "counter",
         "help": "GetPath content integrity check failures (bitrot/corruption)"
+      },
+      {
+        "name": "rio_store_log_active_ingest_sessions",
+        "kind": "gauge",
+        "help": "AppendLog streams currently open on this replica. Each holds a 2x-cut-threshold reservation of log_bytes_budget and one log_max_streams permit."
+      },
+      {
+        "name": "rio_store_log_chunk_write_failures_total",
+        "kind": "counter",
+        "help": "Failed chunk-cut attempts (compression, S3 PUT, or manifest INSERT). Each failure burns a chunk_seq and restores the lines to the buffer; 3 consecutive failures abort the stream so the builder fails over. Alert on sustained non-zero: log durability is degraded."
+      },
+      {
+        "name": "rio_store_log_chunks_written_total",
+        "kind": "counter",
+        "help": "Log chunks durably committed (S3 object + drv_log_chunks manifest row)."
+      },
+      {
+        "name": "rio_store_log_ingest_bytes_total",
+        "kind": "counter",
+        "help": "Log bytes accepted into ingest buffers (post-truncation, uncompressed)."
+      },
+      {
+        "name": "rio_store_log_ingest_lines_total",
+        "kind": "counter",
+        "help": "Log lines accepted into ingest buffers (post-truncation, pre-cut). The write-side twin of the chunk manifest's line_count sum."
+      },
+      {
+        "name": "rio_store_log_ingest_rejected_total",
+        "kind": "counter",
+        "help": "Log batches dropped at the ingest input gates, by reason: non_monotonic / line_number_overflow (malformed worker numbering, per-batch, stream stays open) or byte_cap (per-execution cap, stream-fatal). Sustained non-zero = a misbehaving or hostile builder."
+      },
+      {
+        "name": "rio_store_log_ingest_streams_aborted_total",
+        "kind": "counter",
+        "help": "AppendLog streams aborted server-side, by reason: cut_failures (3 consecutive failed chunk commits), stale_buffer (buffered lines older than 2x the cut interval), lease_lost (another replica stole the ingest session), or chunk_cap (the per-execution chunk-count bound). The builder reconnects and replays its un-acked tail to another replica. Alert on sustained non-zero: this replica cannot durably store logs."
+      },
+      {
+        "name": "rio_store_log_read_data_loss_total",
+        "kind": "counter",
+        "help": "TailLog reads that hit a drv_log_chunks manifest row whose S3 object is missing. Each increment is a hole in a stored build log that cannot be recovered. Alert on ANY increment."
+      },
+      {
+        "name": "rio_store_log_sweep_chunks_deleted_total",
+        "kind": "counter",
+        "help": "drv_log_chunks manifest rows deleted by the build-log TTL sweep."
+      },
+      {
+        "name": "rio_store_log_sweep_executions_deleted_total",
+        "kind": "counter",
+        "help": "Expired drv_executions rows deleted by the hourly build-log TTL sweep (executions older than log_retention_days)."
+      },
+      {
+        "name": "rio_store_log_sweep_objects_deleted_total",
+        "kind": "counter",
+        "help": "Chunk objects deleted from the backend by the build-log TTL sweep. Lags ..._chunks_deleted_total when a backend delete fails; the difference is orphaned objects bounded by the S3 lifecycle rule on logs/."
+      },
+      {
+        "name": "rio_store_log_tail_dropped_total",
+        "kind": "counter",
+        "help": "Live-tail fan-out batches dropped because a TailLog subscriber's queue was full. Lossy by contract (a slow reader must never backpressure ingest); the reader recovers the lines from the manifest on its next reconnect."
+      },
+      {
+        "name": "rio_store_log_tail_proxied_total",
+        "kind": "counter",
+        "help": "TailLog requests relayed to the replica holding the execution's live ingest session (the reader landed on a different replica). Proportional to (replicas - 1) / replicas of live-tail opens; a sudden drop to zero with >1 replica suggests the peer URL template no longer resolves."
+      },
+      {
+        "name": "rio_store_log_tail_proxy_failures_total",
+        "kind": "counter",
+        "help": "Cross-replica TailLog relays that failed to reach the owning replica (connect timeout, DNS, or the forwarded call erroring). Each one degraded a reader to the history-only view. Sustained non-zero with healthy replicas means the log_peer_url_template does not match the Service topology."
+      },
+      {
+        "name": "rio_store_log_tail_subscribers",
+        "kind": "gauge",
+        "help": "Live TailLog follow-subscriptions currently attached to this replica's ingest sessions."
       },
       {
         "name": "rio_store_pg_pool_utilization",

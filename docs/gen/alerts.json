@@ -4,6 +4,8 @@
     "KubeBuildSchedulerPendingStuck",
     "RioControllerRestarts",
     "RioDispatchStarved",
+    "RioLogChunkWriteFailures",
+    "RioLogReadDataLoss",
     "RioNodeclaimPoolAllCellsIceMasked",
     "RioNodeclaimPoolBootTimeoutLoop",
     "RioNodeclaimPoolIceMaskedHigh",

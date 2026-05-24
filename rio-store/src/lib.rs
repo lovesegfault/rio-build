@@ -51,6 +51,8 @@ pub mod gc;
 pub mod grpc;
 #[cfg(feature = "server")]
 pub(crate) mod ingest;
+#[cfg(feature = "server")]
+pub mod logs;
 // pub (not pub(crate)) so the fuzz target at fuzz/rio-store/ can call
 // Manifest::deserialize. The fuzz crate is a separate workspace root.
 #[cfg(feature = "server")]
@@ -323,6 +325,106 @@ pub fn describe_metrics() {
          Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). \
          Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
     );
+
+    // Build-log ingest (logs::ingest). Emitted by the IngestSession
+    // state machine; the AppendLog handler drives it.
+    describe_counter!(
+        "rio_store_log_ingest_lines_total",
+        "Log lines accepted into ingest buffers (post-truncation, pre-cut). \
+         The write-side twin of the chunk manifest's line_count sum."
+    );
+    describe_counter!(
+        "rio_store_log_ingest_bytes_total",
+        "Log bytes accepted into ingest buffers (post-truncation, uncompressed)."
+    );
+    describe_counter!(
+        "rio_store_log_ingest_rejected_total",
+        "Log batches dropped at the ingest input gates, by reason: \
+         non_monotonic / line_number_overflow (malformed worker numbering, \
+         per-batch, stream stays open) or byte_cap (per-execution cap, \
+         stream-fatal). Sustained non-zero = a misbehaving or hostile builder."
+    );
+    describe_counter!(
+        "rio_store_log_chunks_written_total",
+        "Log chunks durably committed (S3 object + drv_log_chunks manifest row)."
+    );
+    describe_counter!(
+        "rio_store_log_chunk_write_failures_total",
+        "Failed chunk-cut attempts (compression, S3 PUT, or manifest INSERT). \
+         Each failure burns a chunk_seq and restores the lines to the buffer; \
+         3 consecutive failures abort the stream so the builder fails over. \
+         Alert on sustained non-zero: log durability is degraded."
+    );
+    describe_counter!(
+        "rio_store_log_tail_dropped_total",
+        "Live-tail fan-out batches dropped because a TailLog subscriber's \
+         queue was full. Lossy by contract (a slow reader must never \
+         backpressure ingest); the reader recovers the lines from the \
+         manifest on its next reconnect."
+    );
+    describe_counter!(
+        "rio_store_log_ingest_streams_aborted_total",
+        "AppendLog streams aborted server-side, by reason: cut_failures \
+         (3 consecutive failed chunk commits), stale_buffer (buffered \
+         lines older than 2x the cut interval), lease_lost (another \
+         replica stole the ingest session), or chunk_cap (the \
+         per-execution chunk-count bound). The builder reconnects and \
+         replays its un-acked tail to another replica. Alert on \
+         sustained non-zero: this replica cannot durably store logs."
+    );
+    describe_counter!(
+        "rio_store_log_read_data_loss_total",
+        "TailLog reads that hit a drv_log_chunks manifest row whose S3 \
+         object is missing. Each increment is a hole in a stored build \
+         log that cannot be recovered. Alert on ANY increment."
+    );
+    describe_counter!(
+        "rio_store_log_tail_proxied_total",
+        "TailLog requests relayed to the replica holding the execution's \
+         live ingest session (the reader landed on a different replica). \
+         Proportional to (replicas - 1) / replicas of live-tail opens; a \
+         sudden drop to zero with >1 replica suggests the peer URL \
+         template no longer resolves."
+    );
+    describe_counter!(
+        "rio_store_log_tail_proxy_failures_total",
+        "Cross-replica TailLog relays that failed to reach the owning \
+         replica (connect timeout, DNS, or the forwarded call erroring). \
+         Each one degraded a reader to the history-only view. Sustained \
+         non-zero with healthy replicas means the log_peer_url_template \
+         does not match the Service topology."
+    );
+    describe_counter!(
+        "rio_store_log_sweep_executions_deleted_total",
+        "Expired drv_executions rows deleted by the hourly build-log TTL \
+         sweep (executions older than log_retention_days)."
+    );
+    describe_counter!(
+        "rio_store_log_sweep_chunks_deleted_total",
+        "drv_log_chunks manifest rows deleted by the build-log TTL sweep."
+    );
+    describe_counter!(
+        "rio_store_log_sweep_objects_deleted_total",
+        "Chunk objects deleted from the backend by the build-log TTL \
+         sweep. Lags ..._chunks_deleted_total when a backend delete \
+         fails; the difference is orphaned objects bounded by the S3 \
+         lifecycle rule on logs/."
+    );
+    describe_gauge!(
+        "rio_store_log_active_ingest_sessions",
+        "AppendLog streams currently open on this replica. Each holds a \
+         2x-cut-threshold reservation of log_bytes_budget and one \
+         log_max_streams permit."
+    );
+    describe_gauge!(
+        "rio_store_log_tail_subscribers",
+        "Live TailLog follow-subscriptions currently attached to this \
+         replica's ingest sessions."
+    );
+    // Pre-register at 0 so PromQL can tell "no sessions" from "store
+    // hasn't reported yet" (same reasoning as the drain gauges below).
+    metrics::gauge!("rio_store_log_active_ingest_sessions").set(0.0);
+    metrics::gauge!("rio_store_log_tail_subscribers").set(0.0);
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)

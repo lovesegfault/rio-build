@@ -183,6 +183,152 @@
         "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "none"}
       }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Build log ingest",
+      "description": "rate(rio_store_log_ingest_lines_total[5m]) and rate(rio_store_log_ingest_bytes_total[5m]): log lines/bytes accepted into AppendLog ingest buffers.",
+      "gridPos": {"x": 0, "y": 22, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_log_ingest_lines_total[5m]))",
+          "legendFormat": "lines/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_store_log_ingest_bytes_total[5m]))",
+          "legendFormat": "bytes/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "bytes/s"},
+            "properties": [
+              {"id": "unit", "value": "Bps"},
+              {"id": "custom.axisPlacement", "value": "right"}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Build log chunks",
+      "description": "Chunk commits vs failed cut attempts vs TTL-sweep deletions. Sustained write failures = log durability degraded (the builders' retransmit buffers are absorbing it); see RioLogChunkWriteFailures.",
+      "gridPos": {"x": 12, "y": 22, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_log_chunks_written_total[5m]))",
+          "legendFormat": "written/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_store_log_chunk_write_failures_total[5m]))",
+          "legendFormat": "write failures/s",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(rio_store_log_sweep_objects_deleted_total[5m]))",
+          "legendFormat": "swept/s",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Build log sessions and tails",
+      "description": "Active AppendLog ingest sessions and live TailLog subscribers, plus the fan-out drop rate (lossy by contract; readers recover from the manifest on reconnect).",
+      "gridPos": {"x": 0, "y": 29, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rio_store_log_active_ingest_sessions)",
+          "legendFormat": "ingest sessions",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rio_store_log_tail_subscribers)",
+          "legendFormat": "tail subscribers",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(rio_store_log_tail_dropped_total[5m]))",
+          "legendFormat": "tail drops/s",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Build log tail proxy",
+      "description": "Cross-replica TailLog relays (a reader landed on a replica that does not hold the live ingest session). Failures degrade the reader to the history-only view; sustained failures with healthy replicas mean log_peer_url_template does not match the Service topology.",
+      "gridPos": {"x": 12, "y": 29, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_log_tail_proxied_total[5m]))",
+          "legendFormat": "proxied/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_store_log_tail_proxy_failures_total[5m]))",
+          "legendFormat": "failures/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
     }
   ]
 }

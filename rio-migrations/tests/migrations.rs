@@ -260,7 +260,10 @@ fn migration_checksums_frozen() {
 /// from tables that rio-SCHEDULER owns/writes.
 ///
 /// rio-store's GC reads `scheduler_live_pins` directly (`gc/mark.rs`,
-/// `gc/sweep.rs`), and GC quotas read `tenants` (`gc/tenant.rs`).
+/// `gc/sweep.rs`), GC quotas read `tenants` (`gc/tenant.rs`), and the
+/// build-log subsystem reads `assignments`/`derivations`/
+/// `drv_executions` (the binding gate in `logs/gate.rs`, latest-exec
+/// resolution in `logs/tail.rs`, the TTL sweep in `logs/sweep.rs`).
 ///
 /// **Primary** enforcement is now compile-time: both crates
 /// `query_as!` into `rio_migrations::schema::{LivePin, TenantRow}`, so a
@@ -306,6 +309,9 @@ async fn cross_service_schema_contract() {
         ("drv_executions", "drv_hash",         "bpchar"),
         ("drv_executions", "status",           "text"),
         ("drv_executions", "final_line_count", "int8"),
+        // logs (062): the TTL sweep's expiry predicate
+        // (logs/sweep.rs: WHERE started_at < now() - retention).
+        ("drv_executions", "started_at",       "timestamptz"),
     ];
 
     for &(table, col, want_udt) in STORE_READS {
@@ -322,8 +328,9 @@ async fn cross_service_schema_contract() {
             got.as_deref(),
             Some(want_udt),
             "cross-service contract broken: rio-store reads {table}.{col} as {want_udt}, \
-             but schema has {got:?} — see gc/mark.rs, gc/sweep.rs, gc/tenant.rs for the \
-             dependent queries",
+             but schema has {got:?} — see gc/mark.rs, gc/sweep.rs, gc/tenant.rs, \
+             rio-store/src/logs/gate.rs, rio-store/src/logs/tail.rs, and \
+             rio-store/src/logs/sweep.rs for the dependent queries",
         );
     }
 }

@@ -44,6 +44,42 @@ pub fn output_path_name(drv_name: &str, output_name: &str) -> String {
     }
 }
 
+/// Extract the 32-char nixbase32 store-path hash from a derivation
+/// identifier for use as the per-derivation build-log key (the PG
+/// `drv_executions.drv_hash` / `drv_logs.drv_hash` column and the
+/// `{drv_hash}` component of the log S3 key).
+///
+/// This is the SINGLE source of truth shared by every component that keys
+/// log state on a derivation (the scheduler's lifecycle rows, rio-store's
+/// log ingest/read paths) so the write and read sides can never drift.
+/// Before this helper existed, the write side keyed on the full
+/// `/nix/store/...` path while the read side keyed on the basename — the
+/// PG lookup never matched and S3 keys had embedded `//nix/store/`
+/// (double-slash from `format!("{prefix}/.../{full_path}")`).
+///
+/// Accepts any of:
+/// - full store path `/nix/store/{hash}-{name}.drv` → `{hash}`
+/// - basename `{hash}-{name}.drv` → `{hash}`
+/// - bare hash `{hash}` → unchanged
+///
+/// Idempotent: `drv_log_hash(drv_log_hash(s)) == drv_log_hash(s)`.
+/// Callers key both push and read on this hash so all input forms resolve
+/// to the same log.
+pub fn drv_log_hash(s: &str) -> String {
+    // Full store path → parsed hash_part. Validates nixbase32 + length.
+    if let Ok(sp) = StorePath::parse(s) {
+        return sp.hash_part();
+    }
+    // Not a parseable store path (no prefix, short test hash, or invalid
+    // name char). Best-effort: strip `/nix/store/` if present, then take
+    // the part before the first `-`. No `-` → already hash-shaped.
+    let base = basename(s).unwrap_or(s);
+    base.split_once('-')
+        .map(|(h, _)| h)
+        .unwrap_or(base)
+        .to_string()
+}
+
 #[derive(Debug, Error)]
 pub enum StorePathError {
     #[error("path does not start with {STORE_DIR}/")]
@@ -862,6 +898,36 @@ mod tests {
         assert_eq!(output_path_name("hello", "out"), "hello");
         assert_eq!(output_path_name("hello", "dev"), "hello-dev");
         assert_eq!(output_path_name("hello", "lib"), "hello-lib");
+    }
+
+    /// `drv_log_hash` is the spec for how every component keys log state
+    /// on a derivation: all three accepted input forms must normalize to
+    /// the same 32-char hash, and the function must be idempotent.
+    #[test]
+    fn test_drv_log_hash_normalization() {
+        const HASH: &str = "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2";
+
+        // Full store path → hash (the StorePath::parse fast path).
+        assert_eq!(drv_log_hash(&format!("/nix/store/{HASH}-hello.drv")), HASH);
+        // Basename → hash.
+        assert_eq!(drv_log_hash(&format!("{HASH}-hello.drv")), HASH);
+        // Bare hash → unchanged.
+        assert_eq!(drv_log_hash(HASH), HASH);
+        // Idempotent for every input form.
+        assert_eq!(
+            drv_log_hash(&drv_log_hash(&format!("{HASH}-hello.drv"))),
+            HASH
+        );
+
+        // Non-parseable fallback: short test identifiers (not 32-char
+        // nixbase32) still split on the first `-`…
+        assert_eq!(drv_log_hash("abc-foo.drv"), "abc");
+        // …and identifiers with no `-` pass through unchanged, so distinct
+        // test keys stay distinct.
+        assert_eq!(drv_log_hash("drvA"), "drvA");
+        // A name containing further dashes only loses the part after the
+        // FIRST dash.
+        assert_eq!(drv_log_hash(&format!("{HASH}-hello-2.12.1.drv")), HASH);
     }
 
     /// `make_output` formula proof: rebuild the fingerprint by hand

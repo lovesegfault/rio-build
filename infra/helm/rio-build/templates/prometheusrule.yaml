@@ -455,4 +455,43 @@ spec:
             description: >-
               PutPath retry rate is {{`{{ $value | humanize }}`}}/s.
               Check S3 5xx rate and PG connection-pool saturation.
+
+        # harden-logs: a failed chunk cut burns a chunk_seq, restores the
+        # lines to the ingest buffer, and retries; 3 consecutive failures
+        # abort the stream and the builder fails over to another replica.
+        # The builders' in-memory retransmit buffers absorb the outage,
+        # but they are bounded (one whole log each) — sustained failures
+        # for 5m means log durability is degraded and the buffers are
+        # filling.
+        - alert: RioLogChunkWriteFailures
+          expr: increase(rio_store_log_chunk_write_failures_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-store build-log chunk writes failing
+            description: >-
+              {{`{{ $value | humanize }}`}} failed log-chunk commits in the
+              last 5m. Check S3 PUT errors and PG availability on the
+              store; builders are buffering un-acked log lines in memory
+              until this recovers.
+
+        # harden-logs: a drv_log_chunks manifest row whose S3 object is
+        # missing. The manifest is written only after the object PUT
+        # succeeds, so this means an object was deleted out from under
+        # its row — a hole in a stored build log that cannot be
+        # recovered. Any increment is an incident; there is no benign
+        # cause.
+        - alert: RioLogReadDataLoss
+          expr: increase(rio_store_log_read_data_loss_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: rio-store build-log data loss detected on read
+            description: >-
+              A TailLog read found {{`{{ $value | humanize }}`}} manifest
+              row(s) referencing missing chunk objects. Check the store
+              logs for the s3_key/exec_id (logged at error!) and audit
+              the S3 lifecycle rule and any manual deletions under logs/.
 {{- end }}

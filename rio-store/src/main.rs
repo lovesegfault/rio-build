@@ -5,14 +5,22 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info};
 
 use rio_proto::ChunkServiceServer;
+use rio_proto::LogServiceServer;
 use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
 use rio_store::backend::ChunkBackend;
 use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
+use rio_store::logs::LogServiceImpl;
+use rio_store::logs::chunks::{
+    FilesystemLogChunkStore, LogChunkStore, MemoryLogChunkStore, S3LogChunkStore,
+};
+use rio_store::logs::ingest::IngestConfig;
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
-use rio_store::config::{CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend};
+use rio_store::config::{
+    ChunkBackendKind, CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -203,6 +211,61 @@ async fn main() -> anyhow::Result<()> {
     // ARE no chunks to get).
     let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
 
+    // LogService: build-log ingest + tailing. The log chunk store
+    // follows the NAR chunk backend's kind: S3 → the same bucket under
+    // the `logs/` prefix (a separate client so log PUTs never contend
+    // with NAR chunk uploads for the SDK's connection pool); filesystem
+    // → a `logs/` subdirectory of the same base dir (chunks survive a
+    // process restart — the property the standalone VM scenario
+    // exercises); inline → in-memory (build logs survive only as long
+    // as the process, loudly logged).
+    let log_chunk_store: Arc<dyn LogChunkStore> = match &cfg.chunk_backend {
+        ChunkBackendKind::S3 { bucket, .. } => {
+            let client = rio_common::s3::default_client(cfg.s3_max_attempts).await;
+            Arc::new(S3LogChunkStore::new(client, bucket.clone()))
+        }
+        ChunkBackendKind::Filesystem { base_dir } => Arc::new(
+            FilesystemLogChunkStore::new(base_dir.join("logs"))
+                .map_err(|e| anyhow::anyhow!("creating the log chunk directory: {e}"))?,
+        ),
+        ChunkBackendKind::Inline => {
+            tracing::warn!(
+                "no chunk backend configured: build-log chunks are stored \
+                 in process memory and will NOT survive a store restart"
+            );
+            Arc::new(MemoryLogChunkStore::default())
+        }
+    };
+    // The pod name routes cross-replica TailLog readers to the replica
+    // holding an execution's live ingest buffer. Kubelet sets HOSTNAME
+    // to the pod name in every container; outside k8s (dev) the
+    // machine hostname is a fine stand-in (there is only one replica).
+    let replica_pod = std::env::var("HOSTNAME").unwrap_or_else(|_| "rio-store-dev".to_string());
+    let mut log_service = LogServiceImpl::new(
+        pool.clone(),
+        Arc::clone(&log_chunk_store),
+        replica_pod.clone(),
+    )
+    .with_ingest_config(IngestConfig {
+        per_exec_byte_cap: cfg.log_ingest_byte_cap,
+        cut_threshold_bytes: cfg.log_cut_threshold_bytes,
+        cut_interval: cfg.log_cut_interval,
+    })
+    .with_max_streams(cfg.log_max_streams)
+    .with_byte_budget(cfg.log_bytes_budget)
+    .with_max_chunks_per_exec(cfg.log_max_chunks_per_exec)
+    .with_peer_url_template(cfg.log_peer_url_template.clone());
+    // Same HMAC key as PutPath: the assignment token authorizes both
+    // the output upload and the log stream for one build attempt.
+    if let Some(v) = rio_auth::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("HMAC key load (LogService): {e}"))?
+    {
+        log_service = log_service.with_hmac_verifier(Arc::new(v));
+    } else {
+        info!("HMAC verification disabled on AppendLog (dev mode)");
+    }
+    info!(%replica_pod, "LogService enabled");
+
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in
     // sweep's pending_s3_deletes enqueue + VerifyChunks HeadObject).
@@ -231,6 +294,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(backend) = chunk_backend_for_gc {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }
+    // Build-log TTL sweep: hourly, deletes executions (and their chunk
+    // objects) older than log_retention_days. The store owns log
+    // retention end to end — the scheduler never touches log storage.
+    rio_store::logs::sweep::spawn_log_sweep(
+        pool.clone(),
+        Arc::clone(&log_chunk_store),
+        std::time::Duration::from_secs(u64::from(cfg.log_retention_days) * 86_400),
+        shutdown.clone(),
+    );
 
     let max_msg_size = rio_common::grpc::max_message_size();
 
@@ -266,7 +338,22 @@ async fn main() -> anyhow::Result<()> {
         "starting gRPC server"
     );
 
+    // r[impl dash.envoy.grpc-web-translate+3]
+    // accept_http1 + CORS + GrpcWebLayer: the dashboard SPA calls
+    // LogService.TailLog from browser fetch() as gRPC-Web over
+    // HTTP/1.1. Same layer stack and ordering as the scheduler's admin
+    // server (CORS outermost so it sees the OPTIONS preflight before
+    // GrpcWebLayer rejects the non-grpc content type; GrpcWebLayer
+    // translates to native gRPC before the JWT interceptor and the
+    // services see the request). The layers wrap EVERY service on the
+    // port — that is harmless: gRPC-Web is a transport encoding, not an
+    // auth change, and native h2 callers (builders, the gateway) are
+    // untouched. The browser still cannot call PutPath/AppendLog
+    // usefully without the HMAC tokens those handlers demand.
     rio_common::server::tonic_builder()
+        .accept_http1(true)
+        .layer(build_cors_layer(&cfg.log_cors_allow_origins))
+        .layer(tonic_web::GrpcWebLayer::new())
         // JWT tenant-token verify layer. jwt_pubkey computed above.
         // Installed unconditionally for type stability (see
         // scheduler/main.rs for the full note).
@@ -296,6 +383,11 @@ async fn main() -> anyhow::Result<()> {
                 .max_decoding_message_size(max_msg_size)
                 .max_encoding_message_size(max_msg_size),
         )
+        .add_service(
+            LogServiceServer::new(log_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
         .serve_with_shutdown(addr, serve_shutdown.cancelled_owned())
         .await?;
 
@@ -304,6 +396,38 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
+
+/// CORS layer for browser gRPC-Web `TailLog` calls. A duplicate of the
+/// scheduler's `build_cors_layer` (same origins format, same three
+/// exposed trailer headers that connect-web needs to surface
+/// `Status.code` to the SPA) — the two servers expose different RPCs to
+/// the same dashboard and must agree on the CORS contract. An empty
+/// origin list (the default) allows no browser origin; native gRPC
+/// callers are unaffected by CORS entirely.
+fn build_cors_layer(cors_allow_origins: &str) -> tower_http::cors::CorsLayer {
+    use http::{HeaderName, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let origins: Vec<http::HeaderValue> = cors_allow_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("x-grpc-web"),
+            HeaderName::from_static("x-user-agent"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("grpc-status"),
+            HeaderName::from_static("grpc-message"),
+            HeaderName::from_static("grpc-status-details-bin"),
+        ])
+}
 
 /// Connect to PostgreSQL and run migrations. URL is logged with
 /// password redacted.

@@ -145,6 +145,65 @@
         "format": "uint",
         "minimum": 0,
         "default": null
+      },
+      "log_bytes_budget": {
+        "description": "Per-replica budget for resident build-log ingest buffer bytes\nacross all concurrent `LogService.AppendLog` streams. Each stream\nreserves `2 × log_cut_threshold_bytes` (its worst-case resident\nbuffer: one chunk mid-cut plus one refilling) at open and holds\nthe reservation for the stream's lifetime; a stream that cannot\nreserve is rejected with `RESOURCE_EXHAUSTED` and the builder\nretries against another replica. Deliberately separate from\n`nar_buffer_budget_bytes` so log ingest and NAR ingest cannot\nstarve each other. Default 1 GiB. Env: `RIO_LOG_BYTES_BUDGET`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 1073741824
+      },
+      "log_max_streams": {
+        "description": "Per-replica cap on concurrent `LogService.AppendLog` streams.\nThe count twin of `log_bytes_budget` (whichever is exhausted\nfirst wins). Default 256. Env: `RIO_LOG_MAX_STREAMS`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 256
+      },
+      "log_ingest_byte_cap": {
+        "description": "Per-execution cap on accepted log bytes (post-truncation content\nplus a per-line overhead charge) over the lifetime of one\nexecution's log. Stream-fatal (`RESOURCE_EXHAUSTED`) when\nexceeded. Default 1 GiB. Env: `RIO_LOG_INGEST_BYTE_CAP`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 1073741824
+      },
+      "log_max_chunks_per_exec": {
+        "description": "Per-execution cap on durably committed log chunks. A builder\nfabricating forward line-number gaps gets one S3 object per\ncontiguous run; the byte cap already bounds the total but this\ncaps the object count directly. Stream-fatal when exceeded.\nDefault 100000. Env: `RIO_LOG_MAX_CHUNKS_PER_EXEC`.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 100000
+      },
+      "log_cut_interval_secs": {
+        "description": "Periodic chunk-cut cadence for `AppendLog` streams: a non-empty\ningest buffer is flushed to S3 at least this often, so a\nscheduler-visible log is never more than this far behind the\nbuilder. Also the basis for the gray-failure staleness abort\n(2× this). Default 60 s. Env: `RIO_LOG_CUT_INTERVAL_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 60
+      },
+      "log_cut_threshold_bytes": {
+        "description": "Size-triggered chunk cut: a chunk is cut as soon as the ingest\nbuffer holds this many uncompressed bytes, without waiting for\nthe periodic timer. Default 8 MiB (≈2 MiB compressed at the\ntypical 4:1 log ratio). Env: `RIO_LOG_CUT_THRESHOLD_BYTES`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 8388608
+      },
+      "log_cors_allow_origins": {
+        "description": "Comma-separated CORS allowed origins for gRPC-Web `TailLog`\nrequests from the dashboard SPA. Same format and rationale as the\nscheduler's `dashboard.cors_allow_origins` (the store now serves\none browser-facing RPC). Empty (default) = no browser origin is\nallowed; native gRPC callers are unaffected. Env:\n`RIO_LOG_CORS_ALLOW_ORIGINS`.",
+        "type": "string",
+        "default": ""
+      },
+      "log_peer_url_template": {
+        "description": "URL template the cross-replica `TailLog` proxy uses to dial the\nstore replica holding an execution's live ingest stream. Every\n`{pod}` is replaced with the owning replica's\n`log_ingest_sessions.replica_pod` value (its `HOSTNAME`, i.e.\nthe pod name). Default\n`http://{pod}.rio-store-headless.rio-store.svc:9002` — the\nstore's headless Service. NOTE: named per-pod A records under a\nheadless Service require the pod spec to set BOTH `hostname` and\n`subdomain`, and a Deployment cannot give each replica a\ndistinct `hostname` — so the practical production configuration\nis an IP-based template (e.g. `http://{pod}:9002`) with the\nreplica registering `status.podIP` (via the downward API) as its\nidentity instead of `HOSTNAME`. The helm chart owns that\npairing. A\ntemplate that does not resolve degrades cross-replica live\ntails to the history-only view (counted by\n`rio_store_log_tail_proxy_failures_total`); it never fails a\nread. Env: `RIO_LOG_PEER_URL_TEMPLATE`.",
+        "type": "string",
+        "default": "http://{pod}.rio-store-headless.rio-store.svc:9002"
+      },
+      "log_retention_days": {
+        "description": "Build-log retention, in days since the execution *started*\n(`drv_executions.started_at` — the only timestamp every\nexecution has). The hourly TTL sweep deletes older executions'\nmanifest rows and chunk objects. The S3 lifecycle rule on the\n`logs/` prefix is the orphan backstop and should be set to this\nvalue plus a few days of slack. Default 30. Env:\n`RIO_LOG_RETENTION_DAYS`.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 30
       }
     },
     "$defs": {
@@ -252,6 +311,15 @@
     "chunk_prefetch_k": 64,
     "stream_drain_secs": 90,
     "pg_max_connections": 50,
-    "substitute_admission_permits": null
+    "substitute_admission_permits": null,
+    "log_bytes_budget": 1073741824,
+    "log_max_streams": 256,
+    "log_ingest_byte_cap": 1073741824,
+    "log_max_chunks_per_exec": 100000,
+    "log_cut_interval_secs": 60,
+    "log_cut_threshold_bytes": 8388608,
+    "log_cors_allow_origins": "",
+    "log_peer_url_template": "http://{pod}.rio-store-headless.rio-store.svc:9002",
+    "log_retention_days": 30
   }
 }

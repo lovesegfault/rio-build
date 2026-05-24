@@ -1295,6 +1295,46 @@
       "doc": "NAR content-addressable store."
     },
     {
+      "path": "logs/",
+      "depth": 0,
+      "doc": "Build-log storage."
+    },
+    {
+      "path": "logs/chunks.rs",
+      "depth": 1,
+      "doc": "Log-chunk storage: key scheme, line codec, and the storage backend trait."
+    },
+    {
+      "path": "logs/gate.rs",
+      "depth": 1,
+      "doc": "The `AppendLog` binding + completeness gate."
+    },
+    {
+      "path": "logs/ingest.rs",
+      "depth": 1,
+      "doc": "The per-stream ingest state machine for `LogService.AppendLog`."
+    },
+    {
+      "path": "logs/service.rs",
+      "depth": 1,
+      "doc": "The `LogService` gRPC handlers: `AppendLog` (authenticated builder"
+    },
+    {
+      "path": "logs/sessions.rs",
+      "depth": 1,
+      "doc": "The live-ingest session registry: a PG-backed lease over"
+    },
+    {
+      "path": "logs/sweep.rs",
+      "depth": 1,
+      "doc": "TTL sweep for expired build logs."
+    },
+    {
+      "path": "logs/tail.rs",
+      "depth": 1,
+      "doc": "The manifest-driven log read path for `LogService.TailLog`."
+    },
+    {
       "path": "main.rs",
       "depth": 0,
       "doc": ""

@@ -103,7 +103,12 @@ where
 /// `SdkError<Op>` and the `Op::Error` service-error types alike (both
 /// satisfy the bound), so call this from before *or* after
 /// `.into_service_error()`.
-fn classify_s3_error<E>(e: E, msg: String) -> anyhow::Error
+///
+/// `pub(crate)`: also the error chokepoint for `logs::chunks`'
+/// `S3LogChunkStore`, so log-chunk S3 failures get the same
+/// auth-vs-transient classification (and the same `BackendAuthError`
+/// downcast in the gRPC layer) as NAR-chunk failures.
+pub(crate) fn classify_s3_error<E>(e: E, msg: String) -> anyhow::Error
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
