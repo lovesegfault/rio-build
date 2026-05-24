@@ -3582,6 +3582,7 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
     let ok = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
+        &Default::default(),
         &auth,
         &shutdown,
         |_, _, _| {},
@@ -3629,6 +3630,7 @@ async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
     let ok = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
+        &Default::default(),
         &auth,
         &shutdown,
         |_, _, _| {},
@@ -3643,6 +3645,165 @@ async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
         store.calls.qpi_calls.read().unwrap().contains(&b),
         "absent ref must reach per-path QPI to attempt substitution"
     );
+    Ok(())
+}
+
+/// A seed in `forgivable` (declared but unwanted) that the upstream
+/// definitively misses must NOT fail the walk: the wanted seed
+/// substitutes, the unwanted one is skipped with a log line, and the
+/// walk returns ok=true. The unwanted seed is still ATTEMPTED
+/// (opportunistic completeness — it stays in the seed list).
+#[tokio::test]
+async fn walk_forgives_unwanted_seed_not_found() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let out = test_store_path("fgvw-out");
+    let dbg = test_store_path("fgvw-debug");
+    // out: substitutable (per-path QPI materializes it). dbg: nowhere
+    // → per-path SubstitutePath returns NotFound.
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let forgivable: HashSet<String> = [dbg.clone()].into();
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![out.clone(), dbg.clone()],
+        &forgivable,
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(
+        ok,
+        "an unwanted seed the upstream misses must be forgiven → ok=true"
+    );
+    let qpi = store.calls.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&dbg),
+        "the unwanted seed must still be attempted (opportunistic \
+         completeness); qpi_calls={qpi:?}"
+    );
+    Ok(())
+}
+
+/// The same scenario with an empty `forgivable` set (= every seed
+/// wanted) keeps today's behaviour: any seed miss fails the walk.
+#[tokio::test]
+async fn walk_fails_on_wanted_seed_not_found() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let out = test_store_path("fgva-out");
+    let dbg = test_store_path("fgva-debug");
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![out.clone(), dbg.clone()],
+        &HashSet::new(),
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(
+        !ok,
+        "every seed wanted (empty forgivable set) → a seed miss must \
+         still fail the walk"
+    );
+    Ok(())
+}
+
+/// Forgiveness is scoped to unwanted SEEDS only. A path discovered via
+/// the reference BFS (a runtime reference of a successfully fetched
+/// seed) is never forgivable — its absence is a hole in a closure the
+/// walk is about to declare complete (`SubstituteComplete{ok=true}` →
+/// `Substituting → Completed` → a dependent ENOENTs at exec time). The
+/// unwanted seed's miss is forgiven AND the wanted seed's missing ref
+/// still fails the walk, in the same run.
+#[tokio::test]
+async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let out = test_store_path("fgvr-out");
+    let dbg = test_store_path("fgvr-debug");
+    let r = test_store_path("fgvr-ref");
+    // out: warm with a reference to r. r: nowhere. dbg: nowhere.
+    seed_with_refs(&store, &out, &[&r]);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let forgivable: HashSet<String> = [dbg.clone()].into();
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![out.clone(), dbg.clone()],
+        &forgivable,
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(
+        !ok,
+        "a missing reference-BFS-discovered path must fail the walk \
+         even when an unwanted seed's miss was forgiven"
+    );
+    Ok(())
+}
+
+/// End-to-end forgiveness: a derivation classified as
+/// pending-substitute whose UNWANTED seed fails the upstream GET must
+/// still complete (the walk forgives the unwanted seed); the same
+/// derivation with an empty wanted set (= all wanted) must demote to
+/// build-from-source (today's behaviour preserved).
+///
+/// P_out is substitutable (probe + GET agree). P_debug is
+/// indeterminate at probe time (treated optimistically →
+/// pending_substitute) but the GET definitively misses (NotFound) —
+/// the HEAD-says-maybe / GET-misses divergence that condemns a whole
+/// closure to a from-source rebuild over an output nothing consumes.
+#[tokio::test]
+async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    for (tag, wanted, expect) in [
+        // P_debug unwanted → its GET miss is forgiven → Completed.
+        (
+            "fgv-w",
+            vec!["out".to_string()],
+            DerivationStatus::Completed,
+        ),
+        // Empty wanted = all wanted → P_debug's GET miss is fatal →
+        // demoted to Ready for a from-source dispatch.
+        ("fgv-a", vec![], DerivationStatus::Ready),
+    ] {
+        let out = test_store_path(&format!("{tag}-out"));
+        let dbg = test_store_path(&format!("{tag}-debug"));
+        store.state.substitutable.write().unwrap().push(out.clone());
+        store.state.indeterminate.write().unwrap().push(dbg.clone());
+
+        let mut n = make_node(tag);
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted;
+        let build_id = Uuid::new_v4();
+        merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+        settle_substituting(&handle, &[tag]).await;
+
+        assert_eq!(
+            expect_drv(&handle, tag).await.status,
+            expect,
+            "{tag}: unwanted-seed fetch failure must be forgiven only \
+             when the seed is outside a non-empty wanted set"
+        );
+        // Opportunistic completeness: the unwanted seed is still
+        // ATTEMPTED (it stays in the seed list) — forgiveness changes
+        // the verdict, not the fetch.
+        assert!(
+            store.calls.qpi_calls.read().unwrap().contains(&dbg),
+            "{tag}: the unwanted seed must still be attempted"
+        );
+    }
     Ok(())
 }
 
@@ -3669,6 +3830,7 @@ async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
     let ok = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
+        &Default::default(),
         &auth,
         &shutdown,
         |_, _, _| {},
@@ -3727,6 +3889,7 @@ async fn walk_substitute_closure_progress_monotone_and_bounded() -> TestResult {
     let ok = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a, b, c],
+        &Default::default(),
         &auth,
         &shutdown,
         |done, expected, _| emits.push((done, expected)),
@@ -3776,6 +3939,7 @@ async fn walk_closure_hostile_refs_bounds_memory() -> TestResult {
     let ok = crate::actor::dispatch::walk_substitute_closure(
         &client,
         vec![a.clone()],
+        &Default::default(),
         &auth,
         &shutdown,
         |_, _, _| {},
