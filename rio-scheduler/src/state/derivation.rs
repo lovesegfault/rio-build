@@ -1624,6 +1624,7 @@ mod tests {
         );
     }
 
+    // r[verify sched.merge.wanted-outputs]
     /// `union_wanted` semantics: empty is the "all outputs wanted"
     /// sentinel, so the union of "all" with anything saturates to "all"
     /// (stays/becomes empty). Non-empty ∪ non-empty is a sorted,

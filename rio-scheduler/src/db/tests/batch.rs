@@ -235,6 +235,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
 /// wanted_output_names persists, recovers, and UNIONS on conflict.
 /// Two builds wanting different outputs of the same drv must leave the
 /// row with the union — overwrite semantics would let build B's {out}

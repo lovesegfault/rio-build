@@ -66,6 +66,7 @@ fn test_merge_dedup() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
 /// A second build merging an already-known node UNIONs its wanted set
 /// into the existing node's (it must never shrink — build B's `{out}`
 /// must not un-want build A's still-needed `dev`), the empty "all
