@@ -437,7 +437,7 @@ pub async fn spawn_build_task(
         ctx.completion_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        let mut store_client = ctx.store_clients.store.clone();
+        let store_clients = ctx.store_clients.clone();
         // Same Arc as the slot's cancel flag. execute_build polls it
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
@@ -506,7 +506,7 @@ pub async fn spawn_build_task(
             let o = executor::execute_build(
                 &assignment,
                 &build_env,
-                &mut store_client,
+                &store_clients,
                 &ctx.stream_tx,
                 prev_line_count,
             )

@@ -23,6 +23,7 @@
     "rio_builder_prefetch_total",
     "rio_builder_stale_assignments_rejected_total",
     "rio_builder_upload_bytes_total",
+    "rio_builder_upload_chunks_total",
     "rio_builder_upload_references_count",
     "rio_builder_upload_skipped_idempotent_total",
     "rio_builder_uploads_total",
@@ -346,6 +347,11 @@
         "name": "rio_builder_upload_bytes_total",
         "kind": "counter",
         "help": "Bytes uploaded to store via PutPath (nar_size on success)"
+      },
+      {
+        "name": "rio_builder_upload_chunks_total",
+        "kind": "counter",
+        "help": "Output chunk digests by PutPathChunked outcome. kind=novel: absent from the store per HasChunks → body sent as a Chunk frame. kind=deduped: already durable → only the manifest entry sent. deduped/(novel+deduped) is the builder-observed dedup ratio; near zero on a cold store, rising as the CAS fills."
       },
       {
         "name": "rio_builder_upload_references_count",

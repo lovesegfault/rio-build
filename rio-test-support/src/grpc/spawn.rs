@@ -159,11 +159,22 @@ pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
     MockStore,
     rio_proto::StoreServiceClient<tonic::transport::Channel>,
 )> {
+    let (store, channel) = spawn_mock_store_inproc_channel().await?;
+    Ok((store, rio_proto::StoreServiceClient::new(channel)))
+}
+
+/// [`spawn_mock_store_inproc`] variant that returns the raw [`Channel`]
+/// so callers can construct multiple typed clients over the same
+/// duplex transport (e.g. `StoreServiceClient` + `ChunkServiceClient`
+/// for the chunked-upload path's `HasChunks` probe). The router serves
+/// both `StoreService` and `ChunkService`, mirroring the real store.
+pub async fn spawn_mock_store_inproc_channel() -> anyhow::Result<(MockStore, Channel)> {
     use hyper_util::rt::TokioIo;
     use tonic::transport::Endpoint;
 
     let store = MockStore::new();
     let svc = StoreServiceServer::new(store.clone());
+    let chunk_svc = ChunkServiceServer::new(store.clone());
 
     // Channel of server-side duplex halves. Each client "connect" mints
     // a duplex pair, hands one half to the server via this channel.
@@ -181,6 +192,7 @@ pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
     tokio::spawn(async move {
         Server::builder()
             .add_service(svc)
+            .add_service(chunk_svc)
             .serve_with_incoming(incoming)
             .await
             .expect("in-process gRPC server");
@@ -208,5 +220,5 @@ pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
         }))
         .await?;
 
-    Ok((store, rio_proto::StoreServiceClient::new(channel)))
+    Ok((store, channel))
 }

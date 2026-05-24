@@ -42,7 +42,11 @@ pub mod quota;
 pub mod runtime;
 pub mod store_fetch;
 pub(crate) mod synth_db;
-pub(crate) mod upload;
+// `pub` (not `pub(crate)`) for tests/chunked_upload.rs — the
+// functional-tier test drives `upload_all_outputs` directly against a
+// real `StoreServiceImpl`. Everything inside except the entry point and
+// the error type stays `pub(crate)`/`pub(super)`.
+pub mod upload;
 
 /// Recover the guard from a poisoned [`std::sync`] lock result.
 ///
@@ -208,6 +212,14 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_upload_bytes_total",
         "Bytes uploaded to store via PutPath (nar_size on success)"
+    );
+    describe_counter!(
+        "rio_builder_upload_chunks_total",
+        "Output chunk digests by PutPathChunked outcome. kind=novel: absent \
+         from the store per HasChunks → body sent as a Chunk frame. \
+         kind=deduped: already durable → only the manifest entry sent. \
+         deduped/(novel+deduped) is the builder-observed dedup ratio; near \
+         zero on a cold store, rising as the CAS fills."
     );
     describe_counter!(
         "rio_builder_upload_skipped_idempotent_total",

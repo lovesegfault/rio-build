@@ -19288,6 +19288,10 @@
           "packageId": "clap"
         },
         {
+          "name": "fastcdc",
+          "packageId": "fastcdc"
+        },
+        {
           "name": "fuser",
           "packageId": "fuser"
         },
@@ -19310,6 +19314,10 @@
         {
           "name": "postcard",
           "packageId": "postcard"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
         },
         {
           "name": "prost-types",
@@ -19392,6 +19400,10 @@
         {
           "name": "rio-nix",
           "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-store",
+          "packageId": "rio-store"
         },
         {
           "name": "rio-test-support",
@@ -20918,6 +20930,10 @@
           "name": "nix",
           "packageId": "nix 0.31.3",
           "target": "cfg(target_os = \"linux\")"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
         },
         {
           "name": "rand",

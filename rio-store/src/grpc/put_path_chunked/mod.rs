@@ -119,11 +119,15 @@ impl StoreServiceImpl {
         // PutPathChunked is meaningless without a chunk backend: the
         // entire point is per-chunk S3 writes. Reject before reading
         // the stream so the builder fails fast on a misconfigured
-        // store instead of streaming gigabytes into an error.
+        // store instead of streaming gigabytes into an error. The
+        // message substring is a wire contract — the builder matches
+        // `CHUNKED_REQUIRES_BACKEND_MSG` to fall back to the legacy
+        // PutPath/PutPathBatch path on inline-only stores.
         let Some(cache) = self.chunk_cache.clone() else {
-            return Err(Status::failed_precondition(
-                "PutPathChunked requires a chunk backend; this store is inline-only",
-            ));
+            return Err(Status::failed_precondition(format!(
+                "{}; this store is inline-only",
+                rio_proto::CHUNKED_REQUIRES_BACKEND_MSG
+            )));
         };
         let backend = cache.backend();
 

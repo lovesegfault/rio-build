@@ -429,10 +429,15 @@ enum PreDaemon {
 pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
-    store_client: &mut StoreServiceClient<Channel>,
+    store_clients: &crate::store_fetch::StoreClients,
     log_tx: &mpsc::Sender<ExecutorMessage>,
     first_line: u64,
 ) -> ExecuteOutcome {
+    // Local mutable handle for the unary/legacy-stream RPCs below.
+    // tonic clients are an Arc'd channel — the clone is a pointer copy.
+    // The chunk client (HasChunks for the chunked upload) is reached
+    // via `store_clients.chunk` at the `collect_outputs` call site.
+    let store_client = &mut store_clients.store.clone();
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
 
@@ -805,13 +810,18 @@ pub async fn execute_build(
         Err(e) => Err(e),
         Ok(br) => collect_outputs(
             &br,
-            store_client,
+            store_clients,
             &overlay_mount,
             &drv,
             drv_path,
             is_fod,
             &input_paths,
             &assignment.assignment_token,
+            // Begin.input_closure must hash to the assignment token's
+            // input_closure_digest claim — pass the scheduler-attested
+            // list through verbatim, NOT the locally-recomputed BFS
+            // closure (input_paths), which can differ in membership.
+            &assignment.input_closure,
         )
         .await
         .map(|o| (br, o)),

@@ -273,9 +273,14 @@
       "doc": "Atomic multi-output upload via `PutPathBatch`."
     },
     {
+      "path": "upload/chunked.rs",
+      "depth": 1,
+      "doc": "`PutPathChunked` upload: single-pass fused walk + chunked client-stream."
+    },
+    {
       "path": "upload/common.rs",
       "depth": 1,
-      "doc": "Mechanics shared by [`single`](super::single) and [`batch`](super::batch):"
+      "doc": "Mechanics shared by [`single`](super::single), [`batch`](super::batch),"
     },
     {
       "path": "upload/single.rs",

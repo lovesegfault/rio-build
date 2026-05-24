@@ -68,6 +68,13 @@ tonic = { workspace = true }
 # google.protobuf.Timestamp in BuildResult.start_time/stop_time.
 # Scheduler's build_samples insert is gated on both being Some.
 prost-types = { workspace = true }
+# Canonical castore Directory encoding in the chunked-upload fused walk:
+# dir_digest = blake3(Directory::encode_to_vec()) must match the store's
+# recompute (r[store.castore.canonical-encoding]).
+prost = { workspace = true }
+# Builder-side FastCDC for PutPathChunked (ADR-022 §6.1): per-file
+# content-defined chunking during the fused output walk.
+fastcdc = { workspace = true }
 fuser = { workspace = true }
 sqlx = { workspace = true }
 nix = { workspace = true }
@@ -107,6 +114,12 @@ rstest = { workspace = true }
 # upload.rs tests use the eager `nar::dump_path` as a byte-exact oracle for
 # the streaming upload pipeline.
 rio-nix = { workspace = true, features = ["test-oracle"] }
+# tests/chunked_upload.rs drives the REAL upload_all_outputs against a
+# REAL StoreServiceImpl (ephemeral PG + MemoryChunkBackend) — the same
+# functional-tier pattern as rio-gateway/tests/functional. Catches
+# walk/framing bugs MockStore's reconstruction could share with the
+# builder.
+rio-store = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-test-support = { workspace = true }

@@ -26,6 +26,19 @@ pub use rio_common::grpc::{
 /// can't drift again.
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 
+/// Substring carried in the `Status::failed_precondition` message when
+/// a store without a configured chunk backend rejects `PutPathChunked`.
+/// This is a wire-protocol contract: rio-builder's upload path matches
+/// it (`is_chunked_unsupported`) to fall back to the legacy
+/// `PutPath`/`PutPathBatch` RPCs instead of failing the build — an
+/// inline-only store (dev mode, VM fixtures without `[chunk_backend]`)
+/// cannot accept chunked uploads at all. Other `FailedPrecondition`
+/// reasons (NAR-hash mismatch, refs mismatch, incomplete stream) MUST
+/// NOT trigger the fallback: they indicate a builder bug that the
+/// legacy path would mask. Single source of truth for both the store
+/// emit site and the builder match site.
+pub const CHUNKED_REQUIRES_BACKEND_MSG: &str = "PutPathChunked requires a chunk backend";
+
 /// Substring carried in `ExecutorError::CgroupOom`'s Display impl and
 /// matched by rio-scheduler's `handle_infrastructure_failure` to trigger
 /// `r[sched.sla.reactive-floor]`. Single source of truth so the

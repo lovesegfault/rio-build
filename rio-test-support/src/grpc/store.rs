@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use tonic::{Request, Response, Status, Streaming};
 
+use prost::Message as _;
 use rio_proto::types;
 use rio_proto::validated::ValidatedPathInfo;
-use rio_proto::{ChunkService, StoreService};
+use rio_proto::{ChunkService, StoreService, castore};
+use sha2::Digest as _;
 
 /// `(PathInfo, NAR bytes)` — stored value type for [`MockStoreState::paths`].
 type StoredPath = (types::PathInfo, Vec<u8>);
@@ -109,6 +111,12 @@ pub struct MockStoreCalls {
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
     pub query_realisation_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// One entry per `PutPathChunked` call that reached `Begin`
+    /// processing: `(novel.len(), input_closure)`. For builder dedup
+    /// tests (a re-upload of identical content must send zero novel
+    /// chunks) and `Begin.input_closure` passthrough assertions.
+    #[allow(clippy::type_complexity)]
+    pub chunked_begins: Arc<RwLock<Vec<(usize, Vec<String>)>>>,
 }
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
@@ -197,6 +205,12 @@ pub struct MockStoreFaults {
     /// tests: a `>16 MiB` entry that early-Ok's must leave the framed
     /// reader at exactly `nar_size` so the next entry's header parses.
     pub put_path_early_ok_paths: Arc<RwLock<HashSet<String>>>,
+    /// If true, `put_path_chunked` returns the same `FailedPrecondition`
+    /// a real store without a chunk backend emits
+    /// (`CHUNKED_REQUIRES_BACKEND_MSG`). For builder fallback tests:
+    /// the upload must degrade to the legacy `PutPath`/`PutPathBatch`
+    /// path instead of failing the build.
+    pub unimplement_put_path_chunked: Arc<AtomicBool>,
 }
 
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
@@ -430,19 +444,355 @@ impl MockStore {
     }
 }
 
+/// NAR wire string framing: `u64le(len) ++ bytes ++ pad-to-8`. Local
+/// helper for the mock's chunked-NAR reconstruction — `rio_nix`'s
+/// `sync_wire` module is `pub(super)`.
+fn nar_wire_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    use rio_nix::protocol::wire::{ZERO_PAD, padding_len};
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+    let pad = padding_len(bytes.len());
+    if pad > 0 {
+        out.extend_from_slice(&ZERO_PAD[..pad]);
+    }
+}
+
+fn nar_wire_str(out: &mut Vec<u8>, s: &str) {
+    nar_wire_bytes(out, s.as_bytes());
+}
+
+/// Reconstruct one output's canonical NAR byte stream from its castore
+/// root node + `Directory` bodies + chunked file contents. This is the
+/// mock's *independent* implementation of the server's verify walk: a
+/// builder whose fused walk emits wrong framing or misaligned chunks
+/// produces a `nar_hash` that won't match the reconstruction, exactly
+/// as the real store would reject it.
+///
+/// `next_chunk` is a cursor into the output's `chunk_manifest`: each
+/// regular file consumes the contiguous run of chunks whose sizes sum
+/// to its `FileEntry.size`.
+struct NarRebuild<'a> {
+    directories: &'a HashMap<[u8; 32], castore::Directory>,
+    chunk_manifest: &'a [types::ChunkRef],
+    chunk_bodies: &'a HashMap<Vec<u8>, Vec<u8>>,
+    cursor: usize,
+}
+
+impl NarRebuild<'_> {
+    fn file(
+        &mut self,
+        out: &mut Vec<u8>,
+        size: u64,
+        executable: bool,
+        digest: &[u8],
+    ) -> Result<(), Status> {
+        use rio_nix::protocol::wire::{ZERO_PAD, padding_len};
+        nar_wire_str(out, "regular");
+        if executable {
+            nar_wire_str(out, "executable");
+            nar_wire_str(out, "");
+        }
+        nar_wire_str(out, "contents");
+        out.extend_from_slice(&size.to_le_bytes());
+        // Splice the contiguous chunk run for this file. Per-file
+        // alignment: the run MUST sum to exactly `size`.
+        let mut got: u64 = 0;
+        let mut file_hasher = blake3::Hasher::new();
+        while got < size {
+            let c = self.chunk_manifest.get(self.cursor).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "mock: chunk_manifest exhausted at {got}/{size} bytes into a file"
+                ))
+            })?;
+            self.cursor += 1;
+            let body = self.chunk_bodies.get(&c.hash).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "mock: chunk {} not sent and not previously seeded",
+                    hex::encode(&c.hash)
+                ))
+            })?;
+            if body.len() != c.size as usize {
+                return Err(Status::invalid_argument(format!(
+                    "mock: chunk {} body is {} bytes but manifest says {}",
+                    hex::encode(&c.hash),
+                    body.len(),
+                    c.size
+                )));
+            }
+            out.extend_from_slice(body);
+            file_hasher.update(body);
+            got += u64::from(c.size);
+        }
+        if got != size {
+            return Err(Status::invalid_argument(format!(
+                "mock: file chunk run sums to {got}, FileEntry.size is {size} \
+                 (chunks not per-file-aligned)"
+            )));
+        }
+        if size > 0 && file_hasher.finalize().as_bytes() != digest {
+            return Err(Status::failed_precondition(
+                "mock: file digest mismatch (FileEntry.digest != blake3(contents))",
+            ));
+        }
+        let pad = padding_len(size as usize);
+        if pad > 0 {
+            out.extend_from_slice(&ZERO_PAD[..pad]);
+        }
+        nar_wire_str(out, ")");
+        Ok(())
+    }
+
+    fn dir(&mut self, out: &mut Vec<u8>, digest: &[u8]) -> Result<(), Status> {
+        let key: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| Status::invalid_argument("mock: dir_digest must be 32 bytes"))?;
+        let dir = self.directories.get(&key).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "mock: Directory body {} not in Begin.directories",
+                hex::encode(digest)
+            ))
+        })?;
+        nar_wire_str(out, "directory");
+        // Merge the three kind-partitioned lists back into byte-lex
+        // name order (the canonical NAR entry order).
+        enum E<'a> {
+            D(&'a castore::DirectoryEntry),
+            F(&'a castore::FileEntry),
+            S(&'a castore::SymlinkEntry),
+        }
+        let mut entries: Vec<(&[u8], E<'_>)> = Vec::new();
+        for d in &dir.directories {
+            entries.push((&d.name, E::D(d)));
+        }
+        for f in &dir.files {
+            entries.push((&f.name, E::F(f)));
+        }
+        for s in &dir.symlinks {
+            entries.push((&s.name, E::S(s)));
+        }
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, e) in entries {
+            nar_wire_str(out, "entry");
+            nar_wire_str(out, "(");
+            nar_wire_str(out, "name");
+            nar_wire_bytes(out, name);
+            nar_wire_str(out, "node");
+            nar_wire_str(out, "(");
+            nar_wire_str(out, "type");
+            match e {
+                E::D(d) => self.dir(out, &d.digest)?,
+                E::F(f) => self.file(out, f.size, f.executable, &f.digest)?,
+                E::S(s) => {
+                    nar_wire_str(out, "symlink");
+                    nar_wire_str(out, "target");
+                    nar_wire_bytes(out, &s.target);
+                    nar_wire_str(out, ")");
+                }
+            }
+            nar_wire_str(out, ")");
+        }
+        nar_wire_str(out, ")");
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl StoreService for MockStore {
-    /// Not modeled: the mock's consumers (builder upload tests against
-    /// the legacy path, gateway/scheduler tests) don't speak the
-    /// chunked protocol yet. The builder-half dispatch adds a real
-    /// implementation when it rewrites `upload_all_outputs`.
+    /// Models the server's verify-then-commit: collects the `Begin` +
+    /// `Chunk` frames, checks the wire-order/digest invariants the real
+    /// store enforces, *independently reconstructs* each output's NAR
+    /// from the castore tree + chunk bodies, and rejects on
+    /// `nar_hash`/`nar_size` disagreement. Committed NARs land in
+    /// `state.paths` (so `GetPath`/`QueryPathInfo` serve them) and the
+    /// chunk bodies in `state.chunks` (so a subsequent `HasChunks`
+    /// reports them present — the dedup path).
     async fn put_path_chunked(
         &self,
-        _request: Request<Streaming<types::PutPathChunkedRequest>>,
+        request: Request<Streaming<types::PutPathChunkedRequest>>,
     ) -> Result<Response<types::PutPathResponse>, Status> {
-        Err(Status::unimplemented(
-            "MockStore does not model PutPathChunked",
-        ))
+        // Capability gate FIRST — a store that structurally cannot do
+        // chunked uploads rejects before any transient-fault modeling,
+        // so tests that arm both `unimplement_put_path_chunked` and
+        // `fail_next_puts` exercise the LEGACY path's retry behavior
+        // (the chunked attempt never consumes a fail_next_puts charge).
+        if self
+            .faults
+            .unimplement_put_path_chunked
+            .load(Ordering::SeqCst)
+        {
+            // Models a pre-ADR-022 store / a store without a chunk
+            // backend: the builder must fall back to the legacy path.
+            return Err(Status::failed_precondition(format!(
+                "{}; this store is inline-only",
+                rio_proto::CHUNKED_REQUIRES_BACKEND_MSG
+            )));
+        }
+        if self
+            .faults
+            .fail_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::unavailable("mock: injected put failure"));
+        }
+
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty PutPathChunked stream"))?;
+        let begin = match first.msg {
+            Some(types::put_path_chunked_request::Msg::Begin(b)) => b,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first PutPathChunked message must be Begin",
+                ));
+            }
+        };
+
+        self.calls
+            .chunked_begins
+            .write()
+            .unwrap()
+            .push((begin.novel.len(), begin.input_closure.clone()));
+
+        // Index Directory bodies by their recomputed digest.
+        let mut directories: HashMap<[u8; 32], castore::Directory> = HashMap::new();
+        for d in &begin.directories {
+            directories.insert(*blake3::hash(&d.encode_to_vec()).as_bytes(), d.clone());
+        }
+
+        // Drain Chunk frames: exactly one per Begin.novel entry, in
+        // Begin.novel order, each hashing to its declared digest.
+        let mut bodies: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut next_novel = 0usize;
+        while let Some(msg) = stream.message().await? {
+            let chunk = match msg.msg {
+                Some(types::put_path_chunked_request::Msg::Chunk(c)) => c,
+                _ => return Err(Status::invalid_argument("mock: duplicate Begin")),
+            };
+            let expected = begin.novel.get(next_novel).ok_or_else(|| {
+                Status::invalid_argument("mock: Chunk frame after novel exhausted")
+            })?;
+            if &chunk.digest != expected {
+                return Err(Status::invalid_argument(format!(
+                    "mock: chunk frame {} out of novel order: got {}, expected {}",
+                    next_novel,
+                    hex::encode(&chunk.digest),
+                    hex::encode(expected),
+                )));
+            }
+            if blake3::hash(&chunk.data).as_bytes() != chunk.digest.as_slice() {
+                return Err(Status::invalid_argument(format!(
+                    "mock: chunk {} bytes do not hash to declared digest",
+                    hex::encode(&chunk.digest)
+                )));
+            }
+            bodies.insert(chunk.digest.clone(), chunk.data);
+            next_novel += 1;
+        }
+        if next_novel < begin.novel.len() {
+            return Err(Status::failed_precondition(
+                "mock: stream ended before all novel chunks arrived",
+            ));
+        }
+        // Deduped chunks come from prior uploads / seeds.
+        {
+            let seeded = self.state.chunks.read().unwrap();
+            for o in &begin.outputs {
+                for c in &o.chunk_manifest {
+                    if !bodies.contains_key(&c.hash)
+                        && let Some(b) = seeded.get(&c.hash)
+                    {
+                        bodies.insert(c.hash.clone(), b.clone());
+                    }
+                }
+            }
+        }
+
+        // Reconstruct + verify + stage each output.
+        let mut staged: Vec<(types::PathInfo, Vec<u8>)> = Vec::new();
+        let mut created = false;
+        for o in &begin.outputs {
+            let _ = rio_nix::store_path::StorePath::parse(&o.store_path)
+                .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
+            let mut nar = Vec::new();
+            nar_wire_str(&mut nar, "nix-archive-1");
+            nar_wire_str(&mut nar, "(");
+            nar_wire_str(&mut nar, "type");
+            let mut rebuild = NarRebuild {
+                directories: &directories,
+                chunk_manifest: &o.chunk_manifest,
+                chunk_bodies: &bodies,
+                cursor: 0,
+            };
+            // `dir()`/`file()`/the symlink arm each emit the `)` that
+            // closes the `(` opened above — same containment as a
+            // directory entry's `node ( type … )`.
+            match o.root_node.as_ref().and_then(|r| r.node.as_ref()) {
+                Some(castore::root_node::Node::DirDigest(d)) => rebuild.dir(&mut nar, d)?,
+                Some(castore::root_node::Node::File(f)) => {
+                    rebuild.file(&mut nar, f.size, f.executable, &f.digest)?
+                }
+                Some(castore::root_node::Node::Symlink(s)) => {
+                    nar_wire_str(&mut nar, "symlink");
+                    nar_wire_str(&mut nar, "target");
+                    nar_wire_bytes(&mut nar, &s.target);
+                    nar_wire_str(&mut nar, ")");
+                }
+                None => return Err(Status::invalid_argument("mock: root_node must be set")),
+            }
+            if rebuild.cursor != o.chunk_manifest.len() {
+                return Err(Status::invalid_argument(format!(
+                    "mock: {} chunk_manifest entries not consumed by the tree walk",
+                    o.chunk_manifest.len() - rebuild.cursor
+                )));
+            }
+
+            let computed: [u8; 32] = sha2::Sha256::digest(&nar).into();
+            if computed.as_slice() != o.nar_hash.as_slice() {
+                return Err(Status::failed_precondition(format!(
+                    "mock: NAR hash mismatch for {}: claimed {}, reconstructed {}",
+                    o.store_path,
+                    hex::encode(&o.nar_hash),
+                    hex::encode(computed),
+                )));
+            }
+            if nar.len() as u64 != o.nar_size {
+                return Err(Status::failed_precondition(format!(
+                    "mock: NAR size mismatch for {}: claimed {}, reconstructed {}",
+                    o.store_path,
+                    o.nar_size,
+                    nar.len(),
+                )));
+            }
+            created |= !self.state.paths.read().unwrap().contains_key(&o.store_path);
+            staged.push((
+                types::PathInfo {
+                    store_path: o.store_path.clone(),
+                    nar_hash: o.nar_hash.clone(),
+                    nar_size: o.nar_size,
+                    references: o.refs.clone(),
+                    deriver: begin.deriver.clone(),
+                    ..Default::default()
+                },
+                nar,
+            ));
+        }
+
+        // Commit all (atomic — nothing recorded if any output failed).
+        self.state.chunks.write().unwrap().extend(bodies);
+        for (info, nar) in staged {
+            self.calls.put_calls.write().unwrap().push(info.clone());
+            self.state
+                .paths
+                .write()
+                .unwrap()
+                .insert(info.store_path.clone(), (info, nar));
+        }
+        Ok(Response::new(types::PutPathResponse { created }))
     }
 
     async fn put_path(

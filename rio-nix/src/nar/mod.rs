@@ -164,8 +164,11 @@ pub struct NarEntry {
 /// plus NUL (filesystem-invalid) and `.`/empty (self-reference). Matches
 /// Nix C++ `archive.cc parseDump`. Shared by [`parse`] and
 /// [`restore_path_streaming`] — both write the name into a host filesystem
-/// path, so both need the same safety boundary.
-pub(super) fn validate_entry_name(name: &str) -> Result<()> {
+/// path, so both need the same safety boundary. Public so the builder's
+/// chunked-upload fused walk (which emits NAR framing and castore
+/// `Directory` entry names from the on-disk tree) applies the same
+/// guard on the producing side.
+pub fn validate_entry_name(name: &str) -> Result<()> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(NarError::InvalidEntryName {
             name: name.to_string(),

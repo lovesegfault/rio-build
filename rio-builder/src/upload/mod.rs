@@ -1,11 +1,17 @@
 //! Output upload to rio-store after build completion.
 //!
-//! Scans the overlay upper layer for new store paths, serializes each as
-//! a NAR, computes SHA-256, and uploads via `StoreService.PutPath` gRPC
-//! with retry on failure.
+//! Scans the overlay upper layer for new store paths, walks each output
+//! once (NAR framing + SHA-256 + refscan + per-file FastCDC + castore
+//! `Directory` construction fused into a single disk pass), and uploads
+//! via `StoreService.PutPathChunked`. Stores that cannot accept chunked
+//! uploads (no chunk backend configured) fall back to the legacy
+//! `PutPath`/`PutPathBatch` path, reusing the walk's parse + reference
+//! results so the fallback costs no extra disk read.
 //!
 //! Submodules:
-//! - `common`: streaming-tee sink, ref-scan, trailer-mode `PathInfo`,
+//! - `chunked`: fused walk + `HasChunks` probe + `PutPathChunked`
+//!   client-stream (ADR-022 §6.1).
+//! - `common`: streaming-tee sink, trailer-mode `PathInfo`,
 //!   assignment-token header — mechanics shared by single + batch.
 //! - `single`: per-output `PutPath` with retry + I-125b concurrent-put
 //!   adoption.
@@ -22,15 +28,18 @@ use tracing::instrument;
 
 use rio_nix::refscan::CandidateSet;
 use rio_proto::StoreServiceClient;
+use rio_proto::store::chunk_service_client::ChunkServiceClient;
 use rio_proto::types::FindMissingPathsRequest;
 use rio_proto::validated::ValidatedPathInfo;
 
 mod batch;
+mod chunked;
 pub(crate) mod common;
 mod single;
 
 use batch::upload_outputs_batch;
-use common::{MAX_PARALLEL_UPLOADS, MAX_UPLOAD_RETRIES, UPLOAD_BACKOFF, prepare_output};
+use chunked::{ChunkedUploadError, upload_outputs_chunked, walk_all_outputs};
+use common::{MAX_PARALLEL_UPLOADS, MAX_UPLOAD_RETRIES, PreparedOutput, UPLOAD_BACKOFF};
 use single::upload_output;
 
 // Re-exports for the test module's `use super::*` (private mechanics
@@ -119,23 +128,38 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
 ///    `FindMissingPaths` filters out outputs the store already has. Skipped
 ///    outputs get their `ValidatedPathInfo` from `QueryPathInfo` — zero disk
 ///    reads.
-/// 2. **≥2 remaining → `PutPathBatch`** for cross-output atomicity
-///    (`r[store.atomic.multi-output]`). On `FailedPrecondition` (an output
-///    ≥ INLINE_THRESHOLD, which the v1 batch handler rejects), falls through
-///    to step 3 — which LOSES atomicity (pre-P0267 status quo).
-/// 3. **≤1 remaining, or batch fallthrough → independent `PutPath`** with
-///    `buffer_unordered(MAX_PARALLEL_UPLOADS)`.
+/// 2. **Fused walk** (`r[builder.upload.fused-walk]`): one disk pass per
+///    output produces the NAR hash, references, castore tree, and
+///    per-file chunk manifest.
+/// 3. **`PutPathChunked`** (`r[store.put.chunked]`): all outputs in one
+///    client-stream, committed atomically. The store reconstructs each
+///    NAR from the Directory tree + chunk bodies and independently
+///    verifies `nar_hash`/`references` before commit.
+/// 4. **Legacy fallback** — only when the store cannot accept chunked
+///    uploads at all (no chunk backend / RPC unimplemented):
+///    ≥2 outputs → `PutPathBatch` (atomic); ≤1 or batch
+///    `FailedPrecondition` fallthrough → independent `PutPath` with
+///    `buffer_unordered(MAX_PARALLEL_UPLOADS)`. Reuses the walk's
+///    parse + reference results — no extra disk pass for prep.
+///
+/// There is no configuration knob for step 4: the store is authoritative
+/// about whether it can accept chunked uploads, and P0583 (chunk backend
+/// required) + P0584 (legacy RPCs reject role=Builder) jointly retire
+/// the fallback.
 ///
 /// Result order is **not** guaranteed. Callers must not assume results
 /// correspond positionally to any input list; use `.store_path` to
 /// identify outputs.
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
+    chunk_client: &ChunkServiceClient<Channel>,
     upper_store: &Path,
     assignment_token: &str,
     deriver: &str,
     ref_candidates: &[String],
+    input_closure: &[String],
 ) -> Result<Vec<ValidatedPathInfo>, UploadError> {
     let outputs = scan_new_outputs(upper_store)?;
     if outputs.is_empty() {
@@ -147,24 +171,20 @@ pub async fn upload_all_outputs(
     //
     // Batch-check all outputs against the store BEFORE reading any bytes
     // from disk. Outputs with a `'complete'` manifest are skipped: the
-    // pre-scan disk read, NAR stream, SHA-256, and gRPC stream setup
-    // are all wasted work when r[store.put.idempotent] would no-op
+    // fused-walk disk read, gRPC stream setup, and chunk re-reads are
+    // all wasted work when r[store.put.idempotent] would no-op
     // server-side anyway.
     //
     // Best-effort: on FindMissingPaths error, log + treat ALL as missing.
     // r[store.put.idempotent] catches the duplicates server-side — zero
     // behavior change from before this pre-check existed. This is an
     // optimization, not a correctness requirement.
-    //
-    // TODO(P0434): manifest-mode bandwidth opt — send manifest-only,
-    // store fetches missing chunks from ChunkCache. Gated on measuring
-    // rio_store_chunk_cache_hits_total ratio in production. Worker NOT
-    // trusted → store must reconstruct NAR to verify, so the "win" is
-    // net positive only if ChunkCache hit rate is high (>80%). P0263
-    // scoped down to the zero-proto-change path; deferred remainder.
     let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
     let (to_upload, mut skipped_results) =
         partition_by_presence(store_client, &outputs, store_paths).await;
+    if to_upload.is_empty() {
+        return Ok(skipped_results);
+    }
     // ---------------------------------------------------------------------
 
     // Build the candidate set ONCE. Same input closure applies to every
@@ -172,21 +192,44 @@ pub async fn upload_all_outputs(
     // is a pointer copy, not a full HashMap clone.
     let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
 
-    // Prep ALL outputs (parse + ref-scan) BEFORE any byte hits the wire.
-    // A prep failure on output k returns Err here; the batch producer is
-    // prep-free, so partial server commit (`r[store.atomic.multi-output]`)
-    // is unrepresentable. Serial — scan_references is spawn_blocking
-    // disk-read; matches MAX_BATCH_OUTPUTS=16 small-N shape. Retries
-    // (batch and per-output) do NOT re-scan.
+    // Fused walk: ALL outputs walked BEFORE any byte hits the wire
+    // (parse + NAR hash + refscan + FastCDC + Directory bodies in one
+    // disk pass each). A walk failure on output k returns Err here; the
+    // stream producer is prep-free, so partial server commit
+    // (`r[store.atomic.multi-output]`) is unrepresentable. Serial — the
+    // walk is spawn_blocking disk-read; matches MAX_BATCH_OUTPUTS=16
+    // small-N shape. Retries do NOT re-walk.
     //
-    // TODO(P0433): trailer-refs protocol extension — move refs into the
-    // PutPath trailer so the scan happens inline with the upload tee
-    // (avoiding this extra disk pass). Gated on measuring pre-scan cost
-    // at scale (see worker.md § pre-scan cost). Deferred P0181 remainder.
-    let mut prepared = Vec::with_capacity(to_upload.len());
-    for b in &to_upload {
-        prepared.push(prepare_output(upper_store, b, &candidates).await?);
+    // This closes TODO(P0433) (refs forced into a separate pre-pass) and
+    // TODO(P0434) (manifest-first upload): the refscan rides the same
+    // disk read as everything else, and the wire carries only the
+    // chunks the store doesn't already have.
+    let walked = walk_all_outputs(upper_store, &to_upload, &candidates).await?;
+
+    // --- PutPathChunked (the default path) -------------------------------
+    match upload_outputs_chunked(
+        store_client,
+        chunk_client,
+        &walked,
+        assignment_token,
+        deriver,
+        input_closure,
+    )
+    .await
+    {
+        Ok(mut results) => {
+            results.append(&mut skipped_results);
+            return Ok(results);
+        }
+        Err(ChunkedUploadError::Upload(e)) => return Err(e),
+        Err(ChunkedUploadError::Unsupported) => {
+            // Fall through to the legacy path below. The walk results
+            // carry everything the legacy prep produced (parsed path +
+            // sorted references), so no disk is re-read for prep.
+        }
     }
+
+    let prepared: Vec<PreparedOutput> = walked.iter().map(PreparedOutput::from).collect();
 
     // Branch: ≥2 outputs TO UPLOAD → atomic batch; ≤1 → independent
     // (atomicity is vacuous for a single output). The count is against the
@@ -411,7 +454,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use rio_test_support::fixtures::{test_drv_path, test_store_basename};
-    use rio_test_support::grpc::{spawn_mock_store_inproc, spawn_mock_store_with_client};
+    use rio_test_support::grpc::{
+        MockStore, spawn_mock_store, spawn_mock_store_inproc, spawn_mock_store_inproc_channel,
+        spawn_mock_store_with_client,
+    };
     use std::sync::atomic::Ordering;
 
     use rio_test_support::fixtures::seed_store_output as make_output_file;
@@ -421,14 +467,52 @@ mod tests {
         Arc::new(CandidateSet::from_paths(std::iter::empty::<&str>()))
     }
 
-    /// Prep helper for tests calling `upload_output` directly: runs the
-    /// real `prepare_output` chokepoint (parse + scan_references).
+    /// TCP mock + both clients. `upload_all_outputs` needs a
+    /// `ChunkServiceClient` for the chunked path's `HasChunks` probe.
+    async fn mock_with_chunk_client() -> anyhow::Result<(
+        MockStore,
+        StoreServiceClient<Channel>,
+        ChunkServiceClient<Channel>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let (store, addr, h) = spawn_mock_store().await?;
+        let ch = rio_proto::client::connect_channel(&addr.to_string()).await?;
+        let max = rio_common::grpc::max_message_size();
+        Ok((
+            store,
+            StoreServiceClient::new(ch.clone())
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max),
+            ChunkServiceClient::new(ch),
+            h,
+        ))
+    }
+
+    /// In-process duplex mock + both clients, for `start_paused` tests.
+    async fn mock_inproc_with_chunk_client() -> anyhow::Result<(
+        MockStore,
+        StoreServiceClient<Channel>,
+        ChunkServiceClient<Channel>,
+    )> {
+        let (store, ch) = spawn_mock_store_inproc_channel().await?;
+        Ok((
+            store,
+            StoreServiceClient::new(ch.clone()),
+            ChunkServiceClient::new(ch),
+        ))
+    }
+
+    /// Prep helper for tests calling `upload_output` /
+    /// `upload_outputs_batch` directly: runs the real fused-walk
+    /// chokepoint (parse + NAR hash + refscan + chunking) and projects
+    /// the legacy `PreparedOutput` view.
     async fn prep_one(
         store_dir: &Path,
         basename: &str,
         candidates: &Arc<CandidateSet>,
     ) -> Result<common::PreparedOutput, UploadError> {
-        prepare_output(store_dir, basename, candidates).await
+        let walked = walk_all_outputs(store_dir, &[basename.to_string()], candidates).await?;
+        Ok(common::PreparedOutput::from(&walked[0]))
     }
 
     #[tokio::test]
@@ -610,7 +694,7 @@ mod tests {
     /// upload_all_outputs runs concurrently; all outputs land in MockStore.
     #[tokio::test]
     async fn test_upload_all_outputs_multiple() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir)?;
@@ -623,7 +707,7 @@ mod tests {
         fs::write(store_dir.join(&b2), b"two")?;
         fs::write(store_dir.join(&b3), b"three")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
             .await
             .expect("all uploads succeed");
 
@@ -635,6 +719,216 @@ mod tests {
         assert!(paths.contains(&format!("/nix/store/{b2}")));
         assert!(paths.contains(&format!("/nix/store/{b3}")));
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 3);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // PutPathChunked path (the default) — fused walk → Begin → Chunk frames
+    // against MockStore's independent NAR reconstruction.
+    // -----------------------------------------------------------------------
+
+    /// A multi-kind output tree (nested dirs, executable, symlink,
+    /// duplicate file contents, empty file, multi-chunk blob).
+    fn complex_output(store_dir: &Path, basename: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = store_dir.join(basename);
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("share/doc")).unwrap();
+        fs::write(root.join("bin/tool"), b"#!/bin/sh\necho hello\n").unwrap();
+        fs::set_permissions(
+            root.join("bin/tool"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(root.join("share/doc/README"), vec![0xA5u8; 4096]).unwrap();
+        fs::write(root.join("share/doc/COPY"), vec![0xA5u8; 4096]).unwrap();
+        fs::write(root.join("empty"), b"").unwrap();
+        fs::write(
+            root.join("blob"),
+            rio_test_support::fixtures::pseudo_random_bytes(7, 600 * 1024),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("bin/tool", root.join("default")).unwrap();
+    }
+
+    /// End-to-end chunked round-trip: the NAR MockStore reconstructs
+    /// from the Directory tree + chunk bodies is byte-identical to the
+    /// `dump_path` oracle of the on-disk tree. Three-way agreement
+    /// (builder's claimed hash == mock's reconstruction == oracle)
+    /// proves the fused walk's framing, chunking, and castore tree are
+    /// mutually consistent.
+    #[tokio::test]
+    async fn test_chunked_upload_roundtrip_complex_tree() -> anyhow::Result<()> {
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let basename = test_store_basename("chunked-tree");
+        complex_output(&store_dir, &basename);
+
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
+            .await
+            .expect("chunked upload succeeds");
+        assert_eq!(results.len(), 1);
+
+        let oracle = nar::dump_path(&store_dir.join(&basename))?;
+        let stored = store.state.paths.read().unwrap();
+        let (info, nar_bytes) = stored
+            .get(&format!("/nix/store/{basename}"))
+            .expect("output committed");
+        assert_eq!(
+            nar_bytes, &oracle,
+            "mock-reconstructed NAR must equal the dump_path oracle"
+        );
+        let expected: [u8; 32] = Sha256::digest(&oracle).into();
+        assert_eq!(info.nar_hash, expected.to_vec());
+        assert_eq!(results[0].nar_hash, expected);
+        // Exactly one PutPathChunked Begin, no legacy PutPath fallback.
+        assert_eq!(store.calls.chunked_begins.read().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// Dedup: a second output with identical content at a different
+    /// store path probes `HasChunks`, finds everything present, and
+    /// sends ZERO novel chunks.
+    #[tokio::test]
+    async fn test_chunked_upload_second_identical_output_sends_no_novel() -> anyhow::Result<()> {
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
+        let payload = rio_test_support::fixtures::pseudo_random_bytes(3, 400 * 1024);
+
+        let tmp_a = tempfile::tempdir()?;
+        let dir_a = tmp_a.path().join("nix/store");
+        fs::create_dir_all(&dir_a)?;
+        let b_a = format!("{DEP_HASH_A}-dedup-a");
+        fs::create_dir_all(dir_a.join(&b_a))?;
+        fs::write(dir_a.join(&b_a).join("data"), &payload)?;
+        upload_all_outputs(&client, &chunk, &dir_a, "", "", &[], &[])
+            .await
+            .expect("first upload");
+
+        let tmp_b = tempfile::tempdir()?;
+        let dir_b = tmp_b.path().join("nix/store");
+        fs::create_dir_all(&dir_b)?;
+        let b_b = format!("{DEP_HASH_B}-dedup-b");
+        fs::create_dir_all(dir_b.join(&b_b))?;
+        fs::write(dir_b.join(&b_b).join("data"), &payload)?;
+        upload_all_outputs(&client, &chunk, &dir_b, "", "", &[], &[])
+            .await
+            .expect("second upload");
+
+        let begins = store.calls.chunked_begins.read().unwrap();
+        assert_eq!(begins.len(), 2);
+        assert!(
+            begins[0].0 > 0,
+            "first upload sends novel chunks (got {})",
+            begins[0].0
+        );
+        assert_eq!(
+            begins[1].0, 0,
+            "second identical upload must send zero novel chunks"
+        );
+        Ok(())
+    }
+
+    /// Capability fallback: a store that rejects PutPathChunked with the
+    /// no-chunk-backend FailedPrecondition gets the legacy PutPath path;
+    /// the build still succeeds.
+    #[tokio::test]
+    async fn test_chunked_upload_falls_back_to_legacy_when_unsupported() -> anyhow::Result<()> {
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
+        store
+            .faults
+            .unimplement_put_path_chunked
+            .store(true, Ordering::SeqCst);
+        let basename = test_store_basename("fallback");
+        let (_tmp, store_dir) = make_output_file(&basename, b"fallback contents")?;
+
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
+            .await
+            .expect("fallback upload succeeds");
+        assert_eq!(results.len(), 1);
+        // The legacy path committed it (put_calls records both paths;
+        // chunked_begins is only pushed once Begin processing starts,
+        // which the unimplemented knob short-circuits).
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 1);
+        assert!(store.calls.chunked_begins.read().unwrap().is_empty());
+        // Legacy path computes the same NAR hash.
+        let expected_nar = nar::dump_path(&store_dir.join(&basename))?;
+        let expected: [u8; 32] = Sha256::digest(&expected_nar).into();
+        assert_eq!(results[0].nar_hash, expected);
+        Ok(())
+    }
+
+    /// Transient store errors on the chunked path are retried with the
+    /// shared MAX_UPLOAD_RETRIES budget; the retry re-probes HasChunks
+    /// and succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn test_chunked_upload_retries_transient() -> anyhow::Result<()> {
+        let (store, client, chunk) = mock_inproc_with_chunk_client().await?;
+        store.faults.fail_next_puts.store(2, Ordering::SeqCst);
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let basename = format!("{DEP_HASH_A}-chunked-retry");
+        fs::write(store_dir.join(&basename), b"retry me")?;
+
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
+            .await
+            .expect("chunked upload succeeds on 3rd attempt");
+        assert_eq!(results.len(), 1);
+        assert_eq!(store.faults.fail_next_puts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// `Begin` carries the scanned references and the verbatim
+    /// `WorkAssignment.input_closure` (NOT the refscan candidate set).
+    #[tokio::test]
+    async fn test_chunked_upload_carries_refs_and_input_closure() -> anyhow::Result<()> {
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let basename = format!("{DEP_HASH_A}-withrefs");
+        let dep = format!("/nix/store/{DEP_HASH_B}-dep");
+        fs::create_dir_all(store_dir.join(&basename))?;
+        fs::write(
+            store_dir.join(&basename).join("conf"),
+            format!("dep={dep}\n"),
+        )?;
+
+        let closure = vec![
+            dep.clone(),
+            "/nix/store/0000000000000000000000000000000z-extra".to_string(),
+        ];
+        let deriver = test_drv_path("withrefs");
+        let results = upload_all_outputs(
+            &client,
+            &chunk,
+            &store_dir,
+            "",
+            &deriver,
+            &[dep.clone()],
+            &closure,
+        )
+        .await
+        .expect("upload succeeds");
+        assert_eq!(
+            results[0]
+                .references
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+            vec![dep.clone()]
+        );
+        let puts = store.calls.put_calls.read().unwrap();
+        assert_eq!(puts[0].references, vec![dep]);
+        assert_eq!(puts[0].deriver, deriver);
+        let begins = store.calls.chunked_begins.read().unwrap();
+        assert_eq!(
+            begins[0].1, closure,
+            "Begin.input_closure is the verbatim WorkAssignment closure"
+        );
         Ok(())
     }
 
@@ -827,7 +1121,7 @@ mod tests {
     async fn test_upload_all_outputs_per_output_refs() -> anyhow::Result<()> {
         let recorder = rio_test_support::metrics::CountingRecorder::default();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir)?;
@@ -845,10 +1139,12 @@ mod tests {
         let deriver = test_drv_path("multi");
         let results = upload_all_outputs(
             &client,
+            &chunk,
             &store_dir,
             "",
             &deriver,
             &[dep_a.clone(), dep_b.clone()],
+            &[],
         )
         .await?;
 
@@ -937,7 +1233,7 @@ mod tests {
     /// instead of reading disk (the optimization's whole point).
     #[tokio::test]
     async fn test_upload_all_outputs_skips_already_present() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
         let basename = format!("{DEP_HASH_A}-already-there");
         let store_path = format!("/nix/store/{basename}");
 
@@ -961,7 +1257,7 @@ mod tests {
             "precondition: seeded vs disk NARs must differ, else this test proves nothing"
         );
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[]).await?;
 
         // Zero PutPath calls — the skip fired.
         assert_eq!(
@@ -983,7 +1279,7 @@ mod tests {
     /// one hits PutPath; both appear in results.
     #[tokio::test]
     async fn test_upload_all_outputs_mixed_presence() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
 
         let b_present = format!("{DEP_HASH_A}-present");
         let b_missing = format!("{DEP_HASH_B}-missing");
@@ -998,7 +1294,7 @@ mod tests {
         fs::write(store_dir.join(&b_present), b"disk present")?;
         fs::write(store_dir.join(&b_missing), b"disk missing")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[]).await?;
 
         // Exactly one PutPath: the missing output.
         let puts = store.calls.put_calls.read().unwrap();
@@ -1030,7 +1326,7 @@ mod tests {
     /// pre-precheck world.
     #[tokio::test]
     async fn test_upload_all_outputs_find_missing_error_falls_back() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
         store.faults.fail_find_missing.store(true, Ordering::SeqCst);
 
         let basename = format!("{DEP_HASH_A}-fallback");
@@ -1044,7 +1340,7 @@ mod tests {
         fs::create_dir_all(&store_dir)?;
         fs::write(store_dir.join(&basename), b"disk fallback")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[]).await?;
 
         // FindMissingPaths failed → fell back to upload → PutPath called.
         // (MockStore's put_path doesn't implement the idempotent no-op;
@@ -1070,7 +1366,7 @@ mod tests {
     /// happen in practice, but the branch is there).
     #[tokio::test]
     async fn test_upload_all_outputs_empty_no_rpc() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
         // Arm the failure: if FindMissingPaths were called, the test
         // would still pass (fail-open), but the empty check should
         // short-circuit BEFORE the RPC.
@@ -1081,8 +1377,16 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         // upper_store doesn't exist — scan_new_outputs returns empty.
 
-        let results =
-            upload_all_outputs(&client, &tmp.path().join("nonexistent"), "", "", &[]).await?;
+        let results = upload_all_outputs(
+            &client,
+            &chunk,
+            &tmp.path().join("nonexistent"),
+            "",
+            "",
+            &[],
+            &[],
+        )
+        .await?;
         assert!(results.is_empty());
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
@@ -1102,7 +1406,7 @@ mod tests {
     /// → put_calls.len() == 0.
     #[tokio::test(start_paused = true)]
     async fn test_batch_prep_failure_no_partial_commit() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir)?;
@@ -1131,7 +1435,7 @@ mod tests {
         }
         let _restore = Restore(bad_dir);
 
-        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let err = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
             .await
             .expect_err("prep must fail on the unreadable output");
         assert!(matches!(err, UploadError::UploadExhausted { .. }));
@@ -1148,9 +1452,18 @@ mod tests {
     /// MAX_UPLOAD_RETRIES budget as the single-output path. Pre-fix: a
     /// single `Unavailable` on a 2-output derivation hit `return Err(e)`
     /// → InfrastructureFailure → full re-build.
+    ///
+    /// Pins the LEGACY batch path: the chunked-unsupported knob forces
+    /// the fallback so `fail_next_puts` charges land on `PutPathBatch`,
+    /// not on `PutPathChunked` (whose retry behavior is covered by
+    /// `test_upload_all_outputs_chunked_retries_transient`).
     #[tokio::test(start_paused = true)]
     async fn test_upload_all_outputs_batch_retries_transient() -> anyhow::Result<()> {
-        let (store, client) = spawn_mock_store_inproc().await?;
+        let (store, client, chunk) = mock_inproc_with_chunk_client().await?;
+        store
+            .faults
+            .unimplement_put_path_chunked
+            .store(true, Ordering::SeqCst);
         // First two batch RPCs return Unavailable; third succeeds.
         store.faults.fail_next_puts.store(2, Ordering::SeqCst);
 
@@ -1161,7 +1474,7 @@ mod tests {
         fs::write(store_dir.join(&b1), b"one")?;
         fs::write(store_dir.join(&b2), b"two")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
             .await
             .expect("batch upload should succeed on 3rd attempt");
 
@@ -1181,9 +1494,14 @@ mod tests {
 
     /// bug_167 (exhaustion): batch retries exhaust → UploadExhausted, NOT
     /// fallthrough to per-output. `Unavailable` ≠ `FailedPrecondition`.
+    /// Legacy-path pin — see `test_upload_all_outputs_batch_retries_transient`.
     #[tokio::test(start_paused = true)]
     async fn test_upload_all_outputs_batch_exhausts_transient() -> anyhow::Result<()> {
-        let (store, client) = spawn_mock_store_inproc().await?;
+        let (store, client, chunk) = mock_inproc_with_chunk_client().await?;
+        store
+            .faults
+            .unimplement_put_path_chunked
+            .store(true, Ordering::SeqCst);
         store
             .faults
             .fail_next_puts
@@ -1195,7 +1513,7 @@ mod tests {
         fs::write(store_dir.join(format!("{DEP_HASH_A}-a")), b"a")?;
         fs::write(store_dir.join(format!("{DEP_HASH_B}-b")), b"b")?;
 
-        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let err = upload_all_outputs(&client, &chunk, &store_dir, "", "", &[], &[])
             .await
             .expect_err("batch should exhaust retries");
         assert!(matches!(err, UploadError::UploadExhausted { .. }));

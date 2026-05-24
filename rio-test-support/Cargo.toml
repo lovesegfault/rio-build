@@ -90,6 +90,11 @@ metrics = { workspace = true, optional = true }
 # benches need unique drv_hash across iterations (scheduler DAG
 # dedupes, collisions skew latency low).
 rand = { workspace = true, optional = true }
+# MockStore's PutPathChunked reconstruction: castore Directory bodies
+# are keyed by blake3(canonical prost encode). Same crate is also a
+# build-dependency (MockAdmin codegen); `dep:prost` in `full` activates
+# both.
+prost = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }

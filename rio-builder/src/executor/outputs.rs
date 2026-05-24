@@ -8,11 +8,9 @@
 
 use std::collections::HashMap;
 
-use tonic::transport::Channel;
 use tracing::instrument;
 
 use rio_nix::derivation::{Derivation, DerivationLike};
-use rio_proto::StoreServiceClient;
 use rio_proto::types::{BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput};
 
 use crate::overlay;
@@ -50,17 +48,24 @@ impl BuildOutputs {
 ///
 /// Reference-scan candidate set = input_paths ∪ drv.outputs() ∪
 /// build_result.built_outputs (the last for floating-CA self-refs).
+///
+/// `input_closure` is `WorkAssignment.input_closure` verbatim — the
+/// scheduler-attested list whose blake3 the assignment token carries.
+/// It is passed through to `PutPathChunked`'s `Begin.input_closure`
+/// unchanged; it is NOT the refscan candidate set (that is the locally
+/// recomputed `input_paths`, which also covers drv outputs).
 #[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_outputs(
     build_result: &rio_nix::protocol::build::BuildResult,
-    store_client: &mut StoreServiceClient<Channel>,
+    store_clients: &crate::store_fetch::StoreClients,
     overlay_mount: &overlay::OverlayMount,
     drv: &Derivation,
     drv_path: &str,
     is_fod: bool,
     input_paths: &[String],
     assignment_token: &str,
+    input_closure: &[String],
 ) -> Result<BuildOutputs, ExecutorError> {
     if !build_result.status.is_success() {
         // I-178: daemon ENOENT on a closure input is worker-local
@@ -180,7 +185,8 @@ pub(super) async fn collect_outputs(
     );
 
     match upload::upload_all_outputs(
-        store_client,
+        &store_clients.store,
+        &store_clients.chunk,
         &overlay_mount.upper_store(),
         // Pass the assignment token as gRPC metadata on each
         // PutPath. Store with hmac_verifier checks it. Empty
@@ -189,6 +195,7 @@ pub(super) async fn collect_outputs(
         assignment_token,
         drv_path,
         &ref_candidates,
+        input_closure,
     )
     .await
     {
