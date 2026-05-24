@@ -17,6 +17,11 @@ use crate::k8s::provider::{Provider, ProviderKind};
 // first real caller.
 #[allow(dead_code)]
 mod archive;
+// The SSH transport + daemon-channel pool also lands ahead of its consumers —
+// the prewarm/timeline modules open channels per request; the allow goes away
+// with them.
+#[allow(dead_code)]
+mod client;
 // Substituter access (narinfo probe + NAR fetch over HTTPS/S3) also lands
 // ahead of its consumers — the supply planner and prewarm phases are the
 // first callers; the allow goes away with them.
