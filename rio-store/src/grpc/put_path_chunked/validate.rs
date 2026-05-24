@@ -490,6 +490,18 @@ pub(super) fn validate_begin(
     }
 
     // --- novel: membership, no-dups, global-first-occurrence order ----
+    // `novel` is a subset of the manifest digest set with no
+    // duplicates, so its length is bounded by the (already-validated)
+    // distinct-digest count. Reject an over-long list BEFORE the
+    // length-derived `with_capacity` allocations below — the count is
+    // wire-controlled and must not size an allocation unchecked.
+    if begin.novel.len() > manifest_len.len() {
+        return Err(invalid(format!(
+            "novel has {} entries but the outputs reference only {} distinct chunks",
+            begin.novel.len(),
+            manifest_len.len()
+        )));
+    }
     let mut novel: Vec<[u8; 32]> = Vec::with_capacity(begin.novel.len());
     let mut novel_set: HashSet<[u8; 32]> = HashSet::with_capacity(begin.novel.len());
     for (i, d) in begin.novel.iter().enumerate() {
@@ -750,6 +762,15 @@ fn walk_output(
     let mut dir_digest_set: HashSet<[u8; 32]> = HashSet::new();
     let mut file_blob_map: HashMap<[u8; 32], (u64, u64)> = HashMap::new();
     let mut index_entries: Vec<NarIndexEntry> = Vec::new();
+    // Cumulative bytes of '/'-joined entry PATHS cloned into
+    // `index_entries` and onto the work stack. The framing cap does not
+    // bound this: framing carries each entry's NAME once, but the index
+    // entry and every pending sibling on the stack carry the FULL path
+    // (all ancestor names), so a deep tree of long names amplifies a
+    // small DAG into `depth × name_len` bytes per entry — up to ~470×
+    // the framing. Counted monotonically (allocations, not live set —
+    // over-counting is the safe direction) against the same 64 MiB cap.
+    let mut path_bytes: u64 = 0;
 
     let root_node = match root {
         root_node::Node::DirDigest(d) => Node::Dir {
@@ -831,6 +852,16 @@ fn walk_output(
             return Err(invalid(format!(
                 "{ctx}: NAR framing exceeds {MAX_NAR_FRAMING_BYTES} bytes (tree has too many \
                  entries for a single upload)"
+            )));
+        }
+        // Bound the cloned path bytes the same way: this charge covers
+        // the `path.clone()` into the node's NAR-index entry below; the
+        // per-child charge in the Dir arm covers the work-stack copies.
+        path_bytes += path.len() as u64;
+        if path_bytes > MAX_NAR_FRAMING_BYTES {
+            return Err(invalid(format!(
+                "{ctx}: tree entry paths exceed {MAX_NAR_FRAMING_BYTES} bytes (tree is too \
+                 deep or its names too long for a single upload)"
             )));
         }
 
@@ -960,6 +991,17 @@ fn walk_output(
                         child_path.push(b'/');
                     }
                     child_path.extend_from_slice(name);
+                    // Per-child charge: a single wide directory pushes
+                    // its whole sibling set (each carrying the full
+                    // path) before the next top-of-loop check runs, so
+                    // the cap must be enforced here, not just per pop.
+                    path_bytes += child_path.len() as u64;
+                    if path_bytes > MAX_NAR_FRAMING_BYTES {
+                        return Err(invalid(format!(
+                            "{ctx}: tree entry paths exceed {MAX_NAR_FRAMING_BYTES} bytes \
+                             (tree is too deep or its names too long for a single upload)"
+                        )));
+                    }
                     stack.push(Work::Close);
                     stack.push(Work::Open {
                         node: child,

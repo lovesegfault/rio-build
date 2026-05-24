@@ -385,15 +385,24 @@ fn reject_conflicting_chunk_lengths() {
 #[test]
 fn reject_novel_not_in_any_manifest() {
     let (mut begin, _t) = valid_begin();
-    begin.novel.push([0xCD; 32].to_vec());
+    // Replace (not append) so the length stays within the distinct-
+    // chunk count and the membership check is the one that fires.
+    begin.novel[0] = [0xCD; 32].to_vec();
     assert_invalid(&begin, "does not appear in any output's chunk_manifest");
+}
+
+#[test]
+fn reject_novel_longer_than_distinct_chunks() {
+    let (mut begin, _t) = valid_begin();
+    begin.novel.push([0xCD; 32].to_vec());
+    assert_invalid(&begin, "distinct chunks");
 }
 
 #[test]
 fn reject_novel_duplicate() {
     let (mut begin, _t) = valid_begin();
-    let first = begin.novel[0].clone();
-    begin.novel.push(first);
+    // Replace (not append) so the length bound does not fire first.
+    begin.novel[1] = begin.novel[0].clone();
     assert_invalid(&begin, "duplicate");
 }
 
