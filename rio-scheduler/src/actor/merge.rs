@@ -13,7 +13,6 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, verifiable_wanted_paths,
-    wanted_subset,
 };
 
 use super::{ActorError, DagActor, MergeDagRequest};
@@ -1245,18 +1244,30 @@ impl DagActor {
             if state.output_paths.is_empty() {
                 continue;
             }
-            let wanted: HashSet<&String> = wanted_subset(
+            // The complement MUST be taken against the *verifiable*
+            // wanted subset. A wanted set that resolves to no
+            // verifiable path (`drv^bogus`) yields an EMPTY wanted set
+            // — and the complement of nothing is every declared path,
+            // which forgives every missing recorded output and a GC'd
+            // node is never reset. On `None` nothing is positively
+            // identifiable as unwanted → forgive nothing → every
+            // missing recorded path triggers the reset (the
+            // conservative pre-feature behaviour).
+            let unwanted: HashSet<String> = match verifiable_wanted_paths(
                 &node.output_names,
                 &node.expected_output_paths,
                 &node.wanted_output_names,
-            )
-            .collect();
-            let unwanted: HashSet<String> = node
-                .expected_output_paths
-                .iter()
-                .filter(|p| !p.is_empty() && !wanted.contains(*p))
-                .cloned()
-                .collect();
+            ) {
+                Some(wanted) => {
+                    let wanted: HashSet<&str> = wanted.into_iter().collect();
+                    node.expected_output_paths
+                        .iter()
+                        .filter(|p| !p.is_empty() && !wanted.contains(p.as_str()))
+                        .cloned()
+                        .collect()
+                }
+                None => HashSet::new(),
+            };
             candidates.push((node.drv_hash.clone(), state.output_paths.clone(), unwanted));
         }
 

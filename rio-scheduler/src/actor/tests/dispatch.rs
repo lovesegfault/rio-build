@@ -3931,6 +3931,52 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
+// r[verify sched.substitute.detached+3]
+/// An UNRESOLVABLE wanted set (non-empty but matching no declared
+/// output name — a `drv^bogus` root the gateway didn't validate) must
+/// not invert the forgiveness gate. `wanted_output_paths()` resolves to
+/// nothing, so the complement "expected − wanted" would be EVERY
+/// declared path — and a forgivable set of everything turns a total
+/// fetch failure into `ok=true` with zero outputs present: the node
+/// Completes vacuously and its dependents dispatch against missing
+/// inputs. The conservative branch for an unresolvable wanted set is
+/// "nothing is forgivable" — every seed failure fails the walk, the
+/// pre-feature behaviour.
+///
+/// The node falls through the merge-time classification (the
+/// `verifiable_wanted_paths` guard skips it), seeds Ready, and reaches
+/// the substitute path via `batch_probe_cached_ready`'s all-declared
+/// fallback — the one route where the spawn-time complement used to
+/// run unguarded.
+#[tokio::test]
+async fn substitute_walk_unresolvable_wanted_set_forgives_nothing() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("fgv-bogus-out");
+    // Indeterminate at probe time (treated optimistically → routed to
+    // the detached fetch) but the GET definitively misses — the only
+    // seed, and the walk must NOT forgive it.
+    store.state.indeterminate.write().unwrap().push(out.clone());
+
+    let mut n = make_node("fgv-bogus");
+    n.output_names = vec!["out".into()];
+    n.expected_output_paths = vec![out.clone()];
+    n.wanted_output_names = vec!["bogus".into()];
+    merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    settle_substituting(&handle, &["fgv-bogus"]).await;
+
+    assert_eq!(
+        expect_drv(&handle, "fgv-bogus").await.status,
+        DerivationStatus::Ready,
+        "an unresolvable wanted set must forgive NOTHING — the only \
+         seed's fetch failure must fail the walk and demote to a \
+         from-source dispatch, not Complete the node with zero outputs \
+         present"
+    );
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+3]
 /// Cold path: A is NOT in `state.paths` (batch returns None) but IS
 /// in `state.substitutable` (per-path QPI materializes it with
