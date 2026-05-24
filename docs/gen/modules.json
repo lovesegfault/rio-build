@@ -1814,9 +1814,39 @@
       "doc": "Replay archive reader — the recorded build load consumed by `xtask k8s"
     },
     {
+      "path": "k8s/replay/client.rs",
+      "depth": 2,
+      "doc": "SSH transport and daemon-channel pool for `xtask k8s replay`."
+    },
+    {
+      "path": "k8s/replay/compare.rs",
+      "depth": 2,
+      "doc": "Outcome comparison for `xtask k8s replay` — classify every replayed"
+    },
+    {
+      "path": "k8s/replay/prewarm.rs",
+      "depth": 2,
+      "doc": "Pre-warm phase for `xtask k8s replay` — the bulk supply pass that runs"
+    },
+    {
+      "path": "k8s/replay/report.rs",
+      "depth": 2,
+      "doc": "Run report for `xtask k8s replay` — the JSON summary artifact, the"
+    },
+    {
       "path": "k8s/replay/substituter.rs",
       "depth": 2,
       "doc": "Binary-cache (substituter) access for `xtask k8s replay` — narinfo"
+    },
+    {
+      "path": "k8s/replay/supply.rs",
+      "depth": 2,
+      "doc": "Supply planning for `xtask k8s replay` — what the target must build vs"
+    },
+    {
+      "path": "k8s/replay/timeline.rs",
+      "depth": 2,
+      "doc": "Timeline engine for `xtask k8s replay` — request pacing at the recorded"
     },
     {
       "path": "k8s/shared.rs",

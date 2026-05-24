@@ -154,9 +154,10 @@ server codecs verify each other.
 |---|---|
 | `mod.rs` | clap args, phase orchestration, summary/exit code |
 | `archive.rs` | DwarFS/dir reader, manifest/requests/builds/impure-env parsing, narinfo sidecars, NAR packing of embedded trees |
-| `client.rs` | russh transport: connect/auth/channel, exec `nix-daemon --stdio`, handshake, op wrappers with deadlines |
-| `supply.rs` | workload set, source-resolution ladder, references-first upload planning, large-path routing, substituter probe/fetch (HTTP + S3) |
-| `prewarm.rs` | union scan → classification → chunked validity probe → topologically levelled upload |
+| `client.rs` | russh transport: connect/auth/channel, exec `nix-daemon --stdio`, handshake, op wrappers with deadlines, lazy re-dial of gateway-closed connections |
+| `substituter.rs` | binary-cache access: narinfo probe and NAR fetch/streaming over HTTPS and S3, with decompression and hash verification |
+| `supply.rs` | workload set, source-resolution ladder, references-first upload planning, large-path routing, cross-request upload claims |
+| `prewarm.rs` | shared supply context (union scan, coverage probes, relay resolution) → chunked validity probe → topologically levelled upload |
 | `timeline.rs` | request pacing (due = start + offset/speedup), admission under the session cap, in-flight tracking, disconnect replay |
 | `compare.rs` | verdict classification, per-output NAR-hash comparison, divergence log |
 | `report.rs` | human summary, `summary.json`, exit-code policy |
