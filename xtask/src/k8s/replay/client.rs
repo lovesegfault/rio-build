@@ -785,6 +785,9 @@ pub struct DaemonChannel {
 
 impl DaemonChannel {
     /// Worker-protocol version negotiated during the handshake.
+    // The replay pipeline only needs ops the minimum version already
+    // guarantees; kept for protocol triage from a debugger or future checks.
+    #[allow(dead_code)]
     pub fn negotiated_version(&self) -> u64 {
         self.negotiated_version
     }

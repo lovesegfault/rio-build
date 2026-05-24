@@ -107,6 +107,9 @@ pub struct OutputRecord {
     /// Lowercase hex SHA-256 of the uncompressed NAR.
     pub nar_hash_hex: String,
     /// Uncompressed NAR size in bytes.
+    // Comparison is by hash only; the size is part of the recorded format
+    // and kept for debugging archives by hand.
+    #[allow(dead_code)]
     pub nar_size: u64,
 }
 
@@ -123,6 +126,9 @@ pub mod prod_status {
     /// The recording client disconnected before the build finished.
     pub const CLIENT_DISCONNECT: i32 = 13;
     /// The build was aborted for resource exhaustion.
+    // The classifier folds this into the generic "deterministic failure"
+    // arm; the constant documents the recorded code.
+    #[allow(dead_code)]
     pub const RESOURCE_EXHAUSTED: i32 = 16;
 }
 
@@ -399,6 +405,9 @@ struct WalkEntry {
     name: String,
     kind: EntryKind,
     /// File size in bytes (0 for directories and symlinks).
+    // NAR packing reads file contents directly; the size is kept for
+    // debugging entry listings (Debug derive).
+    #[allow(dead_code)]
     size: u64,
     /// Executable bit (regular files only).
     executable: bool,
