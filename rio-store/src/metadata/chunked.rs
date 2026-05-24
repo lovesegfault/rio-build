@@ -250,11 +250,32 @@ pub(crate) async fn register_pending_chunks(
     sorted.sort_unstable();
     sorted.dedup_by(|a, b| a.0 == b.0);
     let (hashes, sizes): (Vec<Vec<u8>>, Vec<i64>) = sorted.into_iter().unzip();
+    // `created_at = now()` restarts the orphan-sweep grace clock. A
+    // digest left at refcount 0 by a prior failed attempt keeps its
+    // original `created_at`; without the reset, a retry's row is
+    // already past `CHUNK_GRACE_SECS` the moment the upload starts, and
+    // a sweep + drain firing during the retry's upload window would
+    // delete the S3 object underneath a commit that then references a
+    // missing key.
+    //
+    // TODO: the reset only protects uploads shorter than
+    // `CHUNK_GRACE_SECS` (300s). An upload still in its verify walk
+    // past that is sweep-eligible mid-flight (refcount 0, deleted
+    // false, created_at older than the grace window) — sweep tombstones
+    // the row, drain deletes the object, the commit then resurrects the
+    // row and produces a complete manifest whose chunk is gone from S3
+    // (surfaces as DATA_LOSS on GetPath; detectable by VerifyChunks).
+    // The legacy path is immune only because its write-ahead upsert
+    // bumps refcount to ≥1 before any S3 PUT. Closing this for the
+    // chunked path needs either an in-flight claim exclusion in the
+    // sweep's candidate query (e.g. a `claimed_until` column the
+    // placeholder heartbeat advances) or a provisional refcount that
+    // the commit converts and the placeholder reap decrements.
     sqlx::query(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
         SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[]) AS t(hash, zero, size)
-        ON CONFLICT (blake3_hash) DO UPDATE SET deleted = false
+        ON CONFLICT (blake3_hash) DO UPDATE SET deleted = false, created_at = now()
         "#,
     )
     .bind(&hashes)
