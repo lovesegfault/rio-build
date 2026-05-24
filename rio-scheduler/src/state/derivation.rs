@@ -1051,11 +1051,11 @@ impl DerivationState {
             },
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
-            // TODO: not yet persisted — recovered rows degrade to the
-            // empty sentinel (= all declared outputs wanted, today's
-            // conservative behaviour) until the migration adds the
-            // column and the recovery SELECT carries it.
-            wanted_output_names: Vec::new(),
+            // Persisted with union-on-conflict (`migrations/062`,
+            // `batch_upsert_derivations`). Pre-migration rows carry the
+            // column DEFAULT '{}' = all declared outputs wanted, so
+            // they recover with the old conservative criterion.
+            wanted_output_names: row.wanted_output_names,
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
             // ready_at: Some(now) if Ready → dispatch_wait_seconds
@@ -1925,6 +1925,7 @@ mod tests {
             resubmit_cycles: 0,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
+            wanted_output_names: vec![],
             is_fixed_output: false,
             // is_ca=true: this IS a CA derivation, so the flag
             // mattered pre-restart. Prove it's false post-restart
