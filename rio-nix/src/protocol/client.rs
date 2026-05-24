@@ -13,12 +13,14 @@ use super::handshake::{
     HandshakeError, HandshakeResult, PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2,
 };
 use super::opcodes::WorkerOp;
+use super::pathinfo::{ValidPathInfo, read_valid_path_info};
 use super::stderr::{
     ResultField, STDERR_ERROR, STDERR_LAST, STDERR_NEXT, STDERR_READ, STDERR_RESULT,
     STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY, STDERR_WRITE, StderrError,
 };
 use super::wire::{self, Result, WireError};
 use crate::derivation::BasicDerivation;
+use std::collections::BTreeSet;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// A message received from the daemon during the STDERR loop.
@@ -427,6 +429,56 @@ pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Send `wopQueryValidPaths` (31): ask which of `paths` the daemon already
+/// has.
+///
+/// `substitute = false` mirrors `nix copy` behaviour: answering the query
+/// must not trigger target-side substitution.
+///
+/// The daemon replies (after the STDERR loop) with the subset of `paths` it
+/// considers valid, returned here as a set.
+pub async fn client_query_valid_paths<R, W, S>(
+    reader: &mut R,
+    writer: &mut W,
+    paths: &[S],
+    substitute: bool,
+) -> std::result::Result<BTreeSet<String>, ClientOpError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: AsRef<str>,
+{
+    wire::write_u64(writer, WorkerOp::QueryValidPaths as u64).await?;
+    wire::write_strings(writer, paths).await?;
+    wire::write_bool(writer, substitute).await?;
+    writer.flush().await.map_err(WireError::Io)?;
+
+    drain_stderr_typed(reader).await?;
+    let valid = wire::read_strings(reader).await?;
+    Ok(valid.into_iter().collect())
+}
+
+/// Send `wopQueryPathInfo` (26): fetch one path's [`ValidPathInfo`], `None`
+/// if the daemon does not have the path.
+///
+/// The daemon replies (after the STDERR loop) with a found/not-found bool;
+/// the [`ValidPathInfo`] body follows only when found.
+pub async fn client_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    path: &str,
+) -> std::result::Result<Option<ValidPathInfo>, ClientOpError> {
+    wire::write_u64(writer, WorkerOp::QueryPathInfo as u64).await?;
+    wire::write_string(writer, path).await?;
+    writer.flush().await.map_err(WireError::Io)?;
+
+    drain_stderr_typed(reader).await?;
+    if !wire::read_bool(reader).await? {
+        return Ok(None);
+    }
+    Ok(Some(read_valid_path_info(reader).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +487,7 @@ mod tests {
         BuildResult, BuildStatus, read_basic_derivation, read_build_result, write_build_result,
     };
     use crate::protocol::handshake::{MIN_CLIENT_VERSION, encode_version, server_handshake_split};
+    use crate::protocol::pathinfo::write_valid_path_info;
     use crate::protocol::stderr::StderrWriter;
 
     fn test_drv() -> BasicDerivation {
@@ -1115,6 +1168,94 @@ mod tests {
             .await
             .expect_err("bad magic should fail handshake");
         assert!(matches!(err, HandshakeError::InvalidMagic(0xBADC0FFE)));
+        server.await??;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // client_query_valid_paths / client_query_path_info
+    // -----------------------------------------------------------------------
+
+    /// client_query_valid_paths wire layout round-trip: the request carries
+    /// the opcode, the path collection, and the substitute flag in the order
+    /// the gateway's `handle_query_valid_paths` reads them; the response
+    /// (after STDERR_LAST) is the daemon's collection of valid paths.
+    #[tokio::test]
+    async fn client_query_valid_paths_roundtrip() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let path_a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello";
+        let path_b = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::QueryValidPaths as u64);
+            let paths = wire::read_strings(&mut sr).await?;
+            assert_eq!(paths, vec![path_a.to_string(), path_b.to_string()]);
+            let substitute = wire::read_bool(&mut sr).await?;
+            assert!(!substitute, "substitute flag must reach the wire as false");
+            // Response: STDERR_LAST, then the valid subset (only path_a).
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            wire::write_strings(&mut sw, &[path_a]).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let valid = client_query_valid_paths(&mut cr, &mut cw, &[path_a, path_b], false).await?;
+        server.await??;
+        assert_eq!(valid, BTreeSet::from([path_a.to_string()]));
+        Ok(())
+    }
+
+    /// Two sequential client_query_path_info calls on one connection: a
+    /// found path yields `Some(ValidPathInfo)`, a missing path yields
+    /// `None`. Found/not-found is the bool the gateway's
+    /// `handle_query_path_info` writes after STDERR_LAST, with the
+    /// `ValidPathInfo` body following only when found.
+    #[tokio::test]
+    async fn client_query_path_info_found_and_missing() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let found_path = "/nix/store/cccccccccccccccccccccccccccccccc-found";
+        let missing_path = "/nix/store/dddddddddddddddddddddddddddddddd-missing";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+
+            // Call 1: path present — bool(true) + ValidPathInfo body.
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::QueryPathInfo as u64);
+            let path = wire::read_string(&mut sr).await?;
+            assert_eq!(path, found_path);
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            wire::write_bool(&mut sw, true).await?;
+            write_valid_path_info(
+                &mut sw,
+                &ValidPathInfo {
+                    nar_hash: vec![0xab; 32],
+                    nar_size: 123,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sw.flush().await?;
+
+            // Call 2: path missing — bool(false), nothing else.
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::QueryPathInfo as u64);
+            let path = wire::read_string(&mut sr).await?;
+            assert_eq!(path, missing_path);
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            wire::write_bool(&mut sw, false).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let info = client_query_path_info(&mut cr, &mut cw, found_path).await?;
+        assert_eq!(info.expect("path should be found").nar_size, 123);
+        let missing = client_query_path_info(&mut cr, &mut cw, missing_path).await?;
+        assert!(missing.is_none(), "missing path must map to None");
         server.await??;
         Ok(())
     }
