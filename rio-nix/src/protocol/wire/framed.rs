@@ -251,6 +251,12 @@ const FRAME_CHUNK: usize = 256 * 1024;
 /// Once dropped without [`finish`](Self::finish), the stream has no `u64(0)`
 /// sentinel and any partial frame is lost. The connection must be abandoned —
 /// the peer would wait for more frames indefinitely.
+///
+/// Likewise, if [`write`](Self::write) or [`finish`](Self::finish) returns an
+/// error or its future is dropped mid-flight, the underlying stream may be
+/// left mid-frame (length header written, body partial) with buffered data
+/// still held. Discard the writer and abandon the connection — continuing to
+/// use it would emit bytes the peer would misparse as frame payload.
 pub struct FramedWriter<W> {
     inner: W,
     /// Bytes accepted by `write` but not yet emitted as a frame.
@@ -608,6 +614,100 @@ pub(super) mod tests {
         let fw = FramedWriter::new(&mut buf);
         fw.finish().await?;
         assert_eq!(buf, 0u64.to_le_bytes());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn framed_writer_single_large_write_matches_sliced_writes() -> anyhow::Result<()> {
+        // One 600 KiB write() call crosses two frame boundaries; the output
+        // must be byte-identical to the same payload written in small slices
+        // (whose layout — 256 KiB, 256 KiB, 88 KiB, sentinel — is pinned by
+        // framed_writer_roundtrips_through_framed_stream_reader).
+        let payload: Vec<u8> = (0..600 * 1024).map(|i| (i % 251) as u8).collect();
+
+        let mut single = Vec::new();
+        let mut fw = FramedWriter::new(&mut single);
+        fw.write(&payload).await?;
+        fw.finish().await?;
+
+        let mut sliced = Vec::new();
+        let mut fw = FramedWriter::new(&mut sliced);
+        for chunk in payload.chunks(10_000) {
+            fw.write(chunk).await?;
+        }
+        fw.finish().await?;
+
+        assert_eq!(single, sliced);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn framed_writer_exact_frame_multiple_emits_no_empty_frame() -> anyhow::Result<()> {
+        // Exactly 2 × 256 KiB: finish() must add only the sentinel after the
+        // two full frames — no zero-length frame for the empty tail (a
+        // zero-length frame IS the terminator, so the peer would truncate).
+        let payload = vec![0x5Au8; 512 * 1024];
+        let mut buf = Vec::new();
+        let mut fw = FramedWriter::new(&mut buf);
+        fw.write(&payload).await?;
+        fw.finish().await?;
+
+        // u64(256 KiB) + data, u64(256 KiB) + data, u64(0) — nothing else.
+        assert_eq!(buf.len(), 3 * 8 + 512 * 1024);
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            256 * 1024
+        );
+        let second = 8 + 256 * 1024;
+        assert_eq!(
+            u64::from_le_bytes(buf[second..second + 8].try_into().unwrap()),
+            256 * 1024
+        );
+        assert_eq!(&buf[buf.len() - 8..], &[0u8; 8]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn framed_writer_empty_write_is_a_noop() -> anyhow::Result<()> {
+        // Zero-length write() calls leave the output unchanged: byte-identical
+        // to the same payload written without them (no empty frame emitted).
+        let payload = vec![0x42u8; 1000];
+
+        let mut with_empties = Vec::new();
+        let mut fw = FramedWriter::new(&mut with_empties);
+        fw.write(&[]).await?;
+        fw.write(&payload).await?;
+        fw.write(&[]).await?;
+        fw.finish().await?;
+
+        let mut without = Vec::new();
+        let mut fw = FramedWriter::new(&mut without);
+        fw.write(&payload).await?;
+        fw.finish().await?;
+
+        assert_eq!(with_empties, without);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn framed_writer_matches_eager_write_framed_stream() -> anyhow::Result<()> {
+        // Pin the doc claim "byte-identical to one-shot framing": incremental
+        // writes through FramedWriter produce exactly the bytes of the eager
+        // write_framed_stream at the same 256 KiB chunk size. Payload length
+        // is deliberately not a multiple of anything interesting.
+        let payload: Vec<u8> = (0..600 * 1024 + 123).map(|i| (i % 247) as u8).collect();
+
+        let mut incremental = Vec::new();
+        let mut fw = FramedWriter::new(&mut incremental);
+        for chunk in payload.chunks(7_777) {
+            fw.write(chunk).await?;
+        }
+        fw.finish().await?;
+
+        let mut eager = Vec::new();
+        write_framed_stream(&mut eager, &payload, 256 * 1024).await?;
+
+        assert_eq!(incremental, eager);
         Ok(())
     }
 }
