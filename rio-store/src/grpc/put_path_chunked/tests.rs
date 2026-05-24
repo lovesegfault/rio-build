@@ -277,6 +277,56 @@ fn reject_unsorted_directory_entries() {
     assert_invalid(&begin, "not strictly sorted");
 }
 
+/// A digest-consistent DAG whose parent lies about a child's recursive
+/// descendant count is rejected. The lie cannot be caught by digest
+/// recomputation alone — the wrong `size` is *covered* by the parent's
+/// digest, and the grandparent references the parent by that digest, so
+/// the whole chain checks out — only the cross-body size pass sees it.
+#[test]
+fn reject_inconsistent_child_directory_size() {
+    // Leaf: one symlink → actual descendant count 1.
+    let leaf = Directory {
+        directories: vec![],
+        files: vec![],
+        symlinks: vec![rio_proto::castore::SymlinkEntry {
+            name: b"l".to_vec(),
+            target: b"t".to_vec(),
+        }],
+    };
+    let leaf_digest = *blake3::hash(&leaf.encode_to_vec()).as_bytes();
+    // Root: claims the leaf has 99 descendants.
+    let root = Directory {
+        directories: vec![rio_proto::castore::DirectoryEntry {
+            name: b"sub".to_vec(),
+            digest: leaf_digest.to_vec(),
+            size: 99,
+        }],
+        files: vec![],
+        symlinks: vec![],
+    };
+    let root_digest = *blake3::hash(&root.encode_to_vec()).as_bytes();
+    let begin = PutPathChunkedBegin {
+        deriver: String::new(),
+        outputs: vec![ChunkedOutputHeader {
+            store_path: rio_test_support::fixtures::test_store_path("badsize"),
+            nar_hash: vec![0; 32],
+            nar_size: 1,
+            refs: vec![],
+            root_node: Some(RootNode {
+                node: Some(root_node::Node::DirDigest(root_digest.to_vec())),
+            }),
+            chunk_manifest: vec![],
+        }],
+        directories: vec![leaf, root],
+        novel: vec![],
+        input_closure: vec![],
+    };
+    assert_invalid(&begin, "descendants");
+    // The happy-path coverage for this check is the golden tests above:
+    // `castore::build` always emits true sizes, and those fixtures pass
+    // validation end-to-end.
+}
+
 #[test]
 fn reject_chunk_run_sum_mismatch() {
     let (mut begin, _t) = valid_begin();
@@ -431,6 +481,13 @@ fn reject_exponential_tree() {
         }],
     };
     let mut prev_digest = *blake3::hash(&leaf.encode_to_vec()).as_bytes();
+    // Each level's entries must declare the child's TRUE descendant
+    // count (the cross-body size check rejects inconsistent claims
+    // before the walk even starts — that's a different rejection than
+    // the one this test is for). The counts are honest; the DAG is
+    // still a bomb because the deduplicated bodies expand to 64^4
+    // materialized entries.
+    let mut prev_total: u64 = 1;
     bodies.push(leaf);
     for _level in 0..4 {
         let dir = Directory {
@@ -438,13 +495,14 @@ fn reject_exponential_tree() {
                 .map(|i| rio_proto::castore::DirectoryEntry {
                     name: format!("d{i:02}").into_bytes(),
                     digest: prev_digest.to_vec(),
-                    size: 1,
+                    size: prev_total,
                 })
                 .collect(),
             files: vec![],
             symlinks: vec![],
         };
         prev_digest = *blake3::hash(&dir.encode_to_vec()).as_bytes();
+        prev_total = 64 * (1 + prev_total);
         bodies.push(dir);
     }
     let begin = PutPathChunkedBegin {

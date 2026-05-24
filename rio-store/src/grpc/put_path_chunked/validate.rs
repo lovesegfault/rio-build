@@ -240,8 +240,11 @@ pub(super) fn validate_begin(
     }
     let mut directories: HashMap<[u8; 32], Directory> =
         HashMap::with_capacity(begin.directories.len());
+    // Recursive descendant count per body, keyed by recomputed digest.
+    // Used by the cross-body size-consistency pass below.
+    let mut totals: HashMap<[u8; 32], u64> = HashMap::with_capacity(begin.directories.len());
     for d in &begin.directories {
-        validate_directory(d)?;
+        let total = validate_directory(d)?;
         // Canonical digest is recomputed server-side from the canonical
         // encode — the body is attested by content, never by claim.
         // r[impl store.castore.canonical-encoding]
@@ -251,6 +254,32 @@ pub(super) fn validate_begin(
                 "duplicate Directory body {}",
                 hex::encode(digest)
             )));
+        }
+        totals.insert(digest, total);
+    }
+    // Child-size consistency across bodies: a parent's claimed
+    // `DirectoryEntry.size` must equal the child body's actual
+    // recursive descendant count. The whole chain is digest-consistent
+    // by construction (the size is covered by the parent's digest), so
+    // a builder can fabricate any value — this is the snix
+    // `Directory::validate` cross-check that catches it. Children whose
+    // body is absent from the map are left to the reachability walk
+    // (reachable-and-missing is its own rejection; unreachable is
+    // harmless).
+    for d in directories.values() {
+        for e in &d.directories {
+            let child: [u8; 32] = e.digest.as_slice().try_into().expect("validated 32 bytes");
+            if let Some(actual) = totals.get(&child)
+                && e.size != *actual
+            {
+                return Err(invalid(format!(
+                    "DirectoryEntry \"{}\" claims child {} has {} descendants but its body \
+                     has {actual}",
+                    e.name.escape_ascii(),
+                    hex::encode(child),
+                    e.size,
+                )));
+            }
         }
     }
 
@@ -531,7 +560,12 @@ pub(super) fn validate_begin(
 /// intra-list duplicates), names are unique ACROSS the lists, child
 /// digests are 32 bytes, symlink targets are bounded, and the
 /// recursive descendant count does not overflow.
-fn validate_directory(d: &Directory) -> Result<(), Status> {
+///
+/// Returns the body's own recursive descendant count (computed from
+/// its children's CLAIMED sizes); the caller cross-checks every
+/// `DirectoryEntry.size` against the referenced child body's returned
+/// count once all bodies are digested.
+fn validate_directory(d: &Directory) -> Result<u64, Status> {
     fn check_name(name: &[u8]) -> Result<(), Status> {
         if name.is_empty() {
             return Err(invalid("Directory entry name must not be empty"));
@@ -611,10 +645,11 @@ fn validate_directory(d: &Directory) -> Result<(), Status> {
             )));
         }
     }
-    // Child-size consistency: the recursive descendant count must not
-    // overflow. The exact per-child value is verified implicitly by the
-    // walk's entry-count bound; here we reject the overflow case so the
-    // count arithmetic stays in u64.
+    // Recursive descendant count: `len(files) + len(symlinks) +
+    // Σ(1 + child.size)` — the same formula `castore::build` uses.
+    // Overflow is rejected here; whether each `e.size` term is TRUE is
+    // checked by the caller's cross-body pass once every child body's
+    // own count is known (this function sees one body in isolation).
     let mut total: u64 = d.files.len() as u64 + d.symlinks.len() as u64;
     for e in &d.directories {
         total = total
@@ -622,7 +657,7 @@ fn validate_directory(d: &Directory) -> Result<(), Status> {
             .and_then(|t| t.checked_add(e.size))
             .ok_or_else(|| invalid("Directory descendant count overflows u64"))?;
     }
-    Ok(())
+    Ok(total)
 }
 
 /// Result of [`walk_output`].
@@ -955,6 +990,16 @@ fn walk_output(
     /// [`NarSegment::Framing`] segments, each ≤ [`CHUNK_MAX`] bytes
     /// (the framing runs become CAS chunks; the read path's per-chunk
     /// buffers assume the chunker's max). No-op on an empty buffer.
+    ///
+    /// TODO: each framing run becomes its own S3 object (~100–300 B
+    /// between adjacent files), so a 20k-file output produces 40k+
+    /// extra small objects — per-request PUT cost roughly doubles for
+    /// file-heavy outputs and the chunks table grows accordingly. If
+    /// this shows up in S3 request bills or chunk-row counts, coalesce
+    /// each framing run into the preceding or following content chunk
+    /// (one merged chunk per boundary, still ≤ CHUNK_MAX + framing
+    /// overhead) at the cost of losing content-chunk dedup across
+    /// outputs whose file contents match but whose entry names differ.
     fn flush_framing(segments: &mut Vec<NarSegment>, framing: &mut Vec<u8>) {
         if framing.is_empty() {
             return;
