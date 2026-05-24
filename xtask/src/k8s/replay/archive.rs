@@ -197,7 +197,7 @@ impl ReplayArchive {
                 .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
             let parsed = std::str::from_utf8(&bytes)
                 .map_err(anyhow::Error::from)
-                .and_then(|text| NarInfo::parse(text).map_err(anyhow::Error::from));
+                .and_then(|text| parse_narinfo_sidecar(text, stem));
             match parsed {
                 Ok(narinfo) => {
                     // Key by the hash part so `<hash>-<name>.narinfo` sidecar
@@ -356,6 +356,31 @@ fn parse_builds(bytes: &[u8]) -> Result<HashMap<(i64, String), BuildRecord>> {
         out.insert((record.ssh_session_id, record.drv_path.clone()), record);
     }
     Ok(out)
+}
+
+/// Parse one narinfo sidecar. Sidecars for paths embedded in the archive
+/// legitimately lack a `URL:` line — they describe contents of the archive
+/// itself, not a fetchable cache object, so there is no URL to record — but
+/// [`NarInfo::parse`] requires the field. Synthesize a placeholder (never
+/// dereferenced; embedded bytes come from [`ReplayArchive::dump_nar`]) and
+/// retry. Any other failure, or a failure with a `URL:` line present, is
+/// returned as-is so the caller can warn-and-skip.
+fn parse_narinfo_sidecar(text: &str, stem: &str) -> Result<NarInfo> {
+    match NarInfo::parse(text) {
+        Ok(narinfo) => Ok(narinfo),
+        Err(err) => {
+            let has_url = text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .any(|(key, _)| key.trim() == "URL");
+            if has_url {
+                Err(err.into())
+            } else {
+                NarInfo::parse(&format!("{text}\nURL: nar/{stem}.nar\n"))
+                    .map_err(anyhow::Error::from)
+            }
+        }
+    }
 }
 
 /// The hash part of a store path: the basename characters before the first
@@ -694,6 +719,22 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(&nar).into();
         let nar_hash = format!("sha256:{}", rio_nix::store_path::nixbase32::encode(&digest));
         assert_eq!(nar_hash, ni.nar_hash);
+    }
+
+    /// Real recorders omit `URL:` from embedded-path sidecars (there is no
+    /// cache URL to record); the loader must still accept them. The fixture's
+    /// `c1111...narinfo` has no `URL:` line. `basic.dwarfs` is intentionally
+    /// NOT regenerated with this sidecar — the DwarFS smoke test only asserts
+    /// against contents that image already carries.
+    #[test]
+    fn narinfo_without_url_is_accepted() {
+        let a = ReplayArchive::open(&fixture()).unwrap();
+        let ni = a.narinfo("c1111111111111111111111111111111").unwrap();
+        assert_eq!(ni.nar_size, 200);
+        assert_eq!(
+            ni.store_path,
+            "/nix/store/c1111111111111111111111111111111-dep"
+        );
     }
 
     /// Smoke test for the DwarFS backend against a committed image of the
