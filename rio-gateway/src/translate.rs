@@ -5,10 +5,11 @@
 //! the full derivation graph.
 // r[impl gw.dag.reconstruct+2]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
 use rio_nix::derivation::{Derivation, DerivationLike};
+use rio_nix::protocol::derived_path::OutputSpec;
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types;
@@ -37,6 +38,13 @@ use crate::drv_cache::{max_transitive_inputs, resolve_derivations_batch};
 ///
 /// Returns `(nodes, edges)` for `SubmitBuildRequest`.
 ///
+/// `root_outputs` is the root request's output selection (`^out,dev` /
+/// `^*`). `None` means the opcode carries no selection
+/// (`wopBuildDerivation`) — treated like `^*`: every declared output of
+/// the root is wanted. It only feeds `wanted_output_names` (see
+/// [`populate_wanted_outputs`]); the node/edge set is identical for
+/// every value.
+///
 /// NOTE: all store lookups here are ANONYMOUS (no JWT). This is build
 /// INPUT resolution — `.drv` files and their `input_srcs` may have been
 /// uploaded via a different tenant context. See `resolve_derivation`
@@ -44,6 +52,7 @@ use crate::drv_cache::{max_transitive_inputs, resolve_derivations_batch};
 pub async fn reconstruct_dag(
     root_path: &StorePath,
     root_drv: &Derivation,
+    root_outputs: Option<&OutputSpec>,
     store_client: &mut StoreServiceClient<Channel>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<(Vec<types::DerivationNode>, Vec<types::DerivationEdge>)> {
@@ -158,6 +167,12 @@ pub async fn reconstruct_dag(
     // env/args — it needs resolve even though it's not floating-CA
     // itself. AFTER BFS so every child is in drv_cache.
     populate_needs_resolve(&mut nodes, drv_cache);
+
+    // Populate wanted_output_names: the union of every consumer's
+    // inputDrvs output-name set ∪ the root request's OutputSpec.
+    // AFTER BFS so every consumer's parsed inputDrvs map is in
+    // drv_cache. Empty = all declared outputs wanted.
+    populate_wanted_outputs(&mut nodes, drv_cache, root_path.as_str(), root_outputs);
 
     Ok((nodes, edges))
 }
@@ -295,6 +310,86 @@ fn populate_needs_resolve(
         .collect();
     for idx in deferred {
         nodes[idx].needs_resolve = true;
+    }
+}
+
+/// Fill `wanted_output_names` on each node: the union of every
+/// consumer's `inputDrvs[node]` output-name set, ∪ the root request's
+/// `OutputSpec` for the root node. EMPTY means "all declared outputs
+/// wanted" — the conservative pre-existing behaviour.
+///
+/// - A `^*` root (`OutputSpec::All`) and a root with no spec at all
+///   (`wopBuildDerivation` carries no output selection) keep the empty
+///   sentinel. Empty SATURATES the union: "all" ∪ X = "all", so a node
+///   that any contributor wants in full stays empty no matter what the
+///   other contributors name.
+/// - A `^out,dev` root (`OutputSpec::Names`) contributes those names to
+///   the root node's union. Within one BFS the root has no consumers
+///   (a consumer would be a cycle), but the union is written
+///   symmetrically so the same node reached as a *dependency* of
+///   another root in a multi-root submission merges correctly in
+///   `dedup_dag`.
+/// - A BFS-reachable non-root node always has at least one consumer
+///   naming it (the BFS only discovers nodes via some parent's
+///   inputDrvs). If its consumer is somehow missing from `drv_cache`
+///   (BFS inconsistency — our bug), the node keeps the empty (= all
+///   wanted) sentinel: conservative, never under-wanting.
+///
+/// The result is sorted for determinism — the scheduler's PG upsert
+/// unions arrays with `ORDER BY 1`, so a sorted wire value keeps the
+/// in-memory and persisted sets byte-identical.
+///
+/// Only the scheduler's cache-hit / substitutability classification
+/// reads this; `output_names` / `expected_output_paths` keep the full
+/// declared set (assignment-token allowlist, GC pins, client report).
+fn populate_wanted_outputs(
+    nodes: &mut [types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+    root_path: &str,
+    root_outputs: Option<&OutputSpec>,
+) {
+    // child drv_path → union of every consumer's named outputs.
+    // BTreeSet gives the sorted-dedup for free. Owned strings: a
+    // borrowed map would carry `iter_cached_drvs`'s unified borrow of
+    // `nodes` into the write-back loop below, which needs `nodes`
+    // mutably (the same split the sibling passes sidestep with their
+    // collect-then-apply shape).
+    let mut wanted: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (_, _, drv) in iter_cached_drvs(nodes, drv_cache, "populate_wanted_outputs") {
+        for (child_path, output_names) in drv.input_drvs() {
+            wanted
+                .entry(child_path.clone())
+                .or_default()
+                .extend(output_names.iter().cloned());
+        }
+    }
+
+    // The root's own demand. Names joins the union; All / no-spec pins
+    // the root to the empty (= all wanted) sentinel, overriding any
+    // consumer contribution (all ∪ X = all).
+    let mut root_wants_all = false;
+    match root_outputs {
+        Some(OutputSpec::Names(names)) => {
+            wanted
+                .entry(root_path.to_string())
+                .or_default()
+                .extend(names.iter().cloned());
+        }
+        Some(OutputSpec::All) | None => root_wants_all = true,
+    }
+
+    for node in nodes.iter_mut() {
+        if root_wants_all && node.drv_path == root_path {
+            // Already empty from build_node, but be explicit: the
+            // saturated "all wanted" sentinel wins over anything.
+            node.wanted_output_names.clear();
+            continue;
+        }
+        if let Some(names) = wanted.get(node.drv_path.as_str()) {
+            node.wanted_output_names = names.iter().cloned().collect();
+        }
+        // else: no consumer names it and it isn't a Names-root —
+        // keep the empty (= all wanted) sentinel from build_node.
     }
 }
 
@@ -519,11 +614,13 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
-        // Empty here (= "all declared outputs wanted"). A post-BFS pass
-        // will narrow this to the union of every consumer's inputDrvs
-        // output-name set ∪ the root request's OutputsSpec once the
-        // full DAG is available — same staging as ca_modular_hash /
-        // needs_resolve below.
+        // Empty here (= "all declared outputs wanted").
+        // populate_wanted_outputs() narrows this to the union of every
+        // consumer's inputDrvs output-name set ∪ the root request's
+        // OutputSpec AFTER the full BFS — same staging as
+        // ca_modular_hash / needs_resolve below. The BasicDerivation
+        // single-node fallback never runs the pass, so it keeps the
+        // conservative all-wanted sentinel.
         wanted_output_names: Vec::new(),
         drv_content: Vec::new(),
         is_content_addressed: drv.is_content_addressed(),
@@ -1196,7 +1293,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
-        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache)
             .await
             .expect("reconstruct should succeed");
 
@@ -1222,7 +1319,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(child_path.clone(), child_drv);
 
-        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache)
             .await
             .expect("reconstruct should succeed");
 
@@ -1252,7 +1349,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new(); // child NOT in cache
 
-        let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
+        let result = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache).await;
 
         let err = result.expect_err("unresolvable inputDrv must fail reconstruct_dag");
         let msg = err.to_string();
@@ -1282,7 +1379,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
-        let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
+        let result = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache).await;
 
         let err = result.expect_err("invalid inputDrv path must fail reconstruct_dag");
         let msg = err.to_string();
@@ -1312,7 +1409,7 @@ mod tests {
         cache.insert(b_path.clone(), b_drv);
         cache.insert(c_path.clone(), c_drv);
 
-        let (nodes, edges) = reconstruct_dag(&a_path, &a_drv, &mut store, &mut cache)
+        let (nodes, edges) = reconstruct_dag(&a_path, &a_drv, None, &mut store, &mut cache)
             .await
             .expect("reconstruct should succeed");
 
@@ -1346,7 +1443,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
-        let err = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+        let err = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache)
             .await
             .expect_err("over-cap frontier must be rejected");
         let msg = err.to_string();
@@ -1856,6 +1953,251 @@ mod tests {
         assert!(
             !nodes[4].needs_resolve,
             "IA with only concrete-IA input → still false"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // populate_wanted_outputs
+    // -------------------------------------------------------------------
+
+    /// Multi-output test derivation: each name in `output_names` gets the
+    /// concrete IA path `<out_base>-<name>`. Same ATerm shape as
+    /// [`make_test_derivation`] but with N outputs instead of one.
+    fn make_multi_output_derivation(
+        out_base: &str,
+        output_names: &[&str],
+        input_drvs: &[(&str, &[&str])],
+    ) -> Derivation {
+        let outputs: Vec<String> = output_names
+            .iter()
+            .map(|n| format!(r#"("{n}","{out_base}-{n}","","")"#))
+            .collect();
+        let inputs: Vec<String> = input_drvs
+            .iter()
+            .map(|(path, outs)| {
+                let outs_str: Vec<String> = outs.iter().map(|o| format!(r#""{o}""#)).collect();
+                format!(r#"("{path}",[{}])"#, outs_str.join(","))
+            })
+            .collect();
+        let aterm = format!(
+            r#"Derive([{}],[{}],[],"x86_64-linux","/bin/sh",[],[])"#,
+            outputs.join(","),
+            inputs.join(",")
+        );
+        Derivation::parse(&aterm).expect("test ATerm should parse")
+    }
+
+    /// A node consumed by one parent that names only `{out}` of its three
+    /// declared outputs gets `wanted_output_names == ["out"]`. The `^*`
+    /// root keeps the empty (= all declared outputs wanted) sentinel.
+    /// `output_names` / `expected_output_paths` keep the FULL declared
+    /// set — the wanted set is an additional field, not a narrowing.
+    #[test]
+    fn populate_wanted_outputs_from_consumer_input_drvs() {
+        let parent_path = sp("/nix/store/pppppppppppppppppppppppppppppppp-parent.drv");
+        let child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv");
+
+        // Child declares debug/dev/out; the parent's inputDrvs entry for
+        // it names only {out}.
+        let child = make_multi_output_derivation(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc",
+            &["debug", "dev", "out"],
+            &[],
+        );
+        let parent = make_test_derivation(
+            "/nix/store/ppp-parent-out",
+            &[(child_path.as_str(), &["out"])],
+        );
+
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(parent_path.clone(), parent.clone());
+        drv_cache.insert(child_path.clone(), child.clone());
+
+        let mut nodes = vec![
+            build_node(parent_path.as_str(), &parent),
+            build_node(child_path.as_str(), &child),
+        ];
+        // Pre-pass: build_node leaves the field empty (= all wanted).
+        assert!(nodes[0].wanted_output_names.is_empty());
+        assert!(nodes[1].wanted_output_names.is_empty());
+
+        populate_wanted_outputs(
+            &mut nodes,
+            &drv_cache,
+            parent_path.as_str(),
+            Some(&OutputSpec::All),
+        );
+
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            Vec::<String>::new(),
+            "^* root → empty (= all declared outputs wanted)"
+        );
+        assert_eq!(
+            nodes[1].wanted_output_names,
+            vec!["out"],
+            "child wanted = the one output its only consumer's inputDrvs names"
+        );
+        // The declared-output arrays are NOT narrowed (they stay
+        // index-paired and load-bearing for the assignment token / GC
+        // pins / client output report).
+        assert_eq!(nodes[1].output_names, vec!["debug", "dev", "out"]);
+        assert_eq!(nodes[1].expected_output_paths.len(), 3);
+    }
+
+    /// Two parents naming different subsets of the same child →
+    /// the child's wanted set is the sorted union.
+    #[test]
+    fn populate_wanted_outputs_unions_across_consumers() {
+        let root_path = sp("/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-root.drv");
+        let a_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let b_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        let child_path = sp("/nix/store/dddddddddddddddddddddddddddddddd-glibc.drv");
+
+        let child = make_multi_output_derivation(
+            "/nix/store/dddddddddddddddddddddddddddddddd-glibc",
+            &["debug", "dev", "out"],
+            &[],
+        );
+        // A consumes child^out, B consumes child^dev.
+        let a = make_test_derivation("/nix/store/aaa-out", &[(child_path.as_str(), &["out"])]);
+        let b = make_test_derivation("/nix/store/bbb-out", &[(child_path.as_str(), &["dev"])]);
+        let root = make_test_derivation(
+            "/nix/store/rrr-out",
+            &[(a_path.as_str(), &["out"]), (b_path.as_str(), &["out"])],
+        );
+
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(root_path.clone(), root.clone());
+        drv_cache.insert(a_path.clone(), a.clone());
+        drv_cache.insert(b_path.clone(), b.clone());
+        drv_cache.insert(child_path.clone(), child.clone());
+
+        let mut nodes = vec![
+            build_node(root_path.as_str(), &root),
+            build_node(a_path.as_str(), &a),
+            build_node(b_path.as_str(), &b),
+            build_node(child_path.as_str(), &child),
+        ];
+
+        populate_wanted_outputs(
+            &mut nodes,
+            &drv_cache,
+            root_path.as_str(),
+            Some(&OutputSpec::All),
+        );
+
+        assert_eq!(
+            nodes[3].wanted_output_names,
+            vec!["dev", "out"],
+            "union of both consumers' inputDrvs sets, sorted for determinism"
+        );
+        // The intermediate consumers are each named {out} by the root.
+        assert_eq!(nodes[1].wanted_output_names, vec!["out"]);
+        assert_eq!(nodes[2].wanted_output_names, vec!["out"]);
+    }
+
+    /// The root request's OutputSpec seeds the root node's wanted set:
+    /// `^out` → `["out"]`; `^*` → empty (= all); no spec at all (the
+    /// `wopBuildDerivation` path carries no output selection) → empty.
+    #[test]
+    fn populate_wanted_outputs_root_outputs_spec() {
+        let root_path = sp("/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-multi.drv");
+        let root = make_multi_output_derivation(
+            "/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-multi",
+            &["debug", "dev", "out"],
+            &[],
+        );
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(root_path.clone(), root.clone());
+
+        // `^dev,out` → exactly those names, sorted.
+        let mut nodes = vec![build_node(root_path.as_str(), &root)];
+        populate_wanted_outputs(
+            &mut nodes,
+            &drv_cache,
+            root_path.as_str(),
+            Some(&OutputSpec::Names(vec!["out".into(), "dev".into()])),
+        );
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            vec!["dev", "out"],
+            "^dev,out root → exactly the requested names, sorted"
+        );
+
+        // `^*` → empty (= all declared outputs wanted).
+        let mut nodes = vec![build_node(root_path.as_str(), &root)];
+        populate_wanted_outputs(
+            &mut nodes,
+            &drv_cache,
+            root_path.as_str(),
+            Some(&OutputSpec::All),
+        );
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            Vec::<String>::new(),
+            "^* root → empty sentinel (all declared outputs wanted)"
+        );
+
+        // No spec (wopBuildDerivation carries none) → empty (= all).
+        let mut nodes = vec![build_node(root_path.as_str(), &root)];
+        populate_wanted_outputs(&mut nodes, &drv_cache, root_path.as_str(), None);
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            Vec::<String>::new(),
+            "no root spec → empty sentinel (all declared outputs wanted)"
+        );
+    }
+
+    /// `reconstruct_dag` wires the pass: the post-BFS node list carries
+    /// consumer-derived wanted sets without the caller doing anything
+    /// beyond passing the root's OutputSpec. Mirrors production where
+    /// `resolve_derivation` has already inserted the root into
+    /// `drv_cache` before `reconstruct_dag` runs.
+    #[tokio::test]
+    async fn test_reconstruct_dag_populates_wanted_outputs() {
+        let root_path = sp(&test_drv_path("root"));
+        let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc.drv");
+
+        let child = make_multi_output_derivation(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc",
+            &["debug", "dev", "out"],
+            &[],
+        );
+        let root = make_test_derivation(
+            "/nix/store/aaa-root-out",
+            &[(child_path.as_str(), &["dev"])],
+        );
+
+        let mut store = unreachable_store();
+        let mut cache = HashMap::new();
+        // Production inserts the root via resolve_derivation before
+        // calling reconstruct_dag; the populate pass reads consumers'
+        // inputDrvs out of the cache.
+        cache.insert(root_path.clone(), root.clone());
+        cache.insert(child_path.clone(), child);
+
+        let (nodes, _edges) = reconstruct_dag(
+            &root_path,
+            &root,
+            Some(&OutputSpec::Names(vec!["out".into()])),
+            &mut store,
+            &mut cache,
+        )
+        .await
+        .expect("reconstruct should succeed");
+
+        let by_path: HashMap<&str, &types::DerivationNode> =
+            nodes.iter().map(|n| (n.drv_path.as_str(), n)).collect();
+        assert_eq!(
+            by_path[root_path.as_str()].wanted_output_names,
+            vec!["out"],
+            "root wanted = the request's ^out"
+        );
+        assert_eq!(
+            by_path[child_path.as_str()].wanted_output_names,
+            vec!["dev"],
+            "child wanted = the output the root's inputDrvs entry names"
         );
     }
 }

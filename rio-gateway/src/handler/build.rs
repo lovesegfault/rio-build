@@ -7,7 +7,7 @@ use rio_nix::derivation::Derivation;
 use rio_nix::protocol::build::{
     BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
 };
-use rio_nix::protocol::derived_path::DerivedPath;
+use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
 use rio_nix::protocol::stderr::{
     ActivityType, ResultField, ResultType, StderrError, StderrWriter, verbosity,
 };
@@ -1194,7 +1194,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let (nodes, edges) = match &full_drv {
         Ok(drv) => {
-            match translate::reconstruct_dag(&drv_path, drv, store_client, drv_cache).await {
+            // wopBuildDerivation carries no output selection on the wire
+            // — `None` keeps the root's wanted_output_names empty
+            // (= every declared output wanted).
+            match translate::reconstruct_dag(&drv_path, drv, None, store_client, drv_cache).await {
                 Ok((n, e)) => (n, e),
                 Err(dag_err) => {
                     // Degrading to a 1-node DAG here is wrong: an
@@ -1378,9 +1381,44 @@ async fn enrich_build_result_with_outputs(
 /// root, producing duplicate nodes/edges. The scheduler tolerates dups
 /// (MergeDag is idempotent; `derivation_edges` PK is `(parent,child)` so
 /// dups are `ON CONFLICT DO NOTHING`) but they waste bytes + PG RTTs.
+///
+/// Duplicates are identical EXCEPT for `wanted_output_names` — that is
+/// the one field computed from the *consumers reachable in one root's
+/// BFS* rather than from the `.drv` itself, so each root's copy carries
+/// only that root's demand. Retain-first must therefore UNION the
+/// dropped duplicate's wanted set into the retained node: dropping it
+/// un-wants whatever the other root asked for (root A wants `child^out`,
+/// root B wants `child^dev` — keeping only A's copy would let the
+/// scheduler treat a missing `dev` output as ignorable). Empty
+/// saturates the union (empty = "all declared outputs wanted", and
+/// all ∪ X = all). Mirrors `DerivationState::union_wanted` and the PG
+/// upsert's union-on-conflict.
 fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::DerivationEdge>) {
-    let mut seen = HashSet::new();
-    nodes.retain(|n| seen.insert(n.drv_path.clone()));
+    let mut keep: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<types::DerivationNode> = Vec::with_capacity(nodes.len());
+    for node in nodes.drain(..) {
+        match keep.entry(node.drv_path.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(deduped.len());
+                deduped.push(node);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let kept = &mut deduped[*e.get()].wanted_output_names;
+                if kept.is_empty() || node.wanted_output_names.is_empty() {
+                    // all ∪ anything = all.
+                    kept.clear();
+                } else {
+                    for name in node.wanted_output_names {
+                        if !kept.contains(&name) {
+                            kept.push(name);
+                        }
+                    }
+                    kept.sort_unstable();
+                }
+            }
+        }
+    }
+    *nodes = deduped;
     let mut seen_edges = HashSet::new();
     edges.retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
 }
@@ -1473,8 +1511,13 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 /// do `resolve_derivation` → `reconstruct_dag` → extend nodes/edges,
 /// differing only in error sink (`stderr_err!` abort vs. per-path
 /// `BuildResult::failure`).
+///
+/// `outputs` is the request's `^out,dev` / `^*` selection for THIS
+/// root — it seeds the root node's `wanted_output_names` (`^*` keeps
+/// the empty all-wanted sentinel).
 async fn resolve_built_dag(
     drv: &StorePath,
+    outputs: &OutputSpec,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<(
     Vec<types::DerivationNode>,
@@ -1482,9 +1525,14 @@ async fn resolve_built_dag(
     Derivation,
 )> {
     let drv_obj = resolve_derivation(drv, &mut ctx.store_client, &mut ctx.drv_cache).await?;
-    let (nodes, edges) =
-        translate::reconstruct_dag(drv, &drv_obj, &mut ctx.store_client, &mut ctx.drv_cache)
-            .await?;
+    let (nodes, edges) = translate::reconstruct_dag(
+        drv,
+        &drv_obj,
+        Some(outputs),
+        &mut ctx.store_client,
+        &mut ctx.drv_cache,
+    )
+    .await?;
     Ok((nodes, edges, drv_obj))
 }
 
@@ -1522,13 +1570,15 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
                     Err(e) => stderr_err!(stderr, "store error: {e}"),
                 }
             }
-            DerivedPath::Built { drv, .. } => match resolve_built_dag(drv, ctx).await {
-                Ok((nodes, edges, _)) => {
-                    all_nodes.extend(nodes);
-                    all_edges.extend(edges);
+            DerivedPath::Built { drv, outputs } => {
+                match resolve_built_dag(drv, outputs, ctx).await {
+                    Ok((nodes, edges, _)) => {
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                    }
+                    Err(e) => stderr_err!(stderr, "DAG reconstruction failed for '{drv}': {e}"),
                 }
-                Err(e) => stderr_err!(stderr, "DAG reconstruction failed for '{drv}': {e}"),
-            },
+            }
         }
     }
 
@@ -1612,19 +1662,21 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     };
                 opaque_results.insert(idx, result);
             }
-            DerivedPath::Built { drv, .. } => match resolve_built_dag(drv, ctx).await {
-                Ok((nodes, edges, drv_obj)) => {
-                    all_nodes.extend(nodes);
-                    all_edges.extend(edges);
-                    drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
+            DerivedPath::Built { drv, outputs } => {
+                match resolve_built_dag(drv, outputs, ctx).await {
+                    Ok((nodes, edges, drv_obj)) => {
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                        drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
+                    }
+                    Err(e) => {
+                        opaque_results.insert(
+                            idx,
+                            BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
+                        );
+                    }
                 }
-                Err(e) => {
-                    opaque_results.insert(
-                        idx,
-                        BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
-                    );
-                }
-            },
+            }
         }
     }
 
@@ -1711,6 +1763,69 @@ mod tests {
             output_paths: outs.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// Multi-root submissions concatenate per-root node lists, so a drv
+    /// reachable from two roots appears twice — each copy carrying the
+    /// wanted set computed from THAT root's consumers/spec only.
+    /// Retain-first dedup must UNION the dropped duplicate's
+    /// `wanted_output_names` into the retained node: dropping it
+    /// un-wants whatever the other root demanded (root A wants
+    /// `child^out`, root B wants `child^dev` — keeping only A's copy
+    /// would let the scheduler treat a missing `dev` as ignorable).
+    /// Empty saturates the union (empty = "all declared outputs
+    /// wanted", and all ∪ X = all).
+    #[test]
+    fn dedup_dag_unions_wanted_output_names() {
+        let mk = |wanted: &[&str]| types::DerivationNode {
+            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+            drv_hash: "x".into(),
+            wanted_output_names: wanted.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+
+        // {out} ∪ {dev} = {dev, out} (sorted union).
+        let mut nodes = vec![mk(&["out"]), mk(&["dev"])];
+        let mut edges = Vec::new();
+        dedup_dag(&mut nodes, &mut edges);
+        assert_eq!(nodes.len(), 1, "duplicates by drv_path collapse to one");
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            vec!["dev", "out"],
+            "retained node must carry the UNION of all duplicates' wanted sets"
+        );
+
+        // {out} ∪ {} = {} — the empty (= all-wanted) sentinel saturates.
+        let mut nodes = vec![mk(&["out"]), mk(&[])];
+        dedup_dag(&mut nodes, &mut Vec::new());
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            Vec::<String>::new(),
+            "all ∪ {{out}} = all (empty saturates)"
+        );
+
+        // {} ∪ {out} = {} — saturation is order-independent.
+        let mut nodes = vec![mk(&[]), mk(&["out"])];
+        dedup_dag(&mut nodes, &mut Vec::new());
+        assert_eq!(
+            nodes[0].wanted_output_names,
+            Vec::<String>::new(),
+            "{{out}} ∪ all = all (empty saturates regardless of which copy is retained)"
+        );
+
+        // Distinct drv_paths are untouched (no spurious cross-node union).
+        let mut nodes = vec![
+            types::DerivationNode {
+                drv_path: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y.drv".into(),
+                wanted_output_names: vec!["out".into()],
+                ..Default::default()
+            },
+            mk(&["dev"]),
+        ];
+        dedup_dag(&mut nodes, &mut Vec::new());
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].wanted_output_names, vec!["out"]);
+        assert_eq!(nodes[1].wanted_output_names, vec!["dev"]);
     }
 
     /// Wire helper: read one full `STDERR_START_ACTIVITY` frame and
