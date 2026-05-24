@@ -12,6 +12,12 @@ use std::path::PathBuf;
 use crate::config::XtaskConfig;
 use crate::k8s::provider::{Provider, ProviderKind};
 
+// The archive reader lands ahead of its consumers — the supply/prewarm/
+// timeline modules wire it into `run` next; the allow goes away with the
+// first real caller.
+#[allow(dead_code)]
+mod archive;
+
 /// Exit-code policy for a replay run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum FailOn {
@@ -164,7 +170,7 @@ mod tests {
     /// - NAR-serializes the embedded source store path and prints the
     ///   `NarHash`/`NarSize` values that `narinfo/<hash>.narinfo` must carry
     ///   (`sha256:<nixbase32>` — the encoding `NarInfo` stores verbatim).
-    /// - Parses all three fixture `.drv` files with the rio-nix ATerm parser.
+    /// - Parses all four fixture `.drv` files with the rio-nix ATerm parser.
     /// - Parses the committed narinfo and asserts it matches the recomputed
     ///   hash/size.
     ///
@@ -193,6 +199,7 @@ mod tests {
             "a1111111111111111111111111111111-dep.drv",
             "a2222222222222222222222222222222-app.drv",
             "a3333333333333333333333333333333-impure.drv",
+            "a4444444444444444444444444444444-cached.drv",
         ] {
             let text = std::fs::read_to_string(basic.join("nix/store").join(drv))
                 .unwrap_or_else(|e| panic!("read {drv}: {e}"));
