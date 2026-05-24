@@ -51,7 +51,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Not `rio_common::server::bootstrap`: that path exists for
-    // binaries with a figment-layered TOML config and a CommonConfig
+    // binaries with a layered TOML config and a CommonConfig
     // embed. mountd has eight flags and no config file; the full
     // bootstrap would add a Config type, a validate impl, and a config
     // search path for nothing. Tracing + metrics init is the part that

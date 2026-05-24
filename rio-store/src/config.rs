@@ -744,11 +744,10 @@ mod tests {
 
     /// P0554 wires `express_bucket` from a per-pod env var (downward-API
     /// `topology.kubernetes.io/zone` → AZ → bucket-name template). The
-    /// `Option<String>` field must round-trip via figment env layer.
+    /// `Option<String>` field must round-trip via the env layer.
     #[test]
-    #[allow(clippy::result_large_err)]
     fn chunk_backend_kind_env_tiered() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
             jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
             jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
@@ -776,13 +775,12 @@ mod tests {
     }
 
     /// `EXPRESS_BUCKET` env var omitted → `express_bucket: None`.
-    /// Helm omits the var on AZs without S3 Express; the figment env
-    /// layer must surface the absence as `None` (via `#[serde(default)]`)
-    /// rather than failing tagged-enum deserialization on a missing key.
+    /// Helm omits the var on AZs without S3 Express; the env layer must
+    /// surface the absence as `None` (via `#[serde(default)]`) rather
+    /// than failing tagged-enum deserialization on a missing key.
     #[test]
-    #[allow(clippy::result_large_err)]
     fn chunk_backend_kind_env_tiered_no_express() {
-        figment::Jail::expect_with(|jail| {
+        rio_test_support::Jail::expect_with(|jail| {
             jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
             jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
             jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");

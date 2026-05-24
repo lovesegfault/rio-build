@@ -797,11 +797,14 @@ impl DirectoryServiceImpl {
             return Ok(HashSet::new());
         }
         let slices: Vec<&[u8]> = digests.iter().map(|d| d.as_slice()).collect();
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(&format!(
+        // AssertSqlSafe: `from` is a `&'static str` from the closed
+        // `HasTable` enum above — no request-derived data reaches the
+        // format string; the digests and tenant id are bind parameters.
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT DISTINCT d.digest FROM {from} \
              WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2",
             from = table.join_clause(),
-        ))
+        )))
         .bind(&slices)
         .bind(tenant)
         .fetch_all(&self.pool)
