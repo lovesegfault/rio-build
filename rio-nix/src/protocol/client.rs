@@ -211,9 +211,13 @@ pub(crate) async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> 
     ))))
 }
 
-/// Error from a client-side daemon operation: either the daemon refused the
-/// operation (STDERR_ERROR — the stream is still aligned and usable for a
-/// retry on a fresh channel), or the wire/transport itself failed.
+/// Error from a client-side daemon operation.
+///
+/// [`Daemon`](ClientOpError::Daemon) is the daemon's verdict on the
+/// operation, delivered as an STDERR_ERROR frame with protocol framing intact
+/// (the transport is not corrupted) — callers may report it as a daemon-side
+/// rejection or retry the operation. [`Wire`](ClientOpError::Wire) means the
+/// channel itself is suspect and must be abandoned.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientOpError {
     /// The daemon refused the operation (STDERR_ERROR frame).
@@ -224,21 +228,54 @@ pub enum ClientOpError {
     Wire(#[from] WireError),
 }
 
+/// Maximum STDERR messages [`drain_stderr_typed`] consumes before aborting.
+///
+/// Deliberately ~100× the legacy `MAX_STDERR_MESSAGES`: operations like
+/// BuildPathsWithResults stream every build-log line through this drain, so a
+/// count cap must never fire on a legitimate long build. It exists only to
+/// cut off a pathological/looping daemon that never sends `STDERR_LAST`.
+const MAX_BUILD_LOG_STDERR_MESSAGES: usize = 10_000_000;
+
 /// Drain the STDERR loop until `STDERR_LAST`, surfacing `STDERR_ERROR` as
 /// [`ClientOpError::Daemon`]. Log lines, activities, and results are
 /// discarded (build output is not collected by the callers of this path).
 /// `STDERR_READ`/`STDERR_WRITE` are protocol violations for the operations
 /// this is used with and map to [`ClientOpError::Wire`].
+///
+/// Unlike `drain_stderr` (handshake/SetOptions-scale traffic, 100k cap), this
+/// drain accepts build-scale log/activity streams and is bounded only by the
+/// very high `MAX_BUILD_LOG_STDERR_MESSAGES` ceiling. Callers are expected to
+/// bound wall-clock time with a per-op deadline (e.g.
+/// `tokio::time::timeout`), since a message-count cap cannot protect against
+/// a silently stalled peer.
 pub async fn drain_stderr_typed<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> std::result::Result<(), ClientOpError> {
-    loop {
+    drain_stderr_typed_bounded(r, MAX_BUILD_LOG_STDERR_MESSAGES).await
+}
+
+/// [`drain_stderr_typed`] with an explicit message-count ceiling. Returns a
+/// [`ClientOpError::Wire`] I/O error if more than `max_messages` messages
+/// arrive without `STDERR_LAST`.
+async fn drain_stderr_typed_bounded<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max_messages: usize,
+) -> std::result::Result<(), ClientOpError> {
+    for _ in 0..max_messages {
         match read_stderr_message(r).await? {
             StderrMessage::Last => return Ok(()),
             StderrMessage::Error(e) => return Err(ClientOpError::Daemon(e)),
-            StderrMessage::Read(_) | StderrMessage::Write(_) => {
+            StderrMessage::Read(count) => {
                 return Err(ClientOpError::Wire(WireError::Io(std::io::Error::other(
-                    "unexpected STDERR_READ/STDERR_WRITE during client operation",
+                    format!("unexpected STDERR_READ (n={count}) during client operation"),
+                ))));
+            }
+            StderrMessage::Write(data) => {
+                return Err(ClientOpError::Wire(WireError::Io(std::io::Error::other(
+                    format!(
+                        "unexpected STDERR_WRITE (len={}) during client operation",
+                        data.len()
+                    ),
                 ))));
             }
             StderrMessage::Next(_)
@@ -247,6 +284,9 @@ pub async fn drain_stderr_typed<R: AsyncRead + Unpin>(
             | StderrMessage::Result { .. } => continue,
         }
     }
+    Err(ClientOpError::Wire(WireError::Io(std::io::Error::other(
+        format!("exceeded {max_messages} stderr messages without STDERR_LAST"),
+    ))))
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +951,53 @@ mod tests {
         let (mut cr, _cw) = tokio::io::split(client_stream);
         drain_stderr_typed(&mut cr).await?;
         server.await??;
+        Ok(())
+    }
+
+    /// STDERR_READ is a protocol violation for the operations this drain
+    /// serves: it maps to `ClientOpError::Wire` and the message names the
+    /// violating frame and its requested byte count.
+    #[tokio::test]
+    async fn drain_stderr_typed_read_frame_is_wire_violation() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_READ).await?;
+        wire::write_u64(&mut buf, 4096).await?;
+
+        let err = drain_stderr_typed(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("STDERR_READ must abort the typed drain");
+        assert!(matches!(err, ClientOpError::Wire(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("STDERR_READ"),
+            "message must name the violating frame: {err}"
+        );
+        assert!(
+            err.to_string().contains("4096"),
+            "message must carry the requested byte count: {err}"
+        );
+        Ok(())
+    }
+
+    /// The message-count ceiling aborts a drain whose peer keeps streaming
+    /// log lines without ever sending STDERR_LAST.
+    #[tokio::test]
+    async fn drain_stderr_typed_bounded_aborts_past_max_messages() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            for _ in 0..5 {
+                w.log("still going").await?;
+            }
+        }
+
+        let err = drain_stderr_typed_bounded(&mut std::io::Cursor::new(buf), 3)
+            .await
+            .expect_err("exceeding the message ceiling must abort the drain");
+        assert!(matches!(err, ClientOpError::Wire(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("exceeded 3 stderr messages"),
+            "message must mention the exceeded bound: {err}"
+        );
         Ok(())
     }
 
