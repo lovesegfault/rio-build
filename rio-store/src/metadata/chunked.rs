@@ -242,24 +242,57 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
     Ok(())
 }
 
-/// Finalize a chunked upload: fill real narinfo + flip status to 'complete'.
+/// Finalize a chunked upload: fill real narinfo + flip status to 'complete'
+/// + mark the manifest's chunks durable.
 ///
 /// Does NOT write inline_blob (stays NULL — that's the chunked marker).
 /// Does NOT touch manifest_data (already written at uploading time).
 /// Does NOT touch refcounts (already incremented at uploading time).
 ///
-/// Just the narinfo UPDATE + status flip. Same atomic guarantees as the
-/// inline variant.
-#[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
+/// `chunk_hashes` is the manifest's deduped chunk set (the same array
+/// passed to [`upgrade_manifest_to_chunked`]). The `durable = TRUE`
+/// flip rides in the same transaction as the `'complete'` status flip
+/// so `HasChunks`' durable-presence invariant — bit set iff referenced
+/// by ≥1 complete manifest — holds without a window where the manifest
+/// is complete but its chunks still report absent (or vice versa).
+// r[impl store.chunk.durable-flag]
+#[instrument(skip(pool, info, chunk_hashes), fields(store_path = %info.store_path.as_str()))]
 pub(crate) async fn complete_manifest_chunked(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
+    chunk_hashes: &[Vec<u8>],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     super::complete_manifest_in_conn(&mut tx, info, claim, None).await?;
+    mark_chunks_durable(&mut tx, chunk_hashes).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
+    Ok(())
+}
+
+/// `UPDATE chunks SET durable = TRUE` for a completing manifest's chunk
+/// set, inside the caller's transaction. Sorted before binding per
+/// `r[store.chunk.lock-order]`; `AND NOT durable` keeps the write set
+/// minimal on re-uploads of already-durable content.
+// r[impl store.chunk.durable-flag]
+pub(crate) async fn mark_chunks_durable(
+    conn: &mut sqlx::PgConnection,
+    chunk_hashes: &[Vec<u8>],
+) -> std::result::Result<(), sqlx::Error> {
+    if chunk_hashes.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = chunk_hashes.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sqlx::query(
+        "UPDATE chunks SET durable = TRUE \
+          WHERE blake3_hash = ANY($1) AND NOT durable",
+    )
+    .bind(&sorted)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -1134,7 +1167,7 @@ mod tests {
         mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
         let mut info = rio_test_support::fixtures::make_path_info(&path, &[0u8; 1024], [0x55; 32]);
         info.store_path_hash = sph.clone();
-        complete_manifest_chunked(&db.pool, &info, claim_b)
+        complete_manifest_chunked(&db.pool, &info, claim_b, std::slice::from_ref(&chunk))
             .await
             .unwrap();
 

@@ -15,12 +15,16 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::instrument;
 
 use rio_proto::ChunkService;
-use rio_proto::types::{ChunkData, GetChunkRequest, GetChunkResponse, GetChunksRequest};
+use rio_proto::types::{
+    ChunkData, GetChunkRequest, GetChunkResponse, GetChunksRequest, HasChunksRequest,
+    HasChunksResponse,
+};
 
 use crate::cas::{self, ChunkCache};
 
@@ -49,12 +53,20 @@ pub const GET_CHUNKS_K: usize = 256;
 /// already dominate memory; a deep channel just hides h2 backpressure.
 const GET_CHUNKS_CHANNEL_DEPTH: usize = 8;
 
+/// Cap on the request digest list for `HasChunks`. Mirrors
+/// `directory::HAS_BATCH_MAX` — one presence probe per closure-scale
+/// batch; larger means a pathological caller or a bug. At the cap the
+/// `= ANY($1)` bind array is 64k × 32 B = 2 MiB.
+const HAS_CHUNKS_BATCH_MAX: usize = 65_536;
+
 /// ChunkService implementation.
 ///
 /// Shares `chunk_cache` with `StoreServiceImpl` — one gRPC server
 /// process, two services, same state. `Arc` lets main.rs construct
 /// both from the same backing pieces.
 pub struct ChunkServiceImpl {
+    /// Durable-presence lookups for `HasChunks` (the `chunks` table).
+    pool: PgPool,
     /// Cache for GetChunk. Same cache as GetPath uses — a chunk fetched
     /// by either RPC warms the other. `None` = ChunkService effectively
     /// disabled (all RPCs return FAILED_PRECONDITION); main.rs only
@@ -63,8 +75,8 @@ pub struct ChunkServiceImpl {
 }
 
 impl ChunkServiceImpl {
-    pub fn new(chunk_cache: Option<Arc<ChunkCache>>) -> Self {
-        Self { chunk_cache }
+    pub fn new(pool: PgPool, chunk_cache: Option<Arc<ChunkCache>>) -> Self {
+        Self { pool, chunk_cache }
     }
 
     /// Shared guard: all ChunkService RPCs need a cache. Without a
@@ -108,6 +120,74 @@ fn parse_digest(digest: &[u8]) -> Result<[u8; 32], Status> {
 impl ChunkService for ChunkServiceImpl {
     type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
     type GetChunksStream = ReceiverStream<Result<ChunkData, Status>>;
+
+    /// HasChunks: batch durable-presence probe (ADR-022 §6.2).
+    ///
+    /// Bit `i` is set iff `digests[i]` is referenced by at least one
+    /// `complete` manifest — `chunks.durable AND NOT deleted` — not
+    /// merely refcount ≥ 1. Under these semantics two builders racing
+    /// on the same not-yet-durable chunk both see `false`, both upload,
+    /// and the second S3 PutObject is an idempotent overwrite — closing
+    /// the I-201 stranded-chunk race where a SIGKILL between
+    /// refcount-bump and S3 PutObject combined with a presence-skip
+    /// permanently strands the digest.
+    ///
+    /// **No tenant JOIN** — chunks are content-addressed and
+    /// tenant-agnostic per `r[store.castore.tenant-scope]`
+    /// (`chunk_tenants` was dropped in migration 035); knowing a BLAKE3
+    /// hash already proves you have (or had) the bytes.
+    // r[impl store.chunk.has-chunks-durable]
+    #[instrument(skip(self, request), fields(rpc = "HasChunks"))]
+    async fn has_chunks(
+        &self,
+        request: Request<HasChunksRequest>,
+    ) -> Result<Response<HasChunksResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+        if req.digests.len() > HAS_CHUNKS_BATCH_MAX {
+            return Err(Status::invalid_argument(format!(
+                "digest batch too large: {} > {HAS_CHUNKS_BATCH_MAX}",
+                req.digests.len()
+            )));
+        }
+        let requested: Vec<[u8; 32]> = req
+            .digests
+            .iter()
+            .map(|d| parse_digest(d))
+            .collect::<Result<_, _>>()?;
+        metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasChunks")
+            .record(requested.len() as f64);
+
+        // Sorted + deduped bind array: the partial index
+        // `chunks_present_idx (blake3_hash) WHERE durable AND NOT
+        // deleted` drives this as an index-only probe per digest.
+        let mut lookup: Vec<Vec<u8>> = requested.iter().map(|d| d.to_vec()).collect();
+        lookup.sort_unstable();
+        lookup.dedup();
+        let present_rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT blake3_hash FROM chunks \
+              WHERE blake3_hash = ANY($1) AND durable AND NOT deleted",
+        )
+        .bind(&lookup)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "HasChunks: chunks lookup failed");
+            Status::unavailable("chunk presence lookup failed; retry")
+        })?;
+        let present: std::collections::HashSet<[u8; 32]> = present_rows
+            .into_iter()
+            .filter_map(|(h,)| h.try_into().ok())
+            .collect();
+
+        let mut bitmap = vec![0u8; requested.len().div_ceil(8)];
+        for (i, d) in requested.iter().enumerate() {
+            if present.contains(d) {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(Response::new(HasChunksResponse { bitmap }))
+    }
 
     /// GetChunk: fetch a single chunk by BLAKE3 hash.
     ///

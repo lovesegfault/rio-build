@@ -49,6 +49,7 @@ mod directory;
 mod get_path;
 mod put_path;
 mod put_path_batch;
+mod put_path_chunked;
 mod queries;
 mod sign;
 
@@ -608,6 +609,16 @@ impl StoreService for StoreServiceImpl {
         request: Request<Streaming<PutPathBatchRequest>>,
     ) -> Result<Response<PutPathBatchResponse>, Status> {
         self.put_path_batch_impl(request).await
+    }
+
+    /// Builder-side chunked multi-output upload (ADR-022 §6). See the
+    /// `put_path_chunked` module for the validate → verify → commit flow.
+    #[instrument(skip(self, request), fields(rpc = "PutPathChunked"))]
+    async fn put_path_chunked(
+        &self,
+        request: Request<Streaming<rio_proto::types::PutPathChunkedRequest>>,
+    ) -> Result<Response<PutPathResponse>, Status> {
+        self.put_path_chunked_impl(request).await
     }
 
     type GetPathStream = get_path::GetPathStream;

@@ -57,9 +57,10 @@ pub(in crate::grpc) enum NarPersist {
     Inline(Bytes),
     /// `nar_data.len() >= INLINE_THRESHOLD` and a chunk backend is
     /// configured. Chunks already uploaded + refcounted via
-    /// [`cas::stage_chunked`]; only the `status='complete'` flip
-    /// remains.
-    ChunkedStaged,
+    /// [`cas::stage_chunked`]; the `status='complete'` flip and the
+    /// `durable = TRUE` flip for the carried chunk set remain for the
+    /// batch tx (`r[store.chunk.durable-flag]`).
+    ChunkedStaged { chunk_hashes: Vec<Vec<u8>> },
 }
 
 /// Auth context for PutPath / PutPathBatch: HMAC assignment claims
@@ -656,7 +657,9 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| storage_error("PutPathBatch: stage_chunked", e))?;
             metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-            Ok(NarPersist::ChunkedStaged)
+            Ok(NarPersist::ChunkedStaged {
+                chunk_hashes: stats.chunk_hashes,
+            })
         } else {
             Ok(NarPersist::Inline(Bytes::from(nar_data)))
         }

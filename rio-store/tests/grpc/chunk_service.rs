@@ -49,7 +49,7 @@ impl ChunkSession {
 
         let store_service =
             StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
-        let chunk_service = ChunkServiceImpl::new(Some(cache));
+        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(cache));
 
         let router = Server::builder()
             .add_service(StoreServiceServer::new(store_service))
@@ -156,8 +156,11 @@ async fn test_getchunk_bad_digest_length() -> TestResult {
 /// Inline-only store: ChunkService RPCs → FAILED_PRECONDITION.
 #[tokio::test]
 async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
-    // Construct with cache=None explicitly.
-    let chunk_service = ChunkServiceImpl::new(None);
+    // Construct with cache=None explicitly. The pool is never touched
+    // on the no-cache path — a lazy unconnected one avoids spinning up
+    // postgres for a pure FAILED_PRECONDITION test.
+    let chunk_service =
+        ChunkServiceImpl::new(sqlx::PgPool::connect_lazy("postgres://unused")?, None);
 
     let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
@@ -373,7 +376,8 @@ async fn test_getchunks_not_found_aborts() -> TestResult {
 /// guard is shared so the two RPCs can't drift apart.
 #[tokio::test]
 async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
-    let chunk_service = ChunkServiceImpl::new(None);
+    let chunk_service =
+        ChunkServiceImpl::new(sqlx::PgPool::connect_lazy("postgres://unused")?, None);
     let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let channel = Channel::from_shared(format!("http://{addr}"))?

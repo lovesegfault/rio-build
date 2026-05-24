@@ -132,6 +132,11 @@ pub struct PutChunkedStats {
     pub total_chunks: usize,
     /// Chunks that were already present (skipped upload).
     pub deduped_chunks: usize,
+    /// Deduplicated 32-byte BLAKE3 hashes of every chunk in the
+    /// manifest — the set whose refcounts were incremented. The
+    /// completion transaction flips these to `durable = TRUE` alongside
+    /// the `'complete'` status flip (`r[store.chunk.durable-flag]`).
+    pub chunk_hashes: Vec<Vec<u8>>,
 }
 
 impl PutChunkedStats {
@@ -188,7 +193,11 @@ pub async fn put_chunked(
     let stats = stage_chunked(pool, backend, info, claim, nar_data, max_concurrent).await?;
 
     // --- Step 5: Complete ---
-    if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim).await {
+    // The `durable = TRUE` flip for the manifest's chunks rides in the
+    // same tx as the `'complete'` status flip (r[store.chunk.durable-flag]).
+    if let Err(e) =
+        metadata::complete_manifest_chunked(pool, info, claim, &stats.chunk_hashes).await
+    {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
         // Chunks are uploaded to S3. reap_one decrements refcounts →
         // GC-eligible. We DON'T delete from S3 — GC sweep's job.
@@ -328,7 +337,7 @@ pub async fn stage_chunked(
     // via delete_manifest_chunked_uploading. scopeguard can't do async
     // drop, so explicit match-on-error.
 
-    let stats = match do_upload(
+    let mut stats = match do_upload(
         Some((pool, store_path_hash, claim)),
         backend,
         nar_data,
@@ -345,6 +354,10 @@ pub async fn stage_chunked(
             return Err(e);
         }
     };
+    // Hand the deduped chunk set to the caller so the completion tx can
+    // flip `durable = TRUE` for exactly the hashes whose refcounts were
+    // incremented above (r[store.chunk.durable-flag]).
+    stats.chunk_hashes = chunk_hashes.clone();
 
     // --- Step 4b: Commit S3 presence ---
     // Uploads succeeded → record `uploaded_at` so later PutPaths can
@@ -506,6 +519,9 @@ async fn do_upload(
     Ok(PutChunkedStats {
         total_chunks: total,
         deduped_chunks: total - uploaded,
+        // Filled by `stage_chunked` (which owns the deduped hash list);
+        // `do_upload` only sees the needs-upload subset.
+        chunk_hashes: Vec::new(),
     })
 }
 
@@ -631,6 +647,19 @@ impl ChunkCache {
     /// instead of a separate Arc.
     pub fn backend(&self) -> Arc<dyn ChunkBackend> {
         Arc::clone(&self.backend)
+    }
+
+    /// Insert already-verified chunk bytes into the in-process LRU
+    /// without touching the backend. The PutPathChunked verify walk
+    /// calls this for each novel chunk it has just BLAKE3-verified and
+    /// written, so a repeat occurrence of the same digest later in the
+    /// walk (or a concurrent GetChunks for it) is a memory hit instead
+    /// of an immediate read-back of the bytes we just wrote.
+    ///
+    /// The caller MUST have verified `blake3(bytes) == hash` — this
+    /// bypasses the `get_verified` verify-before-insert step.
+    pub(crate) async fn insert_local(&self, hash: &[u8; 32], bytes: Bytes) {
+        self.lru.insert(*hash, bytes).await;
     }
 
     /// Create a cache with a custom capacity (bytes, not entry count).

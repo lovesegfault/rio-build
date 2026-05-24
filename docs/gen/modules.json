@@ -1340,6 +1340,21 @@
       "doc": "PutPathBatch: atomic multi-output upload."
     },
     {
+      "path": "grpc/put_path_chunked/",
+      "depth": 1,
+      "doc": "`PutPathChunked`: builder-side chunked multi-output upload (ADR-022 §6)."
+    },
+    {
+      "path": "grpc/put_path_chunked/commit.rs",
+      "depth": 2,
+      "doc": "`PutPathChunked` commit transaction (ADR-022 §6.2)."
+    },
+    {
+      "path": "grpc/put_path_chunked/validate.rs",
+      "depth": 2,
+      "doc": "`Begin` validation for `PutPathChunked` (ADR-022 §6.2)."
+    },
+    {
       "path": "grpc/queries.rs",
       "depth": 1,
       "doc": "Read-side StoreService RPCs (QueryPathInfo, FindMissingPaths,"
@@ -1592,6 +1607,11 @@
       "path": "k8s/k3s/smoke.rs",
       "depth": 2,
       "doc": "k3s smoke test: same chaos as EKS, port-forward instead of SSM."
+    },
+    {
+      "path": "k8s/measure.rs",
+      "depth": 1,
+      "doc": "`xtask measure` — ADR-022 P0543 measurement tooling (V11/V12 +"
     },
     {
       "path": "k8s/phases.rs",

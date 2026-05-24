@@ -923,9 +923,13 @@ async fn sweep_orphan_batch(
     // No FOR UPDATE needed on the outer SELECT: the UPDATE's WHERE
     // clause IS the guard. PG's row-level locking for UPDATE
     // serializes against the PutPath UPSERT on the same blake3_hash.
+    // `durable = FALSE` alongside the tombstone for the same reason as
+    // `uploaded_at = NULL`: a resurrected chunk must not answer
+    // `HasChunks` true after the drain removed its S3 object.
+    // r[impl store.chunk.durable-flag]
     let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        UPDATE chunks SET deleted = TRUE, uploaded_at = NULL
+        UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, durable = FALSE
          WHERE blake3_hash = ANY($1)
            AND refcount = 0 AND deleted = FALSE
         RETURNING blake3_hash, size

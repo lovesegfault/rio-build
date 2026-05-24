@@ -305,6 +305,32 @@ pub fn describe_metrics() {
          suggests under-sized fetcher pods (see I-208)."
     );
     describe_counter!(
+        "rio_store_narhash_mismatch_total",
+        "PutPathChunked uploads whose server-recomputed NAR hash (or a \
+         deduped chunk's stored length) disagreed with the builder's claim. \
+         A builder NAR-framing bug or a compromised builder — alert-worthy \
+         and approximately never."
+    );
+    describe_counter!(
+        "rio_store_refs_mismatch_total",
+        "PutPathChunked uploads whose server-rescanned reference set \
+         disagreed with the builder's claimed refs. Same alert posture as \
+         narhash_mismatch: a scanner bug or a lying builder."
+    );
+    describe_counter!(
+        "rio_store_putpath_incomplete_total",
+        "PutPathChunked streams that ended before every Begin.novel chunk \
+         arrived (builder crashed or disconnected mid-upload). Infra-retry \
+         condition, not an alert."
+    );
+    describe_counter!(
+        "rio_store_putpath_verify_unavailable_total",
+        "PutPathChunked verifies aborted by a transient chunk-store error \
+         (S3 fault, or a deduped chunk GC'd between the builder's HasChunks \
+         and the verify walk). The builder retries; sustained nonzero means \
+         the chunk backend is unhealthy."
+    );
+    describe_counter!(
         "rio_store_substitute_probe_cache_hits_total",
         "check_available HEAD-probe cache hits (positive or negative cached \
          result; no upstream HEAD made for this path)."

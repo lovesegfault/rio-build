@@ -204,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
     // ARE no chunks to get).
-    let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
+    let chunk_service = ChunkServiceImpl::new(pool.clone(), chunk_cache.clone());
 
     // Tenant-scoped via JWT or HMAC assignment-token claim — see
     // grpc/directory.rs. ReadBlob shares the chunk cache.

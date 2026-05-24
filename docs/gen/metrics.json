@@ -198,12 +198,16 @@
     "rio_store_nar_index_cache_hits_total",
     "rio_store_nar_index_compute_seconds",
     "rio_store_nar_index_compute_total",
+    "rio_store_narhash_mismatch_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
     "rio_store_put_path_total",
+    "rio_store_putpath_incomplete_total",
     "rio_store_putpath_retries_total",
     "rio_store_putpath_stale_reclaimed_total",
+    "rio_store_putpath_verify_unavailable_total",
+    "rio_store_refs_mismatch_total",
     "rio_store_s3_deletes_pending",
     "rio_store_s3_deletes_stuck",
     "rio_store_s3_requests_total",
@@ -1228,6 +1232,11 @@
         "help": "NAR-index computations (eager PutPath + indexer_loop + sync-on-miss)"
       },
       {
+        "name": "rio_store_narhash_mismatch_total",
+        "kind": "counter",
+        "help": "PutPathChunked uploads whose server-recomputed NAR hash (or a deduped chunk's stored length) disagreed with the builder's claim. A builder NAR-framing bug or a compromised builder — alert-worthy and approximately never."
+      },
+      {
         "name": "rio_store_pg_pool_utilization",
         "kind": "gauge",
         "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
@@ -1248,6 +1257,11 @@
         "help": "Total PutPath operations (per store path; PutPathBatch counts each output)"
       },
       {
+        "name": "rio_store_putpath_incomplete_total",
+        "kind": "counter",
+        "help": "PutPathChunked streams that ended before every Begin.novel chunk arrived (builder crashed or disconnected mid-upload). Infra-retry condition, not an alert."
+      },
+      {
         "name": "rio_store_putpath_retries_total",
         "kind": "counter",
         "help": "PutPath retriable rejections (labeled by reason: serialization| deadlock|placeholder_missing|connection|resource_exhausted| concurrent_upload). Client retries on aborted/unavailable. Sustained high deadlock/connection rate = PG-side problem."
@@ -1256,6 +1270,16 @@
         "name": "rio_store_putpath_stale_reclaimed_total",
         "kind": "counter",
         "help": "Stale 'uploading' placeholders reclaimed on the PutPath hot path (I-207). Nonzero expected under fetcher churn; sustained high suggests under-sized fetcher pods (see I-208)."
+      },
+      {
+        "name": "rio_store_putpath_verify_unavailable_total",
+        "kind": "counter",
+        "help": "PutPathChunked verifies aborted by a transient chunk-store error (S3 fault, or a deduped chunk GC'd between the builder's HasChunks and the verify walk). The builder retries; sustained nonzero means the chunk backend is unhealthy."
+      },
+      {
+        "name": "rio_store_refs_mismatch_total",
+        "kind": "counter",
+        "help": "PutPathChunked uploads whose server-rescanned reference set disagreed with the builder's claimed refs. Same alert posture as narhash_mismatch: a scanner bug or a lying builder."
       },
       {
         "name": "rio_store_s3_deletes_pending",

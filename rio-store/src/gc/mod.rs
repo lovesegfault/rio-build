@@ -541,10 +541,13 @@ pub(super) async fn decrement_hashes_and_enqueue(
     // Only rows we JUST touched (ANY) AND now at 0. `uploaded_at =
     // NULL` so a later resurrection (PutPath upsert flips
     // deleted→false) re-uploads — drain may have already removed the
-    // S3 object by then.
+    // S3 object by then. `durable = false` for the same reason: a
+    // resurrected chunk whose S3 object the drain already removed must
+    // not answer `HasChunks` true (the builder would skip re-sending
+    // it → permanent data loss). r[impl store.chunk.durable-flag]
     let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        UPDATE chunks SET deleted = true, uploaded_at = NULL
+        UPDATE chunks SET deleted = true, uploaded_at = NULL, durable = false
          WHERE blake3_hash = ANY($1) AND refcount = 0
            AND deleted = false
         RETURNING blake3_hash, size

@@ -322,7 +322,7 @@ impl StoreServiceImpl {
     /// degradation visible — alert if sustained nonzero.
     ///
     /// `None` iff signing is disabled entirely.
-    async fn resolve_batch_signer(
+    pub(super) async fn resolve_batch_signer(
         &self,
         tenant_id: Option<uuid::Uuid>,
     ) -> Option<(crate::signing::Signer, bool)> {
@@ -371,9 +371,10 @@ impl StoreServiceImpl {
                 self.sign_with_resolved(signer, *was_tenant, &mut info);
             }
             let inline_blob = match accum.staged.take().expect("staged in phase 2") {
-                NarPersist::Inline(data) => Some(data),
-                NarPersist::ChunkedStaged => None,
+                NarPersist::Inline(data) => (Some(data), Vec::new()),
+                NarPersist::ChunkedStaged { chunk_hashes } => (None, chunk_hashes),
             };
+            let (inline_blob, chunk_hashes) = inline_blob;
             let claim = accum
                 .claim
                 .expect("set in phase-2 for non-already_complete");
@@ -385,6 +386,15 @@ impl StoreServiceImpl {
                 return Err(putpath_metadata_status(
                     "PutPathBatch: complete_manifest",
                     e,
+                ));
+            }
+            // Chunked outputs: flip their chunk set durable in the same
+            // tx as the 'complete' flip (r[store.chunk.durable-flag]).
+            if let Err(e) = metadata::mark_chunks_durable(&mut tx, &chunk_hashes).await {
+                drop(tx);
+                return Err(putpath_metadata_status(
+                    "PutPathBatch: mark_chunks_durable",
+                    e.into(),
                 ));
             }
             created[*idx as usize] = true;
