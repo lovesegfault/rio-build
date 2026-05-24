@@ -35,7 +35,10 @@ scope: with scope; ''
 
       # transfer-volume: bigblob is 300 KiB of zeros. NAR framing
       # adds a few hundred bytes of overhead. ≥300000 is a loose
-      # floor — chunk dedup doesn't change what PutPath RECEIVES.
+      # floor — chunk dedup doesn't change what the upload RECEIVES.
+      # Emitted by both the legacy PutPath commit and the
+      # PutPathChunked commit (P0586), so the assertion holds
+      # whichever RPC the builder picked for this fixture.
       bytes_after = scrape_metrics(${gatewayHost}, 9092)
       b_before = metric_value(bytes_before, "rio_store_put_path_bytes_total") or 0.0
       b_after = metric_value(bytes_after, "rio_store_put_path_bytes_total") or 0.0
@@ -44,11 +47,11 @@ scope: with scope; ''
           f"before={b_before}, after={b_after}, delta={b_after - b_before}"
       )
 
-      # Dedup metric registered + exported (proves chunked PutPath
-      # codepath ran at least once; ratio value is irrelevant here).
-      metrics = ${gatewayHost}.succeed("curl -s http://localhost:9092/metrics")
-      assert "rio_store_chunk_dedup_ratio" in metrics, (
-          "rio_store_chunk_dedup_ratio metric should be exported "
-          "(chunked PutPath path ran)"
-      )
+      # NOTE: the rio_store_chunk_dedup_ratio presence assertion that
+      # used to live here is gone. Since P0586 the builder uploads via
+      # PutPathChunked on chunk-backend stores (this fixture has one),
+      # and that path never calls cas::put_chunked — the gauge is only
+      # set by the legacy PutPath chunked-storage path and the
+      # substitution ingest. The chunk-file-count delta above is the
+      # structural proof that the chunk backend received this upload.
 ''
