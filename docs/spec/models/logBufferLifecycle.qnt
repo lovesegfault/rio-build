@@ -242,48 +242,70 @@ module logBufferLifecycle {
   /// model A only this replica and the abstract interim leader write.
   var stored: Drv -> (int -> StoredRow)
 
-  // The lease-composition interface state (LeaderState's atomics).
-  var isLeader: bool
-  var generation: int
-  var acquiredTransitions: int
-  /// `recovery_completed_for`: the acquire-epoch stamp of the last
-  /// completed recovery, or NO_EPOCH. `recovery_complete()` is
-  /// `recoveredEpoch == acquiredTransitions`.
-  var recoveredEpoch: int
-  /// The actor's `dag_authoritative` bit: true only after a tenure's
-  /// recovery LOADED the DAG successfully (and was not discarded).
-  var loadSucceeded: bool
+  /// The lease-composition interface state (LeaderState's atomics), as
+  /// one record so the actions that do not touch the lease frame it in
+  /// one assignment:
+  ///   - `isLeader`, `generation`, `acquiredTransitions`: the atomics
+  ///     `on_acquire`/`on_rebound`/`on_lose` write.
+  ///   - `recoveredEpoch`: `recovery_completed_for` — the acquire-epoch
+  ///     stamp of the last completed recovery, or NO_EPOCH.
+  ///     `recovery_complete()` is `recoveredEpoch == acquiredTransitions`.
+  ///   - `loadSucceeded`: the actor's `dag_authoritative` bit — true only
+  ///     after a tenure's recovery LOADED the DAG successfully (and the
+  ///     TOCTOU gate did not discard it).
+  var replica: {
+    isLeader: bool,
+    generation: int,
+    acquiredTransitions: int,
+    recoveredEpoch: int,
+    loadSucceeded: bool,
+  }
   /// The Lease object's global `leaseTransitions` count at the apiserver
   /// (holder changes so far, including foreign ones we have not observed).
   var leaseTransitions: int
 
-  // History flags (model-only bookkeeping, never read by an action guard;
-  // each is the discriminator for one expect-violation witness below).
-  /// An eviction dropped a non-empty head prefix of a held ring.
-  var wEvicted: bool
-  /// The ingestion gate rejected a batch as non-monotone.
-  var wRejectedNonMonotone: bool
-  /// A cross-exec restamp cleared a non-empty ring.
-  var wCrossExecCleared: bool
-  /// `flush_final`'s out-of-tenure drop arm reaped a sealed empty entry.
-  var wTenureDropReap: bool
-  /// The periodic refused-UPSERT reap fired (frozen row ⇒ sealed orphan
-  /// discarded).
-  var wRefusedUpsertReap: bool
-  /// The periodic sealed-empty reap fired (empty snapshot of a sealed
-  /// entry).
-  var wSealedEmptyReap: bool
-  /// The terminal epilogue's enqueue-failure reap fired.
-  var wEnqueueFailReap: bool
-  /// A holder change was re-acquired with the generation unchanged (the
-  /// saturated regime — the `req_in_tenure` counterexample's premise).
-  var wGenPinnedAcrossHolderChange: bool
+  /// History flags (model-only bookkeeping, never read by an action
+  /// guard; each is the discriminator for one expect-violation witness
+  /// below). One record so the actions that fire none of them frame them
+  /// in one assignment.
+  ///   - `evicted`: an eviction dropped a non-empty head prefix of a held
+  ///     ring.
+  ///   - `rejectedNonMonotone`: the ingestion gate rejected a batch as
+  ///     non-monotone.
+  ///   - `crossExecCleared`: a cross-exec restamp cleared a non-empty
+  ///     ring.
+  ///   - `tenureDropReap`: `flush_final`'s out-of-tenure drop arm reaped a
+  ///     sealed empty entry.
+  ///   - `refusedUpsertReap`: the periodic refused-UPSERT reap fired
+  ///     (frozen row ⇒ sealed orphan discarded).
+  ///   - `sealedEmptyReap`: the periodic sealed-empty reap fired (empty
+  ///     snapshot of a sealed entry).
+  ///   - `enqueueFailReap`: the terminal epilogue's enqueue-failure reap
+  ///     fired.
+  ///   - `genPinnedAcrossHolderChange`: a holder change was re-acquired
+  ///     with the generation unchanged (the saturated regime — the
+  ///     `req_in_tenure` counterexample's premise).
+  var wit: {
+    evicted: bool,
+    rejectedNonMonotone: bool,
+    crossExecCleared: bool,
+    tenureDropReap: bool,
+    refusedUpsertReap: bool,
+    sealedEmptyReap: bool,
+    enqueueFailReap: bool,
+    genPinnedAcrossHolderChange: bool,
+  }
 
   // --- 5. derived state -------------------------------------------------
 
+  def isLeader: bool = replica.isLeader
+  def generation: int = replica.generation
+  def acquiredTransitions: int = replica.acquiredTransitions
+
   /// `LeaderState::recovery_complete()`.
   def recoveryComplete: bool =
-    recoveredEpoch != NO_EPOCH and recoveredEpoch == acquiredTransitions
+    replica.recoveredEpoch != NO_EPOCH and
+      replica.recoveredEpoch == replica.acquiredTransitions
 
   /// `LogFlusher::may_flush()`: the gate on every self-driven flusher arm
   /// (periodic snapshot, GC sweep, shutdown sweep). Deliberately NOT
@@ -319,6 +341,1222 @@ module logBufferLifecycle {
       | Entry(en) => if (en.exec == e) en.held else Set()
     }
 
+  // Entry accessors. Quint's effect system requires every branch of a
+  // match used in action position to assign the same variables, so the
+  // actions never match on the entry directly: they read it through these
+  // accessors (which return safe defaults for `NoEntry` — the same -1 /
+  // empty-set pattern leaderElection.qnt uses for its nullable snapshots)
+  // and guard on `hasEntry` exactly where the code guards on the DashMap
+  // lookup. The defaults are never observable: every action that reads an
+  // accessor also conjoins the guard that makes the absent case disabled.
+  def hasEntry(d: Drv): bool = entries.get(d) != NoEntry
+  /// The entry's exec stamp; 1 (a valid ghost-map key) when absent.
+  def entryExec(d: Drv): int =
+    match entries.get(d) { | NoEntry => 1 | Entry(en) => en.exec }
+  /// The entry's executor binding; "" (matches no executor) when absent.
+  def entryExecutor(d: Drv): Executor =
+    match entries.get(d) { | NoEntry => "" | Entry(en) => en.executor }
+  def entryHeld(d: Drv): Set[int] =
+    match entries.get(d) { | NoEntry => Set() | Entry(en) => en.held }
+  def entryFinalPending(d: Drv): bool =
+    match entries.get(d) { | NoEntry => false | Entry(en) => en.finalPending }
+  def entryPrefix(d: Drv): Prefix =
+    match entries.get(d) { | NoEntry => PrefChecked | Entry(en) => en.prefix }
+  /// Rebuild `d`'s entry with new held lines / pending mark / prefix
+  /// state, keeping the stamp. Only meaningful under a `hasEntry` guard.
+  def entryWith(d: Drv, held: Set[int], fp: bool, pref: Prefix): EntrySlot =
+    Entry({
+      exec: entryExec(d),
+      executor: entryExecutor(d),
+      held: held,
+      finalPending: fp,
+      prefix: pref,
+    })
+
+  // --- 6. actions -------------------------------------------------------
+  //
+  // Each action's precondition is the corresponding code path's guard and
+  // its effect is that path's state mutation; the function it mirrors is
+  // named in its doc comment. Actions are GUARDED (disabled when their
+  // preconditions fail), not thin always-enabled no-ops. Ceilings
+  // (MAX_EXECS, MAX_LINE, MAX_TRANSITIONS, MAX_GEN) are action
+  // preconditions, never saturating clamps.
+
+  // --- 6a. dispatch -----------------------------------------------------
+
+  /// `assign_to_worker` (actor/dispatch.rs): transition the drv to
+  /// Assigned, `discard_log_buffer` (remove the entry AND the seal — a
+  /// stale seal from a poison-clear would silently drop the new attempt's
+  /// pushes), mint a fresh per-execution UUIDv7, `set_log_exec` (create a
+  /// fresh stamped entry), and `record_assignment` (persist the
+  /// assignment + exec_id for the next recovery's restamp loop).
+  ///
+  /// Covers the first dispatch, the transient-retry re-dispatch, the
+  /// poison-clear resubmit, and the post-terminal-reset re-dispatch — all
+  /// of them discard whatever entry the previous attempt left and start
+  /// from a fresh stamped, unsealed, empty entry.
+  ///
+  /// Gated on `dispatch_ready` (leader + this epoch's recovery complete).
+  /// The executor is the environment's choice.
+  action dispatch(d: Drv, ex: Executor): bool = all {
+    dispatchReady,
+    dispatched.get(d) < MAX_EXECS,
+    val nextExec = dispatched.get(d) + 1
+    all {
+      dispatched' = dispatched.put(d, nextExec),
+      entries' = entries.put(d, Entry({
+        exec: nextExec,
+        executor: ex,
+        held: Set(),
+        finalPending: false,
+        prefix: PrefUnchecked,
+      })),
+      sealed' = sealed.put(d, false),
+      dag' = dag.put(d, DagLive),
+      pg' = pg.put(d, PgLive({ exec: nextExec, executor: ex })),
+    },
+    pendingFinal' = pendingFinal,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  // --- 6b. batch ingestion ----------------------------------------------
+
+  /// The accept predicate of `LogBuffers::push_for` for a non-empty batch
+  /// `[lo, hi)` from `ex` for `d`'s entry, evaluated against the current
+  /// state. The conjuncts, in the code's order:
+  ///   1. not sealed (checked before the entry lookup);
+  ///   2. an entry exists (`no_assignment` otherwise — a fabricated
+  ///      derivation_path must not allocate a buffer);
+  ///   3. the entry's `assigned_executor` matches the calling stream's
+  ///      (`executor_mismatch` otherwise) — r[sched.log.batch-binding];
+  ///   4. the batch's `first_line_number` is strictly above the ring's
+  ///      highest stored line number (`non_monotonic` otherwise) — the
+  ///      comparison is against the CURRENT ring contents only, so it
+  ///      resets when the ring empties — r[sched.executor.input-bounds+2].
+  /// The `line_number_overflow` arm is unrepresentable in the bounded
+  /// line domain (a Kani obligation, not a model one). The `unstamped`
+  /// arm is unreachable (the model has no legacy `push()` entries).
+  def batchAccepted(d: Drv, ex: Executor, lo: int): bool = and {
+    not(sealed.get(d)),
+    hasEntry(d),
+    entryExecutor(d) == ex,
+    entryHeld(d) == Set() or lo > setHi(entryHeld(d)),
+  }
+
+  /// `LogBuffers::push_for` + `push_into`, accept path: the batch's lines
+  /// are appended to the ring and (ghost) attributed to the entry's
+  /// current execution. The batch is the contiguous worker interval
+  /// `[lo, hi)`; an upward gap between the ring's current end and `lo` is
+  /// accepted and becomes an interior hole (obs.log.gap-span).
+  /// The check and the write happen under one shard write-lock in the
+  /// code, so accept-then-append is one atomic step here too.
+  // Mirrors: LogBuffers::push_for (accept), LogBuffers::push_into.
+  action pushBatchAccepted(d: Drv, ex: Executor, lo: int, hi: int): bool = {
+    val lines = lo.to(hi - 1)
+    val e = entryExec(d)
+    all {
+      lo < hi,
+      hi <= MAX_LINE,
+      batchAccepted(d, ex, lo),
+      entries' = entries.put(d,
+        entryWith(d, entryHeld(d).union(lines), entryFinalPending(d), entryPrefix(d))),
+      delivered' = delivered.put(d,
+        delivered.get(d).put(e, delivered.get(d).get(e).union(lines))),
+      sealed' = sealed,
+      pendingFinal' = pendingFinal,
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      stored' = stored,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+      wit' = wit,
+    }
+  }
+
+  /// `LogBuffers::push_for`, non-monotone reject arm: a non-empty batch
+  /// whose `first_line_number` is at or below the ring's highest stored
+  /// line number is dropped — per-batch, no state change beyond the
+  /// rejection counter (here: the witness flag). The other reject arms
+  /// (sealed, no entry, foreign executor) are pure no-ops and are not
+  /// modeled as steps — a no-op self-loop adds no reachable state and the
+  /// binding-gate invariant is about what `pushBatchAccepted` ADMITS, not
+  /// about the rejections being observable.
+  // Mirrors: LogBuffers::push_for (reason="non_monotonic").
+  action pushBatchRejectedNonMonotone(d: Drv, ex: Executor, lo: int): bool = all {
+    not(sealed.get(d)),
+    hasEntry(d),
+    entryExecutor(d) == ex,
+    entryHeld(d) != Set(),
+    lo <= setHi(entryHeld(d)),
+    lo >= 0,
+    lo < MAX_LINE,
+    wit' = { ...wit, rejectedNonMonotone: true },
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  // --- 6c. eviction -----------------------------------------------------
+
+  /// The line/byte-cap eviction inside `LogBuffers::push_into`: pop lines
+  /// off the FRONT of the ring until under the cap. Abstracted to "an
+  /// arbitrary non-empty proper prefix of the held lines may be dropped at
+  /// any time the ring holds at least two lines" — a sound
+  /// over-approximation of the real policy (the real eviction fires only
+  /// when a push exceeds RING_CAPACITY/RING_BYTE_CAP and always leaves at
+  /// least the just-pushed tail; the model may evict more often and more
+  /// aggressively, reaching strictly more states). Eviction only ever pops
+  /// the front, so the survivors stay a suffix and the next flush's
+  /// `first_line` reveals exactly which head range was evicted — the
+  /// disclosed head-loss channel of obs.log.line-conservation.
+  // Mirrors: LogBuffers::push_into (the `while ... pop_front` loop).
+  action evict(d: Drv): bool = all {
+    ENABLE_EVICTION,
+    entryHeld(d).size() >= 2,
+    // The new front: any held line above the current front; every line
+    // below it is evicted. The -1 sentinel keeps the nondet domain
+    // non-empty when the guard above is false (oneOf of an empty set is
+    // undefined); the `cut >= 0` conjunct disables those picks.
+    nondet cut = entryHeld(d).union(Set(-1)).oneOf()
+    all {
+      cut > setLo(entryHeld(d)),
+      cut >= 0,
+      entries' = entries.put(d,
+        entryWith(d, entryHeld(d).filter(n => n >= cut), entryFinalPending(d), entryPrefix(d))),
+    },
+    wit' = { ...wit, evicted: true },
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  // --- 6d. terminal + cleanup -------------------------------------------
+
+  /// The execution a terminal for `d` is attributed to:
+  /// `exec_id_for_terminal` resolves the DAG node's carrier or the
+  /// buffer's stamp; the model uses the buffer's stamp when an entry
+  /// exists (the carrier the flush request actually pins) and the latest
+  /// minted execution otherwise.
+  def terminalExec(d: Drv): int =
+    if (hasEntry(d)) entryExec(d) else dispatched.get(d)
+
+  /// `terminal_log_epilogue` (actor/event.rs) on a derivation reaching a
+  /// terminal state with an execution to finalize, plus the terminal
+  /// transition itself: seal the entry, enqueue the final `FlushRequest`
+  /// stamped with the CURRENT lease generation and acquire-epoch
+  /// (`trigger_log_flush`), mark the entry final-pending
+  /// (`mark_final_pending`, exec-guarded), and persist the terminal
+  /// status to PG. Success, permanent failure, and build-level
+  /// cancellation all route through the same epilogue; the status string
+  /// is not modeled (no invariant reads it).
+  ///
+  /// A second terminal for the same derivation (a re-dispatched
+  /// execution's own terminal) replaces the pending request slot — the
+  /// prefer-the-newer-tenure replacement `retain_deferred` performs.
+  // Mirrors: terminal_log_epilogue + seal_log_buffer + trigger_log_flush
+  //          + mark_final_pending; the terminal-status persist in the
+  //          completion/cancel handlers.
+  action terminalEnqueued(d: Drv): bool = all {
+    dag.get(d) == DagLive,
+    dispatched.get(d) > 0,
+    val e = terminalExec(d)
+    all {
+      pendingFinal' = pendingFinal.put(d, Final({
+        exec: e,
+        gen: generation,
+        transitions: acquiredTransitions,
+      })),
+      // mark_final_pending is exec-guarded: applied only when the entry
+      // is stamped with the execution the request pins.
+      entries' = if (hasEntry(d) and entryExec(d) == e)
+        entries.put(d, entryWith(d, entryHeld(d), true, entryPrefix(d)))
+      else entries,
+    },
+    sealed' = sealed.put(d, true),
+    dag' = dag.put(d, DagTerminal),
+    // The terminal-status persist. PG now records the derivation as
+    // terminal, so the next recovery will not reload it as a live
+    // assignment.
+    pg' = pg.put(d, PgNone),
+    dispatched' = dispatched,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// `terminal_log_epilogue`'s enqueue-failure arm: the flush channel is
+  /// full, the flusher task is dead, or no flusher is configured —
+  /// `try_log_flush` returns false. No request is enqueued and no
+  /// final-pending mark is set; a zero-line entry is reaped on the spot
+  /// (`discard_if_empty` — the flusher's drain will never remove it, the
+  /// periodic snapshot skips zero-line entries, and the drv is terminal
+  /// so no re-dispatch discard is coming). A non-empty entry keeps the
+  /// documented degraded mode (periodic `.partial` snapshots until
+  /// `CleanupTerminalBuild`).
+  /// r[obs.log.entry-justified] (prose reference; the tracey marker lives
+  /// at the check wiring point in nix/quint.nix).
+  // Mirrors: terminal_log_epilogue (enqueued == false) +
+  //          LogBuffers::discard_if_empty.
+  action terminalEnqueueFailed(d: Drv): bool = all {
+    ENABLE_ENQUEUE_FAILURE,
+    dag.get(d) == DagLive,
+    dispatched.get(d) > 0,
+    val emptyReap = and { hasEntry(d), entryHeld(d) == Set() }
+    all {
+      entries' = if (emptyReap) entries.put(d, NoEntry) else entries,
+      // discard_if_empty clears the seal it just set only when it removed
+      // an entry; otherwise the seal stays (it still guards late batches
+      // and CleanupTerminalBuild bounds it).
+      sealed' = sealed.put(d, not(emptyReap)),
+      wit' = if (emptyReap) { ...wit, enqueueFailReap: true } else wit,
+    },
+    dag' = dag.put(d, DagTerminal),
+    pg' = pg.put(d, PgNone),
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  /// The terminal-status persist failing (PG unreachable at terminal
+  /// time): the in-memory DAG records the terminal and the epilogue still
+  /// runs (seal + enqueue), but PG keeps the assignment as live — so the
+  /// next tenure's recovery reloads the derivation as still
+  /// Assigned/Running and restamps the SAME exec_id onto the retained
+  /// entry. This is the correlated failure the deferred-final tenure pin
+  /// exists for: the queued final and the un-persisted terminal are
+  /// evidence of the same PG outage.
+  // Mirrors: the completion handler's failed status UPDATE (the terminal
+  //          proceeds in memory; PG is left stale).
+  action terminalPersistFailed(d: Drv): bool = all {
+    ENABLE_PERSIST_FAILURE,
+    dag.get(d) == DagLive,
+    dispatched.get(d) > 0,
+    val e = terminalExec(d)
+    all {
+      pendingFinal' = pendingFinal.put(d, Final({
+        exec: e,
+        gen: generation,
+        transitions: acquiredTransitions,
+      })),
+      entries' = if (hasEntry(d) and entryExec(d) == e)
+        entries.put(d, entryWith(d, entryHeld(d), true, entryPrefix(d)))
+      else entries,
+    },
+    sealed' = sealed.put(d, true),
+    dag' = dag.put(d, DagTerminal),
+    // The persist failed: PG still says Assigned/Running.
+    pg' = pg,
+    dispatched' = dispatched,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// `handle_cleanup_terminal_build` (actor/build.rs), the log-buffer
+  /// half: TERMINAL_CLEANUP_DELAY after a build completes, the reaped DAG
+  /// nodes' entries are discarded — UNLESS the entry's final flush is
+  /// still pending with the flusher (enqueued and unresolved, or deferred
+  /// and retained), in which case the flusher's processing of that
+  /// request is the entry's reaper. The DAG node itself is removed.
+  // Mirrors: handle_cleanup_terminal_build (remove_build_interest_and_reap
+  //          + the final_pending-gated discard loop).
+  action cleanupTerminal(d: Drv): bool = all {
+    dag.get(d) == DagTerminal,
+    val discard = and { hasEntry(d), not(entryFinalPending(d)) }
+    all {
+      entries' = if (discard) entries.put(d, NoEntry) else entries,
+      sealed' = if (discard) sealed.put(d, false) else sealed,
+    },
+    dag' = dag.put(d, DagAbsent),
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  // --- 6e. the flusher --------------------------------------------------
+
+  /// Read accessors over the stored `drv_logs` row for one execution.
+  def rowOf(d: Drv, e: int): StoredRow = stored.get(d).get(e)
+  def rowExists(d: Drv, e: int): bool = rowOf(d, e) != NoRow
+  def rowComplete(d: Drv, e: int): bool =
+    match rowOf(d, e) { | NoRow => false | Stored(r) => r.complete }
+  /// The row's recorded span end (`first_line + line_count`) — the
+  /// stored-coverage end every subsumption and truncation decision is
+  /// keyed on. 0 when no row exists.
+  def rowEnd(d: Drv, e: int): int =
+    match rowOf(d, e) { | NoRow => 0 | Stored(r) => r.lo + r.cnt }
+  def rowLo(d: Drv, e: int): int =
+    match rowOf(d, e) { | NoRow => 0 | Stored(r) => r.lo }
+  def rowCnt(d: Drv, e: int): int =
+    match rowOf(d, e) { | NoRow => 0 | Stored(r) => r.cnt }
+
+  /// `lookup_stored_prefix`'s "the ring makes the stored row redundant"
+  /// test: the ring contiguously covers the row's whole stated range —
+  /// the same-tenure steady state, where this process wrote the row from
+  /// this very ring. Anything short of that means the stored blob may
+  /// hold lines this replica never had and must be folded in.
+  def ringSubsumesRow(d: Drv, e: int): bool = and {
+    val h = entryHeld(d)
+    and {
+      // ring_contiguous: a non-monotone or holey ring classifies as
+      // non-contiguous — the conservative branch.
+      h.size() == setHi(h) - setLo(h) + 1,
+      setLo(h) <= rowLo(d, e),
+      setHi(h) + 1 >= rowEnd(d, e),
+    },
+  }
+
+  /// `reconcile_stored_prefix` + `lookup_stored_prefix` +
+  /// `truncate_below`: the once-per-execution-per-tenure reconciliation
+  /// of the ring against the stored row, run before the first non-empty
+  /// flush of an execution on a tenure (`PrefixState::Unchecked`). When a
+  /// non-finalized row exists that the ring does not contiguously
+  /// subsume, the stored blob is fetched and cached as the execution's
+  /// recovered prefix and the ring yields every line below the row's
+  /// stated end (overlapping lines are superseded by the durable copy; a
+  /// non-overlapping head below the stored range is the prior tenure's
+  /// unflushed tail, inside the failover budget). Otherwise the entry is
+  /// marked checked and nothing is fetched.
+  ///
+  /// A separate action (not folded into the flush actions) because the
+  /// lookup and the GET are awaits: the environment may act between the
+  /// reconcile settling the prefix state and the flush that consumes it.
+  /// The flush actions require the prefix to be settled when the ring is
+  /// non-empty, exactly as the code's inline `if Unchecked { reconcile }`
+  /// blocks the flush until the reconcile resolves.
+  // Mirrors: LogFlusher::reconcile_stored_prefix, lookup_stored_prefix,
+  //          LogBuffers::truncate_below, set_recovered_prefix,
+  //          mark_prefix_checked.
+  action reconcileStoredPrefix(d: Drv): bool = all {
+    hasEntry(d),
+    entryPrefix(d) == PrefUnchecked,
+    entryHeld(d) != Set(),
+    val e = entryExec(d)
+    val needsFold = and {
+      rowExists(d, e),
+      not(rowComplete(d, e)),
+      not(ringSubsumesRow(d, e)),
+    }
+    entries' = if (needsFold)
+      // Found: cache the row's recorded span as the prefix and drop every
+      // ring line below its stated end.
+      entries.put(d, entryWith(
+        d,
+        entryHeld(d).filter(n => n >= rowEnd(d, e)),
+        entryFinalPending(d),
+        PrefCached({ lo: rowLo(d, e), cnt: rowCnt(d, e) })))
+    else
+      // NotNeeded: no row, a finalized row (the already-finalized guard /
+      // the frozen UPSERT own that), or the ring subsumes it.
+      entries.put(d, entryWith(d, entryHeld(d), entryFinalPending(d), PrefChecked)),
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// `upload_and_record`'s effective-row computation for a non-empty
+  /// payload: the row's `(first_line, line_count)` stay in TRUE worker
+  /// line-number space — the recovered prefix's span, the prefix→ring
+  /// gap, and the ring's line-number span (NOT its physical count) are
+  /// summed, so `first_line + line_count` is one past the highest true
+  /// line the row covers even when the blob omits lines or replaces them
+  /// with a marker (obs.log.gap-span+2). `trueEnd` is the ghost truth the
+  /// `lineSpanExact` invariant compares the recorded span against.
+  // Mirrors: upload_and_record (eff_first_line / eff_line_count /
+  //          ring_span / the gap-merge fold).
+  pure def mergedRow(pref: Prefix, ring: Set[int], complete: bool): Row = {
+    val ringFirst = setLo(ring)
+    val ringLast = setHi(ring)
+    val ringSpan = ringLast - ringFirst + 1
+    match pref {
+      | PrefCached(p) =>
+        // gap = first_line.saturating_sub(prefix_end)
+        val prefixEnd = p.lo + p.cnt
+        val gap = if (ringFirst > prefixEnd) ringFirst - prefixEnd else 0
+        { lo: p.lo, cnt: p.cnt + gap + ringSpan, trueEnd: ringLast + 1, complete: complete }
+      | PrefUnchecked =>
+        { lo: ringFirst, cnt: ringSpan, trueEnd: ringLast + 1, complete: complete }
+      | PrefChecked =>
+        { lo: ringFirst, cnt: ringSpan, trueEnd: ringLast + 1, complete: complete }
+    }
+  }
+
+  /// `flush_periodic` + `upload_and_record(is_final=false)` for one
+  /// derivation with a non-empty ring: snapshot (non-draining), upload
+  /// the `.partial`, and UPSERT the row at `is_complete = false`. The
+  /// frozen-row latch refuses the UPSERT when another tenure already
+  /// finalized the execution; a refused UPSERT against a still-SEALED
+  /// entry is the "finalized elsewhere" signal that reaps the orphan
+  /// (`discard_if_sealed_for_exec(require_empty=false)` — the durable
+  /// record supersedes the retained lines). An UNSEALED entry with a
+  /// refused UPSERT is the live execution's carrier and is left alone.
+  ///
+  /// Gated on `may_flush` (leader + this epoch's recovery complete) and
+  /// on the prefix state being settled (the code's inline reconcile).
+  /// The per-derivation iteration of one tick is split into one action
+  /// per derivation — a superset of the real interleavings (sound).
+  /// r[obs.log.finalize-immutable] r[obs.log.entry-justified] (prose
+  /// references; markers live at the check wiring points in
+  /// nix/quint.nix).
+  // Mirrors: LogFlusher::flush_periodic + upload_and_record (non-final,
+  //          line_count > 0) + upsert_drv_log + the refused-UPSERT reap.
+  action flushPeriodicUpload(d: Drv): bool = all {
+    mayFlush,
+    hasEntry(d),
+    entryHeld(d) != Set(),
+    entryPrefix(d) != PrefUnchecked,
+    val e = entryExec(d)
+    val refused = rowComplete(d, e)
+    val reap = and { refused, sealed.get(d) }
+    all {
+      stored' = if (refused) stored else
+        stored.put(d, stored.get(d).put(e,
+          Stored(mergedRow(entryPrefix(d), entryHeld(d), false)))),
+      entries' = if (reap) entries.put(d, NoEntry) else entries,
+      sealed' = if (reap) sealed.put(d, false) else sealed,
+      wit' = if (reap) { ...wit, refusedUpsertReap: true } else wit,
+    },
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  /// `upload_and_record`'s empty-snapshot early return: a periodic tick
+  /// over a zero-line entry uploads nothing, but a SEALED empty entry
+  /// stamped with this execution is reaped here — sealed means a terminal
+  /// already fired and no restamp adopted the entry as the live carrier;
+  /// empty means there is nothing left to persist (it never held a line,
+  /// or this tick's stored-coverage reconcile truncated the whole ring
+  /// away). Such an entry can never reach the PUT/UPSERT, no other reaper
+  /// remains, and left in place it would sit in memory until process
+  /// restart. An unsealed empty entry (a just-dispatched carrier waiting
+  /// for its first batch) is never touched.
+  /// r[obs.log.entry-justified] (prose reference).
+  // Mirrors: upload_and_record (line_count == 0, !is_final) +
+  //          discard_if_sealed_for_exec(require_empty=true).
+  action flushPeriodicSealedEmptyReap(d: Drv): bool = all {
+    mayFlush,
+    hasEntry(d),
+    entryHeld(d) == Set(),
+    sealed.get(d),
+    entries' = entries.put(d, NoEntry),
+    sealed' = sealed.put(d, false),
+    wit' = { ...wit, sealedEmptyReap: true },
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  /// `flush_final`'s entry-time tenure pin, drop arm: a final flush
+  /// request — first attempt or retained retry — may only finalize under
+  /// the leadership tenure that enqueued it. A request that outlived its
+  /// tenure is dropped with ZERO PG and S3 work; the only entry it reaps
+  /// is one still SEALED for its exec (no restamp in the current tenure
+  /// adopted it as the live carrier) and EMPTY (nothing a retry could
+  /// upload). A sealed non-empty orphan is left for the periodic flush's
+  /// refused-UPSERT or sealed-empty reaps; an unsealed entry may be the
+  /// live execution's restamped carrier and is never touched.
+  /// r[obs.log.deferred-final-retry+4] r[obs.log.entry-justified] (prose
+  /// references).
+  // Mirrors: flush_final (the !req_in_tenure entry pin) +
+  //          discard_if_sealed_for_exec(require_empty=true).
+  action flushFinalDropStale(d: Drv): bool = {
+    val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
+    all {
+      pendingFinal.get(d) != NoFinal,
+      not(reqInTenure(req)),
+      val reap = and {
+        sealed.get(d),
+        hasEntry(d),
+        entryExec(d) == req.exec,
+        entryHeld(d) == Set(),
+      }
+      all {
+        entries' = if (reap) entries.put(d, NoEntry) else entries,
+        sealed' = if (reap) sealed.put(d, false) else sealed,
+        wit' = if (reap) { ...wit, tenureDropReap: true } else wit,
+      },
+      pendingFinal' = pendingFinal.put(d, NoFinal),
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      delivered' = delivered,
+      stored' = stored,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+    }
+  }
+
+  /// `flush_final`'s already-finalized refusal: the guard SELECT finds
+  /// the execution's row already `is_complete = true` — another tenure
+  /// finalized it. The retained residue is drained iff still stamped with
+  /// this execution (and unsealed); nothing is uploaded and the durable
+  /// record is left untouched. The retained lines it lacks fall within
+  /// the accepted failover-loss bound and the loss is disclosed by the
+  /// finalized record's own claimed span.
+  /// r[obs.log.finalize-immutable] (prose reference).
+  // Mirrors: flush_final (the Ok(Some(stored)) if stored.is_complete arm)
+  //          + drain_if_exec + unseal.
+  action flushFinalRefuseFinalized(d: Drv): bool = {
+    val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
+    all {
+      pendingFinal.get(d) != NoFinal,
+      reqInTenure(req),
+      rowComplete(d, req.exec),
+      val drained = and { hasEntry(d), entryExec(d) == req.exec }
+      all {
+        entries' = if (drained) entries.put(d, NoEntry) else entries,
+        sealed' = if (drained) sealed.put(d, false) else sealed,
+      },
+      pendingFinal' = pendingFinal.put(d, NoFinal),
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      delivered' = delivered,
+      stored' = stored,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+      wit' = wit,
+    }
+  }
+
+  /// `flush_final`'s finalize-guard-error arm: the row consult itself
+  /// failed (PG unreachable), so the flusher cannot tell "first
+  /// finalization" from "another leader already finalized this exec" and
+  /// fails closed — nothing is uploaded. A zero-line entry stamped with
+  /// the request's exec is reaped (nothing any retry could upload) and
+  /// the request is consumed; a non-empty stamped entry re-asserts the
+  /// pending mark and the request is RETAINED for retry on the next
+  /// flusher tick (the request stays in the pending slot); no stamped
+  /// entry means nothing a retry could drain — the request is consumed.
+  /// r[obs.log.deferred-final-retry+4] (prose reference).
+  // Mirrors: flush_final (the Err(e) guard arm) +
+  //          discard_if_empty_for_exec + mark_final_pending +
+  //          retain_deferred.
+  action flushFinalGuardError(d: Drv): bool = {
+    val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
+    all {
+      ENABLE_GUARD_FAILURE,
+      pendingFinal.get(d) != NoFinal,
+      reqInTenure(req),
+      not(rowComplete(d, req.exec)),
+      val stamped = and { hasEntry(d), entryExec(d) == req.exec }
+      val emptyReap = and { stamped, entryHeld(d) == Set() }
+      val retained = and { stamped, entryHeld(d) != Set() }
+      all {
+        entries' = if (emptyReap) entries.put(d, NoEntry)
+          else if (retained)
+            entries.put(d, entryWith(d, entryHeld(d), true, entryPrefix(d)))
+          else entries,
+        sealed' = if (emptyReap) sealed.put(d, false) else sealed,
+        // Retained for retry: the request stays in the slot. Consumed
+        // otherwise.
+        pendingFinal' = if (retained) pendingFinal else pendingFinal.put(d, NoFinal),
+      },
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      delivered' = delivered,
+      stored' = stored,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+      wit' = wit,
+    }
+  }
+
+  /// `flush_final`'s drain-and-upload arm for a non-empty ring: the
+  /// in-tenure, not-yet-finalized request drains the entry stamped with
+  /// its execution (`drain_if_exec` — the exec comparison and the removal
+  /// are one atomic op, so a re-dispatch racing the queue cannot have its
+  /// fresh entry drained by a stale request), unseals, uploads the final
+  /// blob, and UPSERTs the row at `is_complete = true`. The row's span is
+  /// the true-line-number merge of the cached prefix, the prefix→ring
+  /// gap, and the ring's span (obs.log.gap-span+2).
+  /// r[obs.log.exec-keyed+2] (prose reference).
+  // Mirrors: flush_final (the drain_if_exec Some arm) + upload_and_record
+  //          (is_final=true, line_count > 0) + upsert_drv_log.
+  action flushFinalUpload(d: Drv): bool = {
+    val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
+    all {
+      pendingFinal.get(d) != NoFinal,
+      reqInTenure(req),
+      not(rowComplete(d, req.exec)),
+      hasEntry(d),
+      entryExec(d) == req.exec,
+      entryHeld(d) != Set(),
+      // The code's inline reconcile must have settled the prefix state
+      // before the pre-drain read; the reconcile is a separate action
+      // here, so the upload waits for it.
+      entryPrefix(d) != PrefUnchecked,
+      stored' = stored.put(d, stored.get(d).put(req.exec,
+        Stored(mergedRow(entryPrefix(d), entryHeld(d), true)))),
+      entries' = entries.put(d, NoEntry),
+      sealed' = sealed.put(d, false),
+      pendingFinal' = pendingFinal.put(d, NoFinal),
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      delivered' = delivered,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+      wit' = wit,
+    }
+  }
+
+  /// `flush_final`'s empty-drain arm: the entry stamped with the
+  /// request's execution drains zero lines (a failover restamp whose
+  /// worker never re-streamed, or a silent build). Nothing is uploaded;
+  /// `finalize_empty_drain` stamps `status`/`finished_at` on any prior
+  /// `.partial` row WITHOUT setting `is_complete` — the stored content is
+  /// truncated at the last periodic snapshot and the incomplete indicator
+  /// must survive (obs.log.incomplete-surfaced). The entry is removed by
+  /// the drain and unsealed.
+  // Mirrors: flush_final (drain_if_exec Some, line_count == 0) +
+  //          finalize_empty_drain.
+  action flushFinalEmptyDrain(d: Drv): bool = {
+    val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
+    all {
+      pendingFinal.get(d) != NoFinal,
+      reqInTenure(req),
+      not(rowComplete(d, req.exec)),
+      hasEntry(d),
+      entryExec(d) == req.exec,
+      entryHeld(d) == Set(),
+      // status/finished_at are not modeled; the row's content columns and
+      // is_complete are untouched.
+      entries' = entries.put(d, NoEntry),
+      sealed' = sealed.put(d, false),
+      pendingFinal' = pendingFinal.put(d, NoFinal),
+      stored' = stored,
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      delivered' = delivered,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+      wit' = wit,
+    }
+  }
+
+  /// `flush_final`'s stale-request / no-entry arm: the entry is gone or
+  /// stamped with a different (newer) execution — a re-dispatch landed
+  /// between queuing and processing. The request is dropped without
+  /// draining anything (the live execution's entry and seal are left
+  /// alone); when no entry exists at all the leftover seal is defensively
+  /// cleared.
+  // Mirrors: flush_final (the drain_if_exec None arm).
+  action flushFinalStaleOrMissing(d: Drv): bool = {
+    val req = match pendingFinal.get(d) { | NoFinal => { exec: 0, gen: 0, transitions: 0 } | Final(r) => r }
+    all {
+      pendingFinal.get(d) != NoFinal,
+      reqInTenure(req),
+      not(rowComplete(d, req.exec)),
+      not(and { hasEntry(d), entryExec(d) == req.exec }),
+      // No entry at all => defensive unseal; a live restamped entry's
+      // seal belongs to the live execution and is left alone.
+      sealed' = if (hasEntry(d)) sealed else sealed.put(d, false),
+      pendingFinal' = pendingFinal.put(d, NoFinal),
+      entries' = entries,
+      stored' = stored,
+      dispatched' = dispatched,
+      dag' = dag,
+      pg' = pg,
+      delivered' = delivered,
+      replica' = replica,
+      leaseTransitions' = leaseTransitions,
+      wit' = wit,
+    }
+  }
+
+  // --- 6f. lease transitions (the §3.3 abstract interface) --------------
+
+  /// A foreign holder change at the apiserver: another replica's steal
+  /// PUT bumps the Lease's `leaseTransitions` count. Our local state does
+  /// not change — we have not observed it yet. Whether we later observe
+  /// it through a lose/acquire edge pair or only late as a rebound is the
+  /// environment's choice (the following actions).
+  action foreignSteal: bool = all {
+    leaseTransitions < MAX_TRANSITIONS,
+    leaseTransitions' = leaseTransitions + 1,
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    wit' = wit,
+  }
+
+  /// `LeaderState::on_lose` + the actor's `handle_leader_lost`: the lease
+  /// loop observes the loss (a 409, an observed foreign holder, or a
+  /// self-fence), clears `is_leader` and the recovery-completion stamp,
+  /// and the actor invalidates the completion and wipes the persisted
+  /// in-memory state (`clear_persisted_state`: the DAG is emptied and
+  /// `dag_authoritative` cleared). The LogBuffers entries are RETAINED —
+  /// a still-streaming worker's in-flight execution keeps its lines
+  /// across the flap; they are reconciled at the next acquisition.
+  /// The lose and the actor's processing of the queued LeaderLost are
+  /// collapsed into one step; the on_lose-to-dequeue window's only
+  /// observable effect (a completion processed with `is_leader` already
+  /// false) is equivalent to the completion landing just before the lose.
+  // Mirrors: LeaderState::on_lose, DagActor::handle_leader_lost,
+  //          clear_persisted_state.
+  action loseLease: bool = all {
+    isLeader,
+    replica' = {
+      ...replica,
+      isLeader: false,
+      recoveredEpoch: NO_EPOCH,
+      loadSucceeded: false,
+    },
+    dag' = DRVS.mapBy(d => DagAbsent),
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// `LeaderState::on_acquire` on a re-acquire that follows at least one
+  /// foreign holder change: our steal PUT bumps the transition count once
+  /// more, the new count is recorded unconditionally in
+  /// `acquired_transitions`, and the generation is `fetch_max`'d to
+  /// `transitions + 1` — a NO-OP when the recovery floor seed has already
+  /// raised the generation past it (the saturated post-deletion regime).
+  /// That no-op is the lease model's "the generation may or may not
+  /// increase on a holder change" guarantee and the premise of the
+  /// `req_in_tenure` acquire-epoch fix; the witness flag records when it
+  /// happens. Recovery has not run yet for the new epoch — the
+  /// fire-and-forgotten LeaderAcquired is the `recoveryRuns*` action.
+  // Mirrors: LeaderState::on_acquire (the steal path).
+  action reacquireAfterHolderChange: bool = all {
+    not(isLeader),
+    leaseTransitions > acquiredTransitions,
+    leaseTransitions < MAX_TRANSITIONS,
+    maxInt(generation, leaseTransitions + 2) <= MAX_GEN,
+    val newCount = leaseTransitions + 1
+    val newGen = maxInt(generation, newCount + 1)
+    all {
+      leaseTransitions' = newCount,
+      replica' = {
+        ...replica,
+        isLeader: true,
+        acquiredTransitions: newCount,
+        generation: newGen,
+      },
+      wit' = if (newGen == generation)
+        { ...wit, genPinnedAcrossHolderChange: true }
+      else wit,
+    },
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+  }
+
+  /// `LeaderState::on_acquire` on a same-epoch re-acquire: a self-fence
+  /// false alarm followed by a successful renew of a lease nobody stole
+  /// in between. The transition count did not move, so the recorded
+  /// acquire-epoch and the generation are both unchanged — the in-flight
+  /// work (including a queued final flush) is still this tenure's to
+  /// resolve, which is exactly why `req_in_tenure` deliberately keeps
+  /// such a request in tenure. Recovery still re-runs (the lose cleared
+  /// the completion stamp and wiped the DAG).
+  // Mirrors: LeaderState::on_acquire (the renew-edge re-acquire path).
+  action reacquireSameEpoch: bool = all {
+    not(isLeader),
+    leaseTransitions == acquiredTransitions,
+    replica' = { ...replica, isLeader: true },
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// `LeaderState::on_rebound`: a holder change observed late, on a
+  /// still-leading round — a foreign term began and ended entirely inside
+  /// our observation gap, so neither an acquire nor a lose edge ever
+  /// fired locally. The completion stamp is cleared FIRST, then the new
+  /// transition count is recorded, then the generation is fetch_max'd.
+  /// `is_leader` is NOT touched and — the encoded surprise — neither is
+  /// the actor's `dag_authoritative` bit nor the DAG: no LeaderLost ever
+  /// fires, and the re-fired LeaderAcquired only clears them when the
+  /// actor dequeues it (the `recoveryRuns*` action). Until then the
+  /// disconnect-time discard's `is_leader && dag_authoritative` gate is
+  /// still open over the pre-rebound DAG.
+  // Mirrors: LeaderState::on_rebound.
+  action reboundLease: bool = all {
+    isLeader,
+    leaseTransitions > acquiredTransitions,
+    maxInt(generation, leaseTransitions + 1) <= MAX_GEN,
+    replica' = {
+      ...replica,
+      acquiredTransitions: leaseTransitions,
+      generation: maxInt(generation, leaseTransitions + 1),
+      recoveredEpoch: NO_EPOCH,
+    },
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  // --- 6g. acquisition-time recovery ------------------------------------
+
+  /// `LogBuffers::set_exec`'s restamp semantics, as recovery applies them
+  /// to one retained entry against the persisted assignment `(e, ex)`:
+  ///   - no entry: create a fresh empty stamped entry (the carrier for
+  ///     the periodic flush before the worker's first batch);
+  ///   - same exec: keep the lines (a single lease flap with no interim
+  ///     re-dispatch — the still-streaming worker's execution must keep
+  ///     accumulating), but clear the seal, the pending-final mark, and
+  ///     the per-tenure prefix bookkeeping (the prior tenure's retained
+  ///     final can no longer resolve the entry, and an interim leader may
+  ///     have extended the stored row past what this ring holds);
+  ///   - cross exec: the assignment was re-issued under a different
+  ///     exec_id while this entry sat retained — clear the lines, the
+  ///     seal, the pending-final mark, and the prefix state; carrying any
+  ///     of them across would hand one execution's output to another
+  ///     execution's S3 key and drv_logs row (obs.log.exec-keyed+2).
+  pure def restampEntry(slot: EntrySlot, e: int, ex: Executor): EntrySlot =
+    match slot {
+      | NoEntry => Entry({ exec: e, executor: ex, held: Set(), finalPending: false, prefix: PrefUnchecked })
+      | Entry(en) =>
+        if (en.exec == e)
+          Entry({ exec: e, executor: ex, held: en.held, finalPending: false, prefix: PrefUnchecked })
+        else
+          Entry({ exec: e, executor: ex, held: Set(), finalPending: false, prefix: PrefUnchecked })
+    }
+
+  /// Whether restamping `slot` against persisted exec `e` is a cross-exec
+  /// restamp that drops a non-empty ring (the witness discriminator).
+  pure def restampDropsLines(slot: EntrySlot, e: int): bool =
+    match slot {
+      | NoEntry => false
+      | Entry(en) => en.exec != e and en.held != Set()
+    }
+
+  /// The post-recovery state of one derivation's entry under a successful
+  /// load: restamped from the persisted assignment when one exists;
+  /// otherwise re-armed (prefix cleared to Unchecked) and then swept by
+  /// `discard_unsealed_not_in` iff unsealed (sealed entries are the
+  /// flusher's to drain — their final flush may still be queued).
+  pure def recoveredEntry(slot: EntrySlot, p: PgAssign, isSealed: bool): EntrySlot =
+    match p {
+      | PgLive(a) => restampEntry(slot, a.exec, a.executor)
+      | PgNone =>
+        if (isSealed)
+          // Spared by the sweep; the prefix re-arm still applies.
+          match slot {
+            | NoEntry => NoEntry
+            | Entry(en) => Entry({ ...en, prefix: PrefUnchecked })
+          }
+        else NoEntry
+    }
+
+  /// `handle_leader_acquired` + `recover_from_pg`, the successful-load,
+  /// gate-passing outcome: clear the persisted state, re-arm the
+  /// stored-coverage reconciliation on every retained entry
+  /// (`rearm_prefix_reconciliation`), reload the DAG from PG, restamp the
+  /// entry of every persisted live assignment (`set_log_exec`), sweep
+  /// every UNSEALED retained entry whose derivation is not live in the
+  /// rebuilt DAG (`sweep_stale_log_buffers` — it went terminal or
+  /// vanished under an interim leader and would otherwise shadow the
+  /// stored log and be re-uploaded every periodic tick), seed the
+  /// generation from the durable floor (which MAY raise it without
+  /// moving the acquire-epoch — the mid-tenure floor-seed event shape
+  /// that saturates the generation), mark the DAG authoritative, and
+  /// record the epoch-keyed recovery completion.
+  /// r[sched.recovery.log-buffer-sweep+2] r[obs.log.exec-keyed+2]
+  /// r[obs.log.stored-coverage-preserved] (prose references).
+  // Mirrors: handle_leader_acquired (the Ok + gate-pass arm),
+  //          recover_from_pg, rearm_prefix_reconciliation, set_exec,
+  //          sweep_stale_log_buffers / discard_unsealed_not_in,
+  //          seed_generation_from, set_recovery_complete.
+  action recoveryOk: bool = all {
+    isLeader,
+    not(recoveryComplete),
+    // The floor seed: 0 = the floor vouches for the entry generation
+    // (the ordinary failover), 1 = the durable floor exceeded it and the
+    // claim target bumped past it (the post-deletion saturation). The
+    // ceiling is a precondition, never a clamp.
+    nondet seedBump = Set(0, 1).oneOf()
+    all {
+      generation + seedBump <= MAX_GEN,
+      replica' = {
+        ...replica,
+        generation: generation + seedBump,
+        recoveredEpoch: acquiredTransitions,
+        loadSucceeded: true,
+      },
+    },
+    dag' = DRVS.mapBy(d => match pg.get(d) { | PgLive(a) => DagLive | PgNone => DagAbsent }),
+    entries' = DRVS.mapBy(d => recoveredEntry(entries.get(d), pg.get(d), sealed.get(d))),
+    // Every restamp (same- or cross-exec) clears the seal; a swept or
+    // spared entry keeps it (the sweep skips sealed keys entirely).
+    sealed' = DRVS.mapBy(d => match pg.get(d) { | PgLive(a) => false | PgNone => sealed.get(d) }),
+    wit' = if (DRVS.exists(d => match pg.get(d) {
+        | PgLive(a) => restampDropsLines(entries.get(d), a.exec)
+        | PgNone => false
+      }))
+      { ...wit, crossExecCleared: true }
+    else wit,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  /// `handle_leader_acquired`'s failed-load arm: the DAG load failed, the
+  /// tenure continues with an EMPTY, NON-authoritative DAG, but
+  /// `set_recovery_complete` still runs — the gate cannot wedge a
+  /// degraded tenure, the periodic flusher still snapshots the retained
+  /// buffers, and the disconnect-time discard fails closed
+  /// (`dag_authoritative` stays false). No restamp and no sweep run; the
+  /// prefix re-arm already did (it precedes the load).
+  // Mirrors: handle_leader_acquired (the Err arm) + recover_from_pg's
+  //          re-arm-then-fail path.
+  action recoveryLoadFailed: bool = all {
+    ENABLE_LOAD_FAILURE,
+    isLeader,
+    not(recoveryComplete),
+    replica' = {
+      ...replica,
+      recoveredEpoch: acquiredTransitions,
+      loadSucceeded: false,
+    },
+    dag' = DRVS.mapBy(d => DagAbsent),
+    // The prefix re-arm runs before the load and therefore before the
+    // failure: every retained entry's per-tenure latch is cleared.
+    entries' = DRVS.mapBy(d => match entries.get(d) {
+      | NoEntry => NoEntry
+      | Entry(en) => Entry({ ...en, prefix: PrefUnchecked })
+    }),
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// `handle_leader_acquired`'s TOCTOU-gate discard arm: the recovery ran
+  /// to completion (re-arm, restamp, sweep — all of `recover_from_pg`'s
+  /// entry mutations are already applied) but a lease flap, a rebound, or
+  /// a missing post-claim confirmation landed before the gate, so the
+  /// loaded DAG is discarded (`clear_persisted_state` again), the
+  /// completion is NOT recorded, and the next LeaderAcquired re-runs
+  /// recovery. The entry mutations are NOT rolled back — they are
+  /// idempotent under the re-run.
+  // Mirrors: handle_leader_acquired (the gate-discard arm).
+  action recoveryDiscarded: bool = all {
+    ENABLE_DISCARDED_RECOVERY,
+    isLeader,
+    not(recoveryComplete),
+    replica' = { ...replica, loadSucceeded: false },
+    dag' = DRVS.mapBy(d => DagAbsent),
+    entries' = DRVS.mapBy(d => recoveredEntry(entries.get(d), pg.get(d), sealed.get(d))),
+    sealed' = DRVS.mapBy(d => match pg.get(d) { | PgLive(a) => false | PgNone => sealed.get(d) }),
+    wit' = if (DRVS.exists(d => match pg.get(d) {
+        | PgLive(a) => restampDropsLines(entries.get(d), a.exec)
+        | PgNone => false
+      }))
+      { ...wit, crossExecCleared: true }
+    else wit,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    leaseTransitions' = leaseTransitions,
+  }
+
+  // --- 6h. the interim leader's PG-visible effects ----------------------
+  //
+  // Model A is single-replica: the interim leader that holds the lease
+  // between our lose and our re-acquire is not modeled as a process, only
+  // as the mutations it leaves in the shared store for our next recovery
+  // and our next flush to observe. Both actions are enabled only while
+  // this replica has observed its loss (`!isLeader`) — the dual-belief
+  // window in which the interim's store writes race ours is model B's
+  // subject (cross-replica finalization).
+
+  /// An interim leader observes the live execution's terminal, finalizes
+  /// its `drv_logs` row, and persists the terminal status. The recorded
+  /// span's end is at least one past every line ever delivered to ANY
+  /// replica for that execution: the worker delivers every line before
+  /// its completion report on the same ordered stream, and the interim's
+  /// own flush obeys the gap-span rule, so a finalizing tenure's row
+  /// covers the execution's true end (the lines only this replica
+  /// received are below that end and therefore inside the finalized
+  /// record's claimed-or-disclosed span). The end may exceed our
+  /// delivered set (the interim received more lines than we did).
+  // Mirrors: another replica's terminal_log_epilogue + flush_final +
+  //          upsert_drv_log, projected onto the shared row.
+  action interimFinalizes(d: Drv): bool = all {
+    not(isLeader),
+    leaseTransitions > acquiredTransitions,
+    pg.get(d) != PgNone,
+    val e = match pg.get(d) { | PgNone => 1 | PgLive(a) => a.exec }
+    val floor = maxInt(setEnd(delivered.get(d).get(e)), 1)
+    all {
+      floor <= MAX_LINE,
+      nondet end = floor.to(MAX_LINE).oneOf()
+      stored' = stored.put(d, stored.get(d).put(e,
+        Stored({ lo: 0, cnt: end, trueEnd: end, complete: true }))),
+    },
+    pg' = pg.put(d, PgNone),
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    delivered' = delivered,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  /// An interim leader re-dispatches the derivation under a fresh
+  /// execution (its worker disconnected or failed transiently): the
+  /// persisted assignment now names an exec_id this replica has never
+  /// seen, so our next recovery's restamp is a CROSS-exec restamp that
+  /// must clear the retained lines.
+  // Mirrors: another replica's assign_to_worker, projected onto the
+  //          assignments row.
+  action interimRedispatches(d: Drv, ex: Executor): bool = all {
+    not(isLeader),
+    leaseTransitions > acquiredTransitions,
+    pg.get(d) != PgNone,
+    dispatched.get(d) < MAX_EXECS,
+    val nextExec = dispatched.get(d) + 1
+    all {
+      dispatched' = dispatched.put(d, nextExec),
+      pg' = pg.put(d, PgLive({ exec: nextExec, executor: ex })),
+    },
+    entries' = entries,
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dag' = dag,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
+  // --- 6i. executor disconnect ------------------------------------------
+
+  /// `handle_executor_disconnected`'s log-buffer cleanup: for each path
+  /// the disconnecting stream pushed accepted batches for, discard the
+  /// entry iff the DAG has never heard of the path AND the entry is
+  /// stamped to the disconnecting executor AND it is not sealed
+  /// (`discard_if_owned_by`). Gated on `is_leader && dag_authoritative`:
+  /// the DAG gate infers "stale" from "not in the DAG", which is only
+  /// meaningful when the DAG reflects PG — a deposed leader, a
+  /// pre-recovery window, or a failed-load tenure must NOT treat "not in
+  /// the (empty) DAG" as "stale" and destroy the retained in-flight
+  /// entries the lease-flap retention preserves. The model's `seen_drvs`
+  /// is every derivation currently stamped to the executor — a superset
+  /// of the real per-stream set, filtered identically by the ownership
+  /// and DAG gates.
+  // Mirrors: handle_executor_disconnected (the seen_drvs loop) +
+  //          LogBuffers::discard_if_owned_by.
+  action executorDisconnects(ex: Executor): bool = all {
+    val gateOpen = isLeader and replica.loadSucceeded
+    def reaped(d: Drv): bool = and {
+      gateOpen,
+      dag.get(d) == DagAbsent,
+      hasEntry(d),
+      entryExecutor(d) == ex,
+      not(sealed.get(d)),
+    }
+    entries' = DRVS.mapBy(d => if (reaped(d)) NoEntry else entries.get(d)),
+    sealed' = sealed,
+    pendingFinal' = pendingFinal,
+    dispatched' = dispatched,
+    dag' = dag,
+    pg' = pg,
+    delivered' = delivered,
+    stored' = stored,
+    replica' = replica,
+    leaseTransitions' = leaseTransitions,
+    wit' = wit,
+  }
+
   // --- 8. init ----------------------------------------------------------
 
   /// The shared zero of both init shapes: no entries, no executions, no
@@ -333,14 +1571,16 @@ module logBufferLifecycle {
     delivered' = DRVS.mapBy(d => 1.to(MAX_EXECS).mapBy(e => Set())),
     stored' = DRVS.mapBy(d => 1.to(MAX_EXECS).mapBy(e => NoRow)),
     leaseTransitions' = 0,
-    wEvicted' = false,
-    wRejectedNonMonotone' = false,
-    wCrossExecCleared' = false,
-    wTenureDropReap' = false,
-    wRefusedUpsertReap' = false,
-    wSealedEmptyReap' = false,
-    wEnqueueFailReap' = false,
-    wGenPinnedAcrossHolderChange' = false,
+    wit' = {
+      evicted: false,
+      rejectedNonMonotone: false,
+      crossExecCleared: false,
+      tenureDropReap: false,
+      refusedUpsertReap: false,
+      sealedEmptyReap: false,
+      enqueueFailReap: false,
+      genPinnedAcrossHolderChange: false,
+    },
   }
 
   /// The `LeaderState::always_leader()` shape (the non-K8s single-replica
@@ -352,11 +1592,13 @@ module logBufferLifecycle {
   /// code paths against a non-trivial retained state (strictly harder).
   action init = all {
     initCommon,
-    isLeader' = true,
-    generation' = 1,
-    acquiredTransitions' = 0,
-    recoveredEpoch' = 0,
-    loadSucceeded' = true,
+    replica' = {
+      isLeader: true,
+      generation: 1,
+      acquiredTransitions: 0,
+      recoveredEpoch: 0,
+      loadSucceeded: true,
+    },
   }
 
   /// The K8s cold-start shape: a standby that has never held the lease.
@@ -366,38 +1608,162 @@ module logBufferLifecycle {
   /// future cold-start regime.
   action initPending = all {
     initCommon,
-    isLeader' = false,
-    generation' = 1,
-    acquiredTransitions' = 0,
-    recoveredEpoch' = NO_EPOCH,
-    loadSucceeded' = false,
+    replica' = {
+      isLeader: false,
+      generation: 1,
+      acquiredTransitions: 0,
+      recoveredEpoch: NO_EPOCH,
+      loadSucceeded: false,
+    },
   }
 
-  // Placeholder transition relation: replaced by the real `step` as the
-  // action tasks land. Keeps `quint run` meaningful from the first commit.
-  action step = all {
-    entries' = entries,
-    sealed' = sealed,
-    pendingFinal' = pendingFinal,
-    dispatched' = dispatched,
-    dag' = dag,
-    pg' = pg,
-    delivered' = delivered,
-    stored' = stored,
-    isLeader' = isLeader,
-    generation' = generation,
-    acquiredTransitions' = acquiredTransitions,
-    recoveredEpoch' = recoveredEpoch,
-    loadSucceeded' = loadSucceeded,
-    leaseTransitions' = leaseTransitions,
-    wEvicted' = wEvicted,
-    wRejectedNonMonotone' = wRejectedNonMonotone,
-    wCrossExecCleared' = wCrossExecCleared,
-    wTenureDropReap' = wTenureDropReap,
-    wRefusedUpsertReap' = wRefusedUpsertReap,
-    wSealedEmptyReap' = wSealedEmptyReap,
-    wEnqueueFailReap' = wEnqueueFailReap,
-    wGenPinnedAcrossHolderChange' = wGenPinnedAcrossHolderChange,
+  // --- 9. step ----------------------------------------------------------
+  // Every disjunct of `step` is a NAMED action with its nondet choices
+  // bound directly inside it (the MBT tracker records the innermost
+  // disjunct's name; an anonymous block makes the whole step anonymous
+  // and undrivable). The flattening is semantics-preserving: `nondet x;
+  // any { a(x), b(x) }` and `any { nondet x; a(x), nondet x; b(x) }` are
+  // the same existential over the same (action, parameter) pairs.
+
+  /// One derivation is dispatched to one executor.
+  action dispatchAny = {
+    nondet d = DRVS.oneOf()
+    nondet ex = EXECUTORS.oneOf()
+    dispatch(d, ex)
+  }
+  /// One worker batch is accepted into one entry.
+  action pushBatchAcceptedAny = {
+    nondet d = DRVS.oneOf()
+    nondet ex = EXECUTORS.oneOf()
+    nondet lo = 0.to(MAX_LINE - 1).oneOf()
+    nondet hi = 1.to(MAX_LINE).oneOf()
+    pushBatchAccepted(d, ex, lo, hi)
+  }
+  /// One worker batch is rejected as non-monotone.
+  action pushBatchRejectedNonMonotoneAny = {
+    nondet d = DRVS.oneOf()
+    nondet ex = EXECUTORS.oneOf()
+    nondet lo = 0.to(MAX_LINE - 1).oneOf()
+    pushBatchRejectedNonMonotone(d, ex, lo)
+  }
+  /// One entry's ring evicts a head prefix.
+  action evictAny = {
+    nondet d = DRVS.oneOf()
+    evict(d)
+  }
+  /// One derivation reaches a terminal state and its final flush is
+  /// enqueued.
+  action terminalEnqueuedAny = {
+    nondet d = DRVS.oneOf()
+    terminalEnqueued(d)
+  }
+  /// One derivation reaches a terminal state and its final flush cannot
+  /// be enqueued.
+  action terminalEnqueueFailedAny = {
+    nondet d = DRVS.oneOf()
+    terminalEnqueueFailed(d)
+  }
+  /// One derivation reaches a terminal state whose PG persist fails.
+  action terminalPersistFailedAny = {
+    nondet d = DRVS.oneOf()
+    terminalPersistFailed(d)
+  }
+  /// One terminal derivation's build cleanup fires.
+  action cleanupTerminalAny = {
+    nondet d = DRVS.oneOf()
+    cleanupTerminal(d)
+  }
+  /// One entry's stored-coverage reconciliation settles.
+  action reconcileStoredPrefixAny = {
+    nondet d = DRVS.oneOf()
+    reconcileStoredPrefix(d)
+  }
+  /// One entry's periodic snapshot uploads (or is refused).
+  action flushPeriodicUploadAny = {
+    nondet d = DRVS.oneOf()
+    flushPeriodicUpload(d)
+  }
+  /// One sealed empty entry is reaped by the periodic tick.
+  action flushPeriodicSealedEmptyReapAny = {
+    nondet d = DRVS.oneOf()
+    flushPeriodicSealedEmptyReap(d)
+  }
+  /// One pending final is dropped as out-of-tenure.
+  action flushFinalDropStaleAny = {
+    nondet d = DRVS.oneOf()
+    flushFinalDropStale(d)
+  }
+  /// One pending final is refused because the row is already finalized.
+  action flushFinalRefuseFinalizedAny = {
+    nondet d = DRVS.oneOf()
+    flushFinalRefuseFinalized(d)
+  }
+  /// One pending final's guard SELECT fails and the request defers.
+  action flushFinalGuardErrorAny = {
+    nondet d = DRVS.oneOf()
+    flushFinalGuardError(d)
+  }
+  /// One pending final drains and uploads.
+  action flushFinalUploadAny = {
+    nondet d = DRVS.oneOf()
+    flushFinalUpload(d)
+  }
+  /// One pending final drains an empty entry.
+  action flushFinalEmptyDrainAny = {
+    nondet d = DRVS.oneOf()
+    flushFinalEmptyDrain(d)
+  }
+  /// One pending final finds its entry gone or restamped.
+  action flushFinalStaleOrMissingAny = {
+    nondet d = DRVS.oneOf()
+    flushFinalStaleOrMissing(d)
+  }
+  /// One interim leader finalizes one execution's row.
+  action interimFinalizesAny = {
+    nondet d = DRVS.oneOf()
+    interimFinalizes(d)
+  }
+  /// One interim leader re-dispatches one derivation.
+  action interimRedispatchesAny = {
+    nondet d = DRVS.oneOf()
+    nondet ex = EXECUTORS.oneOf()
+    interimRedispatches(d, ex)
+  }
+  /// One executor's stream disconnects.
+  action executorDisconnectsAny = {
+    nondet ex = EXECUTORS.oneOf()
+    executorDisconnects(ex)
+  }
+
+  action step = any {
+    dispatchAny,
+    pushBatchAcceptedAny,
+    pushBatchRejectedNonMonotoneAny,
+    evictAny,
+    terminalEnqueuedAny,
+    terminalEnqueueFailedAny,
+    terminalPersistFailedAny,
+    cleanupTerminalAny,
+    reconcileStoredPrefixAny,
+    flushPeriodicUploadAny,
+    flushPeriodicSealedEmptyReapAny,
+    flushFinalDropStaleAny,
+    flushFinalRefuseFinalizedAny,
+    flushFinalGuardErrorAny,
+    flushFinalUploadAny,
+    flushFinalEmptyDrainAny,
+    flushFinalStaleOrMissingAny,
+    foreignSteal,
+    loseLease,
+    reacquireAfterHolderChange,
+    reacquireSameEpoch,
+    reboundLease,
+    recoveryOk,
+    recoveryLoadFailed,
+    recoveryDiscarded,
+    interimFinalizesAny,
+    interimRedispatchesAny,
+    executorDisconnectsAny,
   }
 }
 
@@ -421,4 +1787,72 @@ module logBufferLifecycleBase {
     ENABLE_PERSIST_FAILURE = false,
     ENABLE_GUARD_FAILURE = false
   ).*
+
+  // --- deterministic protocol runs --------------------------------------
+  // Executable sanity checks of the happy path and the known-critical
+  // scenarios; `quint test --main=logBufferLifecycleBase --match=<run>`
+  // replays them. They do not change the verified state space (runs are
+  // not part of `step`).
+
+  /// The happy path: dispatch, stream two lines, terminal, final flush.
+  /// The row records the full contiguous span at `is_complete = true` and
+  /// the entry is gone.
+  run happyPathRun =
+    init
+      .then(dispatch("d1", "e1"))
+      .then(pushBatchAccepted("d1", "e1", 0, 2))
+      .then(terminalEnqueued("d1"))
+      .then(reconcileStoredPrefix("d1"))
+      .then(flushFinalUpload("d1"))
+      .expect(all {
+        entries.get("d1") == NoEntry,
+        not(sealed.get("d1")),
+        pendingFinal.get("d1") == NoFinal,
+        rowComplete("d1", 1),
+        rowLo("d1", 1) == 0,
+        rowCnt("d1", 1) == 2,
+      })
+
+  /// The binding gate: a batch from the executor NOT bound to the entry
+  /// is rejected (the accept action is disabled), and the foreign
+  /// executor cannot pollute the ring.
+  run bindingGateRun =
+    init
+      .then(dispatch("d1", "e1"))
+      .then(pushBatchAccepted("d1", "e1", 0, 1))
+      .expect(all {
+        not(batchAccepted("d1", "e2", 1)),
+        batchAccepted("d1", "e1", 1),
+      })
+
+  /// An interior hole: the worker skips line 1 (delivered only to an
+  /// interim leader in production). The final row's recorded span counts
+  /// the hole (line_count = 3 over a 2-line blob is unrepresentable here
+  /// — the model has no physical blob — but the recorded count is the
+  /// line-number span, not the held-set size).
+  run interiorHoleRun =
+    init
+      .then(dispatch("d1", "e1"))
+      .then(pushBatchAccepted("d1", "e1", 0, 1))
+      .then(pushBatchAccepted("d1", "e1", 2, 3))
+      .then(terminalEnqueued("d1"))
+      .then(reconcileStoredPrefix("d1"))
+      .then(flushFinalUpload("d1"))
+      .expect(all {
+        rowCnt("d1", 1) == 3,
+        rowLo("d1", 1) == 0,
+        rowComplete("d1", 1),
+      })
+
+  /// The non-monotone rejection: a batch at or below the ring's high
+  /// water is dropped and the ring is unchanged.
+  run nonMonotoneRun =
+    init
+      .then(dispatch("d1", "e1"))
+      .then(pushBatchAccepted("d1", "e1", 0, 2))
+      .then(pushBatchRejectedNonMonotone("d1", "e1", 1))
+      .expect(all {
+        entryHeld("d1") == Set(0, 1),
+        wit.rejectedNonMonotone,
+      })
 }
