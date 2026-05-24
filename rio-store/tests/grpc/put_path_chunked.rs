@@ -356,6 +356,39 @@ async fn narhash_mismatch_rejected_and_nothing_committed() -> TestResult {
     Ok(())
 }
 
+/// An output with no regular files at all — empty `chunk_manifest`,
+/// empty `novel`, zero `Chunk` frames, an all-framing manifest — still
+/// commits and round-trips through `GetPath`. Exercises the commit path
+/// for manifests whose every chunk is server-generated.
+#[tokio::test]
+async fn no_regular_files_output_commits_and_roundtrips() -> TestResult {
+    let mut s = ChunkedSession::new().await?;
+    // A directory containing only a symlink and an empty subdirectory:
+    // no regular files anywhere in the tree.
+    let tree = tempfile::tempdir()?;
+    std::fs::create_dir_all(tree.path().join("empty-dir"))?;
+    std::os::unix::fs::symlink("somewhere/else", tree.path().join("link"))?;
+    let path = test_store_path("chunked-no-files");
+    let (out, dirs, chunks, nar) = chunked_output_for_tree(tree.path(), &path, 1024);
+    assert!(
+        out.chunk_manifest.is_empty(),
+        "no regular files → no content chunks"
+    );
+    let begin = assemble_begin(vec![out], vec![dirs]);
+    assert!(begin.novel.is_empty(), "nothing for the builder to send");
+    let created = put_path_chunked(&mut s.store, begin, &chunks, None, |_, c| Some(c))
+        .await
+        .expect("all-framing upload must commit");
+    assert!(created);
+    assert_eq!(s.manifest_status(&path).await.as_deref(), Some("complete"));
+    assert_eq!(
+        s.get_nar(&path).await?,
+        nar,
+        "all-framing manifest round-trips"
+    );
+    Ok(())
+}
+
 /// A `FileEntry.digest` that does not hash the file's actual bytes is
 /// rejected even when the size, the chunk run, and the NAR hash are all
 /// correct. The claimed digest is what the commit persists into

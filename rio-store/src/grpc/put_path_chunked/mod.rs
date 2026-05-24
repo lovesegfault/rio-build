@@ -11,12 +11,22 @@
 //! Flow:
 //! 1. [`validate::validate_begin`] — §6.2 bounds, tree attestation,
 //!    `novel` ordering. Nothing is written before this passes.
-//! 2. Budget acquire + per-output placeholder claim (non-CA only; CA
-//!    paths are claimed post-verify per `r[sec.authz.ca-path-derived+2]`).
-//! 3. [`verify_walk`] — single sequential walk over every output's
+//! 2. Budget acquire + per-output idempotency check and placeholder
+//!    claim (non-CA only; CA paths are claimed post-verify per
+//!    `r[sec.authz.ca-path-derived+2]`).
+//! 3. Write-ahead chunk registration: every digest that may be S3-PUT
+//!    gets a refcount-0 `chunks` row first, kept inside the
+//!    orphan-sweep grace window by a per-request heartbeat, so a
+//!    non-commit outcome leaves sweepable orphans rather than
+//!    untracked S3 objects.
+//! 4. If every output was already `'complete'`: drain the remaining
+//!    `Chunk` frames (verified + written, idempotent) and return
+//!    `created = false` without verifying anything.
+//! 5. [`verify_walk`] — single sequential walk over every output's
 //!    segments, splicing novel chunks from the stream and deduped
-//!    chunks from the CAS into per-output SHA-256 + refscan sinks.
-//! 4. Verdict → commit txn (all outputs, one transaction) or reject.
+//!    chunks from the CAS into per-output SHA-256 + refscan sinks and
+//!    a per-file BLAKE3.
+//! 6. Verdict → commit txn (all outputs, one transaction) or reject.
 // r[impl store.put.chunked]
 // r[impl store.chunk.self-verify]
 // r[impl store.put.narhash-sync]
