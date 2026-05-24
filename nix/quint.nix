@@ -105,9 +105,15 @@ let
   };
 
   # The invariant set every log-buffer lifecycle regime check asserts:
-  # the five model-A invariants of the build-log verification design plus
-  # the boundsOK ceiling tripwire. One list so the three regimes cannot
-  # silently drift apart on which properties they prove.
+  # the five model-A invariants of the build-log verification design,
+  # the three phase-3 calibration invariants (the stale-seal muting dual
+  # of the binding gate, the frozen-row immutability half of
+  # obs.log.finalize-immutable, and the stored-coverage monotonicity
+  # half of obs.log.stored-coverage-preserved — each added because a
+  # historical fix's calibration override produced a harmful state no
+  # original invariant observed), plus the boundsOK ceiling tripwire.
+  # One list so the regimes cannot silently drift apart on which
+  # properties they prove.
   logInvariants = [
     "boundsOK"
     "noCrossExecContamination"
@@ -115,6 +121,9 @@ let
     "bindingGateExcludesForeignExecutors"
     "everyRetainedEntryIsJustified"
     "noSilentLineLoss"
+    "noStaleSealOnLiveCarrier"
+    "finalizedRowFrozen"
+    "storedCoverageNeverRegresses"
   ];
 
   # One `quint verify` run per (model, main-module, invariant-set,
@@ -550,14 +559,15 @@ in
     # + the actor paths that drive them), modeled as a single replica
     # against an adversarial environment of worker batches, lease
     # transitions, recovery runs, flusher ticks, terminals, and reaps
-    # (docs/spec/models/logBufferLifecycle.qnt). Three regimes share one
-    # core module and one invariant set — the five model-A invariants of
-    # the build-log verification design plus the boundsOK ceiling
-    # tripwire; each regime is its own check so a regression in the core
-    # entry lifecycle surfaces in the small fast check instead of buried
-    # in the fault-injection ones. The state counts, depths, and
-    # wall-clocks are in each check's output transcript and the
-    # introducing commit's message.
+    # (docs/spec/models/logBufferLifecycle.qnt). The regimes share one
+    # core module and one invariant set (`logInvariants` above — the five
+    # model-A invariants of the build-log verification design, the three
+    # phase-3 calibration invariants, and the boundsOK ceiling tripwire);
+    # each regime is its own check so a regression in the core entry
+    # lifecycle surfaces in the small fast check instead of buried in the
+    # fault-injection ones. The state counts, depths, and wall-clocks are
+    # in each check's output transcript and the introducing commit's
+    # message.
 
     # The base regime: no lease transitions, no faults, no evictions. The
     # replica holds the lease for the whole trace; the adversaries are
@@ -584,12 +594,16 @@ in
     # The load-bearing verification of the cross-exec restamp clearing
     # (exec-keyed), the stored-coverage reconciliation and the gap-merge
     # fold's span arithmetic (the recovered-prefix branch is only
-    # reachable here), the deferred-final tenure pin, the tenure-orphan
-    # reap, and the conservation law across failovers.
+    # reachable here), the stored-row coverage monotonicity under the
+    # interim leader's extensions (storedCoverageNeverRegresses — the
+    # interim row extension and the reconcile fold are only reachable
+    # here), the deferred-final tenure pin, the tenure-orphan reap, and
+    # the conservation law across failovers.
     # r[verify obs.log.exec-keyed+2]
     # r[verify obs.log.gap-span+2]
     # r[verify obs.log.entry-justified]
     # r[verify obs.log.line-conservation]
+    # r[verify obs.log.stored-coverage-preserved]
     quint-log-flap = mkQuintCheck {
       name = "log-flap";
       spec = "logBufferLifecycle";
@@ -633,10 +647,16 @@ in
 
     # The terminal-persist fault: PG keeps the assignment live after a
     # terminal, unlocking the post-terminal interim subtree. The
-    # load-bearing verification of the refused-UPSERT reap and the
-    # sealed-entry cross-exec restamp.
+    # load-bearing verification of the refused-UPSERT reap, the
+    # sealed-entry cross-exec restamp (noStaleSealOnLiveCarrier's
+    # contended state — a sealed entry meeting a restamp — is only
+    # reachable here), and the frozen-row latch (finalizedRowFrozen's
+    # contended state — a finalized row coexisting with a live same-exec
+    # entry — is only reachable here).
     # r[verify obs.log.entry-justified]
     # r[verify obs.log.line-conservation]
+    # r[verify obs.log.exec-keyed+2]
+    # r[verify obs.log.finalize-immutable]
     quint-log-fault-persist = mkQuintCheck {
       name = "log-fault-persist";
       spec = "logBufferLifecycle";

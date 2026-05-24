@@ -238,6 +238,20 @@ module logBufferLifecycle {
   pure def setHi(s: Set[int]): int = if (s == Set()) 0 else setEnd(s) - 1
   pure def maxInt(a: int, b: int): int = if (a > b) a else b
 
+  /// The `storedHist` ghost update for one (drv, exec) write of row `r`:
+  /// snapshot the first finalizing write, raise the recorded-end
+  /// high-water. Applied by every action that writes `stored`.
+  pure def histAfterWrite(
+    h: { frozen: StoredRow, everEnd: int },
+    r: Row
+  ): { frozen: StoredRow, everEnd: int } = {
+    frozen: match h.frozen {
+      | NoRow => if (r.complete) Stored(r) else NoRow
+      | Stored(f) => Stored(f)
+    },
+    everEnd: maxInt(h.everEnd, r.lo + r.cnt),
+  }
+
   // --- 4. state variables -----------------------------------------------
 
   /// `LogBuffers.buffers`: the per-derivation ring-buffer entries.
@@ -265,6 +279,18 @@ module logBufferLifecycle {
   /// The `drv_logs` row per (drv, exec) — the shared store, which in
   /// model A only this replica and the abstract interim leader write.
   var stored: Drv -> (int -> StoredRow)
+  /// GHOST, per (drv, exec): the stored row's write history, which the
+  /// frozen-row and coverage-monotonicity invariants compare the live row
+  /// against. `frozen` is the row snapshotted by the FIRST write that set
+  /// `is_complete = true` (`NoRow` until then); `everEnd` is the highest
+  /// recorded span end (`first_line + line_count`) any write ever
+  /// recorded. Raised at every `stored` write, never lowered, never read
+  /// by an action guard. In the shipped regimes both fields are functions
+  /// of the live row (every writer is guarded on `not(rowComplete)` and
+  /// every write extends the recorded end), so the ghost adds no distinct
+  /// states there; it diverges from the live row exactly when a
+  /// calibration override removes one of those guards.
+  var storedHist: Drv -> (int -> { frozen: StoredRow, everEnd: int })
 
   /// The lease-composition interface state (LeaderState's atomics), as
   /// one record so the actions that do not touch the lease frame it in
@@ -404,9 +430,14 @@ module logBufferLifecycle {
   // --- 7. invariants ----------------------------------------------------
   //
   // The five model-A invariants of the build-log verification design
-  // (§3.4), each carrying the spec rule it verifies; the rule ↔ invariant
-  // correspondence is docs/spec/models/log-invariant-map.md and the
-  // r[verify ...] markers live at the check wiring points in
+  // (§3.4) plus the three phase-3 calibration invariants (the stale-seal
+  // muting dual, the frozen-row immutability half of finalize-immutable,
+  // and the stored-coverage monotonicity half of
+  // stored-coverage-preserved — each added because a historical fix's
+  // calibration override produced a harmful state none of the original
+  // five observed). Each carries the spec rule it verifies; the rule ↔
+  // invariant correspondence is docs/spec/models/log-invariant-map.md and
+  // the r[verify ...] markers live at the check wiring points in
   // nix/quint.nix. Defined after the actions they constrain so they can
   // reference the accessor defs; Quint definitions are order-independent.
 
@@ -486,22 +517,27 @@ module logBufferLifecycle {
           entryExecutor(d) == ex,
         })))
 
-  /// One reap path's discard branch is enabled for `d`'s entry in this
-  /// state — the entry has lost every justification and the next reap
-  /// that observes it will discard it (the "one step from reaped" half of
-  /// obs.log.entry-justified). The disjuncts are exactly the reap
-  /// actions' discard-branch preconditions.
+  /// One SCHEDULER-INITIATED reap path's discard branch is enabled for
+  /// `d`'s entry in this state — the entry has lost every justification
+  /// and the next reap that observes it will discard it (the "one step
+  /// from reaped" half of obs.log.entry-justified). The disjuncts are
+  /// exactly the reap actions' discard-branch preconditions, restricted
+  /// to the reaps the scheduler itself drives (the periodic tick, the
+  /// acquisition sweep, the terminal cleanup, the pending final's own
+  /// resolution). The disconnect-time discard is deliberately EXCLUDED:
+  /// it is environment-initiated — it fires only if the owning worker's
+  /// stream happens to close, which is not under the scheduler's control
+  /// and may never happen for a long-lived connected worker — so "the
+  /// disconnect discard is enabled" is not "the entry is one step from
+  /// reaped". Conflating the two is exactly why the acquisition sweep
+  /// (e6c18add2) was needed in the code even though the disconnect
+  /// discard already covered the same (leader, DAG-absent, unsealed)
+  /// state: an invariant that accepted the disconnect disjunct would
+  /// declare the un-swept orphan justified forever.
   def reapEnabledFor(d: Drv): bool = or {
     // Terminal cleanup's post-delay discard (skips final-pending
     // entries).
     and { dag.get(d) == DagTerminal, not(entryFinalPending(d)) },
-    // The disconnect-time discard: DAG-unknown, owned, unsealed, behind
-    // the is_leader && dag_authoritative gate. A disconnect may fire at
-    // any time.
-    and {
-      isLeader, replica.loadSucceeded,
-      dag.get(d) == DagAbsent, not(sealed.get(d)),
-    },
     // The acquisition sweep: unsealed and not live in the DAG the next
     // successful recovery rebuilds. Enabled only when a recovery is due.
     and {
@@ -622,6 +658,77 @@ module logBufferLifecycle {
         not(rowComplete(d, e)),
       })))
 
+  /// `NoStaleSealOnLiveCarrier` (obs.log.exec-keyed+2's restamp-unseal
+  /// half; the muting dual of sched.log.batch-binding): a seal tombstone
+  /// is the bridge between an execution's observed terminal and its
+  /// final drain. An entry that is sealed while its derivation is
+  /// tracked LIVE (non-terminal) by this replica's DAG is a stale seal
+  /// muting a live execution: `push_for` checks the seal before the
+  /// binding gate, so every batch of the entry's stamped execution is
+  /// silently rejected — and the muting is invisible to the conservation
+  /// law because a rejected line never enters `delivered`. Post-fix this
+  /// is unreachable: every terminal seals and moves the DAG off
+  /// `DagLive` in the same step, and every restamp (the only path that
+  /// flips a sealed derivation back to `DagLive`) clears the seal. This
+  /// is the invariant that falsifies if either restamp arm of `set_exec`
+  /// stops clearing the seal — the 699ea1692 / 2f9a747d0 calibration
+  /// entries in docs/spec/models/calibration/restamps.qnt.
+  val noStaleSealOnLiveCarrier = DRVS.forall(d =>
+    (sealed.get(d) and hasEntry(d)) implies dag.get(d) != DagLive)
+
+  // NOT AN INVARIANT — the structural dual of noStaleSealOnLiveCarrier
+  // ("a DagLive derivation always HAS an unsealed carrier", the
+  // tenure-pins dossier's liveDerivationHasCarrier candidate) is
+  // reachably FALSE on this model and is deliberately not defined here:
+  // an in-tenure final flush legitimately drains the carrier of a
+  // derivation whose DAG node is live only because the terminal's PG
+  // persist failed and recovery rebuilt the node from the stale
+  // assignment row. The harmful instance of the carrier-less DagLive
+  // state (an out-of-tenure or wrong-exec request did the draining) is
+  // state-identical to that benign one — the distinguishing fact is the
+  // draining request's tenure stamps, which the drain consumes — so the
+  // carrier-destruction half of the tenure-pins harm class is a
+  // TRANSITION property model A cannot state. See
+  // log-invariant-map.md's phase-3 findings and
+  // ~/tmp/rio-formal-verification/phase3-falsification-liveDerivationHasCarrier.md.
+
+  /// `FinalizedRowFrozen` (obs.log.finalize-immutable, the half
+  /// observable under model A's writers — this replica plus the abstract
+  /// interim): once any writer records a `drv_logs` row at
+  /// `is_complete = true`, no later write changes any of its columns —
+  /// content, span, or the complete bit itself. The code's enforcement
+  /// is `upsert_drv_log`'s `WHERE NOT drv_logs.is_complete` chokepoint
+  /// plus `flush_final`'s row consult; the model's enforcement is the
+  /// `not(rowComplete)` guard on every `stored` writer. The ghost
+  /// `storedHist.frozen` snapshots the first finalizing write; this
+  /// invariant falsifies the moment any writer (the un-latched periodic
+  /// UPSERT of abfade4d5^, the consult-free final of 44905298b^) touches
+  /// the row again. The cross-replica blob/row split and the guard
+  /// SELECT -> PUT window stay model B's (`AtMostOneFinalizingWrite`).
+  val finalizedRowFrozen = DRVS.forall(d =>
+    1.to(MAX_EXECS).forall(e =>
+      match storedHist.get(d).get(e).frozen {
+        | NoRow => true
+        | Stored(f) => rowOf(d, e) == Stored(f)
+      }))
+
+  /// `StoredCoverageNeverRegresses` (obs.log.stored-coverage-preserved,
+  /// the single-writer monotonicity half observable in model A): a
+  /// `drv_logs` row's recorded span end (`first_line + line_count`)
+  /// never decreases across writes. A flush that overwrites a row with a
+  /// snapshot of a ring that does not reach the row's prior end destroys
+  /// coverage of lines only the prior writer held (an interim leader's
+  /// `.partial` of lines this replica never received) — the loss the
+  /// stored-coverage reconcile (e1fd179b9) exists to prevent, invisible
+  /// to the per-replica conservation law because those lines are not in
+  /// this replica's `delivered` ghost. The cross-replica conservation
+  /// form (the interim's delivered lines survive into the finalized
+  /// record) is model B's; this is the monotonicity of the shared row
+  /// under the writers model A has.
+  val storedCoverageNeverRegresses = DRVS.forall(d =>
+    1.to(MAX_EXECS).forall(e =>
+      rowEnd(d, e) >= storedHist.get(d).get(e).everEnd))
+
   // --- expect-violation witnesses (non-vacuity probes) ------------------
   //
   // The vals below are NOT invariants and must never be added to a
@@ -732,6 +839,7 @@ module logBufferLifecycle {
     pendingFinal' = pendingFinal,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -847,6 +955,7 @@ module logBufferLifecycle {
       dag' = dag,
       pg' = pg,
       stored' = stored,
+      storedHist' = storedHist,
       replica' = replica,
       leaseTransitions' = leaseTransitions,
     }
@@ -884,6 +993,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
   }
@@ -939,6 +1049,7 @@ module logBufferLifecycle {
     dispatched' = dispatched,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -976,6 +1087,7 @@ module logBufferLifecycle {
     dispatched' = dispatched,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
   }
@@ -1012,6 +1124,7 @@ module logBufferLifecycle {
     dispatched' = dispatched,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -1038,6 +1151,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -1134,6 +1248,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -1207,10 +1322,13 @@ module logBufferLifecycle {
     val e = entryExec(d)
     val refused = rowComplete(d, e)
     val reap = and { refused, sealed.get(d) }
+    val newRow = mergedRow(entryPrefix(d), entryHeld(d), false)
     all {
       stored' = if (refused) stored else
-        stored.put(d, stored.get(d).put(e,
-          Stored(mergedRow(entryPrefix(d), entryHeld(d), false)))),
+        stored.put(d, stored.get(d).put(e, Stored(newRow))),
+      storedHist' = if (refused) storedHist else
+        storedHist.put(d, storedHist.get(d).put(e,
+          histAfterWrite(storedHist.get(d).get(e), newRow))),
       entries' = if (reap) entries.put(d, NoEntry) else entries,
       sealed' = if (reap) sealed.put(d, false) else sealed,
       wit' = if (reap) { ...wit, refusedUpsertReap: true } else wit,
@@ -1251,6 +1369,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
   }
@@ -1290,6 +1409,7 @@ module logBufferLifecycle {
       pg' = pg,
       delivered' = delivered,
       stored' = stored,
+      storedHist' = storedHist,
       replica' = replica,
       leaseTransitions' = leaseTransitions,
     }
@@ -1322,6 +1442,7 @@ module logBufferLifecycle {
       pg' = pg,
       delivered' = delivered,
       stored' = stored,
+      storedHist' = storedHist,
       replica' = replica,
       leaseTransitions' = leaseTransitions,
       wit' = wit,
@@ -1366,6 +1487,7 @@ module logBufferLifecycle {
       pg' = pg,
       delivered' = delivered,
       stored' = stored,
+      storedHist' = storedHist,
       replica' = replica,
       leaseTransitions' = leaseTransitions,
       wit' = wit,
@@ -1396,8 +1518,12 @@ module logBufferLifecycle {
       // before the pre-drain read; the reconcile is a separate action
       // here, so the upload waits for it.
       entryPrefix(d) != PrefUnchecked,
-      stored' = stored.put(d, stored.get(d).put(req.exec,
-        Stored(mergedRow(entryPrefix(d), entryHeld(d), true)))),
+      val newRow = mergedRow(entryPrefix(d), entryHeld(d), true)
+      all {
+        stored' = stored.put(d, stored.get(d).put(req.exec, Stored(newRow))),
+        storedHist' = storedHist.put(d, storedHist.get(d).put(req.exec,
+          histAfterWrite(storedHist.get(d).get(req.exec), newRow))),
+      },
       entries' = entries.put(d, NoEntry),
       sealed' = sealed.put(d, false),
       pendingFinal' = pendingFinal.put(d, NoFinal),
@@ -1436,6 +1562,7 @@ module logBufferLifecycle {
       sealed' = sealed.put(d, false),
       pendingFinal' = pendingFinal.put(d, NoFinal),
       stored' = stored,
+      storedHist' = storedHist,
       dispatched' = dispatched,
       dag' = dag,
       pg' = pg,
@@ -1466,6 +1593,7 @@ module logBufferLifecycle {
       pendingFinal' = pendingFinal.put(d, NoFinal),
       entries' = entries,
       stored' = stored,
+      storedHist' = storedHist,
       dispatched' = dispatched,
       dag' = dag,
       pg' = pg,
@@ -1494,6 +1622,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     wit' = wit,
   }
@@ -1528,6 +1657,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
   }
@@ -1571,6 +1701,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
   }
 
   /// `LeaderState::on_acquire` on a same-epoch re-acquire: a self-fence
@@ -1594,6 +1725,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
   }
@@ -1628,6 +1760,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
   }
@@ -1758,6 +1891,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     leaseTransitions' = leaseTransitions,
   }
 
@@ -1792,6 +1926,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
   }
@@ -1824,6 +1959,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     leaseTransitions' = leaseTransitions,
   }
 
@@ -1847,6 +1983,14 @@ module logBufferLifecycle {
   /// received are below that end and therefore inside the finalized
   /// record's claimed-or-disclosed span). The end may exceed our
   /// delivered set (the interim received more lines than we did).
+  /// Guarded on the row not already being finalized: the interim is
+  /// post-fix (obs.log.finalize-immutable) — its own `upsert_drv_log`
+  /// goes through the same `WHERE NOT drv_logs.is_complete` chokepoint
+  /// as ours, so it cannot rewrite (not even extend) a row some tenure
+  /// already finalized. Without this guard the abstract interim is
+  /// strictly more powerful than any real post-fix replica and
+  /// `finalizedRowFrozen` is falsified by an environment action no code
+  /// path can perform.
   // Mirrors: another replica's terminal_log_epilogue + flush_final +
   //          upsert_drv_log, projected onto the shared row.
   action interimFinalizes(d: Drv): bool = all {
@@ -1860,10 +2004,15 @@ module logBufferLifecycle {
     // finalized span can never regress what any tenure already recorded.
     val floor = maxInt(maxInt(setEnd(delivered.get(d).get(e)), 1), rowEnd(d, e))
     all {
+      not(rowComplete(d, e)),
       floor <= MAX_LINE,
       nondet end = floor.to(MAX_LINE).oneOf()
-      stored' = stored.put(d, stored.get(d).put(e,
-        Stored({ lo: 0, cnt: end, trueEnd: end, complete: true }))),
+      val newRow = { lo: 0, cnt: end, trueEnd: end, complete: true }
+      all {
+        stored' = stored.put(d, stored.get(d).put(e, Stored(newRow))),
+        storedHist' = storedHist.put(d, storedHist.get(d).put(e,
+          histAfterWrite(storedHist.get(d).get(e), newRow))),
+      },
     },
     pg' = pg.put(d, PgNone),
     entries' = entries,
@@ -1907,8 +2056,12 @@ module logBufferLifecycle {
       not(rowComplete(d, e)),
       rowEnd(d, e) < MAX_LINE,
       nondet end = (rowEnd(d, e) + 1).to(MAX_LINE).oneOf()
-      stored' = stored.put(d, stored.get(d).put(e,
-        Stored({ lo: 0, cnt: end, trueEnd: end, complete: false }))),
+      val newRow = { lo: 0, cnt: end, trueEnd: end, complete: false }
+      all {
+        stored' = stored.put(d, stored.get(d).put(e, Stored(newRow))),
+        storedHist' = storedHist.put(d, storedHist.get(d).put(e,
+          histAfterWrite(storedHist.get(d).get(e), newRow))),
+      },
     },
     pg' = pg,
     entries' = entries,
@@ -1945,6 +2098,7 @@ module logBufferLifecycle {
     dag' = dag,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -1984,6 +2138,7 @@ module logBufferLifecycle {
     pg' = pg,
     delivered' = delivered,
     stored' = stored,
+    storedHist' = storedHist,
     replica' = replica,
     leaseTransitions' = leaseTransitions,
     wit' = wit,
@@ -2002,6 +2157,7 @@ module logBufferLifecycle {
     pg' = DRVS.mapBy(d => PgNone),
     delivered' = DRVS.mapBy(d => 1.to(MAX_EXECS).mapBy(e => Set())),
     stored' = DRVS.mapBy(d => 1.to(MAX_EXECS).mapBy(e => NoRow)),
+    storedHist' = DRVS.mapBy(d => 1.to(MAX_EXECS).mapBy(e => { frozen: NoRow, everEnd: 0 })),
     leaseTransitions' = 0,
     wit' = {
       evicted: false,
