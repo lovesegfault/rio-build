@@ -22,6 +22,11 @@ mod archive;
 // with them.
 #[allow(dead_code)]
 mod client;
+// The comparison phase (per-derivation verdicts, verdict counts, streamed
+// divergence records) also lands ahead of its consumer — the report wiring in
+// `run` drives it; the allow goes away with that.
+#[allow(dead_code)]
+mod compare;
 // The pre-warm phase (run-wide supply context + bulk pre-upload before the
 // replay clock starts) also lands ahead of its consumers — the timeline and
 // orchestration wiring drive it; the allow goes away with them.
