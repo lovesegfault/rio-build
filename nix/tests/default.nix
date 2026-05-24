@@ -40,6 +40,7 @@ let
 
   protocol = import ./scenarios/protocol.nix;
   scheduling = import ./scenarios/scheduling.nix;
+  put-path-chunked = import ./scenarios/put-path-chunked.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
   # systemd fixture (HMAC/tenant/validation); e2e uses k3sFull
@@ -602,6 +603,53 @@ in
         # 150s (13 waves × tick=2s × TCG overhead). 900s is comfortable
         # without being an open-ended escape hatch.
         globalTimeout = 900;
+      };
+
+  # ── PutPathChunked (ADR-022 §6, P0586) ──────────────────────────────
+  # The builder-side fused walk + chunked upload, end-to-end: a real
+  # nix build → the real rio-builder fused walk → HasChunks →
+  # PutPathChunked → the real store's reconstruct-and-verify → servable
+  # back through the gateway. Only the subtests that need the REAL
+  # BUILDER live here; the malformed-Begin/tampered-Chunk rejection
+  # matrix is rio-store/tests/grpc/put_path_chunked.rs and the
+  # real-client-vs-real-server matrix is
+  # rio-builder/tests/chunked_upload.rs (see the scenario header for
+  # the full subtest disposition).
+  #
+  # The fixture MUST carry a [chunk_backend] — an inline-only store
+  # rejects PutPathChunked and the builder falls back to the legacy
+  # path, making every assertion vacuous (the roundtrip fragment
+  # detects that and fails loudly).
+  vm-put-path-chunked =
+    (put-path-chunked {
+      inherit pkgs common;
+      fixture = standalone {
+        workers = {
+          worker = { };
+        };
+        extraStoreConfig = {
+          extraConfig = ''
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio/store/chunks"
+          '';
+        };
+        # psql for the manifests/chunks/castore-table assertions.
+        extraPackages = [ pkgs.postgresql_18 ];
+      };
+    }).mkTest
+      {
+        name = "default";
+        subtests = [
+          # r[verify builder.upload.fused-walk]
+          # r[verify builder.upload.chunked-manifest]
+          # r[verify builder.upload.batch+2]
+          # r[verify builder.upload.references-scanned]
+          # r[verify store.put.chunked]
+          "roundtrip"
+          # r[verify store.chunk.has-chunks-durable]
+          "dedup"
+        ];
       };
 
   # r[verify gw.jwt.dual-mode+2]

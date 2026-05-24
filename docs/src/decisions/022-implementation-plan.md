@@ -1,6 +1,6 @@
 # ADR-022 Implementation Plan — castore-FUSE lazy store + per-AZ S3 Express chunk cache
 
-**Status:** Phase-0 gate passed (P0541, P0543, P0544, P0569 done; P0578 PARTIAL — kernel-mechanism subtests Q7-Q12 done; the deferred mountd-protocol subtests landed as `vm-mountd` under P0567, perf criteria measured there but ungated). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete. Phase 3 started: P0567 PARTIAL (rio-mountd daemon + UDS wire protocol + `vm-mountd` VM test landed; helm DS + eks-node pquota assert pending) — the daemon+protocol half P0559 depends on is done, so **P0559 (castore-FUSE itself) is unblocked**; only P0567's deployment tail remains. P0574 (gateway delta-sync client) and P0586 (PutPathChunked) are the other unblocked feature items. P0557 (eager nar_index compute) is BLOCKED on P0586 — `set_nar_index`'s `path_tenants` cross-join (added by P0572 after P0557 was planned) makes a `finalize_single` spawn permanently lose the race against the scheduler's `upsert_path_tenants`; see P0557 note. Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
+**Status:** Phase-0 gate passed (P0541, P0543, P0544, P0569 done; P0578 PARTIAL — kernel-mechanism subtests Q7-Q12 done; the deferred mountd-protocol subtests landed as `vm-mountd` under P0567, perf criteria measured there but ungated). Phase 1/2 in progress: P0545, P0546, P0548, P0549, P0550, P0551, P0552, P0568, P0570, P0572, P0573, P0577, P0588, P0589 done. Castore RPC surface (`GetDirectory`/`Has*`/`ReadBlob`/`StatBlob`) is now complete. Phase 3 started: P0567 PARTIAL (rio-mountd daemon + UDS wire protocol + `vm-mountd` VM test landed; helm DS + eks-node pquota assert pending) — the daemon+protocol half P0559 depends on is done, so **P0559 (castore-FUSE itself) is unblocked**; only P0567's deployment tail remains. P0586 (PutPathChunked) is done — server + builder fused walk + `vm-put-path-chunked`; the builder uploads via `PutPathChunked` wherever the store has a chunk backend and falls back to the legacy RPCs on inline-only stores until P0583/P0584 land. P0574 (gateway delta-sync client) is the other unblocked feature item. P0557 (eager nar_index compute) was BLOCKED on P0586 and is now unblocked — `set_nar_index`'s `path_tenants` cross-join (added by P0572 after P0557 was planned) makes a `finalize_single` spawn permanently lose the race against the scheduler's `upsert_path_tenants`; see P0557 note (the chunked commit txn already writes `nar_index` inline, so P0557's remaining scope is the legacy `PutPath` path only). Design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023. Per-item status is in the metadata line under each `### P05xx` heading.
 **Plan-number range:** P0541–P0589 (gaps at 0542/0547/0558/0561/0587 are abandoned numbers; P0556 abandoned 2026-04-23 — do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
@@ -732,10 +732,35 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 
 **Exit:** `/nixbuild --checks` green.
 
-### P0586 — `PutPathChunked`: builder-side fused walk + `HasChunks` + pipelined sync narhash verify
+### P0586 — `PutPathChunked`: builder-side fused walk + `HasChunks` + pipelined sync narhash verify — **DONE**
 **Crate:** `rio-store, rio-builder, rio-proto` · **Deps:** P0551, P0572, P0573, P0577 · **Complexity:** HIGH
 
 Moves chunking to the builder; rio-store's per-stream working set drops from `nar_size` bytes to one ≤256 KiB chunk in flight. Closes `TODO(P0433)` (refs forced into separate pre-pass) and `TODO(P0434)` (manifest-first upload). Design at [§6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked).
+
+> **Reconciliation (post-DONE).** Three deltas from the file table below:
+> **(a) Capability fallback, not unconditional.** A store without a
+> `[chunk_backend]` rejects `PutPathChunked` with a recognizable
+> `FailedPrecondition` (`rio_proto::CHUNKED_REQUIRES_BACKEND_MSG`); the builder
+> falls back to the legacy `PutPath`/`PutPathBatch` path, reusing the fused
+> walk's parse + reference results so the fallback costs no extra disk pass.
+> There is no config knob — the store is authoritative — and the matcher is
+> deliberately narrow (a verification `FailedPrecondition` such as a NAR-hash
+> mismatch is a builder bug and propagates instead of being masked). Needed
+> because every k3s VM fixture and dev-mode `process-compose` deployment is
+> still inline-only; P0583 (chunk backend required) + P0584 (legacy RPCs
+> reject role=Builder) jointly retire the fallback.
+> **(b) Input-reuse shortcut deferred.** The optional `(size, file_digest)`
+> input-table consult depends on P0559's castore-FUSE `tree::InoMap`, which
+> does not exist yet. The walk always hashes; revisit with P0559.
+> **(c) VM scenario scope.** Only the subtests that need the REAL builder are
+> in `vm-put-path-chunked` (roundtrip = i+ii+x-positive, dedup = vi). The
+> malformed-`Begin`/tampered-`Chunk` rejection matrix (iii, iv, v, vii, viii,
+> ix, x-negative, xi) is `rio-store/tests/grpc/put_path_chunked.rs`
+> (hand-crafted streams against the real handler + ephemeral PG); the
+> real-client-vs-real-server matrix including idempotent re-drive (xii) is
+> `rio-builder/tests/chunked_upload.rs` (the production `upload_all_outputs`
+> against a real `StoreServiceImpl`). A correct builder cannot produce the
+> malformed inputs, and no production fault-injection hook exists to make it.
 
 | File | Change |
 |---|---|
@@ -795,7 +820,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":589,"title":"AssignmentClaims.{role,input_closure_digest} + dispatch populate","deps":[544,588],"crate":"rio-auth,rio-scheduler","priority":92,"status":"DONE","complexity":"LOW","note":"sequenced before P0573/P0586/P0584 — all three read these fields; closure already in hand at dispatch via P0588"}
 {"plan":584,"title":"builder-chunked-only auth gate: PutPath/PutPathBatch reject role=Builder","deps":[586,589],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders"}
 {"plan":585,"title":"Express eviction sweeper: per-AZ Lease, size-bounded MRU (target 8 TiB, hi/lo watermark)","deps":[548,554],"crate":"rio-store,infra","priority":75,"status":"UNIMPL","complexity":"LOW","note":"LastModified=last-cold-miss (read-through-only fill); S3 Lifecycle is age-based ceiling only, app sweep is authoritative for size target"}
-{"plan":586,"title":"PutPathChunked: multi-output Begin + bounds validate + fused walk + HasChunks + pipelined sync narhash+refs verify + CA defer-placeholder","deps":[551,572,573,577,589],"crate":"rio-store,rio-builder,rio-proto","priority":85,"status":"UNIMPL","complexity":"HIGH","note":"closes TODO(P0433/P0434); Begin{outputs[],directories[],novel[],input_closure[]}; bounds + dir-digest recompute before placeholder; per-output verify driver (global first_site for novel); commit txn writes castore + tenant tables; is_ca defers placeholder to commit"}
+{"plan":586,"title":"PutPathChunked: multi-output Begin + bounds validate + fused walk + HasChunks + pipelined sync narhash+refs verify + CA defer-placeholder","deps":[551,572,573,577,589],"crate":"rio-store,rio-builder,rio-proto","priority":85,"status":"DONE","complexity":"HIGH","note":"closes TODO(P0433/P0434); Begin{outputs[],directories[],novel[],input_closure[]}; builder falls back to legacy PutPath on inline-only stores (CHUNKED_REQUIRES_BACKEND_MSG match; retired by P0583+P0584); input-reuse shortcut deferred to P0559"}
 {"plan":556,"title":"[ABANDONED] libcomposefs FFI encoder (composefs-sys + encode.rs) — §3 EROFS alternative","deps":[],"crate":"","priority":0,"status":"ABANDONED","complexity":null,"note":"2026-04-23: §2 castore-FUSE has no metadata image; encoder/patch/VM-test/fuzz all dropped"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552,572,586],"crate":"rio-store","priority":80,"status":"BLOCKED","complexity":"LOW","note":"BLOCKED on P0586: set_nar_index now cross-joins path_tenants (P0572); scheduler writes that AFTER PutPath returns; eager spawn would write empty tenant junctions, permanently. Implement inside P0586's commit txn instead."}
 {"plan":567,"title":"rio-mountd DaemonSet (fuse-fd-handoff + BACKING_OPEN broker + Promote/PromoteChunks verify-copy + cache+chunks ownership + build_id validation + per-uid conn binding + staging quota + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"PARTIAL","complexity":"MED","note":"daemon + SOCK_SEQPACKET/postcard wire protocol + unit tests + vm-mountd VM test (P0578-deferred subtests, perf printed not gated) landed; helm DS and eks-node pquota assert pending; tokio async per-conn; Promote+PromoteChunks both on spawn_blocking+Semaphore; build_id ^[A-Za-z0-9_-]{1,64}$; openat(base_dirfd) not string-concat; one conn per peer_uid; kernel project-quota staging enforcement"}
