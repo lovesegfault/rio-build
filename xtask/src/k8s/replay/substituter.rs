@@ -27,6 +27,12 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 /// take minutes on a slow link.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Overall timeout for one narinfo probe. Probes are ~1 KB and the supply
+/// planner issues thousands of them — a stalled server must not wedge a
+/// probe slot forever. NAR fetches deliberately get NO overall timeout
+/// (bodies can be huge); only [`CONNECT_TIMEOUT`] applies there.
+const NARINFO_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A binary cache reachable over HTTPS or S3.
 ///
 /// Built once per `--target-substituter` / manifest source URL by
@@ -67,6 +73,29 @@ impl Substituter {
         match parsed.scheme() {
             "http" | "https" => {
                 let https = parsed.scheme() == "https";
+                // Substituter strings copied out of nix.conf can carry
+                // parameters (`?priority=40`, `?trusted=1`); they tune
+                // client-side substituter selection, not how objects are
+                // fetched, so strip them from the base (object names are
+                // appended to its path) and say so once.
+                let ignored = match (parsed.query(), parsed.fragment()) {
+                    (None, None) => None,
+                    (query, fragment) => Some(format!(
+                        "{}{}",
+                        query.map(|q| format!("?{q}")).unwrap_or_default(),
+                        fragment.map(|f| format!("#{f}")).unwrap_or_default()
+                    )),
+                };
+                let mut base = parsed;
+                base.set_query(None);
+                base.set_fragment(None);
+                if let Some(ignored) = ignored {
+                    tracing::warn!(
+                        substituter = %base,
+                        ignored = %ignored,
+                        "ignoring substituter URL parameters; they do not affect how objects are fetched"
+                    );
+                }
                 let mut builder = reqwest::Client::builder()
                     .connect_timeout(CONNECT_TIMEOUT)
                     .https_only(https);
@@ -80,10 +109,7 @@ impl Substituter {
                 let client = builder.build().with_context(|| {
                     format!("failed to build the HTTP client for substituter {url}")
                 })?;
-                Ok(Self::Http {
-                    base: parsed,
-                    client,
-                })
+                Ok(Self::Http { base, client })
             }
             "s3" => {
                 let bucket = parsed
@@ -95,10 +121,27 @@ impl Substituter {
                 if !prefix.is_empty() {
                     prefix.push('/');
                 }
-                let region = parsed
-                    .query_pairs()
-                    .find(|(key, _)| key == "region")
-                    .map(|(_, value)| value.into_owned());
+                let mut region = None;
+                let mut ignored: Vec<String> = Vec::new();
+                for (key, value) in parsed.query_pairs() {
+                    match key.as_ref() {
+                        "region" => region = Some(value.into_owned()),
+                        // Parameters that change WHERE or HOW the bucket is
+                        // reached: silently dropping them would probe the
+                        // wrong place and report misleading misses.
+                        "endpoint" | "scheme" | "profile" => {
+                            bail!("unsupported substituter parameter `{key}` in {url}")
+                        }
+                        _ => ignored.push(key.into_owned()),
+                    }
+                }
+                if !ignored.is_empty() {
+                    tracing::warn!(
+                        substituter = url,
+                        ignored = %ignored.join(", "),
+                        "ignoring substituter URL parameters; they do not affect how objects are fetched"
+                    );
+                }
                 // Per-substituter SDK config: the region is a property of
                 // the URL, so the process-global, first-call-wins loader in
                 // `crate::aws::config` is not a fit here. Same
@@ -148,6 +191,7 @@ impl Substituter {
                 let url = object_url(base, &object)?;
                 let resp = client
                     .get(url.clone())
+                    .timeout(NARINFO_TIMEOUT)
                     .send()
                     .await
                     .with_context(|| format!("GET {url}"))?;
@@ -175,12 +219,17 @@ impl Substituter {
                 prefix,
             } => {
                 let key = format!("{prefix}{object}");
-                let resp = match client.get_object().bucket(bucket).key(&key).send().await {
-                    Ok(resp) => resp,
-                    Err(err) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
+                let send = client.get_object().bucket(bucket).key(&key).send();
+                let resp = match tokio::time::timeout(NARINFO_TIMEOUT, send).await {
+                    Err(_) => bail!(
+                        "narinfo probe for s3://{bucket}/{key} timed out after {}s",
+                        NARINFO_TIMEOUT.as_secs()
+                    ),
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(err)) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
                         return Ok(None);
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         return Err(anyhow::Error::new(err).context(format!(
                             "GET s3://{bucket}/{key} (access problems are not treated as a miss)"
                         )));
@@ -202,15 +251,19 @@ impl Substituter {
     }
 
     /// Fetch the NAR named by `info.url`, decompress it per
-    /// `info.compression` (`none`, `zstd`, `xz`), verify the decompressed
-    /// length against `info.nar_size` and its SHA-256 against
-    /// `info.nar_hash`, and return the decompressed bytes.
+    /// `info.compression` (`none`, `zstd`, `xz`, `bzip2`, `gzip`, `br`),
+    /// verify the decompressed length against `info.nar_size` and its
+    /// SHA-256 against `info.nar_hash`, and return the decompressed bytes.
     pub async fn fetch_nar(&self, info: &NarInfo) -> Result<Vec<u8>> {
-        let (declared_size, mut reader) = self.fetch_nar_streaming(info).await?;
+        let (declared_size, reader) = self.fetch_nar_streaming(info).await?;
         // Pre-size from the (untrusted) declared size, capped so a bogus
         // narinfo can't make us reserve gigabytes up front.
         let reserve = usize::try_from(declared_size.min(64 * 1024 * 1024)).unwrap_or(0);
         let mut nar = Vec::with_capacity(reserve);
+        // Bound the decompressed read at declared-size + 1: a decompression
+        // bomb stays bounded no matter what the narinfo claimed, and the
+        // size-mismatch check below then fires deterministically.
+        let mut reader = reader.take(declared_size.saturating_add(1));
         reader
             .read_to_end(&mut nar)
             .await
@@ -241,6 +294,12 @@ impl Substituter {
     ///
     /// No client-side hash verification — the daemon verifies on ingest and
     /// the caller knows the expected length.
+    ///
+    /// Multi-frame compressed bodies are truncated at the first frame by the
+    /// decoders (the same behavior as the other decompression call sites in
+    /// this codebase); the daemon's ingest verification catches the
+    /// resulting short data, so callers should treat daemon-side rejection
+    /// of a relayed path as "the cache served unusable content".
     pub async fn fetch_nar_streaming(
         &self,
         info: &NarInfo,
@@ -307,15 +366,20 @@ fn decompress(
     compression: &str,
     cache: &str,
 ) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
-    use async_compression::tokio::bufread::{XzDecoder, ZstdDecoder};
+    use async_compression::tokio::bufread::{
+        BrotliDecoder, BzDecoder, GzipDecoder, XzDecoder, ZstdDecoder,
+    };
 
     let buffered = tokio::io::BufReader::new(raw);
     Ok(match compression {
         "" | "none" => Box::new(buffered),
         "zstd" => Box::new(ZstdDecoder::new(buffered)),
         "xz" => Box::new(XzDecoder::new(buffered)),
+        "bzip2" => Box::new(BzDecoder::new(buffered)),
+        "gzip" => Box::new(GzipDecoder::new(buffered)),
+        "br" => Box::new(BrotliDecoder::new(buffered)),
         other => bail!(
-            "unsupported NAR compression {other:?} from substituter {cache} (supported: none, zstd, xz)"
+            "unsupported NAR compression {other:?} from substituter {cache} (supported: none, zstd, xz, bzip2, gzip, br)"
         ),
     })
 }
@@ -435,8 +499,10 @@ mod tests {
         // https needs the platform trust store; in CA-bundle-less
         // environments (the nix build sandbox) building the client fails by
         // design. Branch on what the default reqwest builder can do here so
-        // both environments exercise their realistic outcome.
-        let https = Substituter::parse("https://cache.nixos.org").await;
+        // both environments exercise their realistic outcome. The
+        // `?priority=40` parameter (as found in nix.conf substituter lists)
+        // must be stripped from the stored base either way.
+        let https = Substituter::parse("https://cache.nixos.org?priority=40").await;
         if reqwest::Client::builder().build().is_ok() {
             assert_eq!(https.unwrap().url(), "https://cache.nixos.org");
         } else {
@@ -462,6 +528,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s3_bare.url(), "s3://other-cache");
+
+        // S3 parameters that change where/how the bucket is reached are
+        // refused instead of silently ignored.
+        let err = Substituter::parse("s3://my-cache?region=us-east-1&endpoint=http://minio.local")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported substituter parameter") && msg.contains("endpoint"),
+            "{msg}"
+        );
 
         // Unsupported scheme is an error naming the scheme.
         let err = Substituter::parse("ftp://example.org/cache")
@@ -505,6 +582,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn narinfo_success_path_ignores_url_params() {
+        let narinfo_text = "\
+StorePath: /nix/store/b2222222222222222222222222222222-present
+URL: nar/b2222222222222222222222222222222.nar.zst
+Compression: zstd
+NarHash: sha256:0000000000000000000000000000000000000000000000000000
+NarSize: 4242
+References:
+";
+        let routes = HashMap::from([(
+            "/b2222222222222222222222222222222.narinfo".to_string(),
+            (200, narinfo_text.as_bytes().to_vec()),
+        )]);
+        let (base, server) = spawn_test_server(routes).await;
+        // `?priority=40` on the substituter URL must not leak into object
+        // URLs — the canned server only answers the clean path.
+        let sub = Substituter::parse(&format!("{base}?priority=40"))
+            .await
+            .unwrap();
+        assert_eq!(sub.url(), base);
+
+        let info = sub
+            .narinfo("b2222222222222222222222222222222")
+            .await
+            .unwrap()
+            .expect("present narinfo must be Some");
+        assert_eq!(info.nar_size, 4242);
+        assert_eq!(info.compression, "zstd");
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fetch_nar_decompresses_and_verifies() {
         let nar: Vec<u8> = b"replay fixture NAR payload 0123456789".repeat(64);
         let zstd_body = zstd_compress(&nar).await;
@@ -536,9 +646,9 @@ mod tests {
         assert!(err.contains("hash mismatch"), "{err}");
 
         // Unsupported compression names the compression and the cache.
-        let bzip2_info = narinfo_for(&nar, "nar/good.nar.zst", "bzip2");
-        let err = format!("{:#}", sub.fetch_nar(&bzip2_info).await.unwrap_err());
-        assert!(err.contains("bzip2") && err.contains(&sub.url()), "{err}");
+        let lzip_info = narinfo_for(&nar, "nar/good.nar.zst", "lzip");
+        let err = format!("{:#}", sub.fetch_nar(&lzip_info).await.unwrap_err());
+        assert!(err.contains("lzip") && err.contains(&sub.url()), "{err}");
 
         server.abort();
     }
