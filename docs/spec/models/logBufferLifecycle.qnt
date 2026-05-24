@@ -450,6 +450,9 @@ module logBufferLifecycle {
   ///   - `genPinnedAcrossHolderChange`: a holder change was re-acquired
   ///     with the generation unchanged (the saturated regime — the
   ///     `req_in_tenure` counterexample's premise).
+  ///   - `alreadyFinalizedRefusal`: `flush_final`'s already-finalized
+  ///     refusal arm fired (the row consult found another tenure's
+  ///     completed row and refused to re-finalize it).
   var wit: {
     evicted: bool,
     rejectedNonMonotone: bool,
@@ -459,6 +462,7 @@ module logBufferLifecycle {
     sealedEmptyReap: bool,
     enqueueFailReap: bool,
     genPinnedAcrossHolderChange: bool,
+    alreadyFinalizedRefusal: bool,
   }
 
   // --- 5. derived state -------------------------------------------------
@@ -919,6 +923,15 @@ module logBufferLifecycle {
   /// Violated when the terminal epilogue's enqueue-failure reap fires
   /// (orphan shape 4 of 4).
   val noEnqueueFailReap = not(wit.enqueueFailReap)
+  /// Violated when `flush_final`'s already-finalized refusal arm fires —
+  /// the non-vacuity probe for the finalize-once guard partition
+  /// (obs.log.finalize-immutable): without it nothing proves the
+  /// post-44905298b consult arm is reachable and the
+  /// `finalizedRowFrozen` verdict could be vacuous for the final path.
+  /// Reachable only in the fault-persist regime (the only one in which
+  /// a finalized row can coexist with a pending in-tenure final for the
+  /// same execution).
+  val noAlreadyFinalizedRefusal = not(wit.alreadyFinalizedRefusal)
   /// Violated when a holder change is re-acquired with the generation
   /// unchanged — the saturated regime in which the generation alone
   /// cannot identify the tenure and the acquire-epoch half of
@@ -1625,7 +1638,7 @@ module logBufferLifecycle {
       storedHist' = storedHist,
       replica' = replica,
       leaseTransitions' = leaseTransitions,
-      wit' = wit,
+      wit' = { ...wit, alreadyFinalizedRefusal: true },
     }
   }
 
@@ -2413,6 +2426,7 @@ module logBufferLifecycle {
       sealedEmptyReap: false,
       enqueueFailReap: false,
       genPinnedAcrossHolderChange: false,
+      alreadyFinalizedRefusal: false,
     },
   }
 

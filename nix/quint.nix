@@ -144,17 +144,24 @@ let
       # backend — TLC's exhaustive BFS has no step bound and feeding it
       # one would silently weaken the check's guarantee.
       maxSteps ? 10,
+      # Additional .qnt files (relative to docs/spec/models, without
+      # the extension) that `spec` imports. A calibration module under
+      # calibration/ imports ../logBufferLifecycle, so the main model
+      # must be staged alongside it at the same relative position —
+      # quint resolves `from "../x"` against the importing file's
+      # directory.
+      extraSpecs ? [ ],
     }:
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
-        # Only the one .qnt file. A model that imports another file
-        # (a shared harness, a Choreo vendored module) extends the
-        # fileset here — keeping it narrow means an unrelated docs/
-        # edit doesn't re-run every quint check.
+        # Only the named .qnt files. A model that imports another file
+        # (a shared harness, a calibration override's parent model)
+        # extends the fileset via extraSpecs — keeping it narrow means
+        # an unrelated docs/ edit doesn't re-run every quint check.
         src = lib.fileset.toSource {
           root = modelsDir;
-          fileset = modelsDir + "/${spec}.qnt";
+          fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
         };
         # Surfaced in `nix log` and error messages.
         env.MODEL = spec;
@@ -227,14 +234,16 @@ let
       main ? spec,
       # The witness `val` expected to be violated.
       witness,
+      # Same semantics as mkQuintCheck's extraSpecs.
+      extraSpecs ? [ ],
     }:
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
-        # Same single-file narrowing as mkQuintCheck.
+        # Same fileset narrowing as mkQuintCheck.
         src = lib.fileset.toSource {
           root = modelsDir;
-          fileset = modelsDir + "/${spec}.qnt";
+          fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
         };
         env = {
           MODEL = spec;
@@ -813,6 +822,91 @@ in
       spec = "logBufferLifecycle";
       main = "logBufferLifecycleUngated";
       witness = "lineSpanExact";
+    };
+
+    # flush_final's already-finalized refusal arm fires — the
+    # non-vacuity probe for the finalize-once guard partition. Every
+    # other refusal/reap arm has one of these; without it nothing in CI
+    # proves the post-44905298b consult arm is reachable and the
+    # finalizedRowFrozen verdict could go vacuous for the final path.
+    # Fault-persist regime: the only one in which a finalized row can
+    # coexist with a pending in-tenure final for the same execution.
+    quint-log-witness-already-finalized-refusal = mkQuintWitnessCheck {
+      name = "log-witness-already-finalized-refusal";
+      spec = "logBufferLifecycle";
+      main = "logBufferLifecycleFaultPersist";
+      witness = "noAlreadyFinalizedRefusal";
+    };
+
+    # ---------------------------------------------------------------------
+    # Permanent calibration witnesses (phase 3). Each restores one
+    # historical fix's pre-fix behavior via a calibration switch
+    # (docs/spec/models/calibration/) and MUST still falsify the
+    # invariant the fix protects: a green exhaustive regime check plus a
+    # red invariant here is the machine-checked statement "the fix is
+    # necessary and sufficient at these bounds". Only the overrides that
+    # guard against a plausible model regression are wired here; the
+    # full corpus verdict table is log-invariant-map.md's phase-3
+    # findings section and the rest of the override modules stay in
+    # calibration/ as re-runnable evidence. Unlike the non-vacuity
+    # witnesses above, these carry r[verify ...] markers: each is the
+    # machine-checked statement that a specific normative behavior is
+    # the load-bearing fix for its rule's invariant, which is a
+    # verification claim about the rule and not just about the regime
+    # checks' non-vacuity.
+
+    # effefb0a1: a flush payload's span contribution reverts to its
+    # physical line count instead of its line-number span. The cheapest
+    # falsification in the corpus (base regime, one holey ring, no
+    # failover) and the most plausible regression (a refactor
+    # "simplifying" ringSpan back to a count).
+    # r[verify obs.log.gap-span+2]
+    quint-log-calib-physical-count-span = mkQuintWitnessCheck {
+      name = "log-calib-physical-count-span";
+      spec = "calibration/lines";
+      extraSpecs = [ "logBufferLifecycle" ];
+      main = "logBufferLifecyclePhysicalCountSpan";
+      witness = "lineSpanExact";
+    };
+
+    # 6c26e85f8: a cross-exec restamp reverts to carrying the prior
+    # execution's lines into the new execution's entry. The one corpus
+    # row that falsifies an original model-A invariant outright.
+    # r[verify obs.log.exec-keyed+2]
+    quint-log-calib-cross-exec-carries-lines = mkQuintWitnessCheck {
+      name = "log-calib-cross-exec-carries-lines";
+      spec = "calibration/restamps";
+      extraSpecs = [ "logBufferLifecycle" ];
+      main = "logBufferLifecycleCrossExecCarriesLines";
+      witness = "noCrossExecContamination";
+    };
+
+    # f8ce10b8e (and 463090eb7's orphan shape): no recurring reaper for
+    # a sealed non-empty entry whose execution another tenure finalized.
+    # The refused-UPSERT reap is individually load-bearing — deleting it
+    # from the model (e.g. during the phase-6 reap unification) must
+    # turn this red.
+    # r[verify obs.log.entry-justified]
+    quint-log-calib-no-refused-upsert-reap = mkQuintWitnessCheck {
+      name = "log-calib-no-refused-upsert-reap";
+      spec = "calibration/reaps";
+      extraSpecs = [ "logBufferLifecycle" ];
+      main = "logBufferLifecycleNoRefusedUpsertReap";
+      witness = "everyRetainedEntryIsJustified";
+    };
+
+    # 81824cfbb: no reaper for a sealed entry whose ring the
+    # stored-coverage reconcile empties after its pending final is
+    # consumed. The sealed-empty reap is individually load-bearing. The
+    # deepest counterexample in the calibration corpus — random
+    # simulation does not find it.
+    # r[verify obs.log.entry-justified]
+    quint-log-calib-no-sealed-empty-reap = mkQuintWitnessCheck {
+      name = "log-calib-no-sealed-empty-reap";
+      spec = "calibration/reaps";
+      extraSpecs = [ "logBufferLifecycle" ];
+      main = "logBufferLifecycleNoSealedEmptyReap";
+      witness = "everyRetainedEntryIsJustified";
     };
 
     # Implementation conformance (model-based testing). The regime checks
