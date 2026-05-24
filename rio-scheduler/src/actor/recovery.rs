@@ -43,7 +43,7 @@
 
 use super::*;
 use crate::db::RecoveryBuildRow;
-use crate::state::DerivationState;
+use crate::state::{DerivationState, verifiable_wanted_paths};
 
 /// Cross-phase carrier for [`DagActor::recover_from_pg`]: PG row sets
 /// loaded by [`DagActor::load_dag_from_rows`] that the later phases
@@ -1107,35 +1107,36 @@ impl DagActor {
         // trip FMP's InvalidArgument.
         let all_outputs: Vec<String> = orphaned
             .iter()
-            .flat_map(|(_, _, outs, _)| outs.iter())
+            .flat_map(|o| o.expected_output_paths.iter())
             .filter(|p| !p.is_empty())
             .cloned()
             .collect();
         let missing = self.batch_probe_orphan_outputs(all_outputs).await;
 
-        for (drv_hash, executor_id, expected_outputs, wanted_outputs) in orphaned {
+        for o in orphaned {
             // Did the build complete while the scheduler was down
-            // (orphan completion)? All WANTED present = none in
+            // (orphan completion)? All WANTED outputs present = none in
             // `missing` (the probe set stays all expected paths; an
             // absent output nothing wants must not force the orphan
             // back to a from-source re-dispatch). Conservative reset
-            // for: empty verifiable set (CA pre-completion, or a
-            // wanted set that resolves to no concrete path), or no
-            // missing-set (RPC failed/timed out).
-            let verifiable: Vec<&str> = wanted_outputs
-                .iter()
-                .map(String::as_str)
-                .filter(|p| !p.is_empty())
-                .collect();
-            let present = !verifiable.is_empty()
-                && missing
+            // for: no verifiable wanted path (CA pre-completion, or a
+            // wanted set that resolves to nothing), or no missing-set
+            // (RPC failed/timed out).
+            let present = verifiable_wanted_paths(
+                &o.output_names,
+                &o.expected_output_paths,
+                &o.wanted_output_names,
+            )
+            .is_some_and(|verifiable| {
+                missing
                     .as_ref()
-                    .is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)));
+                    .is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)))
+            });
             if present {
-                self.adopt_orphan_completion(&drv_hash, &executor_id, expected_outputs)
+                self.adopt_orphan_completion(&o.drv_hash, &o.executor, o.expected_output_paths)
                     .await;
             } else {
-                self.reset_orphan_to_ready(&drv_hash, &executor_id).await;
+                self.reset_orphan_to_ready(&o.drv_hash, &o.executor).await;
             }
         }
 
@@ -1143,31 +1144,28 @@ impl DagActor {
         self.dispatch_ready().await;
     }
 
-    /// Collect `(drv_hash, assigned_executor, expected_outputs,
-    /// wanted_outputs)` for every Assigned/Running derivation whose
-    /// worker is no longer live — the liveness-check input set for
+    /// Collect an [`OrphanedAssignment`] for every Assigned/Running
+    /// derivation whose worker is no longer live — the liveness-check
+    /// input set for
     /// [`handle_reconcile_assignments`](Self::handle_reconcile_assignments).
     ///
     /// Cloned out of the DAG before any mutation (the per-row
     /// reset/adopt path takes `node_mut`).
     ///
-    /// `executor_id` is `Option`: Assigned/Running with
+    /// `executor` is `Option`: Assigned/Running with
     /// `assigned_executor=None` is inconsistent state (shouldn't
     /// happen, but recovery loads from PG which could have drifted).
     /// We still reconcile it (check store for outputs → Completed,
     /// else Ready) rather than silently skipping and leaving it stuck
     /// forever.
-    ///
-    /// The third tuple element is ALL expected output paths (the probe
-    /// set and the adopted node's recorded `output_paths`); the fourth
-    /// is the recovered row's WANTED subset — the all-present decision
-    /// in [`Self::handle_reconcile_assignments`] is evaluated over the
-    /// wanted subset only, so an orphaned build whose only missing
-    /// output is one nothing wants still adopts as completed.
-    #[allow(clippy::type_complexity)]
-    fn collect_orphaned_assignments(
-        &self,
-    ) -> Vec<(DrvHash, Option<ExecutorId>, Vec<String>, Vec<String>)> {
+    fn collect_orphaned_assignments(&self) -> Vec<OrphanedAssignment> {
+        let orphan = |h: &str, s: &DerivationState, w: Option<&ExecutorId>| OrphanedAssignment {
+            drv_hash: h.into(),
+            executor: w.cloned(),
+            expected_output_paths: s.expected_output_paths.clone(),
+            output_names: s.output_names.clone(),
+            wanted_output_names: s.wanted_output_names.clone(),
+        };
         self.dag
             .iter_nodes()
             .filter(|(_, s)| {
@@ -1198,12 +1196,7 @@ impl DagActor {
                     } else {
                         warn!(drv_hash = %hash, executor_id = %w,
                               "reconcile: worker reconnected but phantom Assigned (not in worker.running_build) — reconciling");
-                        Some((
-                            hash,
-                            Some(w.clone()),
-                            s.expected_output_paths.clone(),
-                            s.wanted_output_paths().cloned().collect(),
-                        ))
+                        Some(orphan(h, s, Some(w)))
                     }
                 }
                 // Stream connected but no heartbeat yet — running_build
@@ -1221,21 +1214,11 @@ impl DagActor {
                            "reconcile: worker stream-connected but not yet heartbeated — deferring");
                     None
                 }
-                Some(w) => Some((
-                    h.into(),
-                    Some(w.clone()),
-                    s.expected_output_paths.clone(),
-                    s.wanted_output_paths().cloned().collect(),
-                )),
+                Some(w) => Some(orphan(h, s, Some(w))),
                 None => {
                     warn!(drv_hash = ?h, status = ?s.status(),
                           "reconcile: Assigned/Running drv with NULL worker — reconciling anyway");
-                    Some((
-                        h.into(),
-                        None,
-                        s.expected_output_paths.clone(),
-                        s.wanted_output_paths().cloned().collect(),
-                    ))
+                    Some(orphan(h, s, None))
                 }
             })
             .collect()
@@ -1431,6 +1414,32 @@ impl DagActor {
             }
         });
     }
+}
+
+/// One orphaned (worker-gone) Assigned/Running derivation collected by
+/// [`DagActor::collect_orphaned_assignments`] for the reconcile pass.
+///
+/// A named struct rather than a tuple: the output-path/output-name
+/// fields are adjacent same-typed `Vec<String>`s, and a positional
+/// swap would silently flip the adoption criterion from "all wanted
+/// outputs present" to something nonsensical without a type error.
+struct OrphanedAssignment {
+    drv_hash: DrvHash,
+    /// `None` = Assigned/Running with no recorded worker (PG drift) —
+    /// still reconciled rather than left stuck forever.
+    executor: Option<ExecutorId>,
+    /// ALL declared output paths: the `FindMissingPaths` probe set and
+    /// the adopted node's recorded `output_paths`. Probing an unwanted
+    /// path is harmless; only the adopt-vs-reset DECISION filters by
+    /// wanted.
+    expected_output_paths: Vec<String>,
+    /// Declared output names, index-paired with `expected_output_paths`.
+    /// Together with `wanted_output_names` these feed
+    /// [`crate::state::verifiable_wanted_paths`] for the adopt-vs-reset
+    /// decision.
+    output_names: Vec<String>,
+    /// The recovered row's wanted set (empty = all declared wanted).
+    wanted_output_names: Vec<String>,
 }
 
 /// Delay before post-recovery worker reconciliation. Workers have

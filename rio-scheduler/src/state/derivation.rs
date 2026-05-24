@@ -1449,6 +1449,37 @@ pub fn wanted_subset<'a>(
         .map(|(_, path)| path)
 }
 
+/// The *verifiable* wanted subset of `expected_output_paths`: the
+/// non-empty concrete paths resolved by [`wanted_subset`], or `None`
+/// when the resolution yields zero non-empty paths — every wanted name
+/// unmatched against the declared outputs (a client sent `drv^bogus`
+/// and the gateway does not validate the root OutputsSpec against the
+/// declared outputs), or only floating-CA `""` placeholders.
+///
+/// THE single guard for every wanted-output completeness predicate.
+/// The empty case is unrepresentable in the `Some` branch by
+/// construction so that a `wanted.iter().all(present)` predicate can
+/// never be vacuously true: a vacuous "all wanted outputs present"
+/// verdict completes a derivation with zero outputs verified —
+/// dispatching its dependents against missing inputs, adopting an
+/// unfinished orphan as completed, or (in the top-down prune) dropping
+/// the dependency closure from the submission entirely. On `None` the
+/// caller MUST take its conservative branch: skip the classification,
+/// fall back to all declared paths, or treat the node as unavailable.
+/// Falling through to a from-source build / the full merge is always
+/// safe; a false "complete" is not.
+pub fn verifiable_wanted_paths<'a>(
+    output_names: &'a [String],
+    expected_output_paths: &'a [String],
+    wanted_output_names: &'a [String],
+) -> Option<Vec<&'a str>> {
+    let paths: Vec<&str> = wanted_subset(output_names, expected_output_paths, wanted_output_names)
+        .map(String::as_str)
+        .filter(|p| !p.is_empty())
+        .collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
 /// Poison detection config. Replaces the former `POISON_THRESHOLD` const.
 ///
 /// `require_distinct_workers` toggles between HashSet semantics

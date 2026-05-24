@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use rio_proto::types::FindMissingPathsRequest;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+use crate::state::{DerivationStatus, DrvHash, ExecutorId, verifiable_wanted_paths};
 
 use super::DagActor;
 #[cfg(test)]
@@ -679,19 +679,23 @@ impl DagActor {
             // be present (→ complete inline) or present-or-
             // substitutable (→ detached fetch). A missing output
             // nothing consumes must not force a from-source dispatch.
-            // Degrades to all of `paths` for an empty wanted set, for
-            // a node that vanished from the DAG mid-probe, and for a
-            // wanted set that resolves to no concrete path (defensive
-            // — a vacuously-true `all()` would complete the node with
-            // zero outputs verified). The probe set and the `to_spawn`
-            // walk seeds stay ALL expected paths (opportunistic
-            // completeness — fetch the unwanted output too if the
-            // upstream has it).
+            // `verifiable_wanted_paths` returns None for a wanted set
+            // that resolves to no verifiable path; degrade to all of
+            // `paths` then (and for a node that vanished from the DAG
+            // mid-probe). The probe set and the `to_spawn` walk seeds
+            // stay ALL expected paths (opportunistic completeness —
+            // fetch the unwanted output too if the upstream has it).
             let wanted: Vec<String> = self
                 .dag
                 .node(&drv_hash)
-                .map(|s| s.wanted_output_paths().cloned().collect())
-                .filter(|w: &Vec<String>| !w.is_empty())
+                .and_then(|s| {
+                    verifiable_wanted_paths(
+                        &s.output_names,
+                        &s.expected_output_paths,
+                        &s.wanted_output_names,
+                    )
+                })
+                .map(|w| w.into_iter().map(str::to_owned).collect())
                 .unwrap_or_else(|| paths.clone());
             if wanted.iter().all(|p| !missing.contains(p)) {
                 // `substitute_tried` ⇒ the closure walk ingested the
@@ -1166,14 +1170,18 @@ impl DagActor {
             let substitute_tried = state.substitute_tried;
             // Demand-driven completeness: the probe set stays ALL
             // expected paths, but the present/substitutable verdicts
-            // below are evaluated over the WANTED subset only. Falls
-            // back to all expected paths when the wanted set resolves
-            // to nothing (defensive — a vacuously-true `all()` would
-            // complete the node with zero outputs verified).
-            let mut wanted: Vec<String> = state.wanted_output_paths().cloned().collect();
-            if wanted.is_empty() {
-                wanted = state.expected_output_paths.clone();
-            }
+            // below are evaluated over the WANTED subset only.
+            // `verifiable_wanted_paths` returns None for a wanted set
+            // that resolves to no verifiable path; degrade to all
+            // expected paths then — same shape as
+            // `batch_probe_cached_ready`.
+            let wanted: Vec<String> = verifiable_wanted_paths(
+                &state.output_names,
+                &state.expected_output_paths,
+                &state.wanted_output_names,
+            )
+            .map(|w| w.into_iter().map(str::to_owned).collect())
+            .unwrap_or_else(|| state.expected_output_paths.clone());
             let Some(store) = &self.store_client else {
                 return false;
             };

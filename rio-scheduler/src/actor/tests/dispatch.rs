@@ -1223,6 +1223,118 @@ async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResu
     Ok(())
 }
 
+/// `batch_probe_cached_ready` × wanted outputs: a Ready node whose only
+/// missing output is one nothing wants must be completed inline by the
+/// dispatch-time batch probe instead of staying Ready forever / being
+/// dispatched to a builder. The node is aarch64 with only an x86_64
+/// worker connected so it can never dispatch — with the all-declared
+/// criterion it would sit Ready until the heat death of the universe
+/// because P_debug is missing and unsubstitutable.
+#[tokio::test]
+async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let _rx = connect_executor(&handle, "bpw-b", "x86_64-linux").await?;
+
+    let out = test_store_path("bpw-out");
+    let dbg = test_store_path("bpw-debug");
+    let mut n = make_node("bpw-drv");
+    n.system = "aarch64-linux".into();
+    n.output_names = vec!["out".into(), "debug".into()];
+    n.expected_output_paths = vec![out.clone(), dbg.clone()];
+    n.wanted_output_names = vec!["out".into()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "bpw-drv").await.status,
+        DerivationStatus::Ready,
+        "precondition: nothing in store at merge time → Ready"
+    );
+
+    // P_out appears in the store AFTER merge (another build uploaded
+    // it). P_debug stays missing and unsubstitutable. The next
+    // heartbeat-driven dispatch pass batch-probes the Ready node.
+    store.seed_with_content(&out, b"out");
+    send_heartbeat(&handle, "bpw-b", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "bpw-drv").await.status,
+        DerivationStatus::Completed,
+        "all WANTED outputs present → completed inline by the batch \
+         probe; the missing unwanted P_debug must not keep it Ready"
+    );
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.state, rio_proto::types::BuildState::Succeeded as i32);
+    Ok(())
+}
+
+/// `ready_check_or_spawn` × wanted outputs: same scenario as
+/// [`batch_probe_completes_on_missing_unwanted_output`] but through the
+/// per-drv fallback path. The multi-output node is a PARENT promoted to
+/// Ready mid-pass by its dep completing via the batch probe — it is not
+/// in the batch's candidate snapshot, so the drain loop's
+/// `!batch_checked.contains()` branch sends it through
+/// `ready_check_or_spawn`. The FMP-call count proves the per-drv path
+/// (not the batch) made the decision.
+#[tokio::test]
+async fn ready_check_completes_on_missing_unwanted_output() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let _rx = connect_executor(&handle, "rcw-b", "x86_64-linux").await?;
+
+    let dep_out = test_store_path("rcw-dep-out");
+    let app_out = test_store_path("rcw-app-out");
+    let app_dbg = test_store_path("rcw-app-debug");
+    // Both aarch64 so neither can dispatch to the x86_64 worker — the
+    // only way out of Ready is the store probe.
+    let mut dep = make_node("rcw-dep");
+    dep.system = "aarch64-linux".into();
+    dep.expected_output_paths = vec![dep_out.clone()];
+    let mut app = make_node("rcw-app");
+    app.system = "aarch64-linux".into();
+    app.output_names = vec!["out".into(), "debug".into()];
+    app.expected_output_paths = vec![app_out.clone(), app_dbg.clone()];
+    app.wanted_output_names = vec!["out".into()];
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![app, dep],
+        vec![make_test_edge("rcw-app", "rcw-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Seed dep's output and app's WANTED output post-merge. app's
+    // unwanted P_debug stays missing+unsubstitutable.
+    store.seed_with_content(&dep_out, b"dep");
+    store.seed_with_content(&app_out, b"out");
+    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
+    send_heartbeat(&handle, "rcw-b", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    // Batch (1 FMP) completes dep → app promoted to Ready mid-pass →
+    // per-drv probe (1 FMP) → all wanted present → completed.
+    assert_eq!(
+        store.calls.find_missing_calls.load(Ordering::SeqCst),
+        2,
+        "1 batch FMP (dep) + 1 per-drv FMP (cascade-promoted app) — \
+         proves ready_check_or_spawn made app's decision, not the batch"
+    );
+    assert_eq!(
+        expect_drv(&handle, "rcw-app").await.status,
+        DerivationStatus::Completed,
+        "all WANTED outputs present → completed by the per-drv probe; \
+         the missing unwanted P_debug must not force a dispatch"
+    );
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.state, rio_proto::types::BuildState::Succeeded as i32);
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test

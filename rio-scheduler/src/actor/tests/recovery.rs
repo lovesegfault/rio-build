@@ -731,6 +731,82 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     Ok(())
 }
 
+/// Orphan adoption × wanted outputs: an orphaned assignment (worker
+/// gone) whose only missing output is one nothing wants must still be
+/// adopted as completed. The worker built and uploaded every output
+/// anyone consumes before the scheduler died; forcing the whole
+/// derivation back to Ready over an absent `-debug` output nobody
+/// references re-dispatches a finished build. The wanted set must
+/// round-trip through PG (the orphan is reconstructed from the
+/// recovered row, not from a live submission).
+#[tokio::test]
+async fn test_orphan_adoption_ignores_missing_unwanted_output() -> TestResult {
+    use super::integration::{put_test_path, setup_inproc_store};
+
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+    let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+    let out = test_store_path("orphan-w-out");
+    let dbg = test_store_path("orphan-w-debug");
+    // Only the WANTED output is in the store. P_debug is missing.
+    put_test_path(&mut store_client, &out).await?;
+
+    // Phase 1: merge a multi-output node wanting only {out}, drop the
+    // actor, backdate PG to Assigned-by-a-dead-worker. (Inline
+    // seed_orphan_assigned — that helper is single-output.)
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(sched_db.pool.clone());
+        let mut node = make_node("orphan-w-drv");
+        node.output_names = vec!["out".into(), "debug".into()];
+        node.expected_output_paths = vec![out.clone(), dbg.clone()];
+        node.wanted_output_names = vec!["out".into()];
+        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = $1 \
+         WHERE drv_hash = $2",
+    )
+    .bind("orphan-w-dead")
+    .bind("orphan-w-drv")
+    .execute(&sched_db.pool)
+    .await?;
+
+    // Phase 2: recover (the wanted set comes back from PG), reconcile.
+    let (handle, _task) = recover_with_store(sched_db.pool.clone(), store_client.clone()).await?;
+    assert_eq!(
+        expect_drv(&handle, "orphan-w-drv").await.status,
+        DerivationStatus::Assigned,
+        "precondition: recovered as Assigned to a worker that won't reconnect"
+    );
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, "orphan-w-drv").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Completed,
+        "all WANTED outputs present → orphan adopted as completed; the \
+         missing unwanted P_debug must not force a reset to Ready"
+    );
+    assert_eq!(
+        post.output_paths,
+        vec![out, dbg],
+        "the adopted node still records ALL declared paths"
+    );
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "single-drv build succeeds via orphan adoption"
+    );
+    Ok(())
+}
+
 /// Phantom-Assigned after crash-during-dispatch.
 ///
 /// Scenario: scheduler persists PG=Assigned+worker, crashes BEFORE

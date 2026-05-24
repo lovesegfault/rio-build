@@ -1542,6 +1542,105 @@ async fn test_preexisting_completed_gc_matrix(
     Ok(())
 }
 
+/// `verify_preexisting_completed` × wanted outputs: a pre-existing
+/// Completed node whose recorded `output_paths` include a path that is
+/// missing from the store but POSITIVELY UNWANTED by the current
+/// submission must NOT reset to Ready — its absence is legitimate (it
+/// was never substituted because nothing wanted it) and resetting on
+/// every re-merge would ping-pong Completed↔Ready forever. The same
+/// node merged by a build that DOES want the missing output must reset
+/// (the one re-open that lets the delta be substituted or rebuilt).
+///
+/// Setup: Build A merges `app-a → dep` where dep declares {out, debug};
+/// the worker reports both outputs but only P_out is ever uploaded to
+/// the store (P_debug is recorded in `output_paths` yet missing). Build
+/// B re-merges dep with a per-case wanted set.
+#[rstest::rstest]
+// P_debug missing but build B only wants {out} → forgiven → stays Completed.
+#[case::missing_unwanted_not_reset(&["out"], DerivationStatus::Completed, 1)]
+// P_debug missing and build B wants everything (empty sentinel) → reset.
+#[case::missing_wanted_resets(&[], DerivationStatus::Ready, 0)]
+#[tokio::test]
+async fn test_preexisting_completed_missing_unwanted_output_not_reset(
+    #[case] wanted: &[&str],
+    #[case] expect_dep_status: DerivationStatus,
+    #[case] expect_cached: u32,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut w1 = connect_executor(&handle, "vw-w1", "x86_64-linux").await?;
+
+    let out = test_store_path("vw-dep-out");
+    let dbg = test_store_path("vw-dep-debug");
+    let mk_dep = |wanted: &[&str]| {
+        let mut d = make_node("vw-dep");
+        d.output_names = vec!["out".into(), "debug".into()];
+        d.expected_output_paths = vec![out.clone(), dbg.clone()];
+        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        d
+    };
+
+    // Build A: app-a → dep. dep dispatches first (leaf). The worker
+    // reports BOTH outputs so output_paths records both, but only
+    // P_out is uploaded to the store — P_debug stays missing.
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("vw-app-a"), mk_dep(&[])],
+        vec![make_test_edge("vw-app-a", "vw-dep")],
+        false,
+    )
+    .await?;
+    let assn = recv_assignment(&mut w1).await;
+    assert!(assn.drv_path.ends_with("vw-dep.drv"));
+    store.seed_with_content(&out, b"out");
+    complete_ca(
+        &handle,
+        "vw-w1",
+        &assn.drv_path,
+        &[("out", &out, vec![0u8; 32]), ("debug", &dbg, vec![0u8; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+    // Hold app-a Running so Build A stays Active and dep stays in DAG.
+    let mut _w2 = connect_executor(&handle, "vw-w2", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut _w2).await;
+    let pre = expect_drv(&handle, "vw-dep").await;
+    assert_eq!(pre.status, DerivationStatus::Completed, "precondition");
+    assert_eq!(
+        pre.output_paths,
+        vec![out.clone(), dbg.clone()],
+        "precondition: both outputs recorded, only P_out in store"
+    );
+
+    // Build B: app-b → dep (pre-existing Completed). The stale-verify
+    // probe finds P_debug missing; whether that triggers the reset
+    // depends on whether build B wants `debug`.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("vw-app-b"), mk_dep(wanted)],
+        vec![make_test_edge("vw-app-b", "vw-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "vw-dep").await.status,
+        expect_dep_status,
+        "wanted={wanted:?}: a missing recorded output triggers the \
+         Completed→Ready reset iff the current submission wants it"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.cached_derivations,
+        expect_cached,
+        "wanted={wanted:?}"
+    );
+
+    Ok(())
+}
+
 // ===========================================================================
 // I-099/I-094: re-probe existing not-done nodes at merge
 // ===========================================================================

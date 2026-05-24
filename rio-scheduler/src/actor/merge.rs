@@ -12,7 +12,8 @@ use uuid::Uuid;
 use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{
-    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, wanted_subset,
+    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, verifiable_wanted_paths,
+    wanted_subset,
 };
 
 use super::{ActorError, DagActor, MergeDagRequest};
@@ -1837,29 +1838,23 @@ impl DagActor {
             if !n.expected_output_paths.iter().any(|p| !p.is_empty()) {
                 continue;
             }
-            let wanted: Vec<&String> = wanted_subset(
+            // A wanted set that resolves to no verifiable path cannot
+            // be classified — fall through to build, same as the
+            // all-declared guard above.
+            let Some(wanted) = verifiable_wanted_paths(
                 &n.output_names,
                 &n.expected_output_paths,
                 self.dag
                     .node(h)
                     .map(|s| s.wanted_output_names.as_slice())
                     .unwrap_or(&n.wanted_output_names),
-            )
-            .collect();
-            // Defensive: a wanted set that resolves to no non-empty
-            // concrete path (every wanted name unmatched) cannot be
-            // verified — fall through to build, same as the
-            // all-declared guard above.
-            if !wanted.iter().any(|p| !p.is_empty()) {
+            ) else {
                 continue;
-            }
-            if wanted.iter().all(|p| p.is_empty() || present.contains(*p)) {
+            };
+            if wanted.iter().all(|p| present.contains(*p)) {
                 hits.insert(h.clone(), n.expected_output_paths.clone());
             } else if wanted.iter().all(|p| {
-                p.is_empty()
-                    || present.contains(*p)
-                    || substitutable.contains(*p)
-                    || indeterminate.contains(*p)
+                present.contains(*p) || substitutable.contains(*p) || indeterminate.contains(*p)
             }) {
                 pending_substitute.push((h.clone(), n.expected_output_paths.clone()));
             }
@@ -2304,23 +2299,18 @@ impl DagActor {
             .filter(|p| !substitutable.contains(p))
             .collect();
         if roots.iter().any(|n| {
-            let mut wanted = wanted_subset(
+            // A root whose wanted set resolves to no verifiable path
+            // must never vacuously satisfy the all-available
+            // criterion: treat it as "unavailable" so the prune
+            // doesn't fire and drop a dependency closure the root
+            // actually needs. Falling through to the full merge is
+            // always safe.
+            verifiable_wanted_paths(
                 &n.output_names,
                 &n.expected_output_paths,
                 &n.wanted_output_names,
             )
-            .filter(|p| !p.is_empty())
-            .peekable();
-            // Defensive: a wanted set that resolves to no non-empty
-            // concrete path (every wanted name unmatched — a client
-            // sent `drv^bogus` and the gateway doesn't validate the
-            // root OutputsSpec against the declared outputs) must
-            // never vacuously satisfy a completeness predicate. Treat
-            // it as "unavailable" so the prune doesn't fire and drop a
-            // dependency closure the root actually needs — same
-            // conservative direction as the check_cached_outputs
-            // guard; falling through to the full merge is always safe.
-            wanted.peek().is_none() || wanted.any(|p| truly_missing.contains(p.as_str()))
+            .is_none_or(|wanted| wanted.iter().any(|p| truly_missing.contains(*p)))
         }) {
             debug!(
                 missing = truly_missing.len(),
