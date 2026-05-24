@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod framed;
-pub use framed::{FramedStreamReader, MAX_FRAME_SIZE, MAX_FRAMED_TOTAL};
+pub use framed::{FramedStreamReader, FramedWriter, MAX_FRAME_SIZE, MAX_FRAMED_TOTAL};
 
 /// Padding alignment for the Nix wire format.
 const PADDING: usize = 8;

@@ -1,4 +1,4 @@
-//! Streaming framed reader for Nix framed byte streams.
+//! Streaming framed reader and writer for Nix framed byte streams.
 // r[impl gw.wire.framed-no-padding]
 // r[impl gw.opcode.add-to-store-nar.framing+2]
 // r[impl gw.opcode.add-multiple.unaligned-frames]
@@ -6,7 +6,9 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::{Result, write_u64};
 
 /// Maximum total size for framed stream reassembly (4 GiB). Must be ≥
 /// `rio_common::limits::MAX_NAR_SIZE` so the gateway's `wopAddToStoreNar`
@@ -221,6 +223,81 @@ impl<R: AsyncRead + Unpin> AsyncRead for FramedStreamReader<R> {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming framed writer
+// ---------------------------------------------------------------------------
+
+/// Frame size emitted by [`FramedWriter`] (256 KiB). Well under
+/// [`MAX_FRAME_SIZE`], so a peer's per-frame cap is never a concern.
+const FRAME_CHUNK: usize = 256 * 1024;
+
+/// Incremental writer for the Nix framed byte stream encoding: a sequence of
+/// `u64(chunk_len) + chunk_data` (no padding), terminated by `u64(0)`.
+///
+/// Client-side counterpart to [`FramedStreamReader`]. Frames are emitted
+/// every `FRAME_CHUNK` (256 KiB) logical bytes regardless of how the caller
+/// slices its [`write`](Self::write) calls, so the byte stream is identical
+/// to one-shot framing of the same payload.
+///
+/// **Streaming write — bounded memory.** For small payloads already held in
+/// one buffer, [`write_framed_stream`](super::write_framed_stream) is simpler
+/// (same wire format, takes a `&[u8]`).
+///
+/// # Cancellation
+///
+/// Once dropped without [`finish`](Self::finish), the stream has no `u64(0)`
+/// sentinel and any partial frame is lost. The connection must be abandoned —
+/// the peer would wait for more frames indefinitely.
+pub struct FramedWriter<W> {
+    inner: W,
+    /// Bytes accepted by `write` but not yet emitted as a frame.
+    /// Never exceeds `FRAME_CHUNK`.
+    buf: Vec<u8>,
+}
+
+impl<W: AsyncWrite + Unpin> FramedWriter<W> {
+    /// Create a new `FramedWriter` wrapping `inner`.
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(FRAME_CHUNK),
+        }
+    }
+
+    /// Buffer `data`, emitting complete 256 KiB frames as they fill.
+    pub async fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        while !data.is_empty() {
+            let take = (FRAME_CHUNK - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == FRAME_CHUNK {
+                self.flush_frame().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the buffered bytes as a single `u64(len) + data` frame.
+    async fn flush_frame(&mut self) -> Result<()> {
+        write_u64(&mut self.inner, self.buf.len() as u64).await?;
+        self.inner.write_all(&self.buf).await?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush any partial frame and write the `u64(0)` terminator.
+    ///
+    /// Returns the inner writer (NOT flushed at the transport level — the
+    /// caller decides when to `flush()`).
+    pub async fn finish(mut self) -> Result<W> {
+        if !self.buf.is_empty() {
+            self.flush_frame().await?;
+        }
+        write_u64(&mut self.inner, 0).await?;
+        Ok(self.inner)
     }
 }
 
@@ -479,5 +556,58 @@ pub(super) mod tests {
         assert!(reader.is_done());
         assert_eq!(reader.total_bytes_read(), FRAMES * MAX_FRAME_SIZE);
         assert!(reader.total_bytes_read() > MAX_FRAMED_TOTAL);
+    }
+
+    // FramedWriter tests
+
+    #[tokio::test]
+    async fn framed_writer_roundtrips_through_framed_stream_reader() -> anyhow::Result<()> {
+        // 600 KiB of patterned data → expect frames of 256 KiB, 256 KiB,
+        // 88 KiB, then the u64(0) sentinel.
+        let payload: Vec<u8> = (0..600 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut buf = Vec::new();
+        let mut fw = FramedWriter::new(&mut buf);
+        // Write in awkward slice sizes to prove frame boundaries don't
+        // follow write() calls.
+        for chunk in payload.chunks(10_000) {
+            fw.write(chunk).await?;
+        }
+        fw.finish().await?;
+
+        // Frame layout: u64(256 KiB) + data, u64(256 KiB) + data,
+        // u64(88 KiB) + data, u64(0) — no padding anywhere.
+        assert_eq!(buf.len(), 4 * 8 + 600 * 1024);
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            256 * 1024
+        );
+        let second = 8 + 256 * 1024;
+        assert_eq!(
+            u64::from_le_bytes(buf[second..second + 8].try_into().unwrap()),
+            256 * 1024
+        );
+        let third = second + 8 + 256 * 1024;
+        assert_eq!(
+            u64::from_le_bytes(buf[third..third + 8].try_into().unwrap()),
+            88 * 1024
+        );
+        // Last 8 bytes are the u64(0) sentinel.
+        assert_eq!(&buf[buf.len() - 8..], &[0u8; 8]);
+
+        // Round-trip through the existing server-side reader.
+        let mut reader = FramedStreamReader::new(Cursor::new(buf), MAX_FRAMED_TOTAL);
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out).await?;
+        assert_eq!(out, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn framed_writer_empty_stream_is_just_sentinel() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        let fw = FramedWriter::new(&mut buf);
+        fw.finish().await?;
+        assert_eq!(buf, 0u64.to_le_bytes());
+        Ok(())
     }
 }
