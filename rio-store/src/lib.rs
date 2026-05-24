@@ -318,6 +318,14 @@ pub fn describe_metrics() {
          narhash_mismatch: a scanner bug or a lying builder."
     );
     describe_counter!(
+        "rio_store_file_digest_mismatch_total",
+        "PutPathChunked uploads where a regular file's spliced contents \
+         hashed to something other than the claimed FileEntry.digest — an \
+         attempt to alias another file's identity in file_blobs (which \
+         ReadBlob/StatBlob resolve content by). Same alert posture as \
+         narhash_mismatch."
+    );
+    describe_counter!(
         "rio_store_putpath_incomplete_total",
         "PutPathChunked streams that ended before every Begin.novel chunk \
          arrived (builder crashed or disconnected mid-upload). Infra-retry \

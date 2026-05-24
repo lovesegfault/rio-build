@@ -356,6 +356,48 @@ async fn narhash_mismatch_rejected_and_nothing_committed() -> TestResult {
     Ok(())
 }
 
+/// A `FileEntry.digest` that does not hash the file's actual bytes is
+/// rejected even when the size, the chunk run, and the NAR hash are all
+/// correct. The claimed digest is what the commit persists into
+/// `file_blobs` and what `ReadBlob`/`StatBlob`/`HasBlobs` resolve
+/// content by — without the per-file BLAKE3 recompute a compromised
+/// builder could alias another file's identity onto its own bytes.
+///
+/// The fixture is a single-regular-file root: the tampered digest lives
+/// in `root_node.file.digest`, which is not covered by any Directory
+/// body's hash, so no earlier digest-chain check can shadow the new
+/// per-file content check. The NAR byte stream does not contain the
+/// castore digest, so the NAR hash still matches.
+#[tokio::test]
+async fn poisoned_file_entry_digest_rejected() -> TestResult {
+    let mut s = ChunkedSession::new().await?;
+    let tree = tempfile::tempdir()?;
+    let f = tree.path().join("blob");
+    std::fs::write(&f, vec![0x77u8; 3000])?;
+    let path = test_store_path("chunked-poison");
+    let (mut out, dirs, chunks, _) = chunked_output_for_tree(&f, &path, 1024);
+    assert!(dirs.is_empty(), "single-file root has no Directory bodies");
+    // Tamper with the claimed castore file digest. Everything else
+    // (size, chunk run, nar_hash, nar_size) stays correct.
+    let file = match out.root_node.as_mut().and_then(|r| r.node.as_mut()) {
+        Some(rio_proto::castore::root_node::Node::File(f)) => f,
+        other => panic!("expected a File root, got {other:?}"),
+    };
+    file.digest = vec![0xD0; 32];
+    let begin = assemble_begin(vec![out], vec![dirs]);
+    let err = put_path_chunked(&mut s.store, begin, &chunks, None, |_, c| Some(c))
+        .await
+        .expect_err("poisoned FileEntry.digest must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("file digest mismatch"), "{err:?}");
+    // Nothing committed, no file_blobs row under the poisoned digest.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(n, 0, "no file_blobs row survives a poisoned digest");
+    Ok(())
+}
+
 /// Every S3 object a failed upload wrote has a refcount-0 `chunks` row,
 /// and the orphan-chunk sweep can therefore find and collect it. ADR-022
 /// §6.3: non-committed novel chunks "are refcount-0 orphans for the

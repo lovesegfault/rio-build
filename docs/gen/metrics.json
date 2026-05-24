@@ -182,6 +182,7 @@
     "rio_store_directory_read_seconds",
     "rio_store_express_bytes",
     "rio_store_express_evicted_total",
+    "rio_store_file_digest_mismatch_total",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_orphan_reap_failed_total",
@@ -1150,6 +1151,11 @@
         "name": "rio_store_express_evicted_total",
         "kind": "counter",
         "help": "Chunks deleted from Express by the eviction sweeper (labeled az_id)"
+      },
+      {
+        "name": "rio_store_file_digest_mismatch_total",
+        "kind": "counter",
+        "help": "PutPathChunked uploads where a regular file's spliced contents hashed to something other than the claimed FileEntry.digest — an attempt to alias another file's identity in file_blobs (which ReadBlob/StatBlob resolve content by). Same alert posture as narhash_mismatch."
       },
       {
         "name": "rio_store_gc_chunk_orphan_swept_total",

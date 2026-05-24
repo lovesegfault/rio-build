@@ -72,8 +72,17 @@ pub(super) enum NarSegment {
     Framing { bytes: Vec<u8>, digest: [u8; 32] },
     /// A regular file's contents: the next `n_chunks` entries of this
     /// output's `chunk_manifest`. The verify task splices the chunk
-    /// bodies in here.
-    FileContents { n_chunks: usize },
+    /// bodies in here, BLAKE3-hashes them, and rejects the upload if
+    /// the result differs from `file_digest` — the builder-claimed
+    /// `FileEntry.digest` that the commit transaction persists into
+    /// `file_blobs` and that `ReadBlob`/`StatBlob`/`HasBlobs` later
+    /// resolve content by. Without that check a compromised builder
+    /// could register an arbitrary digest → its own bytes and have the
+    /// store serve them for another path's file.
+    FileContents {
+        n_chunks: usize,
+        file_digest: [u8; 32],
+    },
 }
 
 /// One output of a validated `Begin`.
@@ -415,7 +424,7 @@ pub(super) fn validate_begin(
                         hash: *digest,
                         size: bytes.len() as u32,
                     }),
-                    NarSegment::FileContents { n_chunks } => {
+                    NarSegment::FileContents { n_chunks, .. } => {
                         for _ in 0..*n_chunks {
                             let (h, s) = chunk_manifest[cursor];
                             cursor += 1;
@@ -877,15 +886,16 @@ fn walk_output(
                 flushed += framing.len() as u64;
                 framing_flushed += framing.len() as u64;
                 flush_framing(&mut segments, &mut framing);
+                let fdigest: [u8; 32] = digest.try_into().expect("validated 32 bytes");
                 segments.push(NarSegment::FileContents {
                     n_chunks: cursor - run_start,
+                    file_digest: fdigest,
                 });
                 flushed += size;
                 let pad = (size.next_multiple_of(8) - size) as usize;
                 framing.extend_from_slice(&[0u8; 8][..pad]);
                 put_str(&mut framing, ")");
 
-                let fdigest: [u8; 32] = digest.try_into().expect("validated 32 bytes");
                 file_blob_map
                     .entry(fdigest)
                     .or_insert((content_offset, size));

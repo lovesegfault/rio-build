@@ -75,6 +75,12 @@ enum WalkOutcome {
     /// The builder's manifest doesn't describe the bytes that exist —
     /// the recomputed NAR could never match.
     Mismatch(String),
+    /// A regular file's spliced contents hash to something other than
+    /// the claimed `FileEntry.digest`. Distinct from [`Self::Mismatch`]
+    /// because the attack it blocks is different: the NAR hash can
+    /// still be correct while the castore digest is poisoned to alias
+    /// another file's identity in `file_blobs`.
+    FileDigestMismatch(String),
 }
 
 /// Per-output verify accumulators. `None` for idempotent-skipped
@@ -274,6 +280,14 @@ impl StoreServiceImpl {
                     .increment(unskipped(&skipped));
                 return Err(Status::failed_precondition(format!(
                     "chunk length mismatch during verify: {msg}"
+                )));
+            }
+            WalkOutcome::FileDigestMismatch(msg) => {
+                metrics::counter!("rio_store_file_digest_mismatch_total").increment(1);
+                metrics::counter!("rio_store_put_path_total", "result" => "error")
+                    .increment(unskipped(&skipped));
+                return Err(Status::failed_precondition(format!(
+                    "file digest mismatch during verify: {msg}"
                 )));
             }
         }
@@ -527,7 +541,22 @@ impl StoreServiceImpl {
                             let _ = acc.scanner.write_all(bytes);
                         }
                     }
-                    NarSegment::FileContents { n_chunks, .. } => {
+                    NarSegment::FileContents {
+                        n_chunks,
+                        file_digest,
+                    } => {
+                        // Per-file BLAKE3 over the spliced contents.
+                        // The claimed `FileEntry.digest` is what the
+                        // commit persists into `file_blobs` and what
+                        // `ReadBlob`/`StatBlob`/`HasBlobs` resolve
+                        // content by, with no read-side verification —
+                        // an unverified claim would let a builder
+                        // register an arbitrary digest → its own bytes
+                        // and have the store serve them for another
+                        // path's file. Skipped outputs don't fetch
+                        // bodies and don't write `file_blobs`, so the
+                        // check is scoped to verified outputs.
+                        let mut file_hasher = accs[out_idx].is_some().then(blake3::Hasher::new);
                         for _ in 0..*n_chunks {
                             let (digest, len) = out.chunk_manifest[cursor];
                             cursor += 1;
@@ -599,9 +628,22 @@ impl StoreServiceImpl {
                                     }
                                 }
                             };
-                            if let (Some(acc), Some(body)) = (&mut accs[out_idx], body) {
-                                acc.hasher.update(&body);
-                                let _ = acc.scanner.write_all(&body);
+                            if let (Some(acc), Some(body)) = (&mut accs[out_idx], &body) {
+                                acc.hasher.update(body);
+                                let _ = acc.scanner.write_all(body);
+                            }
+                            if let (Some(h), Some(body)) = (&mut file_hasher, &body) {
+                                h.update(body);
+                            }
+                        }
+                        if let Some(h) = file_hasher {
+                            let computed = *h.finalize().as_bytes();
+                            if computed != *file_digest {
+                                return Ok(WalkOutcome::FileDigestMismatch(format!(
+                                    "FileEntry claims digest {} but its contents hash to {}",
+                                    hex::encode(file_digest),
+                                    hex::encode(computed)
+                                )));
                             }
                         }
                     }

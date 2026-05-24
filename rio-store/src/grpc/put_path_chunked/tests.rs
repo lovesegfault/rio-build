@@ -30,12 +30,23 @@ fn reassemble(
                 );
                 nar.extend_from_slice(bytes);
             }
-            NarSegment::FileContents { n_chunks } => {
+            NarSegment::FileContents {
+                n_chunks,
+                file_digest,
+            } => {
+                let mut hasher = blake3::Hasher::new();
                 for _ in 0..*n_chunks {
                     let (d, _) = out.chunk_manifest[cursor];
                     cursor += 1;
                     nar.extend_from_slice(&chunks[&d]);
+                    hasher.update(&chunks[&d]);
                 }
+                assert_eq!(
+                    *file_digest,
+                    *hasher.finalize().as_bytes(),
+                    "segment file_digest must match the spliced contents \
+                     (fixture digests come from nar_ls)"
+                );
             }
         }
     }
