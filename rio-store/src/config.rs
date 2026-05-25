@@ -60,6 +60,98 @@ pub enum ChunkBackendKind {
     },
 }
 
+/// NAR compression codec for binary-cache-compat objects
+/// (`nar/*.nar.<ext>`).
+///
+/// Lowercase serde names (`zstd`/`xz`/`none`) are exactly the values a
+/// stock-Nix `.narinfo` `Compression:` field carries, so the config
+/// string and the published metadata can never disagree on spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CompatCompression {
+    /// zstd (`nar/*.nar.zst`). Default — best compress-speed/ratio
+    /// trade-off for the synchronous post-commit write path.
+    Zstd,
+    /// xz (`nar/*.nar.xz`). Smaller objects, much slower to compress —
+    /// only worth it when S3 storage cost dominates over PutPath
+    /// latency.
+    Xz,
+    /// No compression (`nar/*.nar`). Debugging / pre-compressed
+    /// content only.
+    None,
+}
+
+/// When the binary-cache-compat write runs relative to the PutPath
+/// PostgreSQL commit.
+///
+/// Single-variant on purpose: ADR-022 §10 documents `async` (bounded
+/// background queue, lower PutPath latency, larger reconciler backlog
+/// on crash) as a future option that is NOT implemented in the first
+/// pass. Modeling the knob as an enum now means turning that on later
+/// is a config value, not a config-schema break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatWriteMode {
+    /// Write the `.narinfo` + compressed NAR synchronously inside the
+    /// PutPath handler, after the PG transaction commits. A failure is
+    /// logged + metered but never fails the RPC.
+    SyncAfterCommit,
+}
+
+// r[impl store.compat.runtime-toggle]
+/// Stock-Nix binary-cache compatibility layer (ADR-022 Design Overview
+/// §10). When `enabled`, every committed path is *additionally*
+/// written to S3-standard as a stock-Nix object pair
+/// (`{store-path-hash}.narinfo` + `nar/{file-hash}.nar.<ext>`), so
+/// `nix copy --from s3://bucket` substitutes with no rio process
+/// running. Runtime config, not a build flag: toggling OFF stops new
+/// compat writes (existing objects stay); toggling ON resumes for
+/// subsequent puts. Never affects chunked storage either way.
+///
+/// The compat writer itself is not wired yet (it lands with the
+/// `compat::writer` module); until then these fields are validated and
+/// carried but otherwise inert, so enabling them is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct BinaryCacheCompat {
+    /// Master switch: `true` (default) additionally publishes every
+    /// committed path to the compat bucket as a stock-Nix `.narinfo` +
+    /// compressed-NAR pair; `false` ("pure rio mode") stops new compat
+    /// writes (existing objects stay). Default ON is the
+    /// migration-phase posture: the S3 bucket stays readable by plain
+    /// Nix and PG loss degrades to the stock-Nix path instead of an
+    /// outage. Flip OFF once every consumer is rio-aware to roughly
+    /// halve S3 storage. Set via `RIO_BINARY_CACHE_COMPAT__ENABLED`.
+    pub enabled: bool,
+    /// Bucket for compat objects. `None` (default) = the chunk
+    /// backend's S3-standard bucket (`chunk_backend.bucket`). Set only
+    /// to publish the binary cache somewhere other than the chunk
+    /// store. Must be non-empty when set. Set via
+    /// `RIO_BINARY_CACHE_COMPAT__BUCKET`.
+    pub bucket: Option<String>,
+    /// NAR compression codec (`zstd`/`xz`/`none`). Default `zstd`. Set
+    /// via `RIO_BINARY_CACHE_COMPAT__COMPRESSION`.
+    pub compression: CompatCompression,
+    /// When the compat write happens relative to the PutPath PG
+    /// commit. Only `sync_after_commit` exists today (see
+    /// [`CompatWriteMode`]).
+    pub write_mode: CompatWriteMode,
+}
+
+impl Default for BinaryCacheCompat {
+    fn default() -> Self {
+        Self {
+            // ON by default per ADR-022 §10: compat is the migration
+            // on-ramp and the PG-outage substitution floor. Operators
+            // opt OUT once all consumers are rio-aware.
+            enabled: true,
+            bucket: None,
+            compression: CompatCompression::Zstd,
+            write_mode: CompatWriteMode::SyncAfterCommit,
+        }
+    }
+}
+
 // r[impl store.netpol.egress+2]
 // Egress targets are exactly what's configured here: postgres
 // (`database_url`) and the chunk backend (S3 or filesystem). The
@@ -81,6 +173,11 @@ pub struct Config {
     /// `validate()` rejects `None` at startup with the list of valid
     /// kinds. See [`ChunkBackendKind`] for TOML syntax.
     pub chunk_backend: Option<ChunkBackendKind>,
+    /// Stock-Nix binary-cache compatibility layer (ADR-022 §10):
+    /// also write `.narinfo` + `nar/*.nar.zst` objects to S3-standard
+    /// so plain `nix` clients can substitute from the bucket without
+    /// rio. Default ON. See [`BinaryCacheCompat`].
+    pub binary_cache_compat: BinaryCacheCompat,
     /// moka LRU capacity for chunk reads, in bytes. Default 2 GiB.
     /// One cache shared by StoreService + ChunkService — a chunk
     /// warmed by either is hot for both.
@@ -199,6 +296,7 @@ impl Default for Config {
             // validate() with a clear error instead of silently picking
             // a backend.
             chunk_backend: None,
+            binary_cache_compat: BinaryCacheCompat::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
             // — the constant is crate-private so duplicated here,
             // but the config_defaults_are_stable test catches drift.
@@ -323,6 +421,22 @@ impl rio_common::config::ValidateConfig for Config {
             self.substitute_admission_permits.is_none_or(|n| n >= 1),
             "substitute_admission_permits must be >= 1; unset \
              RIO_SUBSTITUTE_ADMISSION_PERMITS to derive from pg_max_connections"
+        );
+        // binary_cache_compat.bucket: absent means "use the chunk
+        // backend's S3-standard bucket"; present must be a real bucket
+        // name. Some("") (e.g. a templating layer rendering an empty
+        // value instead of omitting the env var) would point the compat
+        // writer at a bucket literally named "" — reject at boot, not
+        // at the first compat write. `enabled` itself needs no check:
+        // with no writer wired yet it is inert, and once the writer
+        // lands a non-S3 deployment simply has nothing to write to.
+        anyhow::ensure!(
+            self.binary_cache_compat
+                .bucket
+                .as_ref()
+                .is_none_or(|b| !b.trim().is_empty()),
+            "binary_cache_compat.bucket must be a non-empty bucket name when set; \
+             unset RIO_BINARY_CACHE_COMPAT__BUCKET to use the chunk backend's bucket"
         );
         Ok(())
     }
@@ -454,6 +568,19 @@ mod tests {
         // 4 eager nar_ls passes in flight; 0 would silently disable
         // the optimization, larger risks unbounded post-handler RSS.
         assert_eq!(d.nar_index_concurrency, 4);
+        // r[verify store.compat.runtime-toggle]
+        // Binary-cache compat defaults ON (ADR-022 §10 migration
+        // posture), no dedicated bucket (→ chunk backend's bucket),
+        // zstd, synchronous post-commit write. Changing any of these
+        // changes what a bare deployment publishes to S3 — deliberate
+        // only.
+        assert!(d.binary_cache_compat.enabled);
+        assert!(d.binary_cache_compat.bucket.is_none());
+        assert_eq!(d.binary_cache_compat.compression, CompatCompression::Zstd);
+        assert_eq!(
+            d.binary_cache_compat.write_mode,
+            CompatWriteMode::SyncAfterCommit
+        );
     }
 
     #[test]
@@ -592,6 +719,39 @@ mod tests {
             database_url: "postgres://x".into(),
             chunk_backend: Some(ChunkBackendKind::Memory),
             substitute_admission_permits: None,
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    /// `binary_cache_compat.bucket = Some("")` (a templating layer
+    /// rendering an empty value instead of omitting the env var) would
+    /// point the compat writer at a bucket literally named "".
+    /// validate() rejects it at boot; `None` and a real name both pass.
+    #[test]
+    fn validate_rejects_empty_compat_bucket() {
+        for bad in ["", "   "] {
+            let cfg = Config {
+                database_url: "postgres://x".into(),
+                chunk_backend: Some(ChunkBackendKind::Memory),
+                binary_cache_compat: BinaryCacheCompat {
+                    bucket: Some(bad.into()),
+                    ..BinaryCacheCompat::default()
+                },
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("binary_cache_compat.bucket"), "got: {err}");
+        }
+        // A real bucket name passes; the default (None → chunk backend
+        // bucket) is covered by config_accepts_valid below.
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
+            binary_cache_compat: BinaryCacheCompat {
+                bucket: Some("nix-cache".into()),
+                ..BinaryCacheCompat::default()
+            },
             ..Default::default()
         };
         assert!(ok.validate().is_ok());
@@ -844,6 +1004,87 @@ mod tests {
         });
     }
 
+    /// Full `[binary_cache_compat]` table through the config-crate
+    /// Value layer (same loader main.rs uses). The lowercase enum
+    /// strings are load-bearing: `compression = "zstd"|"xz"|"none"`
+    /// must match what the published `.narinfo` `Compression:` field
+    /// will say, and the NixOS module / helm values write these exact
+    /// strings.
+    #[test]
+    fn binary_cache_compat_toml() {
+        let cfg = parse_toml(
+            r#"
+            [binary_cache_compat]
+            enabled = false
+            bucket = "nix-cache"
+            compression = "xz"
+            write_mode = "sync_after_commit"
+            "#,
+        );
+        assert!(!cfg.binary_cache_compat.enabled);
+        assert_eq!(cfg.binary_cache_compat.bucket.as_deref(), Some("nix-cache"));
+        assert_eq!(cfg.binary_cache_compat.compression, CompatCompression::Xz);
+        assert_eq!(
+            cfg.binary_cache_compat.write_mode,
+            CompatWriteMode::SyncAfterCommit
+        );
+    }
+
+    /// Partial `[binary_cache_compat]` table: unspecified fields fall
+    /// back to the struct-level `#[serde(default)]` — in particular
+    /// `enabled` stays `true` when an operator only pins the bucket or
+    /// codec. A partial table silently flipping the toggle OFF would
+    /// stop compat publication without anyone asking for it.
+    #[test]
+    fn binary_cache_compat_partial_table_keeps_default_on() {
+        let cfg = parse_toml(
+            r#"
+            [binary_cache_compat]
+            bucket = "nix-cache"
+            "#,
+        );
+        assert!(cfg.binary_cache_compat.enabled);
+        assert_eq!(cfg.binary_cache_compat.bucket.as_deref(), Some("nix-cache"));
+        assert_eq!(cfg.binary_cache_compat.compression, CompatCompression::Zstd);
+    }
+
+    // r[verify store.compat.runtime-toggle]
+    /// The runtime toggle via the env layer — the path helm actually
+    /// uses (store.yaml renders `RIO_BINARY_CACHE_COMPAT__*`). The
+    /// disable switch is the whole point: `ENABLED=false` must reach
+    /// the parsed config, and the nested-struct fields must round-trip
+    /// alongside it.
+    #[test]
+    fn binary_cache_compat_env_disable() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_BINARY_CACHE_COMPAT__ENABLED", "false");
+            jail.set_env("RIO_BINARY_CACHE_COMPAT__BUCKET", "nix-cache");
+            jail.set_env("RIO_BINARY_CACHE_COMPAT__COMPRESSION", "none");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert!(
+                !cfg.binary_cache_compat.enabled,
+                "RIO_BINARY_CACHE_COMPAT__ENABLED=false must disable the compat layer"
+            );
+            assert_eq!(cfg.binary_cache_compat.bucket.as_deref(), Some("nix-cache"));
+            assert_eq!(cfg.binary_cache_compat.compression, CompatCompression::None);
+            Ok(())
+        });
+    }
+
+    /// No `RIO_BINARY_CACHE_COMPAT__*` env vars at all → compiled
+    /// default (enabled, chunk-backend bucket, zstd). This is what a
+    /// helm deployment that omits the values block gets.
+    #[test]
+    fn binary_cache_compat_env_absent_is_default_on() {
+        rio_test_support::Jail::expect_with(|_jail| {
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert!(cfg.binary_cache_compat.enabled);
+            assert!(cfg.binary_cache_compat.bucket.is_none());
+            assert_eq!(cfg.binary_cache_compat.compression, CompatCompression::Zstd);
+            Ok(())
+        });
+    }
+
     /// P0218 T2: nar_buffer_budget_bytes TOML roundtrip via the real
     /// `rio_common::config::load` path. Jail changes cwd to a temp dir;
     /// `./store.toml` in there is picked up by load()'s `{component}.toml`
@@ -906,6 +1147,10 @@ mod tests {
         kind = "filesystem"
         base_dir = "/custom/path"
 
+        [binary_cache_compat]
+        enabled = false
+        compression = "none"
+
         [jwt]
         required = true
         "#,
@@ -919,11 +1164,17 @@ mod tests {
                 "[chunk_backend] table must thread through the config layers"
             );
             assert!(
+                !cfg.binary_cache_compat.enabled,
+                "[binary_cache_compat] table must thread through the config layers"
+            );
+            assert_eq!(cfg.binary_cache_compat.compression, CompatCompression::None);
+            assert!(
                 cfg.jwt.required,
                 "[jwt] table must thread through the config layers into JwtConfig"
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on the sub-struct (partial table must work).
+            assert!(cfg.binary_cache_compat.bucket.is_none());
         }
     );
 
@@ -931,6 +1182,10 @@ mod tests {
         assert!(cfg.chunk_backend.is_none());
         assert!(cfg.nar_buffer_budget_bytes.is_none());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
+        // ADR-022 binary-cache compat: absent section → default ON,
+        // chunk-backend bucket, zstd, sync-after-commit.
+        assert_eq!(cfg.binary_cache_compat, BinaryCacheCompat::default());
+        assert!(cfg.binary_cache_compat.enabled);
         assert!(cfg.signing_key_path.is_none());
         assert!(cfg.hmac_key_path.is_none());
         assert_eq!(

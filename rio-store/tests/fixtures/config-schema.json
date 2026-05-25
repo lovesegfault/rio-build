@@ -39,6 +39,16 @@
         ],
         "default": null
       },
+      "binary_cache_compat": {
+        "description": "Stock-Nix binary-cache compatibility layer (ADR-022 §10):\nalso write `.narinfo` + `nar/*.nar.zst` objects to S3-standard\nso plain `nix` clients can substitute from the bucket without\nrio. Default ON. See [`BinaryCacheCompat`].",
+        "$ref": "#/$defs/BinaryCacheCompat",
+        "default": {
+          "enabled": true,
+          "bucket": null,
+          "compression": "zstd",
+          "write_mode": "sync_after_commit"
+        }
+      },
       "chunk_cache_capacity_bytes": {
         "description": "moka LRU capacity for chunk reads, in bytes. Default 2 GiB.\nOne cache shared by StoreService + ChunkService — a chunk\nwarmed by either is hot for both.",
         "type": "integer",
@@ -247,6 +257,65 @@
           }
         ]
       },
+      "BinaryCacheCompat": {
+        "description": "Stock-Nix binary-cache compatibility layer (ADR-022 Design Overview\n§10). When `enabled`, every committed path is *additionally*\nwritten to S3-standard as a stock-Nix object pair\n(`{store-path-hash}.narinfo` + `nar/{file-hash}.nar.<ext>`), so\n`nix copy --from s3://bucket` substitutes with no rio process\nrunning. Runtime config, not a build flag: toggling OFF stops new\ncompat writes (existing objects stay); toggling ON resumes for\nsubsequent puts. Never affects chunked storage either way.\n\nThe compat writer itself is not wired yet (it lands with the\n`compat::writer` module); until then these fields are validated and\ncarried but otherwise inert, so enabling them is a no-op.",
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "description": "Master switch: `true` (default) additionally publishes every\ncommitted path to the compat bucket as a stock-Nix `.narinfo` +\ncompressed-NAR pair; `false` (\"pure rio mode\") stops new compat\nwrites (existing objects stay). Default ON is the\nmigration-phase posture: the S3 bucket stays readable by plain\nNix and PG loss degrades to the stock-Nix path instead of an\noutage. Flip OFF once every consumer is rio-aware to roughly\nhalve S3 storage. Set via `RIO_BINARY_CACHE_COMPAT__ENABLED`.",
+            "type": "boolean",
+            "default": true
+          },
+          "bucket": {
+            "description": "Bucket for compat objects. `None` (default) = the chunk\nbackend's S3-standard bucket (`chunk_backend.bucket`). Set only\nto publish the binary cache somewhere other than the chunk\nstore. Must be non-empty when set. Set via\n`RIO_BINARY_CACHE_COMPAT__BUCKET`.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "compression": {
+            "description": "NAR compression codec (`zstd`/`xz`/`none`). Default `zstd`. Set\nvia `RIO_BINARY_CACHE_COMPAT__COMPRESSION`.",
+            "$ref": "#/$defs/CompatCompression",
+            "default": "zstd"
+          },
+          "write_mode": {
+            "description": "When the compat write happens relative to the PutPath PG\ncommit. Only `sync_after_commit` exists today (see\n[`CompatWriteMode`]).",
+            "$ref": "#/$defs/CompatWriteMode",
+            "default": "sync_after_commit"
+          }
+        }
+      },
+      "CompatCompression": {
+        "description": "NAR compression codec for binary-cache-compat objects\n(`nar/*.nar.<ext>`).\n\nLowercase serde names (`zstd`/`xz`/`none`) are exactly the values a\nstock-Nix `.narinfo` `Compression:` field carries, so the config\nstring and the published metadata can never disagree on spelling.",
+        "oneOf": [
+          {
+            "description": "zstd (`nar/*.nar.zst`). Default — best compress-speed/ratio\ntrade-off for the synchronous post-commit write path.",
+            "type": "string",
+            "const": "zstd"
+          },
+          {
+            "description": "xz (`nar/*.nar.xz`). Smaller objects, much slower to compress —\nonly worth it when S3 storage cost dominates over PutPath\nlatency.",
+            "type": "string",
+            "const": "xz"
+          },
+          {
+            "description": "No compression (`nar/*.nar`). Debugging / pre-compressed\ncontent only.",
+            "type": "string",
+            "const": "none"
+          }
+        ]
+      },
+      "CompatWriteMode": {
+        "description": "When the binary-cache-compat write runs relative to the PutPath\nPostgreSQL commit.\n\nSingle-variant on purpose: ADR-022 §10 documents `async` (bounded\nbackground queue, lower PutPath latency, larger reconciler backlog\non crash) as a future option that is NOT implemented in the first\npass. Modeling the knob as an enum now means turning that on later\nis a config value, not a config-schema break.",
+        "oneOf": [
+          {
+            "description": "Write the `.narinfo` + compressed NAR synchronously inside the\nPutPath handler, after the PG transaction commits. A failure is\nlogged + metered but never fails the RPC.",
+            "type": "string",
+            "const": "sync_after_commit"
+          }
+        ]
+      },
       "JwtConfig": {
         "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
         "type": "object",
@@ -274,6 +343,12 @@
     "metrics_addr": "[::]:9092",
     "drain_grace_secs": 6,
     "chunk_backend": null,
+    "binary_cache_compat": {
+      "enabled": true,
+      "bucket": null,
+      "compression": "zstd",
+      "write_mode": "sync_after_commit"
+    },
     "chunk_cache_capacity_bytes": 2147483648,
     "nar_buffer_budget_bytes": null,
     "signing_key_path": null,

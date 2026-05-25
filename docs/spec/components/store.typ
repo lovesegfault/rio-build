@@ -907,6 +907,36 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
+= Stock-Nix Binary-Cache Compatibility (ADR-022)
+
+#r("store.compat.runtime-toggle")[
+  The store MUST expose a runtime configuration toggle
+  `binary_cache_compat.enabled` (TOML `[binary_cache_compat]` /
+  `RIO_BINARY_CACHE_COMPAT__*` env), default `true`, that controls whether
+  each committed path is *additionally* published to the S3-standard bucket
+  as a stock-Nix binary-cache object pair (`{store-path-hash}.narinfo` +
+  `nar/{file-hash}.nar.<ext>`). With the toggle disabled the store MUST NOT
+  write any new compat objects (existing objects are left in place); with it
+  enabled the companion knobs select the target bucket
+  (`bucket`, unset = the chunk backend's S3-standard bucket), the NAR
+  compression codec (`compression`: `zstd` default, `xz`, `none`), and the
+  write mode (`write_mode`: `sync_after_commit` only). The toggle MUST NOT
+  affect chunked storage in either state.
+]
+
+This is a runtime config value, not a build flag (ADR-022 Design Overview
+§10): default-ON is the migration on-ramp (existing Nix infrastructure reads
+the bucket as a plain binary cache while rio rolls out) and the
+disaster-recovery floor (PG outage degrades to the slower stock-Nix path
+instead of a total substitution outage); operators flip it OFF ("pure rio
+mode") once every consumer is rio-aware to reclaim roughly half the S3
+storage. The compat writer itself, its post-commit ordering, the
+`nix-cache-info` bootstrap object, and GC of compat objects are specified by
+the companion requirements (`store.compat.nar-on-put`,
+`store.compat.narinfo-on-put`, `store.compat.write-after-commit`,
+`store.compat.stock-nix-substitute`, `store.compat.gc-coupled`), which land
+with the writer implementation.
+
 = Two-Phase Garbage Collection
 
 #r("store.gc.two-phase")[

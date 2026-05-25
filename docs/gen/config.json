@@ -348,6 +348,30 @@
         "description": "Where chunks live. **Required** — every NAR is chunked, so a store without a backend cannot accept or serve anything. `validate()` rejects `None` at startup with the list of valid kinds."
       },
       {
+        "key": "binary_cache_compat.enabled",
+        "type": "boolean",
+        "default": "true",
+        "description": "Master switch: `true` (default) additionally publishes every committed path to the compat bucket as a stock-Nix `.narinfo` + compressed-NAR pair; `false` (\"pure rio mode\") stops new compat writes (existing objects stay)."
+      },
+      {
+        "key": "binary_cache_compat.bucket",
+        "type": "string",
+        "default": "",
+        "description": "Bucket for compat objects. `None` (default) = the chunk backend's S3-standard bucket (`chunk_backend.bucket`)."
+      },
+      {
+        "key": "binary_cache_compat.compression",
+        "type": "CompatCompression",
+        "default": "zstd",
+        "description": "NAR compression codec (`zstd`/`xz`/`none`)."
+      },
+      {
+        "key": "binary_cache_compat.write_mode",
+        "type": "CompatWriteMode",
+        "default": "sync_after_commit",
+        "description": "When the compat write happens relative to the PutPath PG commit."
+      },
+      {
         "key": "chunk_cache_capacity_bytes",
         "type": "uint64",
         "default": "2147483648",

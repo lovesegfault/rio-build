@@ -273,6 +273,26 @@ store:
     # output has a stable landing spot and the selection mechanism only
     # has to read values, not re-plumb them.
     expressBucketByAzId: {}
+  # Stock-Nix binary-cache compatibility layer (ADR-022 §10). When
+  # enabled (the default), every committed path is ALSO written to
+  # S3-standard as a stock-Nix `.narinfo` + `nar/*.nar.zst` pair, so
+  # plain `nix copy --from s3://<bucket>` substitutes with no rio
+  # process running (migration on-ramp + PG-outage floor). Disabling
+  # ("pure rio mode") stops new compat writes — existing objects stay —
+  # and roughly halves S3 storage. Never affects chunked storage.
+  # NOTE: this is the config/env surface only; rio-store accepts and
+  # validates it today, the compat writer itself ships separately.
+  binaryCacheCompat:
+    enabled: true
+    # Compat-objects bucket. Empty → the chunk backend's S3-standard
+    # bucket (chunkBackend.bucket). Set only to publish the binary
+    # cache to a different bucket than the chunk store. Rendered as
+    # RIO_BINARY_CACHE_COMPAT__BUCKET only when non-empty (an empty
+    # string would name a bucket "").
+    bucket: ""
+    # NAR compression: zstd (default), xz, or none — the same strings
+    # the published .narinfo Compression: field carries.
+    compression: zstd
   # Pin the store pod to one node. Only rendered when
   # karpenter.enabled=false. Used with kind: filesystem so the pod
   # follows the local-path PV it bound (vmtest-full.yaml pins to the
