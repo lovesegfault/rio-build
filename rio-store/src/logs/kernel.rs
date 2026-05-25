@@ -72,6 +72,63 @@ impl ChunkVisit {
 /// under the `BIGINT` precondition (`first_line` and `n_lines` at most
 /// [`i64::MAX`]) the saturation never engages and every quantity below
 /// is exact.
+//
+// ── Kani contracts ───────────────────────────────────────────────────
+// The requires clause is the manifest BIGINT round-trip invariant: both
+// columns came out of `read_manifest_range`'s `u64::try_from(i64)` (or,
+// for the post-decompress call, out of `decompress_lines`'s 16 MiB
+// bound). `next_line` is unconstrained — the cursor seeds from the
+// client-supplied `since_line`, which is any u64. Under the requires,
+// `first_line + n_lines` fits in u64 (i64::MAX + i64::MAX < u64::MAX),
+// so the ensures closures may compute it exactly; CBMC additionally
+// rejects any overflow inside the closures themselves, so the contract
+// doubles as the no-overflow proof for the range arithmetic.
+//
+// The case split mirrors `logService.qnt::visitChunk` exactly: a chunk
+// is skipped iff it has no lines at or above the watermark; a visited
+// chunk contributes `[max(first, cursor), first + count)` and lands the
+// watermark one past its last line. Verified by
+// `check_visit_chunk_contract` in `#[cfg(kani)] mod proofs`; the
+// fold-level dedup properties (each line at most once, served set ==
+// union) are the `check_dedup_{pair,triple}_*` harnesses.
+#[cfg_attr(
+    kani,
+    kani::requires(first_line <= i64::MAX as u64 && n_lines <= i64::MAX as u64)
+)]
+#[cfg_attr(kani, kani::ensures(|r: &ChunkVisit| {
+    // The contribution is exactly the chunk's range above the
+    // watermark: empty when the chunk has nothing at or above it,
+    // `[max(first_line, next_line), first_line + n_lines)` otherwise.
+    let end = first_line + n_lines;
+    if n_lines == 0 || end <= next_line {
+        r.yield_from == r.yield_until
+    } else {
+        r.yield_from == if first_line > next_line { first_line } else { next_line }
+            && r.yield_until == end
+    }
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &ChunkVisit| {
+    // Dedup safety: no yielded line is below the watermark (a line
+    // already served by an earlier chunk is never served again), the
+    // yielded range is well-formed, and every yielded line is one the
+    // chunk actually holds.
+    r.yield_from >= next_line
+        && r.yield_from <= r.yield_until
+        && (r.yield_from == r.yield_until
+            || (r.yield_from >= first_line && r.yield_until <= first_line + n_lines))
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &ChunkVisit| {
+    // The watermark is monotone and lands one past the chunk's last
+    // line iff the chunk contributed anything; a skipped chunk leaves
+    // it untouched.
+    let end = first_line + n_lines;
+    r.next_line
+        == if n_lines == 0 || end <= next_line {
+            next_line
+        } else {
+            end
+        }
+}))]
 pub fn visit_chunk(next_line: u64, first_line: u64, n_lines: u64) -> ChunkVisit {
     // One past the chunk's last line, and the last line itself. The
     // `n_lines == 0` guard below keeps the `end - 1` underflow
@@ -145,6 +202,86 @@ pub enum AcceptVerdict {
 /// The caller handles the empty batch before calling this (nothing to
 /// buffer, nothing to check); the kernel is nevertheless total over
 /// `line_count == 0`.
+//
+// ── Kani contracts ───────────────────────────────────────────────────
+// One ensures clause per verdict variant, each an iff: the verdict is X
+// exactly when X's condition holds and no earlier check fired. Together
+// the four clauses prove the accept verdict rejects exactly the inputs
+// the model's accept predicate rejects — the conditions below transcribe
+// `docs/spec/models/logService.qnt::acceptVerdict`:
+//
+//     pure def acceptVerdict(hw, ceiling, lo, hi) =
+//       if (lo < hw) RejectNonMonotone
+//       else match ceiling {
+//         | NoCeiling => Accept(hi)
+//         | Ceiling(c) =>
+//           if (lo >= c.value) RejectPastFinal
+//           else Accept(minInt(hi, c.value))
+//       }
+//
+// (`hi` is the batch's exclusive end `lo + count`.) The overflow arm is
+// the one addition: the model's bounded line domain cannot represent an
+// unrepresentable batch, so its predicate is conditioned on
+// representability — clauses 2-4 carry the same `end <= i64::MAX`
+// conjunct. There is no requires clause: the kernel is total and the
+// worker-supplied inputs are untrusted, so the contract must hold over
+// the full u64 domain. Verified by `check_accept_verdict_contract` in
+// `#[cfg(kani)] mod proofs`.
+#[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
+    // RejectedOverflow iff the batch's exclusive end cannot round-trip
+    // through the manifest's BIGINT columns. (The model omits this arm:
+    // "the overflow arm is unrepresentable in the bounded line domain".)
+    matches!(r, AcceptVerdict::RejectedOverflow)
+        == match first_line_number.checked_add(line_count) {
+            None => true,
+            Some(end) => end > i64::MAX as u64,
+        }
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
+    // RejectedNonMonotone iff representable AND below the high-water
+    // mark (`if (lo < hw) RejectNonMonotone`).
+    matches!(r, AcceptVerdict::RejectedNonMonotone)
+        == (first_line_number
+            .checked_add(line_count)
+            .is_some_and(|end| end <= i64::MAX as u64)
+            && first_line_number < high_water_line)
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
+    // RejectedPastFinal iff representable, monotone, AND the batch
+    // starts at or past the known ceiling
+    // (`if (lo >= c.value) RejectPastFinal`).
+    matches!(r, AcceptVerdict::RejectedPastFinal)
+        == (first_line_number
+            .checked_add(line_count)
+            .is_some_and(|end| end <= i64::MAX as u64)
+            && first_line_number >= high_water_line
+            && final_line_count.is_some_and(|c| first_line_number >= c))
+}))]
+#[cfg_attr(kani, kani::ensures(|r: &AcceptVerdict| {
+    // Accepted iff no rejection fires (implied by the three iffs above
+    // over the four-variant enum); the accepted end is the batch's end
+    // clamped to the ceiling (`Accept(minInt(hi, c.value))` /
+    // `Accept(hi)`), so no accepted line is ever at or past the
+    // recorded final_line_count (store.log.completeness-gate) and the
+    // kept-line count never exceeds the batch's.
+    match r {
+        AcceptVerdict::Accepted { end } => first_line_number
+            .checked_add(line_count)
+            .is_some_and(|batch_end| {
+                batch_end <= i64::MAX as u64
+                    && first_line_number >= high_water_line
+                    && final_line_count.is_none_or(|c| first_line_number < c)
+                    && *end
+                        == match final_line_count {
+                            Some(c) if c < batch_end => c,
+                            _ => batch_end,
+                        }
+                    && *end >= first_line_number
+                    && *end <= batch_end
+            }),
+        _ => true,
+    }
+}))]
 pub fn accept_verdict(
     high_water_line: u64,
     final_line_count: Option<u64>,
@@ -204,4 +341,192 @@ pub fn manifest_covers_contiguously(chunks: &[(i64, i64)], up_to: i64) -> bool {
         }
     }
     covered >= up_to
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Verify [`visit_chunk`] against its `kani::ensures` contracts for
+    /// every `(next_line, first_line, n_lines)` triple satisfying the
+    /// `kani::requires` BIGINT precondition (which `proof_for_contract`
+    /// assumes automatically). The full type domain is a strict
+    /// superset of the inputs reachable from production — the cursor
+    /// can be any u64 (the client-supplied `since_line` is unclamped),
+    /// the manifest columns are bounded by the SQL `try_from`, and the
+    /// decompressed line count is bounded by the 16 MiB codec limit.
+    /// Proving over the superset is sound: it implies the property over
+    /// the reachable subset. `visit_chunk` has no loops, no allocation,
+    /// no recursion, so the proof is exhaustive over the domain (not
+    /// bounded).
+    ///
+    /// This establishes that the chunk-interval arithmetic cannot
+    /// overflow under the BIGINT precondition (the ensures closures
+    /// recompute `first_line + n_lines` with overflow checks on) and
+    /// that one visit step behaves exactly like the model's
+    /// `visitChunk`. The fold-level dedup property is
+    /// `check_dedup_{pair,triple}_serves_union_exactly_once`.
+    #[kani::proof_for_contract(visit_chunk)]
+    fn check_visit_chunk_contract() {
+        let next_line: u64 = kani::any();
+        let first_line: u64 = kani::any();
+        let n_lines: u64 = kani::any();
+        let _ = visit_chunk(next_line, first_line, n_lines);
+    }
+
+    /// Verify [`accept_verdict`] against its `kani::ensures` contracts
+    /// for every `(high_water_line, final_line_count, first_line_number,
+    /// line_count)` quadruple — the kernel has no requires clause, so
+    /// the proof covers the full u64/Option<u64> domain, which is
+    /// exactly the untrusted-worker input space. The four iff clauses
+    /// together prove the verdict partition matches the model's
+    /// `acceptVerdict` (see the contract comment on the function).
+    #[kani::proof_for_contract(accept_verdict)]
+    fn check_accept_verdict_contract() {
+        let high_water_line: u64 = kani::any();
+        let final_line_count: Option<u64> = kani::any();
+        let first_line_number: u64 = kani::any();
+        let line_count: u64 = kani::any();
+        let _ = accept_verdict(
+            high_water_line,
+            final_line_count,
+            first_line_number,
+            line_count,
+        );
+    }
+
+    /// Is `x` one of the lines chunk `(first_line, n_lines)` holds?
+    /// The spec-side membership predicate the dedup harnesses compare
+    /// the fold's output against. Computed with exact arithmetic — the
+    /// harnesses' assumptions keep `first_line + n_lines` in range, and
+    /// CBMC rejects the harness if they did not.
+    fn in_chunk(x: u64, first_line: u64, n_lines: u64) -> bool {
+        x >= first_line && x < first_line + n_lines
+    }
+
+    /// Is `x` in the half-open range a [`ChunkVisit`] yielded?
+    fn in_visit(x: u64, v: &ChunkVisit) -> bool {
+        x >= v.yield_from && x < v.yield_until
+    }
+
+    // (The tracey verify markers for these harnesses live at the
+    // `kani-rio-store` wiring point in nix/kani.nix, not here — same
+    // discipline as the VM-test subtests list: a marker in the harness
+    // would tell tracey the rule is verified even if the member were
+    // never wired into the check set.)
+    /// The read path's dedup over TWO possibly-overlapping chunks
+    /// visited in ascending `first_line` order (the
+    /// `read_manifest_range` `ORDER BY`): every line is served at most
+    /// once, and the served set is exactly the union of the chunks'
+    /// line ranges restricted to `[since_line, ∞)` — the
+    /// `servedSpanExact` invariant of `docs/spec/models/logService.qnt`
+    /// (`r.served == manifestUnion(e)` ∧ `r.count == r.served.size()`),
+    /// proven here over the full BIGINT-bounded u64 domain instead of
+    /// the model's `MAX_LINE = 3`.
+    ///
+    /// `x` is a universally quantified line number: CBMC checks the
+    /// assertions for every value, so `in_a || in_b == in_union` is set
+    /// equality and `!(in_a && in_b)` is pairwise disjointness.
+    #[kani::proof]
+    fn check_dedup_pair_serves_union_exactly_once() {
+        let since: u64 = kani::any();
+        let (f_a, n_a): (u64, u64) = (kani::any(), kani::any());
+        let (f_b, n_b): (u64, u64) = (kani::any(), kani::any());
+        // The manifest BIGINT precondition (read_manifest_range's
+        // try_from) and the visit order (ORDER BY first_line; the
+        // session_id tiebreak only orders equal-first_line chunks,
+        // which the symbolic `f_a <= f_b` already covers).
+        kani::assume(f_a <= i64::MAX as u64 && n_a <= i64::MAX as u64);
+        kani::assume(f_b <= i64::MAX as u64 && n_b <= i64::MAX as u64);
+        kani::assume(f_a <= f_b);
+
+        let mut cursor = since;
+        let v_a = visit_chunk(cursor, f_a, n_a);
+        cursor = v_a.next_line;
+        let v_b = visit_chunk(cursor, f_b, n_b);
+
+        let x: u64 = kani::any();
+        let served_a = in_visit(x, &v_a);
+        let served_b = in_visit(x, &v_b);
+        // Each line is served at most once across the walk.
+        assert!(!(served_a && served_b));
+        // The served set equals the union of the chunks' ranges above
+        // the starting watermark: nothing is dropped (no line of any
+        // chunk at or past `since` is missing) and nothing is invented.
+        let in_union = x >= since && (in_chunk(x, f_a, n_a) || in_chunk(x, f_b, n_b));
+        assert!((served_a || served_b) == in_union);
+    }
+
+    /// [`check_dedup_pair_serves_union_exactly_once`] over THREE
+    /// chunks — enough for the shapes two chunks cannot reach: a chunk
+    /// entirely contained in the union of its two predecessors, an
+    /// overlap chain (A∩B ≠ ∅ ≠ B∩C), and a gap followed by an overlap.
+    #[kani::proof]
+    fn check_dedup_triple_serves_union_exactly_once() {
+        let since: u64 = kani::any();
+        let (f_a, n_a): (u64, u64) = (kani::any(), kani::any());
+        let (f_b, n_b): (u64, u64) = (kani::any(), kani::any());
+        let (f_c, n_c): (u64, u64) = (kani::any(), kani::any());
+        kani::assume(f_a <= i64::MAX as u64 && n_a <= i64::MAX as u64);
+        kani::assume(f_b <= i64::MAX as u64 && n_b <= i64::MAX as u64);
+        kani::assume(f_c <= i64::MAX as u64 && n_c <= i64::MAX as u64);
+        kani::assume(f_a <= f_b && f_b <= f_c);
+
+        let mut cursor = since;
+        let v_a = visit_chunk(cursor, f_a, n_a);
+        cursor = v_a.next_line;
+        let v_b = visit_chunk(cursor, f_b, n_b);
+        cursor = v_b.next_line;
+        let v_c = visit_chunk(cursor, f_c, n_c);
+
+        let x: u64 = kani::any();
+        let served_a = in_visit(x, &v_a);
+        let served_b = in_visit(x, &v_b);
+        let served_c = in_visit(x, &v_c);
+        assert!(!(served_a && served_b));
+        assert!(!(served_a && served_c));
+        assert!(!(served_b && served_c));
+        let in_union =
+            x >= since && (in_chunk(x, f_a, n_a) || in_chunk(x, f_b, n_b) || in_chunk(x, f_c, n_c));
+        assert!((served_a || served_b || served_c) == in_union);
+    }
+
+    /// [`manifest_covers_contiguously`] never reports a gapped manifest
+    /// as covering: a `true` verdict means every point of `[0, up_to)`
+    /// lies inside at least one chunk's range. This is the soundness
+    /// direction of the completeness predicate — the direction whose
+    /// failure serves a gapped log as complete and seals it against the
+    /// late replay that would fill the gap. Bounded to manifests of at
+    /// most three chunks (enough for a gap, an overlap, and an
+    /// extension — the same shapes the model's `MAX_LINE = 3` domain
+    /// reaches); the completeness direction (a fully-covered manifest
+    /// is reported as covering) is pinned by the `contiguity_*` unit
+    /// tests in `gate.rs`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_manifest_covers_no_uncovered_point() {
+        const MAX_CHUNKS: usize = 3;
+        let all: [(i64, i64); MAX_CHUNKS] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_CHUNKS);
+        let chunks = &all[..len];
+        // Rows the ingest path wrote: non-negative, end fits in BIGINT
+        // (accept_verdict's overflow arm), ORDER BY first_line.
+        for c in chunks {
+            kani::assume(c.0 >= 0 && c.1 >= 0 && c.0.checked_add(c.1).is_some());
+        }
+        for w in chunks.windows(2) {
+            kani::assume(w[0].0 <= w[1].0);
+        }
+        let up_to: i64 = kani::any();
+        kani::assume(up_to >= 0);
+
+        if manifest_covers_contiguously(chunks, up_to) {
+            // A universally quantified point of [0, up_to): some chunk
+            // must hold it.
+            let x: i64 = kani::any();
+            kani::assume(x >= 0 && x < up_to);
+            assert!(chunks.iter().any(|&(f, n)| f <= x && x < f + n));
+        }
+    }
 }

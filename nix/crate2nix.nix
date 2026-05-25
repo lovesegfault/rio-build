@@ -84,6 +84,21 @@
   #   rio-* paths only, so dep coverage data would be discarded at
   #   report time anyway.
   localExtraRustcOpts ? [ ],
+  # `localExtraRustcOpts` for local crates that land in the *host*
+  # graph. A workspace member can be pulled into the host graph by a
+  # build-script dependency chain (rio-test-support's build.rs depends
+  # on rio-proto, which drags rio-common/rio-nix/workspace-hack along) —
+  # those copies are `isLocal` AND `isHost` at once. Defaults to
+  # `localExtraRustcOpts` so trees that don't split host from target
+  # keep one flat opt list and every existing drvPath is unchanged.
+  #
+  # crateBuildKani overrides this to `[]` for the same reason it blanks
+  # `globalExtraRustcOptsHost`: the local opts there are kani-compiler
+  # arguments riding in `-Cllvm-args` (`--reachability=harnesses`,
+  # `-Zfunction-contracts`), and a host crate compiles WITHOUT
+  # `--kani-compiler` — vanilla rustc forwards the unknown flags to LLVM,
+  # which rejects them.
+  localExtraRustcOptsHost ? localExtraRustcOpts,
   # Crate types to drop from `crate_.type` for *target*-graph crates.
   # crateBuildKani sets `[ "cdylib" "staticlib" ]`: kani-compiler with
   # the default `--reachability=none` skips codegen for deps (only MIR
@@ -187,8 +202,11 @@ let
       # Host graph (build scripts, proc-macros, and their dep closures)
       # may need a different global flag set than the target graph
       # (rlib chain). Default config makes them identical, so this is
-      # a no-op for crateBuild and crateBuildCov.
+      # a no-op for crateBuild and crateBuildCov. The local split is
+      # the same story for workspace members reached through a
+      # build-script dependency edge.
       effectiveGlobalOpts = if isHost then globalExtraRustcOptsHost else globalExtraRustcOpts;
+      effectiveLocalOpts = if isHost then localExtraRustcOptsHost else localExtraRustcOpts;
       # cargo-hakari's job is feature unification at LOCK time. crate2nix
       # reads Cargo.lock directly (features already baked into each dep's
       # `resolvedDefaultFeatures`), so building workspace-hack's 116 deps
@@ -289,14 +307,12 @@ let
         extraRustcOpts =
           remapOpts
           ++ effectiveGlobalOpts
-          ++ lib.optionals isLocal (localExtraRustcOpts ++ [ localRemap ])
+          ++ lib.optionals isLocal (effectiveLocalOpts ++ [ localRemap ])
           ++ (crate_'.extraRustcOpts or [ ]);
       }
       //
         lib.optionalAttrs
-          (lib.elem "-Cinstrument-coverage" (
-            effectiveGlobalOpts ++ lib.optionals isLocal localExtraRustcOpts
-          ))
+          (lib.elem "-Cinstrument-coverage" (effectiveGlobalOpts ++ lib.optionals isLocal effectiveLocalOpts))
           {
             # Discard build-time profraws. Test runners override at
             # runtime to collect real data.

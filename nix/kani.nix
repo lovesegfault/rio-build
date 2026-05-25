@@ -117,4 +117,26 @@ in
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;
   };
+
+  # rio-store: the log-chunk decision kernels (rio-store/src/logs/kernel.rs).
+  # Five harnesses:
+  #   - check_visit_chunk_contract / check_accept_verdict_contract:
+  #     #[kani::proof_for_contract] over the full input domain — the
+  #     chunk-interval arithmetic cannot overflow under the manifest
+  #     BIGINT precondition, and the accept verdict partitions its
+  #     inputs exactly as docs/spec/models/logService.qnt::acceptVerdict.
+  #   - check_dedup_{pair,triple}_serves_union_exactly_once: the read
+  #     path's ordered-walk dedup serves each line at most once and the
+  #     served set equals the union of the chunks' ranges (the model's
+  #     servedSpanExact, over the full u64 domain instead of MAX_LINE=3).
+  #   - check_manifest_covers_no_uncovered_point: a manifest reported as
+  #     covering [0, up_to) really has no gap (the soundness direction
+  #     of the completeness predicate that seals a log against appends).
+  # r[verify store.log.session-keyed]
+  # r[verify store.log.ingest-bounds]
+  # r[verify store.log.completeness-gate]
+  kani-rio-store = mkKaniCheck {
+    name = "rio-store";
+    crate = crateBuildKani.members.rio-store;
+  };
 }

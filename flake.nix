@@ -494,6 +494,18 @@
                 # stubs and build scripts execute normally. Mirrors
                 # `cargo kani`'s `-Z target-applies-to-host`.
                 globalExtraRustcOptsHost = [ ];
+                # The same split for WORKSPACE MEMBERS that land in the
+                # host graph (rio-test-support's build.rs depends on
+                # rio-proto, which drags rio-common/rio-nix/
+                # workspace-hack into the host closure of any member
+                # that depends on rio-test-support — rio-store does, via
+                # its feature-unified `test-utils`). localExtraRustcOpts
+                # below is a set of kani-compiler arguments riding in
+                # `-Cllvm-args`; without `--kani-compiler` (host crates
+                # drop it via globalExtraRustcOptsHost) vanilla rustc
+                # forwards them to LLVM, which rejects
+                # `--reachability=harnesses` as an unknown argument.
+                localExtraRustcOptsHost = [ ];
                 localExtraRustcOpts = [
                   "-Cllvm-args=--reachability=harnesses"
                   # Function contracts: gate behind kani-compiler's
@@ -1448,7 +1460,16 @@
                   # structure than the model's action partition — not a
                   # formal refinement). r[verify] markers are at the
                   # wiring point in nix/kani.nix.
-                  inherit (kaniChecks) kani-rio-lease;
+                  #
+                  # kani-rio-store: same pipeline over the log-chunk
+                  # decision kernels (rio-store/src/logs/kernel.rs) — the
+                  # chunk-interval arithmetic, the read-path overlap
+                  # dedup, the accept verdict, and the completeness fold.
+                  # The formal model (quint-log-service-*, in miscChecks)
+                  # verifies the protocol over a bounded line domain;
+                  # these harnesses verify the per-decision arithmetic
+                  # over the full u64 domain.
+                  inherit (kaniChecks) kani-rio-lease kani-rio-store;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.
                   # No KVM needed (synthetic tarballs).
