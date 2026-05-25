@@ -761,6 +761,39 @@ module retryPolicy {
     (dStatus == DPoisoned and poisonSrc == DispatchPoison) implies
       lastPoisonReason == RFleetExhausted
 
+  /// A poison clear that took effect in memory has taken effect durably:
+  /// the admin/TTL clear is PG-first (a failed PG clear aborts the whole
+  /// clear -- sched.admin.clear-poison's both-stores obligation), so in
+  /// the state right after a clear observation the durable row is never
+  /// still poisoned. Deliberately scoped to the TTL/admin path: the
+  /// cache-hit clear is best-effort by design (a lost clear_poison there
+  /// is reconciled by the next recovery, not by retry), so OCacheHit is
+  /// not in the antecedent. Stage-C calibration invariant: the
+  /// pre-b874e5120 in-mem-first ordering falsifies it.
+  val clearedPoisonClearsDurably =
+    (last.kind == OTtlExpire or last.kind == OPoisonClear) implies
+      pg.status != PgPoisoned
+
+  /// Failover preserves the poison set: a durable row that still says
+  /// Poisoned (and is not TTL-expired) is reloaded as Poisoned -- the
+  /// "poison set preserved exactly minus TTL-expired entries" clause of
+  /// sched.retry.recovery-projection that the counter-projection
+  /// equality alone cannot see (it is conditioned on the recovered
+  /// status). DCompleted is excluded from the antecedent: a cache-hit
+  /// clear whose best-effort PG clear was lost legitimately leaves a
+  /// stale Poisoned row behind a Completed node, and the gone-arm
+  /// preserves the completion. Stage-C calibration invariant: a
+  /// recovery that drops poisoned rows (the 891a6520d shape) falsifies
+  /// it.
+  val recoveryPreservesPoisonStatus =
+    justFailedOver implies (
+      and {
+        pg.status == PgPoisoned,
+        match pg.poisonedAt { | NoTime => true | At(t) => now - t <= POISON_TTL },
+        dStatus != DCompleted,
+      } implies dStatus == DPoisoned
+    )
+
   // --- 6b. expect-violation witnesses (non-vacuity probes) ---------------
   // Each states "the interesting thing never happens"; the wired check
   // passes only when the checker violates it. None of these are
