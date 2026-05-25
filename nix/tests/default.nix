@@ -41,6 +41,7 @@ let
   protocol = import ./scenarios/protocol.nix;
   scheduling = import ./scenarios/scheduling.nix;
   put-path-chunked = import ./scenarios/put-path-chunked.nix;
+  store-tiered = import ./scenarios/store-tiered.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
   # systemd fixture (HMAC/tenant/validation); e2e uses k3sFull
@@ -759,6 +760,48 @@ in
           "roundtrip"
           # r[verify store.chunk.has-chunks-durable]
           "dedup"
+        ];
+      };
+
+  # ── tiered chunk backend (ADR-023, P0555) ───────────────────────────
+  # TieredChunkBackend cache semantics against a real S3 API: one
+  # Garage server on the control VM hosting BOTH buckets
+  # (authoritative + express stand-in), three store replicas sharing
+  # PG and the buckets (A gateway-attached + B express-enabled, C with
+  # express_bucket unset → local=None). Reads are driven per-replica
+  # via grpcurl GetPath; assertions are the rio_store_tiered_*
+  # counters + bucket key-set comparisons. See the scenario header for
+  # why the plan's "two minio instances" sketch became one Garage with
+  # two buckets (minio is insecure-flagged in nixpkgs; both tiers
+  # share one AWS_ENDPOINT_URL) and why the express stand-in bucket is
+  # not named *--x-s3.
+  vm-store-tiered =
+    (store-tiered {
+      inherit pkgs common;
+      fixture = standalone {
+        workers = { };
+        # Every replica's [chunk_backend] comes from env vars (tiered +
+        # Garage endpoint, set by the scenario). An /etc/rio/store.toml
+        # would leak replica A's express_bucket into the extra
+        # replicas on the same host (the env layer can override a TOML
+        # key but never unset one), so drop the fixture's default
+        # filesystem TOML entirely.
+        extraStoreConfig = {
+          extraConfig = "";
+        };
+      };
+    }).mkTest
+      {
+        name = "default";
+        subtests = [
+          # r[verify store.backend.tiered-put-remote-first]
+          "put-remote-only"
+          # r[verify store.backend.tiered-get-fallback]
+          "cold-miss-fallback"
+          # r[verify obs.metric.chunk-backend-tiered]
+          "replica-warm-via-read-through"
+          # r[verify store.backend.tiered-get-fallback]
+          "local-none-passthrough"
         ];
       };
 
