@@ -6,6 +6,7 @@
 //! ([`protocol::wire`]), and handshake/STDERR framing. Fuzzed parsers
 //! live in `fuzz/rio-nix/`.
 
+pub mod ca;
 pub mod derivation;
 pub mod hash;
 pub mod nar;
