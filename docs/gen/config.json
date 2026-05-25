@@ -530,6 +530,42 @@
         "description": "Base directory for per-build overlay upper/work layers."
       },
       {
+        "key": "mountd_request_timeout_secs",
+        "type": "uint64",
+        "default": "30",
+        "description": "Timeout (seconds) for every rio-mountd UDS round-trip (`Mount`/`BackingOpen`/`BackingClose`/`Promote`). `BackingOpen` and `BackingClose` are sub-millisecond ioctls; `Promote` of a large staged file is a verify-copy bounded by disk bandwidth — 30 s covers a multi-GiB promote on a contended node SSD."
+      },
+      {
+        "key": "jit_fetch_timeout_secs",
+        "type": "uint64",
+        "default": "60",
+        "description": "Timeout (seconds) for a castore-FUSE `open()` JIT fetch (`ReadBlob` stream + blake3 verify)."
+      },
+      {
+        "key": "dag_prefetch_timeout_secs",
+        "type": "uint64",
+        "default": "30",
+        "description": "Timeout (seconds) for the mount-time `GetDirectory(recursive)` Directory-DAG prefetch."
+      },
+      {
+        "key": "max_backing_ids",
+        "type": "uint",
+        "default": "4096",
+        "description": "Per-build ceiling on concurrently-open castore-FUSE file handles (≈ live kernel backing-id registrations)."
+      },
+      {
+        "key": "disable_passthrough",
+        "type": "boolean",
+        "default": "false",
+        "description": "Disable FUSE passthrough on the castore mount: every `open()` replies `FOPEN_KEEP_CACHE` and reads are served by userspace `pread` from the backing cache."
+      },
+      {
+        "key": "stream_threshold_bytes",
+        "type": "uint64",
+        "default": "8388608",
+        "description": "Files larger than this (bytes) take the streaming open path (P0575) instead of a whole-file fetch before `open()` returns."
+      },
+      {
         "key": "metrics_addr",
         "type": "string",
         "default": "[::]:9093",

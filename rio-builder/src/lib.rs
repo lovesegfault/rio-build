@@ -108,6 +108,23 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
             0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
         ],
     ),
+    (
+        // Bimodal: a backing-cache hit is one stat + one mountd
+        // round-trip (sub-ms to low ms); a miss is a whole-file
+        // ReadBlob bounded by jit_fetch_timeout (60 s). The default
+        // [0.005..10.0] buckets put every miss in {le="+Inf"}.
+        "rio_builder_castore_fuse_open_seconds",
+        &[
+            0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
+        ],
+    ),
+    (
+        // One multi-root GetDirectory(recursive) stream per build —
+        // chromium-scale closures are ~5 MiB of Directory bodies, so
+        // the tail is network-bound seconds, not the sub-second default.
+        "rio_builder_castore_dag_prefetch_seconds",
+        &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -124,6 +141,79 @@ pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 
     castore_fuse::mountd::describe_metrics();
+
+    // ── castore-FUSE (ADR-022 §14) ────────────────────────────────────
+    // r[impl obs.metric.castore-fuse]
+    describe_counter!(
+        "rio_builder_castore_fuse_upcalls_total",
+        "Castore-FUSE kernel upcalls by op (lookup/getattr/readdir/readlink/open/read). \
+         With every cache TTL infinite the steady-state rate is ~one per distinct dentry \
+         per build; read>0 means passthrough is not engaging."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_lookup_total",
+        "Castore-FUSE cold lookup() upcalls (first touch of each (parent, name) pair — \
+         the dcache absorbs repeats at Duration::MAX ttl)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_readdir_total",
+        "Castore-FUSE cold readdir()/readdirplus() upcalls (first enumeration of each \
+         directory — FOPEN_CACHE_DIR absorbs repeats)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_open_mode_total",
+        "Castore-FUSE open() replies by mode: passthrough (reads bypass FUSE entirely) \
+         or keep_cache (userspace pread per uncached read). passthrough=0 with \
+         keep_cache>0 means FUSE_PASSTHROUGH was not negotiated — check the kernel \
+         version and RIO_DISABLE_PASSTHROUGH."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_open_case_total",
+        "Castore-FUSE open() dispatch decisions: hit (backing cache), miss_small \
+         (whole-file JIT fetch), miss_stream (above stream_threshold; streaming in \
+         P0575), wait_fetching (another open of the same digest was already filling)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_chunk_source_total",
+        "Where castore-FUSE fill bytes came from, by src: remote (rio-store) or \
+         node_ssd (the shared chunk cache, P0575). The node_ssd fraction is the \
+         cross-build dedup ratio."
+    );
+    describe_histogram!(
+        "rio_builder_castore_fuse_open_seconds",
+        "Castore-FUSE open() upcall-to-reply latency, labeled by hit \
+         (node_ssd = backing-cache hit, remote = JIT fetch)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_fetch_bytes_total",
+        "Bytes fetched on behalf of castore-FUSE open(), labeled by hit \
+         (remote = from rio-store; node_ssd = from the shared node cache, P0575)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_integrity_fail_total",
+        "Castore-FUSE fetches whose bytes did not blake3-hash to the requested \
+         file_digest. The bytes are discarded and the open fails with EIO. \
+         Nonzero = corrupt store content or a transport integrity failure — \
+         investigate immediately."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_eio_total",
+        "EIO replies returned to the kernel from the castore-FUSE open()/read() path \
+         (fetch timeout, integrity failure, mountd error, open ceiling). Every one \
+         fails a build (as an infrastructure failure)."
+    );
+    describe_gauge!(
+        "rio_builder_castore_fuse_circuit_open",
+        "1.0 when the castore-FUSE fetch circuit breaker is open (rio-store \
+         unreachable or degraded). Opens after 5 consecutive fetch failures OR 720s \
+         since last successful fetch with at least one failure since. Half-open after \
+         30s (one probe fetch allowed)."
+    );
+    describe_histogram!(
+        "rio_builder_castore_dag_prefetch_seconds",
+        "Mount-time GetDirectory(recursive=true) Directory-DAG prefetch wall-clock \
+         per build (one multi-root call for the whole input closure)."
+    );
 
     describe_counter!(
         "rio_builder_builds_total",

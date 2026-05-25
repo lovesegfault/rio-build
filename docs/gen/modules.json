@@ -73,14 +73,39 @@
       "doc": "Castore-FUSE lazy `/nix/store` (ADR-022 §2)."
     },
     {
+      "path": "castore_fuse/circuit.rs",
+      "depth": 1,
+      "doc": "Castore-FUSE fetch circuit breaker. **std::sync ONLY** — FUSE"
+    },
+    {
+      "path": "castore_fuse/fs.rs",
+      "depth": 1,
+      "doc": "`fuser::Filesystem` impl for the castore-FUSE (ADR-022 §2.4–§2.6)."
+    },
+    {
       "path": "castore_fuse/mountd.rs",
       "depth": 1,
       "doc": "`rio-mountd` — the privileged per-node broker for castore-FUSE."
     },
     {
+      "path": "castore_fuse/mountd_client.rs",
+      "depth": 1,
+      "doc": "In-process client for the `rio-mountd` UDS protocol."
+    },
+    {
       "path": "castore_fuse/mountd_proto.rs",
       "depth": 1,
       "doc": "UDS wire protocol between the unprivileged builder and `rio-mountd`."
+    },
+    {
+      "path": "castore_fuse/open.rs",
+      "depth": 1,
+      "doc": "The castore-FUSE `open()` data path (ADR-022 §2.6–§2.7)."
+    },
+    {
+      "path": "castore_fuse/tree.rs",
+      "depth": 1,
+      "doc": "DAG prefetch + content-addressed inode model (ADR-022 §2.2–§2.3)."
     },
     {
       "path": "cgroup.rs",

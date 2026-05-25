@@ -109,6 +109,54 @@ pub struct Config {
     pub fuse_fetch_timeout: std::time::Duration,
     /// Base directory for per-build overlay upper/work layers.
     pub overlay_base_dir: PathBuf,
+    /// Timeout (seconds) for every rio-mountd UDS round-trip
+    /// (`Mount`/`BackingOpen`/`BackingClose`/`Promote`). `BackingOpen`
+    /// and `BackingClose` are sub-millisecond ioctls; `Promote` of a
+    /// large staged file is a verify-copy bounded by disk bandwidth —
+    /// 30 s covers a multi-GiB promote on a contended node SSD.
+    /// Env: `RIO_MOUNTD_REQUEST_TIMEOUT_SECS`.
+    #[serde(
+        rename = "mountd_request_timeout_secs",
+        with = "rio_common::config::secs"
+    )]
+    #[schemars(with = "u64")]
+    pub mountd_request_timeout: std::time::Duration,
+    /// Timeout (seconds) for a castore-FUSE `open()` JIT fetch
+    /// (`ReadBlob` stream + blake3 verify). Bounds how long a build's
+    /// `open(2)` can block on a cold input before failing with `EIO`
+    /// (classified as an infrastructure failure, not a build failure).
+    /// Env: `RIO_JIT_FETCH_TIMEOUT_SECS`.
+    #[serde(rename = "jit_fetch_timeout_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
+    pub jit_fetch_timeout: std::time::Duration,
+    /// Timeout (seconds) for the mount-time `GetDirectory(recursive)`
+    /// Directory-DAG prefetch. Expiry is an infrastructure retry — the
+    /// build never started, no partial state.
+    /// Env: `RIO_DAG_PREFETCH_TIMEOUT_SECS`.
+    #[serde(
+        rename = "dag_prefetch_timeout_secs",
+        with = "rio_common::config::secs"
+    )]
+    #[schemars(with = "u64")]
+    pub dag_prefetch_timeout: std::time::Duration,
+    /// Per-build ceiling on concurrently-open castore-FUSE file
+    /// handles (≈ live kernel backing-id registrations). Not an LRU —
+    /// backing ids are released only on `release(fh)`. On overflow
+    /// `open()` returns `EMFILE`.
+    pub max_backing_ids: usize,
+    /// Disable FUSE passthrough on the castore mount: every `open()`
+    /// replies `FOPEN_KEEP_CACHE` and reads are served by userspace
+    /// `pread` from the backing cache. Escape hatch for debugging
+    /// passthrough/overlay interactions; adds a kernel↔userspace
+    /// round-trip per uncached read. Env: `RIO_DISABLE_PASSTHROUGH`.
+    pub disable_passthrough: bool,
+    /// Files larger than this (bytes) take the streaming open path
+    /// (P0575) instead of a whole-file fetch before `open()` returns.
+    /// Default 8 MiB: P0543's v12 measurement put the latency
+    /// crossover at ~1.21 MiB, so 8 MiB sits 6.6× above it — trading
+    /// ≤67 ms of whole-file open latency for not running the
+    /// chunk-cache machinery on 1.2–8 MiB files.
+    pub stream_threshold_bytes: u64,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
     /// HTTP /healthz + /readyz listen address. Builder has no gRPC
@@ -218,6 +266,12 @@ impl Default for Config {
             fuse_passthrough: true,
             fuse_fetch_timeout: std::time::Duration::from_secs(60),
             overlay_base_dir: "/var/rio/overlays".into(),
+            mountd_request_timeout: std::time::Duration::from_secs(30),
+            jit_fetch_timeout: std::time::Duration::from_secs(60),
+            dag_prefetch_timeout: std::time::Duration::from_secs(30),
+            max_backing_ids: 4096,
+            disable_passthrough: false,
+            stream_threshold_bytes: 8 * 1024 * 1024,
             common: rio_common::config::CommonConfig::new(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
             // gateway (9090→9190). Scheduler/store piggyback health
@@ -402,6 +456,32 @@ mod tests {
              serde's bool default is false so this needs explicit handling"
         );
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
+        assert_eq!(
+            d.mountd_request_timeout,
+            std::time::Duration::from_secs(30),
+            "mountd round-trips are bounded by a multi-GiB Promote verify-copy"
+        );
+        assert_eq!(
+            d.jit_fetch_timeout,
+            std::time::Duration::from_secs(60),
+            "castore-FUSE open() JIT fetch budget"
+        );
+        assert_eq!(
+            d.dag_prefetch_timeout,
+            std::time::Duration::from_secs(30),
+            "mount-time GetDirectory(recursive) budget"
+        );
+        assert_eq!(d.max_backing_ids, 4096);
+        assert!(
+            !d.disable_passthrough,
+            "passthrough MUST default to ON — disable_passthrough is the escape hatch"
+        );
+        assert_eq!(
+            d.stream_threshold_bytes,
+            8 * 1024 * 1024,
+            "P0543 v12 measured the crossover at ~1.21 MiB; 8 MiB keeps the chunk-cache \
+             machinery off 1.2-8 MiB files"
+        );
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9093");
         assert_eq!(d.health_addr.to_string(), "[::]:9193");
         assert_eq!(d.log_rate_limit, 250_000);
@@ -463,6 +543,20 @@ mod tests {
              via the compiled-defaults base layer"
         );
         assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(60));
+        // Castore-FUSE knobs: every non-zero default must survive the
+        // compiled-defaults base layer (serde's numeric default is 0,
+        // which would turn stream_threshold_bytes=0 into "every file
+        // takes the streaming path" and max_backing_ids=0 into "every
+        // open() is EMFILE").
+        assert_eq!(
+            cfg.mountd_request_timeout,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(cfg.jit_fetch_timeout, std::time::Duration::from_secs(60));
+        assert_eq!(cfg.dag_prefetch_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(cfg.max_backing_ids, 4096);
+        assert!(!cfg.disable_passthrough);
+        assert_eq!(cfg.stream_threshold_bytes, 8 * 1024 * 1024);
     });
 
     /// `detect_system()`'s contract is "Nix-style system double". Rust's

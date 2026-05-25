@@ -225,6 +225,41 @@
       "doc": ""
     },
     {
+      "enum": "MountdError",
+      "name": "Disconnected",
+      "crate": "rio-builder",
+      "msg": "rio-mountd connection lost: {0}",
+      "doc": "The connection is gone (daemon restarted, socket error). All in-flight and future calls fail immediately."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Rejected",
+      "crate": "rio-builder",
+      "msg": "rio-mountd rejected the request: {0}",
+      "doc": "The daemon replied `Err(kind)`. [`ErrKind::is_build_fatal`] decides whether retrying can ever succeed."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Send",
+      "crate": "rio-builder",
+      "msg": "rio-mountd send: {0}",
+      "doc": "Local frame encode/send failure."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "rio-mountd did not reply within {0:?}",
+      "doc": "No reply within the caller's timeout. The request may still be in flight daemon-side; the late reply is discarded."
+    },
+    {
+      "enum": "MountdError",
+      "name": "UnexpectedReply",
+      "crate": "rio-builder",
+      "msg": "rio-mountd sent an unexpected reply: {0:?}",
+      "doc": "The daemon replied with a `Resp` variant the request cannot produce (protocol bug on one side or the other)."
+    },
+    {
       "enum": "OverlayError",
       "name": "DirCreate",
       "crate": "rio-builder",
@@ -272,6 +307,41 @@
       "crate": "rio-builder",
       "msg": "overlay upperdir {path} is itself on an overlayfs mount (statfs f_type=OVERLAYFS_SUPER_MAGIC); the kernel refuses to use an overlayfs as upperdir/workdir. Set --overlay-base-dir to a directory on a real filesystem (e.g., a local SSD emptyDir volume), not the merged view of another overlay.",
       "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadDigest",
+      "crate": "rio-builder",
+      "msg": "malformed digest ({len} bytes, want 32) in {context}",
+      "doc": "A digest field on the wire was not 32 bytes."
+    },
+    {
+      "enum": "TreeError",
+      "name": "EmptyRootNode",
+      "crate": "rio-builder",
+      "msg": "input root {0} has an empty RootNode — scheduler sent an unindexed path",
+      "doc": "A root entry in `WorkAssignment.input_roots` has no `node` set."
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingDirectory",
+      "crate": "rio-builder",
+      "msg": "store returned no Directory body for digest {digest} (referenced by {referrer}) — has the NAR indexer (P0557) processed this path?",
+      "doc": "A `DirectoryEntry.digest` referenced by the prefetched DAG (or a root's `dir_digest`) has no corresponding `Directory` body in the stream. The store has not finished indexing this path."
+    },
+    {
+      "enum": "TreeError",
+      "name": "PrefetchTimeout",
+      "crate": "rio-builder",
+      "msg": "DAG prefetch timed out after {0:?}",
+      "doc": "The `GetDirectory(recursive=true)` call did not complete within `dag_prefetch_timeout`. Infra-retry."
+    },
+    {
+      "enum": "TreeError",
+      "name": "Rpc",
+      "crate": "rio-builder",
+      "msg": "GetDirectory: {0}",
+      "doc": "The `GetDirectory` RPC failed."
     },
     {
       "enum": "UploadError",
@@ -1376,14 +1446,29 @@
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
     },
     {
+      "name": "FetchError",
+      "crate": "rio-builder",
+      "doc": "Why a `ReadBlob` fill failed."
+    },
+    {
       "name": "FrameError",
       "crate": "rio-builder",
       "doc": "Frame-level decode/encode errors (not protocol errors — those are [`ErrKind`])."
     },
     {
+      "name": "MountdError",
+      "crate": "rio-builder",
+      "doc": "A mountd request failure, classified for the build-vs-infra decision."
+    },
+    {
       "name": "OverlayError",
       "crate": "rio-builder",
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
+    },
+    {
+      "name": "TreeError",
+      "crate": "rio-builder",
+      "doc": "Errors from [`build_tree`]. Every variant is an infrastructure failure (the build never started; re-queue to a fresh pod) except where noted — none of these can be caused by the derivation under build."
     },
     {
       "name": "UploadError",

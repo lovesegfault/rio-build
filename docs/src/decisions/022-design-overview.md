@@ -318,6 +318,10 @@ r[builder.fs.fetch-circuit]
 
 A circuit breaker on the castore-FUSE fetch path trips on sustained rio-store unreachability and fails the build fast rather than letting every `open()` time out individually.
 
+r[builder.fs.listxattr-size-branch]
+
+The castore-FUSE `listxattr` handler MUST branch on the request's `size` argument: `size == 0` is the buffer-length probe and is answered with `reply.size(0)`; `size > 0` wants the (empty) name list and MUST be answered with `reply.data(&[])`. Replying `size(0)` to a `size > 0` request serializes an 8-byte `fuse_getxattr_out` struct as the list payload, which the kernel's `fuse_verify_xattr_list` reads as a corrupt zero-length name and rejects with `EIO`. This broke `shutil.copy2` from store paths once already; overlayfs probes `user.overlay.*` on every lower inode, so the handler cannot fall back to fuser's `ENOSYS` default either.
+
 ## 14. Observability
 
 r[obs.metric.castore-fuse]

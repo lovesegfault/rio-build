@@ -11,39 +11,45 @@ use std::time::Duration;
 
 use tonic::transport::Channel;
 
-use rio_proto::StoreServiceClient;
 use rio_proto::store::chunk_service_client::ChunkServiceClient;
+use rio_proto::{DirectoryServiceClient, StoreServiceClient};
 
 /// gRPC client bundle for store fetches.
 ///
-/// Wraps `StoreServiceClient` and `ChunkServiceClient` over a single
-/// (typically p2c-balanced) `tonic::transport::Channel`. Clone is
-/// cheap — the channel is `Arc`-internal.
+/// Wraps `StoreServiceClient`, `ChunkServiceClient`, and
+/// `DirectoryServiceClient` over a single (typically p2c-balanced)
+/// `tonic::transport::Channel`. Clone is cheap — the channel is
+/// `Arc`-internal.
 ///
 /// Kept as a struct (not a bare type alias) so future client additions
-/// (P0573 `DirectoryService`, P0577 `BlobService`) thread through every
-/// call site as one parameter. `chunk` is the P0568 addition: the
-/// castore-FUSE fill task (P0559) calls `chunk.get_chunks(stream)` to
-/// pipeline local-cache misses to rio-store's batched fan-out instead
-/// of paying a per-chunk `GetChunk` RTT.
+/// thread through every call site as one parameter. `chunk` is the
+/// P0568 addition (the streaming fill task pipelines local-cache misses
+/// to rio-store's batched fan-out); `directory` is the P0559 addition
+/// (the castore-FUSE prefetches the Directory DAG via `GetDirectory`
+/// and fetches whole files via `ReadBlob`).
 #[derive(Clone)]
 pub struct StoreClients {
     pub store: StoreServiceClient<Channel>,
     pub chunk: ChunkServiceClient<Channel>,
+    pub directory: DirectoryServiceClient<Channel>,
 }
 
 impl StoreClients {
-    /// Wrap the store and chunk clients over a single `Channel` with
-    /// the standard max-message-size headroom (matches
-    /// `connect_single`'s convention). One channel: both RPC services
-    /// run on the same rio-store endpoint and share the p2c balancer.
+    /// Wrap the store, chunk, and directory clients over a single
+    /// `Channel` with the standard max-message-size headroom (matches
+    /// `connect_single`'s convention). One channel: all three RPC
+    /// services run on the same rio-store endpoint and share the p2c
+    /// balancer.
     pub fn from_channel(ch: Channel) -> Self {
         let max = rio_common::grpc::max_message_size();
         Self {
             store: StoreServiceClient::new(ch.clone())
                 .max_decoding_message_size(max)
                 .max_encoding_message_size(max),
-            chunk: ChunkServiceClient::new(ch)
+            chunk: ChunkServiceClient::new(ch.clone())
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max),
+            directory: DirectoryServiceClient::new(ch)
                 .max_decoding_message_size(max)
                 .max_encoding_message_size(max),
         }

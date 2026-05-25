@@ -83,6 +83,46 @@
         "type": "string",
         "default": "/var/rio/overlays"
       },
+      "mountd_request_timeout_secs": {
+        "description": "Timeout (seconds) for every rio-mountd UDS round-trip\n(`Mount`/`BackingOpen`/`BackingClose`/`Promote`). `BackingOpen`\nand `BackingClose` are sub-millisecond ioctls; `Promote` of a\nlarge staged file is a verify-copy bounded by disk bandwidth —\n30 s covers a multi-GiB promote on a contended node SSD.\nEnv: `RIO_MOUNTD_REQUEST_TIMEOUT_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 30
+      },
+      "jit_fetch_timeout_secs": {
+        "description": "Timeout (seconds) for a castore-FUSE `open()` JIT fetch\n(`ReadBlob` stream + blake3 verify). Bounds how long a build's\n`open(2)` can block on a cold input before failing with `EIO`\n(classified as an infrastructure failure, not a build failure).\nEnv: `RIO_JIT_FETCH_TIMEOUT_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 60
+      },
+      "dag_prefetch_timeout_secs": {
+        "description": "Timeout (seconds) for the mount-time `GetDirectory(recursive)`\nDirectory-DAG prefetch. Expiry is an infrastructure retry — the\nbuild never started, no partial state.\nEnv: `RIO_DAG_PREFETCH_TIMEOUT_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 30
+      },
+      "max_backing_ids": {
+        "description": "Per-build ceiling on concurrently-open castore-FUSE file\nhandles (≈ live kernel backing-id registrations). Not an LRU —\nbacking ids are released only on `release(fh)`. On overflow\n`open()` returns `EMFILE`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 4096
+      },
+      "disable_passthrough": {
+        "description": "Disable FUSE passthrough on the castore mount: every `open()`\nreplies `FOPEN_KEEP_CACHE` and reads are served by userspace\n`pread` from the backing cache. Escape hatch for debugging\npassthrough/overlay interactions; adds a kernel↔userspace\nround-trip per uncached read. Env: `RIO_DISABLE_PASSTHROUGH`.",
+        "type": "boolean",
+        "default": false
+      },
+      "stream_threshold_bytes": {
+        "description": "Files larger than this (bytes) take the streaming open path\n(P0575) instead of a whole-file fetch before `open()` returns.\nDefault 8 MiB: P0543's v12 measurement put the latency\ncrossover at ~1.21 MiB, so 8 MiB sits 6.6× above it — trading\n≤67 ms of whole-file open latency for not running the\nchunk-cache machinery on 1.2–8 MiB files.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 8388608
+      },
       "metrics_addr": {
         "description": "Prometheus exporter listen address. Per-binary defaults differ\n(gateway 9090, scheduler 9091, …) so each `Config::default()`\nsets this explicitly via [`CommonConfig::new`].",
         "type": "string",
@@ -212,6 +252,12 @@
     "fuse_passthrough": true,
     "fuse_fetch_timeout_secs": 60,
     "overlay_base_dir": "/var/rio/overlays",
+    "mountd_request_timeout_secs": 30,
+    "jit_fetch_timeout_secs": 60,
+    "dag_prefetch_timeout_secs": 30,
+    "max_backing_ids": 4096,
+    "disable_passthrough": false,
+    "stream_threshold_bytes": 8388608,
     "metrics_addr": "[::]:9093",
     "drain_grace_secs": 6,
     "health_addr": "[::]:9193",
