@@ -138,6 +138,24 @@ pub struct OpenPath {
     /// attempt; recorded after.
     pub circuit: Arc<CircuitBreaker>,
     clients: StoreClients,
+    /// Tokio runtime handle for bridging the sync FUSE callback into
+    /// the async gRPC fetch (`Handle::block_on` from the calling fuser
+    /// thread).
+    ///
+    /// INVARIANT (P0560 mount wiring): no task scheduled on this
+    /// runtime may perform blocking filesystem I/O against the castore
+    /// mount or the overlay merged view stacked on top of it.
+    /// `block_on` parks a fuser thread until a tokio worker drives the
+    /// fetch future to completion; if a tokio worker is itself parked
+    /// in the kernel waiting on a FUSE upcall that only a fuser thread
+    /// can answer, and every fuser thread is parked in `block_on`
+    /// waiting for a tokio worker, the mount deadlocks with no
+    /// timeout to save it. Today the invariant holds because this
+    /// runtime only runs gRPC I/O and the upload pipeline (which reads
+    /// the overlay *upper*, never the lower). The old FUSE module's
+    /// warm-stat `spawn_blocking` tasks consumed the mount they served
+    /// and paid for it with D-state hangs at teardown (I-165) — do not
+    /// reintroduce that shape here.
     runtime: Handle,
     mountd: MountdClient,
     cfg: OpenConfig,
@@ -252,7 +270,19 @@ impl OpenPath {
             // streaming.
             OpenCase::MissStream
         };
+        // The "always" above must survive a panic, not just an Err.
+        // The realistic panic in the fill is `Handle::block_on` on a
+        // runtime that is shutting down (process teardown racing a
+        // late open()); fuser catches callback panics, so without this
+        // guard the leaked FillState would silently wedge every future
+        // open of this digest. Disarmed on the normal return path,
+        // which publishes the real outcome instead of the guard's EIO.
+        let unwind_guard = scopeguard::guard((), |()| {
+            state.finish(Err(Errno::EIO));
+            self.fills.lock().ignore_poison().remove(file_digest);
+        });
         let outcome = self.fill_and_promote(file_digest);
+        scopeguard::ScopeGuard::into_inner(unwind_guard);
         state.finish(outcome);
         self.fills.lock().ignore_poison().remove(file_digest);
         outcome.map(|()| case)

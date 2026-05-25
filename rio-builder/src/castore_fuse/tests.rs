@@ -547,6 +547,54 @@ async fn concurrent_opens_of_one_digest_fetch_once() {
     );
 }
 
+/// A panic in the fill winner must not wedge the digest: the unwind
+/// guard publishes a failure and removes the in-flight `FillState`, so
+/// the next opener becomes a fresh winner and succeeds. Without the
+/// guard, every later open of this digest would park as a loser for
+/// its full wait deadline against a fill that will never finish —
+/// silently, because fuser catches callback panics.
+///
+/// The injected panic is `Handle::block_on` called from inside the
+/// runtime (the test calls `ensure_backing` directly from the async
+/// context instead of from a blocking thread) — the same call site
+/// that panics in production when a late `open()` races runtime
+/// shutdown at process teardown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_fill_does_not_wedge_the_digest() {
+    // Short timeouts so a regression (the loser path waiting out its
+    // full deadline) fails the test in milliseconds, not tens of
+    // seconds.
+    let h = harness_with(OpenConfig {
+        jit_fetch_timeout: Duration::from_millis(250),
+        mountd_request_timeout: Duration::from_millis(250),
+        stream_threshold: 1024,
+    })
+    .await;
+    let content = b"recovered after a panicked fill".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.open_path.ensure_backing(&digest, content.len() as u64)
+    }));
+    assert!(
+        panicked.is_err(),
+        "block_on from a runtime worker must panic — the panic injection itself broke"
+    );
+
+    // The digest is not wedged: the next opener (through the normal
+    // blocking-thread path) wins a fresh fill and succeeds. It also
+    // exercises the orphan-reclaim path — the panicked fill left its
+    // flock-released `.partial` behind.
+    let case = ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("a fresh open after a panicked fill must succeed");
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
+        content
+    );
+}
+
 /// An orphaned `.partial` from a fill that died without cleanup is
 /// reclaimed (unlink + retry) instead of permanently wedging that
 /// digest.

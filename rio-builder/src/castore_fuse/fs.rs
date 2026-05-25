@@ -72,6 +72,53 @@ struct BackingTable {
     by_digest: HashMap<[u8; 32], (u32, u32)>,
 }
 
+impl BackingTable {
+    /// Reuse the existing backing id for `digest` (bumping its
+    /// open-handle count) or mint a new one via `mint` and register it
+    /// with a count of one. A failed mint leaves no entry, so the next
+    /// open retries the registration instead of reusing a phantom id.
+    ///
+    /// The caller MUST hold the table's lock across this call —
+    /// including the `mint` round-trip — so two racing first-opens of
+    /// one digest serialize into mint-then-reuse instead of both
+    /// registering (re-registering while the first registration is
+    /// still attached to the inode is the kernel-EBUSY path).
+    fn acquire<E>(
+        &mut self,
+        digest: [u8; 32],
+        mint: impl FnOnce() -> Result<u32, E>,
+    ) -> Result<u32, E> {
+        match self.by_digest.get_mut(&digest) {
+            Some((id, refcount)) => {
+                *refcount += 1;
+                Ok(*id)
+            }
+            None => {
+                let id = mint()?;
+                self.by_digest.insert(digest, (id, 1));
+                Ok(id)
+            }
+        }
+    }
+
+    /// Drop one open's reference on `digest`'s backing registration.
+    /// Returns `Some(id)` when the last reference is released — the
+    /// caller must then close the id via mountd. Returns `None` while
+    /// other opens still hold it, or if the digest was never
+    /// registered (a release for an open whose registration failed).
+    fn release(&mut self, digest: &[u8; 32]) -> Option<u32> {
+        let (id, refcount) = self.by_digest.get_mut(digest)?;
+        *refcount -= 1;
+        if *refcount == 0 {
+            let id = *id;
+            self.by_digest.remove(digest);
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
 /// The castore FUSE filesystem: an immutable [`InoMap`] for metadata
 /// plus an [`OpenPath`] for data.
 pub struct CastoreFs {
@@ -457,22 +504,19 @@ impl Filesystem for CastoreFs {
             // across the BackingOpen round-trip so two first-opens of
             // one digest cannot both register — re-registering while
             // the first registration is still attached to the inode is
-            // the kernel-EBUSY path (I-061).
-            let mut backings = self.backings.lock().ignore_poison();
-            let registered = match backings.by_digest.get_mut(&file_digest) {
-                Some((id, refcount)) => {
-                    *refcount += 1;
-                    Ok(*id)
-                }
-                None => self
-                    .open_path
-                    .mountd()
-                    .backing_open(file.as_raw_fd(), self.open_path.mountd_timeout())
-                    .inspect(|id| {
-                        backings.by_digest.insert(file_digest, (*id, 1));
-                    }),
-            };
-            drop(backings);
+            // the kernel-EBUSY path (I-061). The round-trip is a
+            // sub-millisecond UDS-brokered ioctl, the same cost the old
+            // module paid for the in-process ioctl under its
+            // backing_state write lock.
+            let registered = self
+                .backings
+                .lock()
+                .ignore_poison()
+                .acquire(file_digest, || {
+                    self.open_path
+                        .mountd()
+                        .backing_open(file.as_raw_fd(), self.open_path.mountd_timeout())
+                });
             match registered {
                 Ok(backing_id) => {
                     // Register the open BEFORE replying: the kernel may
@@ -610,22 +654,7 @@ impl Filesystem for CastoreFs {
             // open of this content releases. By the time this callback
             // runs the kernel has already detached `fi->fb` for this
             // open, so a future re-registration cannot EBUSY.
-            let last = {
-                let mut backings = self.backings.lock().ignore_poison();
-                match backings.by_digest.get_mut(&digest) {
-                    Some((id, refcount)) => {
-                        *refcount -= 1;
-                        if *refcount == 0 {
-                            let id = *id;
-                            backings.by_digest.remove(&digest);
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                }
-            };
+            let last = self.backings.lock().ignore_poison().release(&digest);
             if let Some(id) = last {
                 // Best-effort: a failed BackingClose leaks one IDR slot
                 // in the kernel until the connection dies. The
@@ -741,5 +770,103 @@ mod tests {
     fn raise_nofile_limit_is_best_effort() {
         raise_nofile_limit();
         raise_nofile_limit();
+    }
+
+    // ── BackingTable: the I-061 EBUSY-avoidance refcounting ──────────
+    //
+    // The kernel rejects a passthrough open of an inode that already
+    // has a *different* fuse_backing attached, so the table must mint
+    // exactly one backing id per live file_digest and only return it
+    // for closing once the last open releases. The caller holds the
+    // table's lock across acquire (mint included), so "two concurrent
+    // first-opens" serialize into mint-then-reuse — which is exactly
+    // what these sequential calls model.
+
+    /// Two opens of the same content mint exactly one backing id; the
+    /// second reuses the first's registration.
+    #[test]
+    fn backing_table_mints_once_and_reuses_for_concurrent_opens() {
+        let mut table = BackingTable::default();
+        let digest = [0xAB; 32];
+        let mut mints = 0u32;
+
+        let first = table
+            .acquire::<()>(digest, || {
+                mints += 1;
+                Ok(7)
+            })
+            .expect("first open mints");
+        let second = table
+            .acquire::<()>(digest, || {
+                mints += 1;
+                Ok(999)
+            })
+            .expect("second open reuses");
+        assert_eq!(first, 7);
+        assert_eq!(second, 7, "the second open must reuse the first's id");
+        assert_eq!(mints, 1, "exactly one BackingOpen for two opens");
+
+        // A different digest is an independent registration.
+        let other = table.acquire::<()>([0xCD; 32], || Ok(8)).unwrap();
+        assert_eq!(other, 8);
+    }
+
+    /// N acquires need N releases before the id is returned for
+    /// closing; closing early would yank the backing out from under a
+    /// still-open file handle.
+    #[test]
+    fn backing_table_closes_only_on_the_last_release() {
+        let mut table = BackingTable::default();
+        let digest = [0x11; 32];
+        for _ in 0..3 {
+            table.acquire::<()>(digest, || Ok(42)).unwrap();
+        }
+        assert_eq!(table.release(&digest), None, "2 opens still live");
+        assert_eq!(table.release(&digest), None, "1 open still live");
+        assert_eq!(
+            table.release(&digest),
+            Some(42),
+            "the last release returns the id to close"
+        );
+        // The registration is gone: the next open mints a fresh id
+        // (safe — the kernel detached fi->fb when the last open
+        // released) and a spurious extra release is a no-op, not an
+        // underflow.
+        assert_eq!(table.release(&digest), None);
+        let mut minted = false;
+        let next = table
+            .acquire::<()>(digest, || {
+                minted = true;
+                Ok(43)
+            })
+            .unwrap();
+        assert_eq!(next, 43);
+        assert!(minted, "a re-open after the last release mints fresh");
+    }
+
+    /// A failed mint (mountd unreachable, backing-id cap) leaves no
+    /// entry — the next open retries the registration instead of
+    /// reusing an id that was never issued.
+    #[test]
+    fn backing_table_failed_mint_leaves_no_entry() {
+        let mut table = BackingTable::default();
+        let digest = [0x22; 32];
+        let err = table
+            .acquire(digest, || Err::<u32, &str>("mountd is down"))
+            .expect_err("mint failure propagates");
+        assert_eq!(err, "mountd is down");
+        assert!(
+            table.by_digest.is_empty(),
+            "a failed mint must not leave a phantom registration"
+        );
+        assert_eq!(
+            table.release(&digest),
+            None,
+            "releasing a never-registered digest is a no-op"
+        );
+
+        // The retry mints for real.
+        let id = table.acquire::<()>(digest, || Ok(5)).unwrap();
+        assert_eq!(id, 5);
     }
 }
