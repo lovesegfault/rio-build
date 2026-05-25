@@ -116,6 +116,18 @@
         "description": "Global SSH connection cap (`r[gw.conn.cap]`)."
       },
       {
+        "key": "max_sessions",
+        "type": "uint",
+        "default": "4096",
+        "description": "Global active-session cap (`r[gw.conn.session-cap]`) — the pod's OOM backstop."
+      },
+      {
+        "key": "max_channels_per_connection",
+        "type": "uint",
+        "default": "512",
+        "description": "Per-connection SSH channel bound (`r[gw.conn.channel-limit+3]`)."
+      },
+      {
         "key": "max_transitive_inputs",
         "type": "uint",
         "default": "1048576",

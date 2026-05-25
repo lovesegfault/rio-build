@@ -93,10 +93,30 @@ pub struct Config {
     /// or rejects). Set via `RIO_SERVICE_HMAC_KEY_PATH`.
     pub service_hmac_key_path: Option<std::path::PathBuf>,
     /// Global SSH connection cap (`r[gw.conn.cap]`). At cap, new
-    /// connects are rejected at the first `auth_*` callback. Default
-    /// [`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000 —
-    /// ≈2 GiB bounded at 4 channels × 2×256 KiB each).
+    /// connects are rejected at the first `auth_*` callback. Bounds
+    /// per-connection russh state and file descriptors; session memory
+    /// is bounded separately by `max_sessions`. Default
+    /// [`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000). Set via
+    /// `RIO_MAX_CONNECTIONS`.
     pub max_connections: usize,
+    /// Global active-session cap (`r[gw.conn.session-cap]`) — the pod's
+    /// OOM backstop. Each exec'd protocol session costs ~550 KiB of
+    /// buffers, so the default 4096 ≈ 2.2 GiB of the 4 GiB pod limit.
+    /// At cap, additional `exec` requests are rejected cleanly (the SSH
+    /// channel opens, the exec gets `channel_failure` + exit-status 1)
+    /// — never with a channel-open refusal, which corrupts stock nix
+    /// clients behind `ControlMaster`. Default
+    /// [`crate::server::DEFAULT_MAX_SESSIONS`]. Set via
+    /// `RIO_MAX_SESSIONS`.
+    pub max_sessions: usize,
+    /// Per-connection SSH channel bound (`r[gw.conn.channel-limit+3]`).
+    /// An absurdity detector for channel-leaking or hostile clients,
+    /// not a resource bound — that is `max_sessions`. Default
+    /// [`crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION`] (512 —
+    /// a 128-core CI machine running nix-fast-build behind one
+    /// ControlMaster with 4× headroom). Set via
+    /// `RIO_MAX_CHANNELS_PER_CONNECTION`.
+    pub max_channels_per_connection: usize,
     /// DAG-reconstruction cap on transitive input derivations per
     /// build (DoS guard). Default
     /// [`crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS`]
@@ -130,6 +150,8 @@ impl Default for Config {
             rate_limit: None,
             service_hmac_key_path: None,
             max_connections: crate::server::DEFAULT_MAX_CONNECTIONS,
+            max_sessions: crate::server::DEFAULT_MAX_SESSIONS,
+            max_channels_per_connection: crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION,
             max_transitive_inputs: crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS,
         }
     }
@@ -255,6 +277,11 @@ mod tests {
         // (the right value is workload-dependent).
         assert!(d.rate_limit.is_none());
         assert_eq!(d.max_connections, crate::server::DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(d.max_sessions, crate::server::DEFAULT_MAX_SESSIONS);
+        assert_eq!(
+            d.max_channels_per_connection,
+            crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION
+        );
     }
 
     /// clap --help must still work (no panics in derive expansion).
@@ -271,6 +298,8 @@ mod tests {
         "gateway",
         r#"
         max_connections = 555
+        max_sessions = 2222
+        max_channels_per_connection = 33
         max_transitive_inputs = 250000
 
 
@@ -284,6 +313,8 @@ mod tests {
         "#,
         |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
+            assert_eq!(cfg.max_sessions, 2222);
+            assert_eq!(cfg.max_channels_per_connection, 33);
             assert_eq!(cfg.max_transitive_inputs, 250_000);
             assert!(
                 cfg.jwt.required,
@@ -310,6 +341,11 @@ mod tests {
         assert!(cfg.rate_limit.is_none());
         assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.max_connections, crate::server::DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(cfg.max_sessions, crate::server::DEFAULT_MAX_SESSIONS);
+        assert_eq!(
+            cfg.max_channels_per_connection,
+            crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION
+        );
         assert_eq!(
             cfg.max_transitive_inputs,
             crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS

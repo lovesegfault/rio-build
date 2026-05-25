@@ -154,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
         .with_rate_limiter(limiter)
         .with_max_connections(cfg.max_connections)
+        .with_max_sessions(cfg.max_sessions)
+        .with_max_channels_per_connection(cfg.max_channels_per_connection)
         .with_resolve_timeout(std::time::Duration::from_millis(cfg.resolve_timeout_ms));
     let server = match service_signer {
         Some(s) => server.with_service_hmac_signer(s),

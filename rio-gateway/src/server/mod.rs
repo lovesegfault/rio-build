@@ -38,10 +38,55 @@ use crate::ratelimit::TenantLimiter;
 
 /// Default global connection cap (`r[gw.conn.cap]`). At this many
 /// concurrent SSH connections, new accepts are rejected immediately.
-/// Each connection is ~2 MiB (MAX_CHANNELS_PER_CONNECTION × 2×256 KiB
-/// duplex buffers), so 1000 connections ≈ 2 GiB bounded. Configurable
-/// via `gateway.toml max_connections`.
+/// Bounds per-connection russh state and file descriptors; the memory
+/// consumed by protocol sessions is bounded separately by
+/// [`DEFAULT_MAX_SESSIONS`]. Configurable via `gateway.toml
+/// max_connections`.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
+
+/// Default global active-session cap (`r[gw.conn.session-cap]`) — the
+/// pod-level OOM backstop. Each exec'd protocol session allocates
+/// 2×256 KiB duplex buffers + a 64-slot mpsc + 3 task stacks (~550 KiB
+/// worst case), so 4096 sessions ≈ 2.2 GiB of the pod's 4 GiB limit.
+/// Sized to ~2× the largest plausible legitimate burst (a few CI
+/// machines × 64–128 nix-fast-build workers each) so it only fires
+/// under genuine overload, where a clean per-exec rejection beats an
+/// OOMKill of every other session.
+///
+/// Checked in `exec_request`, NOT `channel_open_session`: an exec-time
+/// `channel_failure` is a clean `ssh` exit for a ControlMaster mux
+/// client, while a channel-open refusal makes OpenSSH silently fall
+/// back to a direct connection that nix's `LocalCommand` corrupts.
+/// Configurable via `gateway.toml max_sessions`.
+///
+/// Horizontal scaling note: this is a per-pod cap. Adding replicas adds
+/// aggregate capacity for additional client *connections*, but a
+/// ControlMaster pins all of its channels to one pod's TCP connection —
+/// no amount of scale-out redistributes an already-multiplexed client.
+pub const DEFAULT_MAX_SESSIONS: usize = 4096;
+
+/// Default per-connection SSH channel bound
+/// (`r[gw.conn.channel-limit+3]`). An absurdity detector, not a
+/// resource bound: an attacker distributes sessions across the
+/// [`DEFAULT_MAX_CONNECTIONS`] allowed connections, so only the global
+/// [`DEFAULT_MAX_SESSIONS`] semaphore bounds pod memory. 512 covers a
+/// 128-core CI machine running nix-fast-build behind one ControlMaster
+/// with 4× headroom; its real job is stopping a burst of CHANNEL_OPENs
+/// with no exec (each allocates a russh channel-table entry but no
+/// ChannelSession) from growing without bound. Configurable via
+/// `gateway.toml max_channels_per_connection`.
+pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
+
+/// Grace period between the last SSH channel closing and the gateway
+/// disconnecting the idle connection (`r[gw.conn.exit-status+1]`). A
+/// ControlMaster mux whose in-flight session count transits through
+/// zero between builds must NOT lose its transport — the master would
+/// exit and every remaining nix process in the batch would fall back to
+/// a corrupted direct connection. 60 s comfortably covers inter-build
+/// gaps; a genuinely abandoned connection is still reaped 60× sooner
+/// than `inactivity_timeout`. Overridable for tests via
+/// `with_empty_connection_grace`.
+pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The SSH server that accepts connections and spawns protocol sessions.
 pub struct GatewayServer {
@@ -93,6 +138,19 @@ pub struct GatewayServer {
     /// Default [`DEFAULT_MAX_CONNECTIONS`] = 1000; override via
     /// `with_max_connections()`.
     conn_sem: Arc<Semaphore>,
+    // r[impl gw.conn.session-cap]
+    /// Global active-session semaphore. One permit per spawned protocol
+    /// session across all connections; acquired in `exec_request`,
+    /// released when the `ChannelSession` drops. Default
+    /// [`DEFAULT_MAX_SESSIONS`]; override via `with_max_sessions()`.
+    session_sem: Arc<Semaphore>,
+    /// Per-connection SSH channel absurdity bound. Default
+    /// [`DEFAULT_MAX_CHANNELS_PER_CONNECTION`]; override via
+    /// `with_max_channels_per_connection()`.
+    max_channels_per_connection: usize,
+    /// See [`EMPTY_CONNECTION_GRACE`]. Overridable for tests via
+    /// `with_empty_connection_grace()`.
+    empty_connection_grace: std::time::Duration,
     /// Count of REAL (post-auth-handshake) connections currently open.
     /// Same lifecycle as the `rio_gateway_connections_active` gauge —
     /// incremented in [`ConnectionHandler::mark_real_connection`],
@@ -133,6 +191,9 @@ impl GatewayServer {
             limiter: TenantLimiter::disabled(),
             quota_cache: QuotaCache::new(),
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            session_sem: Arc::new(Semaphore::new(DEFAULT_MAX_SESSIONS)),
+            max_channels_per_connection: DEFAULT_MAX_CHANNELS_PER_CONNECTION,
+            empty_connection_grace: EMPTY_CONNECTION_GRACE,
             active_conns: Arc::new(AtomicUsize::new(0)),
             sessions_shutdown: CancellationToken::new(),
         }
@@ -178,6 +239,30 @@ impl GatewayServer {
     /// (there are none before `run()`).
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.conn_sem = Arc::new(Semaphore::new(max));
+        self
+    }
+
+    /// Override the global active-session cap. Default
+    /// [`DEFAULT_MAX_SESSIONS`]. Must be called before `run()` —
+    /// replaces the semaphore, losing any already-acquired permits
+    /// (there are none before `run()`).
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.session_sem = Arc::new(Semaphore::new(max));
+        self
+    }
+
+    /// Override the per-connection SSH channel absurdity bound. Default
+    /// [`DEFAULT_MAX_CHANNELS_PER_CONNECTION`].
+    pub fn with_max_channels_per_connection(mut self, max: usize) -> Self {
+        self.max_channels_per_connection = max;
+        self
+    }
+
+    /// Override the idle-connection grace period. Default
+    /// [`EMPTY_CONNECTION_GRACE`]. Exposed so tests can use a short
+    /// grace without waiting 60 s for the disconnect to fire.
+    pub fn with_empty_connection_grace(mut self, grace: std::time::Duration) -> Self {
+        self.empty_connection_grace = grace;
         self
     }
 
@@ -479,6 +564,11 @@ impl russh::server::Server for GatewayServer {
             conn_permit,
             active_conns: Arc::clone(&self.active_conns),
             sessions_shutdown: self.sessions_shutdown.clone(),
+            session_sem: Arc::clone(&self.session_sem),
+            max_channels_per_connection: self.max_channels_per_connection,
+            open_channels: 0,
+            empty_connection_grace: self.empty_connection_grace,
+            pending_idle_disconnect: None,
         }
     }
 }

@@ -1144,16 +1144,24 @@ argument (`ends_with("nix-daemon")`) and requires the last argument to be
 exactly `--stdio`. This allows clients that send a full store path (e.g.,
 `/nix/store/...-nix-2.20.0/bin/nix-daemon --stdio`) to connect successfully.
 
-#r("gw.conn.exit-status")[
+#r("gw.conn.exit-status+1")[
   When the protocol handler returns, the gateway MUST send `exit-status` (RFC
   4254 §6.10) on the channel before `eof`/`close`; openssh under
   `ControlMaster` waits for `exit-status` before its foreground process returns
   to the parent (nix), so omitting it leaves `nom build` hung until
   `ControlPersist` expires. A rejected `exec_request` MUST send
   `channel_failure` followed by `exit-status 1` + `eof` + `close` for the same
-  reason. When the last channel on a connection closes, the gateway MUST send
-  `SSH_MSG_DISCONNECT` so the TCP socket closes promptly instead of waiting for
-  `inactivity_timeout`.
+  reason. When a connection has had zero open channels continuously for
+  `EMPTY_CONNECTION_GRACE` (60 s), the gateway MUST send `SSH_MSG_DISCONNECT`
+  so an abandoned TCP socket closes promptly instead of waiting for
+  `inactivity_timeout` (which an idle-but-keepalive-answering client never
+  trips). The gateway MUST NOT disconnect the instant the last channel closes:
+  a `ControlMaster` mux's in-flight session count transits through zero
+  between builds, and killing its transport there makes the master exit,
+  OpenSSH unlink the "stale" control socket, and every remaining nix process
+  in the batch silently fall back to a direct connection whose handshake is
+  corrupted by Nix's `LocalCommand` --- one touch-zero event poisons the rest
+  of a 64-worker run.
 ]
 
 #r("gw.conn.session-error-visible")[
@@ -1176,14 +1184,51 @@ exactly `--stdio`. This allows clients that send a full store path (e.g.,
   #rref("sched.backstop.timeout").
 ]
 
-#r("gw.conn.channel-limit+2")[
-  A single SSH connection may open at most `MAX_CHANNELS_PER_CONNECTION`
-  (default 4) active protocol sessions. Additional `channel_open_session`
-  requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`; an `exec_request` on an
-  already-open channel that would exceed the cap receives `channel_failure`
-  (the load-bearing check --- `channel_open_session` does not insert into the
-  session map, so a burst of opens followed by execs would otherwise bypass the
-  open-time gate). The limit matches Nix's default `max-jobs`.
+#r("gw.conn.channel-limit+3")[
+  A single SSH connection may have at most `max_channels_per_connection`
+  (default 512) channels open at the SSH level; additional
+  `channel_open_session` requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The
+  count MUST be taken at `channel_open_session`/`channel_close` (SSH-level
+  opens), not from the exec'd-session map, so a burst of opens with no exec is
+  bounded too. This is an absurdity bound on a channel-leaking or hostile
+  client, NOT a resource bound --- resource protection is
+  #rref("gw.conn.session-cap"), because an attacker distributes sessions
+  across the #rref("gw.conn.cap") allowed connections and only a global cap
+  bounds the instance. The bound MUST sit far above any legitimate
+  `ControlMaster` fan-out: one mux'd connection legitimately carries one
+  channel per concurrent nix process on the client machine (64--128 for a CI
+  box running `nix-fast-build`), and refusing a channel open corrupts a stock
+  nix client behind `ControlMaster auto` (OpenSSH silently falls back to a
+  direct connection where Nix's unconsumed `LocalCommand` output lands in
+  front of the worker-protocol handshake --- `protocol mismatch, got
+  'started\noixd'`).
+]
+
+The previous revision capped this at 4 "to match Nix's default `max-jobs`".
+That rationale was wrong on both ends: `max-jobs` controls local build
+parallelism (one `nix build -j64 --store ssh-ng://` opens *one* channel), and
+the thing that does stack channels on one connection --- N independent nix
+processes behind the user's `ControlMaster` --- is unbounded and legitimate.
+Like #rref("gw.conn.keepalive+2") (I-161), this was an SSH-hardening limit
+calibrated to an assumption about stock-client behavior that stock clients
+violate.
+
+#r("gw.conn.session-cap")[
+  The gateway MUST bound the total number of concurrently active protocol
+  sessions across all connections on the instance (`max_sessions`, default
+  4096). The bound MUST be enforced at `exec_request` time, before the
+  session's buffers are allocated, by rejecting the exec per
+  #rref("gw.conn.exit-status+1") --- never by refusing the channel open. An
+  exec-time `channel_failure` is a clean `ssh` exit for a `ControlMaster` mux
+  client (the master has already reported `MUX_S_SESSION_OPENED` to its
+  client by the time the exec reply arrives), while a channel-open refusal
+  triggers OpenSSH's silent fallback to a corrupted direct connection. Each
+  session costs \~550 KiB of duplex buffers, so the default bounds session
+  memory at \~2.2 GiB --- the instance's OOM backstop. The cap is per
+  instance: horizontal scaling adds aggregate capacity for additional client
+  connections, but a `ControlMaster` pins all of its channels to one
+  instance's TCP connection, so the cap must accommodate the largest single
+  multiplexed client on its own.
 ]
 
 #r("gw.conn.keepalive+2")[
