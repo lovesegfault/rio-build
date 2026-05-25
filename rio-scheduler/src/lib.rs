@@ -34,6 +34,14 @@ pub mod grpc;
 pub use rio_lease as lease;
 pub mod lease_hooks;
 pub(crate) mod queue;
+// The Phase-0 reference fold over a derivation's failure history — the
+// executable specification the retryPolicy model's CountersRefineHistory
+// invariant compares the live RetryState counters against. Dead code by
+// design until Phase 1 collapses the nine failure entry points onto
+// decide(); see the module doc for why it is wired (clippy/rustfmt/tests)
+// but unreferenced.
+#[allow(dead_code)]
+pub(crate) mod retry_policy;
 pub mod sla;
 pub mod state;
 

@@ -1058,6 +1058,11 @@
       "doc": "Priority ready queue for derivation dispatch."
     },
     {
+      "path": "retry_policy.rs",
+      "depth": 0,
+      "doc": "The reference fold over a derivation's observed failure history."
+    },
+    {
       "path": "sla/",
       "depth": 0,
       "doc": "ADR-023 SLA-driven per-derivation sizing."

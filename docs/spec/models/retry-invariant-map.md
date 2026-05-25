@@ -249,16 +249,23 @@ controller channel).
 
 ## Verify-marker status
 
-New rules whose verification is deferred to the Stage-B model
-(`retryPolicy.qnt`) and recorded here per the Phase-1-exit convention:
-`sched.retry.counters-refine-history` (the model's `CountersRefineHistory`
-invariant compares the live counters against the fold),
-`sched.retry.verdict-channel-invariant` (expected to falsify on the
-as-built encoding — D1/D3), `sched.retry.no-double-count` (expected to
-falsify or hold depending on the dedup encoding — the G5 family),
+New rules whose verification is deliberately deferred to the Stage-B model
+(`retryPolicy.qnt`) and therefore expected to appear in
+`tracey query untested` until the model's checks are wired:
+`sched.retry.verdict-channel-invariant` (expected to *falsify* on the
+as-built encoding — D1), `sched.retry.no-double-count` (expected to falsify
+or hold depending on the dedup encoding — the G5 family),
 `sched.retry.recovery-projection` (the model's failover action),
 `sched.poison.cascade-dependents` (the model's cascade action; the existing
-keep-going and recovery-cascade tests verify the build-level consequences).
-`sched.retry.transient-budget` and `sched.retry.attempts-bounded` are
-verified by the referenceFold's unit tests against hand-computed histories
-(`rio-scheduler/src/retry_policy.rs`).
+keep-going and recovery-cascade tests verify the build-level consequences
+but not the reaches-exactly-the-dependents set property).
+
+`sched.retry.transient-budget`, `sched.retry.attempts-bounded`, and
+`sched.retry.counters-refine-history` carry `r[verify]` markers on the
+referenceFold's unit tests (`rio-scheduler/src/retry_policy.rs`), which pin
+the fold against hand-computed histories covering every counter, the window
+reset, the exemption, a poison, a TTL expiry, and a per-executor exclusion.
+The model's exhaustive form of `counters-refine-history` — the *live*
+counters compared against the fold over every observation ordering — is
+still Stage-B work; the unit tests verify the fold, the model verifies the
+code against the fold.
