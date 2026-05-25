@@ -32,6 +32,13 @@
 
 pub mod outcome;
 pub mod request;
+// The sandbox child sequence (the next change in this crate) is the
+// production consumer of the seccomp filter; until it lands, the unit
+// tests are its only callers, so the module's items would otherwise trip
+// dead_code under `--deny warnings`. Remove the allow when the sandbox
+// sequence wires `build_filter` + `install` into the pre-exec path.
+#[allow(dead_code)]
+pub(crate) mod seccomp;
 
 pub use outcome::{
     ExecEvent, ExecutionOutcome, ExitOutcome, LogStream, OutputFileType, OutputMetadata,
