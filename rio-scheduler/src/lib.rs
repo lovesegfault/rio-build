@@ -210,14 +210,25 @@ pub fn describe_metrics() {
          the newly-inserted-CA path, that one counts the pre-existing-completed path."
     );
     describe_counter!(
+        "rio_scheduler_substitute_demotions_total",
+        "Non-forgivable path failures in the detached substitute walk, labeled by reason: \
+         not_found (every upstream definitively missed on every retry), not_found_infra \
+         (the NotFound never reached an upstream — no tenant context / substituter not \
+         configured / substitution disabled; fix the auth chain or config), error \
+         (non-transient gRPC error), exhausted (transient errors on every retry). Any \
+         increment demotes the derivation — and therefore its whole build-time closure — \
+         to a from-source build over a failed download; page on any sustained rate."
+    );
+    describe_counter!(
         "rio_scheduler_substitute_fetch_failures_total",
         "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
     );
     describe_counter!(
         "rio_scheduler_substitute_fetch_retries_total",
-        "Transient (Unavailable/Aborted/ResourceExhausted) substitute-fetch errors that \
-         triggered a backoff retry. High rate without matching failures = store load \
-         absorbed by retry; high rate WITH failures = backoff insufficient."
+        "Retryable substitute-fetch errors (transient Unavailable/Aborted/ResourceExhausted, \
+         or a NotFound that contradicts the earlier HEAD probe / narinfo) that triggered a \
+         backoff retry. High rate without matching failures = store load absorbed by retry; \
+         high rate WITH failures = backoff insufficient."
     );
     describe_counter!(
         "rio_scheduler_substitute_spawned_total",

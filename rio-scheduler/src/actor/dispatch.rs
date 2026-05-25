@@ -2571,6 +2571,51 @@ impl SubstituteAuth {
     }
 }
 
+/// `reason` label values for `rio_scheduler_substitute_demotions_total`,
+/// derived from the FINAL error that demoted a non-forgivable path. A
+/// small fixed set — never the raw store message or the path.
+///
+/// - `not_found`: a plain path-not-found after the retry ladder — every
+///   configured upstream definitively missed on every attempt (the HEAD
+///   probe and the GET really did disagree, persistently).
+/// - `not_found_infra`: the NotFound message indicates the request
+///   never reached the upstream (auth chain / substituter config) — fix
+///   the infrastructure, the path is probably fine.
+/// - `error`: a non-transient, non-NotFound gRPC error (no retry).
+/// - `exhausted`: transient errors on every attempt of the ladder.
+fn demotion_reason(e: &tonic::Status) -> &'static str {
+    match e.code() {
+        tonic::Code::NotFound => {
+            let m = e.message();
+            if m.contains("no tenant context")
+                || m.contains("substituter not configured")
+                || m.contains("substitution disabled")
+            {
+                "not_found_infra"
+            } else {
+                "not_found"
+            }
+        }
+        c if rio_common::grpc::is_transient(c) => "exhausted",
+        _ => "error",
+    }
+}
+
+/// Bump the demotion counters for a non-forgivable path whose failure
+/// is about to set `ok = false` — the derivation and its build-time
+/// closure are about to be compiled from source because a download
+/// failed. The caller emits the `error!` (the message differs per
+/// arm); this owns the two counters so no demotion site can increment
+/// one and forget the other.
+fn record_demotion(e: &tonic::Status) {
+    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+    metrics::counter!(
+        "rio_scheduler_substitute_demotions_total",
+        "reason" => demotion_reason(e)
+    )
+    .increment(1);
+}
+
 /// `MAX_SUBSTITUTE_CLOSURE` overshoot guard for [`walk_substitute_closure`].
 /// Re-checked after every per-path `references` push so a hostile
 /// upstream can overshoot by at most one path's `MAX_REFERENCES` (10k),
@@ -2613,8 +2658,11 @@ fn closure_cap_exceeded(visited: usize) -> bool {
 /// through to per-path QPI for the whole layer (correctness over
 /// throughput).
 ///
-/// Any `Ok(None)` (upstream miss), non-transient `Err`, retry-exhaust,
-/// or `MAX_SUBSTITUTE_CLOSURE` cap → `false`. Self-references and
+/// A non-transient `Err`, a retry-exhausted path (NotFound and
+/// transient errors share the backoff ladder — a NotFound inside the
+/// walk contradicts the HEAD probe / narinfo that named the path, so
+/// it is retried rather than believed on first occurrence), or the
+/// `MAX_SUBSTITUTE_CLOSURE` cap → `false`. Self-references and
 /// diamonds dedup via `visited`.
 ///
 /// **`forgivable`** is the subset of `seeds` whose failure must NOT
@@ -2628,19 +2676,26 @@ fn closure_cap_exceeded(visited: usize) -> bool {
 /// WANTED seed and a failed reference-BFS-discovered path (a runtime
 /// reference of something already fetched — its absence is a hole in a
 /// closure we are about to declare complete) keep failing the walk;
-/// only unwanted seeds are in `forgivable` by construction.
+/// only unwanted seeds are in `forgivable` by construction. A
+/// forgivable seed is forgiven on its FIRST failure of any kind — it
+/// does not consume the retry budget (the per-path loop is serial, so
+/// ~32 s of backoff on an output nobody consumes delays every path
+/// behind it).
 ///
 /// **Residual hole risk.** If a WANTED output runtime-references an
 /// unwanted sibling output, forgiving that sibling can leave a hole in
 /// the wanted output's runtime closure even though the walk returns
-/// `ok=true`. The no-hole guarantee only holds for the **NotFound**
-/// arm, and only against an upstream that maintains its closure
-/// invariant: an upstream that served the wanted output has every path
-/// in that output's closure, so a true miss on the sibling proves the
-/// wanted output does not reference it. The **non-transient-error**
-/// and **retry-exhaust** arms carry no such proof — the upstream may
-/// well have the sibling (a 500, a timeout, a flaky connection) and
-/// the walk still completes with the reference unsatisfied. Accepted
+/// `ok=true`. The no-hole guarantee only holds when the forgiven
+/// error is a **NotFound**, and only against an upstream that
+/// maintains its closure invariant: an upstream that served the wanted
+/// output has every path in that output's closure, so a true miss on
+/// the sibling proves the wanted output does not reference it. A
+/// forgiven **transient or non-transient error** carries no such proof
+/// — the upstream may well have the sibling (a 500, a timeout, a flaky
+/// connection) and the walk still completes with the reference
+/// unsatisfied; first-failure forgiveness widens this slightly (a
+/// transient blip that one retry would have cleared is now forgiven
+/// instead of retried). Accepted
 /// because (a) it requires the rare wanted→unwanted-sibling reference
 /// direction (`-debug`/`-doc` outputs reference their `out`, not the
 /// reverse), and (b) the alternative — failing the walk — is a
@@ -2754,6 +2809,13 @@ pub(super) async fn walk_substitute_closure(
             // emitting raw `done` would make the bar jump backward.
             // The hwm makes the per-path contribution monotone.
             let mut in_flight_hwm: u64 = 0;
+            // Final error of the retry ladder, for the post-loop
+            // exhaustion arm: the demotion log and the
+            // `substitute_demotions_total{reason}` label need to know
+            // whether the budget was burned by NotFounds (the upstream
+            // kept contradicting the probe) or by transient errors
+            // (the store never answered).
+            let mut last_err: Option<tonic::Status> = None;
             // Per-path re-mint cadence: the per-layer mint above is
             // not enough — this serial loop can run >30 min on a wide
             // cold layer (hundreds of paths × admission-wait + retry
@@ -2825,47 +2887,51 @@ pub(super) async fn walk_substitute_closure(
                         }
                         continue 'paths;
                     }
-                    Err(e) if e.code() == tonic::Code::NotFound => {
-                        // An unwanted seed the upstream definitively
-                        // misses is forgiven: not a failure (no
-                        // metric), the walk continues, the closure is
-                        // still complete for every output anything
-                        // consumes. `store_msg` for the same reason as
-                        // the fatal arm below: "no tenant context" /
-                        // "substituter not configured" mean the
-                        // request never reached the upstream — a
-                        // forgiven skip that should have been a fetch.
-                        if forgivable.contains(&p) {
-                            info!(path = %p, store_msg = e.message(),
-                                  "unwanted output not substituted; continuing without it");
-                            forgiven.push(p.clone());
-                            continue 'paths;
-                        }
-                        // The consequence of this arm is "compile the
-                        // derivation (and its build closure) from
-                        // source", so the WHY must survive into the
-                        // log. `store_msg` is rio-store's own reason:
-                        // "no tenant context on request" / "substituter
-                        // not configured" mean the request never
-                        // reached cache.nixos.org (fix the auth chain
-                        // / config); a bare "path not found" means
-                        // every configured upstream definitively
-                        // missed (the HEAD probe and the GET really
-                        // did disagree). Indistinguishable before
-                        // 2026-05-23.
-                        warn!(path = %p, store_msg = e.message(),
-                              "detached substitute fetch: NotFound; demoting to cache-miss");
-                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                            .increment(1);
-                        ok = false;
+                    // An unwanted seed is forgiven on its FIRST
+                    // failure of ANY kind: not a failure (no metric),
+                    // the walk continues, the closure is still
+                    // complete for every output anything consumes.
+                    // Checked before the retry ladder — burning ~32 s
+                    // of serialized backoff on an output nobody
+                    // consumes delays every path behind it in the
+                    // layer. The path was still ATTEMPTED once
+                    // (opportunistic completeness — it stays in the
+                    // seed list). `store_msg` for the same reason as
+                    // the fatal arms below: "no tenant context" /
+                    // "substituter not configured" mean the request
+                    // never reached the upstream — a forgiven skip
+                    // that should have been a fetch.
+                    Err(e) if forgivable.contains(&p) => {
+                        info!(path = %p, code = ?e.code(), store_msg = e.message(),
+                              "unwanted output not substituted; continuing without it");
+                        forgiven.push(p.clone());
                         continue 'paths;
                     }
-                    Err(e) if rio_common::grpc::is_transient(e.code()) => {
-                        debug!(path = %p, attempt, error = %e,
-                               "substitute fetch transient error; retrying");
+                    // A NotFound inside the walk is always a
+                    // contradiction: every path here was either
+                    // HEAD-probed as available minutes earlier (a
+                    // seed) or named in a narinfo the upstream just
+                    // served (a reference), so "the upstream doesn't
+                    // have it" disagrees with an observation the
+                    // store/upstream made moments ago. The genuinely-
+                    // not-on-any-upstream case never enters the walk.
+                    // Treat it like a transient error: retry through
+                    // the same backoff ladder. The 2026-05 incident
+                    // demoted 235 paths to from-source builds on
+                    // first-occurrence NotFounds that the store never
+                    // actually checked against the upstream; all 235
+                    // substituted fine 80 seconds later.
+                    Err(e)
+                        if e.code() == tonic::Code::NotFound
+                            || rio_common::grpc::is_transient(e.code()) =>
+                    {
+                        debug!(path = %p, attempt, code = ?e.code(), store_msg = e.message(),
+                               "substitute fetch retryable error; retrying");
                         metrics::counter!("rio_scheduler_substitute_fetch_retries_total")
                             .increment(1);
-                        if attempt + 1 == super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
+                        let exhausted = attempt + 1 == super::SUBSTITUTE_FETCH_MAX_ATTEMPTS;
+                        last_err = Some(e);
+                        if exhausted {
                             break;
                         }
                         tokio::select! {
@@ -2876,35 +2942,55 @@ pub(super) async fn walk_substitute_closure(
                         }
                     }
                     Err(e) => {
-                        // Same forgiveness as the NotFound arm: a
-                        // non-transient error on an unwanted seed is
-                        // not worth a from-source rebuild.
-                        if forgivable.contains(&p) {
-                            info!(path = %p, error = %e,
-                                  "unwanted output not substituted; continuing without it");
-                            forgiven.push(p.clone());
-                            continue 'paths;
-                        }
-                        warn!(path = %p, error = %e,
-                              "detached substitute fetch failed; demoting to cache-miss");
-                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                            .increment(1);
+                        // Non-transient, non-NotFound: retrying won't
+                        // change the answer. error! (not warn!) — this
+                        // event means a derivation and its build-time
+                        // closure are about to be compiled from source
+                        // because a download failed; it should page.
+                        error!(path = %p, error = %e, store_msg = e.message(),
+                               reason = demotion_reason(&e),
+                               "detached substitute fetch failed; demoting to cache-miss");
+                        record_demotion(&e);
                         ok = false;
                         continue 'paths;
                     }
                 }
             }
-            // Exhausted retries on transient errors.
-            if forgivable.contains(&p) {
-                info!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
-                      "unwanted output not substituted (retries exhausted); \
-                       continuing without it");
-                forgiven.push(p.clone());
-                continue 'paths;
+            // Retry ladder exhausted: every attempt failed with a
+            // retryable error (NotFound or transient) on a
+            // non-forgivable path — every other arm `continue 'paths`
+            // out of the attempt loop, so `last_err` is always the
+            // final attempt's error here. The consequence is "compile
+            // the derivation (and its build closure) from source", so
+            // the WHY must survive into the log: `store_msg` is
+            // rio-store's own reason — "no tenant context on request"
+            // / "substituter not configured" mean the request never
+            // reached cache.nixos.org (fix the auth chain / config); a
+            // bare "path not found" means every configured upstream
+            // definitively missed on every attempt (the HEAD probe and
+            // the GET really did disagree). Indistinguishable before
+            // 2026-05-23.
+            let store_msg = last_err
+                .as_ref()
+                .map(|e| e.message().to_owned())
+                .unwrap_or_default();
+            let reason = last_err.as_ref().map_or("exhausted", demotion_reason);
+            error!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
+                   store_msg, reason,
+                   "detached substitute fetch exhausted retries; demoting to cache-miss");
+            match last_err {
+                Some(e) => record_demotion(&e),
+                // Unreachable in practice; keep the failure counted
+                // rather than silently losing the demotion.
+                None => {
+                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+                    metrics::counter!(
+                        "rio_scheduler_substitute_demotions_total",
+                        "reason" => "exhausted"
+                    )
+                    .increment(1);
+                }
             }
-            warn!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
-                  "detached substitute fetch exhausted retries; demoting to cache-miss");
-            metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
             ok = false;
         }
     }

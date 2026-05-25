@@ -927,11 +927,16 @@ predicates filter by the wanted subset.
   `SUBSTITUTE_FETCH_TIMEOUT` (minutes, not seconds), and post
   `ActorCommand::SubstituteComplete{drv_hash, ok}` back into the mailbox. The
   task posts `ok=true` ONLY if every *wanted* seed and every node discovered
-  by the reference BFS was found or substituted; a `NotFound` / non-transient
-  error / retry-exhaust on any of those, or the `MAX_SUBSTITUTE_CLOSURE` cap,
+  by the reference BFS was found or substituted. Per-path failure handling
+  retries a `NotFound` or transient error up to the attempt budget before
+  recording the failure (every path in the walk was either probed as
+  available or named in a narinfo the upstream just served, so a `NotFound`
+  inside the walk contradicts an earlier observation); a non-transient error,
+  a path whose retries exhaust, or the `MAX_SUBSTITUTE_CLOSURE` cap,
   → `ok=false`. A seed that is declared-but-unwanted
   (#rref("sched.merge.wanted-outputs")) is still attempted --- opportunistic
-  completeness --- but its failure is forgiven: logged, not counted as a fetch
+  completeness --- but it is forgiven on its first failure of any kind,
+  without consuming the retry budget: logged, not counted as a fetch
   failure. The store substitutes ONE path per
   call (no recursion), so this BFS is the only place the runtime closure can be
   completed. `Substituting` is NOT terminal (`all_deps_completed` returns false

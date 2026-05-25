@@ -155,6 +155,25 @@ pub struct MockStoreFaults {
     /// structurally — every path retried exactly N times — without a
     /// wall-clock window.
     pub fail_qpi_resource_exhausted_per_path_n: Arc<std::sync::atomic::AtomicU32>,
+    /// While > 0, query_path_info / substitute_path return `NotFound`
+    /// for the first N attempts PER PATH (tracked via
+    /// [`MockStoreCalls::qpi_attempts_by_path`]); attempt N+1 falls
+    /// through to normal behavior. Models the incident shape where the
+    /// store short-circuits a substitution with NotFound without ever
+    /// reaching the upstream and a later attempt succeeds. For
+    /// retry-contradicted-NotFound tests (same per-path count shape as
+    /// `fail_qpi_resource_exhausted_per_path_n`).
+    pub fail_qpi_not_found_per_path_n: Arc<std::sync::atomic::AtomicU32>,
+    /// Paths for which query_path_info / substitute_path always return
+    /// `Internal` (non-transient, non-NotFound → no retry ladder).
+    /// Per-path counterpart of `fail_query_path_info_permanent` for
+    /// tests that need ONE path to fail hard while its siblings
+    /// substitute normally — e.g. the end-to-end demotion tests, which
+    /// would otherwise burn the scheduler's full ~32 s NotFound/
+    /// transient backoff ladder in real time (the actor-driven tests
+    /// can't virtualize the clock; ephemeral PG and paused time don't
+    /// compose).
+    pub fail_qpi_internal_paths: Arc<RwLock<HashSet<String>>>,
     /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
     pub fail_get_path: Arc<AtomicBool>,
     /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
@@ -328,6 +347,26 @@ impl MockStore {
         if per_path_n > 0 && attempt <= per_path_n {
             return Err(Status::resource_exhausted(
                 "mock: injected query_path_info ResourceExhausted (per-path-n)",
+            ));
+        }
+        let nf_per_path_n = self
+            .faults
+            .fail_qpi_not_found_per_path_n
+            .load(Ordering::SeqCst);
+        if nf_per_path_n > 0 && attempt <= nf_per_path_n {
+            return Err(Status::not_found(
+                "mock: injected query_path_info NotFound (per-path-n)",
+            ));
+        }
+        if self
+            .faults
+            .fail_qpi_internal_paths
+            .read()
+            .unwrap()
+            .contains(path)
+        {
+            return Err(Status::internal(
+                "mock: injected query_path_info permanent failure (per-path)",
             ));
         }
         if self.faults.fail_query_path_info.load(Ordering::SeqCst) {
