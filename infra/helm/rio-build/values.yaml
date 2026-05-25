@@ -229,9 +229,14 @@ store:
   chunkBackend:
     # Required — every NAR is chunked; the store refuses to start
     # with no backend. s3 requires bucket (+ endpoint/region/creds
-    # via env or IRSA); filesystem requires baseDir (+ a writable
-    # volume — the chart provisions a `rio-store-chunks` PVC and
-    # mounts it at baseDir for kind: filesystem); memory is test-only.
+    # via env or IRSA); tiered is s3 plus an optional per-AZ S3 Express
+    # read-through cache (same bucket/prefix keys for the authoritative
+    # tier); filesystem requires baseDir (+ a writable volume — the
+    # chart provisions a `rio-store-chunks` PVC and mounts it at
+    # baseDir for kind: filesystem); memory is test-only.
+    #
+    # Flipping tiered → s3 is instant and lossless (S3 standard is
+    # always authoritative; Express is a disposable read-through cache).
     kind: s3
     bucket: ""
     # Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).
@@ -247,6 +252,27 @@ store:
     # kind: filesystem only — size of the `rio-store-chunks` PVC the
     # chart provisions. Default 10Gi.
     # volumeSize: 10Gi
+    # kind=tiered only: the S3 Express One Zone directory bucket
+    # (`*--x-s3` name) this replica uses as its local cache tier.
+    # Rendered as RIO_CHUNK_BACKEND__EXPRESS_BUCKET when non-empty.
+    # Empty → no env var → TieredChunkBackend runs with local=None
+    # (direct S3-standard reads — degraded, never down).
+    #
+    # A Deployment-level value is only correct when every store pod is
+    # in the bucket's AZ (single-AZ cluster, an explicit zone
+    # nodeSelector, or a VM test's minio stand-in). For multi-AZ
+    # clusters leave this empty and populate expressBucketByAzId.
+    expressBucket: ""
+    # kind=tiered only: per-AZ Express bucket map keyed by physical
+    # AZ-ID, from `tofu output express_bucket_by_az_id`
+    # (xtask --set-json). NOT rendered into the pod env: the per-pod
+    # "which AZ am I in" resolution cannot be done by helm (the
+    # downward API exposes pod fields, not node labels) and is not yet
+    # implemented store-side — until it is, multi-AZ tiered deployments
+    # run every replica with local=None. Recorded here so the terraform
+    # output has a stable landing spot and the selection mechanism only
+    # has to read values, not re-plumb them.
+    expressBucketByAzId: {}
   # Pin the store pod to one node. Only rendered when
   # karpenter.enabled=false. Used with kind: filesystem so the pod
   # follows the local-path PV it bound (vmtest-full.yaml pins to the

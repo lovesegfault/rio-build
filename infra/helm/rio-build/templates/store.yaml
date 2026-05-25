@@ -109,6 +109,16 @@ spec:
             - name: AWS_ENDPOINT_URL
               value: {{ .endpoint | quote }}
             {{- end }}
+            {{- if and (eq .kind "tiered") .expressBucket }}
+            # Local cache tier (S3 Express One Zone directory bucket).
+            # Gated on kind so a stale expressBucket can't leak an
+            # unknown field into the s3/filesystem config variants.
+            # Omitted (not set to "") when empty: Some("") would build
+            # an S3 client against a bucket named "" — absent is what
+            # deserializes to express_bucket=None / local=None.
+            - name: RIO_CHUNK_BACKEND__EXPRESS_BUCKET
+              value: {{ .expressBucket | quote }}
+            {{- end }}
             {{- end }}
             {{- with $s.extraEnv }}
             {{- toYaml . | nindent 12 }}
