@@ -648,6 +648,176 @@ module retryPolicy {
     (poisonSrc != NoPoison) iff (dStatus == DPoisoned),
   }
 
+  /// The model-checked form of sched.retry.counters-refine-history+2:
+  /// the live counters equal the reference fold of the observed history
+  /// (carried incrementally as `spec`). poisoned_at is excluded when the
+  /// poison came from a site outside the fold's event alphabet (the
+  /// dispatch-time fleet exhaust, the recovery reconcile).
+  /// EXPECTED FALSIFICATION (pre-registered): histories reaching D2
+  /// (at-cap controller termination: the missing anchor stamp) or D3
+  /// (promoted controller termination: the missing exempt charge).
+  val countersRefineHistory =
+    if (poisonSrc == DispatchPoison or poisonSrc == RecoveryPoison)
+      { ...live, poisonedAt: NoTime } == { ...spec, poisonedAt: NoTime }
+    else
+      live == spec
+
+  /// The budget verdict is channel-invariant: the live terminal state
+  /// agrees with the fold's verdict over the observed history (the fold
+  /// is channel-invariant by construction, so live-vs-fold agreement is
+  /// the single-trace form of sched.retry.verdict-channel-invariant,
+  /// scoped to the terminal budget verdicts).
+  /// EXPECTED FALSIFICATION (pre-registered): the D1 history -- the
+  /// timeout budget exhausted via E7 lands as Poisoned where the fold
+  /// (and E4) produce Cancelled.
+  val verdictMatchesFold = and {
+    (dStatus == DPoisoned and poisonSrc == EventPoison) implies
+      match specVerdict { | VPoison(r) => true | VRequeue => false | VCancel => false },
+    dStatus == DCancelled implies specVerdict == VCancel,
+  }
+
+  /// sched.retry.attempts-bounded+2, the per-event clauses: a single
+  /// accounting observation never charges the same budget twice, and
+  /// every worker-reported failure or backstop observation either
+  /// charges at least one budget or produces a terminal state.
+  val attemptsChargedOnce = and {
+    not(last.doubleCharge),
+    (last.kind == OE1 or last.kind == OE2 or last.kind == OE3 or
+     last.kind == OE4 or last.kind == OE8)
+      implies (last.chargedAny or last.terminal),
+  }
+
+  /// sched.retry.attempts-bounded+2, the boundedness clause: the number
+  /// of physical attempts is bounded by what the enabled budgets
+  /// justify (ATTEMPT_BOUND is a regime constant).
+  /// EXPECTED FALSIFICATION (pre-registered): the C2 no-report
+  /// hard-crash loop -- an uncounted disconnect-requeue cycle bounded by
+  /// nothing in the retry machinery.
+  val attemptsBoundedGlobal = physAttempts <= ATTEMPT_BOUND
+
+  /// The model-checked form of sched.retry.no-double-count: one
+  /// physical executor death produces at most one counted accounting
+  /// event for the derivation, over every observation subset and order
+  /// the channels can produce.
+  val noDoubleCount = EXECUTORS.forall(w => execs.get(w).deathCharges <= 1)
+
+  /// Poison is terminal until cleared: while poisoned, no accounting
+  /// event charges the counters (the entry points' status guards hold --
+  /// the only charging observation that may coincide with DPoisoned is
+  /// the one that produced the poison itself, marked terminal), the
+  /// poison stamp stays present, and the only exits are the sanctioned
+  /// ones (TTL expiry, cache hit, bounded resubmit, failover recovery) --
+  /// the latter is structural: no other action's effect leaves DPoisoned.
+  val poisonIsTerminalUntilCleared = and {
+    (dStatus == DPoisoned and last.chargedAny) implies last.terminal,
+    dStatus == DPoisoned implies live.poisonedAt != NoTime,
+  }
+
+  /// The cascade reaches exactly the dependents: a DepFailed dependent is
+  /// justified by the building derivation having been failure-terminal,
+  /// and whenever the building derivation is failure-terminal the
+  /// not-yet-started dependent has been cascaded (the cascade is atomic
+  /// with the terminal transition; the resubmit re-merge re-seeds it).
+  val cascadeReachesExactlyTheDependents = and {
+    depStatus == DepFailed implies everFailureTerminal,
+    failureTerminal implies depStatus == DepFailed,
+  }
+
+  /// Post-failover state equals the documented projection of the
+  /// persisted row (4 recovered / 1 derived / 5 defaulted; poisoned rows
+  /// via from_poisoned_row, non-terminal rows via from_recovery_row).
+  val recoveryIsTheDocumentedProjection =
+    justFailedOver implies
+      if (dStatus == DPoisoned and poisonSrc != RecoveryPoison)
+        live == recoveryProjectionPoisoned(pg)
+      else if (dStatus == DReady)
+        live == recoveryProjectionNonTerminal(pg)
+      else true
+
+  /// No recovered counter exceeds what the durable rows support, and the
+  /// durable rows themselves never claim more than the history actually
+  /// produced (the mirror writers only lose writes, never invent them):
+  /// every executor PG names as a failed builder really did have a
+  /// charging failure recorded against it at some point, and the
+  /// recovered exclusion set comes from the row alone.
+  val recoveryNeverFabricatesFailures = and {
+    pg.failedBuilders.subseteq(everFailedBuilders),
+    justFailedOver implies live.failedBuilders.subseteq(pg.failedBuilders),
+  }
+
+  /// The durable view contains every charge the mirror protocol claims
+  /// to mirror: an executor recorded into the live failed_builders set is
+  /// also in the PG column.
+  /// EXPECTED FALSIFICATION (pre-registered, the durable face of D4):
+  /// E8's backstop charge has no append_failed_worker call, so the PG
+  /// column permanently misses it (and, in the fault regime, a lost
+  /// append_failed_worker does the same).
+  val durableMirrorsCharges = live.failedBuilders.subseteq(pg.failedBuilders)
+
+  /// The fleet-exhaust poison is sound: it only fires when the exclusion
+  /// set covers a non-empty eligible fleet (the empty fleet defers --
+  /// sched.dispatch.fleet-exhaust+3).
+  val placementSound =
+    (dStatus == DPoisoned and poisonSrc == DispatchPoison) implies
+      lastPoisonReason == RFleetExhausted
+
+  // --- 6b. expect-violation witnesses (non-vacuity probes) ---------------
+  // Each states "the interesting thing never happens"; the wired check
+  // passes only when the checker violates it. None of these are
+  // invariants.
+
+  /// Violated when the transient budget's cap poisons.
+  val noTransientCapPoison = not(dStatus == DPoisoned and lastPoisonReason == RTransientBudget)
+  /// Violated when the non-exempt infra budget's cap poisons.
+  val noInfraCapPoison = not(dStatus == DPoisoned and lastPoisonReason == RInfraBudget)
+  /// Violated when the exempt-infra budget's cap poisons.
+  val noExemptCapPoison = not(dStatus == DPoisoned and lastPoisonReason == RExemptInfraBudget)
+  /// Violated when the distinct-worker poison threshold fires.
+  val noThresholdPoison = not(dStatus == DPoisoned and lastPoisonReason == RThreshold)
+  /// Violated when the fleet-exhaust backstop poisons.
+  val noFleetExhaustPoison = not(dStatus == DPoisoned and lastPoisonReason == RFleetExhausted)
+  /// Violated when the worker-reported timeout cap produces terminal Cancelled.
+  val noTimeoutCapCancel = not(dStatus == DCancelled)
+  /// Violated when the controller-reported timeout cap poisons (the D1 arm).
+  val noControllerCapPoison = not(dStatus == DPoisoned and lastPoisonReason == RTimeoutBudget)
+  /// Violated when the I-127 stale-window reset fires.
+  val noWindowReset = not(last.windowReset)
+  /// Violated when the window reset fires on an exempt under-cap event
+  /// (the as-built E2 fall-through the corrected fold reproduces).
+  val noExemptFallthroughReset = not(last.exemptFallthrough)
+  /// Violated when a promoted controller termination is processed (D3 shape).
+  val noPromotedTermination = not(last.kind == OE6 and last.promoted)
+  /// Violated when an at-cap controller termination charges (D2 shape).
+  val noAtCapTermination = not(last.kind == OE6 and last.atCap and last.chargedAny)
+  /// Violated when a controller report is correlated through a
+  /// recently_disconnected entry (the late installment).
+  val noLateInstallment = not(last.lateInstallment)
+  /// Violated when a controller report races ahead of the disconnect.
+  val noRaceAheadReport = not(last.raceAhead)
+  /// Violated when the backstop fires.
+  val noBackstop = not(last.kind == OE8)
+  /// Violated when a poison TTL expiry clears the derivation.
+  val noTtlExpiry = not(last.kind == OTtlExpire)
+  /// Violated when a resubmit reset starts a second poison cycle.
+  val noResubmitReset = not(live.resubmitCycles > 0)
+  /// Violated when a cache hit clears a poisoned derivation.
+  val noCacheHitClear = not(last.kind == OCacheHit)
+  /// Violated when the dependent is cascaded.
+  val noCascade = not(depStatus == DepFailed)
+  /// Violated when a leader failover happens with a non-empty,
+  /// under-budget recovered history.
+  val noFailoverWithHistory = not(and {
+    justFailedOver,
+    pg.failedBuilders != Set() or pg.retryCount > 0,
+    dStatus == DReady,
+  })
+  /// Violated when a best-effort PG mirror write is lost.
+  val noPgWriteLost = not(pgFaultsLeft < PG_FAULTS)
+  /// Violated when a controller report charges (or poisons) for a death
+  /// whose disconnect was already processed -- both channels of one
+  /// death observed, the second one counted (the dedup's contended shape).
+  val noDualObservation = not(last.lateInstallment and (last.chargedAny or last.terminal))
+
   // --- 7. actions ---------------------------------------------------------
   // Every action's precondition is the corresponding code path's guard
   // and its effect is that path's state mutation; the entry point it
@@ -1678,4 +1848,440 @@ module retryPolicy {
     poisonTtlExpires,
     leaderFailover,
   }
+}
+
+// ===========================================================================
+// THE WORKER-CHANNEL REGIME: every failure is worker-reported (E1-E4), two
+// executor slots, resets enabled, no pod deaths, no controller channel, no
+// backstop, no failover, no PG faults. This is the regime where the live
+// counters and the reference fold share the whole event alphabet, so
+// countersRefineHistory and verdictMatchesFold are expected to HOLD: it
+// validates that the scattered per-entry-point increments (with their
+// per-counter fencepost conventions, the window reset and its exempt
+// fall-through, the backoff arming, the threshold/fleet/cap ordering)
+// really are the fold -- and it carries the placement/threshold scenarios
+// that need a second slot.
+// ===========================================================================
+module retryPolicyWorker {
+  import retryPolicy(
+    EXECUTORS = Set("w1", "w2"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 6,
+    ATTEMPT_BOUND = 6,
+    MAX_FAILOVERS = 0,
+    PG_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = false,
+    ENABLE_CRASH = false,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = true
+  ).*
+
+  /// The transient budget mechanics: the first failure charges count /
+  /// failure_count / failed_builders and arms the backoff (computed from
+  /// the pre-increment count), the placement exclusion sends the retry to
+  /// the other slot, the second distinct failure trips the poison
+  /// threshold (under default-shaped constants the distinct-worker
+  /// threshold always fires before the per-cycle count cap, because
+  /// hard_filter never lets the same worker fail the same derivation
+  /// twice in a cycle), the cascade reaches the dependent, and the
+  /// resubmit reset restores the per-cycle budget while counting the
+  /// cycle.
+  run transientBudgetRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTransient, false))
+      .then(processReport("w1", RcTransient, false, false, false, false))
+      .expect(all {
+        live.count == 1, live.failureCount == 1, live.backoffUntil == At(1),
+        live.failedBuilders == Set("w1"), pg.failedBuilders == Set("w1"),
+        countersRefineHistory, verdictMatchesFold, dStatus == DReady,
+        not(placeable.contains("w1")),
+      })
+      .then(tick)
+      .then(dispatchTo("w2"))
+      .then(buildEndsReported("w2", RcTransient, false))
+      .then(processReport("w2", RcTransient, false, false, false, false))
+      .expect(all {
+        dStatus == DPoisoned, lastPoisonReason == RThreshold,
+        depStatus == DepFailed, countersRefineHistory, verdictMatchesFold,
+        cascadeReachesExactlyTheDependents, durableMirrorsCharges,
+      })
+      .then(resubmitReset(false))
+      .expect(all {
+        dStatus == DReady, live.resubmitCycles == 1, live.count == 0,
+        live.failedBuilders == Set(), depStatus == DepReady,
+        countersRefineHistory, recoveryNeverFabricatesFailures,
+      })
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTransient, false))
+      .then(processReport("w1", RcTransient, false, false, false, false))
+      .expect(all {
+        dStatus == DReady, live.count == 1, live.resubmitCycles == 1,
+        countersRefineHistory,
+      })
+
+  /// The distinct-worker poison threshold: one failure on each slot and
+  /// the second one trips the threshold before the count cap is reached.
+  run thresholdPoisonRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTransient, false))
+      .then(processReport("w1", RcTransient, false, false, false, false))
+      .then(tick)
+      .then(dispatchTo("w2"))
+      .then(buildEndsReported("w2", RcTransient, false))
+      .then(processReport("w2", RcTransient, false, false, false, false))
+      .expect(all {
+        dStatus == DPoisoned, lastPoisonReason == RThreshold,
+        live.failedBuilders == Set("w1", "w2"),
+        countersRefineHistory, verdictMatchesFold, durableMirrorsCharges,
+      })
+
+  /// The I-127 window reset, including the as-built exempt fall-through:
+  /// a counted infra failure anchors the window, an exempt
+  /// (CONCURRENT_PUTPATH) failure past the window also zeroes the counted
+  /// budget while charging only the exemption budget, and the fold
+  /// reproduces both.
+  run infraWindowExemptFallthroughRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcInfraOther, false))
+      .then(processReport("w1", RcInfraOther, false, false, false, false))
+      .expect(all { live.infraCount == 1, live.lastInfraAt == At(0), countersRefineHistory })
+      .then(tick)
+      .then(tick)
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcInfraPutPath, false))
+      .then(processReport("w1", RcInfraPutPath, false, false, false, false))
+      .expect(all {
+        live.infraCount == 0,
+        live.exemptInfraCount == 1,
+        live.lastInfraAt == At(0),
+        last.windowReset, last.exemptFallthrough,
+        countersRefineHistory,
+      })
+
+  /// The worker-reported timeout budget: terminal Cancelled (not
+  /// Poisoned) at the cap, immediately resubmit-retriable.
+  run workerTimeoutCancelRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTimeout, false))
+      .then(processReport("w1", RcTimeout, false, false, false, false))
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTimeout, false))
+      .then(processReport("w1", RcTimeout, false, false, false, false))
+      .expect(all { live.timeoutCount == 2, dStatus == DReady })
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTimeout, false))
+      .then(processReport("w1", RcTimeout, false, false, false, false))
+      .expect(all {
+        dStatus == DCancelled, specVerdict == VCancel,
+        verdictMatchesFold, countersRefineHistory,
+        depStatus == DepFailed,
+      })
+      .then(resubmitReset(false))
+      .expect(dStatus == DReady and live.resubmitCycles == 1)
+}
+
+// ===========================================================================
+// THE DUAL-CHANNEL REGIME: pod deaths, the controller report channel (with
+// race-ahead, late-installment, re-dispatch interleavings and report loss),
+// the wedge/backstop, the no-report crash, and the worker channel, on one
+// executor slot. This is the regime that carries the pre-registered
+// expected falsifications: verdictMatchesFold falsifies on the D1 history
+// (the timeout cap exhausted via E7 lands as Poisoned), countersRefineHistory
+// falsifies on D2/D3 histories (the at-cap controller increment without the
+// window anchor; the promoted controller termination that charges nothing),
+// and durableMirrorsCharges falsifies on D4 (the backstop charge that never
+// reaches PG). The dedup invariant noDoubleCount and the per-event charge
+// discipline are expected to HOLD.
+// ===========================================================================
+module retryPolicyDual {
+  import retryPolicy(
+    EXECUTORS = Set("w1"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 6,
+    ATTEMPT_BOUND = 6,
+    MAX_FAILOVERS = 0,
+    PG_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = true,
+    ENABLE_CRASH = true,
+    ENABLE_WEDGE = true,
+    ENABLE_RESETS = true
+  ).*
+
+  /// D1 reproducer: the same exhausted timeout budget that E4 turns into
+  /// terminal Cancelled is turned into Poisoned by E7 when the controller
+  /// observes the deadline overruns -- the verdict depends on the channel.
+  run d1ControllerTimeoutCapPoisonRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkDeadline))
+      .then(processDisconnect("w1"))
+      .then(ctrlDeliverDeadline("w1"))
+      .expect(all { live.timeoutCount == 1, countersRefineHistory, verdictMatchesFold })
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkDeadline))
+      .then(processDisconnect("w1"))
+      .then(ctrlDeliverDeadline("w1"))
+      .expect(all { live.timeoutCount == 2, countersRefineHistory, verdictMatchesFold })
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkDeadline))
+      .then(processDisconnect("w1"))
+      .then(ctrlDeliverDeadline("w1"))
+      .expect(all {
+        // the cap-hitting observation arrives on the controller channel:
+        // the as-built E7 poisons (24 h TTL, bounded resubmit) where the
+        // fold -- and the worker-reported E4 -- produce Cancel.
+        dStatus == DPoisoned,
+        lastPoisonReason == RTimeoutBudget,
+        specVerdict == VCancel,
+        not(verdictMatchesFold),
+        not(countersRefineHistory),
+        noDoubleCount,
+      })
+
+  /// D2 reproducer: an at-cap controller-reported OOM charges infra_count
+  /// without stamping the window anchor; the fold stamps it.
+  run d2AtCapAnchorRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkOom))
+      .then(processDisconnect("w1"))
+      .then(ctrlDeliverOomLate("w1", false, true))
+      .expect(all {
+        live.infraCount == 1,
+        live.lastInfraAt == NoTime,
+        spec.infraCount == 1,
+        spec.lastInfraAt == At(0),
+        not(countersRefineHistory),
+        last.lateInstallment,
+        noDoubleCount,
+        verdictMatchesFold,
+      })
+
+  /// D3 reproducer: a floor-promoted controller-reported OOM charges
+  /// nothing; the fold charges exempt_infra_count per
+  /// sched.retry.exempt-infra-cap.
+  run d3PromotedChargesNothingRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkOom))
+      .then(processDisconnect("w1"))
+      .then(ctrlDeliverOomLate("w1", true, false))
+      .expect(all {
+        live.exemptInfraCount == 0,
+        spec.exemptInfraCount == 1,
+        not(countersRefineHistory),
+        verdictMatchesFold,
+        noDoubleCount,
+      })
+
+  /// D4 reproducer: the backstop's failed_builders/failure_count charge
+  /// has no PG mirror, so the durable view permanently misses it.
+  run d4BackstopUnmirroredRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildWedges("w1"))
+      .then(backstopFires("w1"))
+      .expect(all {
+        live.failedBuilders == Set("w1"),
+        live.failureCount == 1,
+        pg.failedBuilders == Set(),
+        not(durableMirrorsCharges),
+        countersRefineHistory,
+        dStatus == DReady,
+      })
+
+  /// The dedup under the dual observation of one death: the race-ahead
+  /// report charges, sets last_completed so the disconnect does not
+  /// insert a recently_disconnected entry, and the late re-report finds
+  /// nothing -- exactly one counted accounting event for one death.
+  run dualObservationDedupRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkOom))
+      .then(ctrlDeliverOomRaceAhead("w1", false, true))
+      .expect(all { live.infraCount == 1, last.raceAhead, noDoubleCount })
+      .then(processDisconnect("w1"))
+      .expect(all {
+        execs.get("w1").rd == NoTime,
+        live.infraCount == 1,
+        noDoubleCount,
+        dStatus == DReady,
+      })
+
+  /// The late installment landing after the derivation was already
+  /// re-dispatched: the charge still lands on the derivation (the status
+  /// guard admits Running), the next attempt keeps running.
+  run lateInstallmentAfterRedispatchRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkOom))
+      .then(processDisconnect("w1"))
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(ctrlDeliverOomLate("w1", false, true))
+      .expect(all {
+        dStatus == DRunning,
+        live.infraCount == 1,
+        last.lateInstallment,
+        noDoubleCount,
+        not(countersRefineHistory), // D2: the anchor again
+      })
+}
+
+// ===========================================================================
+// THE CRASH REGIME: the C2 no-report hard-crash loop in isolation. The only
+// failure the executor ever produces is a daemon crash with no
+// CompletionReport and no usable controller reason; every cycle resets the
+// derivation to Ready and charges nothing, so the boundedness clause of
+// sched.retry.attempts-bounded+2 is falsified: physAttempts exceeds the
+// bound the poison threshold would justify if disconnects counted (the
+// spec's "executor disconnect DOES count" sentence -- contradiction C2).
+// ===========================================================================
+module retryPolicyCrash {
+  import retryPolicy(
+    EXECUTORS = Set("w1"),
+    MAX_TIME = 1,
+    MAX_ATTEMPTS = 5,
+    ATTEMPT_BOUND = 3,
+    MAX_FAILOVERS = 0,
+    PG_FAULTS = 0,
+    ENABLE_WORKER = false,
+    ENABLE_PODDEATH = false,
+    ENABLE_CRASH = true,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = false
+  ).*
+
+  /// C2 reproducer: four uncounted dispatch-crash-requeue cycles exceed
+  /// the threshold-derived bound without any budget moving.
+  run c2CrashLoopRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkCrash))
+      .then(processDisconnect("w1"))
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkCrash))
+      .then(processDisconnect("w1"))
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsPodDeath("w1", DkCrash))
+      .then(processDisconnect("w1"))
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .expect(all {
+        physAttempts == 4,
+        not(attemptsBoundedGlobal),
+        live == zeroCounters,
+        countersRefineHistory,
+        attemptsChargedOnce,
+      })
+}
+
+// ===========================================================================
+// THE FAULT-PERSIST / FAILOVER REGIME: the dual-channel alphabet (minus the
+// crash loop) plus one leader failover and one silently-lost best-effort PG
+// mirror write. The recovery invariants are the load-bearing ones here: the
+// post-failover state is the documented 4-recovered / 1-derived / 5-defaulted
+// projection of whatever PG actually holds, and nothing in PG or in the
+// recovered state claims a failure that never happened -- lost writes only
+// ever make the durable view (and therefore the recovered state) more
+// forgiving, never less.
+// ===========================================================================
+module retryPolicyFailover {
+  import retryPolicy(
+    EXECUTORS = Set("w1"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 5,
+    ATTEMPT_BOUND = 5,
+    MAX_FAILOVERS = 1,
+    PG_FAULTS = 1,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = true,
+    ENABLE_CRASH = false,
+    ENABLE_WEDGE = true,
+    ENABLE_RESETS = true
+  ).*
+
+  /// The selective forgiveness end to end: an infra charge and a timeout
+  /// charge (both RAM-only) plus a transient charge (mirrored); after the
+  /// failover the mirrored counters come back, failure_count is re-derived
+  /// from the persisted exclusion set, the RAM-only budgets are forgiven,
+  /// and the fold ghost is re-seeded alongside the live counters.
+  run failoverForgivenessRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcInfraOther, false))
+      .then(processReport("w1", RcInfraOther, false, false, false, false))
+      .expect(all { live.infraCount == 1, pg.retryCount == 0 })
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTimeout, false))
+      .then(processReport("w1", RcTimeout, false, false, false, false))
+      .expect(all { live.timeoutCount == 1, live.infraCount == 1 })
+      .then(respawnExecutor("w1"))
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcTransient, false))
+      .then(processReport("w1", RcTransient, false, false, false, false))
+      .expect(all {
+        live.count == 1, live.failedBuilders == Set("w1"),
+        pg.retryCount == 1, pg.failedBuilders == Set("w1"),
+        live.infraCount == 1, live.timeoutCount == 1,
+      })
+      .then(leaderFailover)
+      .expect(all {
+        justFailedOver,
+        dStatus == DReady,
+        live.count == 1,
+        live.failedBuilders == Set("w1"),
+        live.failureCount == 1,
+        live.infraCount == 0,
+        live.timeoutCount == 0,
+        live.backoffUntil == NoTime,
+        recoveryIsTheDocumentedProjection,
+        recoveryNeverFabricatesFailures,
+        countersRefineHistory,
+      })
+
+  /// A lost persist_poisoned mirror write: the in-memory poison stands
+  /// for the rest of the tenure, but the durable row never learned of it,
+  /// so the failover recovers the derivation as Ready with only what the
+  /// row supports -- the documented consequence of best-effort mirrors,
+  /// not a fabrication (and not a violation of the projection rule).
+  run lostPoisonMirrorFailoverRun =
+    init
+      .then(dispatchTo("w1"))
+      .then(buildEndsReported("w1", RcPermanent, false))
+      // the poisoning report's PG writes (persist_poisoned +
+      // append_failed_worker) are silently lost
+      .then(processReport("w1", RcPermanent, false, false, false, true))
+      .expect(all {
+        dStatus == DPoisoned,
+        lastPoisonReason == RPermanent,
+        pg.status == PgNonTerminal,
+        pg.failedBuilders == Set(),
+        pgFaultsLeft == 0,
+        recoveryNeverFabricatesFailures,
+      })
+      .then(leaderFailover)
+      .expect(all {
+        dStatus == DReady,
+        live == zeroCounters,
+        recoveryIsTheDocumentedProjection,
+        recoveryNeverFabricatesFailures,
+        poisonIsTerminalUntilCleared,
+        countersRefineHistory,
+      })
 }
