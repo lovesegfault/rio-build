@@ -143,7 +143,9 @@ impl StoreServiceImpl {
                 bail!(e);
             }
             // r[impl sec.authz.ca-path-derived+2]
-            if let Err(e) = verify_ca_store_path(info, auth.hmac_claims.as_ref(), &ctx) {
+            if let Err(e) =
+                verify_ca_store_path(info, &accum.nar_data, auth.hmac_claims.as_ref(), &ctx)
+            {
                 bail!(e);
             }
 

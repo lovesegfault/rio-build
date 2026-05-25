@@ -271,7 +271,7 @@ pub(in crate::grpc) fn verify_nar(
 /// [`validate_put_metadata`] skipped the `store_path ∈
 /// expected_outputs` check (the path isn't known at sign time). This
 /// is the replacement gate: recompute the CA store path SERVER-SIDE
-/// from the NAR hash that [`verify_nar`] just confirmed, and reject if
+/// from the NAR that [`verify_nar`] just confirmed, and reject if
 /// it doesn't match `info.store_path`. A worker holding an
 /// `is_ca=true` token therefore cannot upload to any path that isn't
 /// the content-derived path of the NAR it actually sent.
@@ -281,10 +281,24 @@ pub(in crate::grpc) fn verify_nar(
 /// (`state.ca.is_ca && !state.is_fixed_output`). FODs with known
 /// output paths go through the IA `expected_outputs` check instead.
 ///
+/// **Self-references**: a floating-CA output whose content embeds its
+/// own store path declares itself in `references`. The expected path
+/// is then `make_fixed_output_with_self` over the **hash modulo
+/// self-references** — the NAR re-hashed with every occurrence of the
+/// *claimed* path's hash part zeroed ([`HashModuloSink`]). This stays
+/// self-certifying: a forged claim would need a path whose hash part,
+/// once zeroed in the content, hashes back to exactly that path.
+/// Non-self-referencing uploads keep using the already-verified plain
+/// NAR hash (identical to the modulo hash when there are no
+/// occurrences) — no second pass over the bytes.
+///
 /// `None`/non-CA claims → no-op (IA already gated, dev/service
 /// bypass already trusted).
+///
+/// [`HashModuloSink`]: rio_nix::ca::HashModuloSink
 pub(in crate::grpc) fn verify_ca_store_path(
     info: &ValidatedPathInfo,
+    nar_data: &[u8],
     hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
     ctx_label: &str,
 ) -> Result<(), Status> {
@@ -295,34 +309,41 @@ pub(in crate::grpc) fn verify_ca_store_path(
         return Ok(());
     }
 
-    // Self-reference: Nix's `:self` token in the source-type
-    // fingerprint isn't yet implemented in rio-nix's
-    // `make_fixed_output`. Filter the path-under-construction out of
-    // refs and reject explicitly if it was present — none in the
-    // current build graph.
+    // The path under construction may appear in its own reference set
+    // (declared self-reference). It is expressed via the `:self`
+    // fingerprint token, never as an ordinary reference.
     let refs: Vec<rio_nix::store_path::StorePath> = info
         .references
         .iter()
         .filter(|r| r.as_str() != info.store_path.as_str())
         .cloned()
         .collect();
-    if refs.len() != info.references.len() {
-        return Err(Status::unimplemented(format!(
-            "{ctx_label}: self-referencing floating-CA not yet supported \
-             (extend make_fixed_output with :self)"
-        )));
-    }
+    let has_self_reference = refs.len() != info.references.len();
 
-    // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar has
-    // already confirmed it equals SHA-256(stream)).
-    let nar_hash =
+    let content_hash = if has_self_reference {
+        // Hash modulo self-references: zero every occurrence of the
+        // claimed path's hash part, then hash. O(nar) — only paid by
+        // self-referencing uploads.
+        use std::io::Write as _;
+        let mut sink = rio_nix::ca::HashModuloSink::new(
+            rio_nix::hash::HashAlgo::SHA256,
+            &info.store_path.hash_part(),
+        );
+        sink.write_all(nar_data)
+            .map_err(|e| Status::internal(format!("{ctx_label}: hash-modulo: {e}")))?;
+        sink.finish().0
+    } else {
+        // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar
+        // has already confirmed it equals SHA-256(stream)).
         rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
-            .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))?;
-    let expected = rio_nix::store_path::StorePath::make_fixed_output(
+            .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))?
+    };
+    let expected = rio_nix::store_path::StorePath::make_fixed_output_with_self(
         info.store_path.name(),
-        &nar_hash,
+        &content_hash,
         /* recursive */ true,
         &refs,
+        has_self_reference,
     )
     .map_err(|e| Status::invalid_argument(format!("{ctx_label}: CA path derive: {e}")))?;
 
@@ -530,7 +551,7 @@ impl StoreServiceImpl {
             info,
             "PutPath",
         )?;
-        verify_ca_store_path(info, hmac_claims, "PutPath")?;
+        verify_ca_store_path(info, &nar_data, hmac_claims, "PutPath")?;
         Ok((nar_data, held_permits))
     }
 
@@ -668,7 +689,7 @@ impl StoreServiceImpl {
 #[cfg(test)]
 mod verify_nar_tests {
     use super::*;
-    use rio_test_support::fixtures::{make_path_info_for_nar, test_store_path};
+    use rio_test_support::fixtures::{make_path_info_for_nar, test_drv_path, test_store_path};
 
     fn digest(d: &[u8]) -> [u8; 32] {
         Sha256::digest(d).into()
@@ -685,6 +706,135 @@ mod verify_nar_tests {
 
         let e = verify_nar(digest(b"different data"), data.len() as u64, &info, "t").unwrap_err();
         assert!(e.message().contains("hash mismatch"), "got: {e:?}");
+    }
+
+    /// Build the canonical NAR of a regular file with the given contents.
+    fn nar_of_file(contents: &[u8]) -> Vec<u8> {
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: contents.to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).expect("in-memory NAR serialize");
+        nar
+    }
+
+    fn ca_claims() -> rio_auth::hmac::AssignmentClaims {
+        rio_auth::hmac::AssignmentClaims {
+            executor_id: "test-executor".into(),
+            drv_hash: "test-drv-hash".into(),
+            expected_outputs: vec![String::new()],
+            is_ca: true,
+            expiry_unix: u64::MAX,
+            tenant: None,
+        }
+    }
+
+    /// Construct a ValidatedPathInfo claiming `path` with `references`,
+    /// nar_hash = SHA-256(nar).
+    fn ca_info(
+        path: &rio_nix::store_path::StorePath,
+        references: &[rio_nix::store_path::StorePath],
+        nar: &[u8],
+    ) -> ValidatedPathInfo {
+        let mut info = make_path_info_for_nar(path.as_str(), nar);
+        info.references = references.to_vec();
+        info
+    }
+
+    /// The genuine content-derived path of a SELF-REFERENCING CA output:
+    /// fixed-point construction — content embeds the scratch path, the
+    /// final path is derived from the content with the scratch hash
+    /// zeroed, then the content is rewritten scratch→final. The
+    /// underlying primitives are golden-tested against real `nix` in
+    /// rio-nix (`tests/ca_golden.rs`); these tests pin the GATE's
+    /// behavior (declared-self detection, modulus choice, rejection).
+    fn build_self_referencing_upload(name: &str) -> (rio_nix::store_path::StorePath, Vec<u8>) {
+        use std::io::Write as _;
+        let drv = rio_nix::store_path::StorePath::parse(&test_drv_path(name)).unwrap();
+        let scratch =
+            rio_nix::store_path::StorePath::make_scratch_output_path(&drv, "out").unwrap();
+        let content_at_scratch = format!("I live at {}\n", scratch.as_str()).into_bytes();
+        let nar_at_scratch = nar_of_file(&content_at_scratch);
+
+        let mut sink =
+            rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &scratch.hash_part());
+        sink.write_all(&nar_at_scratch).unwrap();
+        let (modulo, _) = sink.finish();
+        let final_path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            name,
+            &modulo,
+            true,
+            &[],
+            true,
+        )
+        .unwrap();
+
+        // Rewrite scratch→final in the content (same-length hash parts).
+        let final_content = String::from_utf8(content_at_scratch)
+            .unwrap()
+            .replace(&scratch.hash_part(), &final_path.hash_part())
+            .into_bytes();
+        (final_path, nar_of_file(&final_content))
+    }
+
+    #[test]
+    fn ca_self_reference_accepted_and_wrong_path_rejected() {
+        let (path, nar) = build_self_referencing_upload("selfref-gate");
+        let info = ca_info(&path, std::slice::from_ref(&path), &nar);
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("genuine self-referencing upload must pass");
+
+        // Same NAR claimed under a different (well-formed) path: the
+        // modulus changes, the recomputed path can't match the claim.
+        let other = rio_nix::store_path::StorePath::parse(&test_store_path("imposter")).unwrap();
+        let info = ca_info(&other, std::slice::from_ref(&other), &nar);
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    #[test]
+    fn ca_undeclared_self_reference_rejected() {
+        // Content embeds the claimed path but `references` does not
+        // declare it: the gate must use the plain NAR hash (no modulo),
+        // which cannot reproduce the claimed path.
+        let (path, nar) = build_self_referencing_upload("selfref-undeclared");
+        let info = ca_info(&path, &[], &nar);
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    #[test]
+    fn ca_non_self_referencing_unchanged() {
+        // No self-reference: expected path = make_fixed_output over the
+        // plain NAR hash (the pre-existing behavior).
+        let nar = nar_of_file(b"no self references here\n");
+        let digest: [u8; 32] = Sha256::digest(&nar).into();
+        let hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
+        let path = rio_nix::store_path::StorePath::make_fixed_output("plain-ca", &hash, true, &[])
+            .unwrap();
+        let info = ca_info(&path, &[], &nar);
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").expect("plain CA must pass");
+
+        // And a wrong claim is still rejected.
+        let other = rio_nix::store_path::StorePath::parse(&test_store_path("wrong")).unwrap();
+        let info = ca_info(&other, &[], &nar);
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn ca_gate_noop_without_ca_claims() {
+        let nar = nar_of_file(b"whatever\n");
+        let path = rio_nix::store_path::StorePath::parse(&test_store_path("ia-path")).unwrap();
+        let info = ca_info(&path, &[], &nar);
+        // No claims at all.
+        verify_ca_store_path(&info, &nar, None, "t").expect("no claims = no-op");
+        // Claims with is_ca = false.
+        let mut claims = ca_claims();
+        claims.is_ca = false;
+        verify_ca_store_path(&info, &nar, Some(&claims), "t").expect("non-CA claims = no-op");
     }
 
     /// Incremental hashing through `accumulate_chunk` produces the same
