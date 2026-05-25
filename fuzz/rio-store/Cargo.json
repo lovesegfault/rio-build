@@ -9459,9 +9459,11 @@
         "hostname",
         "mman",
         "mount",
+        "personality",
         "process",
         "sched",
         "signal",
+        "term",
         "uio",
         "user"
       ],
@@ -19613,6 +19615,10 @@
         },
         {
           "name": "nix",
+          "packageId": "nix"
+        },
+        {
+          "name": "nix",
           "packageId": "nix",
           "target": "aarch64-unknown-linux-gnu"
         },
@@ -20189,6 +20195,10 @@
           "name": "miniz_oxide",
           "packageId": "miniz_oxide",
           "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix"
         },
         {
           "name": "nix",

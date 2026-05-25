@@ -4,6 +4,7 @@ members = [
   "rio-cli",
   "rio-common",
   "rio-controller",
+  "rio-exec",
   "rio-gateway",
   "rio-lease",
   "rio-migrations",
@@ -31,6 +32,7 @@ repository = "https://github.com/lovesegfault/rio-build"
 # Internal crates
 rio-auth = { path = "rio-auth" }
 rio-common = { path = "rio-common" }
+rio-exec = { path = "rio-exec" }
 rio-migrations = { path = "rio-migrations" }
 rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }

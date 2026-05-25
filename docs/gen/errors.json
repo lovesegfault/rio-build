@@ -295,6 +295,13 @@
       "doc": "K8s API error (connection, permission, not-found)."
     },
     {
+      "enum": "ExecError",
+      "name": "InvalidRequest",
+      "crate": "rio-exec",
+      "msg": "invalid request: {0}",
+      "doc": "The request failed [`ExecutionRequest::validate`]. The message names the rule that was violated and the offending path or field."
+    },
+    {
       "enum": "GatewayError",
       "name": "ClientReported",
       "crate": "rio-gateway",
@@ -1359,6 +1366,11 @@
       "name": "Error",
       "crate": "rio-controller",
       "doc": "Top-level reconcile error. kube's `Controller::run` takes an `error_policy` fn that receives this and decides requeue timing. `Box` on the finalizer variant: `finalizer::Error<Self>` is recursive (it wraps our Error for ApplyFailed/CleanupFailed). Unboxed it's an infinite-size type. Box breaks the cycle with a pointer indirection."
+    },
+    {
+      "name": "ExecError",
+      "crate": "rio-exec",
+      "doc": "Errors produced by the executor. Every variant is an *infrastructure* failure from the caller's point of view — a request that could not be validated or a sandbox that could not be constructed. A process that runs and exits non-zero is **not** an error; that is an [`ExitOutcome`] in a successful [`ExecutionOutcome`]. Sandbox-setup failure variants (one per setup phase: namespace creation, mount application, `pivot_root`, privilege drop, …) are added together with the sandbox implementation so each phase failure stays individually attributable."
     },
     {
       "name": "GatewayError",

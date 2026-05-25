@@ -6212,6 +6212,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-exec"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "rio-gateway"
 version = "0.1.0"
 dependencies = [

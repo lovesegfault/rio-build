@@ -516,6 +516,23 @@
       "doc": "Pool CRD: spawns one-shot rio-builder Jobs (builder OR fetcher mode)."
     }
   ],
+  "rio-exec": [
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Build-system-agnostic Linux sandbox executor."
+    },
+    {
+      "path": "outcome.rs",
+      "depth": 0,
+      "doc": "The execution outcome: what happened when the request was run."
+    },
+    {
+      "path": "request.rs",
+      "depth": 0,
+      "doc": "The execution request: a complete, concrete description of a process"
+    }
+  ],
   "rio-gateway": [
     {
       "path": "config.rs",
