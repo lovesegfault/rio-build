@@ -278,6 +278,11 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
                         if log.tail.len() == LOG_TAIL_LINES {
                             log.tail.remove(0);
                         }
+                        // Failure-evidence display only (the harness prints
+                        // this tail when a corpus entry diverges); lossy is
+                        // the sanctioned choice for log display per
+                        // clippy.toml — build output is arbitrary bytes.
+                        #[allow(clippy::disallowed_methods)]
                         log.tail.push(String::from_utf8_lossy(&l).into_owned());
                     }
                     LineAction::Phase(p) => log.phases.push(p),

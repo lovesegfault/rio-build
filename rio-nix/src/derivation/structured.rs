@@ -43,16 +43,23 @@ impl<'a> StructuredEnv<'a> {
     }
 
     /// Whether the derivation opted into structured attributes
-    /// (`__structuredAttrs = true` at eval time, which Nix records as
-    /// the env var `__structuredAttrs=1` plus the `__json` blob).
+    /// (`__structuredAttrs = true` at eval time).
     ///
-    /// Note this is deliberately read from the FLAT env: the marker
-    /// itself is always a real env var, even for structured-attrs
-    /// derivations.
+    /// Detection matches Nix's `ParsedDerivation::hasStructuredAttrs()`:
+    /// an instantiated structured-attrs derivation is one whose env
+    /// carries the `__json` blob. The eval-time `__structuredAttrs`
+    /// attribute is consumed by `derivationStrict` and does NOT appear
+    /// as an env var in the `.drv` — keying on it mis-detects every
+    /// real structured-attrs derivation as a flat-env one (caught by
+    /// the vm-differential harness: the builder then gets no
+    /// `.attrs.sh` and an injected `out=`, and structured builds fail).
+    ///
+    /// Presence of the key is deliberately checked on the raw env (not
+    /// `self.json`): a present-but-malformed `__json` must still route
+    /// the derivation down the structured path so materialization can
+    /// fail loudly instead of silently building with a flat env.
     pub fn is_structured_attrs(&self) -> bool {
-        self.env
-            .get("__structuredAttrs")
-            .is_some_and(|v| v == "1" || v == "true")
+        self.env.contains_key("__json")
     }
 
     /// The parsed `__json` blob, when present and well-formed.
@@ -164,13 +171,29 @@ mod tests {
         let s = StructuredEnv::new(&env);
         assert!(s.json().is_none());
         assert_eq!(s.string("pname"), Some("fallback".into()));
+        // The key is present, so the derivation still routes down the
+        // structured path — materialization then fails loudly on the
+        // malformed blob instead of silently building with a flat env.
+        assert!(s.is_structured_attrs());
     }
 
     #[test]
-    fn structured_attrs_marker_is_flat_env_only() {
-        // The __structuredAttrs flag is itself always a flat env var;
-        // a __json blob alone does not make the drv structured-attrs.
-        let env = env_of(&[("__json", r#"{"__structuredAttrs":true}"#)]);
+    fn json_presence_alone_means_structured_attrs() {
+        // What `nix-instantiate` actually emits for a structured-attrs
+        // derivation: the env carries `__json` and NOTHING else marks
+        // the opt-in (`__structuredAttrs` is consumed at eval time and
+        // never appears as an env var). Caught by the vm-differential
+        // harness when detection keyed on the nonexistent marker.
+        let env = env_of(&[("__json", r#"{"name":"demo","outputs":["out"]}"#)]);
+        assert!(StructuredEnv::new(&env).is_structured_attrs());
+    }
+
+    #[test]
+    fn marker_without_json_is_not_structured_attrs() {
+        // A hand-written env var named `__structuredAttrs` (no `__json`)
+        // is just an ordinary attribute of a flat-env derivation; only
+        // the presence of the serialized blob switches modes.
+        let env = env_of(&[("__structuredAttrs", "1"), ("pname", "hello")]);
         assert!(!StructuredEnv::new(&env).is_structured_attrs());
     }
 }
