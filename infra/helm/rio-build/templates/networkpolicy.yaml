@@ -146,6 +146,39 @@ spec:
     - toCIDR:
         - 169.254.169.254/32
         - fd00:ec2::254/128
+{{- if .Values.mountd.enabled }}
+---
+# rio-mountd ingress + egress: the per-node castore broker is the most
+# privileged workload in the system (root + CAP_SYS_ADMIN + hostPath
+# into the shared cache) and its only legitimate network surface is the
+# :9095 metrics exporter — the data plane is a node-local UDS that no
+# network policy can see. Ingress allows only the metrics scrape (same
+# host/remote-node/cluster entity set as scheduler-ingress: kubelet's
+# liveness probe and Prometheus both originate from the host netns).
+# The egressDeny-all is load-bearing, not decorative: Cilium only
+# switches an endpoint to default-deny in a direction that has at least
+# one rule selecting it, so an ingress-only policy would leave a
+# compromised mountd with default-ALLOW egress to the apiserver, the
+# store, and the world.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: rio-mountd
+  namespace: {{ $ns.builders.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-mountd
+  ingress:
+    - fromEntities: [host, remote-node, cluster]
+      toPorts:
+        - ports:
+            - {port: "9095", protocol: TCP}
+  egressDeny:
+    - toEntities: [all]
+{{- end }}
 ---
 # Controller egress: DNS + kube-apiserver. The controller's ONLY
 # upstream is the k8s API (watch/patch CRs across namespaces). The old

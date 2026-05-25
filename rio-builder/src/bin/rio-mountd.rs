@@ -40,7 +40,12 @@ struct Args {
     /// Per-Promote size ceiling in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_PROMOTE_BYTES)]
     max_promote_bytes: u64,
-    /// SO_PEERCRED gid allowed to connect (the builder pods' fsGroup).
+    /// SO_PEERCRED gid allowed to connect — the host `rio-builder`
+    /// group (helm `mountd.allowedGid`). How a userns-confined builder
+    /// pod presents this gid is the open "socket access under
+    /// hostUsers:false" question owned by §P0559 of the ADR-022
+    /// implementation plan; it is NOT the pod's `fsGroup` (a
+    /// supplementary group, which SO_PEERCRED never reports).
     #[arg(long)]
     allowed_gid: u32,
     /// Prometheus exporter listen address.

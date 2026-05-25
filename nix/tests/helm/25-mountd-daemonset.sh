@@ -70,6 +70,24 @@ test "$(yq "$ds | .metadata.namespace" "$out")" = "rio-builders" || {
   exit 1
 }
 
+# The socket volume is the dedicated /run/rio-mountd directory, never
+# the host's entire /run — that would hand a CAP_SYS_ADMIN pod the
+# containerd/systemd/dbus control sockets. Both directions: the named
+# volume points at the right path, AND no volume (whatever its name)
+# mounts /run itself.
+test "$(yq "$ds | .spec.template.spec.volumes[] | select(.name==\"run-rio-mountd\") | .hostPath.path" "$out")" = "/run/rio-mountd" || {
+  echo "FAIL: rio-mountd socket volume hostPath.path != /run/rio-mountd" >&2
+  exit 1
+}
+# Capture-then-grep (not `yq | grep -q`): in the `if pipeline; then
+# FAIL` direction a producer SIGPIPE under pipefail silently skips the
+# FAIL — the r39 pass-gap shape from 02-monitoring-kinds.sh.
+paths=$(yq "$ds | .spec.template.spec.volumes[].hostPath.path" "$out")
+if grep -qx "/run" <<<"$paths"; then
+  echo "FAIL: rio-mountd mounts the host's entire /run — narrow it to /run/rio-mountd" >&2
+  exit 1
+fi
+
 # mountd.enabled=false must drop the DaemonSet entirely.
 off=$TMPDIR/mountd-off.yaml
 helm template rio . \

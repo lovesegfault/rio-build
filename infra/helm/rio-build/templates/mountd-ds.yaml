@@ -112,6 +112,17 @@ spec:
             # consumes the castore mountpoints, so the unpropagated
             # mount is unobservable.
             privileged: false
+            # no_new_privs. Does not affect the added capability: runc
+            # sets the bounding set from the spec and execve re-grants
+            # bounding→effective for a uid-0 process regardless of NNP
+            # — NNP only blocks gaining privileges via setuid/file-caps
+            # binaries, which this container has no business execing.
+            allowPrivilegeEscalation: false
+            # Every write target is a volume mount (/run/rio-mountd,
+            # /var/rio/*); /dev/fuse and the FUSE mounts live on their
+            # own mounts, not the rootfs. Same posture as every other
+            # component in the chart.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
               add: [SYS_ADMIN]

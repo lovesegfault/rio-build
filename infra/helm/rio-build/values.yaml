@@ -919,8 +919,14 @@ mountd:
   resources:
     # The hot path (BackingOpen) is one ioctl per request; Promote
     # copies are disk-bound, bounded by an internal
-    # Semaphore(num_cpus). Memory is the 64 KiB copy buffer per
-    # in-flight promote + tokio overhead.
+    # Semaphore(num_cpus), each holding a 64 KiB copy buffer. The
+    # dominant ADVERSARIAL consumer is the per-connection backing-id
+    # table: every BackingOpen pins a kernel `fuse_backing` struct +
+    # a held file reference until BackingClose or teardown, bounded at
+    # MAX_LIVE_BACKING_IDS (2^20) per connection (castore_fuse/
+    # mountd.rs) — that memory is charged to the kernel, not this
+    # cgroup, so the limit here only needs to cover the daemon's own
+    # heap.
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 512Mi}
 

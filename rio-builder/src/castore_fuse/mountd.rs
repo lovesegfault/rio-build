@@ -527,10 +527,18 @@ fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
     // all of /run) and /run is a tmpfs wiped every boot — own the
     // parent's existence here rather than requiring every deployment
     // (k8s DirectoryOrCreate, VM tests, bare `cargo run`) to pre-create
-    // it. 0755: builder uids need search permission to reach the
-    // socket; the 0660 socket inode is the access gate.
+    // it. The mode is set explicitly rather than inherited from
+    // `create_dir_all`'s `0777 & ~umask`: under a hardened umask
+    // (0027/0077 — exactly what a systemd `UMask=` drop-in sets) the
+    // dir comes out 0750/0700 root:root and builder uids EACCES on
+    // connect() before any auth check runs. 0755 because builder uids
+    // only need search permission to reach the socket; the 0660 socket
+    // inode below is the access gate. The explicit chmod also repairs
+    // a dir left behind by a previous wrong-umask incarnation.
     if let Some(parent) = cfg.socket_path.parent() {
         std::fs::create_dir_all(parent).context("create socket parent dir")?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .context("chmod socket parent dir")?;
     }
     let _ = std::fs::remove_file(&cfg.socket_path);
     let fd = socket(

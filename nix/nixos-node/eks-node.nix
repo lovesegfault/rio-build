@@ -575,7 +575,12 @@ in
         #
         # Idempotent across reboots: the EBS root persists over
         # stop/start, so a formatted image is detected (blkid) and left
-        # alone — re-running mkfs would wipe the warm caches.
+        # alone — re-running mkfs would wipe the warm caches. A crash
+        # MID-mkfs can leave an image blkid recognizes (the superblock
+        # lands early) but that mount(2) rejects as incomplete; this
+        # unit does not detect that — the mount fails, the node never
+        # reaches Ready (no `nofail`), and Karpenter replaces it. Node
+        # replacement is the recovery path, not a re-mkfs here.
         rio-var-rio-image = {
           description = "Create the /var/rio XFS-prjquota backing image";
           before = [ "var-rio.mount" ];
