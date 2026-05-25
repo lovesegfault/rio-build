@@ -190,6 +190,83 @@
       "doc": ""
     },
     {
+      "enum": "FrameError",
+      "name": "Codec",
+      "crate": "rio-builder",
+      "msg": "postcard: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Eof",
+      "crate": "rio-builder",
+      "msg": "peer closed the connection",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Io",
+      "crate": "rio-builder",
+      "msg": "socket: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Oversize",
+      "crate": "rio-builder",
+      "msg": "frame exceeds MAX_FRAME_BYTES ({0} > {MAX_FRAME_BYTES})",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Truncated",
+      "crate": "rio-builder",
+      "msg": "frame truncated by the kernel (MSG_TRUNC) — peer sent an oversize datagram",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Closed",
+      "crate": "rio-builder",
+      "msg": "mountd connection closed",
+      "doc": "The daemon closed the connection or the reader thread died. Every outstanding and future request fails with this — the build's mount is gone and the build must fail as infra."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Connect",
+      "crate": "rio-builder",
+      "msg": "connect {path}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Frame",
+      "crate": "rio-builder",
+      "msg": "mountd request: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Rejected",
+      "crate": "rio-builder",
+      "msg": "mountd rejected request: {0}",
+      "doc": "A typed protocol rejection. `ErrKind::is_build_fatal` decides whether the caller surfaces a build failure or an infra retry."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "mountd did not reply within {0:?}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "UnexpectedReply",
+      "crate": "rio-builder",
+      "msg": "mountd reply has unexpected variant for this request",
+      "doc": ""
+    },
+    {
       "enum": "OverlayError",
       "name": "DirCreate",
       "crate": "rio-builder",
@@ -236,6 +313,55 @@
       "name": "UpperOnOverlayfs",
       "crate": "rio-builder",
       "msg": "overlay upperdir {path} is itself on an overlayfs mount (statfs f_type=OVERLAYFS_SUPER_MAGIC); the kernel refuses to use an overlayfs as upperdir/workdir. Set --overlay-base-dir to a directory on a real filesystem (e.g., a local SSD emptyDir volume), not the merged view of another overlay.",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadDigestLen",
+      "crate": "rio-builder",
+      "msg": "castore digest under {context:?} is {got} bytes, want 32",
+      "doc": "`context` is the input root's store path, or the parent directory's hex digest when the bad entry is inside a streamed `Directory` body."
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadStorePath",
+      "crate": "rio-builder",
+      "msg": "store path {store_path:?} has no basename",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "DuplicateBasename",
+      "crate": "rio-builder",
+      "msg": "duplicate store-path basename {basename:?} in input_roots",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingDirectory",
+      "crate": "rio-builder",
+      "msg": "directory {digest} is referenced by the DAG but was not returned by GetDirectory ({returned} bodies returned)",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingRootNode",
+      "crate": "rio-builder",
+      "msg": "input root {store_path:?} has no root_node (path not yet NAR-indexed)",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "Rpc",
+      "crate": "rio-builder",
+      "msg": "GetDirectory: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "GetDirectory(recursive) timed out after {0:?}",
       "doc": ""
     },
     {
@@ -862,6 +988,34 @@
       "doc": ""
     },
     {
+      "enum": "DirectoryError",
+      "name": "BadDigestLen",
+      "crate": "rio-proto",
+      "msg": "child digest for entry {0:?} is {1} bytes, expected 32",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "DuplicateName",
+      "crate": "rio-proto",
+      "msg": "duplicate entry name {0:?} across the directory's kind lists",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "InvalidName",
+      "crate": "rio-proto",
+      "msg": "entry name {0:?} is not a valid single path component",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "Unsorted",
+      "crate": "rio-proto",
+      "msg": "entries not sorted byte-lexicographically by name within a kind list at {0:?}",
+      "doc": ""
+    },
+    {
       "enum": "NarCollectError",
       "name": "Io",
       "crate": "rio-proto",
@@ -1322,6 +1476,27 @@
       "crate": "rio-store",
       "msg": "upstream {what} exceeds {limit}-byte cap",
       "doc": "An upstream-supplied body exceeded a size cap (narinfo, `/nix-cache-info`, declared `NarSize`, or decompressed NAR). `tenant_upstreams` rows are tenant-supplied; one tenant's hostile upstream must not OOM the process-global substituter."
+    },
+    {
+      "enum": "WalkError",
+      "name": "BadRoot",
+      "crate": "rio-store",
+      "msg": "malformed root node: {0}",
+      "doc": "`RootNode.node` is unset or a digest field has the wrong length."
+    },
+    {
+      "enum": "WalkError",
+      "name": "MissingDirectory",
+      "crate": "rio-store",
+      "msg": "directory {0} referenced but not supplied",
+      "doc": "A `DirectoryEntry.digest` reachable from the root has no body in the supplied map. For `PutPathChunked` this means the builder omitted a body from `Begin.directories`."
+    },
+    {
+      "enum": "WalkError",
+      "name": "TooManyNodes",
+      "crate": "rio-store",
+      "msg": "walk exceeded {0} nodes",
+      "doc": "The walk visited more nodes than the caller's cap. A Directory *DAG* expands to a *tree* on walk — a deliberately deep-and-wide DAG can reference the same subtree exponentially many times, so the node count must be bounded independently of the (already-bounded) distinct-body count."
     }
   ],
   "enums": [
@@ -1341,9 +1516,24 @@
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
     },
     {
+      "name": "FrameError",
+      "crate": "rio-builder",
+      "doc": "Frame-level decode/encode errors (not protocol errors — those are [`ErrKind`])."
+    },
+    {
+      "name": "MountdError",
+      "crate": "rio-builder",
+      "doc": ""
+    },
+    {
       "name": "OverlayError",
       "crate": "rio-builder",
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
+    },
+    {
+      "name": "TreeError",
+      "crate": "rio-builder",
+      "doc": "Errors from DAG prefetch / tree construction. All of them mean the build never started — the caller classifies every variant as an infrastructure failure and re-queues."
     },
     {
       "name": "UploadError",
@@ -1411,6 +1601,11 @@
       "doc": ""
     },
     {
+      "name": "DirectoryError",
+      "crate": "rio-proto",
+      "doc": "Why a client-supplied [`Directory`] body was rejected."
+    },
+    {
       "name": "NarCollectError",
       "crate": "rio-proto",
       "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`]."
@@ -1474,6 +1669,11 @@
       "name": "SubstituteError",
       "crate": "rio-store",
       "doc": "Errors surfaced by the substitution path. Callers map these to gRPC status; `NotFound` is the normal miss case (no upstream has the path, or the tenant has no upstreams configured). `Clone` so moka's `try_get_with` can hand the same error to every coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned)."
+    },
+    {
+      "name": "WalkError",
+      "crate": "rio-store",
+      "doc": ""
     }
   ]
 }

@@ -28,6 +28,66 @@
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
     },
     {
+      "path": "bin/",
+      "depth": 0,
+      "doc": ""
+    },
+    {
+      "path": "bin/rio-mountd.rs",
+      "depth": 1,
+      "doc": "`rio-mountd` — privileged per-node broker for castore-FUSE."
+    },
+    {
+      "path": "bin/spike_mountd_client.rs",
+      "depth": 1,
+      "doc": "VM-test client for the production `rio-mountd` daemon (P0567)."
+    },
+    {
+      "path": "castore_fuse/",
+      "depth": 0,
+      "doc": "Castore-FUSE lazy `/nix/store` (ADR-022 §2)."
+    },
+    {
+      "path": "castore_fuse/circuit.rs",
+      "depth": 1,
+      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on"
+    },
+    {
+      "path": "castore_fuse/mountd.rs",
+      "depth": 1,
+      "doc": "`rio-mountd` — the privileged per-node broker for castore-FUSE."
+    },
+    {
+      "path": "castore_fuse/mountd_client.rs",
+      "depth": 1,
+      "doc": "In-process client for the rio-mountd UDS protocol."
+    },
+    {
+      "path": "castore_fuse/mountd_proto.rs",
+      "depth": 1,
+      "doc": "UDS wire protocol between the unprivileged builder and `rio-mountd`."
+    },
+    {
+      "path": "castore_fuse/open.rs",
+      "depth": 1,
+      "doc": "The castore-FUSE `open()` data path (ADR-022 §2.6–2.7)."
+    },
+    {
+      "path": "castore_fuse/stream.rs",
+      "depth": 1,
+      "doc": "Streaming `open()` for large files (ADR-022 §2.8)."
+    },
+    {
+      "path": "castore_fuse/sweep.rs",
+      "depth": 1,
+      "doc": "Disk-pressure LRU sweep over the mountd-owned shared caches."
+    },
+    {
+      "path": "castore_fuse/tree.rs",
+      "depth": 1,
+      "doc": "Mount-time Directory-DAG prefetch and the content-addressed inode"
+    },
+    {
       "path": "cgroup.rs",
       "depth": 0,
       "doc": "Per-build cgroup v2 resource tracking."
@@ -100,17 +160,12 @@
     {
       "path": "fuse/circuit.rs",
       "depth": 1,
-      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on"
+      "doc": "Re-export of the fetch circuit breaker, which moved to"
     },
     {
       "path": "fuse/fetch/",
       "depth": 1,
       "doc": "Fetch and materialize store paths into the local cache."
-    },
-    {
-      "path": "fuse/fetch/client.rs",
-      "depth": 2,
-      "doc": "gRPC client bundle for FUSE fetches."
     },
     {
       "path": "fuse/inode.rs",
@@ -201,6 +256,11 @@
       "path": "runtime/slot.rs",
       "depth": 1,
       "doc": "Single-build occupancy tracking and cancellation."
+    },
+    {
+      "path": "store_fetch.rs",
+      "depth": 0,
+      "doc": "Store-fetch primitives shared by the old FUSE (`fuse::fetch`) and"
     },
     {
       "path": "synth_db.rs",
@@ -664,9 +724,19 @@
       "doc": "NAR (Nix ARchive) format reader and writer."
     },
     {
+      "path": "nar/frame.rs",
+      "depth": 1,
+      "doc": "NAR framing emitters for external walkers."
+    },
+    {
       "path": "nar/fs.rs",
       "depth": 1,
       "doc": "Filesystem ↔ NAR streaming."
+    },
+    {
+      "path": "nar/ls.rs",
+      "depth": 1,
+      "doc": "Streaming NAR index — `nar_ls`."
     },
     {
       "path": "nar/reader.rs",
@@ -750,6 +820,11 @@
     }
   ],
   "rio-proto": [
+    {
+      "path": "castore_util.rs",
+      "depth": 0,
+      "doc": "Helpers on the `rio.castore` wire types that both producers and"
+    },
     {
       "path": "client/",
       "depth": 0,
@@ -968,6 +1043,11 @@
       "doc": "Build CRUD + status transitions — `builds` table."
     },
     {
+      "path": "db/closure.rs",
+      "depth": 1,
+      "doc": "Transitive input-closure walk for `WorkAssignment.input_roots`."
+    },
+    {
       "path": "db/derivations.rs",
       "depth": 1,
       "doc": "Per-derivation state + poison tracking — `derivations` table."
@@ -1175,14 +1255,29 @@
       "doc": "Per-replica admission gate for `try_substitute_on_miss`."
     },
     {
-      "path": "backend.rs",
+      "path": "backend/",
       "depth": 0,
       "doc": "Chunk storage backends."
+    },
+    {
+      "path": "backend/tiered.rs",
+      "depth": 1,
+      "doc": "Two-tier chunk backend: per-AZ S3 Express read-through cache over"
     },
     {
       "path": "cas.rs",
       "depth": 0,
       "doc": "Chunked content-addressable storage orchestration."
+    },
+    {
+      "path": "castore.rs",
+      "depth": 0,
+      "doc": "Directory merkle layer (ADR-022 §8): bottom-up `dir_digest` pass"
+    },
+    {
+      "path": "castore_nar.rs",
+      "depth": 0,
+      "doc": "Castore Directory DAG → NAR byte stream (the inverse of"
     },
     {
       "path": "chunker.rs",
@@ -1243,6 +1338,11 @@
       "path": "grpc/chunk.rs",
       "depth": 1,
       "doc": "ChunkService gRPC implementation."
+    },
+    {
+      "path": "grpc/directory.rs",
+      "depth": 1,
+      "doc": "ADR-022 castore RPC surface (P0573 / P0577 / P0570)."
     },
     {
       "path": "grpc/get_path.rs",
@@ -1328,6 +1428,11 @@
       "path": "metadata/upstreams.rs",
       "depth": 1,
       "doc": "Per-tenant upstream binary-cache config (`tenant_upstreams` table,"
+    },
+    {
+      "path": "nar_index.rs",
+      "depth": 0,
+      "doc": "Derived per-path NAR file/dir/symlink listing (`nar_index` table)."
     },
     {
       "path": "realisations.rs",

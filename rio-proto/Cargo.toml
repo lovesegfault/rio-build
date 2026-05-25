@@ -21,6 +21,9 @@ tonic-prost = { workspace = true }
 tonic-health = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
+# castore_util::directory_digest — the canonical dir_digest both the
+# builder (producer) and store (validator) compute.
+blake3 = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
