@@ -416,6 +416,27 @@ impl StorePath {
     }
 }
 
+/// Compute Nix's `hashPlaceholder(outputName)` string.
+///
+/// This is the value the Nix *language* `placeholder "<output>"`
+/// builtin evaluates to, and the value `derivationStrict` writes into a
+/// derivation's env for content-addressed outputs whose path is unknown
+/// at eval time: `"/" + nixbase32(sha256("nix-output:" + outputName))`.
+/// At build time the builder-side `inputRewrites` map replaces every
+/// occurrence of this string (in argv, env values, `passAsFile`
+/// contents, and `.attrs.{json,sh}`) with the output's actual in-sandbox
+/// path.
+///
+/// The leading `/` makes the placeholder an "impossible path": it can
+/// never collide with a real store path (those start with
+/// `/nix/store/`), so an unrewritten placeholder is loudly wrong rather
+/// than silently plausible.
+pub fn hash_placeholder(output_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("nix-output:{output_name}").as_bytes());
+    format!("/{}", nixbase32::encode(&digest))
+}
+
 impl std::str::FromStr for StorePath {
     type Err = StorePathError;
 
@@ -618,6 +639,22 @@ pub mod nixbase32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hash_placeholder_matches_nix() {
+        // Golden value: `nix eval --expr 'builtins.placeholder "out"'`
+        // (also the canonical hashPlaceholder("out") env value Nix
+        // writes for CA outputs — see derivation/hash.rs's
+        // ca_floating_leaf fixture, captured from a real .drv).
+        assert_eq!(
+            hash_placeholder("out"),
+            "/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9"
+        );
+        // Distinct outputs get distinct placeholders.
+        assert_ne!(hash_placeholder("out"), hash_placeholder("dev"));
+        assert!(hash_placeholder("dev").starts_with('/'));
+        assert!(!hash_placeholder("dev").starts_with("/nix/store/"));
+    }
 
     #[test]
     fn test_parse_valid_store_path() -> anyhow::Result<()> {

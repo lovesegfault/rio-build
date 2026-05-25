@@ -500,16 +500,6 @@ pub(crate) fn fod_algo_verifiable(algo: &str) -> bool {
     )
 }
 
-/// `__structuredAttrs`-aware env lookup, mirroring Nix's
-/// `ParsedDerivation::get{String,Bool,Strings}Attr`.
-///
-/// When a derivation sets `__structuredAttrs = true`, Nix's
-/// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
-/// they do NOT appear as separate env keys. Direct `env.get("foo")`
-/// returns None, so the ADR-023 sizing hints (and pre-existing
-/// `requiredSystemFeatures` / `__noChroot`) were always None for
-/// structuredAttrs drvs. JSON is checked first, then raw env, matching
-/// upstream semantics.
 /// Clamp for tenant-controlled string attrs (`pname`/`version`/`name`)
 /// that become cache keys / PG columns. 256 chars: longest real nixpkgs
 /// pname is ~90; this leaves headroom for monorepos with path-style
@@ -524,29 +514,38 @@ const MAX_ATTR_LEN: usize = 256;
 /// and 64 is well past any legitimate `requiredSystemFeatures` set.
 const MAX_LIST_LEN: usize = 64;
 
-pub(crate) struct StructuredEnv<'a> {
-    env: &'a std::collections::BTreeMap<String, String>,
-    json: Option<serde_json::Value>,
-}
+/// The shared `__structuredAttrs`-aware lookup lives in
+/// [`rio_nix::derivation::StructuredEnv`] (it is also used by
+/// rio-builder's native-executor glue — one parser, no JSON-vs-env
+/// precedence drift). The gateway-specific ADR-023 clamping policy
+/// stays HERE, as an extension trait over the shared type: the clamps
+/// exist because these attrs feed gateway-owned cache keys / PG columns
+/// / wire messages, which is this crate's threat model, not rio-nix's.
+pub(crate) use rio_nix::derivation::StructuredEnv;
 
-impl<'a> StructuredEnv<'a> {
-    pub(crate) fn new(env: &'a std::collections::BTreeMap<String, String>) -> Self {
-        let json = env.get("__json").and_then(|s| serde_json::from_str(s).ok());
-        Self { env, json }
-    }
-
-    fn string(&self, key: &str) -> Option<String> {
-        self.json
-            .as_ref()
-            .and_then(|j| j.get(key)?.as_str().map(String::from))
-            .or_else(|| self.env.get(key).cloned())
-    }
-
-    /// [`Self::string`] with a `MAX_ATTR_LEN`-char clamp. ADR-023
+/// Gateway-side clamped accessors over [`StructuredEnv`].
+pub(crate) trait ClampedAttrs {
+    /// String attr with a `MAX_ATTR_LEN`-char clamp. ADR-023
     /// §Threat-model: `pname`/`version` are tenant-controlled and feed
     /// the per-tenant `SlaEstimator` cache key + `build_samples.pname`
     /// PG column; a 1 MiB pname is otherwise carried verbatim through
     /// proto → DerivationNode → ModelKey → cache key → PG.
+    fn string_clamped(&self, key: &str) -> Option<String>;
+
+    /// String-list attr with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
+    /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
+    /// tenant-controlled and feeds the `derivations.required_features`
+    /// PG `text[]` column, `SpawnIntent.required_features` on the wire,
+    /// and the scheduler's in-memory `DerivationState`. Same threat as
+    /// [`ClampedAttrs::string_clamped`] but for a list. See also
+    /// `executor_service.rs`'s `MAX_HEARTBEAT_FEATURES` (the
+    /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
+    /// debounce-key clamp — both are second-line defenses behind this
+    /// gateway-side bound at the trust boundary.
+    fn strings_clamped(&self, key: &str) -> Option<Vec<String>>;
+}
+
+impl ClampedAttrs for StructuredEnv<'_> {
     fn string_clamped(&self, key: &str) -> Option<String> {
         self.string(key).map(|mut s| {
             if s.chars().count() > MAX_ATTR_LEN {
@@ -556,42 +555,6 @@ impl<'a> StructuredEnv<'a> {
         })
     }
 
-    pub(crate) fn bool(&self, key: &str) -> Option<bool> {
-        self.json
-            .as_ref()
-            .and_then(|j| j.get(key)?.as_bool())
-            .or_else(|| self.env.get(key).map(|v| v == "1" || v == "true"))
-    }
-
-    fn strings(&self, key: &str) -> Option<Vec<String>> {
-        self.json
-            .as_ref()
-            .and_then(|j| {
-                Some(
-                    j.get(key)?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                )
-            })
-            .or_else(|| {
-                self.env
-                    .get(key)
-                    .map(|s| s.split_whitespace().map(String::from).collect())
-            })
-    }
-
-    /// [`Self::strings`] with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
-    /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
-    /// tenant-controlled and feeds the `derivations.required_features`
-    /// PG `text[]` column, `SpawnIntent.required_features` on the wire,
-    /// and the scheduler's in-memory `DerivationState`. Same threat as
-    /// [`Self::string_clamped`] but for a list. See also
-    /// `executor_service.rs`'s `MAX_HEARTBEAT_FEATURES` (the
-    /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
-    /// debounce-key clamp — both are second-line defenses behind this
-    /// gateway-side bound at the trust boundary.
     fn strings_clamped(&self, key: &str) -> Option<Vec<String>> {
         self.strings(key).map(|mut v| {
             v.truncate(MAX_LIST_LEN);

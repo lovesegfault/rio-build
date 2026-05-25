@@ -14,8 +14,10 @@ use thiserror::Error;
 
 mod aterm;
 mod hash;
+mod structured;
 
 pub use hash::hash_derivation_modulo;
+pub use structured::StructuredEnv;
 
 /// Errors from parsing or hashing ATerm derivations.
 #[derive(Debug, Error)]
