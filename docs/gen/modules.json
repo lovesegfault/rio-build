@@ -1315,6 +1315,11 @@
       "doc": "The per-stream ingest state machine for `LogService.AppendLog`."
     },
     {
+      "path": "logs/kernel.rs",
+      "depth": 1,
+      "doc": "Pure decision kernels for the log chunk subsystem."
+    },
+    {
       "path": "logs/mbt_tests.rs",
       "depth": 1,
       "doc": "Model-based testing: replay traces generated from the LogService"
