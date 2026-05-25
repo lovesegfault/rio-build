@@ -1479,10 +1479,24 @@ impl DagActor {
             // Substituting) instead of pushing to ready_queue. The
             // metric above stays — output WAS gone, even if upstream
             // can re-provide it.
-            if output_paths
-                .iter()
-                .all(|p| !missing.contains(p.as_str()) || substitutable.contains(p.as_str()))
-            {
+            //
+            // r[impl sched.merge.wanted-outputs]
+            // Like the reset decision above, the routing forgives
+            // `unwanted` paths: a recorded output the current
+            // submission positively does not want (typically never
+            // present and not substitutable — the steady state the
+            // demand-driven criterion leaves behind) must not push the
+            // node onto the ready queue when every WANTED missing path
+            // is substitutable. The routing must never be stricter than
+            // the reset that put the node here, otherwise the detached
+            // re-substitution lane is skipped and only the
+            // dispatch-time batch probe (cap-truncated, fail-open)
+            // stands between the node and a from-source re-dispatch.
+            if output_paths.iter().all(|p| {
+                !missing.contains(p.as_str())
+                    || substitutable.contains(p.as_str())
+                    || unwanted.contains(p.as_str())
+            }) {
                 metrics::counter!("rio_scheduler_stale_completed_substituted_total").increment(1);
                 to_spawn.push((drv_hash_k, output_paths));
             } else {

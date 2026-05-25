@@ -1652,6 +1652,125 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     Ok(())
 }
 
+// r[verify sched.merge.stale-substitutable]
+// r[verify sched.merge.wanted-outputs]
+/// `verify_preexisting_completed` ROUTING × wanted outputs: once the
+/// reset HAS fired (a wanted recorded output is missing), the choice
+/// between the detached re-substitution (`to_spawn`) and the ready
+/// queue must be made over the same wanted-aware view as the reset
+/// decision. A recorded-but-UNWANTED output that was never present and
+/// is not substitutable — the steady state the demand-driven cache-hit
+/// criterion leaves behind — must not disqualify the node from the
+/// substitution lane when the wanted output IS substitutable. Routed to
+/// the ready queue instead, the node only re-substitutes if the
+/// dispatch-time batch probe rescues it (cap-truncatable, fail-open),
+/// and `rio_scheduler_stale_completed_substituted_total` never moves.
+///
+/// Setup mirrors the reset-decision test above: dep declares
+/// {out, debug}, every consumer only wants `out`, the worker reports
+/// both outputs but only P_out is uploaded. Then P_out is GC'd but
+/// substitutable upstream; P_debug stays missing and NOT substitutable.
+/// Build B re-merges dep wanting only `out`.
+#[tokio::test]
+async fn test_preexisting_completed_unwanted_missing_output_routes_to_substitution() -> TestResult {
+    // Thread-local recorder: #[tokio::test]'s current-thread runtime
+    // means the actor task sees it at .await points (same mechanism as
+    // misc.rs's gauge tests). Installed before the actor spawns so the
+    // merge-time increment is captured.
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut w1 = connect_executor(&handle, "vr-w1", "x86_64-linux").await?;
+
+    let out = test_store_path("vr-dep-out");
+    let dbg = test_store_path("vr-dep-debug");
+    let mk_dep = || {
+        let mut d = make_node("vr-dep");
+        d.output_names = vec!["out".into(), "debug".into()];
+        d.expected_output_paths = vec![out.clone(), dbg.clone()];
+        d.wanted_output_names = vec!["out".into()];
+        d
+    };
+
+    // Build A: app-a → dep; nothing ever wants `debug`. The worker
+    // reports BOTH outputs so output_paths records both, but only P_out
+    // is uploaded to the store — P_debug stays missing.
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("vr-app-a"), mk_dep()],
+        vec![make_test_edge("vr-app-a", "vr-dep")],
+        false,
+    )
+    .await?;
+    let assn = recv_assignment(&mut w1).await;
+    assert!(assn.drv_path.ends_with("vr-dep.drv"));
+    store.seed_with_content(&out, b"out");
+    complete_ca(
+        &handle,
+        "vr-w1",
+        &assn.drv_path,
+        &[("out", &out, vec![0u8; 32]), ("debug", &dbg, vec![0u8; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+    // Hold app-a Running so Build A stays Active and dep stays in DAG.
+    let mut _w2 = connect_executor(&handle, "vr-w2", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut _w2).await;
+    assert_eq!(
+        expect_drv(&handle, "vr-dep").await.status,
+        DerivationStatus::Completed,
+        "precondition"
+    );
+
+    // GC P_out but leave it substitutable upstream; P_debug stays
+    // missing AND not substitutable.
+    store.state.paths.write().unwrap().remove(&out);
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    // Build B: app-b → dep, wanting only `out`. The reset fires (P_out
+    // is missing and wanted); the routing must take the detached
+    // substitution lane because the only non-substitutable missing path
+    // is the unwanted P_debug.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("vr-app-b"), mk_dep()],
+        vec![make_test_edge("vr-app-b", "vr-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The discriminator: the verify-time routing took the detached
+    // substitution. With a routing computed over ALL recorded paths
+    // (ignoring `unwanted`), dep lands in the ready queue instead and
+    // this counter never moves — even if the dispatch-time batch probe
+    // later rescues the node.
+    assert_eq!(
+        recorder.get("rio_scheduler_stale_completed_substituted_total{}"),
+        1,
+        "a missing-but-substitutable WANTED output plus a missing-and-\
+         unsubstitutable UNWANTED output must route to the detached \
+         substitution at verify time, not the ready queue; counters \
+         seen: {:?}",
+        recorder.all_keys()
+    );
+
+    // And the detached fetch settles the node back to Completed (the
+    // walk forgives the unwanted P_debug), so build B never re-builds.
+    settle_substituting(&handle, &["vr-dep"]).await;
+    assert_eq!(
+        expect_drv(&handle, "vr-dep").await.status,
+        DerivationStatus::Completed,
+        "SubstituteComplete{{ok=true}} returns the reset node to Completed"
+    );
+
+    Ok(())
+}
+
 // ===========================================================================
 // I-099/I-094: re-probe existing not-done nodes at merge
 // ===========================================================================
