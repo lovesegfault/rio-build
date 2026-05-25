@@ -236,6 +236,29 @@ pkgs.testers.runNixOSTest {
         )
         node.succeed("systemctl is-active kubelet.service")
 
+    # P0567: rio-mountd enforces per-build staging quotas with XFS
+    # project quotas, so /var/rio/staging MUST land on an XFS mounted
+    # with prjquota. The module-eval assertion in eks-node.nix proves
+    # the *declared* fileSystems satisfy that; this proves the boot
+    # actually produced the mount (backing-image oneshot → loop mount →
+    # tmpfiles subdirs ON the XFS, not on the root fs underneath it).
+    with subtest("/var/rio is XFS with prjquota and holds the mountd trees"):
+        node.wait_for_unit("var-rio.mount")
+        fstype = node.succeed("findmnt -rn -o FSTYPE /var/rio").strip()
+        assert fstype == "xfs", f"/var/rio fstype={fstype!r}, want xfs"
+        opts = node.succeed("findmnt -rn -o OPTIONS /var/rio").strip()
+        assert "prjquota" in opts, f"/var/rio mounted without prjquota: {opts!r}"
+        for d in ("cache", "chunks", "staging", "castore"):
+            # Same st_dev as the mountpoint == created on the XFS, not
+            # shadowed by it.
+            node.succeed(
+                f"[ \"$(stat -c %d /var/rio/{d})\" = \"$(stat -c %d /var/rio)\" ]"
+            )
+        # The socket-owning group exists with the gid mountd-ds.yaml
+        # passes as --allowed-gid and the helm chart documents as
+        # mountd.allowedGid.
+        node.succeed("[ \"$(getent group rio-builder | cut -d: -f3)\" = 990 ]")
+
     # bug_054: pause import previously had `|| true` and lacked --local.
     # With sandbox=localhost/kubernetes/pause there is no registry
     # fallback, so a swallowed failure left a Ready-but-100%-failing

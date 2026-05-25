@@ -1,0 +1,182 @@
+{{- if .Values.mountd.enabled }}
+{{- $m := .Values.mountd -}}
+# rio-mountd — privileged per-node broker for castore-FUSE (P0567).
+#
+# One pod per builder/fetcher node. The unprivileged builder pod cannot
+# (a) open /dev/fuse, (b) call FUSE_DEV_IOC_BACKING_OPEN (init-ns
+# CAP_SYS_ADMIN), or (c) write the shared node-local cache (integrity
+# boundary). This DaemonSet brokers all three over a SOCK_SEQPACKET UDS
+# at /run/rio-mountd.sock.
+#
+# Namespace: rio-builders (PSA privileged). CAP_SYS_ADMIN + hostPath are
+# both rejected by PSA baseline/restricted, and rio-system is
+# restricted. The pods land on builder AND fetcher nodes regardless of
+# the DaemonSet's own namespace.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rio-mountd
+  namespace: {{ .Values.namespaces.builders.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-mountd" "component" "mountd") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-mountd" | nindent 6 }}
+  updateStrategy:
+    rollingUpdate:
+      # A node whose mountd is restarting cannot Mount{} new builds and
+      # every live FUSE connection on it aborts (the kept /dev/fuse dups
+      # close). Roll one node at a time so an upgrade never takes more
+      # than one node's worth of builds down at once.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "rio.labels" (dict "root" . "name" "rio-mountd" "component" "mountd") | nindent 8 }}
+    spec:
+      # Must not be evicted to make room for builder pods: a node
+      # without mountd fails every build scheduled onto it.
+      priorityClassName: system-node-critical
+      # Talks to nothing but the kernel and its UDS peers — keep the
+      # default ServiceAccount's token out of a CAP_SYS_ADMIN pod.
+      automountServiceAccountToken: false
+      # Builder/fetcher nodes only (the nodeclaim_pool reconciler
+      # stamps rio.build/node-role onto every NodeClaim it mints —
+      # cover.rs NODE_ROLE_LABEL). nodeAffinity rather than nodeSelector
+      # because the match is a set, not a single value.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rio.build/node-role
+                    operator: In
+                    values: [builder, fetcher]
+      # Builder nodes carry rio.build/builder=true:NoSchedule, fetcher
+      # nodes rio.build/fetcher=true:NoSchedule, metal nodes
+      # rio.build/kvm=true:NoSchedule. Node infrastructure must run on
+      # all of them regardless of which taints a future hw-class adds —
+      # blanket-tolerate, same as every CNI/node-agent DaemonSet.
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # Root: the daemon mounts fuse.rio-castore filesystems, chowns
+        # per-build staging dirs to arbitrary peer uids, and publishes
+        # root-owned 0444 cache entries.
+        runAsUser: 0
+        runAsGroup: 0
+        seccompProfile:
+          # Allows mount/umount2/quotactl when paired with
+          # CAP_SYS_ADMIN (they sit in the profile's caps-gated group);
+          # only pivot_root is missing from that group, and mountd
+          # never calls it.
+          type: RuntimeDefault
+      containers:
+        - name: mountd
+          image: {{ include "rio.image" (list . $m.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          # The rio-builder image's entrypoint is /bin/rio-builder;
+          # rio-mountd ships in the same image (same crate).
+          command: ["/bin/rio-mountd"]
+          args:
+            - --socket=/run/rio-mountd.sock
+            - --castore-dir=/var/rio/castore
+            - --staging-dir=/var/rio/staging
+            - --cache-dir=/var/rio/cache
+            - --chunks-dir=/var/rio/chunks
+            - --staging-quota-bytes={{ $m.stagingQuotaBytes | int64 }}
+            - --allowed-gid={{ $m.allowedGid | int }}
+            - --metrics-addr=[::]:9095
+          securityContext:
+            # NOT privileged: the daemon needs exactly CAP_SYS_ADMIN
+            # (mount(2), FUSE_DEV_IOC_BACKING_OPEN, quotactl) on top of
+            # the ambient root it already has for chown/0444
+            # publication. privileged would also disable seccomp and
+            # expose every host device.
+            #
+            # TODO: P0560 (the builder-side castore cutover) needs the
+            # fuse.rio-castore mounts this daemon creates at
+            # /var/rio/castore/<build_id> to be visible in the BUILDER
+            # pod's mount namespace (they are its overlay lowerdir).
+            # Mount propagation container→host requires
+            # `mountPropagation: Bidirectional` on the castore
+            # volumeMount, and the k8s API only admits Bidirectional on
+            # `privileged: true` containers. Resolve in P0560 by either
+            # (a) flipping this to privileged + Bidirectional (loses
+            # seccomp), or (b) moving the mount(2) to the builder side
+            # — the builder already receives the /dev/fuse fd over
+            # SCM_RIGHTS and can mount it inside its own userns, which
+            # keeps mountd unprivileged. Until P0560 lands nothing
+            # consumes the castore mountpoints, so the unpropagated
+            # mount is unobservable.
+            privileged: false
+            capabilities:
+              drop: [ALL]
+              add: [SYS_ADMIN]
+          ports:
+            - name: metrics
+              containerPort: 9095
+          env:
+            {{- include "rio.rustLogEnv" . | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 12 }}
+          volumeMounts:
+            # The socket lives in the HOST /run so builder pods can
+            # reach it via their own hostPath mount. The PARENT
+            # directory is mounted (not the socket file): the daemon
+            # unlinks and re-binds the socket on restart, and a
+            # single-file hostPath pins the dead inode on both sides.
+            # /run/rio-mountd.sock is a cross-component contract — the
+            # binary default, the P0559 client, and the vm-mountd
+            # scenario all use it — so the parent is /run itself.
+            - name: run
+              mountPath: /run
+            - name: var-rio-cache
+              mountPath: /var/rio/cache
+            - name: var-rio-chunks
+              mountPath: /var/rio/chunks
+            - name: var-rio-staging
+              mountPath: /var/rio/staging
+            - name: var-rio-castore
+              mountPath: /var/rio/castore
+            - name: dev-fuse
+              mountPath: /dev/fuse
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
+          # The daemon serves on a UDS, not TCP — the only TCP listener
+          # is the metrics exporter, which binds before the socket
+          # accept loop starts. Good enough for liveness (a wedged
+          # tokio runtime stops answering HTTP); there is no readiness
+          # gate because nothing routes Service traffic to this pod.
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+      volumes:
+        - name: run
+          hostPath:
+            path: /run
+            type: Directory
+        # `type: Directory` (not DirectoryOrCreate): the four trees are
+        # created by the AMI's tmpfiles rules ON the XFS-prjquota
+        # /var/rio mount (nix/nixos-node/eks-node.nix). DirectoryOrCreate
+        # would let kubelet silently create them on whatever is mounted
+        # at /var/rio — including the unquota'd root fs if the XFS mount
+        # failed — and the staging quota would be a no-op. A missing dir
+        # is a loud ContainerCreating failure instead.
+        - name: var-rio-cache
+          hostPath: {path: /var/rio/cache, type: Directory}
+        - name: var-rio-chunks
+          hostPath: {path: /var/rio/chunks, type: Directory}
+        - name: var-rio-staging
+          hostPath: {path: /var/rio/staging, type: Directory}
+        - name: var-rio-castore
+          hostPath: {path: /var/rio/castore, type: Directory}
+        - name: dev-fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
+{{- end }}

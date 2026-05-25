@@ -77,4 +77,24 @@ spec:
   podMetricsEndpoints:
     - portName: metrics
       interval: {{ .Values.monitoring.scrapeInterval }}
+{{- if .Values.mountd.enabled }}
+---
+# rio-mountd DaemonSet: per-node pods, no Service (the data plane is a
+# UDS) — PodMonitor scrapes the metrics containerPort (9095) directly,
+# same shape as the builder PodMonitor above.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: rio-mountd
+  namespace: {{ $ns.builders.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" $ "name" "rio-mountd" "component" "mountd") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-mountd" | nindent 6 }}
+  podMetricsEndpoints:
+    - portName: metrics
+      interval: {{ .Values.monitoring.scrapeInterval }}
+{{- end }}
 {{- end }}

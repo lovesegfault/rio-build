@@ -883,6 +883,48 @@ gateway:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# rio-mountd — privileged per-node castore broker (DaemonSet)
+# ──────────────────────────────────────────────────────────────────────────
+# One pod per builder/fetcher node. Brokers the three things the
+# unprivileged builder pod cannot do itself: open /dev/fuse,
+# FUSE_DEV_IOC_BACKING_OPEN (init-ns CAP_SYS_ADMIN), and writes into the
+# shared node-local cache (integrity boundary — content is re-hashed
+# before publication). Talks to builder pods over
+# /run/rio-mountd.sock (hostPath); needs no cluster networking beyond
+# the Prometheus scrape of :9095.
+mountd:
+  enabled: true
+  # Reuses the rio-builder image: rio-mountd is a [[bin]] of the
+  # rio-builder crate so the binary already ships in that image, and
+  # that image is already prebaked into the AMI (executorSeed) + pulled
+  # for every builder pod — a dedicated image would be a second cold
+  # ECR pull on node boot, delaying mountd past the first builder pod's
+  # connect attempt. The container overrides the entrypoint to
+  # /bin/rio-mountd.
+  image: rio-builder
+  # Numeric gid of the `rio-builder` group. THREE sites must agree on
+  # this value — it is the trust boundary for who may talk to mountd:
+  #   - here → `--allowed-gid` (mountd chowns the socket to it and
+  #     drops any connection whose SO_PEERCRED.gid differs)
+  #   - nix/nixos-node/eks-node.nix `users.groups.rio-builder.gid`
+  #     (the host-side group the socket inode is owned by)
+  #   - the builder pod's group (P0559 wires the in-process client;
+  #     see the TODO at rio-controller/src/reconcilers/pool/pod.rs)
+  allowedGid: 990
+  # Kernel-enforced per-build staging quota in bytes (XFS project
+  # quota on /var/rio/staging/<build_id>). 10 GiB. 0 disables
+  # enforcement — never do that in production; a single build could
+  # fill the node's /var/rio.
+  stagingQuotaBytes: 10737418240
+  resources:
+    # The hot path (BackingOpen) is one ioctl per request; Promote
+    # copies are disk-bound, bounded by an internal
+    # Semaphore(num_cpus). Memory is the 64 KiB copy buffer per
+    # in-flight promote + tokio overhead.
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+
+# ──────────────────────────────────────────────────────────────────────────
 # Karpenter NodePools + EC2NodeClass
 # ──────────────────────────────────────────────────────────────────────────
 # In the chart (not terraform) so `helm rollback` takes node config with

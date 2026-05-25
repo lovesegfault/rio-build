@@ -19,6 +19,7 @@
 {
   config,
   lib,
+  options,
   pkgs,
   pins,
   ...
@@ -27,6 +28,30 @@ let
   cfg = config.services.rio.eksNode;
   nodeadm = pkgs.callPackage ./nodeadm.nix { inherit pins; };
   ecr-credential-provider = pkgs.callPackage ./ecr-credential-provider.nix { inherit pins; };
+
+  # The /var/rio fileSystems entry, factored out because it has to be
+  # declared at TWO option paths (see the `fileSystems."/var/rio"`
+  # comment below for what the mount is for):
+  #   - `fileSystems."/var/rio"` for the real AMI;
+  #   - `virtualisation.fileSystems."/var/rio"` for the qemu-vm test
+  #     (nix/tests/nixos-node.nix). qemu-vm.nix replaces the WHOLE
+  #     `fileSystems` attrset with `mkVMOverride` (a priority-10
+  #     definition of the option, which discards every default-priority
+  #     definition wholesale — not a per-attribute merge), so a mount
+  #     declared only at the first path silently vanishes under the VM
+  #     test and the prjquota assertion below fails.
+  varRioFileSystem = {
+    device = "/var/rio.img";
+    fsType = "xfs";
+    options = [
+      "loop"
+      "prjquota"
+      "noatime"
+      # Requires=+After= from var-rio.mount onto the image-creation
+      # oneshot below.
+      "x-systemd.requires=rio-var-rio-image.service"
+    ];
+  };
 
   # containerd-config.nix pins sandbox = "localhost/kubernetes/pause" and
   # expects the AMI bake to have pre-loaded it (templates/shared/runtime/
@@ -98,13 +123,118 @@ in
         they're GC roots only. See r[infra.node.prebake-layer-warm].
       '';
     };
+
+    varRioSize = lib.mkOption {
+      type = lib.types.str;
+      default = "100G";
+      example = "200G";
+      description = ''
+        Size of the sparse `/var/rio.img` backing file for the
+        XFS-with-prjquota filesystem rio-mountd owns (shared backing
+        cache, chunk cache, per-build staging, castore mountpoints).
+        Sparse — root-volume blocks are only consumed as the caches
+        fill, but a full /var/rio consumes this much of
+        `karpenter.dataVolumeSize`, so keep
+        `dataVolumeSize - varRioSize` above the largest pod
+        ephemeral-storage request (see the dataVolumeSize budget note
+        in infra/helm/rio-build/values.yaml). The P0571 LRU sweep
+        keeps usage below this ceiling once it lands.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    # ── /var/rio/staging MUST be on XFS with project quotas ──────────
+    # rio-mountd (P0567) enforces per-build staging quotas with XFS
+    # project quotas: `ioctl(FS_IOC_FSSETXATTR, {fsx_projid, PROJINHERIT})`
+    # + `quotactl(Q_SETQUOTA)` on a mountd-assigned projid. Without
+    # `prjquota` in the mount options the quotactl fails and every
+    # build's staging writes are unbounded — a single build can fill
+    # the node's disk. Asserted at module eval so a filesystem-layout
+    # refactor that silently lands /var/rio/staging back on the ext4
+    # root fails `node-ami-eval` instead of shipping an AMI with no
+    # quota enforcement.
+    assertions = [
+      {
+        assertion =
+          let
+            # The filesystem that will host /var/rio/staging is the
+            # fileSystems entry with the longest mountPoint that is a
+            # path-prefix of it.
+            covers =
+              fs: lib.hasPrefix (if fs.mountPoint == "/" then "/" else fs.mountPoint + "/") "/var/rio/staging/";
+            stagingFs = lib.last (
+              lib.sortOn (fs: lib.stringLength fs.mountPoint) (
+                lib.filter covers (lib.attrValues config.fileSystems)
+              )
+            );
+          in
+          stagingFs.fsType == "xfs"
+          && lib.any (o: lib.elem o stagingFs.options) [
+            "prjquota"
+            "pquota"
+          ];
+        message = ''
+          services.rio.eksNode: /var/rio/staging must be hosted on an XFS
+          filesystem mounted with the `prjquota` (or `pquota`) option —
+          rio-mountd enforces per-build staging quotas via XFS project
+          quotas, and without them staging writes are unbounded. Keep the
+          `fileSystems."/var/rio"` XFS loopback declared in eks-node.nix,
+          or move /var/rio onto another XFS filesystem mounted with
+          prjquota.
+        '';
+      }
+    ];
+
+    # Host-side group owning /run/rio-mountd.sock (created 0660
+    # root:rio-builder by rio-mountd). The gid is FIXED and must agree
+    # with two other sites:
+    #   - helm `mountd.allowedGid` → rio-mountd `--allowed-gid` (the
+    #     SO_PEERCRED gate + the socket fchown)
+    #   - the builder pod's group (P0559 wires the client; see the TODO
+    #     at rio-controller/src/reconcilers/pool/pod.rs)
+    # 990 matches nix/tests/scenarios/mountd.nix. NixOS allocates
+    # dynamic system gids downward from 999 but skips explicitly-taken
+    # ids, and ids.nix has no static 990, so this cannot collide.
+    users.groups.rio-builder.gid = 990;
+
     # Cilium WireGuard transparent encryption (encryption.type=
     # wireguard in addons.tf). cilium-agent loads this on demand,
     # but having it in initrd avoids a node-Ready delay.
     boot.kernelModules = [ "wireguard" ];
+
+    # ── /var/rio: XFS-with-prjquota for rio-mountd ───────────────────
+    # The root fs is ext4 (amazon-image.nix) and carries no project-
+    # quota metadata, so /var/rio gets its own XFS on a sparse loopback
+    # backing file on the root volume. One filesystem covers all four
+    # mountd-owned trees (cache, chunks, staging, castore): only
+    # staging needs prjquota, but a dedicated fs also gives the P0571
+    # LRU sweep a statvfs budget that isn't coupled to image-pull /
+    # kubelet pressure on the root volume.
+    #
+    # Loopback (not a second EBS volume, not the instance-store RAID0):
+    #   - works identically on every NodeClass (rio-default/rio-metal
+    #     are EBS-only; rio-nvme's RAID0 is mounted at /var/lib/kubelet
+    #     and shares its projid space with kubelet's ephemeral-storage
+    #     quotas — reusing it would alias mountd's monotonic-from-1
+    #     projids onto kubelet's);
+    #   - no karpenter blockDeviceMappings / device-name churn.
+    # The cost is the loop driver's extra page-cache copy on the
+    # staging/cache write path. If that shows up in promote throughput,
+    # the upgrade path is a dedicated gp3 volume formatted the same way
+    # (the assertion above doesn't care where the XFS comes from).
+    #
+    # NOT `nofail`: a Ready builder node whose /var/rio mount failed
+    # would run mountd against the unquota'd ext4 root underneath the
+    # mountpoint (silent loss of the staging quota). Same fail-hard
+    # rationale as kubelet's Requires=rio-nvme-mount below; Karpenter
+    # replaces a node that never reaches Ready.
+    fileSystems."/var/rio" = varRioFileSystem;
+    # qemu-vm only (see the varRioFileSystem comment). The option does
+    # not exist outside the VM-test composition, hence the guard.
+    virtualisation = lib.optionalAttrs (options ? virtualisation.fileSystems) {
+      fileSystems."/var/rio" = varRioFileSystem;
+    };
 
     # ── nix-ld: glibc shim for DaemonSet-delivered host binaries ─────
     # cilium DaemonSet hostPath-copies a glibc-linked /opt/cni/bin/
@@ -437,6 +567,56 @@ in
           };
         };
 
+        # ── rio-var-rio-image: oneshot, before var-rio.mount ──────────
+        # Creates and formats the sparse XFS backing file for the
+        # declarative fileSystems."/var/rio" entry above. Pulled in by
+        # the mount unit's `x-systemd.requires=`; a separate service
+        # because mount units cannot run ExecStartPre.
+        #
+        # Idempotent across reboots: the EBS root persists over
+        # stop/start, so a formatted image is detected (blkid) and left
+        # alone — re-running mkfs would wipe the warm caches.
+        rio-var-rio-image = {
+          description = "Create the /var/rio XFS-prjquota backing image";
+          before = [ "var-rio.mount" ];
+          unitConfig = {
+            # var-rio.mount is Before=local-fs.target, which is before
+            # basic.target — the default service dependencies
+            # (After=basic.target) would cycle.
+            DefaultDependencies = false;
+          };
+          # The truncate is sparse so it doesn't need the grown root,
+          # but mkfs.xfs writes the journal (~varRioSize/2048 of real
+          # blocks) — order after the root partition+fs growth so a
+          # `diskSize = "auto"`-built image with minimal slack can't
+          # ENOSPC on first boot. Both After= edges are no-ops when the
+          # unit doesn't exist (QEMU VM tests) or is skipped.
+          after = [
+            "growpart.service"
+            "systemd-growfs-root.service"
+          ];
+          path = [
+            pkgs.kmod
+            pkgs.xfsprogs
+            pkgs.util-linux
+          ];
+          script = ''
+            set -euo pipefail
+            # `mount -o loop` opens /dev/loop-control, which only
+            # exists once the loop module is loaded. modules-load.d has
+            # no ordering against local-fs.target, so load it here.
+            modprobe loop
+            [ -f /var/rio.img ] || truncate -s ${cfg.varRioSize} /var/rio.img
+            # Already formatted (reboot of a persistent EBS root) →
+            # keep the warm caches.
+            blkid /var/rio.img >/dev/null || mkfs.xfs -q /var/rio.img
+          '';
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+        };
+
         # ── nodeadm-init: oneshot, before kubelet ─────────────────────
         # `init --skip run --daemon kubelet`: write kubelet config only, don't
         # systemctl-start it (nodeadm assumes AL2023 unit names; ours
@@ -636,11 +816,24 @@ in
       # writes); vpc-cni's aws-node DaemonSet hostPath-mounts /opt/cni/
       # bin and /etc/cni/net.d and writes there. Both must exist + be
       # writable.
+      #
+      # /var/rio/{cache,chunks,staging,castore}: the four mountd-owned
+      # trees (P0567/P0571). rio-mountd open()s them O_DIRECTORY at
+      # startup and the mountd-ds.yaml hostPath mounts use
+      # `type: Directory` so a missing dir is a loud scheduling failure,
+      # not a kubelet-created root-owned surprise. tmpfiles-setup runs
+      # After=local-fs.target, which waits for var-rio.mount (not
+      # `nofail`), so these land on the XFS — never on the root fs
+      # underneath the mountpoint.
       tmpfiles.rules = [
         "d /etc/kubernetes/manifests 0755 root root -"
         "d /etc/cni/net.d 0755 root root -"
         "d /opt/cni/bin 0755 root root -"
         "d /var/lib/kubelet 0755 root root -"
+        "d /var/rio/cache 0755 root root -"
+        "d /var/rio/chunks 0755 root root -"
+        "d /var/rio/staging 0755 root root -"
+        "d /var/rio/castore 0755 root root -"
       ];
     };
   };
