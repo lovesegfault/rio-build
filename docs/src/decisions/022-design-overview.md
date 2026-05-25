@@ -239,7 +239,7 @@ The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not open
 | 1 | rio-mountd | `fuse_fd = open("/dev/fuse")`; **keep a `dup()`**; `mount("fuse", "/var/rio/castore/{build_id}", …, "fd=N,allow_other,default_permissions,…")`; send fd over UDS via `SCM_RIGHTS` |
 | 2 | builder | receive fuse fd; spawn castore-FUSE server on it (`fuser::Session::from_fd`) |
 | 3 | builder (in own userns) | `mount("overlay", merged, "overlay", 0, "userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>")`; bind `merged` → `/nix/store` |
-| per-open | builder → rio-mountd | `BackingOpen{cache_fd}` over UDS (`SCM_RIGHTS`) → mountd `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN)` → reply `backing_id`. `BackingClose{id}` on release. mountd does not inspect the fd — the ioctl rejects depth>0 backing, and `backing_id` is conn-scoped. |
+| per-open | builder → rio-mountd | `BackingOpen{cache_fd}` over UDS (`SCM_RIGHTS`) → mountd re-opens the fd `O_RDONLY` (`r[builder.mountd.backing-readonly]`) → `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN)` → reply `backing_id`. `BackingClose{id}` on release. The ioctl rejects depth>0 backing, and `backing_id` is conn-scoped. |
 | per-promote | builder → rio-mountd | `Promote{digest}` → mountd opens `staging/<digest>`, claims the digest with a flock-held `cache/ab/<digest>.promoting` placeholder, stream-copies into a unique mountd-owned temp file while hashing, verifies `blake3 == digest`, renames its own temp file into place, unlinks staging, drops the claim. |
 | teardown | rio-mountd | on UDS close: `umount2(castore_mnt, MNT_DETACH)`; `rm -rf staging/{build_id}`; `rmdir`; drop kept fuse-fd. Builder mount-ns death drops overlay. On daemon start: scan `/var/rio/castore/*` + `/var/rio/staging/*` and reap orphans (`r[builder.mountd.orphan-scan]`). |
 
@@ -250,6 +250,12 @@ r[builder.mountd.backing-broker]
 `BackingOpen{}`/`BackingClose{id}` are the only ioctl-brokering requests: the fd travels in the frame's `SCM_RIGHTS` cmsg, never in the serialized body; mountd issues `FUSE_DEV_IOC_BACKING_OPEN` against its kept `/dev/fuse` dup and replies the conn-scoped `backing_id`.
 
 The wire format is one postcard-encoded frame per `SOCK_SEQPACKET` datagram (`MAX_FRAME_BYTES = 4096`, enforced via `MSG_TRUNC` on the receive side). Not `SOCK_STREAM` + length-prefix: stream sockets associate `SCM_RIGHTS` ancillary data with a byte position rather than a frame, so a reader whose `recvmsg` boundaries drift from the writer's `sendmsg` boundaries can attach an fd to the wrong pipelined request. Message-boundary preservation makes one datagram == one frame == its fds.
+
+r[builder.mountd.backing-readonly]
+
+mountd MUST NOT register the client-supplied fd as the passthrough backing file: it re-opens that fd `O_RDONLY` (via `/proc/self/fd/<n>` — same inode, fresh file description) and registers the read-only re-open, so the only file description the privileged side ever hands to `FUSE_DEV_IOC_BACKING_OPEN` is unwritable, whatever access mode the client's fd carries.
+
+The kernel never does I/O through the registered fd itself — each FUSE open re-opens the backing *path* with the FUSE caller's flags under mountd's (root) credentials (`fuse_passthrough_open` → `backing_file_open`) — so the pin cannot break read passthrough. The FUSE-layer rejection (`r[builder.fs.open-read-only]`) is what keeps write-mode flags away from that kernel-side re-open; the broker-side pin is the privileged-side guarantee that no writable file description for a shared-cache entry is ever registered, regardless of client behavior.
 
 r[builder.mountd.concurrency]
 
@@ -364,7 +370,7 @@ The `r[...]` markers introduced by ADR-022 across the design book are the spec-t
 |---|---|
 | Mount stack | `builder.fs.castore-stack` · `builder.fs.castore-dag-source` · `builder.fs.castore-inode-digest` · `builder.fs.castore-cache-config` · `builder.fs.fd-handoff-ordering` · `builder.overlay.castore-lower` |
 | castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` · `builder.fs.open-iomode-compatible` |
-| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.promote-verified` · `builder.mountd.promote-bounded-copy` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` · `builder.mountd.build-id-validated` · `builder.mountd.build-id-unique` · `builder.mountd.uid-bound` · `builder.mountd.one-mount` · `builder.mountd.staging-quota` · `sec.boundary.mountd` |
+| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.backing-readonly` · `builder.mountd.promote-verified` · `builder.mountd.promote-bounded-copy` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` · `builder.mountd.build-id-validated` · `builder.mountd.build-id-unique` · `builder.mountd.uid-bound` · `builder.mountd.one-mount` · `builder.mountd.staging-quota` · `sec.boundary.mountd` |
 | FUSE handler quirks | `builder.fs.listxattr-size-branch` |
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
 | Dispatch | `sched.dispatch.input-roots` |

@@ -136,6 +136,10 @@
     "messages": [],
     "doc": "Executor-facing RPCs served by the rio-scheduler process. \"Executor\" is the generic term for both builders (airgapped, arbitrary derivation code) and fetchers (open egress, FOD-only, hash-check bounded) — same binary, same pair of unaries, different RIO_EXECUTOR_KIND env."
   },
+  "castore.proto": {
+    "services": [],
+    "doc": "Content-addressed Directory DAG (ADR-022 §2.2/§8). Vendored from"
+  },
   "dag.proto": {
     "services": [],
     "messages": [

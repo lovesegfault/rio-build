@@ -141,6 +141,10 @@ const FS_IOC_FSSETXATTR: libc::c_ulong = 0x401c_5820;
 /// created after it, kernel-side, with no per-file work.
 const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
 
+/// `<sys/quota.h>` `QIF_LIMITS` (`QIF_BLIMITS | QIF_ILIMITS`): which
+/// `dqblk` fields `Q_SETQUOTA` should apply.
+const QIF_LIMITS: u32 = 1 | 4;
+
 /// kubelet's project-ID allocator base (`volume/util/fsquota`:
 /// `firstQuota = 1048576`). Kubelet assigns projids upward from here
 /// and records them in `/etc/projid`; the builder-owned range below
@@ -164,6 +168,17 @@ pub const BUILDER_PROJID_RANGE: u32 = 1 << 19;
 // at kubelet's base. A drift in either constant is a compile error,
 // not a runtime collision.
 const _: () = assert!(BUILDER_PROJID_BASE + BUILDER_PROJID_RANGE == KUBELET_PROJID_BASE);
+
+/// rio-mountd's project-ID range floor. mountd staging dirs claim ids
+/// in `[MOUNTD_PROJID_BASE, MOUNTD_PROJID_CEILING)` — disjoint from
+/// the builder-minted `[BUILDER_PROJID_BASE, …)` and kubelet's
+/// `[KUBELET_PROJID_BASE, …)` so the three allocators partition the id
+/// space statically when `/var/rio` is a bind of the kubelet XFS
+/// (rio-nvme nodes; PROJID-04).
+pub const MOUNTD_PROJID_BASE: u32 = 1;
+/// See [`MOUNTD_PROJID_BASE`].
+pub const MOUNTD_PROJID_CEILING: u32 = BUILDER_PROJID_BASE;
+const _: () = assert!(MOUNTD_PROJID_CEILING <= BUILDER_PROJID_BASE);
 
 /// R17 (live_063): bound on the linear free-record probe. VIOLABLE,
 /// hypothesis 64: a collision needs two live emptyDirs on one node
@@ -743,6 +758,60 @@ fn statvfs_of(dir: &Path) -> Option<libc::statvfs> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut sv) } == 0).then_some(sv)
 }
 
+/// Assign XFS project `projid` to the directory behind `dirfd` (with
+/// `PROJINHERIT` so children are accounted against it) and set a hard
+/// block limit of `limit_bytes`. `limit_bytes == 0` clears the limit
+/// (used at teardown so dead projids don't accumulate quota records).
+///
+/// Unlike [`current_bytes`], failures here are **errors**, not `None`:
+/// rio-mountd calls this to enforce a security bound
+/// (`r[builder.mountd.staging-quota]`) and silently running unquota'd
+/// would defeat it. The caller decides whether the filesystem is
+/// required to support project quotas.
+///
+/// Uses the generic `Q_SETQUOTA`/`struct dqblk` interface rather than
+/// the XFS-specific `Q_XSETQLIM`/`fs_disk_quota`: XFS wires the VFS
+/// quota ops, `libc` already ships the `dqblk` layout, and the generic
+/// path also covers ext4-with-`prjquota`. `dqb_bhardlimit` is in
+/// 1024-byte blocks per `<sys/quota.h>`.
+pub fn apply_project_quota(dirfd: &impl AsRawFd, projid: u32, limit_bytes: u64) -> io::Result<()> {
+    // ── 1. Tag the directory with the project id + inherit flag.
+    let mut x = Fsxattr::default();
+    // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
+    // the pointer. `x` is repr(C), Default-zeroed, lives on our stack.
+    if unsafe { libc::ioctl(dirfd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    x.fsx_projid = projid;
+    x.fsx_xflags |= FS_XFLAG_PROJINHERIT;
+    // SAFETY: FS_IOC_FSSETXATTR reads exactly sizeof(Fsxattr) bytes.
+    if unsafe { libc::ioctl(dirfd.as_raw_fd(), FS_IOC_FSSETXATTR, &x as *const _) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // ── 2. Hard block limit on the project.
+    // SAFETY: dqblk is POD; zeroed is a valid bit-pattern.
+    let mut dq: libc::dqblk = unsafe { std::mem::zeroed() };
+    dq.dqb_bhardlimit = limit_bytes.div_ceil(1024);
+    dq.dqb_bsoftlimit = dq.dqb_bhardlimit;
+    dq.dqb_valid = QIF_LIMITS;
+    let cmd = qcmd(libc::Q_SETQUOTA, PRJQUOTA);
+    // SAFETY: SYS_quotactl_fd(int fd, int cmd, qid_t id, void *addr).
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_quotactl_fd,
+            dirfd.as_raw_fd() as libc::c_long,
+            cmd as libc::c_long,
+            projid as libc::c_long,
+            &mut dq as *mut _ as libc::c_long,
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,5 +1143,16 @@ mod tests {
         assert_eq!(ProjQuota::Minted(id).project_id(), Some(id));
         assert_eq!(ProjQuota::Unavailable.project_id(), None);
         assert_eq!(id.get(), BUILDER_PROJID_BASE + 7);
+    }
+
+    /// The set side must FAIL (not silently no-op) on a filesystem
+    /// without project-quota support — rio-mountd treats that as a
+    /// fatal Mount error because the staging quota is a security bound.
+    #[test]
+    fn apply_fails_loudly_without_prjquota() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = File::open(dir.path()).unwrap();
+        let r = apply_project_quota(&f, 4242, 1 << 20);
+        assert!(r.is_err(), "tmpfs must not accept a project quota: {r:?}");
     }
 }

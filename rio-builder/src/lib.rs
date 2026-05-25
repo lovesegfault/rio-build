@@ -31,6 +31,7 @@
 #![deny(missing_docs)]
 
 pub(crate) mod banner;
+pub mod castore_fuse;
 pub mod cgroup;
 pub mod config;
 pub mod executor;
@@ -98,14 +99,33 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_builder_fuse_fetch_duration_seconds",
         &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0],
     ),
+    (
+        // Spans five decades: BackingOpen/BackingClose are a single
+        // ioctl (sub-ms, the 0.0005/0.001 buckets), Mount is a handful
+        // of syscalls (~ms), and Promote of a multi-GiB staged file is
+        // tens of seconds of copy+blake3. The [0.005..10.0] default
+        // loses both tails.
+        "rio_mountd_request_seconds",
+        &[
+            0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
 /// the source for `docs/ref/metrics.typ` — see
 /// `xtask/src/regen/docs_data.rs::metrics()` for the data-flow.
+///
+/// Also registers the `rio_mountd_*` descriptions: rio-mountd is a
+/// separate binary in this crate, and `tests/metrics_registered.rs`
+/// cross-references every `metrics::*!` emission in `src/` against this
+/// one function. Describing a metric a given binary never emits is
+/// harmless (an extra `# HELP` line at worst).
 // r[impl obs.metric.builder]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    castore_fuse::mountd::describe_metrics();
 
     describe_counter!(
         "rio_builder_builds_total",
