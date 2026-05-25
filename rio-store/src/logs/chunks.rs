@@ -106,38 +106,59 @@ pub enum PutOutcome {
     Existed,
 }
 
+/// Width of the per-line length prefix in the chunk payload.
+const LINE_LEN_PREFIX_BYTES: usize = 4;
+
 /// zstd-compress log lines into a chunk blob.
 ///
-/// Every line — including the last — is terminated with `\n`, matching
-/// the scheduler's flusher convention ("its content always ends with
-/// `\n`"). The terminator-on-every-line scheme is what makes the
-/// trailing-empty-line case round-trip: `["a", ""]` encodes as
-/// `"a\n\n"`, which [`decompress_lines`] strips one terminator from and
-/// splits into exactly `["a", ""]`. Zero lines encode as a zero-byte
-/// payload.
+/// Each line is framed as a little-endian `u32` byte length followed by
+/// the line's raw bytes. Length-prefix framing keeps the codec
+/// injective over **arbitrary** line content: a line is whatever byte
+/// string the worker sent (truncated to `MAX_LINE_LEN`), including
+/// embedded `\n`, `\r\n`, NULs, and the empty string, and it must come
+/// back out as exactly one line with exactly those bytes. (The previous
+/// `\n`-terminated framing split a line containing `0x0A` into two at
+/// read time, shifting every subsequent line's positional attribution
+/// and serving line numbers the manifest row never claimed.) Zero lines
+/// encode as a zero-byte payload.
+///
+/// A line longer than `u32::MAX` cannot be framed and is rejected as a
+/// `Codec` error — unreachable from the ingest path, which truncates to
+/// `MAX_LINE_LEN` (64 KiB) before cutting.
 ///
 /// Pure sync function — callers compressing more than a trivial amount
 /// of data run it under `tokio::task::spawn_blocking` (a few MiB of log
 /// compresses in ~10-50 ms, long enough to stall a tokio worker).
 pub fn compress_lines(lines: &[Vec<u8>]) -> Result<Vec<u8>, LogChunkError> {
     use std::io::Write as _;
-    let payload_len: usize = lines.iter().map(|l| l.len() + 1).sum();
+    let payload_len: usize = lines.iter().map(|l| l.len() + LINE_LEN_PREFIX_BYTES).sum();
     let mut encoder =
         zstd::stream::Encoder::new(Vec::with_capacity(payload_len / 4), LOG_CHUNK_ZSTD_LEVEL)
             .map_err(LogChunkError::Codec)?;
     for line in lines {
+        let len = u32::try_from(line.len()).map_err(|_| {
+            LogChunkError::Codec(std::io::Error::other(format!(
+                "log line of {} bytes exceeds the u32 length-prefix range",
+                line.len()
+            )))
+        })?;
+        encoder
+            .write_all(&len.to_le_bytes())
+            .map_err(LogChunkError::Codec)?;
         encoder.write_all(line).map_err(LogChunkError::Codec)?;
-        encoder.write_all(b"\n").map_err(LogChunkError::Codec)?;
     }
     encoder.finish().map_err(LogChunkError::Codec)
 }
 
 /// Decompress a chunk blob back into its log lines.
 ///
-/// Inverse of [`compress_lines`]: decompress, strip exactly one trailing
-/// `\n` (the final line's terminator), split on `\n`. An empty
-/// decompressed payload is zero lines (not one empty line) — see
-/// `codec_roundtrips_single_empty_line_vs_no_lines`.
+/// Inverse of [`compress_lines`]: decompress, then walk the payload
+/// reading one `u32` little-endian length prefix and that many content
+/// bytes per line. An empty decompressed payload is zero lines (not one
+/// empty line) — see `codec_roundtrips_single_empty_line_vs_no_lines`.
+/// A payload that ends mid-prefix or whose last prefix runs past the
+/// end is corrupt (`Codec` error) — the framing is self-delimiting, so
+/// a well-formed payload always consumes exactly to the end.
 ///
 /// Refuses to decompress past `MAX_DECOMPRESSED_CHUNK_BYTES` (a
 /// `Codec` error) so a corrupt frame cannot balloon into an unbounded
@@ -157,16 +178,31 @@ pub fn decompress_lines(blob: &[u8]) -> Result<Vec<Vec<u8>>, LogChunkError> {
             "chunk decompresses past the {MAX_DECOMPRESSED_CHUNK_BYTES}-byte bound"
         ))));
     }
-    if decoded.is_empty() {
-        return Ok(Vec::new());
+    let mut lines = Vec::new();
+    let mut rest: &[u8] = &decoded;
+    while !rest.is_empty() {
+        let Some((prefix, after_prefix)) = rest.split_at_checked(LINE_LEN_PREFIX_BYTES) else {
+            return Err(LogChunkError::Codec(std::io::Error::other(format!(
+                "chunk payload ends mid length-prefix ({} trailing bytes)",
+                rest.len()
+            ))));
+        };
+        let len = u32::from_le_bytes(
+            prefix
+                .try_into()
+                .expect("split_at_checked returned 4 bytes"),
+        ) as usize;
+        let Some((content, after_content)) = after_prefix.split_at_checked(len) else {
+            return Err(LogChunkError::Codec(std::io::Error::other(format!(
+                "chunk line length prefix ({len} bytes) runs past the payload \
+                 ({} bytes remain)",
+                after_prefix.len()
+            ))));
+        };
+        lines.push(content.to_vec());
+        rest = after_content;
     }
-    // Strip the final line's terminator before splitting so split('\n')
-    // yields exactly the encoded lines (and not a phantom trailing empty
-    // line). A blob produced by compress_lines always ends with '\n';
-    // tolerate one that doesn't rather than erroring (the legacy flusher
-    // has the same unwrap_or fallback).
-    let raw: &[u8] = decoded.strip_suffix(b"\n").unwrap_or(&decoded);
-    Ok(raw.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect())
+    Ok(lines)
 }
 
 /// Storage backend for log chunks.
@@ -661,6 +697,59 @@ mod tests {
         assert_eq!(decompress_lines(&blob).unwrap(), lines);
     }
 
+    /// Line content is arbitrary worker-supplied bytes (the builder
+    /// forwards whole `STDERR_NEXT` payloads as one line without
+    /// splitting; a hostile builder can send anything), so the codec
+    /// must be injective over content that contains the byte values a
+    /// delimiter-based framing would treat as structure: an embedded
+    /// `\n` (the byte that split a line in two under the old framing —
+    /// the `servedSpanExact` violation `seed-crash-embedded-newline`
+    /// reproduces), a `\r\n` pair, a NUL, and the zero-length line. N
+    /// lines in, the same N lines out, byte for byte.
+    #[test]
+    fn codec_roundtrips_delimiter_and_control_bytes() {
+        let lines: Vec<Vec<u8>> = vec![
+            b"two logical lines\nin one stored line".to_vec(),
+            b"crlf terminated\r\n".to_vec(),
+            b"embedded\0nul".to_vec(),
+            b"".to_vec(),
+            b"\n".to_vec(),
+            vec![0xA0, 0x0A, 0x00, 0x00, 0x00, 0x00], // the minimized fuzz reproducer's line 10
+        ];
+        let blob = compress_lines(&lines).unwrap();
+        let roundtripped = decompress_lines(&blob).unwrap();
+        assert_eq!(
+            roundtripped.len(),
+            lines.len(),
+            "a line containing a delimiter byte must not split into two"
+        );
+        assert_eq!(roundtripped, lines);
+    }
+
+    /// The length-prefix framing gives the decoder real failure modes a
+    /// delimiter split never had: a payload that ends mid-prefix and a
+    /// prefix whose declared length runs past the payload are both
+    /// corruption, not lines. (Built by compressing raw payload bytes
+    /// directly — `compress_lines` cannot produce these.)
+    #[test]
+    fn codec_rejects_malformed_framing() {
+        let compress_raw = |payload: &[u8]| {
+            zstd::stream::encode_all(payload, LOG_CHUNK_ZSTD_LEVEL).expect("in-memory zstd encode")
+        };
+        // Two trailing bytes where a 4-byte length prefix should start.
+        let truncated_prefix = compress_raw(&[1, 0, 0, 0, b'x', 9, 9]);
+        assert!(matches!(
+            decompress_lines(&truncated_prefix),
+            Err(LogChunkError::Codec(_))
+        ));
+        // A prefix declaring 200 content bytes with only 1 present.
+        let overlong_length = compress_raw(&[200, 0, 0, 0, b'x']);
+        assert!(matches!(
+            decompress_lines(&overlong_length),
+            Err(LogChunkError::Codec(_))
+        ));
+    }
+
     /// A frame whose decompressed size exceeds [`MAX_DECOMPRESSED_CHUNK_BYTES`]
     /// is rejected instead of ballooning into an unbounded allocation. A
     /// 17 MiB payload of zeros compresses to a few KiB — exactly the
@@ -680,13 +769,13 @@ mod tests {
         }
     }
 
-    /// The trailing-empty-line ambiguity: after a join('\n')/split('\n')
-    /// round trip, `["a", ""]` and `["a"]` are indistinguishable unless
-    /// the codec terminates every line (including the last) with the
-    /// delimiter and the decoder strips exactly one terminator before
-    /// splitting. This is the convention the scheduler's flusher/reader
-    /// pair already uses; pin it here so the two codecs agree for as long
-    /// as both exist.
+    /// The trailing-empty-line case: `["a", ""]` and `["a"]` must stay
+    /// distinguishable through the round trip (the manifest row claims
+    /// two lines; serving one would desynchronize the positional
+    /// attribution). Under the old join/split framing this took a
+    /// terminate-every-line convention to get right; under length
+    /// prefixes the empty line is its own zero-length record and the
+    /// case is pinned here so it stays covered.
     #[test]
     fn codec_roundtrips_trailing_empty_line() {
         let lines: Vec<Vec<u8>> = vec![b"a".to_vec(), b"".to_vec()];
@@ -702,7 +791,7 @@ mod tests {
             decompress_lines(&compress_lines(&none).unwrap()).unwrap(),
             none
         );
-        // One empty line -> a lone terminator -> one empty line.
+        // One empty line -> a lone zero-length prefix -> one empty line.
         let one_empty: Vec<Vec<u8>> = vec![b"".to_vec()];
         assert_eq!(
             decompress_lines(&compress_lines(&one_empty).unwrap()).unwrap(),
