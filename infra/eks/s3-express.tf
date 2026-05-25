@@ -2,10 +2,12 @@
 # cache tier in front of aws_s3_bucket.chunks (ADR-023, P0553).
 #
 # r[impl infra.express.cache-tier]
-# (documentary marker — tracey does not scan .tf; the scannable spec
-# anchor for this rule is docs/src/decisions/023-tiered-chunk-backend.md
-# and the consuming code is rio-store's ChunkBackendKind::Tiered. See
-# the P0553 plan entry for the coverage note.)
+# (documentary marker — tracey does not scan .tf, so this is not a
+# scannable impl site and the rule currently has none anywhere; it
+# stays listed by `tracey query uncovered` until the main line puts
+# the marker on the consuming code, rio-store's
+# ChunkBackendKind::Tiered / TieredChunkBackend. The spec text lives
+# in ADR-023, tiered chunk backend.)
 #
 # One bucket per AZ that (a) hosts a cluster subnet AND (b) is in the
 # S3-Express-supported AZ-ID set. Store replicas in an AZ with a bucket
@@ -29,6 +31,12 @@ locals {
   # letter suffix (us-east-2a) is account-randomized; the ID (use2-az1)
   # is physical — Express availability and bucket placement are both
   # keyed by ID.
+  #
+  # NOTE: this re-derives the `slice(..., 0, 3)` expression main.tf
+  # passes to module.vpc (the module echoes back names via
+  # module.vpc.azs but has no zone-id output, so reading it would not
+  # remove the duplication) — if the AZ count or selection in main.tf
+  # ever changes, change it here too.
   cluster_az_names   = slice(data.aws_availability_zones.available.names, 0, 3)
   cluster_az_ids     = slice(data.aws_availability_zones.available.zone_ids, 0, 3)
   zone_name_by_az_id = zipmap(local.cluster_az_ids, local.cluster_az_names)

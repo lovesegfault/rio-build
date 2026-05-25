@@ -21,7 +21,7 @@ The tier semantics:
 - `get(digest)` tries `local`; on miss, reads `remote` **and writes through to `local`**. Read-through is the only way Express fills.
 - `local = None` (no Express bucket for this AZ, or `kind = s3`) degrades to pass-through to `remote` — behaviorally identical to the pre-ADR-023 backend.
 
-Each rio-store pod resolves its node's AZ-ID at startup (`topology.kubernetes.io/zone` downward-API → IMDS `placement/availability-zone-id`) and picks the matching Express bucket from helm-supplied config. A pod scheduled to an AZ with no Express bucket (Express is not available in every AZ-ID) runs with `local = None`.
+Each rio-store pod is configured with at most one Express bucket — the one for its own AZ. Today helm renders a single explicit bucket (`store.chunkBackend.expressBucket` → `RIO_CHUNK_BACKEND__EXPRESS_BUCKET`), which is correct only when every store pod runs in that bucket's AZ (single-AZ or zone-pinned deployments). Multi-AZ per-pod selection — the store resolving its own AZ at startup and picking from the helm-supplied per-AZ bucket map (`store.chunkBackend.expressBucketByAzId`, populated from the terraform output) — is a pending main-line item; the candidate resolution mechanisms (IMDS, node-label lookup, KEP-4742 pod topology labels) are catalogued in the [implementation plan's P0554 handoff note](./022-implementation-plan.md). A pod with no selected bucket (its AZ has no Express bucket, or the selection is not yet implemented) runs with `local = None`.
 
 r[infra.express.cache-tier]
 
@@ -45,7 +45,7 @@ The bounded-cache invariant (`r[infra.express.bounded-eviction]`, [Design Overvi
 
 ## Deployment prerequisite
 
-S3 Express One Zone is available only in specific AZ-IDs. EKS subnets must land in supported AZ-IDs — verify via `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` (the letter suffix `us-east-1a` is account-randomized; the `use1-azN` ID is physical). `infra/eks/variables.tf:express_az_ids` is the intersection of subnet zone-ids with the Express-supported set; an empty list disables the cache tier cluster-wide. See [Design Overview §9](./022-design-overview.md#9-tiered-chunk-backend) for the supported-AZ list snapshot.
+S3 Express One Zone is available only in specific AZ-IDs. EKS subnets must land in supported AZ-IDs — verify via `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` (the letter suffix `us-east-1a` is account-randomized; the `use1-azN` ID is physical). `infra/eks/variables.tf:express_supported_az_ids` holds the Express-supported AZ-ID set; `infra/eks/s3-express.tf` intersects it with the cluster's subnet zone-ids (`local.express_az_ids`) to decide which buckets exist. Setting the variable to `[]` (or an empty intersection) disables the cache tier cluster-wide. See [Design Overview §9](./022-design-overview.md#9-tiered-chunk-backend) for the supported-AZ list snapshot.
 
 ## Rollback
 
