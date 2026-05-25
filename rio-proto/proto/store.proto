@@ -173,4 +173,13 @@ service StoreAdminService {
   // per-replica ratio. I-105: PG pool exhaustion is the cliff that
   // cascades into FUSE circuit-trip; this is the leading indicator.
   rpc GetLoad(rio.types.GetLoadRequest) returns (rio.types.GetLoadResponse);
+
+  // Invalidate a store path's metadata (narinfo + manifests via
+  // CASCADE, path_tenants, and — unless keep_realisations —
+  // realisations/realisation_deps rows resolving to it) so the next
+  // submission misses the cache and re-executes. Operator remediation
+  // for wrong-content uploads; idempotent (absent path → found=false,
+  // zero counts). Does NOT delete chunk data — GC reclaims orphaned
+  // chunks on its normal sweep.
+  rpc InvalidatePath(rio.types.InvalidatePathRequest) returns (rio.types.InvalidatePathResponse);
 }

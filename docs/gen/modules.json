@@ -245,6 +245,11 @@
       "doc": "`rio-cli gc` — trigger a store garbage-collection sweep."
     },
     {
+      "path": "invalidate_path.rs",
+      "depth": 0,
+      "doc": "`rio-cli invalidate-path` — operator remediation for a path that was"
+    },
+    {
       "path": "keygen.rs",
       "depth": 0,
       "doc": "`rio-cli keygen` — generate an ed25519 narinfo signing keypair."
@@ -680,6 +685,11 @@
     }
   ],
   "rio-nix": [
+    {
+      "path": "ca.rs",
+      "depth": 0,
+      "doc": "Content-addressing primitives for floating-CA outputs."
+    },
     {
       "path": "derivation/",
       "depth": 0,
@@ -1360,6 +1370,11 @@
       "path": "metadata/inline.rs",
       "depth": 1,
       "doc": "Inline write-ahead: small NARs stored directly in `manifests.inline_blob`."
+    },
+    {
+      "path": "metadata/invalidate.rs",
+      "depth": 1,
+      "doc": "Admin invalidation of a store path's cache metadata."
     },
     {
       "path": "metadata/queries.rs",

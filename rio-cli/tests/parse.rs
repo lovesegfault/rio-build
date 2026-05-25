@@ -76,6 +76,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "sla",
     "verify-chunks",
     "upstream",
+    "invalidate-path",
     "keygen",
 ];
 
@@ -218,6 +219,18 @@ fn per_subcommand_help_renders() {
 )]
 #[case::upstream_remove_no_url(&["upstream", "remove", "--tenant", "t1"], false)]
 #[case::upstream_bare(&["upstream"], false)]
+// invalidate-path: one required positional (the store path) + the
+// optional --keep-realisations flag. Parse-only (connect-refused after
+// clap, same pattern as the other store-admin subcommands).
+#[case::invalidate_path_ok(
+    &["invalidate-path", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo"],
+    true
+)]
+#[case::invalidate_path_keep(
+    &["invalidate-path", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo", "--keep-realisations"],
+    true
+)]
+#[case::invalidate_path_bare(&["invalidate-path"], false)]
 // keygen: three required positionals (name, secret path, public path).
 // The "parses" case points at a nonexistent directory so execution
 // fails with ENOENT (exit 1) instead of writing key files from a

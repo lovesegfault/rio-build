@@ -463,3 +463,33 @@ message RemoveUpstreamRequest {
   string tenant_id = 1;
   string url = 2;                    // matches UNIQUE(tenant_id, url)
 }
+
+// StoreAdminService.InvalidatePath — operator remediation for a path
+// that was uploaded, signed, and cached with wrong content (the
+// "wrong-success" incident class): delete the metadata that makes the
+// path a cache hit so the next submission misses and re-executes.
+// Chunk data is NOT touched (GC owns chunk lifecycle; orphaned chunks
+// are reclaimed by the normal sweep once nothing references them).
+message InvalidatePathRequest {
+  // Full store path (`/nix/store/{hash}-{name}`).
+  string store_path = 1;
+  // Keep `realisations` / `realisation_deps` rows that resolve to this
+  // path. Default (false) deletes them — a CA realisation pointing at
+  // an invalidated path would otherwise keep answering
+  // wopQueryRealisation with a path that 404s on fetch.
+  bool keep_realisations = 2;
+}
+
+message InvalidatePathResponse {
+  // True if anything referencing the path existed (narinfo row or
+  // realisation rows). False = the call was a no-op (idempotent).
+  bool found = 1;
+  // Rows deleted per table. `manifest_existed` is 0/1 (the manifests /
+  // manifest_data / content_index rows go via ON DELETE CASCADE, so
+  // only their existence is observable, not exact counts).
+  uint64 narinfo_deleted = 2;
+  uint64 manifest_existed = 3;
+  uint64 realisations_deleted = 4;
+  uint64 realisation_deps_deleted = 5;
+  uint64 path_tenants_deleted = 6;
+}

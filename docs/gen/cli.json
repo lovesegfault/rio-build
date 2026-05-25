@@ -17,6 +17,7 @@
     "sla",
     "verify-chunks",
     "upstream",
+    "invalidate-path",
     "keygen"
   ]
 }

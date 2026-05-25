@@ -42,6 +42,7 @@ use tracing::warn;
 mod chunked;
 mod cluster_key_history;
 mod inline;
+pub(crate) mod invalidate;
 mod queries;
 pub(crate) mod tenant_keys;
 pub(crate) mod upstreams;

@@ -30,8 +30,8 @@ use rio_common::grpc::StatusExt;
 
 use rio_proto::types::{
     AddUpstreamRequest, GcProgress, GcRequest, GetLoadRequest, GetLoadResponse,
-    ListUpstreamsRequest, ListUpstreamsResponse, RemoveUpstreamRequest, UpstreamInfo,
-    VerifyChunksProgress, VerifyChunksRequest,
+    InvalidatePathRequest, InvalidatePathResponse, ListUpstreamsRequest, ListUpstreamsResponse,
+    RemoveUpstreamRequest, UpstreamInfo, VerifyChunksProgress, VerifyChunksRequest,
 };
 
 use crate::admission::AdmissionGate;
@@ -598,6 +598,47 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             substitute_admission_utilization: sub_util,
         }))
     }
+
+    /// Operator remediation for a wrong-content upload: delete the
+    /// metadata that makes `store_path` a cache hit (narinfo +
+    /// CASCADE'd manifests, path_tenants, and — unless
+    /// `keep_realisations` — realisations/realisation_deps resolving
+    /// to it) so the next submission misses and re-executes. Chunk
+    /// data is untouched; GC reclaims orphans on its normal sweep.
+    /// Idempotent: an absent path returns `found = false` with zero
+    /// counts.
+    #[instrument(skip(self, request), fields(rpc = "InvalidatePath"))]
+    async fn invalidate_path(
+        &self,
+        request: Request<InvalidatePathRequest>,
+    ) -> Result<Response<InvalidatePathResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-cli"])?;
+        let req = request.into_inner();
+        let store_path = rio_nix::store_path::StorePath::parse(&req.store_path)
+            .status_invalid(&format!("invalid store_path {:?}", req.store_path))?;
+
+        let counts =
+            metadata::invalidate::invalidate_path(&self.pool, &store_path, req.keep_realisations)
+                .await
+                .map_err(|e| super::metadata_status("InvalidatePath", e))?;
+
+        info!(
+            store_path = %store_path,
+            found = counts.found(),
+            narinfo = counts.narinfo_deleted,
+            realisations = counts.realisations_deleted,
+            "InvalidatePath"
+        );
+        Ok(Response::new(InvalidatePathResponse {
+            found: counts.found(),
+            narinfo_deleted: counts.narinfo_deleted,
+            manifest_existed: counts.manifest_existed,
+            realisations_deleted: counts.realisations_deleted,
+            realisation_deps_deleted: counts.realisation_deps_deleted,
+            path_tenants_deleted: counts.path_tenants_deleted,
+        }))
+    }
 }
 
 /// Parse the proto's string tenant_id into a Uuid. Proto uses string
@@ -1093,5 +1134,169 @@ mod tests {
             .await
             .expect_err("no backend → error");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// InvalidatePath deletes narinfo (manifests follow via CASCADE),
+    /// path_tenants, the path's realisations, and any realisation_deps
+    /// edges touching them (their FKs are ON DELETE RESTRICT) — while
+    /// leaving unrelated realisations alone. A second call is a
+    /// `found = false` no-op.
+    #[tokio::test]
+    async fn invalidate_path_deletes_metadata_and_is_idempotent() {
+        use crate::test_helpers::{StoreSeed, seed_tenant};
+        use rio_proto::types::InvalidatePathRequest;
+        use rio_test_support::fixtures::test_store_path;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // Seed: narinfo+manifest for the victim path, a realisation
+        // resolving to it, a second realisation (other path) depending
+        // on the first via realisation_deps, and a path_tenants row.
+        let path = test_store_path("invalidate-victim");
+        let hash = StoreSeed::path("invalidate-victim").seed(&db.pool).await;
+        let other_path = test_store_path("invalidate-bystander");
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+             VALUES ($1, 'out', $2, $3), ($4, 'out', $5, $3)",
+        )
+        .bind(vec![1u8; 32])
+        .bind(&path)
+        .bind(vec![9u8; 32])
+        .bind(vec![2u8; 32])
+        .bind(&other_path)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+             VALUES ($1, 'out', $2, 'out')",
+        )
+        .bind(vec![2u8; 32])
+        .bind(vec![1u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let tid = seed_tenant(&db.pool, "invalidate-tenant").await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&hash)
+            .bind(tid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let resp = svc
+            .invalidate_path(Request::new(InvalidatePathRequest {
+                store_path: path.clone(),
+                keep_realisations: false,
+            }))
+            .await
+            .expect("invalidate")
+            .into_inner();
+        assert!(resp.found);
+        assert_eq!(resp.narinfo_deleted, 1);
+        assert_eq!(resp.manifest_existed, 1);
+        assert_eq!(resp.realisations_deleted, 1);
+        assert_eq!(resp.realisation_deps_deleted, 1);
+        assert_eq!(resp.path_tenants_deleted, 1);
+
+        // Cache-hit metadata is gone…
+        let narinfo: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let manifests: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((narinfo, manifests), (0, 0));
+        // …and the bystander realisation survives.
+        let bystander: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM realisations WHERE output_path = $1")
+                .bind(&other_path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(bystander, 1);
+
+        // Idempotent second call.
+        let resp2 = svc
+            .invalidate_path(Request::new(InvalidatePathRequest {
+                store_path: path,
+                keep_realisations: false,
+            }))
+            .await
+            .expect("second invalidate")
+            .into_inner();
+        assert!(!resp2.found);
+        assert_eq!(resp2.narinfo_deleted, 0);
+        assert_eq!(resp2.realisations_deleted, 0);
+    }
+
+    /// `keep_realisations = true` deletes the cache-hit metadata but
+    /// leaves the realisations rows in place.
+    #[tokio::test]
+    async fn invalidate_path_keep_realisations() {
+        use crate::test_helpers::StoreSeed;
+        use rio_proto::types::InvalidatePathRequest;
+        use rio_test_support::fixtures::test_store_path;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        let path = test_store_path("invalidate-keep");
+        StoreSeed::path("invalidate-keep").seed(&db.pool).await;
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+             VALUES ($1, 'out', $2, $3)",
+        )
+        .bind(vec![3u8; 32])
+        .bind(&path)
+        .bind(vec![9u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let resp = svc
+            .invalidate_path(Request::new(InvalidatePathRequest {
+                store_path: path.clone(),
+                keep_realisations: true,
+            }))
+            .await
+            .expect("invalidate")
+            .into_inner();
+        assert!(resp.found);
+        assert_eq!(resp.narinfo_deleted, 1);
+        assert_eq!(resp.realisations_deleted, 0);
+
+        let kept: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM realisations WHERE output_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, 1);
+    }
+
+    /// Malformed store paths are rejected before touching the DB.
+    #[tokio::test]
+    async fn invalidate_path_rejects_malformed_path() {
+        use rio_proto::types::InvalidatePathRequest;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        let err = svc
+            .invalidate_path(Request::new(InvalidatePathRequest {
+                store_path: "not-a-store-path".into(),
+                keep_realisations: false,
+            }))
+            .await
+            .expect_err("malformed path must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

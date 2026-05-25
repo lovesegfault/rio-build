@@ -750,6 +750,20 @@
       "doc": ""
     },
     {
+      "enum": "RewriteError",
+      "name": "EmptyFrom",
+      "crate": "rio-nix",
+      "msg": "rewrite pair {index}: from is empty",
+      "doc": ""
+    },
+    {
+      "enum": "RewriteError",
+      "name": "LengthMismatch",
+      "crate": "rio-nix",
+      "msg": "rewrite pair {index}: from is {from} bytes but to is {to} bytes (must be equal)",
+      "doc": ""
+    },
+    {
       "enum": "StorePathError",
       "name": "EmptyName",
       "crate": "rio-nix",
@@ -760,7 +774,7 @@
       "enum": "StorePathError",
       "name": "FixedOutputRefsNotAllowed",
       "crate": "rio-nix",
-      "msg": "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})",
+      "msg": "fixed-output path with references or self-reference requires recursive SHA-256 (got {algo}, recursive={recursive})",
       "doc": ""
     },
     {
@@ -1432,6 +1446,11 @@
       "name": "NarInfoError",
       "crate": "rio-nix",
       "doc": "Errors from narinfo parsing."
+    },
+    {
+      "name": "RewriteError",
+      "crate": "rio-nix",
+      "doc": "Error constructing a [`RewritingSink`] or [`HashModuloSink`]."
     },
     {
       "name": "StorePathError",
