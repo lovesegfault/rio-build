@@ -618,6 +618,18 @@
         "type": "uint64",
         "default": "120",
         "description": "I-116 idle timeout: exit if no assignment arrives for this long."
+      },
+      {
+        "key": "hashed_mirrors",
+        "type": "list<string>",
+        "default": "[]",
+        "description": "Hashed-mirror base URLs that the native `builtin:fetchurl` tries before the origin URL, as `<mirror>/<algo>/<base16-hash>`."
+      },
+      {
+        "key": "extra_sandbox_paths",
+        "type": "list<string>",
+        "default": "[]",
+        "description": "Extra host paths bind-mounted read-only into every build sandbox (same path inside and outside)."
       }
     ],
     "controller": [

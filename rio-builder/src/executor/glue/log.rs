@@ -85,7 +85,9 @@ impl NixLogFilter {
     /// Classify one captured line (without its trailing newline).
     pub(crate) fn handle(&mut self, line: &[u8]) -> LineAction {
         self.lines_seen += 1;
-        if self.lines_seen >= self.cap {
+        // `>` (not `>=`): the cap is the maximum number of ACCEPTED
+        // lines, so the cap-th line still passes and the cap+1-th trips.
+        if self.lines_seen > self.cap {
             return LineAction::CapExceeded;
         }
 
@@ -189,9 +191,12 @@ mod tests {
             LineAction::Phase(_)
         ));
         assert!(matches!(f.handle(b"three"), LineAction::Forward(_)));
-        // Fourth line hits the cap (>=), regardless of its content.
-        assert_eq!(f.handle(b"four"), LineAction::CapExceeded);
-        // And stays exceeded.
+        // The cap is the number of ACCEPTED lines: the fourth (cap-th)
+        // line still passes…
+        assert!(matches!(f.handle(b"four"), LineAction::Forward(_)));
+        // …and the cap+1-th trips, regardless of its content, and stays
+        // exceeded.
         assert_eq!(f.handle(b"five"), LineAction::CapExceeded);
+        assert_eq!(f.handle(b"six"), LineAction::CapExceeded);
     }
 }

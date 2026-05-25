@@ -22,7 +22,7 @@
 //! for the synthetic-DB path (`ValidatedPathInfo`: references, NAR hash
 //! and size) — no additional store round-trips.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rio_nix::hash::{HashAlgo, NixHash};
 use rio_proto::validated::ValidatedPathInfo;
@@ -133,6 +133,13 @@ impl<'a> ClosureIndex<'a> {
     /// the authority if the deployed version's field set differs.
     pub(crate) fn closure_info_json(&self, targets: &[String]) -> Result<Value, GlueError> {
         let closure = self.closure_of(targets)?;
+        // Per-path closure SETS are memoized across the member loop:
+        // closureInfo-style graphs (NixOS images) have thousands of
+        // members whose closures overlap almost entirely, and the naive
+        // per-member BFS is O(N²) traversals. set(p) = {p} ∪ ⋃ set(ref)
+        // computed once per path in dependency-first order; sizes are
+        // then a sum over the memoized set.
+        let mut memo: BTreeMap<&str, std::rc::Rc<BTreeSet<&str>>> = BTreeMap::new();
         let arr: Vec<Value> = closure
             .iter()
             .map(|p| {
@@ -146,7 +153,7 @@ impl<'a> ClosureIndex<'a> {
                     "narHash": nar_hash.to_sri(),
                     "narSize": info.nar_size,
                     "references": refs,
-                    "closureSize": self.closure_size_of(p),
+                    "closureSize": self.closure_size_memo(p, &mut memo),
                 })
             })
             .collect();
@@ -154,29 +161,85 @@ impl<'a> ClosureIndex<'a> {
     }
 
     /// Sum of `narSize` over the closure of one path (which is fully
-    /// inside the index by construction — `closure_of` validated it).
-    fn closure_size_of(&self, path: &str) -> u64 {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        let mut queue = vec![path];
-        let mut total = 0u64;
-        while let Some(p) = queue.pop() {
+    /// inside the index by construction — `closure_of` validated it),
+    /// using `memo` to share already-computed closure sets between
+    /// calls. Self-references are tolerated (a path is always in its
+    /// own set); store-path reference graphs are otherwise acyclic.
+    fn closure_size_memo(
+        &'a self,
+        path: &'a str,
+        memo: &mut BTreeMap<&'a str, std::rc::Rc<BTreeSet<&'a str>>>,
+    ) -> u64 {
+        // Iterative post-order: a path is finalized only after all its
+        // references are, so each set is built exactly once.
+        let mut stack: Vec<(&str, bool)> = vec![(path, false)];
+        while let Some((p, children_done)) = stack.pop() {
+            if memo.contains_key(p) {
+                continue;
+            }
             let Some(info) = self.by_path.get(p) else {
+                // Outside the index (cannot happen for closure_of
+                // output); treat as empty so the sum stays defined.
+                memo.insert(p, std::rc::Rc::new(BTreeSet::new()));
                 continue;
             };
-            if !seen.insert(info.store_path.as_str()) {
-                continue;
-            }
-            total += info.nar_size;
-            for r in &info.references {
-                queue.push(r.as_str());
+            if children_done {
+                let mut set: BTreeSet<&str> = BTreeSet::new();
+                set.insert(info.store_path.as_str());
+                for r in &info.references {
+                    if let Some(child) = memo.get(r.as_str()) {
+                        set.extend(child.iter().copied());
+                    }
+                }
+                memo.insert(p, std::rc::Rc::new(set));
+            } else {
+                stack.push((p, true));
+                for r in &info.references {
+                    if r.as_str() != p && !memo.contains_key(r.as_str()) {
+                        stack.push((r.as_str(), false));
+                    }
+                }
             }
         }
-        total
+        memo[path]
+            .iter()
+            .map(|p| self.by_path.get(p).map_or(0, |i| i.nar_size))
+            .sum()
+    }
+}
+
+/// Validate an `exportReferencesGraph` graph name.
+///
+/// The name is tenant-controlled (straight from the derivation env /
+/// `__json`) and becomes a file name under `/build` in the flat form,
+/// so it must never be able to traverse paths. The accepted set is
+/// CppNix's own check — first char `[A-Za-z_]`, rest
+/// `[A-Za-z0-9_.-]` — which inherently rejects empty names, `.`, `..`,
+/// anything containing `/`, and NUL. Real-world names like
+/// `closure-info` (dashes, dots) remain accepted; do not tighten
+/// further or drvs Nix builds would be rejected here.
+pub(crate) fn validate_graph_name(name: &str) -> Result<(), GlueError> {
+    let mut chars = name.chars();
+    let valid = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(GlueError::ExportRefsInvalidName {
+            name: name.to_owned(),
+        })
     }
 }
 
 /// Parse the flat-env `exportReferencesGraph` value: alternating
-/// `name path name path …` whitespace-separated pairs.
+/// `name path name path …` whitespace-separated pairs. Graph names are
+/// validated (see [`validate_graph_name`]) so a hostile name is
+/// rejected as the tenant's input error before any path is built from
+/// it.
 pub(crate) fn parse_flat_export_refs(value: &str) -> Result<Vec<(String, String)>, GlueError> {
     let words: Vec<&str> = value.split_whitespace().collect();
     if !words.len().is_multiple_of(2) {
@@ -184,10 +247,13 @@ pub(crate) fn parse_flat_export_refs(value: &str) -> Result<Vec<(String, String)
             value: value.to_owned(),
         });
     }
-    Ok(words
+    words
         .chunks_exact(2)
-        .map(|c| (c[0].to_owned(), c[1].to_owned()))
-        .collect())
+        .map(|c| {
+            validate_graph_name(c[0])?;
+            Ok((c[0].to_owned(), c[1].to_owned()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -290,5 +356,34 @@ mod tests {
         );
         assert!(parse_flat_export_refs("name-without-path /x odd").is_err());
         assert_eq!(parse_flat_export_refs("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn graph_names_are_validated() {
+        // Real-world names pass: dashes and dots are legal past the
+        // first character (e.g. nixpkgs' `closure-info`).
+        assert!(parse_flat_export_refs("closure-info /nix/store/x").is_ok());
+        assert!(validate_graph_name("registration_v2.txt").is_ok());
+
+        // Path traversal and separators are rejected as the tenant's
+        // input error, naming the offending graph name.
+        let err = parse_flat_export_refs("../escape /nix/store/x").unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsInvalidName { ref name } if name == "../escape"),
+            "{err}"
+        );
+        let err = parse_flat_export_refs("sub/dir /nix/store/x").unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsInvalidName { ref name } if name == "sub/dir"),
+            "{err}"
+        );
+        // `.`/`..`/empty/leading-digit/NUL are all outside CppNix's
+        // accepted set too.
+        for bad in [".", "..", "", "0day", "with\0nul"] {
+            assert!(
+                validate_graph_name(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 }

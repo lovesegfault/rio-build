@@ -27,6 +27,7 @@
 //! consumes this module.
 
 pub(crate) mod attrs;
+pub(crate) mod builtin;
 pub(crate) mod env;
 pub(crate) mod log;
 pub(crate) mod refs_graph;
@@ -83,14 +84,39 @@ pub(crate) enum GlueError {
     #[error("exportReferencesGraph value is malformed (expected `name path` pairs): {value}")]
     ExportRefsMalformed { value: String },
 
+    /// The graph *name* is tenant-controlled and becomes a file name
+    /// under `/build` (flat form) — reject anything that is not a safe
+    /// identifier at the source instead of relying on downstream path
+    /// validation. Mirrors CppNix's `[A-Za-z_][A-Za-z0-9_.-]*` check,
+    /// so a derivation Nix accepts is accepted here and vice versa.
+    #[error(
+        "exportReferencesGraph name `{name}` is not a valid graph name \
+         (must match [A-Za-z_][A-Za-z0-9_.-]*)"
+    )]
+    ExportRefsInvalidName { name: String },
+
     #[error("derivation builder path is empty")]
     EmptyBuilder,
 
     #[error("derivation path {path} is not a valid store path: {message}")]
     BadDerivationPath { path: String, message: String },
 
+    #[error("builtin:fetchurl derivation has no (non-empty) `url` attribute")]
+    FetchurlMissingUrl,
+
+    #[error(
+        "builtin:fetchurl requires the rio-builder binary path (SandboxOptions::builder_binary) \
+         to re-exec inside the sandbox"
+    )]
+    FetchurlBuilderBinaryUnknown,
+
+    /// The constructed request failed `rio_exec` boundary validation.
+    /// Carries only the validation message (never the executor's
+    /// infrastructure error variants — those cannot occur here, and
+    /// admitting the whole `ExecError` enum would contradict the
+    /// "input problems only" contract above).
     #[error("constructed execution request failed validation: {0}")]
-    InvalidRequest(#[from] rio_exec::ExecError),
+    InvalidRequest(String),
 }
 
 /// Host-side directories backing the sandbox's writable mounts.
@@ -139,6 +165,18 @@ pub(crate) struct SandboxOptions {
     pub max_log_bytes: Option<u64>,
     /// Per-build cgroup directory (created by the caller).
     pub cgroup: Option<PathBuf>,
+    /// Hashed-mirror base URLs tried before the origin URL by
+    /// `builtin:fetchurl` (successor of nix.conf `hashed-mirrors`).
+    /// Only passed to flat-mode FODs.
+    pub hashed_mirrors: Vec<String>,
+    /// Host path of the rio-builder binary itself, bind-mounted into
+    /// builtin sandboxes for the `__builtin-fetchurl` re-exec. The
+    /// activation wires this from `std::env::current_exe()`; `None`
+    /// makes builtin derivations fail with a typed error.
+    pub builder_binary: Option<PathBuf>,
+    /// Operator-provided netrc contents for authenticated fetchurl
+    /// sources, written into the sandbox as an inline file.
+    pub netrc: Option<Vec<u8>>,
 }
 
 /// One planned derivation output.
@@ -170,10 +208,10 @@ pub(crate) struct PreparedBuild {
 pub(crate) enum GluePlan {
     /// Run the builder inside the sandbox.
     Sandbox(Box<PreparedBuild>),
-    /// `builtin:fetchurl` — implemented natively by the fetcher (it
-    /// re-execs the rio-builder binary inside the sandbox); no generic
-    /// sandbox request is constructed here.
-    BuiltinFetchurl,
+    /// `builtin:fetchurl` — the rio-builder binary re-execs itself
+    /// inside the sandbox as `rio-builder __builtin-fetchurl`; the
+    /// carried request is that re-exec (see [`builtin`]).
+    BuiltinFetchurl(Box<PreparedBuild>),
 }
 
 /// Translate a resolved derivation into an execution plan.
@@ -190,10 +228,12 @@ pub(crate) fn derivation_into_request(
     paths: &SandboxPaths,
     opts: &SandboxOptions,
 ) -> Result<GluePlan, GlueError> {
-    // builtin: builders never get a sandbox request.
+    // builtin: builders never get a generic sandbox request — they
+    // re-exec this binary's __builtin-fetchurl subcommand instead.
     if let Some(rest) = drv.builder().strip_prefix("builtin:") {
         return match rest {
-            "fetchurl" => Ok(GluePlan::BuiltinFetchurl),
+            "fetchurl" => builtin::prepare_fetchurl(drv_path, drv, paths, opts)
+                .map(|pb| GluePlan::BuiltinFetchurl(Box::new(pb))),
             _ => Err(GlueError::UnsupportedBuiltin {
                 builder: drv.builder().to_owned(),
             }),
@@ -357,7 +397,9 @@ pub(crate) fn derivation_into_request(
             cgroup: opts.cgroup.clone(),
         },
     };
-    request.validate()?;
+    request
+        .validate()
+        .map_err(|e| GlueError::InvalidRequest(e.to_string()))?;
 
     Ok(GluePlan::Sandbox(Box::new(PreparedBuild {
         request,
@@ -511,6 +553,9 @@ mod tests {
             max_silent: Some(Duration::from_secs(600)),
             max_log_bytes: Some(64 * 1024 * 1024),
             cgroup: Some(PathBuf::from("/sys/fs/cgroup/rio/builds/b1")),
+            hashed_mirrors: vec![],
+            builder_binary: Some(PathBuf::from("/host/bin/rio-builder")),
+            netrc: None,
         }
     }
 
@@ -527,7 +572,7 @@ mod tests {
             .expect("glue should succeed")
         {
             GluePlan::Sandbox(p) => *p,
-            GluePlan::BuiltinFetchurl => panic!("not a builtin"),
+            GluePlan::BuiltinFetchurl(_) => panic!("not a builtin"),
         }
     }
 
@@ -680,7 +725,18 @@ mod tests {
         let (input_paths, input_meta) = closure();
         let plan = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
             .unwrap();
-        assert!(matches!(plan, GluePlan::BuiltinFetchurl));
+        let GluePlan::BuiltinFetchurl(prepared) = plan else {
+            panic!("builtin:fetchurl must dispatch to the re-exec path");
+        };
+        // The re-exec request targets this binary's subcommand, not a
+        // builder script.
+        assert_eq!(
+            prepared.request.args,
+            vec![
+                OsString::from("rio-builder"),
+                OsString::from("__builtin-fetchurl")
+            ]
+        );
 
         let other = BasicDerivation::new(
             drv.outputs().to_vec(),

@@ -26,6 +26,7 @@
 //! ```
 
 pub(crate) mod banner;
+pub mod builtin_fetchurl;
 pub mod cgroup;
 pub mod config;
 pub mod executor;

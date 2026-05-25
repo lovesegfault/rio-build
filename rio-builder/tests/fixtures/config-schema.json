@@ -159,6 +159,22 @@
         "format": "uint64",
         "minimum": 0,
         "default": 120
+      },
+      "hashed_mirrors": {
+        "description": "Hashed-mirror base URLs that the native `builtin:fetchurl`\ntries before the origin URL, as `<mirror>/<algo>/<base16-hash>`.\nSuccessor of the nix.conf `hashed-mirrors` setting (the\nConfigMap-rendered nix.conf is unused by the native executor).\nEnv: `RIO_HASHED_MIRRORS=http://a/,http://b/` (comma-sep).\nDefault: empty (origin URLs only).",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "extra_sandbox_paths": {
+        "description": "Extra host paths bind-mounted read-only into every build\nsandbox (same path inside and outside). Successor of the\nnix.conf `extra-sandbox-paths` setting. Operators use this for\nsite-local impurities (e.g. a corporate CA directory).\nEnv: `RIO_EXTRA_SANDBOX_PATHS=/a,/b` (comma-sep). Default: empty.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
       }
     },
     "$defs": {
@@ -224,6 +240,8 @@
     "executor_token": "",
     "daemon_timeout_secs": 7200,
     "max_silent_time_secs": 0,
-    "idle_secs": 120
+    "idle_secs": 120,
+    "hashed_mirrors": [],
+    "extra_sandbox_paths": []
   }
 }

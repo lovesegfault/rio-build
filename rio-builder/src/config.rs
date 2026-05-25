@@ -196,6 +196,23 @@ pub struct Config {
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
+    /// Hashed-mirror base URLs that the native `builtin:fetchurl`
+    /// tries before the origin URL, as `<mirror>/<algo>/<base16-hash>`.
+    /// Successor of the nix.conf `hashed-mirrors` setting (the
+    /// ConfigMap-rendered nix.conf is unused by the native executor).
+    /// Env: `RIO_HASHED_MIRRORS=http://a/,http://b/` (comma-sep).
+    /// Default: empty (origin URLs only).
+    #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    #[schemars(with = "Vec<String>")]
+    pub hashed_mirrors: Vec<String>,
+    /// Extra host paths bind-mounted read-only into every build
+    /// sandbox (same path inside and outside). Successor of the
+    /// nix.conf `extra-sandbox-paths` setting. Operators use this for
+    /// site-local impurities (e.g. a corporate CA directory).
+    /// Env: `RIO_EXTRA_SANDBOX_PATHS=/a,/b` (comma-sep). Default: empty.
+    #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    #[schemars(with = "Vec<String>")]
+    pub extra_sandbox_paths: Vec<String>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -233,6 +250,8 @@ impl Default for Config {
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
+            hashed_mirrors: Vec::new(),
+            extra_sandbox_paths: Vec::new(),
         }
     }
 }

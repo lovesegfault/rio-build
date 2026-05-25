@@ -6069,6 +6069,7 @@ name = "rio-builder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compression",
  "axum",
  "clap",
  "fuser",
@@ -6079,6 +6080,7 @@ dependencies = [
  "nix 0.31.3",
  "prost-types",
  "regex",
+ "reqwest",
  "rio-common",
  "rio-exec",
  "rio-nix",
@@ -6096,6 +6098,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tower",

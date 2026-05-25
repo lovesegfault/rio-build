@@ -69,6 +69,16 @@ serde_json = { workspace = true }
 toml = { workspace = true, optional = true }
 # I-178b: ANSI-escape strip in is_input_materialization_failure.
 regex = { workspace = true }
+# Native builtin:fetchurl (the __builtin-fetchurl re-exec subcommand):
+# streaming HTTP download of FOD sources. rustls via the workspace
+# feature set; "stream" for bytes_stream() → file/decoder piping.
+reqwest = { workspace = true, features = ["stream"] }
+# xz decode for `unpack = true` fetchurl payloads (same crate the store
+# uses for substituter NARs; only the xz codec is exercised here).
+async-compression = { workspace = true }
+# SyncIoBridge: drives the async xz decoder from the blocking thread
+# that runs the synchronous NAR restore.
+tokio-util = { workspace = true, features = ["io-util"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

@@ -11423,6 +11423,7 @@
         "codec",
         "default",
         "io",
+        "io-util",
         "slab",
         "time"
       ],

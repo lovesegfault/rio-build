@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use super::GlueError;
 use super::env::rewrite;
-use super::refs_graph::ClosureIndex;
+use super::refs_graph::{ClosureIndex, validate_graph_name};
 
 /// The two structured-attrs files, already placeholder-rewritten.
 #[derive(Debug)]
@@ -67,6 +67,10 @@ pub(crate) fn prepare_structured_attrs(
     // exportReferencesGraph: { <key>: <path or [paths]> } → closure info.
     if let Some(Value::Object(erg)) = map.get("exportReferencesGraph").cloned().as_ref() {
         for (key, val) in erg {
+            // Same tenant-input guard as the flat form: the key is
+            // attacker-controlled; reject non-identifier names before
+            // doing anything with them (parity with CppNix).
+            validate_graph_name(key)?;
             let targets: Vec<String> = match val {
                 Value::String(s) => vec![s.clone()],
                 Value::Array(a) => a
@@ -340,5 +344,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, GlueError::StructuredAttrsNotObject));
+    }
+
+    #[test]
+    fn export_refs_graph_key_is_validated() {
+        // The structured form's graph names (JSON keys) get the same
+        // tenant-input guard as the flat form: traversal-shaped names
+        // are rejected before any use.
+        let err = prepare_structured_attrs(
+            &json!({"exportReferencesGraph": {"../escape": ["/nix/store/x"]}}),
+            &["out".to_string()],
+            &empty_closure(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsInvalidName { ref name } if name == "../escape"),
+            "{err}"
+        );
     }
 }

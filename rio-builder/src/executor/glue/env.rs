@@ -324,16 +324,20 @@ mod tests {
 
         // The attr itself is NOT in the env; <attr>Path is.
         assert!(!env.contains_key("buildScript"));
-        // Golden file name: nix-instantiate writes
-        // .attr-<nixbase32(sha256("buildScript"))>; value verified against
-        // `nix-hash --type sha256 --to-base32 $(echo -n buildScript | sha256sum)`
-        // semantics via the library primitive (the exact string is pinned
-        // so accidental algorithm changes fail loudly).
+        // Golden file name: Nix writes .attr-<nixbase32(sha256(name))>.
+        // The literal below is
+        //   nix-hash --type sha256 --to-base32 \
+        //     $(echo -n buildScript | sha256sum | cut -d' ' -f1)
+        // = nixbase32(sha256("buildScript")) — pinned so an accidental
+        // change to the hashing or encoding fails loudly, not just a
+        // length check.
         assert_eq!(passed_files.len(), 1);
         let pf = &passed_files[0];
         assert_eq!(env["buildScriptPath"], format!("/build/{}", pf.file_name));
-        assert!(pf.file_name.starts_with(".attr-"));
-        assert_eq!(pf.file_name.len(), ".attr-".len() + 52);
+        assert_eq!(
+            pf.file_name,
+            ".attr-1hh0pq9k4wbl9mj5xlw82k9dw6jijbh6a82qwxyb5mlam7l6j2s9"
+        );
         // Contents are rewritten.
         assert_eq!(
             pf.contents,

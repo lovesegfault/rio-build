@@ -19055,6 +19055,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "async-compression",
+          "packageId": "async-compression"
+        },
+        {
           "name": "axum",
           "packageId": "axum"
         },
@@ -19093,6 +19097,10 @@
         {
           "name": "regex",
           "packageId": "regex"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest"
         },
         {
           "name": "rio-common",
@@ -19149,6 +19157,10 @@
         {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
         },
         {
           "name": "toml",
@@ -25281,6 +25293,7 @@
         "codec",
         "default",
         "io",
+        "io-util",
         "slab",
         "time"
       ],
