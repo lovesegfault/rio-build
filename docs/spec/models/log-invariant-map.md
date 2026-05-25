@@ -338,3 +338,67 @@ The single-replica halves of the first and fourth rows are now covered by
 model A's `storedCoverageNeverRegresses`; model B's job for them narrows to
 the *delivered-lines* (rather than recorded-span) form of the conservation
 law.
+
+## Campaign close-out — the subsystem this document verifies has been deleted
+
+Everything above is a historical record. The in-scheduler build-log subsystem
+this campaign modeled — `rio-scheduler/src/logs/`, the per-derivation ring
+buffer, `push_for`, the gap-merge fold, the four reaps, the lease-gated
+flusher, the stored-coverage reconciliation, the `drv_logs` row — was deleted
+and replaced by a lease-decoupled `LogService` in rio-store (authenticated
+chunked ingest, immutable session-keyed S3 chunks, a PostgreSQL line-range
+manifest, read-time set-union dedup, a TTL sweep, and a read-time
+completeness predicate). `logBufferLifecycle.qnt`, `calibration/`, and the
+23 `quint-log-*` checks were retired with their subject; this map, the
+invariant definitions, and the calibration table above are what remains. The
+rule names, file paths, check attrs, and present-tense claims above describe
+the deleted design and its CI wiring as they existed at the close of Phase 3.
+
+**Outcome.** The campaign found, confirmed, fixed, and proved one new bug in
+the old subsystem (calibration entry #0: the gap-merge fold double-counts a
+re-delivered overlap once the stored-coverage reconcile empties the ring; the
+`accounted_below` accept floor is the fix, and the ungated witness plus the
+green flap regime are the machine-checked statement that the fix is necessary
+and sufficient at the model's bounds). It calibrated the model against the
+subsystem's 22 historical bugs: 14 are re-findable by the invariant set
+(reverting the fix falsifies an invariant over the regime's full state
+space), 2 are proven redundant for safety (the enqueue-failure reap and the
+pin-before-guard hoist hold every invariant with the fix reverted), and the
+rest are dispositioned as not-encoded or model-B in the table above. That
+table — six of the 22 bugs are orphaned-entry leaks, four are finalize-once
+races, and almost all of the rest are lease-coupling scar tissue — is the
+documented evidence for the architecture change that obsoleted the model: the
+replacement removes the state those bug classes live in rather than adding a
+fifth reap or a sixth gate. The rebase audit (`harden-logs-audit.md` in the
+campaign workspace) walked every bug class against the LogService and found
+no exposure to the dominant ones: re-delivery lands as a manifest overlap
+that the read path dedups instead of a span overstatement, and there is no
+retained entry to orphan and no finalizing write to race.
+
+**The nine invariants against the LogService**, per the rebase audit:
+
+| Invariant | Disposition | Why |
+|---|---|---|
+| `noCrossExecContamination` | **Structural** | Storage is keyed by `exec_id` end-to-end (chunk key, manifest PK, the stream bound to one execution at open); a re-dispatch mints a new `exec_id` and a new key namespace. The in-memory carrier a restamp could contaminate does not exist — the ingest session is created per stream and dropped with it. |
+| `lineSpanExact` | **Gap → fixed** | The per-chunk half is structural (a chunk's recorded count is the physical length of a contiguous run; no gap arithmetic exists to overshoot). The log-level half moved into the completeness gate, whose post-terminal MUST (drop accepted lines at or past `final_line_count`) was specified but unimplemented — the one real protocol finding of the audit, fixed during integration by enforcing the gate on every append rather than only at stream open. |
+| `bindingGateExcludesForeignExecutors` | **Structural** | Relocated and strengthened: `store.log.append-auth` (HMAC token → derivation match → latest-assignment + builder binding) runs at stream open, and the stream is then bound to one `(exec_id, session_id)` whose chunk keys cannot name any other execution. |
+| `everyRetainedEntryIsJustified` | **Vacuous** | The four orphan shapes and their three differently-gated reapers are gone. The only retained in-memory state is the per-stream ingest buffer, whose lifetime is the gRPC stream's; the persistent analog (a manifest row) is justified by definition and reaped only by the TTL sweep. |
+| `noSilentLineLoss` | **Structural** | A line leaves the builder's retransmit buffer only when an ack covers it; an ack is sent only after the manifest INSERT commits; the manifest row is written only after the object PUT. Every remaining loss channel is disclosed (the computed `is_complete = false`, the abandoned-drain counter, the missing-object read error). |
+| `noStaleSealOnLiveCarrier` | **Vacuous** | No seal latch and no carrier. Completeness is a monotone predicate recomputed from the DB on every open and every read; a seal that outlives the state that justified it is unrepresentable. |
+| `finalizedRowFrozen` | **Vacuous** | There is no finalized row to freeze: chunks are write-once, the manifest is INSERT-only, `final_line_count` is stamped once at terminal, and no finalizing write consolidates other writers' data. |
+| `storedCoverageNeverRegresses` | **Vacuous** | Coverage is the union of INSERT-only manifest rows; there is no reconcile that folds a stored row into a new write, so nothing can replace a larger span with a smaller one. Overlapping sessions union at read time. |
+| `boundsOK` | **Vacuous** | The model's own state-ceiling tripwire (a TLC finite-state-space artifact) has no subject without the model. The implementation bounds it stood beside (the ring byte cap, the periodic flush) are replaced by `store.log.ingest-bounds`. |
+
+**Successor.** The continuing campaign re-targets onto the LogService
+session/chunk protocol (model C: ingest sessions, chunk manifests, the
+read-time dedup, the TTL sweep, and the completeness gate) — a much smaller
+model with no lease composition, no reaps, and no tenure pins. Its plan is
+`log-formal-reshape-plan.md` in the campaign workspace; its acceptance test
+is this document's calibration table re-run against the new architecture,
+each of the 22 rows becoming either "no exposure by construction" with the
+structural reason or "the equivalent hazard exists at this site and this
+invariant checks it". Model B is cancelled outright — its subject
+(cross-replica tenure-pinned finalization of a shared `drv_logs` row) does
+not exist in the new architecture — and the Phase-6 simplification ledger
+closes with "the architecture change was the simplification": the cutover
+deleted every mechanism the calibration proved redundant, and the rest.
