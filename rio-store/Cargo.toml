@@ -198,3 +198,16 @@ axum = { workspace = true }
 config.workspace = true
 # For log-assertion tests (maybe_sign warn on empty refs).
 tracing-test = { workspace = true }
+# Model-based testing (src/logs/mbt_tests.rs): replay traces generated
+# from docs/spec/models/logService.qnt against the real LogService
+# ingest/gate/read/sweep code, diffing the projected state after every
+# step. Shells out to `quint` at test time — the mbt_* tests are
+# #[ignore]d in the default profile and run by the dedicated
+# mbt-rio-logservice check that puts quint on the PATH.
+quint-connect = { workspace = true }
+# ITF (Informal Trace Format) deserialization for the named-run
+# replays: `quint test --out-itf` emits the model's per-step states;
+# the replay diffs the implementation's projection against them.
+# `itf::de::{As, Integer}` also adapt the model's int-keyed maps
+# (`#map` with `#bigint` keys) onto BTreeMap<u64, _> projections.
+itf = { workspace = true }

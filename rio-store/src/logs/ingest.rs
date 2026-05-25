@@ -361,6 +361,15 @@ impl IngestSession {
         self.final_line_count
     }
 
+    /// The lowest acceptable `first_line_number` for the next batch
+    /// (one past the last accepted line). Read-only: only
+    /// [`Self::accept`] raises it. Exposed so the model-conformance
+    /// projection (`mbt_tests`) can compare it against the model's
+    /// `highWater` without reaching into the private field.
+    pub fn high_water_line(&self) -> u64 {
+        self.high_water_line
+    }
+
     /// Record the execution's `final_line_count` as the exclusive
     /// upper bound on acceptable line numbers
     /// (`store.log.completeness-gate`: accepted lines numbered at or

@@ -37,6 +37,8 @@ pub mod chunks;
 pub mod gate;
 pub mod ingest;
 pub mod kernel;
+#[cfg(test)]
+mod mbt_tests;
 pub mod service;
 pub mod sessions;
 pub mod sweep;

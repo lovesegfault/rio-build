@@ -1315,6 +1315,11 @@
       "doc": "The per-stream ingest state machine for `LogService.AppendLog`."
     },
     {
+      "path": "logs/mbt_tests.rs",
+      "depth": 1,
+      "doc": "Model-based testing: replay traces generated from the LogService"
+    },
+    {
       "path": "logs/service.rs",
       "depth": 1,
       "doc": "The `LogService` gRPC handlers: `AppendLog` (authenticated builder"
