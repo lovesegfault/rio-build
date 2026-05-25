@@ -34,7 +34,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
     seccompProfile:                              # SeccompProfileKind?, optional — CEL-forbidden for Fetcher
       type: Localhost                            #   RuntimeDefault | Localhost | Unconfined
       localhostProfile: operator/rio-builder.json#   required iff type=Localhost (r[ctrl.crd.seccomp-cel])
-    # fuseCacheBytes: <bytes>                    # u64?, REJECTED by CEL for BOTH kinds since r35 (merged_bug_024) — all pools read `[nodeclaim_pool].fuse_cache_bytes` (helm `poolDefaults.fuseCacheBytes`, 50Gi prod / 8Gi default). See r[ctrl.event.spec-degrade].
+    # fuseCacheBytes: <bytes>                    # u64?, REJECTED by CEL for BOTH kinds since r35 (merged_bug_024) — pools read the per-kind `[nodeclaim_pool].{fuse_cache_bytes,fetcher_fuse_cache_bytes}` (helm `poolDefaults.{fuseCacheBytes,fetcherFuseCacheBytes}`, 50Gi/4Gi prod). See r[ctrl.event.spec-degrade].
     # NOT CRD fields: resources (per-pod cpu/mem/disk come from the
     # scheduler's per-drv SpawnIntent — ADR-023); securityContext (caps
     # hardcoded in build_executor_pod_spec()); topologySpread (one-shot
@@ -1034,15 +1034,25 @@ constraints:
   field, the spec value, and the remediation.
 ]
 
-The FUSE cache emptyDir `sizeLimit` for *all* pool kinds is single-sourced from
-`[nodeclaim_pool].fuse_cache_bytes` (controller.toml; helm
-`poolDefaults.fuseCacheBytes`, 50Gi in prod) so FFD/cover/stamp agree ---
+The FUSE cache emptyDir `sizeLimit` is single-sourced from a per-*kind*
+boot-time value --- `[nodeclaim_pool].fuse_cache_bytes` for Builder pools (helm
+`poolDefaults.fuseCacheBytes`, 50Gi in prod) and
+`[nodeclaim_pool].fetcher_fuse_cache_bytes` for Fetcher pools (helm
+`poolDefaults.fetcherFuseCacheBytes`, 4Gi) --- so FFD/cover/stamp agree.
 `PoolSpec.fuseCacheBytes` is rejected for both Builder and Fetcher kind.
 (Pre-§13e, Fetcher pools could set a per-pool value because they didn't route
 through `nodeclaim_pool`; §13e routed them through, and r35 closed the
-resulting accounting drift.) The same value is added to the container's
+resulting accounting drift by collapsing both kinds onto the builder value.
+The per-kind split keeps the single-sourcing while stopping fetcher pods from
+reserving the builder's input-closure budget: a FOD's input closure is a fetch
+script's runtime deps, not an arbitrary build closure, and the builder budget
+dominated the fetcher pod's ephemeral-storage request ~30#sym.times over what
+the pod could ever touch.) The same value is added to the container's
 `ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so
-the cache never outlives one build's input closure.
+the cache never outlives one build's input closure. Unlike the overlay
+(`disk_bytes`), the FUSE-cache dimension has no eviction-driven escalation
+path, so the fetcher budget must statically cover the heaviest fetch toolchain
+in use; raise `fetcherFuseCacheBytes` if one outgrows it.
 
 = Pool Finalizer
 

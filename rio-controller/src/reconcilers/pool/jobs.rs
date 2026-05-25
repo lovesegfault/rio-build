@@ -135,11 +135,28 @@ pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_b
 /// fit-checks. FFD's contract is "predicts what kube-scheduler will
 /// do"; the only way that holds is for both sides to compute the same
 /// triple from the same fn (§Simulator-shares-accounting).
+///
+/// `fuse_cache_bytes` is the BUILDER pool budget
+/// (`[nodeclaim_pool].fuse_cache_bytes`); Fetcher intents substitute
+/// the much smaller [`pod::fetcher_fuse_cache_bytes`] — a FOD's input
+/// closure is a fetch script's runtime deps, not an arbitrary build
+/// closure, and inheriting the builder budget made the fuse-cache
+/// addend dominate the fetcher pod's ephemeral-storage request ~30×
+/// over what the pod can ever use. The selection keys on
+/// `SpawnIntent.kind` here and on `pool.spec.kind` in
+/// [`pod::fuse_cache_bytes`]; the scheduler's intent filter
+/// (`intent.kind == pool.spec.kind`) keeps the two in agreement for
+/// every intent a pool actually spawns.
 pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> (u32, u64, u64) {
+    let fuse = if i.kind == i32::from(rio_proto::types::ExecutorKind::Fetcher) {
+        pod::fetcher_fuse_cache_bytes()
+    } else {
+        fuse_cache_bytes
+    };
     (
         i.cores,
         i.mem_bytes,
-        pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse_cache_bytes),
+        pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse),
     )
 }
 
@@ -1300,8 +1317,12 @@ mod tests {
     /// bytes` (the global), while a Fetcher Pool's `spec.fuseCacheBytes`
     /// override fed the stamp side directly. The two diverge → FFD
     /// fit-checks against a different ephemeral-storage triple than the
-    /// pod actually requests. Single-source from `BUILDER_FUSE_CACHE`
-    /// (the same OnceLock Builder pools use) closes the gap.
+    /// pod actually requests. Single-source from the per-kind OnceLock
+    /// (`FETCHER_FUSE_CACHE` here) closes the gap. The intent carries
+    /// `kind=Fetcher`, matching the pool — the scheduler's intent
+    /// filter guarantees that for every intent a pool spawns, and it is
+    /// the precondition for the stamp side (keyed on `pool.spec.kind`)
+    /// and the FFD side (keyed on `SpawnIntent.kind`) to agree.
     #[test]
     fn footprint_matches_stamped_requests_fetcher() {
         const GI: u64 = 1 << 30;
@@ -1315,6 +1336,7 @@ mod tests {
             mem_bytes: 4 * GI,
             disk_bytes: 8 * GI,
             disk_headroom_factor: Some(1.5),
+            kind: rio_proto::types::ExecutorKind::Fetcher.into(),
             ..Default::default()
         };
         let j = job(&pool, &i);
@@ -1329,23 +1351,73 @@ mod tests {
             .and_then(|r| r.requests.as_ref())
             .unwrap();
         let q = |k: &str| req[k].0.parse::<u64>().unwrap();
-        // The production input source for FFD/cover_deficit is
-        // `cfg.fuse_cache_bytes` (= `BUILDER_FUSE_CACHE`). The stamp
-        // side MUST read the same — a per-pool override would make the
-        // pod request a different ephemeral-storage triple than FFD
-        // fit-checked.
+        // The stamp side reads the FETCHER budget, not the builder's —
+        // and not the per-pool override. FFD/cover pass the BUILDER
+        // value to `intent_pod_footprint`, which substitutes the
+        // fetcher budget for `kind=Fetcher` intents, so both sides
+        // land on the same triple.
+        let fetcher_fuse = pod::fetcher_fuse_cache_bytes();
+        assert_eq!(
+            pod::fuse_cache_bytes(&pool),
+            fetcher_fuse,
+            "Fetcher pool fuse_cache_bytes single-sourced from FETCHER_FUSE_CACHE \
+             (per-Pool override defeats §Simulator-shares-accounting)"
+        );
         let cfg_fuse = *pod::BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
-        assert_eq!(
-            pod::fuse_cache_bytes(&pool),
-            cfg_fuse,
-            "Fetcher pool fuse_cache_bytes single-sourced from BUILDER_FUSE_CACHE              (per-Pool override defeats §Simulator-shares-accounting)"
+        assert_ne!(
+            fetcher_fuse, cfg_fuse,
+            "fetcher budget must differ from the builder budget for this \
+             test to prove the per-kind selection"
         );
         let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
         assert_eq!(q("cpu"), u64::from(fc));
         assert_eq!(q("memory"), fm);
         assert_eq!(q("ephemeral-storage"), fd);
+        assert_eq!(
+            fd,
+            ((8 * GI) as f64 * 1.5) as u64 + fetcher_fuse + LOG_BUDGET_BYTES,
+            "fetcher ephemeral-storage = disk×headroom + FETCHER fuse budget + log"
+        );
+    }
+
+    /// The cold-start fetcher pod's ephemeral-storage request. The
+    /// median FOD is a small source archive: the overlay term
+    /// (`disk_bytes × headroom`, where the download lands) starts at
+    /// the scheduler's preferLocalBuild floor and grows via the
+    /// reactive disk floor when a pod is evicted for exceeding it, so
+    /// the cold-start request only needs to cover the median — the
+    /// fuse-cache term is the fetch script's input closure, and the
+    /// log budget is fixed. Pinning the absolute number keeps the
+    /// "how many fetcher pods fit on a node" property under review:
+    /// any change to one of the three addends shows up here as a
+    /// deliberate diff, not as a silent packing regression.
+    #[test]
+    fn cold_start_fetcher_ephemeral_request_is_small() {
+        const GI: u64 = 1 << 30;
+        // The scheduler's cold-start solve for a preferLocalBuild FOD
+        // (every nixpkgs fetcher): cores=1, mem=2Gi, disk=1Gi, flat
+        // 1.5× headroom (no fit ⇒ no variance-aware curve).
+        let i = SpawnIntent {
+            intent_id: "x".into(),
+            cores: 1,
+            mem_bytes: 2 * GI,
+            disk_bytes: GI,
+            disk_headroom_factor: Some(1.5),
+            kind: rio_proto::types::ExecutorKind::Fetcher.into(),
+            ..Default::default()
+        };
+        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
+            .get()
+            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
+        let (_, _, eph) = intent_pod_footprint(&i, cfg_fuse);
+        assert_eq!(
+            eph,
+            (3 * GI) / 2 + pod::FETCHER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES,
+            "cold-start fetcher ephemeral-storage = 1Gi×1.5 + fetcher fuse + 1Gi log"
+        );
+        assert_eq!(eph, 6_979_321_856, "= 6.5 GiB");
     }
 
     /// mb_022: a Builder Pool that sets `fuseCacheBytes` (pre-CEL CR)
@@ -1367,16 +1439,17 @@ mod tests {
             "Builder ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
         );
         // r35 merged_bug_024: Fetcher Pool ALSO ignores spec.fuseCacheBytes
-        // — single-sourced from BUILDER_FUSE_CACHE. §13e routed Fetcher
-        // Pools through nodeclaim_pool, so a per-Pool override would
-        // make FFD/cover predict a different ephemeral-storage footprint
-        // than the pod actually stamps.
+        // — single-sourced from the boot-time per-kind value
+        // (FETCHER_FUSE_CACHE). §13e routed Fetcher Pools through
+        // nodeclaim_pool, so a per-Pool override would make FFD/cover
+        // predict a different ephemeral-storage footprint than the pod
+        // actually stamps.
         let mut f = test_pool("f", ExecutorKind::Fetcher);
         f.spec.fuse_cache_bytes = Some(100 * (1 << 30));
         assert_eq!(
             pod::fuse_cache_bytes(&f),
-            cfg_fuse,
-            "Fetcher ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
+            pod::fetcher_fuse_cache_bytes(),
+            "Fetcher ignores spec.fuseCacheBytes — single-sourced from FETCHER_FUSE_CACHE"
         );
     }
 
@@ -1684,7 +1757,7 @@ mod tests {
     /// closure size, so every fresh drv_hash re-climbs the floor.
     ///
     /// r35 merged_bug_024: `PoolSpec.fuse_cache_bytes` is IGNORED for
-    /// both kinds — single-sourced from `BUILDER_FUSE_CACHE` so
+    /// both kinds — single-sourced from the per-kind boot-time value so
     /// FFD/cover/stamp agree (§Simulator-shares-accounting). The
     /// emptyDir sizeLimit and the `ephemeral-storage` addend both read
     /// the same value so they cannot drift even within one kind.
@@ -1694,22 +1767,28 @@ mod tests {
         let cfg_fuse = *pod::BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
+        let fetcher_fuse = pod::fetcher_fuse_cache_bytes();
         for (kind, override_, expect) in [
             (ExecutorKind::Builder, None, cfg_fuse),
-            (ExecutorKind::Fetcher, None, cfg_fuse),
+            (ExecutorKind::Fetcher, None, fetcher_fuse),
             // mb_035: Builder ignores PoolSpec override (single-sourced).
             (ExecutorKind::Builder, Some(4 * GI), cfg_fuse),
             // r35 merged_bug_024: Fetcher ALSO ignores PoolSpec override —
             // §13e routes Fetcher Pools through nodeclaim_pool, so the
             // override would make FFD predict a different footprint than
             // the pod stamps.
-            (ExecutorKind::Fetcher, Some(6 * GI), cfg_fuse),
+            (ExecutorKind::Fetcher, Some(6 * GI), fetcher_fuse),
         ] {
             let mut pool = test_pool("p", kind);
             pool.spec.fuse_cache_bytes = override_;
             let i = SpawnIntent {
                 intent_id: "abc".into(),
                 disk_bytes: 5 * GI,
+                kind: match kind {
+                    ExecutorKind::Builder => rio_proto::types::ExecutorKind::Builder,
+                    ExecutorKind::Fetcher => rio_proto::types::ExecutorKind::Fetcher,
+                }
+                .into(),
                 ..Default::default()
             };
             let job = job(&pool, &i);

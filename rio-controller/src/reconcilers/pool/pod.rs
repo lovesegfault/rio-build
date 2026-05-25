@@ -102,34 +102,62 @@ pub(crate) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
 /// pod actually stamps.
 pub static BUILDER_FUSE_CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// Default FUSE cache emptyDir sizeLimit for fetcher pods, when
+/// `[nodeclaim_pool].fetcher_fuse_cache_bytes` is unset.
+///
+/// A fetcher's FUSE cache holds the FOD's *input* closure — the fetch
+/// script's runtime deps (curl/git/cargo/JDK + stdenv), not the
+/// artifact it downloads (that lands in the overlay emptyDir, which is
+/// sized from `disk_bytes` and grows via the reactive disk floor on
+/// eviction). Fetch-script closures are bounded by the heaviest
+/// fetcher toolchain in use, not by the download size, so this is a
+/// static bound with no escalation path: it must comfortably cover the
+/// worst toolchain (JDK/dotnet-class, ~1.5–2 GiB) but should not
+/// inherit the builder budget, which is sized for arbitrary build-time
+/// closures and dominates the fetcher pod's ephemeral-storage request
+/// ~30× over what a FOD can ever touch.
+pub(crate) const FETCHER_FUSE_CACHE_BYTES: u64 = 4 * (1 << 30);
+
+/// Set once at boot from `[nodeclaim_pool].fetcher_fuse_cache_bytes`.
+/// Same single-sourcing contract as [`BUILDER_FUSE_CACHE`], for
+/// Fetcher pools/intents.
+pub static FETCHER_FUSE_CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Effective fetcher FUSE-cache budget: the boot-time config value, or
+/// [`FETCHER_FUSE_CACHE_BYTES`] when unset. Shared by
+/// [`fuse_cache_bytes`] (pool axis: emptyDir sizeLimit + the stamped
+/// pod request) and `intent_pod_footprint` (intent axis: FFD fit-check
+/// + `cover_deficit`'s NodeClaim sizing) so the two cannot drift.
+pub(crate) fn fetcher_fuse_cache_bytes() -> u64 {
+    *FETCHER_FUSE_CACHE
+        .get()
+        .unwrap_or(&FETCHER_FUSE_CACHE_BYTES)
+}
+
 /// Per-pool FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
 /// sizeLimit and the `ephemeral-storage` budget addend so they cannot
-/// drift. ALL pools single-source from [`BUILDER_FUSE_CACHE`]
-/// (= `[nodeclaim_pool].fuse_cache_bytes`) so FFD/cover/stamp agree
-/// (§Simulator-shares-accounting). `PoolSpec.fuse_cache_bytes` is
-/// CEL-rejected for both kinds; pre-CEL CRs are ignored here with a
-/// Warning event (`DEGRADE_CHECKS::*FuseCacheBytesIgnored`).
+/// drift. Pools single-source from the per-kind boot-time value
+/// ([`BUILDER_FUSE_CACHE`] = `[nodeclaim_pool].fuse_cache_bytes`,
+/// [`FETCHER_FUSE_CACHE`] = `[nodeclaim_pool].fetcher_fuse_cache_bytes`)
+/// so FFD/cover/stamp agree (§Simulator-shares-accounting).
+/// `PoolSpec.fuse_cache_bytes` is CEL-rejected for both kinds; pre-CEL
+/// CRs are ignored here with a Warning event
+/// (`DEGRADE_CHECKS::*FuseCacheBytesIgnored`).
 ///
 /// r35 merged_bug_024: §13e routed Fetcher Pools through
-/// `nodeclaim_pool` — FFD/cover read `cfg.fuse_cache_bytes` for
-/// fetcher cells too, so a per-Pool Fetcher override would diverge the
-/// FFD fit-check from the stamped pod request (the same drift mb_035
-/// closed for Builder).
-//
-// TODO: per-kind `FETCHER_FUSE_CACHE` OnceLock fed from a new
-// `[nodeclaim_pool].fetcher_fuse_cache_bytes` (default 4 GiB) +
-// `intent_pod_footprint(i, kind, ...)`. With the OnceLock set in prod,
-// fetcher pods reserve `BUILDER_FUSE_CACHE` (50 GiB) instead of the
-// ~4 GiB FODs actually need, ~12× over-allocating ephemeral-storage —
-// safe direction (under-packs nodes, doesn't break builds) but
-// expensive at chromium-scale fan-out. Add once
-// `rio_controller_nodeclaim_idle_cores` shows the bin-packing
-// regression in prod.
+/// `nodeclaim_pool` — FFD/cover read the config for fetcher cells too,
+/// so a per-Pool Fetcher override would diverge the FFD fit-check from
+/// the stamped pod request (the same drift mb_035 closed for Builder).
+/// The per-KIND split keeps that property: `intent_pod_footprint`
+/// selects on `SpawnIntent.kind`, this selects on `pool.spec.kind`, and
+/// the scheduler's intent filter guarantees the two agree for every
+/// intent a pool spawns.
 pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
     match pool.spec.kind {
-        ExecutorKind::Builder | ExecutorKind::Fetcher => *BUILDER_FUSE_CACHE
+        ExecutorKind::Builder => *BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&BUILDER_FUSE_CACHE_BYTES),
+        ExecutorKind::Fetcher => fetcher_fuse_cache_bytes(),
     }
 }
 

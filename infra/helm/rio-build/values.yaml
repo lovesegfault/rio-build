@@ -1153,17 +1153,28 @@ poolDefaults:
   enabled: false
   features: []
   image: rio-builder
-  # 50Gi. Reconciler adds this verbatim to every worker pod's (Builder
-  # AND Fetcher) ephemeral-storage request/limit AND the fuse-cache
-  # emptyDir sizeLimit. Single-sourced through controller.toml
+  # 50Gi. Reconciler adds this verbatim to every BUILDER pod's
+  # ephemeral-storage request/limit AND the fuse-cache emptyDir
+  # sizeLimit. Single-sourced through controller.toml
   # `[nodeclaim_pool].fuse_cache_bytes` — NOT the per-Pool CRD spec
   # (CEL-rejected for BOTH kinds since r35; see
   # docs/spec/components/controller.typ). Controller fallback when unset
   # is 8Gi (`BUILDER_FUSE_CACHE_BYTES`) — the safe minimum so non-helm
   # Pools schedule on small-disk nodes; prod overrides UP here. Raising
-  # this grows EVERY worker pod's ephemeral-storage request — check
+  # this grows EVERY builder pod's ephemeral-storage request — check
   # node capacity headroom before bumping.
   fuseCacheBytes: 53687091200
+  # 4Gi. Fetcher-pod analogue of fuseCacheBytes
+  # (`[nodeclaim_pool].fetcher_fuse_cache_bytes`). A FOD's FUSE cache
+  # only ever holds the fetch script's input closure (curl/git/JDK-class
+  # toolchains), not the artifact it downloads — that lands in the
+  # overlay emptyDir, which is sized from the intent's disk_bytes and
+  # grows via the scheduler's reactive disk floor on eviction. Unlike
+  # the overlay, this dimension does NOT escalate on eviction: a FOD
+  # whose input closure exceeds it retries to exhaustion and poisons,
+  # so raise it HERE if a fetcher toolchain outgrows it. Controller
+  # fallback when unset is 4Gi (`FETCHER_FUSE_CACHE_BYTES`).
+  fetcherFuseCacheBytes: 4294967296
   # privileged:true is an ESCAPE HATCH for clusters whose containerd
   # lacks base_runtime_spec device injection. It disables seccomp
   # entirely (ADR-012) and is unacceptable for multi-tenant.

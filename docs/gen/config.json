@@ -760,6 +760,12 @@
         "description": "FUSE-cache budget added to every builder pod's `ephemeral-storage` request (the `fuse-cache` emptyDir)."
       },
       {
+        "key": "nodeclaim_pool.fetcher_fuse_cache_bytes",
+        "type": "uint64",
+        "default": "4294967296",
+        "description": "FUSE-cache budget for FETCHER pods (the `fuse-cache` emptyDir sizeLimit and the matching `ephemeral-storage` addend)."
+      },
+      {
         "key": "nodeclaim_pool.kube_build_scheduler_enabled",
         "type": "boolean",
         "default": "true",
