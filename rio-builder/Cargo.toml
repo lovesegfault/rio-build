@@ -12,6 +12,20 @@ description = "Build executor with FUSE store for rio-build"
 name = "rio-builder"
 path = "src/main.rs"
 
+# Privileged per-node DaemonSet: /dev/fuse handoff + BACKING_OPEN broker
+# + verified cache promotion (ADR-022 §11, P0567). Same crate as the
+# builder because both link castore_fuse::mountd_proto.
+[[bin]]
+name = "rio-mountd"
+path = "src/bin/rio-mountd.rs"
+
+# VM-test client for the production rio-mountd daemon (vm-mountd
+# scenario). Stands in for the builder side of the UDS protocol until
+# P0559's in-process client exists.
+[[bin]]
+name = "spike_mountd_client"
+path = "src/bin/spike_mountd_client.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
@@ -56,6 +70,12 @@ axum = { workspace = true }
 scopeguard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# castore_fuse/mountd_proto.rs UDS wire format (one postcard datagram
+# per SOCK_SEQPACKET frame).
+postcard = { workspace = true }
+# rio-mountd Promote re-hashes staged content before it becomes visible
+# in the node-shared cache.
+blake3 = { workspace = true }
 toml = { workspace = true, optional = true }
 # I-178b: ANSI-escape strip in is_input_materialization_failure.
 regex = { workspace = true }

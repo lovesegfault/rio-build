@@ -19,6 +19,10 @@
     ],
     "doc": "Executor-facing RPCs served by the rio-scheduler process."
   },
+  "castore.proto": {
+    "services": [],
+    "doc": "Content-addressed Directory DAG (ADR-022 §2.2/§8). Vendored from"
+  },
   "dag.proto": {
     "services": [],
     "doc": "DAG wire types — derivation nodes/edges and per-derivation events."

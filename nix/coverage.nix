@@ -64,6 +64,7 @@ let
     "builder"
     "controller"
     "cli"
+    "mountd"
   ];
   objectFlags = lib.concatMapStringsSep " " (b: "--object ${b}") covBins;
 
