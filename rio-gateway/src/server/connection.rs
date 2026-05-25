@@ -22,7 +22,7 @@ use russh::keys::PublicKey;
 use russh::server::{Auth, Handler, Msg, Session};
 use russh::{ChannelId, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
@@ -65,18 +65,16 @@ impl ConnStage {
     }
 }
 
-/// Max active protocol sessions per SSH connection. Matches Nix's
-/// default `max-jobs` — a well-behaved `nix build -j4` opens at most
-/// this many channels. Each session = 2 spawned tasks + 2×256 KiB
-/// duplex buffers, so this bounds per-connection memory at ~2 MiB.
-///
-/// Counted via `self.sessions.len()` — see `channel_open_session`.
-const MAX_CHANNELS_PER_CONNECTION: usize = 4;
-
 /// State for an active protocol session on one SSH channel.
 pub(super) struct ChannelSession {
     /// Send client data to the protocol handler.
     client_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Global session-cap permit (`r[gw.conn.session-cap]`). Acquired
+    /// in `exec_request` BEFORE the duplex buffers are allocated; held
+    /// for the session's lifetime so every removal path (channel close,
+    /// dead protocol task, connection drop clearing the map) releases
+    /// the slot. Underscore-prefixed: never read, only dropped.
+    _session_permit: tokio::sync::OwnedSemaphorePermit,
     /// Protocol handler task. NOT aborted in Drop — dropping a
     /// `JoinHandle` detaches the task, it keeps running. `shutdown`
     /// below is the graceful stop signal. Held (not immediately
@@ -124,7 +122,7 @@ impl Drop for ChannelSession {
     }
 }
 
-// r[impl gw.conn.exit-status]
+// r[impl gw.conn.exit-status+1]
 /// Reject an exec request and tear the channel down so the client `ssh`
 /// process exits. `channel_failure` alone leaves the channel open;
 /// openssh under ControlMaster waits for `exit-status` before its
@@ -222,6 +220,31 @@ pub struct ConnectionHandler {
     /// cancelling the server-wide parent reaches every proto_task
     /// regardless of which connection/channel owns it.
     pub(super) sessions_shutdown: CancellationToken,
+    /// Global active-session semaphore (`r[gw.conn.session-cap]`),
+    /// shared with `GatewayServer` and every other connection.
+    /// `exec_request` does `try_acquire_owned()`; the permit lives in
+    /// the `ChannelSession`. This — not the per-connection channel
+    /// bound — is the resource limit that protects pod memory.
+    pub(super) session_sem: Arc<Semaphore>,
+    /// Per-connection SSH channel absurdity bound
+    /// (`r[gw.conn.channel-limit+3]`). See
+    /// [`super::DEFAULT_MAX_CHANNELS_PER_CONNECTION`].
+    pub(super) max_channels_per_connection: usize,
+    /// SSH-level open channel count: incremented when
+    /// `channel_open_session` accepts, decremented in `channel_close`.
+    /// NOT `sessions.len()` — a channel that has been opened but not
+    /// yet exec'd is counted here and invisible there, so a burst of
+    /// opens with no execs is still bounded.
+    pub(super) open_channels: usize,
+    /// Grace period between the last channel closing and the idle
+    /// connection being disconnected. See
+    /// [`super::EMPTY_CONNECTION_GRACE`].
+    pub(super) empty_connection_grace: std::time::Duration,
+    /// The armed idle-disconnect timer, if the connection currently has
+    /// zero open channels. Aborted when a new channel opens and in
+    /// `Drop` (the timer must not outlive the connection it would
+    /// disconnect).
+    pub(super) pending_idle_disconnect: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionHandler {
@@ -347,6 +370,13 @@ impl ConnectionHandler {
 
 impl Drop for ConnectionHandler {
     fn drop(&mut self) {
+        // The idle-disconnect timer holds a russh `Handle` to this
+        // connection; if the connection is already gone the disconnect
+        // would be a harmless no-op, but there's no reason to keep a
+        // 60s sleeper alive per churned connection.
+        if let Some(timer) = self.pending_idle_disconnect.take() {
+            timer.abort();
+        }
         if self.auth_attempted {
             self.active_conns.fetch_sub(1, Ordering::Relaxed);
             metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
@@ -640,24 +670,44 @@ impl Handler for ConnectionHandler {
         self.stage
             .store(ConnStage::ChannelOpen as u8, Ordering::Relaxed);
         let channel_id = channel.id();
-        // r[impl gw.conn.channel-limit+2]
-        // Gate on sessions.len(), not "channels ever opened" — a channel
-        // without an `exec_request` has no ChannelSession, no spawned
-        // tasks, no buffers. Only exec'd channels consume resources.
-        // Fast-path rejection for well-behaved (open→exec interleaved)
-        // clients; `exec_request` re-checks for the burst-open-then-exec
-        // ordering, which is the load-bearing gate.
-        if self.sessions.len() >= MAX_CHANNELS_PER_CONNECTION {
+        // r[impl gw.conn.channel-limit+3]
+        // Absurdity bound on SSH-level open channels, NOT a resource
+        // bound — that is the global session semaphore in
+        // `exec_request`. Gate on `open_channels` (counted at
+        // open/close), not `sessions.len()` (counted at exec/close): a
+        // burst of N opens with no execs is invisible to the session
+        // map but still allocates a russh channel-table entry each.
+        //
+        // Refusing an open is a poison pill for a stock nix client
+        // behind `ControlMaster auto`: OpenSSH silently falls back to a
+        // direct connection, nix's `LocalCommand=echo started` fires
+        // there, and "started\n" lands in front of the worker-protocol
+        // handshake ("protocol mismatch, got 'started\noixd'"). So this
+        // bound sits far above any legitimate fan-out (a 128-core CI
+        // box running nix-fast-build behind one mux is ~128 channels) —
+        // a connection that reaches it is leaking channels or hostile,
+        // and a corrupted fallback is an acceptable failure mode there.
+        if self.open_channels >= self.max_channels_per_connection {
             warn!(
                 peer = ?self.peer_addr,
-                active = self.sessions.len(),
-                limit = MAX_CHANNELS_PER_CONNECTION,
-                "rejecting SSH channel open: per-connection limit reached"
+                open = self.open_channels,
+                limit = self.max_channels_per_connection,
+                "rejecting SSH channel open: per-connection channel bound reached"
             );
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
             return Ok(false);
         }
-        info!(channel = ?channel_id, "SSH session channel opened");
+        self.open_channels += 1;
+        // A new channel means the connection is no longer idle — disarm
+        // any pending idle-disconnect from a previous touch-zero.
+        if let Some(timer) = self.pending_idle_disconnect.take() {
+            timer.abort();
+        }
+        info!(
+            channel = ?channel_id,
+            open = self.open_channels,
+            "SSH session channel opened"
+        );
         Ok(true)
     }
 
@@ -683,23 +733,29 @@ impl Handler for ConnectionHandler {
             return reject_exec(session, channel_id);
         }
 
-        // r[impl gw.conn.channel-limit+2]
-        // Load-bearing re-check: `channel_open_session` gates on
-        // `sessions.len()` but never inserts (this method does, below).
-        // A client that bursts N×CHANNEL_OPEN (each sees len()==0 →
-        // accepted) then N×exec would otherwise spawn N ChannelSessions
-        // — 3 tasks + ~550 KiB buffers each — defeating the ~2 MiB
-        // per-connection bound the global memory budget depends on.
-        if self.sessions.len() >= MAX_CHANNELS_PER_CONNECTION {
+        // r[impl gw.conn.session-cap]
+        // Global admission control: one permit per spawned protocol
+        // session, across ALL connections on this pod. Acquired BEFORE
+        // `channel_success` and before the ~550 KiB of duplex buffers
+        // below are allocated — a rejected exec must cost nothing.
+        //
+        // This is the safe place to shed load. By the time the exec
+        // reply arrives, an OpenSSH mux master has already told its
+        // client `MUX_S_SESSION_OPENED`, so a `channel_failure` here
+        // produces a clean `ssh` exit — no fallback to a direct
+        // connection, no LocalCommand corruption (contrast with
+        // refusing the channel OPEN, see gw.conn.channel-limit+3).
+        // At the default cap (4096 ≈ 2.2 GiB of buffers) this only
+        // fires when the pod is genuinely at its memory ceiling, where
+        // a visible rejection beats an OOMKill of every other session.
+        let Ok(session_permit) = Arc::clone(&self.session_sem).try_acquire_owned() else {
             warn!(
                 peer = ?self.peer_addr,
-                active = self.sessions.len(),
-                limit = MAX_CHANNELS_PER_CONNECTION,
-                "rejecting exec request: per-connection channel limit reached"
+                "rejecting exec request: global session cap reached"
             );
-            metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
+            metrics::counter!("rio_gateway_errors_total", "type" => "session_cap").increment(1);
             return reject_exec(session, channel_id);
-        }
+        };
 
         session.channel_success(channel_id)?;
         metrics::gauge!("rio_gateway_channels_active").increment(1.0);
@@ -797,7 +853,7 @@ impl Handler for ConnectionHandler {
                     }
                 }
             }
-            // r[impl gw.conn.exit-status]
+            // r[impl gw.conn.exit-status+1]
             // RFC 4254 §6.10: send `exit-status` BEFORE eof/close. Without
             // it, openssh's foreground client process (under ControlMaster)
             // never returns to nix → nix blocks in pipe-read → `nom build`
@@ -828,6 +884,7 @@ impl Handler for ConnectionHandler {
                 _proto_task: proto_task,
                 response_task,
                 shutdown,
+                _session_permit: session_permit,
             },
         );
 
@@ -878,16 +935,59 @@ impl Handler for ConnectionHandler {
         debug!(channel = ?channel, "SSH channel closed");
         // Gauge decrement handled by ChannelSession::Drop.
         self.sessions.remove(&channel);
-        // r[impl gw.conn.exit-status]
-        // Last channel gone → disconnect the SSH connection. Without
-        // this, the TCP socket stays ESTABLISHED until either the
-        // client's ControlPersist or our `inactivity_timeout` (3600s)
-        // fires — `connections_active=1, channels_active=0` for up to
-        // an hour per client. A subsequent ssh-ng op re-handshakes;
-        // ControlMaster reuse is traded for prompt server-side cleanup.
-        if self.sessions.is_empty() {
-            debug!("last channel closed; disconnecting SSH connection");
-            session.disconnect(Disconnect::ByApplication, "last channel closed", "")?;
+        self.open_channels = self.open_channels.saturating_sub(1);
+        // r[impl gw.conn.exit-status+1]
+        // Last channel gone → arm a grace timer, THEN disconnect.
+        //
+        // Disconnecting immediately here (the previous behavior) tears
+        // down a ControlMaster's transport the instant its in-flight
+        // session count transits through zero between builds. The
+        // master then exits, OpenSSH unlinks the "stale" control
+        // socket, and every remaining nix process in the batch silently
+        // falls back to a direct connection whose handshake is
+        // corrupted by `LocalCommand` — one touch-zero event poisons
+        // the rest of a 64-worker run.
+        //
+        // The grace period keeps the mux alive across inter-build gaps
+        // while still reaping a genuinely abandoned connection 60×
+        // sooner than `inactivity_timeout` (which an idle-but-
+        // keepalive-answering client never trips). A non-mux client
+        // (`ssh gw nix-daemon --stdio`, one channel) closes its own TCP
+        // connection as soon as it receives `exit-status` — the timer
+        // never fires for it.
+        //
+        // Race at the boundary: a channel open that arrives in the same
+        // instant the timer fires may lose (the abort in
+        // `channel_open_session` lands after `disconnect` was already
+        // queued). That is the inherent boundary condition of any idle
+        // timeout; the client retries on a fresh connection.
+        if self.open_channels == 0 && self.sessions.is_empty() {
+            if let Some(prev) = self.pending_idle_disconnect.take() {
+                prev.abort();
+            }
+            let handle = session.handle();
+            let grace = self.empty_connection_grace;
+            let peer = self.peer_addr;
+            self.pending_idle_disconnect = Some(rio_common::task::spawn_monitored(
+                "idle-disconnect",
+                async move {
+                    tokio::time::sleep(grace).await;
+                    debug!(
+                        peer = ?peer,
+                        grace_secs = grace.as_secs(),
+                        "no open channels for the grace period; disconnecting"
+                    );
+                    // Err = the connection already ended for another
+                    // reason — nothing left to disconnect.
+                    let _ = handle
+                        .disconnect(
+                            Disconnect::ByApplication,
+                            "no open channels".to_owned(),
+                            String::new(),
+                        )
+                        .await;
+                },
+            ));
         }
         Ok(())
     }

@@ -147,10 +147,20 @@ impl client::Handler for AcceptAllClient {
 /// the REAL production `build_ssh_config`. Returns (bound addr, client
 /// key, background server join handle).
 ///
-/// Mock gRPC backends — T1 opens channels but never reaches opcodes
-/// (no wire handshake sent on the SSH channel data stream).
+/// Mock gRPC backends — these tests open channels but never reach
+/// opcodes (no wire handshake sent on the SSH channel data stream).
 async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::task::JoinHandle<()>)>
 {
+    spawn_ssh_server_with(|s| s).await
+}
+
+/// [`spawn_ssh_server`] with a builder hook so tests can shrink the
+/// limits (`with_max_sessions(4)`, `with_max_channels_per_connection(8)`,
+/// `with_empty_connection_grace(200ms)`) instead of opening 4096
+/// channels to reach the production defaults.
+async fn spawn_ssh_server_with(
+    configure: impl FnOnce(GatewayServer) -> GatewayServer,
+) -> anyhow::Result<(SocketAddr, PrivateKey, tokio::task::JoinHandle<()>)> {
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
     let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
@@ -165,7 +175,11 @@ async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::ta
     let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = socket.local_addr()?;
 
-    let mut server = GatewayServer::new(store_client, scheduler_client, vec![client_pub]);
+    let mut server = configure(GatewayServer::new(
+        store_client,
+        scheduler_client,
+        vec![client_pub],
+    ));
     let srv_handle = tokio::spawn(async move {
         if let Err(e) = server.run_on_socket(config, &socket).await {
             eprintln!("ssh server error: {e}");
@@ -175,18 +189,14 @@ async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::ta
     Ok((addr, client_key, srv_handle))
 }
 
-// r[verify gw.conn.channel-limit+2]
-/// Open 4 channels + exec on each (populates `self.sessions`), then
-/// a 5th `channel_open_session` receives `SSH_MSG_CHANNEL_OPEN_FAILURE`.
-/// Closing one channel frees a slot; 6th open succeeds.
-///
-/// Must hold channel handles — dropping them closes the channel and
-/// shrinks `sessions.len()`.
-#[tokio::test]
-async fn test_fifth_channel_rejected() -> anyhow::Result<()> {
-    common::init_test_logging();
-    let (addr, client_key, srv) = spawn_ssh_server().await?;
-
+/// Connect + authenticate a russh client against a [`spawn_ssh_server`]
+/// instance. Extracted because the multi-connection tests (the global
+/// session cap is shared across connections) need to do this twice with
+/// the same key.
+async fn connect_and_auth(
+    addr: SocketAddr,
+    client_key: PrivateKey,
+) -> anyhow::Result<client::Handle<AcceptAllClient>> {
     let config = Arc::new(client::Config::default());
     let mut session = client::connect(config, addr, AcceptAllClient).await?;
     let auth_ok = session
@@ -196,49 +206,64 @@ async fn test_fifth_channel_rejected() -> anyhow::Result<()> {
         )
         .await?
         .success();
-    assert!(auth_ok, "publickey auth should succeed");
+    anyhow::ensure!(auth_ok, "publickey auth should succeed");
+    Ok(session)
+}
 
-    // Open 4 channels, send exec on each. `exec(true, ...)` waits for
-    // the server's channel_success reply — by the time it returns, the
-    // server has inserted into `self.sessions`.
+// r[verify gw.conn.channel-limit+3]
+/// The per-connection bound counts SSH-level OPEN channels (not exec'd
+/// sessions): with the bound set to 8, eight opens with NO exec all
+/// succeed (under the old `sessions.len()` gate they were invisible and
+/// unbounded), the 9th receives `SSH_MSG_CHANNEL_OPEN_FAILURE`, and
+/// closing one releases the slot for a 10th.
+///
+/// Must hold channel handles — dropping them closes the channel and
+/// decrements `open_channels`.
+#[tokio::test]
+async fn test_channel_open_absurdity_bound() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const BOUND: usize = 8;
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_max_channels_per_connection(BOUND)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // Open BOUND channels with no exec. Every one must be accepted —
+    // the bound is the absurdity threshold, not a working limit.
     let mut chans = Vec::new();
-    for i in 0..4 {
-        let ch = session.channel_open_session().await?;
-        ch.exec(true, "nix-daemon --stdio").await?;
+    for i in 0..BOUND {
+        let ch = session
+            .channel_open_session()
+            .await
+            .unwrap_or_else(|e| panic!("open #{i} should be accepted (bound={BOUND}): {e:?}"));
         chans.push(ch);
-        // Small yield to let the server process the exec fully before
-        // the next open — russh serializes handler calls, but the exec
-        // reply races with our next open request at the TCP layer.
-        tokio::task::yield_now().await;
-        eprintln!("channel {i} opened and exec'd");
     }
 
-    // 5th: server returns Ok(false) → SSH_MSG_CHANNEL_OPEN_FAILURE →
-    // client sees Err(ChannelOpenFailure).
-    let fifth = session.channel_open_session().await;
+    // BOUND+1th: server returns Ok(false) → SSH_MSG_CHANNEL_OPEN_FAILURE
+    // → client sees Err(ChannelOpenFailure).
+    let over = session.channel_open_session().await;
     assert!(
-        matches!(fifth, Err(russh::Error::ChannelOpenFailure(_))),
-        "expected ChannelOpenFailure, got {fifth:?}"
+        matches!(over, Err(russh::Error::ChannelOpenFailure(_))),
+        "open #{BOUND} must be refused at the absurdity bound, got {over:?}"
     );
 
     // Closing one frees a slot. `.close()` sends SSH_MSG_CHANNEL_CLOSE
     // async — give the server a beat to process channel_close →
-    // sessions.remove before we try the 6th open.
+    // open_channels -= 1 before we retry.
     //
     // SLEEP JUSTIFICATION: russh provides no client-side await for
     // the server's channel-close confirm. The slot frees when the
-    // server's handler.channel_close() runs (sessions.remove), which
-    // is strictly after the SSH_MSG_CHANNEL_CLOSE round-trip. 50ms
-    // is generous for a localhost round-trip + handler dispatch;
-    // event-driven sync would require server-side test hooks
-    // (channel-count broadcast) — not worth the test-only plumbing.
+    // server's handler.channel_close() runs, which is strictly after
+    // the SSH_MSG_CHANNEL_CLOSE round-trip. 50ms is generous for a
+    // localhost round-trip + handler dispatch; event-driven sync would
+    // require server-side test hooks — not worth the test-only
+    // plumbing.
     let closed = chans.pop().unwrap();
     closed.close().await?;
     drop(closed);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let sixth = session.channel_open_session().await;
-    assert!(sixth.is_ok(), "slot should free after close: {sixth:?}");
+    let retry = session.channel_open_session().await;
+    assert!(retry.is_ok(), "slot should free after close: {retry:?}");
 
     drop(chans);
     drop(session);
@@ -285,48 +310,38 @@ async fn test_auth_publickey_offered_rejects_unknown_key() -> anyhow::Result<()>
     Ok(())
 }
 
-// r[verify gw.conn.channel-limit+2]
-/// Burst N×`channel_open_session` first (each sees `sessions.len()==0`
-/// → accepted), THEN N×exec. The 5th and 6th exec must receive
-/// `channel_failure` — the `exec_request` re-check is the load-bearing
-/// gate; `channel_open_session` alone never inserts into the session
-/// map, so without the re-check all N execs would spawn.
-///
-/// Regression: at b62291b8 all 6 execs succeed (cap bypassed).
+// r[verify gw.conn.session-cap]
+/// The global session cap rejects the over-limit EXEC (clean
+/// `channel_failure`), never the channel OPEN (which would corrupt a
+/// ControlMaster client), and the cap is shared across connections:
+/// with `max_sessions = 4`, six opens on connection A all succeed,
+/// execs 1-4 succeed, execs 5-6 get `channel_failure`, an exec on a
+/// second connection B is also rejected, and closing one of A's live
+/// sessions frees a permit that B can then claim.
 #[tokio::test]
-async fn test_burst_open_then_exec_respects_channel_limit() -> anyhow::Result<()> {
+async fn test_global_session_cap_rejects_exec_cleanly() -> anyhow::Result<()> {
     common::init_test_logging();
-    let (addr, client_key, srv) = spawn_ssh_server().await?;
+    const CAP: usize = 4;
+    let (addr, client_key, srv) = spawn_ssh_server_with(|s| s.with_max_sessions(CAP)).await?;
+    let conn_a = connect_and_auth(addr, client_key.clone()).await?;
 
-    let config = Arc::new(client::Config::default());
-    let mut session = client::connect(config, addr, AcceptAllClient).await?;
-    let auth_ok = session
-        .authenticate_publickey(
-            "nix",
-            PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
-        )
-        .await?
-        .success();
-    assert!(auth_ok, "publickey auth should succeed");
-
-    // Burst-open 6 channels with NO exec. `channel_open_session` checks
-    // `sessions.len()` (==0 for all six) so all opens are accepted.
+    // Open 6 channels — all accepted (well under the 512 absurdity
+    // bound; the session cap must NOT refuse opens).
     let mut chans = Vec::new();
     for i in 0..6 {
-        let ch = session
-            .channel_open_session()
-            .await
-            .unwrap_or_else(|e| panic!("burst open #{i} should be accepted (len()==0): {e:?}"));
+        let ch = conn_a.channel_open_session().await.unwrap_or_else(|e| {
+            panic!("open #{i} must be accepted (cap gates execs, not opens): {e:?}")
+        });
         chans.push(ch);
     }
 
-    // Now exec on each. First 4 → channel_success; 5th and 6th →
+    // Exec on each. First CAP → channel_success; the rest →
     // channel_failure. `exec(true, ...)` only SENDS the request; the
     // server's success/failure reply arrives via `wait()`.
     for (i, ch) in chans.iter_mut().enumerate() {
         ch.exec(true, "nix-daemon --stdio").await?;
         let msg = ch.wait().await.expect("server reply");
-        if i < 4 {
+        if i < CAP {
             assert!(
                 matches!(msg, russh::ChannelMsg::Success),
                 "exec #{i} should get channel_success: {msg:?}"
@@ -334,12 +349,131 @@ async fn test_burst_open_then_exec_respects_channel_limit() -> anyhow::Result<()
         } else {
             assert!(
                 matches!(msg, russh::ChannelMsg::Failure),
-                "exec #{i} must get channel_failure (exec_request channel-limit re-check); got {msg:?}"
+                "exec #{i} must get channel_failure (global session cap); got {msg:?}"
             );
         }
     }
 
+    // The cap is GLOBAL: a second SSH connection sees the same
+    // exhausted semaphore.
+    let conn_b = connect_and_auth(addr, client_key).await?;
+    let mut b_ch = conn_b.channel_open_session().await?;
+    b_ch.exec(true, "nix-daemon --stdio").await?;
+    let msg = b_ch.wait().await.expect("server reply");
+    assert!(
+        matches!(msg, russh::ChannelMsg::Failure),
+        "exec on a second connection must also be rejected (the cap is global): {msg:?}"
+    );
+
+    // Closing one of A's live sessions releases its permit to B.
+    // SLEEP JUSTIFICATION: the permit is released when the server's
+    // channel_close → sessions.remove → ChannelSession::Drop runs,
+    // strictly after the SSH_MSG_CHANNEL_CLOSE round-trip; russh has
+    // no client-side await for that. 50ms >> a localhost round-trip.
+    let closed = chans.remove(0);
+    closed.close().await?;
+    drop(closed);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut b_ch2 = conn_b.channel_open_session().await?;
+    b_ch2.exec(true, "nix-daemon --stdio").await?;
+    let msg = b_ch2.wait().await.expect("server reply");
+    assert!(
+        matches!(msg, russh::ChannelMsg::Success),
+        "a permit freed on connection A must be claimable from connection B: {msg:?}"
+    );
+
     drop(chans);
+    drop(conn_a);
+    drop(conn_b);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.channel-limit+3]
+// r[verify gw.conn.session-cap]
+/// The headline regression test for the ControlMaster incident: 32
+/// concurrent `nix-daemon --stdio` sessions multiplexed onto ONE SSH
+/// connection must ALL be admitted under the default limits. Under the
+/// previous design (`MAX_CHANNELS_PER_CONNECTION = 4`) only 4 of these
+/// execs succeeded and the rest were refused — and any refusal of the
+/// channel *open* makes a stock nix client behind `ControlMaster auto`
+/// silently fall back to a direct connection whose handshake is
+/// corrupted by `LocalCommand`.
+#[tokio::test]
+async fn test_many_multiplexed_sessions_all_succeed() -> anyhow::Result<()> {
+    common::init_test_logging();
+    let (addr, client_key, srv) = spawn_ssh_server().await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    let mut chans = Vec::new();
+    for i in 0..32 {
+        let ch = session.channel_open_session().await.unwrap_or_else(|e| {
+            panic!("open #{i}/32 must be accepted under default limits: {e:?}")
+        });
+        chans.push(ch);
+    }
+    for (i, ch) in chans.iter_mut().enumerate() {
+        ch.exec(true, "nix-daemon --stdio").await?;
+        let msg = ch.wait().await.expect("server reply");
+        assert!(
+            matches!(msg, russh::ChannelMsg::Success),
+            "exec #{i}/32 must succeed under default limits (one ControlMaster \
+             carrying a 32-worker nix-fast-build is a legitimate client); got {msg:?}"
+        );
+    }
+
+    drop(chans);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.exit-status+1]
+/// A connection whose channel count transits through zero must survive
+/// for the grace period (a ControlMaster between builds), and must
+/// still be reaped once the grace period expires without a new channel
+/// (an abandoned connection).
+#[tokio::test]
+async fn test_connection_survives_channel_count_touching_zero() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // Build 1: open, exec, close — the connection's channel count
+    // touches zero.
+    let ch1 = session.channel_open_session().await?;
+    ch1.exec(true, "nix-daemon --stdio").await?;
+    ch1.close().await?;
+    drop(ch1);
+
+    // Give the server time to process the close and arm the idle
+    // timer, but stay well inside the grace period. Under the previous
+    // behavior the server sent SSH_MSG_DISCONNECT here and build 2
+    // failed.
+    tokio::time::sleep(GRACE / 4).await;
+
+    // Build 2: the mux opens its next session on the same connection.
+    let ch2 = session.channel_open_session().await.map_err(|e| {
+        anyhow::anyhow!("connection must survive its channel count touching zero: {e:?}")
+    })?;
+    ch2.exec(true, "nix-daemon --stdio").await?;
+    ch2.close().await?;
+    drop(ch2);
+
+    // No build 3: after the grace period expires with zero channels,
+    // the server disconnects. 3× the grace is comfortably past the
+    // timer without making the test slow.
+    tokio::time::sleep(GRACE * 3).await;
+    let after = session.channel_open_session().await;
+    assert!(
+        after.is_err(),
+        "an idle connection must still be reaped after the grace period, \
+         got a successful open: {after:?}"
+    );
+
     drop(session);
     srv.abort();
     Ok(())

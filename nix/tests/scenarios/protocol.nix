@@ -23,7 +23,7 @@
   common,
   fixture,
   cold ? false,
-  # Exercise `r[gw.conn.exit-status]`: client has nix-output-monitor +
+  # Exercise `r[gw.conn.exit-status+1]`: client has nix-output-monitor +
   # ControlMaster ssh config; subtest asserts `nom build` exits within
   # the timeout (vs hanging until ControlPersist) and gateway-side
   # `connections_active` returns to 0. Only the CppNix warm variant
@@ -257,7 +257,7 @@ let
   # default.nix extraClientModules). Without the gateway sending
   # `exit-status` (RFC 4254 §6.10), openssh's foreground client process
   # never returns to nix → nix blocks in pipe-read → `nom build` hangs.
-  # Without `disconnect()` on last-channel-close, the TCP socket stays
+  # Without the empty-connection-grace disconnect, the TCP socket stays
   # ESTABLISHED until inactivity_timeout (3600s).
   nomExitScript = ''
     with subtest("nom build exits under ControlMaster (gateway sends exit-status)"):
@@ -274,18 +274,22 @@ let
         )
         assert rc == 0, (
             f"nom build exited {rc} (124=timeout → gateway likely "
-            f"missing exit-status; see r[gw.conn.exit-status]). out: {out}"
+            f"missing exit-status; see r[gw.conn.exit-status+1]). out: {out}"
         )
 
-    with subtest("gateway connection closed after last channel (disconnect)"):
-        # The mux daemon may still hold the TCP open for ControlPersist
-        # client-side, but the gateway should have sent SSH_MSG_DISCONNECT
-        # → server-side connections_active drops to 0 promptly. Scrape on
-        # the gateway node (has curl; client may not).
+    with subtest("gateway reaps the idle connection after the empty grace period"):
+        # The mux daemon holds the TCP open for ControlPersist (600s)
+        # client-side. The gateway MUST NOT disconnect the instant the
+        # build's channel closes (that kills a ControlMaster mid-batch
+        # — see r[gw.conn.exit-status+1]); it disconnects after the
+        # connection has had zero channels for EMPTY_CONNECTION_GRACE
+        # (60s). Budget 90s: 60s timer + scrape/teardown tail under
+        # builder load. Scrape on the gateway node (has curl; client
+        # may not).
         ${gatewayHost}.wait_until_succeeds(
             "curl -fsS http://localhost:9090/metrics | "
             "grep -qx 'rio_gateway_connections_active 0'",
-            timeout=15,
+            timeout=90,
         )
 
     with subtest("rejected exec exits promptly (exit-status on failure path)"):
