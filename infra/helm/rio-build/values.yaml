@@ -228,10 +228,10 @@ store:
     annotations: {}
   chunkBackend:
     # Required — every NAR is chunked; the store refuses to start
-    # without a backend. s3 requires bucket (+ endpoint/region/creds
+    # with no backend. s3 requires bucket (+ endpoint/region/creds
     # via env or IRSA); filesystem requires baseDir (+ a writable
-    # volume — the chart mounts a hostPath at baseDir for kind:
-    # filesystem); memory is test-only.
+    # volume — the chart provisions a `rio-store-chunks` PVC and
+    # mounts it at baseDir for kind: filesystem); memory is test-only.
     kind: s3
     bucket: ""
     # Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).

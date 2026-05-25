@@ -20,7 +20,7 @@ rio_test_support::metrics_suite! {
     spec_floor: 12,
     emit_floor: 15,
     default_buckets_ok: [
-        // Inline NARs ~5-50ms (PG round-trip), chunked S3 ~100ms-10s.
+        // Single-chunk NARs ~5-50ms, multi-chunk S3 ~100ms-10s.
         // [0.005..10.0] fits.
         "rio_store_put_path_duration_seconds",
         "rio_store_get_path_duration_seconds",

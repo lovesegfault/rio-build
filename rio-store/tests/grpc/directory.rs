@@ -637,7 +637,7 @@ async fn read_blob_tenant_scoped() {
 }
 
 /// Zero-byte file: the chunk plan is empty and the stream closes with
-/// no frames, both inline and chunked.
+/// no frames, for both single-chunk and multi-chunk NARs.
 // r[verify store.castore.blob-read]
 #[tokio::test]
 async fn read_blob_zero_byte_file() {
@@ -830,9 +830,8 @@ async fn stat_blob_tenant_scoped() {
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
 
-/// `file_blobs.size` overrunning a *chunked* NAR is DATA_LOSS — the
-/// inline-path overrun test doesn't reach `build_chunk_plan`, which
-/// `read_blob` and `stat_blob` share.
+/// `file_blobs.size` overrunning a multi-chunk NAR is DATA_LOSS in
+/// `build_chunk_plan`, which `read_blob` and `stat_blob` share.
 // r[verify store.castore.blob-stat]
 // r[verify store.castore.blob-read]
 #[tokio::test]

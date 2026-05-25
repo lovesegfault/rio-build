@@ -56,10 +56,9 @@ struct OutputAccum {
     /// Phase-1 only: phase 2 freezes it into [`Self::nar_bytes`].
     nar_data: Vec<u8>,
     /// [`Self::nar_data`] frozen into a refcounted `Bytes` at the top
-    /// of phase 2 (zero-copy `Vec → Bytes`). Shared by the staged
-    /// inline blob (a `clone()` of the same allocation) and the
-    /// post-commit eager `nar_index` pass, so neither costs a second
-    /// copy of the NAR.
+    /// of phase 2 (zero-copy `Vec → Bytes`). The post-commit eager
+    /// `nar_index` pass clones this same allocation, so indexing never
+    /// costs a second copy of the NAR.
     nar_bytes: Option<bytes::Bytes>,
     /// Incremental NAR digest, fed by `accumulate_chunk`. Finalized in
     /// phase 2 for [`verify_nar`].
@@ -184,9 +183,8 @@ impl StoreServiceImpl {
 
             info.store_path_hash = accum.store_path_hash.clone();
             // Freeze the accumulation Vec into a refcounted Bytes
-            // (zero-copy). The staged inline blob and the post-commit
-            // eager nar_index pass both clone this same allocation
-            // (r[store.index.putpath-eager]).
+            // (zero-copy). The post-commit eager nar_index pass clones
+            // this same allocation (r[store.index.putpath-eager]).
             let nar = bytes::Bytes::from(std::mem::take(&mut accum.nar_data));
             match self.stage_nar_for_batch(info, claim, &nar).await {
                 Ok(p) => accum.staged = Some(p),
@@ -375,8 +373,8 @@ impl StoreServiceImpl {
         }
     }
 
-    /// Phase 3: open ONE transaction, flip every owned output to
-    /// `status='complete'` (inline or chunked-staged), commit, then
+    /// Phase 3: open ONE transaction, flip every owned (chunk-staged)
+    /// output to `status='complete'`, commit, then
     /// emit per-output created/bytes metrics. Tx auto-rollback on early
     /// return; caller's `PlaceholderGuard`s reap placeholders on Drop +
     /// staged chunk refcounts (committed in phase-2's separate txs).

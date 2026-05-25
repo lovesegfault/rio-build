@@ -602,10 +602,11 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
 
     // Pipeline: wire-read sequential (entry N+1's metadata follows N's NAR
     // bytes — can't read ahead), store-call concurrent. The store does NOT
-    // validate references at PutPath time (rio-store/src/metadata/inline.rs:
-    // refs go into a `text[]` column, no FK, no existence check — they're
-    // walked by GC mark, not validated at insert), so reordering is safe
-    // even though Nix sends entries in topological order.
+    // validate references at PutPath time (`insert_manifest_uploading` in
+    // rio-store/src/metadata/mod.rs: refs go into a `text[]` column, no FK,
+    // no existence check — they're walked by GC mark, not validated at
+    // insert), so reordering is safe even though Nix sends entries in
+    // topological order.
     //
     // I-052: live-measured ~20 paths/sec sequential (store p50=25ms). At
     // 45k entries that's ~31 minutes before any build starts. 32-way

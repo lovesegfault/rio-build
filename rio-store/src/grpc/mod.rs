@@ -4,7 +4,7 @@
 //! - `put_path` — write-ahead upload flow (Steps 1-6) + `common` shared
 //!   with `put_path_batch`
 //! - `put_path_batch` — atomic multi-output upload
-//! - `get_path` — streaming NAR download (inline/chunked reassembly)
+//! - `get_path` — streaming NAR download (chunk reassembly)
 //! - `queries` — read RPCs (QueryPathInfo, FindMissingPaths, …)
 //! - `sign` — narinfo signing + sig-visibility gate
 //! - `chunk` — ChunkService (GetChunk)
@@ -205,9 +205,8 @@ pub struct StoreServiceImpl {
     /// Tenant-aware ed25519 signer for narinfo. Wraps the cluster
     /// `Signer` + PG pool for per-tenant key lookup. `None` = signing
     /// disabled (paths stored without our signature; still serveable,
-    /// just unverified). Arc because both PutPath branches need it and
-    /// the inline branch doesn't have a good place to hold a reference
-    /// across the await.
+    /// just unverified). Arc because PutPath and PutPathBatch both
+    /// need a handle to hold across their persist awaits.
     signer: Option<Arc<TenantSigner>>,
     /// HMAC verifier for assignment tokens on PutPath. When Some, a
     /// PutPath without a valid `x-rio-assignment-token` metadata
