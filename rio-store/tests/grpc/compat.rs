@@ -398,6 +398,81 @@ async fn reconciler_failure_keeps_path_pending_and_loop_alive() -> TestResult {
     Ok(())
 }
 
+// r[verify store.compat.reconcile]
+/// The tick (the loop body the periodic wrapper sleeps between):
+/// a batch of permanently-failing rows ends the tick after ONE pass —
+/// no progress means back to the interval sleep, never an immediate
+/// re-list — and the failed rows are stamped so a newer healthy path
+/// arriving later is served first on the next tick instead of being
+/// starved behind them.
+#[tokio::test]
+async fn reconciler_tick_idles_on_failures_without_starving_new_paths() -> TestResult {
+    use rio_store::compat::{CompatWriter, reconciler};
+    use rio_store::test_helpers::StoreSeed;
+
+    let (mut s, backend) = StoreSession::new_chunked().await?;
+    let shutdown = rio_common::signal::Token::new();
+
+    // Two permanently-failing pending paths (chunks never written).
+    let broken_a = format!("/nix/store/{}-tick-broken-a", "j".repeat(32));
+    let broken_b = format!("/nix/store/{}-tick-broken-b", "k".repeat(32));
+    for p in [&broken_a, &broken_b] {
+        StoreSeed::raw_path(p)
+            .with_chunk_manifest(&[([0xCD; 32], 32)])
+            .with_nar_size(32)
+            .seed(&s.db.pool)
+            .await;
+    }
+
+    let cache = Arc::new(rio_store::cas::ChunkCache::new(
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>
+    ));
+    let writer = CompatWriter::new(
+        s.db.pool.clone(),
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>,
+        rio_store::config::CompatCompression::Zstd,
+    );
+
+    // Tick 1: everything fails → exactly one pass over the batch, then
+    // the tick returns (the periodic wrapper would now sleep). If the
+    // no-progress guard were missing this would loop forever and the
+    // test would hang.
+    let tick = reconciler::run_tick(&s.db.pool, &cache, &writer, &shutdown).await;
+    assert_eq!(tick.published, 0);
+    assert_eq!(
+        tick.failed, 2,
+        "one attempt per failing row, not a hot loop"
+    );
+    // Rotation stamp recorded for both failures.
+    let stamped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE compat_attempted_at IS NOT NULL")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(stamped, 2, "failed rows must be stamped for rotation");
+
+    // A newer healthy pending path arrives after the failures.
+    let healthy = format!("/nix/store/{}-tick-healthy", "l".repeat(32));
+    let (nar, _) = make_nar(b"new path behind a failing prefix");
+    let info = make_path_info(&healthy, &nar, Sha256::digest(&nar).into());
+    assert!(put_path(&mut s.client, info, nar).await?);
+
+    // Tick 2: the healthy path sorts ahead of the previously-failed
+    // rows (NULLS FIRST) and is published — no starvation.
+    let tick = reconciler::run_tick(&s.db.pool, &cache, &writer, &shutdown).await;
+    assert_eq!(
+        tick.published, 1,
+        "newer pending path must not be starved by older failing rows"
+    );
+    let recorded: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT compat_file_hash FROM narinfo WHERE store_path = $1")
+            .bind(&healthy)
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert!(recorded.is_some(), "healthy path published on tick 2");
+
+    Ok(())
+}
+
 // r[verify store.compat.narinfo-on-put]
 /// PutPathBatch: every committed output gets its own compat pair, and
 /// the published narinfo carries the batch-resolved signature.

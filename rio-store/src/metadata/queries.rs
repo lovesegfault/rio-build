@@ -719,10 +719,18 @@ pub(crate) async fn set_compat_file_hash(
 }
 
 /// Compat-reconciler work queue: committed paths whose compat object
-/// pair has not been published (`compat_file_hash IS NULL`), oldest
-/// first. Bounded by `limit` so one batch is a bounded amount of
-/// reassembly work; the partial index `narinfo_compat_pending_idx`
-/// (M_066) makes the empty-backlog steady state an index-only no-op.
+/// pair has not been published (`compat_file_hash IS NULL`). Bounded
+/// by `limit` so one batch is a bounded amount of reassembly work; the
+/// partial index `narinfo_compat_pending_idx` (M_066) makes the
+/// empty-backlog steady state an index-only no-op.
+///
+/// Ordering is the starvation guard: never-attempted paths
+/// (`compat_attempted_at IS NULL`) come first, then
+/// least-recently-attempted, then oldest registration. A failed
+/// backfill stamps `compat_attempted_at` ([`bump_compat_attempt`]), so
+/// permanently-failing rows rotate behind every newer pending path
+/// instead of pinning the front of the queue — the compat analogue of
+/// [`bump_nar_index_retry`]'s rotation for the NAR-index queue.
 ///
 /// Only `'complete'` manifests qualify — placeholders are still being
 /// uploaded (the inline writer or a later reconciler pass picks them
@@ -732,13 +740,26 @@ pub(crate) async fn list_compat_pending(pool: &PgPool, limit: i64) -> Result<Vec
         "SELECT n.store_path FROM narinfo n \
          INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
          WHERE n.compat_file_hash IS NULL AND m.status = 'complete' \
-         ORDER BY n.registration_time ASC \
+         ORDER BY n.compat_attempted_at ASC NULLS FIRST, n.registration_time ASC \
          LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Record a failed compat backfill attempt: stamp
+/// `narinfo.compat_attempted_at = now()` so [`list_compat_pending`]'s
+/// ordering rotates the row behind never-attempted and
+/// less-recently-failed paths. Success needs no stamp — the row leaves
+/// the queue via `compat_file_hash`.
+pub(crate) async fn bump_compat_attempt(pool: &PgPool, store_path: &str) -> Result<()> {
+    sqlx::query("UPDATE narinfo SET compat_attempted_at = now() WHERE store_path = $1")
+        .bind(store_path)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Size of the compat-reconciler backlog (committed paths with

@@ -1130,6 +1130,27 @@ pub const M_065: () = ();
 /// build cost 062's indexes already accepted at migration time.
 pub const M_066: () = ();
 
+/// 067 — `narinfo.compat_attempted_at`: failure rotation for the
+/// compat reconciler queue.
+///
+/// The reconciler lists pending rows (`compat_file_hash IS NULL`)
+/// ordered `compat_attempted_at ASC NULLS FIRST, registration_time
+/// ASC` and stamps the column on every failed backfill attempt.
+/// Never-attempted paths therefore always sort ahead of
+/// previously-failed ones, so ≥64 permanently-failing old rows
+/// (missing chunks, unreachable compat bucket) cannot starve newer
+/// pending paths, and a failing row is retried at most once per pass
+/// instead of hot-looping. Same rotate-to-the-back idea as
+/// `bump_nar_index_retry` uses `manifests.updated_at` for the
+/// NAR-index queue; a dedicated column because `registration_time` is
+/// client-visible metadata and `manifests.updated_at` already carries
+/// the indexer-queue and stale-upload-reclaim semantics.
+///
+/// Nullable, no index: the M_066 partial index already narrows scans
+/// to pending rows, and ordering within that set is a sort over
+/// pending rows only.
+pub const M_067: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

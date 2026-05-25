@@ -6,18 +6,24 @@
 //! uploads), upstream substitution, paths ingested while compat was
 //! OFF, and inline writes that failed or crashed mid-way — leaves
 //! `narinfo.compat_file_hash IS NULL`. This loop drains that set:
-//! list a bounded batch (oldest first), reassemble each NAR from the
-//! chunk store (the same per-chunk-verified reassembly GetPath and the
-//! NAR indexer use), publish the pair through the same
-//! [`CompatWriter`], and let `write()` record `compat_file_hash`.
+//! list a bounded batch (never-attempted paths first, then
+//! least-recently-failed), reassemble each NAR from the chunk store
+//! (the same per-chunk-verified reassembly GetPath and the NAR indexer
+//! use), publish the pair through the same [`CompatWriter`], and let
+//! `write()` record `compat_file_hash`.
 //!
-//! Best-effort by construction: a per-path failure is logged and
-//! counted, the path stays pending (NULL), and the loop moves on — it
-//! never crashes the process and never blocks an upload. Multiple
-//! replicas may run the loop concurrently; a double-publish is
-//! idempotent (same content, same keys) and the column update is
-//! last-writer-wins on an identical value, so no leader gate is
-//! needed — duplicate work during a backlog drain is the only cost.
+//! Best-effort by construction: a per-path failure is logged, counted,
+//! and stamped onto `narinfo.compat_attempted_at` (which rotates the
+//! row behind newer pending paths — see
+//! [`metadata::bump_compat_attempt`]); the path stays pending (NULL)
+//! and the loop moves on — it never crashes the process and never
+//! blocks an upload. A tick keeps draining only while batches make
+//! progress, so a backlog of permanently-failing rows degrades to one
+//! attempt per row per tick instead of a hot loop. Multiple replicas
+//! may run the loop concurrently; a double-publish is idempotent (same
+//! content, same keys) and the column update is last-writer-wins on an
+//! identical value, so no leader gate is needed — duplicate work
+//! during a backlog drain is the only cost.
 //!
 //! Memory bound: one NAR at a time per replica (the batch is processed
 //! serially), so peak extra RSS is one decompressed NAR plus its
@@ -37,8 +43,8 @@ use crate::nar_index;
 use super::writer::CompatWriter;
 
 /// Paths fetched per batch. Bounds one batch's PG round-trip and the
-/// granularity at which the shutdown signal is honored; the loop keeps
-/// pulling batches within a tick until the backlog is empty.
+/// granularity at which the shutdown signal is honored; a tick keeps
+/// pulling batches while they make progress (see [`run_tick`]).
 const RECONCILE_BATCH: i64 = 64;
 
 /// Outcome of one [`run_once`] batch.
@@ -58,6 +64,17 @@ impl ReconcileStats {
     /// the configured interval instead of immediately re-polling.
     pub fn idle(&self) -> bool {
         self.published == 0 && self.failed == 0
+    }
+
+    /// Fold another batch's outcome into a per-tick aggregate.
+    /// `backlog` keeps the FIRST batch's value (the size of the queue
+    /// when the tick started — what the gauge already reported).
+    fn absorb(&mut self, other: &ReconcileStats) {
+        self.published += other.published;
+        self.failed += other.failed;
+        if self.backlog == 0 {
+            self.backlog = other.backlog;
+        }
     }
 }
 
@@ -98,11 +115,61 @@ pub async fn run_once(
                 stats.failed += 1;
                 metrics::counter!("rio_store_compat_reconcile_total", "result" => "error")
                     .increment(1);
+                // Rotate the failed row behind never-attempted and
+                // less-recently-failed paths so a permanently-failing
+                // prefix can't starve the rest of the queue. Best
+                // effort: if even the stamp fails (PG hiccup), the row
+                // simply keeps its old position.
+                if let Err(bump_err) = metadata::bump_compat_attempt(pool, &store_path).await {
+                    warn!(%store_path, error = %bump_err, "compat retry-rotation stamp failed");
+                }
                 warn!(%store_path, error = %e, "compat backfill failed; path stays pending");
             }
         }
     }
     Ok(stats)
+}
+
+/// One reconciler *tick*: drain batches back-to-back while they make
+/// progress, then return so the periodic wrapper sleeps for the
+/// configured interval.
+///
+/// The continuation condition is **progress-based** (`published > 0`),
+/// not "queue non-empty": a batch that publishes nothing — every row
+/// permanently failing (missing chunks, unreachable compat bucket) —
+/// ends the tick instead of immediately re-listing the same rows
+/// forever. Failed rows are stamped via
+/// [`metadata::bump_compat_attempt`], so on the next tick (and on the
+/// next batch within this tick) never-attempted paths sort ahead of
+/// them; the combination bounds re-attempts of a permanently-failing
+/// row to roughly once per tick while newer pending paths are never
+/// starved behind it.
+pub async fn run_tick(
+    pool: &PgPool,
+    cache: &Arc<ChunkCache>,
+    writer: &CompatWriter,
+    shutdown: &rio_common::signal::Token,
+) -> ReconcileStats {
+    let mut tick = ReconcileStats::default();
+    loop {
+        if shutdown.is_cancelled() {
+            return tick;
+        }
+        match run_once(pool, cache, writer).await {
+            Ok(stats) => {
+                tick.absorb(&stats);
+                if stats.published == 0 {
+                    // No progress (idle queue OR an all-failures batch)
+                    // → back to the interval sleep.
+                    return tick;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "compat reconciler batch listing failed; retrying next tick");
+                return tick;
+            }
+        }
+    }
 }
 
 /// Publish the compat pair for one pending path: read its committed
@@ -169,23 +236,12 @@ pub fn spawn_reconciler_loop(
         let writer = Arc::clone(&writer);
         let shutdown = shutdown.clone();
         async move {
-            // Drain continuously within one tick: a fresh-enabled
-            // deployment may have the entire store as backlog, and one
-            // batch per 30 s would never catch up. The shutdown check
+            // Drain continuously within one tick (a fresh-enabled
+            // deployment may have the entire store as backlog; one
+            // batch per 30 s would never catch up) — but only while
+            // batches make progress; see run_tick. The shutdown check
             // between batches keeps SIGTERM responsive mid-drain.
-            loop {
-                if shutdown.is_cancelled() {
-                    return;
-                }
-                match run_once(&pool, &cache, &writer).await {
-                    Ok(stats) if stats.idle() => return,
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(error = %e, "compat reconciler batch listing failed; retrying next tick");
-                        return;
-                    }
-                }
-            }
+            run_tick(&pool, &cache, &writer, &shutdown).await;
         }
     })
 }

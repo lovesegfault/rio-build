@@ -982,17 +982,22 @@ the compat layer.
 #r("store.compat.reconcile")[
   When the compat layer is enabled, the store MUST run a background
   reconciler that repeatedly selects committed paths whose
-  `narinfo.compat_file_hash` is NULL (bounded batches, oldest first by
-  registration time), reassembles each path's NAR from the chunk store with
-  the same per-chunk verification the read path uses, re-verifies the
-  whole-NAR SHA-256 against the narinfo row, publishes the compat object
-  pair through the same writer as the inline path, and records
-  `compat_file_hash`. Per-path failures MUST be logged and counted
-  (#(refs.metric)("rio_store_compat_reconcile_total")`{result="error"}`) and
-  MUST NOT stop the loop or affect any RPC; the backlog MUST be observable
-  via #(refs.metric)("rio_store_compat_backlog"). The reconciler's poll
-  cadence is `binary_cache_compat.reconcile_interval_secs` (`0` disables
-  it); within one tick it drains the backlog continuously rather than one
+  `narinfo.compat_file_hash` is NULL (bounded batches; never-attempted paths
+  before previously-failed ones, oldest first within each), reassembles each
+  path's NAR from the chunk store with the same per-chunk verification the
+  read path uses, re-verifies the whole-NAR SHA-256 against the narinfo row,
+  publishes the compat object pair through the same writer as the inline
+  path, and records `compat_file_hash`. Per-path failures MUST be logged,
+  counted
+  (#(refs.metric)("rio_store_compat_reconcile_total")`{result="error"}`),
+  and rotated behind newer pending paths (`narinfo.compat_attempted_at`),
+  and MUST NOT stop the loop or affect any RPC; a batch that publishes
+  nothing MUST end the tick (return to the interval sleep) so
+  permanently-failing rows are bounded to roughly one attempt per tick and
+  can never starve newer pending paths. The backlog MUST be observable via
+  #(refs.metric)("rio_store_compat_backlog"). The reconciler's poll cadence
+  is `binary_cache_compat.reconcile_interval_secs` (`0` disables it); within
+  one tick it keeps draining while batches make progress rather than one
   batch per interval.
 ]
 
