@@ -109,6 +109,9 @@ nix = { version = "0.31", features = [
   "process",
   "signal",
   "socket",
+  # getrlimit/setrlimit: the castore-FUSE raises RLIMIT_NOFILE at init
+  # (one fd per concurrently-open passthrough file).
+  "resource",
 ] }
 # raw_os_error()/raise()/errno constants where the `nix` crate is
 # overkill. Used as a normal dep in rio-gateway (EMFILE/ENFILE accept
@@ -444,6 +447,22 @@ clap-verbosity-flag = { version = "3", default-features = false, features = [
 ] }
 console = "0.16"
 filetime = "0.2"
+
+# fuser pinned to upstream master for PR #660's raw BackingId
+# marshalling (`ReplyOpen::wrap_backing` / `BackingId::{create_raw,
+# into_raw}`), merged after the 0.17.0 release. The castore-FUSE
+# (ADR-022 §2.5/§2.6) splits passthrough across a privilege boundary:
+# rio-mountd (CAP_SYS_ADMIN) issues FUSE_DEV_IOC_BACKING_OPEN on its
+# kept dup of /dev/fuse and returns the raw backing_id over the UDS; the
+# unprivileged builder wraps that u32 into its FOPEN_PASSTHROUGH open
+# reply. Stock 0.17.0 only mints BackingId via an in-process ioctl
+# (EPERM without init-namespace CAP_SYS_ADMIN). The lovesegfault fork is
+# a mirror of the pinned rev (the pin survives upstream history
+# rewrites), not a patch carrier — the rev is byte-identical to
+# cberner/fuser master. Drop the git pin when a release containing #660
+# ships.
+[patch.crates-io]
+fuser = { git = "https://github.com/lovesegfault/fuser", rev = "2bdfbc53a116b9b4af5c91d20ab6a4f9b9004645" }
 
 [profile.release]
 incremental = false

@@ -86,7 +86,7 @@ pub struct NixStoreFs {
     /// Circuit breaker for the fetch path. Opens after `threshold`
     /// consecutive failures OR `wall_clock_trip` since last success.
     /// `Arc` so P0210's heartbeat can clone a handle before
-    /// `fuser::spawn_mount2` consumes `self` — same pattern as `cache`.
+    /// `fuser::spawn_mount` consumes `self` — same pattern as `cache`.
     /// Checked/recorded by every singleflight `Fetch` owner
     /// (`ensure_cached` AND `prefetch_path_blocking`): under singleflight,
     /// a prefetch-owned failure is NOT silent — a FUSE waiter parked in
@@ -137,7 +137,7 @@ impl NixStoreFs {
     }
 
     /// Clone a handle to the circuit breaker. P0210's heartbeat calls
-    /// this BEFORE `fuser::spawn_mount2` consumes the fs, then polls
+    /// this BEFORE `fuser::spawn_mount` consumes the fs, then polls
     /// `is_open()` from the heartbeat loop.
     pub fn circuit(&self) -> Arc<CircuitBreaker> {
         Arc::clone(&self.circuit)
@@ -298,7 +298,7 @@ pub struct FuseMount {
     session: Option<fuser::BackgroundSession>,
     /// fusectl `abort` control file for this connection, captured at
     /// mount time. `None` if `stat(mount_point)` failed (mount not yet
-    /// visible — shouldn't happen post-`spawn_mount2`) or fusectl isn't
+    /// visible — shouldn't happen post-`spawn_mount`) or fusectl isn't
     /// mounted; abort then degrades to the plain session-Drop path.
     abort_path: Option<PathBuf>,
 }
@@ -376,7 +376,7 @@ const FUSECTL_ROOT: &str = "/sys/fs/fuse/connections";
 /// dev box, or our heuristic raced) is fine; anything else is logged at
 /// warn and the abort path degrades exactly as pre-I-165b.
 ///
-/// Called AFTER `spawn_mount2` so the "is anything in the dir?"
+/// Called AFTER `spawn_mount` so the "is anything in the dir?"
 /// heuristic can use our own freshly-created connection as the witness
 /// — avoids a spurious mount attempt → EBUSY on hosts where fusectl is
 /// already mounted but no other FUSE connections exist yet.
@@ -392,7 +392,7 @@ const FUSECTL_ROOT: &str = "/sys/fs/fuse/connections";
 // r[impl builder.shutdown.fuse-abort]
 fn ensure_fusectl_mounted() {
     // fusectl is a virtual fs that enumerates live connections at
-    // readdir time. If our just-opened connection (spawn_mount2 ran
+    // readdir time. If our just-opened connection (spawn_mount ran
     // already) shows up, fusectl is mounted. If the dir is empty or
     // unreadable, it isn't — try to mount.
     let already = std::fs::read_dir(FUSECTL_ROOT)
@@ -483,7 +483,7 @@ fn fusectl_abort_path_at(mount_point: &Path, connections_root: &Path) -> Option<
 ///
 /// Returns the [`FuseMount`] handle (drop on shutdown — `Drop` writes
 /// the fusectl abort then unmounts) plus the circuit breaker handle
-/// (cloned out BEFORE `spawn_mount2` consumes the fs). The heartbeat
+/// (cloned out BEFORE `spawn_mount` consumes the fs). The heartbeat
 /// loop polls `is_open()` on the
 /// returned handle; the fuser thread pool writes to the same breaker
 /// via `ensure_cached`.
@@ -504,16 +504,16 @@ pub fn mount_fuse_background(
         n_threads,
         fetch_timeout,
     );
-    // Clone the Arc out before spawn_mount2 takes `fs` by value. The
+    // Clone the Arc out before spawn_mount takes `fs` by value. The
     // heartbeat loop is the only reader outside the FUSE thread pool.
     let circuit = fs.circuit();
 
     let config = make_fuse_config(n_threads);
-    let session = fuser::spawn_mount2(fs, mount_point, &config)?;
+    let session = fuser::spawn_mount(fs, mount_point, &config)?;
 
     // I-165b: containers without systemd don't have fusectl mounted;
     // mount it ourselves so the abort-path lookup below can succeed.
-    // After spawn_mount2 so our own connection serves as the "is it
+    // After spawn_mount so our own connection serves as the "is it
     // already mounted?" witness.
     ensure_fusectl_mounted();
 

@@ -6,7 +6,7 @@
 //!
 //! Modes:
 //!   spike_digest_fuse <mount> <counter-file> [<manifest>]
-//!     Self-mount via fuser::mount2 (privileged path).
+//!     Self-mount via fuser::mount (privileged path).
 //!   spike_digest_fuse --recv-fd <socket> <counter-file> [<manifest>]
 //!     Listen on <socket>, recv pre-opened /dev/fuse fd via SCM_RIGHTS, then
 //!     serve via Session::from_fd. The mount itself is done by a separate
@@ -353,6 +353,6 @@ fn main() -> anyhow::Result<()> {
     config.acl = SessionACL::All;
     config.n_threads = Some(2);
     eprintln!("spike_digest_fuse: mounting at {mount_point}");
-    fuser::mount2(fs, Path::new(mount_point), &config)?;
+    fuser::mount(fs, Path::new(mount_point), &config)?;
     Ok(())
 }

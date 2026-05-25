@@ -439,7 +439,7 @@ pub fn prefetch_path_blocking(
 /// cache.insert. Shared by ensure_cached and prefetch.
 ///
 /// Free fn (not a method on NixStoreFs) so prefetch can call it
-/// without a NixStoreFs (which is consumed by fuser::spawn_mount2).
+/// without a NixStoreFs (which is consumed by fuser::spawn_mount).
 /// Takes the three things it actually needs: cache, client, runtime.
 ///
 /// SYNC with internal block_on — caller is either a FUSE thread

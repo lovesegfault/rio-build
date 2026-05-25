@@ -300,6 +300,6 @@ fn main() -> anyhow::Result<()> {
     config.n_threads = Some(4);
 
     eprintln!("spike_stream_fuse: mounting at {mount_point}");
-    fuser::mount2(fs, Path::new(&mount_point), &config)?;
+    fuser::mount(fs, Path::new(&mount_point), &config)?;
     Ok(())
 }

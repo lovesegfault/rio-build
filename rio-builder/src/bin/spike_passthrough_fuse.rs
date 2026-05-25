@@ -455,7 +455,7 @@ fn main() -> anyhow::Result<()> {
     .with_context(|| format!("mount fuse at {mnt}"))?;
     eprintln!("spike_passthrough_fuse: mounted at {mnt}");
 
-    // mount_options/acl on Config only apply to the mount2() path; from_fd
+    // mount_options/acl on Config only apply to the mount() path; from_fd
     // takes acl positionally and never mounts.
     let mut config = Config::default();
     config.n_threads = Some(2);

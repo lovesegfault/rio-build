@@ -118,5 +118,5 @@ fn main() {
         MountOption::AutoUnmount,
     ];
     config.acl = SessionACL::All;
-    fuser::mount2(NegSpike { counts }, std::path::Path::new(&mount), &config).unwrap();
+    fuser::mount(NegSpike { counts }, std::path::Path::new(&mount), &config).unwrap();
 }

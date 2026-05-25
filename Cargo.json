@@ -7090,9 +7090,11 @@
       "crateName": "fuser",
       "version": "0.17.0",
       "edition": "2024",
-      "sha256": "1kwgd5mfmgqlf4jmi1gwxsgc6zsbjnbxfbz5x4wjw34hg2lfr9c0",
+      "sha256": "0pin1m7spim8c48wzckpwhsr1h95x7v04bf5m2ls47y7pm7qf548",
       "source": {
-        "type": "crates-io"
+        "type": "git",
+        "url": "https://github.com/lovesegfault/fuser",
+        "rev": "2bdfbc53a116b9b4af5c91d20ab6a4f9b9004645"
       },
       "dependencies": [
         {
@@ -15430,6 +15432,7 @@
         "mman",
         "mount",
         "process",
+        "resource",
         "sched",
         "signal",
         "socket",

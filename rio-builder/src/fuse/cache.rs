@@ -201,7 +201,7 @@ pub struct Cache {
     ///
     /// Lives on `Cache` (not `NixStoreFs`) for the same reason as
     /// `manifest_hints`: `NixStoreFs` is consumed by
-    /// `fuser::spawn_mount2`; the executor only holds `Arc<Cache>`.
+    /// `fuser::spawn_mount`; the executor only holds `Arc<Cache>`.
     /// Not thread-local: FUSE callbacks run on `fuser`'s own thread
     /// pool, not the executor's tokio worker.
     known_inputs: RwLock<Option<HashMap<String, u64 /* nar_size */>>>,
