@@ -6106,10 +6106,13 @@ name = "rio-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
+ "ed25519-dalek",
  "hex",
  "k8s-openapi",
  "kube",
+ "rand 0.10.1",
  "rio-auth",
  "rio-common",
  "rio-crds",
@@ -6118,6 +6121,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
  "uuid",

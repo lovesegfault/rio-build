@@ -245,6 +245,11 @@
       "doc": "`rio-cli gc` — trigger a store garbage-collection sweep."
     },
     {
+      "path": "keygen.rs",
+      "depth": 0,
+      "doc": "`rio-cli keygen` — generate an ed25519 narinfo signing keypair."
+    },
+    {
       "path": "logs.rs",
       "depth": 0,
       "doc": "`rio-cli logs` — stream build logs for a derivation."

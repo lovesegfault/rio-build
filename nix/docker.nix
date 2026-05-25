@@ -481,7 +481,9 @@ rec {
   # them back into k8s Secrets. Public signing key goes to rio/signing-
   # key-pub so operators can read it without touching the private half.
   #
-  # Needs nix-store (--generate-binary-cache-key), awscli2, openssl.
+  # Needs rio-cli (keygen), awscli2, openssl. No Nix closure: the
+  # signing keypair comes from `rio-cli keygen`, which emits the same
+  # name:base64 format `nix-store --generate-binary-cache-key` did.
   # IRSA via the rio-bootstrap ServiceAccount gives it
   # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
   #
@@ -500,7 +502,7 @@ rec {
         pkgs.awscli2
         pkgs.openssl
         pkgs.openssh
-        nixForBuilder
+        rio-crates.rio-cli
         pkgs.bash
         pkgs.coreutils
       ];
@@ -518,7 +520,7 @@ rec {
             pkgs.awscli2
             pkgs.openssl
             pkgs.openssh
-            nixForBuilder
+            rio-crates.rio-cli
             pkgs.coreutils
           ]
         }"

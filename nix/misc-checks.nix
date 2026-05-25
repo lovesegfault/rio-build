@@ -848,7 +848,7 @@ in
   # bootstrap-job.yaml documents the script as "Idempotent". The
   # signing-key block guarded ONE secret but created TWO; a Job retry
   # after dying between them (or a delete-private-only rotation) left
-  # a permanently mismatched/missing pub. Mock aws + nix-store +
+  # a permanently mismatched/missing pub. Mock aws + rio-cli +
   # openssl + ssh-keygen and assert convergence from partial state.
   bootstrap-idempotent =
     pkgs.runCommand "rio-bootstrap-idempotent"
@@ -883,9 +883,11 @@ in
           *) exit 0 ;;
         esac
         EOF
-        # Trivial mocks: nix-store writes deterministic content keyed
-        # by a counter so scenario C can detect regeneration.
-        cat > bin/nix-store <<EOF
+        # Trivial mocks: rio-cli (keygen NAME SEC PUB — same last-two-
+        # args-are-output-paths shape nix-store had) writes
+        # deterministic content keyed by a counter so scenario C can
+        # detect regeneration.
+        cat > bin/rio-cli <<EOF
         #!$sh
         n=\$(cat $TMPDIR/gen-count 2>/dev/null || echo 0)
         n=\$((n+1)); echo \$n > $TMPDIR/gen-count

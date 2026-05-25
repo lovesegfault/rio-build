@@ -93,8 +93,8 @@ externalSecrets:
   auroraEndpoint: ""
 
 # Helm pre-install/pre-upgrade hook Job. Idempotent — describe-secret guards.
-# Generates rio/hmac (openssl rand 32) and rio/signing-key (nix-store
-# --generate-binary-cache-key) in Secrets Manager IF THEY DON'T EXIST.
+# Generates rio/hmac (openssl rand 32) and rio/signing-key (rio-cli
+# keygen) in Secrets Manager IF THEY DON'T EXIST.
 # Regenerating would invalidate in-flight assignment tokens / all narinfo
 # signatures. The public signing key goes to rio/signing-key-pub so operators
 # can read it without touching the private half.

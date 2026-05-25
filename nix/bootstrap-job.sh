@@ -37,13 +37,12 @@ else
   echo "[bootstrap] generating rio/signing-key"
   tmp=$(mktemp -d)
   # Key name includes the bucket so narinfo `Sig:` lines identify
-  # which cluster signed them. Format: name:base64-seed.
-  # --store dummy://: nix-store opens LocalStore on startup
-  # (mkdir /nix/store/.links) → EROFS under readOnlyRootFilesystem.
-  # The dummy backend skips all filesystem store init.
-  nix-store --store dummy:// \
-    --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
-    "$tmp/key.sec" "$tmp/key.pub"
+  # which cluster signed them. rio-cli keygen emits the same
+  # name:base64(seed++pubkey) / name:base64(pubkey) pair that
+  # `nix-store --generate-binary-cache-key` did, without needing the
+  # Nix closure (or its LocalStore-init-under-readOnlyRootFilesystem
+  # workaround) in the bootstrap image.
+  rio-cli keygen "rio-$CHUNK_BUCKET" "$tmp/key.sec" "$tmp/key.pub"
   # Pub FIRST, create||put: a half-done prior run or a delete-
   # private-only rotation converges instead of leaving a stale
   # pub. If we die after pub-create, retry's guard fails (private

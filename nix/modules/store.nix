@@ -31,7 +31,8 @@ in
       description = ''
         Path to the ed25519 narinfo signing key (Nix secret-key format:
         `name:base64-seed`). Null = signing disabled. Generate with
-        `nix-store --generate-binary-cache-key`. File should be mode
+        `rio-cli keygen` (or the format-identical
+        `nix-store --generate-binary-cache-key`). File should be mode
         0600. This is a PATH (read at runtime), not inlined content —
         keeps the secret out of the Nix store.
       '';

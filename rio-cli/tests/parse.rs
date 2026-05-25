@@ -76,6 +76,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "sla",
     "verify-chunks",
     "upstream",
+    "keygen",
 ];
 
 #[test]
@@ -217,6 +218,14 @@ fn per_subcommand_help_renders() {
 )]
 #[case::upstream_remove_no_url(&["upstream", "remove", "--tenant", "t1"], false)]
 #[case::upstream_bare(&["upstream"], false)]
+// keygen: three required positionals (name, secret path, public path).
+// The "parses" case points at a nonexistent directory so execution
+// fails with ENOENT (exit 1) instead of writing key files from a
+// parse test — same fail-after-clap pattern as the connect-refused
+// subcommands above.
+#[case::keygen_ok(&["keygen", "k", "/nonexistent-rio-cli-test/k.sec", "/nonexistent-rio-cli-test/k.pub"], true)]
+#[case::keygen_missing_pub(&["keygen", "k", "/tmp/k.sec"], false)]
+#[case::keygen_bare(&["keygen"], false)]
 // --json is #[arg(global = true)] — accepted before OR after the subcommand.
 #[case::json_before(&["--json", "status"], true)]
 #[case::json_after(&["status", "--json"], true)]
