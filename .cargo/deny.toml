@@ -118,3 +118,13 @@ allow-wildcard-paths = true
 # must be explicitly blessed here.
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+  # fuser pinned to a post-0.17.0 master rev for PR #660's raw
+  # BackingId marshalling (the unprivileged castore-FUSE builder must
+  # wrap a rio-mountd-brokered backing id into its FOPEN_PASSTHROUGH
+  # reply). Mirror of cberner/fuser master — see the [patch.crates-io]
+  # comment in the workspace Cargo.toml for the rationale and the drop
+  # condition. Remove this entry together with the patch when a fuser
+  # release containing the constructor ships.
+  "https://github.com/lovesegfault/fuser",
+]

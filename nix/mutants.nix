@@ -87,9 +87,9 @@ let
           ];
         };
 
-        cargoDeps = rustPlatformStable.importCargoLock {
-          lockFile = ../Cargo.lock;
-        };
+        # Shared lockfile + git-dependency outputHashes — see
+        # nix/lib/cargo-lock.nix for the two-hash-registries gotcha.
+        cargoDeps = rustPlatformStable.importCargoLock (import ./lib/cargo-lock.nix);
 
         nativeBuildInputs =
           with pkgs;
