@@ -116,7 +116,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_gateway_dagsync_bytes_saved_total",
-        "Delta-sync file-content bytes sourced from the local store instead of the remote peer"
+        "Delta-sync file-content bytes served from the local store instead of the remote peer"
     );
     describe_counter!(
         "rio_gateway_dagsync_bytes_fetched_total",

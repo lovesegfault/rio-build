@@ -633,7 +633,7 @@
       {
         "name": "rio_gateway_dagsync_bytes_saved_total",
         "kind": "counter",
-        "help": "Delta-sync file-content bytes sourced from the local store instead of the remote peer"
+        "help": "Delta-sync file-content bytes served from the local store instead of the remote peer"
       },
       {
         "name": "rio_gateway_dagsync_dirs_fetched_total",
