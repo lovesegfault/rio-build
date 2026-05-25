@@ -211,13 +211,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_substitute_demotions_total",
-        "Non-forgivable path failures in the detached substitute walk, labeled by reason: \
-         not_found (every upstream definitively missed on every retry), not_found_infra \
-         (the NotFound never reached an upstream — no tenant context / substituter not \
-         configured / substitution disabled; fix the auth chain or config), error \
-         (non-transient gRPC error), exhausted (transient errors on every retry). Any \
-         increment demotes the derivation — and therefore its whole build-time closure — \
-         to a from-source build over a failed download; page on any sustained rate."
+        "Non-forgivable path failures in the detached substitute walk, labeled by a reason \
+         derived from the final error of the path's retry ladder: not_found (a definitive \
+         all-upstreams miss), not_found_infra (a NotFound that never reached an upstream — \
+         no tenant context / substituter not configured; fix the auth chain or config), \
+         error (non-transient gRPC error, no retry), exhausted (the retry budget ran out \
+         on a transient error). Any increment demotes the derivation — and therefore its \
+         whole build-time closure — to a from-source build over a failed download; page on \
+         any sustained rate."
     );
     describe_counter!(
         "rio_scheduler_substitute_fetch_failures_total",
