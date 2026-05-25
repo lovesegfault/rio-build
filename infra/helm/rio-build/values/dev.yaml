@@ -28,6 +28,10 @@ scheduler:
 
 gateway:
   replicas: 1
+  # EKS-only (the ScaledObject CR needs the KEDA operator). Local k3s
+  # falls back to the static `replicas` above.
+  autoscaling:
+    enabled: false
   service:
     # LoadBalancer needs metallb or cloud LB controller. ClusterIP +
     # port-forward is simpler.

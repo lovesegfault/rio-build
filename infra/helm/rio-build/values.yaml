@@ -806,21 +806,30 @@ scheduler:
 gateway:
   enabled: true
   image: rio-gateway
+  # Static replica count — only consulted where autoscaling is disabled
+  # (environments without the KEDA operator: the k3s VM tests and local
+  # dev). Everywhere else the replica count is owned by the
+  # ScaledObject below and this field is not rendered.
   replicas: 2
-  # KEDA-driven horizontal autoscaling on active session count.
-  # Disabled by default: existing static-replica deployments unchanged.
-  # Requires the KEDA operator (infra/eks/keda.tf) AND a reachable
-  # prometheus scraping rio_gateway_channels_active (monitoring.enabled
-  # + kube-prometheus-stack on the reference deploy). With enabled=true,
-  # gateway.replicas (above) is IGNORED — gateway.yaml omits
-  # .spec.replicas so helm upgrade doesn't fight the autoscaler.
+  # Horizontal autoscaling on active session count. This is how the
+  # gateway scales, not an optional feature: the per-pod session cap
+  # (gateway max_sessions, the OOM backstop) is a safety limit, not a
+  # capacity plan — the thing that turns demand into capacity is KEDA
+  # adding replicas at 25% of that cap. Enabled by default. The flag
+  # exists only because the ScaledObject CR requires the KEDA operator
+  # (infra/eks/keda.tf) and a prometheus scraping
+  # rio_gateway_channels_active — the k3s VM-test and local-dev
+  # profiles run neither, set enabled=false, and fall back to the
+  # static `replicas` above. With autoscaling enabled, gateway.yaml
+  # omits .spec.replicas so helm upgrade doesn't fight the autoscaler.
   #
   # Sizing rationale + the ControlMaster single-connection caveat live
   # in templates/gateway-scaledobject.yaml.
   autoscaling:
-    enabled: false
-    # Floor matches the static `replicas: 2` above so flipping
-    # autoscaling on never scales BELOW today's topology.
+    enabled: true
+    # Production floor — the pre-autoscaling static topology was 2
+    # replicas behind the NLB, and the PDB (minAvailable: 1) needs ≥2
+    # for any voluntary disruption to be allowed.
     minReplicas: 2
     maxReplicas: 8
     # Desired replicas = ceil(sum(rio_gateway_channels_active) / this).

@@ -21,13 +21,19 @@ helm template rio . --set global.image.tag=test \
   --set componentScaler.store.enabled=true >"$out"
 
 # Multi-replica Deployments: static `replicas: N` ∪ ComponentScaler-
-# targeted with `replicas.min > 1`. r38 (AMEND of r37 verifier-note):
-# rio-store is multi-replica when ComponentScaler manages it but has
-# no static `replicas:` field — the original filter never saw it.
+# targeted with `replicas.min > 1` ∪ KEDA-ScaledObject-targeted with
+# `minReplicaCount > 1`. r38 (AMEND of r37 verifier-note): rio-store is
+# multi-replica when ComponentScaler manages it but has no static
+# `replicas:` field — the original filter never saw it. Same amendment
+# for rio-gateway once autoscaling became the default: the Deployment
+# omits `.spec.replicas` so helm upgrade doesn't fight the autoscaler,
+# but KEDA holds it at minReplicaCount — it is still a multi-replica
+# control-plane Deployment and still needs podAntiAffinity + a PDB.
 multi_replica=$(
   {
     yq -N 'select(.kind=="Deployment" and (.spec.replicas // 1) > 1) | .metadata.name' "$out"
     yq -N 'select(.kind=="ComponentScaler" and (.spec.replicas.min // 1) > 1) | .spec.targetRef.name' "$out"
+    yq -N 'select(.kind=="ScaledObject" and (.spec.minReplicaCount // 1) > 1) | .spec.scaleTargetRef.name' "$out"
   } | sort -u
 )
 n=$(echo "$multi_replica" | grep -c . || true)

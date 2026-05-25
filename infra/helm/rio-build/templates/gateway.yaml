@@ -58,7 +58,12 @@ spec:
       # so SIGKILL is a backstop for a hung process.
       terminationGracePeriodSeconds: {{ add $g.nlbDeregisterSecs $g.drainGraceSecs $g.sessionDrainSecs 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
-      {{- if gt (int $g.replicas) 1 }}
+      {{- /* The effective floor is minReplicas under autoscaling and the
+             static replicas otherwise — anti-affinity must key on
+             whichever one actually governs the pod count, or a profile
+             with replicas:1 + autoscaling on would silently co-locate
+             both KEDA-managed pods. */}}
+      {{- if gt (int (ternary $g.autoscaling.minReplicas $g.replicas $g.autoscaling.enabled)) 1 }}
       # r37 bug_020 (sweep): rio-gateway is the only build-submission
       # path (SSH ingress). Both replicas on one node → drain stalls
       # behind the PDB but every NLB target is gone for the eviction

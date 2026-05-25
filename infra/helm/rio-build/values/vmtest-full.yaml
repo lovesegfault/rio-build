@@ -118,6 +118,11 @@ gateway:
   image: rio-gateway
   # 1 replica: no LB in VM. podAntiAffinity renders only at replicas>1.
   replicas: 1
+  # EKS-only (the ScaledObject CR needs the KEDA operator, which the
+  # airgapped k3s image set doesn't carry). Falls back to the static
+  # `replicas` above. Same shape as `karpenter.enabled: false`.
+  autoscaling:
+    enabled: false
   schedulerAddr: rio-scheduler.rio-system:9001
   storeAddr: rio-store.rio-store:9002
   schedulerBalanceHost: rio-scheduler-headless.rio-system
