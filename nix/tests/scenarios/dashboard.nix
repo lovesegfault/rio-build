@@ -63,6 +63,30 @@
           "| grep -qF 'id=\"app\"'"
       )
 
+  # ── Pin the scheduler to a single replica ─────────────────────────
+  # Both replicas are Ready (readiness is tcpSocket, not leadership);
+  # the standby answers every actor-gated RPC with a Trailers-Only
+  # Unavailable (HTTP 200, empty body), and nginx's ClusterIP upstream
+  # neither targets the leader nor re-rolls the backend on retry (see
+  # ci-failure-patterns.md "nginx LB to standby replica"). Scale to 1
+  # so the only endpoint IS the leader; nothing after this fragment
+  # needs two replicas.
+  with subtest("pin scheduler to one replica for the nginx proxy path"):
+      k3s_server.succeed(
+          "k3s kubectl -n ${ns} scale deploy/rio-scheduler --replicas=1"
+      )
+      # The ReplicaSet controller may pick the leader as the scale-down
+      # victim; the survivor then acquires the lease within LEASE_TTL
+      # (15s). Budget: termination grace + TTL + acquire retry + slack.
+      k3s_server.wait_until_succeeds(
+          "pods=$(k3s kubectl -n ${ns} get pods -l app.kubernetes.io/name=rio-scheduler "
+          "-o jsonpath='{.items[*].metadata.name}'); "
+          "holder=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+          "-o jsonpath='{.spec.holderIdentity}'); "
+          "test -n \"$holder\" && test \"$pods\" = \"$holder\"",
+          timeout=90,
+      )
+
   # ── (3) gRPC-Web unary THROUGH nginx ─────────────────────────────
   # curl → nginx:8080 → /rio.admin.AdminService/ClusterStatus matches
   # the `location ~ ^/rio\.(admin|scheduler)\./` block → proxy_pass
@@ -74,18 +98,8 @@
   # won't be 0x00.
   #
   # Empty proto body = 5-byte header (1 byte flag + 4 bytes len=0).
-  # wait_until_succeeds: nginx proxies to the rio-scheduler Service and
-  # both replicas are Ready (readiness is tcpSocket, not leadership), so
-  # a request that lands on the standby gets a Trailers-Only Unavailable
-  # (HTTP 200, empty body) and the grep fails. Retries normally
-  # re-balance per connection (observed: a geometric ~50%-per-attempt
-  # distribution across runs), but two failure modes can defeat the
-  # retry budget entirely: a hung upstream connection (nginx
-  # proxy_connect_timeout is 60s — one hang eats the whole budget
-  # without --max-time) and connection-level pinning to the standby.
-  # --max-time 5 caps each attempt so the budget always buys >=10
-  # independent tries; the except block captures the evidence needed to
-  # tell those modes apart if it still fails.
+  # --max-time 5: nginx's proxy_connect_timeout is 60s, so one hung
+  # upstream connection would otherwise eat the whole retry budget.
   try:
       with subtest("gRPC-Web unary via nginx: ClusterStatus 0x00 prefix"):
           k3s_server.wait_until_succeeds(
@@ -153,8 +167,9 @@
               timeout=60,
           )
   except Exception:
-      # Discriminate "every attempt hit the standby" (access log full of
-      # 200s with ~0 body bytes) from "connections to the leader hang"
+      # Discriminate "the lone replica still answers Trailers-Only"
+      # (access log full of 200s with 0 body bytes — the replica lost
+      # the lease or never finished recovery) from "connections hang"
       # (504s / connect timeouts) from "leader not in the endpoint set".
       print("== DIAGNOSTIC: nginx -> scheduler gRPC-Web proxy path ==")
       print(k3s_server.execute(
