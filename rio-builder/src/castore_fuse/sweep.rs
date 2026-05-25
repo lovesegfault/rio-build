@@ -180,9 +180,18 @@ pub(crate) fn sweep_pass_with(
     let mut orphans = staging_candidates(&dirs.staging, live_build_ids);
     orphans.sort_by_key(|(_, mtime)| *mtime);
     for (name, _) in orphans {
-        if free().is_some_and(|pct| pct > high_pct) {
-            stats.reached_high_water = true;
-            break;
+        match free() {
+            Some(pct) if pct > high_pct => {
+                stats.reached_high_water = true;
+                break;
+            }
+            Some(_) => {}
+            // Deleting blindly when we can no longer measure free space
+            // is the one wrong answer — stop the pass.
+            None => {
+                warn!("sweep: free-space probe failed mid-pass; stopping");
+                break;
+            }
         }
         if let Some(bytes) = remove_staging_orphan(&dirs.staging, live_build_ids, &name) {
             stats.removed += 1;
@@ -233,8 +242,14 @@ fn evict_cache_tier(
     let mut entries = cache_candidates(root);
     entries.sort_by_key(|e| e.mtime);
     for entry in entries {
-        if free().is_some_and(|pct| pct > high_pct) {
-            return true;
+        match free() {
+            Some(pct) if pct > high_pct => return true,
+            Some(_) => {}
+            // Probe failure mid-pass: stop rather than evict blindly.
+            None => {
+                warn!("sweep: free-space probe failed mid-pass; stopping");
+                return false;
+            }
         }
         match std::fs::remove_file(&entry.path) {
             Ok(()) => {
@@ -610,6 +625,36 @@ mod tests {
         let removed = remove_staging_orphan(&fx.dirs.staging, &fx.live, "reused-id");
         assert_eq!(removed, None);
         assert!(dir.exists());
+    }
+
+    /// A probe that dies mid-pass stops the sweep instead of letting it
+    /// evict blindly with no stop condition.
+    #[test]
+    fn probe_failure_mid_pass_stops_eviction() {
+        let fx = Fx::new();
+        let kept_a = fx.put(&fx.dirs.chunks, "chunk", 1024, 1_000);
+        let kept_b = fx.put(&fx.dirs.cache, "entry", 1024, 2_000);
+
+        // First call (the trigger check) reports pressure; every later
+        // call fails.
+        let mut calls = 0u32;
+        let mut probe = || {
+            calls += 1;
+            (calls == 1).then_some(5.0)
+        };
+        let stats = sweep_pass_with(
+            &fx.dirs,
+            &fx.live,
+            LOW_WATER_PCT,
+            HIGH_WATER_PCT,
+            &mut probe,
+        );
+
+        assert!(stats.triggered);
+        assert!(!stats.reached_high_water);
+        assert_eq!(stats.removed, 0, "nothing may be evicted blind");
+        assert!(kept_a.exists());
+        assert!(kept_b.exists());
     }
 
     /// Missing trees (fresh node, dirs not created yet) are handled
