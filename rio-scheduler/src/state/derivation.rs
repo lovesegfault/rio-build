@@ -11,7 +11,7 @@
 //! `DependencyFailed` (upstream failed). A derivation observed in
 //! `Failed` is mid-retry, not stuck.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -832,6 +832,25 @@ pub struct DerivationState {
     /// keeps using expected_output_paths. Grows monotonically via
     /// union_wanted() — never shrink while any interested build is live.
     pub wanted_output_names: Vec<String>,
+    /// Per-build wanted-output contributions: for each interested build,
+    /// the `wanted_output_names` of THAT build's submission for this
+    /// node (the per-submission sets that [`Self::wanted_output_names`]
+    /// unions together). An entry whose value is the EMPTY Vec means
+    /// that build wants ALL declared outputs (same sentinel as the
+    /// union). A MISSING entry for an interested build means its
+    /// contribution is UNKNOWN — recovery rebuilds `interested_builds`
+    /// from `build_derivations`, which carries no per-build wanted data
+    /// — and [`effective_wanted`] must then fall back to the stored
+    /// node-level union instead of guessing.
+    ///
+    /// Entries follow `interested_builds` membership exactly: recorded
+    /// where interest is recorded (`dag.merge`'s existing-node and
+    /// new-node paths, plus the resubmit-reset carry-over), removed
+    /// where interest is removed (`rollback_merge`,
+    /// `remove_build_interest`, `remove_build_interest_and_reap`).
+    /// In-memory only — never persisted, so the map starts empty after
+    /// leader failover.
+    pub wanted_by_build: HashMap<Uuid, Vec<String>>,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
     /// When the derivation entered Ready state (for assignment latency metric).
@@ -945,6 +964,9 @@ impl DerivationState {
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
             wanted_output_names: node.wanted_output_names.clone(),
+            // The submitting build's contribution is recorded by
+            // `dag.merge` (the build_id isn't known here).
+            wanted_by_build: HashMap::new(),
             db_id: None,
             ready_at: None,
             running_since: None,
@@ -1056,6 +1078,10 @@ impl DerivationState {
             // column DEFAULT '{}' = all declared outputs wanted, so
             // they recover with the old conservative criterion.
             wanted_output_names: row.wanted_output_names,
+            // Per-build contributions are not persisted; recovered
+            // interest has unknown contributions (missing entries), so
+            // `effective_wanted` falls back to the union above.
+            wanted_by_build: HashMap::new(),
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
             // ready_at: Some(now) if Ready → dispatch_wait_seconds
@@ -1141,6 +1167,7 @@ impl DerivationState {
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
             wanted_output_names: Vec::new(),
+            wanted_by_build: HashMap::new(),
             db_id: Some(row.derivation_id),
             ready_at: None,
             running_since: None,
@@ -1419,6 +1446,61 @@ pub use rio_common::wanted_outputs::{
     union_wanted_saturating, verifiable_wanted_paths, wanted_subset,
 };
 
+/// Effective wanted set for classification: the saturating union of the
+/// wanted contributions ([`DerivationState::wanted_by_build`]) of LIVE
+/// interested builds. A build is live iff its [`BuildInfo`](super::BuildInfo)
+/// is present in `builds` and `!state().is_terminal()` — a missing entry
+/// counts as terminal (terminal cleanup removes the `BuildInfo` and the
+/// DAG interest in the same handler).
+///
+/// Returns `None` when the caller MUST fall back to the stored
+/// node-level union ([`DerivationState::wanted_output_names`]):
+/// - the node has zero live interested builds (all terminal, missing
+///   from `builds`, or an empty interest set — recovered orphans), or
+/// - any live interested build's contribution is unknown (no
+///   `wanted_by_build` entry — post-failover, where recovery rebuilds
+///   interest from `build_derivations` but contributions are not
+///   persisted). A partial union would silently under-count that
+///   build's wants, so the conservative union wins instead.
+///
+/// `Some(vec![])` means "ALL declared outputs wanted": at least one live
+/// build contributed the empty all-wanted sentinel, which saturates the
+/// union (same algebra as [`union_wanted_saturating`]). Note the
+/// asymmetry with `None`: the empty Vec is an explicit per-build
+/// contribution, never a fallback value.
+///
+/// Free function (not a `DerivationState` method) because liveness needs
+/// the actor's `builds` map, which the node cannot see; it lives here
+/// (not rio-common) because it needs [`BuildInfo`](super::BuildInfo).
+pub fn effective_wanted(
+    state: &DerivationState,
+    builds: &HashMap<Uuid, super::BuildInfo>,
+) -> Option<Vec<String>> {
+    use super::BuildStateExt as _;
+
+    // None = no live contribution folded yet. Folding starts from the
+    // first live contribution (cloned) rather than an empty accumulator:
+    // an empty Vec is the "all wanted" sentinel and would saturate the
+    // union from the start.
+    let mut effective: Option<Vec<String>> = None;
+    for build_id in &state.interested_builds {
+        let live = builds
+            .get(build_id)
+            .is_some_and(|b| !b.state().is_terminal());
+        if !live {
+            continue;
+        }
+        // A live interested build with an unknown contribution: a partial
+        // union would under-count its wants — bail to the stored union.
+        let contribution = state.wanted_by_build.get(build_id)?;
+        match &mut effective {
+            None => effective = Some(contribution.clone()),
+            Some(acc) => union_wanted_saturating(acc, contribution),
+        }
+    }
+    effective
+}
+
 /// Poison detection config. Replaces the former `POISON_THRESHOLD` const.
 ///
 /// `require_distinct_workers` toggles between HashSet semantics
@@ -1588,6 +1670,128 @@ mod tests {
         s.wanted_output_names = vec!["out".into()];
         s.union_wanted(&[]);
         assert_eq!(s.wanted_output_names, Vec::<String>::new());
+    }
+
+    /// `effective_wanted` — the wanted set scoped to LIVE interested
+    /// builds, with the documented fallbacks:
+    /// 1. a single live build's narrow contribution is returned as-is
+    ///    (and two live builds' contributions union);
+    /// 2. a live build contributing the empty all-wanted sentinel
+    ///    saturates the result to `Some(vec![])`;
+    /// 3. a terminal build's contribution stops counting;
+    /// 4. a live build with an UNKNOWN contribution (no `wanted_by_build`
+    ///    entry — post-failover recovery) → `None` (caller falls back to
+    ///    the stored node-level union);
+    /// 5. zero live interested builds (terminal, missing `BuildInfo`, or
+    ///    empty interest set) → `None`.
+    #[test]
+    fn effective_wanted_live_union_and_fallbacks() -> anyhow::Result<()> {
+        use std::collections::HashMap;
+
+        use super::super::{BuildInfo, BuildOptions, BuildState, PriorityClass};
+
+        let mk_build = |bid| {
+            BuildInfo::new_pending(
+                bid,
+                None,
+                PriorityClass::Scheduled,
+                false,
+                BuildOptions::default(),
+                HashSet::new(),
+            )
+        };
+        let live_out = Uuid::new_v4();
+        let live_dev = Uuid::new_v4();
+        let live_all = Uuid::new_v4();
+        let live_unknown = Uuid::new_v4();
+        let done = Uuid::new_v4();
+
+        let mut builds: HashMap<Uuid, BuildInfo> = HashMap::new();
+        for bid in [live_out, live_dev, live_all, live_unknown] {
+            builds.insert(bid, mk_build(bid));
+        }
+        let mut terminal = mk_build(done);
+        terminal.transition(BuildState::Active)?;
+        terminal.transition(BuildState::Succeeded)?;
+        builds.insert(done, terminal);
+
+        let mut s = DerivationState::try_from_node(&dummy_node())?;
+
+        // 1. Single live build → its own contribution, verbatim.
+        s.interested_builds = [live_out].into();
+        s.wanted_by_build = [(live_out, vec!["out".to_string()])].into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            Some(vec!["out".to_string()]),
+            "single live build → its own contribution"
+        );
+
+        // 1b. Two live builds → saturating union of their contributions.
+        s.interested_builds = [live_out, live_dev].into();
+        s.wanted_by_build = [
+            (live_out, vec!["out".to_string()]),
+            (live_dev, vec!["dev".to_string()]),
+        ]
+        .into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            Some(vec!["dev".to_string(), "out".to_string()]),
+            "two live builds → union of their contributions"
+        );
+
+        // 2. A live build contributing the empty sentinel saturates.
+        s.interested_builds = [live_out, live_all].into();
+        s.wanted_by_build = [(live_out, vec!["out".to_string()]), (live_all, vec![])].into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            Some(vec![]),
+            "a live build wanting all saturates the live union to all"
+        );
+
+        // 3. A terminal build's (wider) contribution stops counting.
+        s.interested_builds = [live_out, done].into();
+        s.wanted_by_build = [(live_out, vec!["out".to_string()]), (done, vec![])].into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            Some(vec!["out".to_string()]),
+            "a terminal build's all-wanted contribution must stop counting"
+        );
+
+        // 4. A live build whose contribution is unknown → None (fallback),
+        //    even though another live build's contribution is known.
+        s.interested_builds = [live_out, live_unknown].into();
+        s.wanted_by_build = [(live_out, vec!["out".to_string()])].into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            None,
+            "an unknown contribution of a live build forces the stored-union fallback"
+        );
+
+        // 5. Zero live interested builds → None.
+        // 5a. Only a terminal build is interested.
+        s.interested_builds = [done].into();
+        s.wanted_by_build = [(done, vec!["out".to_string()])].into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            None,
+            "no live interested builds → fallback to the stored union"
+        );
+        // 5b. The interested build has no BuildInfo at all (terminal
+        //     cleanup already removed it) — treated as terminal.
+        let gone = Uuid::new_v4();
+        s.interested_builds = [gone].into();
+        s.wanted_by_build = [(gone, vec!["out".to_string()])].into();
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            None,
+            "an interested build with no BuildInfo entry counts as terminal"
+        );
+        // 5c. Empty interest set (recovered orphan) → None.
+        s.interested_builds = HashSet::new();
+        s.wanted_by_build = HashMap::new();
+        assert_eq!(effective_wanted(&s, &builds), None);
+
+        Ok(())
     }
 
     /// `drv_name()` strips the `.drv` suffix from the store-path

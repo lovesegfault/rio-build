@@ -116,6 +116,181 @@ fn test_merge_unions_wanted_outputs_on_existing_node() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Alongside the node-level union, `merge` records WHICH build
+/// contributed WHICH wanted set in `wanted_by_build`, on both the
+/// new-node path and the existing-node path. The per-build entry is the
+/// submission's own set (empty = that build wants ALL declared
+/// outputs), independent of what the union saturates to.
+#[test]
+fn test_merge_records_per_build_contribution() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let build2 = Uuid::new_v4();
+    let mut node = make_node("hashC", "x86_64-linux");
+
+    // New-node path: build1 wants only `out`.
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(build1, &[node.clone()], &[], "")?;
+    assert_eq!(
+        dag.nodes["hashC"].wanted_by_build.get(&build1),
+        Some(&vec!["out".to_string()]),
+        "new-node path must record the submitting build's contribution"
+    );
+
+    // Existing-node path: build2 wants all (empty sentinel).
+    node.wanted_output_names = vec![];
+    dag.merge(build2, &[node.clone()], &[], "")?;
+    let n = &dag.nodes["hashC"];
+    assert_eq!(
+        n.wanted_by_build.get(&build2),
+        Some(&Vec::<String>::new()),
+        "existing-node path must record the second build's contribution \
+         (empty = all declared outputs)"
+    );
+    assert_eq!(
+        n.wanted_by_build.get(&build1),
+        Some(&vec!["out".to_string()]),
+        "the first build's contribution must not be overwritten by the second's"
+    );
+    // The stored node-level union still saturates exactly as before.
+    assert!(n.wanted_output_names.is_empty());
+    Ok(())
+}
+
+/// The resubmit-reset path destructively removes a retriable node and
+/// re-inserts fresh state; prior interest AND prior per-build
+/// contributions are carried over so the other still-interested builds'
+/// wants survive the reset (contributions follow interest membership).
+#[test]
+fn test_merge_resubmit_reset_carries_contributions() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let mut node = make_node("hashRC", "x86_64-linux");
+    node.wanted_output_names = vec!["dev".into()];
+    dag.merge(build1, &[node.clone()], &[], "")?;
+    dag.nodes
+        .get_mut("hashRC")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    // build2 resubmits wanting only `out` → reset; build1's carried-over
+    // interest keeps its `dev` contribution.
+    let build2 = Uuid::new_v4();
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(build2, &[node.clone()], &[], "")?;
+    let n = &dag.nodes["hashRC"];
+    assert!(n.interested_builds.contains(&build1));
+    assert_eq!(
+        n.wanted_by_build.get(&build1),
+        Some(&vec!["dev".to_string()]),
+        "carried-over interest must keep its contribution across the reset"
+    );
+    assert_eq!(
+        n.wanted_by_build.get(&build2),
+        Some(&vec!["out".to_string()]),
+        "the resubmitter's own contribution must be recorded on the reset node"
+    );
+    Ok(())
+}
+
+/// A failed merge (cycle) must restore per-build contributions exactly:
+/// an entry the merge ADDED is removed, and an entry the merge OVERWROTE
+/// (the same build re-merging the node with a different wanted set) is
+/// restored to its prior value — mirroring the `wanted_grown` rollback.
+#[test]
+fn test_merge_rollback_restores_contributions() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+    let mut x = make_node("hashRB", "x86_64-linux");
+    x.wanted_output_names = vec!["out".into()];
+    dag.merge(build_a, &[x.clone()], &[], "")?;
+
+    // Failed merge by a DIFFERENT build: its added entry must be removed.
+    x.wanted_output_names = vec!["dev".into()];
+    let nodes = vec![
+        x.clone(),
+        make_node("hashRBy", "x86_64-linux"),
+        make_node("hashRBz", "x86_64-linux"),
+    ];
+    let cycle = vec![
+        make_edge("hashRBy", "hashRBz"),
+        make_edge("hashRBz", "hashRBy"),
+    ];
+    assert!(dag.merge(build_b, &nodes, &cycle, "").is_err());
+    let n = &dag.nodes["hashRB"];
+    assert!(
+        !n.wanted_by_build.contains_key(&build_b),
+        "a rolled-back merge must not leave the rejected build's contribution"
+    );
+    assert_eq!(
+        n.wanted_by_build.get(&build_a),
+        Some(&vec!["out".to_string()])
+    );
+
+    // Failed merge by the SAME build overwriting its own prior entry: the
+    // prior contribution must be restored (not removed, not left at the
+    // overwritten value).
+    assert!(dag.merge(build_a, &nodes, &cycle, "").is_err());
+    let n = &dag.nodes["hashRB"];
+    assert_eq!(
+        n.wanted_by_build.get(&build_a),
+        Some(&vec!["out".to_string()]),
+        "rollback must restore an overwritten contribution to its pre-merge value"
+    );
+    assert!(
+        n.interested_builds.contains(&build_a),
+        "interest from the prior successful merge must survive the rollback"
+    );
+    Ok(())
+}
+
+/// Contributions follow interest membership on the way out too:
+/// `remove_build_interest` (the cancel path) and
+/// `remove_build_interest_and_reap` (terminal-build cleanup) drop the
+/// build's `wanted_by_build` entry together with its `interested_builds`
+/// membership, leaving other builds' contributions untouched.
+#[test]
+fn test_remove_build_interest_drops_contribution() -> anyhow::Result<()> {
+    let mut node = make_node("hashRM", "x86_64-linux");
+    let build1 = Uuid::new_v4();
+    let build2 = Uuid::new_v4();
+
+    // remove_build_interest (cancel path).
+    let mut dag = DerivationDag::new();
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(build1, &[node.clone()], &[], "")?;
+    node.wanted_output_names = vec!["dev".into()];
+    dag.merge(build2, &[node.clone()], &[], "")?;
+    dag.remove_build_interest(build1);
+    let n = &dag.nodes["hashRM"];
+    assert!(
+        !n.wanted_by_build.contains_key(&build1),
+        "removed interest must take the build's contribution with it"
+    );
+    assert_eq!(
+        n.wanted_by_build.get(&build2),
+        Some(&vec!["dev".to_string()]),
+        "the remaining build's contribution must be untouched"
+    );
+
+    // remove_build_interest_and_reap (terminal cleanup). The node is
+    // shared with build2 so it survives the reap; build1's entry goes.
+    let mut dag = DerivationDag::new();
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(build1, &[node.clone()], &[], "")?;
+    node.wanted_output_names = vec!["dev".into()];
+    dag.merge(build2, &[node.clone()], &[], "")?;
+    dag.remove_build_interest_and_reap(build1);
+    let n = &dag.nodes["hashRM"];
+    assert!(!n.wanted_by_build.contains_key(&build1));
+    assert_eq!(
+        n.wanted_by_build.get(&build2),
+        Some(&vec!["dev".to_string()])
+    );
+    Ok(())
+}
+
 #[test]
 fn test_edges_and_deps() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();

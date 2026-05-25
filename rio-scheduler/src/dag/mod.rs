@@ -72,6 +72,15 @@ pub struct MergeResult {
     /// would still let a rejected build's wanted set permanently widen
     /// the cache-hit criterion for everyone else.
     pub wanted_grown: Vec<(DrvHash, Vec<String>)>,
+    /// Pre-existing nodes where this merge recorded the submitting
+    /// build's `wanted_by_build` contribution, with the prior entry
+    /// value (`None` = the build had no entry). Rollback removes the
+    /// inserted entry or restores the overwritten one — a leaked
+    /// contribution would make the rejected build look live-and-
+    /// interested to the effective-wanted computation. Newly-inserted
+    /// and resubmit-reset nodes don't need this: rollback removes the
+    /// former wholesale and restores the latter's full prior state.
+    pub contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)>,
 }
 
 /// The global derivation DAG maintained by the actor.
@@ -285,6 +294,10 @@ impl DerivationDag {
         // required for a cache hit) but would still violate the
         // exact-pre-merge-DAG restore invariant.
         let mut wanted_grown: Vec<(DrvHash, Vec<String>)> = Vec::new();
+        // Prior `wanted_by_build` entry (None = absent) of pre-existing
+        // nodes where this merge recorded the submitting build's
+        // contribution, so rollback can remove/restore it.
+        let mut contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)> = Vec::new();
         // Full prior state of retriable nodes destructively removed below
         // for resubmit-reset. rollback_merge restores these so a failed
         // merge leaves the DAG exactly as it was (status, interest set,
@@ -337,6 +350,7 @@ impl DerivationDag {
                     old.interested_builds.clone(),
                     old.retry.resubmit_cycles,
                     old.wanted_output_names.clone(),
+                    old.wanted_by_build.clone(),
                 );
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
@@ -348,8 +362,9 @@ impl DerivationDag {
             // `rollback_merge` — a failed merge restores the exact
             // pre-merge DAG. Currently: `interested_builds` (via
             // `interest_added`), `traceparent` (via
-            // `traceparent_upgraded`), and `wanted_output_names` (via
-            // `wanted_grown`).
+            // `traceparent_upgraded`), `wanted_output_names` (via
+            // `wanted_grown`), and `wanted_by_build` (via
+            // `contributions_recorded`).
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
@@ -368,6 +383,16 @@ impl DerivationDag {
                         wanted_grown.push((drv_hash.clone(), prior));
                     }
                 }
+                // Per-build contribution: remember WHAT this submission
+                // wanted so the effective-wanted computation can stop
+                // counting it once this build goes terminal. The prior
+                // entry (usually absent; present when the same build
+                // re-merges the node) is kept for rollback, mirroring
+                // `wanted_grown`.
+                let prior_contribution = existing
+                    .wanted_by_build
+                    .insert(build_id, node.wanted_output_names.clone());
+                contributions_recorded.push((drv_hash.clone(), prior_contribution));
                 // First submitter's traceparent wins — but recovery/
                 // poison-reset set "", which isn't a submitter. Upgrade
                 // an empty traceparent so a user submitting after
@@ -394,6 +419,7 @@ impl DerivationDag {
                             &interest_added,
                             &traceparent_upgraded,
                             &wanted_grown,
+                            &contributions_recorded,
                             build_id,
                             removed_retriable,
                         );
@@ -412,6 +438,11 @@ impl DerivationDag {
                 // kvm pool skips it (I-181 ∅ guard).
                 self.apply_soft_features(&mut state);
                 state.interested_builds.insert(build_id);
+                // The submitting build's per-build contribution — the
+                // counterpart of the existing-node path's insert.
+                state
+                    .wanted_by_build
+                    .insert(build_id, node.wanted_output_names.clone());
                 // Carry over interested_builds + resubmit_cycles from the
                 // removed retriable node (if any) — other stuck builds
                 // get the reset too; resubmit_cycles is INCREMENTED here
@@ -421,11 +452,19 @@ impl DerivationDag {
                 // per-cycle max_retries budget restored on every resubmit.
                 // The prior wanted set is unioned in too — the carried-over
                 // interested builds still want their outputs; replacing the
-                // set with only the resubmitter's would shrink it.
-                if let Some((prior_interest, prior_cycles, prior_wanted)) = prior {
+                // set with only the resubmitter's would shrink it. Their
+                // per-build contributions are carried alongside (they
+                // follow interest membership); `or_insert` keeps the
+                // resubmitter's own entry authoritative.
+                if let Some((prior_interest, prior_cycles, prior_wanted, prior_contributions)) =
+                    prior
+                {
                     state.interested_builds.extend(prior_interest);
                     state.retry.resubmit_cycles = prior_cycles + 1;
                     state.union_wanted(&prior_wanted);
+                    for (b, w) in prior_contributions {
+                        state.wanted_by_build.entry(b).or_insert(w);
+                    }
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
@@ -499,6 +538,7 @@ impl DerivationDag {
                     &interest_added,
                     &traceparent_upgraded,
                     &wanted_grown,
+                    &contributions_recorded,
                     build_id,
                     removed_retriable,
                 );
@@ -514,6 +554,7 @@ impl DerivationDag {
             removed_retriable,
             traceparent_upgraded,
             wanted_grown,
+            contributions_recorded,
         })
     }
 
@@ -603,6 +644,7 @@ impl DerivationDag {
         interest_added: &[DrvHash],
         traceparent_upgraded: &[DrvHash],
         wanted_grown: &[(DrvHash, Vec<String>)],
+        contributions_recorded: &[(DrvHash, Option<Vec<String>>)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
     ) {
@@ -675,6 +717,25 @@ impl DerivationDag {
         for (hash, prior) in wanted_grown {
             if let Some(state) = self.nodes.get_mut(hash) {
                 state.wanted_output_names = prior.clone();
+            }
+        }
+
+        // Undo the submitting build's per-build contribution on
+        // pre-existing nodes where this merge recorded it: remove the
+        // entry it inserted (`None` prior), or restore the entry it
+        // overwrote. Reverse order so that, if the same node was
+        // somehow recorded twice in one merge, the oldest (true
+        // pre-merge) prior is the one that sticks.
+        for (hash, prior) in contributions_recorded.iter().rev() {
+            if let Some(state) = self.nodes.get_mut(hash) {
+                match prior {
+                    Some(w) => {
+                        state.wanted_by_build.insert(build_id, w.clone());
+                    }
+                    None => {
+                        state.wanted_by_build.remove(&build_id);
+                    }
+                }
             }
         }
     }
@@ -1007,6 +1068,8 @@ impl DerivationDag {
 
         for (hash, state) in &mut self.nodes {
             state.interested_builds.remove(&build_id);
+            // Contributions follow interest membership.
+            state.wanted_by_build.remove(&build_id);
             if state.interested_builds.is_empty() && !state.status().is_terminal() {
                 orphaned.push(hash.clone());
             }
@@ -1029,6 +1092,8 @@ impl DerivationDag {
 
         for (hash, state) in &mut self.nodes {
             state.interested_builds.remove(&build_id);
+            // Contributions follow interest membership.
+            state.wanted_by_build.remove(&build_id);
             // Exclude Poisoned: recovered-poisoned nodes have
             // interested_builds=∅ from birth (from_poisoned_row at
             // state/derivation.rs) and are TTL-tracked — reaping them

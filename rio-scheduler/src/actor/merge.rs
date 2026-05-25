@@ -1733,6 +1733,7 @@ impl DagActor {
             &merge_result.interest_added,
             &merge_result.traceparent_upgraded,
             &merge_result.wanted_grown,
+            &merge_result.contributions_recorded,
             build_id,
             merge_result.removed_retriable,
         );
