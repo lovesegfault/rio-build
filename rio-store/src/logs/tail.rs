@@ -32,6 +32,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::chunks::{LogChunkError, LogChunkStore, decompress_lines};
+use super::kernel::visit_chunk;
 
 /// One `drv_log_chunks` manifest row, as the read path needs it.
 ///
@@ -173,12 +174,10 @@ pub async fn read_chunk(
     // manifest is just a table) has nothing to contribute, and a chunk
     // whose last line is below the watermark is a same-range chunk from
     // a second session whose lines were all already yielded. Both take
-    // the cheap skip branch — no GET.
-    let last_line = chunk
-        .first_line
-        .saturating_add(chunk.line_count)
-        .saturating_sub(1);
-    if chunk.line_count == 0 || last_line < cursor.next_line {
+    // the cheap skip branch — no GET. The verdict comes from the pure
+    // kernel (`kernel::visit_chunk`), evaluated here against the
+    // manifest's claimed line count.
+    if visit_chunk(cursor.next_line, chunk.first_line, chunk.line_count).is_empty() {
         return Ok(Vec::new());
     }
 
@@ -229,15 +228,23 @@ pub async fn read_chunk(
         );
     }
 
+    // The dedup proper, re-evaluated against the number of lines the
+    // object ACTUALLY decompressed to (which the warn above allows to
+    // disagree with the manifest's count): yield `[yield_from,
+    // yield_until)` and advance the watermark to the kernel's answer.
+    // `kernel::visit_chunk` is the single owner of the skip/advance
+    // decision — a skipped chunk (everything already yielded) leaves
+    // the cursor untouched.
+    let visit = visit_chunk(cursor.next_line, chunk.first_line, lines.len() as u64);
     let mut out = Vec::new();
     for (i, line) in lines.into_iter().enumerate() {
         let line_no = chunk.first_line.saturating_add(i as u64);
-        if line_no < cursor.next_line {
+        if line_no < visit.yield_from {
             continue;
         }
         out.push((line_no, line));
-        cursor.next_line = line_no + 1;
     }
+    cursor.next_line = visit.next_line;
     Ok(out)
 }
 

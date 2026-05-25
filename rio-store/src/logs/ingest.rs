@@ -28,6 +28,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use super::chunks::{LogChunkError, LogChunkStore, compress_lines, log_chunk_key};
+use super::kernel::{AcceptVerdict, accept_verdict};
 
 /// Max bytes per stored line. Longer lines are truncated at accept so a
 /// single line cannot dominate the buffer or a chunk.
@@ -428,15 +429,35 @@ impl IngestSession {
             return Ok(AcceptOutcome::Accepted { cut_due });
         }
 
-        // -- Line-number bounds. The numbering is worker-supplied and the
-        // worker is untrusted; everything downstream (the manifest's
-        // [first_line, first_line + line_count) arithmetic, the read
-        // path's attribution, the completeness fold) relies on it being
-        // monotone and representable as BIGINT.
+        // -- The input gates, delegated to the pure kernel
+        // (`kernel::accept_verdict`). The numbering is worker-supplied
+        // and the worker is untrusted; everything downstream (the
+        // manifest's [first_line, first_line + line_count) arithmetic,
+        // the read path's attribution, the completeness fold) relies on
+        // it being monotone and representable as BIGINT. Once the
+        // execution's lifecycle row is terminal with a known
+        // `final_line_count`, that count is one past the last line the
+        // build produced (the builder's own post-footer high-water mark
+        // from its CompletionReport): lines numbered at or past it
+        // cannot be part of the log and are dropped, so a builder
+        // holding a still-current token for a terminal-but-incomplete
+        // execution can fill the gap below the recorded end but never
+        // grow the log past it. A batch starting at or past the ceiling
+        // is dropped whole; one that straddles it keeps only the lines
+        // below it. Lines accepted before the ceiling is learned (the
+        // seal lands mid-stream and the handler's refresh has not
+        // observed it yet) are the bounded residual disclosed at the
+        // refresh site. The kernel owns the verdict; this block owns
+        // the per-verdict metrics and logging.
+        // r[impl store.log.completeness-gate]
         let line_count = batch.lines.len() as u64;
-        let end = match batch.first_line_number.checked_add(line_count) {
-            Some(end) if end <= i64::MAX as u64 => end,
-            _ => {
+        let end = match accept_verdict(
+            self.high_water_line,
+            self.final_line_count,
+            batch.first_line_number,
+            line_count,
+        ) {
+            AcceptVerdict::RejectedOverflow => {
                 metrics::counter!(
                     "rio_store_log_ingest_rejected_total",
                     "reason" => "line_number_overflow"
@@ -450,73 +471,59 @@ impl IngestSession {
                 );
                 return Ok(AcceptOutcome::RejectedOverflow);
             }
+            AcceptVerdict::RejectedNonMonotone => {
+                metrics::counter!(
+                    "rio_store_log_ingest_rejected_total",
+                    "reason" => "non_monotonic"
+                )
+                .increment(1);
+                tracing::debug!(
+                    exec_id = %self.exec_id,
+                    first_line_number = batch.first_line_number,
+                    high_water_line = self.high_water_line,
+                    "rejected log batch: non-monotone first_line_number"
+                );
+                return Ok(AcceptOutcome::RejectedNonMonotone);
+            }
+            AcceptVerdict::RejectedPastFinal => {
+                metrics::counter!(
+                    "rio_store_log_ingest_rejected_total",
+                    "reason" => "past_final_line_count"
+                )
+                .increment(1);
+                tracing::debug!(
+                    exec_id = %self.exec_id,
+                    first_line_number = batch.first_line_number,
+                    // RejectedPastFinal is only reachable with a known
+                    // ceiling; `unwrap_or` keeps the log site total.
+                    final_line_count = self.final_line_count.unwrap_or(0),
+                    "rejected log batch: every line is at or past the recorded final_line_count"
+                );
+                return Ok(AcceptOutcome::RejectedPastFinal);
+            }
+            AcceptVerdict::Accepted { end } => end,
         };
-        if batch.first_line_number < self.high_water_line {
+        let mut batch_lines = batch.lines;
+        if end < batch.first_line_number + line_count {
+            // Straddles the recorded end: keep [first, end), drop
+            // [end, first + line_count). `end` was clamped to the
+            // ceiling by the kernel, so this branch fires exactly when
+            // the un-clamped end exceeded it.
+            let keep = (end - batch.first_line_number) as usize;
+            let dropped = batch_lines.len() - keep;
+            batch_lines.truncate(keep);
             metrics::counter!(
                 "rio_store_log_ingest_rejected_total",
-                "reason" => "non_monotonic"
+                "reason" => "past_final_line_count"
             )
             .increment(1);
             tracing::debug!(
                 exec_id = %self.exec_id,
                 first_line_number = batch.first_line_number,
-                high_water_line = self.high_water_line,
-                "rejected log batch: non-monotone first_line_number"
+                final_line_count = self.final_line_count.unwrap_or(0),
+                dropped,
+                "truncated log batch at the recorded final_line_count"
             );
-            return Ok(AcceptOutcome::RejectedNonMonotone);
-        }
-
-        // -- The completeness ceiling. Once the execution's lifecycle
-        // row is terminal with a known `final_line_count`, that count
-        // is one past the last line the build produced (the builder's
-        // own post-footer high-water mark from its CompletionReport):
-        // lines numbered at or past it cannot be part of the log and
-        // are dropped, so a builder holding a still-current token for
-        // a terminal-but-incomplete execution can fill the gap below
-        // the recorded end but never grow the log past it. A batch
-        // starting at or past the ceiling is dropped whole; one that
-        // straddles it keeps only the lines below it. Lines accepted
-        // before the ceiling is learned (the seal lands mid-stream and
-        // the handler's refresh has not observed it yet) are the
-        // bounded residual disclosed at the refresh site.
-        // r[impl store.log.completeness-gate]
-        let mut end = end;
-        let mut batch_lines = batch.lines;
-        if let Some(ceiling) = self.final_line_count {
-            if batch.first_line_number >= ceiling {
-                metrics::counter!(
-                    "rio_store_log_ingest_rejected_total",
-                    "reason" => "past_final_line_count"
-                )
-                .increment(1);
-                tracing::debug!(
-                    exec_id = %self.exec_id,
-                    first_line_number = batch.first_line_number,
-                    final_line_count = ceiling,
-                    "rejected log batch: every line is at or past the recorded final_line_count"
-                );
-                return Ok(AcceptOutcome::RejectedPastFinal);
-            }
-            if end > ceiling {
-                // Straddles the recorded end: keep [first, ceiling),
-                // drop [ceiling, end).
-                let keep = (ceiling - batch.first_line_number) as usize;
-                let dropped = batch_lines.len() - keep;
-                batch_lines.truncate(keep);
-                end = ceiling;
-                metrics::counter!(
-                    "rio_store_log_ingest_rejected_total",
-                    "reason" => "past_final_line_count"
-                )
-                .increment(1);
-                tracing::debug!(
-                    exec_id = %self.exec_id,
-                    first_line_number = batch.first_line_number,
-                    final_line_count = ceiling,
-                    dropped,
-                    "truncated log batch at the recorded final_line_count"
-                );
-            }
         }
 
         // -- Truncation BEFORE byte accounting, so an oversized line

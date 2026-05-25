@@ -29,6 +29,8 @@ use sqlx::PgPool;
 use tonic::Status;
 use uuid::Uuid;
 
+use super::kernel::manifest_covers_contiguously;
+
 /// A stream open that passed every check. Carries the values the
 /// handler needs downstream: the normalized 32-char `drv_hash` (the
 /// chunk-key / `drv_executions.drv_hash` form, NOT the DAG key), the
@@ -229,7 +231,8 @@ pub(super) async fn sealed_final_line_count(
 }
 
 /// Does the execution's chunk manifest contiguously cover `[0, up_to)`?
-/// The second half of [`log_is_complete`].
+/// The second half of [`log_is_complete`]. The fold itself is the pure
+/// kernel [`manifest_covers_contiguously`]; this wrapper owns the SQL.
 async fn manifest_covers(pool: &PgPool, exec_id: Uuid, up_to: i64) -> Result<bool, Status> {
     // Store-owned table → runtime query (no cross-service contract to
     // enforce). Ordered by first_line so the contiguity fold is a
@@ -244,28 +247,6 @@ async fn manifest_covers(pool: &PgPool, exec_id: Uuid, up_to: i64) -> Result<boo
     .status_internal("AppendLog gate: completeness check")?;
 
     Ok(manifest_covers_contiguously(&chunks, up_to))
-}
-
-/// Does an `ORDER BY first_line` manifest cover a contiguous
-/// `[0, up_to)` with no gaps?
-///
-/// Chunks may overlap (two ingest sessions for one execution after a
-/// replica failover) — overlap extends coverage, it never breaks it. A
-/// chunk starting *past* the covered-through point is a gap and ends
-/// the fold early.
-fn manifest_covers_contiguously(chunks: &[(i64, i64)], up_to: i64) -> bool {
-    let mut covered = 0i64;
-    for &(first_line, line_count) in chunks {
-        if first_line > covered {
-            // A gap: nothing covers [covered, first_line).
-            return false;
-        }
-        covered = covered.max(first_line.saturating_add(line_count));
-        if covered >= up_to {
-            return true;
-        }
-    }
-    covered >= up_to
 }
 
 #[cfg(test)]
