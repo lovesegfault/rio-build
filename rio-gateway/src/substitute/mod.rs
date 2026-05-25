@@ -274,9 +274,24 @@ pub(crate) async fn try_substitute_missing(
 
     // ── Capability probe, per path ──────────────────────────────────
     let mut remote_store = peer.remote_store.clone();
-    for path in missing {
+    for (i, path) in missing.iter().enumerate() {
         match probe_path(&mut remote_store, jwt.as_deref(), path).await {
             Ok(c) => candidates.push(c),
+            Err(reason) if reason.is_peer_unreachable() => {
+                // A black-holed or down peer fails each probe only
+                // after its connect/RPC timeout — paying that per
+                // remaining path would stall the client's copy for
+                // 10-30s × N before the whole-NAR fallback even
+                // starts. One transport-level failure ⇒ stop probing
+                // this batch; everything unprobed stays missing.
+                warn!(
+                    %path, %reason,
+                    remaining = missing.len() - i,
+                    "dag-sync peer unreachable; skipping remaining probes for this request"
+                );
+                still_missing.extend(missing[i..].iter().cloned());
+                break;
+            }
             Err(reason) => {
                 debug!(%path, %reason, "dag-sync probe declined; falling through to whole-NAR push");
                 still_missing.push(path.clone());
@@ -359,11 +374,18 @@ async fn sync_candidates(
     //       whole path set in memory at once (each blob is capped at
     //       MAX_NAR_SIZE but the aggregate is uncapped), whereas the
     //       whole-NAR fallback path buffers one NAR at a time.
+    // On top of (b), `upload_one` peaks at roughly 3× one path's
+    // content size (the fetched/local bodies, their clones in the
+    // NarNode tree, and the serialized NAR buffer) while it runs.
     // Future fix: bounded-concurrency fetches plus per-path (or
     // streaming) blob retrieval so the working set is one path's
-    // contents, like upload_one already is. Acceptable today because a
-    // mostly-missing closure declines cheaply at the probe/HasBlobs
-    // stage anyway and the client's whole-NAR push takes over.
+    // contents, like upload_one already is. A peer-down cooldown
+    // shared across sessions is also not implemented — each
+    // wopQueryValidPaths re-probes; the first transport failure only
+    // short-circuits the rest of THAT call's probes. Acceptable today
+    // because a mostly-missing closure declines cheaply at the
+    // probe/HasBlobs stage anyway and the client's whole-NAR push
+    // takes over.
     let walk = dag_sync::walk_dag(local, remote, roots, stats).await?;
     let fetched =
         dag_sync::fetch_missing_blobs(local, remote, &walk.candidate_files, stats).await?;
@@ -431,12 +453,23 @@ async fn upload_one(
         stats.bytes_saved += body.len() as u64;
         contents.insert(*digest, body);
     }
-    let nar = dag_sync::assemble_nar(c.info.store_path.as_str(), &c.index, |digest, _| {
-        contents.get(&digest).cloned().ok_or(DagSyncError::Rpc {
-            rpc: "ReadBlob",
-            status: tonic::Status::internal("blob missing from the pre-resolved content map"),
+    // Tree-build + NAR serialization is pure CPU over up to
+    // MAX_NAR_SIZE of owned bytes — same shape (and same cross-tenant
+    // tail-latency rationale) as `handle_add_to_store`'s
+    // spawn_blocking'd hash + serialize: keep it off the reactor
+    // threads.
+    let store_path = c.info.store_path.to_string();
+    let index = c.index.clone();
+    let nar = tokio::task::spawn_blocking(move || {
+        dag_sync::assemble_nar(&store_path, &index, |digest, _| {
+            contents.get(&digest).cloned().ok_or(DagSyncError::Rpc {
+                rpc: "ReadBlob",
+                status: tonic::Status::internal("blob missing from the pre-resolved content map"),
+            })
         })
-    })?;
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("NAR reassembly task: {e}"))??;
     if nar.len() as u64 != c.info.nar_size {
         anyhow::bail!(
             "reassembled NAR is {} bytes but the remote PathInfo says {}",
@@ -476,6 +509,50 @@ enum ProbeDecline {
     GetNarIndex(tonic::Status),
     #[error("nar_size {0} exceeds MAX_NAR_SIZE")]
     TooLarge(u64),
+    #[error("remote answered for {got:?}, not the requested path")]
+    PathMismatch { got: String },
+}
+
+impl ProbeDecline {
+    /// `true` when the decline is a transport-level failure (peer
+    /// down, black-holed, or timing out) rather than a per-path
+    /// answer. The probe loop stops on the first such failure —
+    /// every further probe would pay the same connect/RPC timeout.
+    /// `Unknown` is included because tonic surfaces some transport
+    /// breakage as it; the cost of over-matching is only that the
+    /// rest of the batch falls back to the whole-NAR push.
+    fn is_peer_unreachable(&self) -> bool {
+        match self {
+            Self::QueryPathInfo(s) | Self::GetNarIndex(s) => matches!(
+                s.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Unknown
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// Validate the remote's `QueryPathInfo` answer against the path the
+/// client actually asked for. Split from [`probe_path`] so the
+/// decision is unit-testable without a gRPC server.
+///
+/// The path-identity check is load-bearing for correctness, not just
+/// hygiene: candidates and the synced set are keyed by
+/// `info.store_path`, and `wopQueryValidPaths` reports anything not in
+/// the still-missing set as valid. A peer that echoed a *different*
+/// path would otherwise get its answer recorded under the wrong key —
+/// the requested path would be reported valid without ever being
+/// stored, and the client would silently skip its push.
+fn check_probe_info(requested: &str, info: &ValidatedPathInfo) -> Result<(), ProbeDecline> {
+    if info.store_path.as_str() != requested {
+        return Err(ProbeDecline::PathMismatch {
+            got: info.store_path.to_string(),
+        });
+    }
+    if info.nar_size > MAX_NAR_SIZE {
+        return Err(ProbeDecline::TooLarge(info.nar_size));
+    }
+    Ok(())
 }
 
 /// The per-path capability probe: `QueryPathInfo` + `GetNarIndex`
@@ -492,9 +569,7 @@ async fn probe_path(
             .await
             .map_err(ProbeDecline::QueryPathInfo)?
             .ok_or(ProbeDecline::NotOnRemote)?;
-    if info.nar_size > MAX_NAR_SIZE {
-        return Err(ProbeDecline::TooLarge(info.nar_size));
-    }
+    check_probe_info(path, &info)?;
     // GetNarIndex is builder-internal on the store side: it rejects
     // requests carrying an end-user tenant JWT. The path was already
     // tenant-authorized by the QueryPathInfo above, and the index
@@ -538,4 +613,92 @@ fn emit_stats(stats: &SyncStats) {
     metrics::counter!("rio_gateway_dagsync_blobs_fetched_total").increment(stats.blobs_fetched);
     metrics::counter!("rio_gateway_dagsync_bytes_saved_total").increment(stats.bytes_saved);
     metrics::counter!("rio_gateway_dagsync_bytes_fetched_total").increment(stats.bytes_fetched);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ValidatedPathInfo claiming to be `path` with an in-bounds
+    /// nar_size.
+    fn info_for(path: &str) -> ValidatedPathInfo {
+        ValidatedPathInfo {
+            store_path: rio_nix::store_path::StorePath::parse(path).expect("valid test path"),
+            store_path_hash: Vec::new(),
+            deriver: None,
+            nar_hash: [0u8; 32],
+            nar_size: 1024,
+            references: Vec::new(),
+            registration_time: 0,
+            ultimate: false,
+            signatures: Vec::new(),
+            content_address: None,
+        }
+    }
+
+    const REQUESTED: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-requested";
+    const OTHER: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-other";
+
+    /// A peer that answers `QueryPathInfo(requested)` with a DIFFERENT
+    /// store path must be declined at probe time. Candidates and the
+    /// synced set are keyed by `info.store_path`; accepting the
+    /// mismatched answer would let the requested path be reported
+    /// "valid" to the client without ever being stored.
+    #[test]
+    fn probe_declines_a_path_identity_mismatch() {
+        let err = check_probe_info(REQUESTED, &info_for(OTHER))
+            .expect_err("mismatched store_path must be declined");
+        assert!(
+            matches!(&err, ProbeDecline::PathMismatch { got } if got == OTHER),
+            "got {err:?}"
+        );
+        // The matching answer passes.
+        check_probe_info(REQUESTED, &info_for(REQUESTED)).expect("matching path is accepted");
+    }
+
+    /// Oversize NARs are declined before any castore RPC fires.
+    #[test]
+    fn probe_declines_an_oversize_nar() {
+        let mut info = info_for(REQUESTED);
+        info.nar_size = MAX_NAR_SIZE + 1;
+        let err = check_probe_info(REQUESTED, &info).expect_err("oversize must be declined");
+        assert!(matches!(err, ProbeDecline::TooLarge(_)), "got {err:?}");
+    }
+
+    /// Transport-level probe failures short-circuit the batch; per-path
+    /// answers (NotFound, Unimplemented, mismatch, oversize) do not.
+    #[test]
+    fn peer_unreachable_classification() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unknown,
+        ] {
+            assert!(
+                ProbeDecline::QueryPathInfo(tonic::Status::new(code, "x")).is_peer_unreachable(),
+                "{code:?} on QueryPathInfo is transport-level"
+            );
+            assert!(
+                ProbeDecline::GetNarIndex(tonic::Status::new(code, "x")).is_peer_unreachable(),
+                "{code:?} on GetNarIndex is transport-level"
+            );
+        }
+        for decline in [
+            ProbeDecline::NotOnRemote,
+            ProbeDecline::NoNarIndex,
+            ProbeDecline::NotIndexed,
+            ProbeDecline::NoRootDigest,
+            ProbeDecline::TooLarge(1),
+            ProbeDecline::PathMismatch {
+                got: OTHER.to_string(),
+            },
+            ProbeDecline::QueryPathInfo(tonic::Status::permission_denied("x")),
+            ProbeDecline::GetNarIndex(tonic::Status::internal("x")),
+        ] {
+            assert!(
+                !decline.is_peer_unreachable(),
+                "{decline:?} is a per-path answer, not peer-down"
+            );
+        }
+    }
 }
