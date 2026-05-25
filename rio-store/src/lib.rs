@@ -341,8 +341,12 @@ pub fn describe_metrics() {
         "rio_store_log_ingest_rejected_total",
         "Log batches dropped at the ingest input gates, by reason: \
          non_monotonic / line_number_overflow (malformed worker numbering, \
-         per-batch, stream stays open) or byte_cap (per-execution cap, \
-         stream-fatal). Sustained non-zero = a misbehaving or hostile builder."
+         per-batch, stream stays open), past_final_line_count (lines at or \
+         past the execution's recorded end after the completeness seal \
+         lands; per-batch, stream stays open, also counted once per \
+         straddling batch that is truncated rather than dropped whole) or \
+         byte_cap (per-execution cap, stream-fatal). Sustained non-zero = \
+         a misbehaving or hostile builder."
     );
     describe_counter!(
         "rio_store_log_chunks_written_total",

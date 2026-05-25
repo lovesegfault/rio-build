@@ -29,16 +29,25 @@ use sqlx::PgPool;
 use tonic::Status;
 use uuid::Uuid;
 
-/// A stream open that passed every check. Carries the two values the
+/// A stream open that passed every check. Carries the values the
 /// handler needs downstream: the normalized 32-char `drv_hash` (the
-/// chunk-key / `drv_executions.drv_hash` form, NOT the DAG key) and the
-/// parsed `exec_id`.
+/// chunk-key / `drv_executions.drv_hash` form, NOT the DAG key), the
+/// parsed `exec_id`, and — when the execution is already terminal —
+/// the recorded `final_line_count` the ingest session enforces as its
+/// per-append ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateOk {
     /// `drv_log_hash()` of the derivation — the form chunk keys and
     /// `drv_executions.drv_hash` use.
     pub drv_hash: String,
     pub exec_id: Uuid,
+    /// The execution's recorded end, if its lifecycle row is already
+    /// terminal with a known count at open time (the late-replay
+    /// case). `None` for a still-running execution — the handler's
+    /// periodic refresh picks the count up if the seal lands
+    /// mid-stream. See `store.log.completeness-gate`: accepted lines
+    /// numbered at or past this are dropped.
+    pub final_line_count: Option<i64>,
 }
 
 // r[impl store.log.append-auth]
@@ -136,8 +145,16 @@ pub async fn check_append_open(
         ));
     }
 
-    // -- Check 4: the seal. A complete log accepts no more appends.
-    if log_is_complete(pool, exec_id).await? {
+    // -- Check 4: the seal. A complete log accepts no more appends. The
+    // recorded final line count (known here iff the execution is
+    // already terminal — the late-replay case) also rides back to the
+    // ingest session as its per-append ceiling, so an admitted replay
+    // can fill the gap below the recorded end but never grow the log
+    // past it.
+    let final_line_count = sealed_final_line_count(pool, exec_id).await?;
+    if let Some(up_to) = final_line_count
+        && manifest_covers(pool, exec_id, up_to).await?
+    {
         return Err(Status::failed_precondition(
             "AppendLog: this execution's log is already complete",
         ));
@@ -150,6 +167,7 @@ pub async fn check_append_open(
     Ok(GateOk {
         drv_hash: claims_hash,
         exec_id,
+        final_line_count,
     })
 }
 
@@ -165,6 +183,28 @@ pub async fn check_append_open(
 /// path imports this exact function instead of growing a second copy
 /// that could diverge from the seal.
 pub(super) async fn log_is_complete(pool: &PgPool, exec_id: Uuid) -> Result<bool, Status> {
+    match sealed_final_line_count(pool, exec_id).await? {
+        Some(final_line_count) => manifest_covers(pool, exec_id, final_line_count).await,
+        None => Ok(false),
+    }
+}
+
+// r[impl store.log.completeness-gate]
+/// The execution's recorded end — its `final_line_count` — if its
+/// lifecycle row is terminal and the builder-reported count is known.
+///
+/// `None` means the execution is still running, has no row yet, or
+/// never reported a count: there is no recorded end to seal against or
+/// to enforce as the ingest session's per-append ceiling. The two
+/// halves of the completeness predicate split here so the `AppendLog`
+/// gate can hand the count to the session without a second
+/// `drv_executions` read, and so the handler's mid-stream refresh asks
+/// exactly the question it needs ("is there a recorded end yet?")
+/// without folding the manifest.
+pub(super) async fn sealed_final_line_count(
+    pool: &PgPool,
+    exec_id: Uuid,
+) -> Result<Option<i64>, Status> {
     // Compile-time checked: `drv_executions` is scheduler-written /
     // store-read (see `DrvExecutionRow` and the `STORE_READS` contract).
     let row = sqlx::query!(
@@ -176,19 +216,21 @@ pub(super) async fn log_is_complete(pool: &PgPool, exec_id: Uuid) -> Result<bool
     .status_internal("AppendLog gate: completeness check")?;
 
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     let terminal = row
         .status
         .as_deref()
         .is_some_and(|s| EXEC_STATUS_TERMINAL.contains(&s));
-    let Some(final_line_count) = row.final_line_count else {
-        return Ok(false);
-    };
     if !terminal {
-        return Ok(false);
+        return Ok(None);
     }
+    Ok(row.final_line_count)
+}
 
+/// Does the execution's chunk manifest contiguously cover `[0, up_to)`?
+/// The second half of [`log_is_complete`].
+async fn manifest_covers(pool: &PgPool, exec_id: Uuid, up_to: i64) -> Result<bool, Status> {
     // Store-owned table → runtime query (no cross-service contract to
     // enforce). Ordered by first_line so the contiguity fold is a
     // single pass.
@@ -201,7 +243,7 @@ pub(super) async fn log_is_complete(pool: &PgPool, exec_id: Uuid) -> Result<bool
     .await
     .status_internal("AppendLog gate: completeness check")?;
 
-    Ok(manifest_covers_contiguously(&chunks, final_line_count))
+    Ok(manifest_covers_contiguously(&chunks, up_to))
 }
 
 /// Does an `ORDER BY first_line` manifest cover a contiguous
@@ -356,6 +398,9 @@ mod tests {
         assert_eq!(ok.exec_id, exec);
         // The normalized 32-char form, ready for chunk-key construction.
         assert_eq!(ok.drv_hash, "0cnyg10nhcqdl6ck2dwgmnzh7lcyhkzm");
+        // No drv_executions row at all (let alone a terminal one): the
+        // session has no append ceiling yet.
+        assert_eq!(ok.final_line_count, None);
     }
 
     // r[verify store.log.append-auth]
@@ -444,9 +489,17 @@ mod tests {
         // Coverage [0, 50) then a gap — lines 50..100 are missing.
         seed_chunk(&db.pool, exec, 0, 0, 50).await;
 
-        check_append_open(&db.pool, &claims("builder-0", DRV), &header(DRV_PATH, exec))
+        let ok = check_append_open(&db.pool, &claims("builder-0", DRV), &header(DRV_PATH, exec))
             .await
             .expect("a terminal-but-incomplete execution must accept the late replay");
+        // The admitted replay carries the recorded end with it: the
+        // ingest session enforces it as the per-append ceiling so the
+        // replay can fill [50, 100) but never append at or past 100.
+        assert_eq!(
+            ok.final_line_count,
+            Some(100),
+            "an already-terminal execution's recorded end must ride back to the session"
+        );
     }
 
     // r[verify store.log.completeness-gate]

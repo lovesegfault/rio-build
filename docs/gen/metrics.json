@@ -1133,7 +1133,7 @@
       {
         "name": "rio_store_log_ingest_rejected_total",
         "kind": "counter",
-        "help": "Log batches dropped at the ingest input gates, by reason: non_monotonic / line_number_overflow (malformed worker numbering, per-batch, stream stays open) or byte_cap (per-execution cap, stream-fatal). Sustained non-zero = a misbehaving or hostile builder."
+        "help": "Log batches dropped at the ingest input gates, by reason: non_monotonic / line_number_overflow (malformed worker numbering, per-batch, stream stays open), past_final_line_count (lines at or past the execution's recorded end after the completeness seal lands; per-batch, stream stays open, also counted once per straddling batch that is truncated rather than dropped whole) or byte_cap (per-execution cap, stream-fatal). Sustained non-zero = a misbehaving or hostile builder."
       },
       {
         "name": "rio_store_log_ingest_streams_aborted_total",

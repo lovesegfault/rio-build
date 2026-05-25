@@ -380,11 +380,13 @@ impl LogService for LogServiceImpl {
             // Dev mode (no HMAC verifier): no claims to bind against.
             // Trust the header's identity but keep the completeness
             // seal — a complete log must not accept appends even from a
-            // dev-mode caller.
+            // dev-mode caller — and the per-append ceiling that rides
+            // back to the session with it.
             None => {
                 let exec_id: Uuid = header.exec_id.parse().map_err(|_| {
                     Status::invalid_argument("AppendLog: header.exec_id is not a valid UUID")
                 })?;
+                let final_line_count = gate::sealed_final_line_count(&self.pool, exec_id).await?;
                 if gate::log_is_complete(&self.pool, exec_id).await? {
                     return Err(Status::failed_precondition(
                         "AppendLog: this execution's log is already complete",
@@ -393,6 +395,7 @@ impl LogService for LogServiceImpl {
                 GateOk {
                     drv_hash: rio_nix::store_path::drv_log_hash(&header.derivation_path),
                     exec_id,
+                    final_line_count,
                 }
             }
         };
@@ -438,12 +441,21 @@ impl LogService for LogServiceImpl {
         }
 
         // -- 6. The session, the registry entry, and the driver task.
-        let session = IngestSession::new(
+        let mut session = IngestSession::new(
             exec_id,
             session_id,
             gate_ok.drv_hash,
             self.ingest_config.clone(),
         );
+        if let Some(n) = gate_ok.final_line_count {
+            // The execution is already terminal with a recorded end
+            // (the late-replay case): the session is born knowing its
+            // append ceiling. A negative count is unrepresentable on
+            // the write side (the scheduler stores the proto's u64);
+            // clamp defensively rather than wrap.
+            // r[impl store.log.completeness-gate]
+            session.set_final_line_count(n.max(0) as u64);
+        }
         let shared = Arc::clone(session.shared());
         // A previous session for the same execution on this replica
         // (its lease was stolen by `acquire`'s same-pod arm, or it is
@@ -884,7 +896,8 @@ impl AppendDriver {
                             // Per-batch rejections: counted inside
                             // `accept`, the stream stays open.
                             Ok(AcceptOutcome::RejectedNonMonotone)
-                            | Ok(AcceptOutcome::RejectedOverflow) => {}
+                            | Ok(AcceptOutcome::RejectedOverflow)
+                            | Ok(AcceptOutcome::RejectedPastFinal) => {}
                             // Stream-fatal (the per-execution byte cap).
                             Err(status) => return LoopExit::Abort(status),
                         }
@@ -920,7 +933,33 @@ impl AppendDriver {
                 }
                 _ = heartbeat_interval.tick() => {
                     match sessions::heartbeat(&self.pool, self.session.exec_id, self.session.session_id).await {
-                        Ok(HeartbeatOutcome::Renewed) => {}
+                        Ok(HeartbeatOutcome::Renewed) => {
+                            // Piggyback the completeness-ceiling refresh
+                            // on the heartbeat's existing 15 s DB
+                            // cadence: a seal that lands mid-stream (the
+                            // scheduler stamps the terminal row while
+                            // the builder is still streaming) is
+                            // observed within one heartbeat, after which
+                            // accept() drops lines at or past the
+                            // recorded end. Skipped once known — the
+                            // count is stamped once and never changes.
+                            // Lines accepted between the stamp and this
+                            // refresh are the bounded residual; they are
+                            // over-coverage the completeness fold
+                            // already tolerates, not silent loss.
+                            // A refresh failure (PG blip) just retries
+                            // next tick.
+                            // r[impl store.log.completeness-gate]
+                            if self.session.final_line_count().is_none()
+                                && let Ok(Some(n)) = gate::sealed_final_line_count(
+                                    &self.pool,
+                                    self.session.exec_id,
+                                )
+                                .await
+                            {
+                                self.session.set_final_line_count(n.max(0) as u64);
+                            }
+                        }
                         Ok(HeartbeatOutcome::Lost) => {
                             metrics::counter!(
                                 "rio_store_log_ingest_streams_aborted_total",
@@ -1551,6 +1590,69 @@ mod tests {
         assert!(
             !is_complete,
             "no terminal drv_executions row yet => the log cannot be complete"
+        );
+    }
+
+    /// store.log.completeness-gate, the per-append half: a builder
+    /// holding a still-current assignment token for a
+    /// terminal-but-incomplete execution is admitted (the late replay
+    /// that completes the log MUST be admitted) but cannot grow the log
+    /// past the build's recorded end — accepted lines numbered at or
+    /// past `final_line_count` are dropped at ingest, never stored, and
+    /// never served. Without the per-append comparison the open-time
+    /// seal is the only enforcement and a live stream can append
+    /// arbitrary content past the end the build actually produced.
+    // r[verify store.log.completeness-gate]
+    #[tokio::test]
+    async fn append_past_final_line_count_is_dropped() {
+        let mut h = harness().await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        // The build finished and reported 2 lines (0 and 1), but no
+        // chunk ever landed: terminal, incomplete — the gate admits the
+        // replay that is supposed to fill the gap.
+        sqlx::query(
+            "UPDATE drv_executions SET status = 'succeeded', finished_at = now(), \
+             final_line_count = 2 WHERE exec_id = $1",
+        )
+        .bind(exec)
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+        let tok = token("builder-0", DRV);
+
+        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("a terminal-but-incomplete execution must admit the late replay");
+        // The legitimate replay: the two lines the build actually
+        // produced, ending exactly at final_line_count.
+        tx.send(batch_msg(0, &["line zero", "line one"]))
+            .await
+            .unwrap();
+        // The injection: a batch starting at the recorded end. Nothing
+        // in it can be part of the log.
+        tx.send(batch_msg(2, &["injected two", "injected three"]))
+            .await
+            .unwrap();
+        drop(tx);
+        // Drain the acks until the stream closes (the final drain cuts
+        // whatever was buffered).
+        while let Ok(Some(_)) = acks.message().await {}
+
+        let resp = h
+            .client
+            .tail_log(tail_req(exec, false))
+            .await
+            .expect("tail");
+        let (lines, is_complete) = collect_tail(resp.into_inner()).await.expect("collect");
+        assert_eq!(
+            lines.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 1],
+            "lines at or past the recorded final_line_count must be dropped at ingest, \
+             not stored and served"
+        );
+        assert!(
+            is_complete,
+            "the replay covered [0, 2): the log must read as complete"
         );
     }
 

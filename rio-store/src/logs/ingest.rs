@@ -134,6 +134,13 @@ pub enum AcceptOutcome {
     /// number that cannot round-trip through `drv_log_chunks.first_line`
     /// would corrupt the read path's attribution).
     RejectedOverflow,
+    /// Every line in the batch is numbered at or past the execution's
+    /// recorded `final_line_count`: the build's log ends below this
+    /// batch's first line, so nothing in it can be part of the log
+    /// (`store.log.completeness-gate`). The legitimate late replay
+    /// never sends these — the count is the builder's own post-footer
+    /// high-water mark from its `CompletionReport`.
+    RejectedPastFinal,
 }
 
 /// Why [`IngestSession::should_abort`] wants the stream torn down.
@@ -308,6 +315,14 @@ pub struct IngestSession {
     /// one past the last accepted line. Forward gaps are allowed
     /// (`first_line_number > high_water_line`); going backwards is not.
     high_water_line: u64,
+    /// The exclusive upper bound on acceptable line numbers: the
+    /// execution's recorded `final_line_count`, once known. Seeded
+    /// from the open-time gate for an already-terminal execution (the
+    /// late replay) and refreshed by the handler's heartbeat tick for
+    /// a seal that lands mid-stream. `None` until the scheduler stamps
+    /// the lifecycle row terminal with a known count — until then no
+    /// ceiling applies.
+    final_line_count: Option<u64>,
     /// Total post-truncation bytes accepted over the session's lifetime
     /// (never decremented on cut). Compared against
     /// [`IngestConfig::per_exec_byte_cap`].
@@ -332,9 +347,27 @@ impl IngestSession {
             config,
             next_seq: 0,
             high_water_line: 0,
+            final_line_count: None,
             accepted_bytes: 0,
             consecutive_cut_failures: 0,
         }
+    }
+
+    /// The per-append ceiling, if the execution's recorded end is
+    /// known yet. The handler's periodic refresh uses `is_none()` to
+    /// decide whether it still needs to consult the lifecycle row.
+    pub fn final_line_count(&self) -> Option<u64> {
+        self.final_line_count
+    }
+
+    /// Record the execution's `final_line_count` as the exclusive
+    /// upper bound on acceptable line numbers
+    /// (`store.log.completeness-gate`: accepted lines numbered at or
+    /// past it are dropped). The count is stamped once at terminal and
+    /// never changes, so the first observed value wins and later calls
+    /// are no-ops.
+    pub fn set_final_line_count(&mut self, n: u64) {
+        self.final_line_count.get_or_insert(n);
     }
 
     /// The shared buffer + subscriber-list handle. The `TailLog` path
@@ -433,11 +466,63 @@ impl IngestSession {
             return Ok(AcceptOutcome::RejectedNonMonotone);
         }
 
+        // -- The completeness ceiling. Once the execution's lifecycle
+        // row is terminal with a known `final_line_count`, that count
+        // is one past the last line the build produced (the builder's
+        // own post-footer high-water mark from its CompletionReport):
+        // lines numbered at or past it cannot be part of the log and
+        // are dropped, so a builder holding a still-current token for
+        // a terminal-but-incomplete execution can fill the gap below
+        // the recorded end but never grow the log past it. A batch
+        // starting at or past the ceiling is dropped whole; one that
+        // straddles it keeps only the lines below it. Lines accepted
+        // before the ceiling is learned (the seal lands mid-stream and
+        // the handler's refresh has not observed it yet) are the
+        // bounded residual disclosed at the refresh site.
+        // r[impl store.log.completeness-gate]
+        let mut end = end;
+        let mut batch_lines = batch.lines;
+        if let Some(ceiling) = self.final_line_count {
+            if batch.first_line_number >= ceiling {
+                metrics::counter!(
+                    "rio_store_log_ingest_rejected_total",
+                    "reason" => "past_final_line_count"
+                )
+                .increment(1);
+                tracing::debug!(
+                    exec_id = %self.exec_id,
+                    first_line_number = batch.first_line_number,
+                    final_line_count = ceiling,
+                    "rejected log batch: every line is at or past the recorded final_line_count"
+                );
+                return Ok(AcceptOutcome::RejectedPastFinal);
+            }
+            if end > ceiling {
+                // Straddles the recorded end: keep [first, ceiling),
+                // drop [ceiling, end).
+                let keep = (ceiling - batch.first_line_number) as usize;
+                let dropped = batch_lines.len() - keep;
+                batch_lines.truncate(keep);
+                end = ceiling;
+                metrics::counter!(
+                    "rio_store_log_ingest_rejected_total",
+                    "reason" => "past_final_line_count"
+                )
+                .increment(1);
+                tracing::debug!(
+                    exec_id = %self.exec_id,
+                    first_line_number = batch.first_line_number,
+                    final_line_count = ceiling,
+                    dropped,
+                    "truncated log batch at the recorded final_line_count"
+                );
+            }
+        }
+
         // -- Truncation BEFORE byte accounting, so an oversized line
         // cannot defeat the byte cap (the scheduler's gate has the same
         // ordering for the same reason).
-        let lines: Vec<Vec<u8>> = batch
-            .lines
+        let lines: Vec<Vec<u8>> = batch_lines
             .into_iter()
             .map(|line| {
                 if line.len() > MAX_LINE_LEN {
@@ -454,7 +539,10 @@ impl IngestSession {
         // and is what every resource bound (the cut trigger, the
         // lifetime cap, buffer_bytes) is charged — they bound memory and
         // storage, and a line costs its header even when its content is
-        // one byte.
+        // one byte. Both (and the accepted-lines metric) are computed
+        // over the post-ceiling, post-truncation lines: only what is
+        // actually buffered is counted or charged.
+        let accepted_line_count = lines.len() as u64;
         let content_bytes: u64 = lines.iter().map(|l| l.len() as u64).sum();
         let batch_bytes: u64 = lines.iter().map(|l| accounted_len(l)).sum();
 
@@ -521,7 +609,7 @@ impl IngestSession {
 
         self.high_water_line = end;
         self.accepted_bytes += batch_bytes;
-        metrics::counter!("rio_store_log_ingest_lines_total").increment(line_count);
+        metrics::counter!("rio_store_log_ingest_lines_total").increment(accepted_line_count);
         metrics::counter!("rio_store_log_ingest_bytes_total").increment(content_bytes);
 
         Ok(AcceptOutcome::Accepted { cut_due })
@@ -880,6 +968,58 @@ mod tests {
         assert!(matches!(
             session.accept(batch(0, 1)).unwrap(),
             AcceptOutcome::Accepted { .. }
+        ));
+    }
+
+    /// store.log.completeness-gate, the per-append comparison: once the
+    /// execution's recorded `final_line_count` is known, accepted lines
+    /// numbered at or past it are dropped — a batch starting at or past
+    /// the ceiling is rejected whole, a batch straddling it keeps only
+    /// the lines below it, and lines below it are unaffected. The
+    /// stream stays open throughout (per-batch rejection, like the
+    /// other input gates).
+    // r[verify store.log.completeness-gate]
+    #[test]
+    fn drops_lines_at_or_past_final_line_count() {
+        let mut session = new_session(test_config());
+        // The build's recorded end: 8 lines, 0..=7.
+        session.set_final_line_count(8);
+
+        // Entirely below the ceiling: accepted untouched.
+        assert!(matches!(
+            session.accept(batch(0, 5)).unwrap(),
+            AcceptOutcome::Accepted { .. }
+        ));
+        assert_eq!(buffered_line_count(&session), 5);
+
+        // Straddles the ceiling: lines 5..=7 kept, 8 and 9 dropped.
+        assert!(matches!(
+            session.accept(batch(5, 5)).unwrap(),
+            AcceptOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            buffered_line_count(&session),
+            8,
+            "a batch straddling final_line_count must keep only the lines below it"
+        );
+
+        // Entirely at/past the ceiling: dropped whole, nothing buffered.
+        assert!(matches!(
+            session.accept(batch(8, 3)).unwrap(),
+            AcceptOutcome::RejectedPastFinal
+        ));
+        assert_eq!(
+            buffered_line_count(&session),
+            8,
+            "a batch starting at or past final_line_count must not be buffered"
+        );
+
+        // The first observed value wins: a later (different) set is a
+        // no-op, so the ceiling cannot be moved once learned.
+        session.set_final_line_count(100);
+        assert!(matches!(
+            session.accept(batch(8, 3)).unwrap(),
+            AcceptOutcome::RejectedPastFinal
         ));
     }
 
