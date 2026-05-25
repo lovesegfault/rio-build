@@ -24,10 +24,11 @@ test-fixtures = ["dep:toml"]
 
 [dependencies]
 rio-common = { workspace = true }
-# ExitOutcome consumed by the native-executor result classification
-# (executor/native_result). The full execute() integration lands at
-# activation; the dependency exists now so the classification is written
-# against the real type rather than a local mirror of it.
+# Native sandbox executor (namespaces, seccomp, pty capture). Two
+# consumers until activation wires the full pipeline: the request glue
+# (executor/glue/) translates derivations into build-system-agnostic
+# ExecutionRequests, and the result classification (executor/native_result)
+# consumes ExitOutcome. Nothing Nix-specific lives below that boundary.
 rio-exec = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }

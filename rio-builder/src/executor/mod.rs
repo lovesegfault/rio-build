@@ -39,6 +39,13 @@ use crate::overlay;
 use crate::upload;
 
 mod daemon;
+// Native-executor request glue: Derivation → rio_exec::ExecutionRequest
+// + the `@nix` log filter. Not yet wired into execute_build — the
+// activation milestone replaces run_daemon_lifecycle with
+// rio_exec::execute() and consumes this module; until then it is
+// compiled + unit-tested standalone.
+#[allow(dead_code)] // removed at activation (M7)
+pub(crate) mod glue;
 mod inputs;
 mod monitors;
 mod native_result;

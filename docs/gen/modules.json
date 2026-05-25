@@ -58,6 +58,31 @@
       "doc": "Daemon I/O after spawn: handshake, wopBuildDerivation, STDERR loop, log batching."
     },
     {
+      "path": "executor/glue/",
+      "depth": 1,
+      "doc": "Nix request glue: `Derivation` → [`rio_exec::ExecutionRequest`]."
+    },
+    {
+      "path": "executor/glue/attrs.rs",
+      "depth": 2,
+      "doc": "`__structuredAttrs` materialization: `.attrs.json` and `.attrs.sh`."
+    },
+    {
+      "path": "executor/glue/env.rs",
+      "depth": 2,
+      "doc": "Builder environment materialization and placeholder rewriting."
+    },
+    {
+      "path": "executor/glue/log.rs",
+      "depth": 2,
+      "doc": "The `@nix` log side-channel filter."
+    },
+    {
+      "path": "executor/glue/refs_graph.rs",
+      "depth": 2,
+      "doc": "`exportReferencesGraph` materialization."
+    },
+    {
       "path": "executor/inputs.rs",
       "depth": 1,
       "doc": "Input fetching: .drv from store, metadata, input closure, FOD hash verification."
@@ -719,6 +744,11 @@
       "path": "derivation/hash.rs",
       "depth": 1,
       "doc": "Modular derivation hashing (Nix `hashDerivationModulo`)."
+    },
+    {
+      "path": "derivation/structured.rs",
+      "depth": 1,
+      "doc": "`__structuredAttrs`-aware attribute lookup."
     },
     {
       "path": "hash.rs",
