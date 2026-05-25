@@ -1,8 +1,9 @@
 //! Directory-DAG delta-sync: discover what changed, fetch only that.
 //!
-//! [`sync_closure`] copies a set of store paths from a remote rio-store
-//! into the gateway's local rio-store without transferring the bytes
-//! the local store already holds. Discovery is a BFS over the remote's
+//! [`super::try_substitute_missing`] copies a set of store paths from
+//! a remote rio-store into the gateway's local rio-store without
+//! transferring the bytes the local store already holds. Discovery is
+//! a BFS over the remote's
 //! castore Directory DAG, pruned at every subtree whose `dir_digest`
 //! the local store already has — RPC count and transfer volume scale
 //! with the *change* between the two stores, not with the closure size
@@ -40,9 +41,10 @@ use std::collections::{HashMap, HashSet};
 use rio_nix::nar::{self, NarEntry, NarNode};
 use rio_proto::types::{NarIndex, NarIndexEntry};
 
-/// Counters accumulated over one [`sync_closure`] call. Emitted as
-/// `rio_gateway_dagsync_*` by the caller; kept as a plain struct so
-/// the walk is unit-testable without a metrics recorder.
+/// Counters accumulated over one [`super::try_substitute_missing`]
+/// call. Emitted as `rio_gateway_dagsync_*` by the caller; kept as a
+/// plain struct so the walk is unit-testable without a metrics
+/// recorder.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SyncStats {
     /// Subtree roots skipped because the local store already had the

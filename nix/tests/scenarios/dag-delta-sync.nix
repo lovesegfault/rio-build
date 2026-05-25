@@ -283,6 +283,16 @@ pkgs.testers.runNixOSTest {
     # identical to what the client built locally.
     # ══════════════════════════════════════════════════════════════════
     with subtest("dag-delta-sync: reassembled path round-trips byte-identically"):
+        # The freshly-synced path has no path_tenants row in store-A
+        # and no trusted signature, so the I-217 tenant-visibility gate
+        # hides it from the tenant's NEXT read — exactly as it would a
+        # whole-NAR `nix copy` push. Tag ownership the same way the
+        # test did for the pre-seeded closures (production registers
+        # ownership at build completion / replication time).
+        psql(${gatewayHost},
+            "INSERT INTO path_tenants (store_path_hash, tenant_id) "
+            f"SELECT store_path_hash, '{tid}' FROM narinfo "
+            "ON CONFLICT DO NOTHING")
         client.succeed("mkdir -p /root/verify")
         client.succeed(
             f"nix copy --no-check-sigs --from 'ssh-ng://${gatewayHost}' "

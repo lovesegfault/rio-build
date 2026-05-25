@@ -6,8 +6,8 @@
 //! if a peer rio-store is configured — materialize the missing paths
 //! itself by delta-syncing them from the peer instead of making the
 //! client push whole NARs over SSH. The discovery and transfer scale
-//! with what *changed* between the two stores (see
-//! [`dag_sync`]'s module docs for the algorithm).
+//! with what *changed* between the two stores (see the `dag_sync`
+//! submodule's docs for the algorithm).
 //!
 //! ## Capability dispatch
 //!
