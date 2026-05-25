@@ -15,10 +15,15 @@
 //!   two consumers must yield empty if either side is empty.
 //!
 //! The scheduler's merge/dispatch/recovery classification and the
-//! gateway's will-dispatch prediction + DAG dedup MUST agree on both,
-//! or the gateway predicts a different cache-hit verdict than the
-//! scheduler delivers. This module is the single implementation both
-//! crates call; do not re-derive the algebra at a call site.
+//! gateway's will-dispatch prediction + DAG dedup all call this single
+//! implementation; do not re-derive the algebra at a call site. The
+//! gateway predicts from its own submission's wanted set, while the
+//! scheduler classifies against its effective wanted set scoped to
+//! live interested builds — which may be narrower or wider than any
+//! one submission's. The prediction is an inlining optimization (a
+//! wrong guess costs bytes or a worker→store round-trip), not a
+//! correctness contract; what must not drift between the two crates
+//! is the sentinel/saturation algebra itself.
 
 /// The wanted subset of `expected_output_paths`, resolved by zipping the
 /// (`output_names` ↔ `expected_output_paths`) parallel arrays and keeping
@@ -34,7 +39,7 @@
 /// will-dispatch prediction operates on the proto type itself; every
 /// call site MUST share one implementation or the hit criterion drifts
 /// between prediction time, merge time, and dispatch time.
-// r[impl sched.merge.wanted-outputs]
+// r[impl sched.merge.wanted-outputs+2]
 pub fn wanted_subset<'a>(
     output_names: &'a [String],
     expected_output_paths: &'a [String],
@@ -67,7 +72,7 @@ pub fn wanted_subset<'a>(
 /// fall back to all declared paths, or treat the node as unavailable.
 /// Falling through to a from-source build / the full merge is always
 /// safe; a false "complete" is not.
-// r[impl sched.merge.wanted-outputs]
+// r[impl sched.merge.wanted-outputs+2]
 pub fn verifiable_wanted_paths<'a>(
     output_names: &'a [String],
     expected_output_paths: &'a [String],
@@ -83,12 +88,16 @@ pub fn verifiable_wanted_paths<'a>(
 /// Union `src` into `dst`, saturating on the empty (= "all declared
 /// outputs wanted") sentinel.
 ///
-/// The wanted set only ever grows — never shrink it while any
-/// interested build is live, or build B's `{out}` could un-want
-/// build A's still-needed `dev`. Empty is the "all declared outputs
-/// wanted" sentinel, so the union saturates: `all ∪ X = all`. If either
-/// side is empty, the result is empty (= all). Otherwise the result is
-/// the sorted, deduplicated set union.
+/// The STORED node-level union only ever grows — never shrink it, or
+/// build B's `{out}` could un-want build A's still-needed `dev` in the
+/// persisted fallback. Live-build scoping happens elsewhere: the
+/// scheduler folds per-build contributions with this same helper into
+/// an effective wanted set over LIVE interested builds, so a terminal
+/// build's wants stop counting without the stored union ever
+/// shrinking. Empty is the "all declared outputs wanted" sentinel, so
+/// the union saturates: `all ∪ X = all`. If either side is empty, the
+/// result is empty (= all). Otherwise the result is the sorted,
+/// deduplicated set union.
 ///
 /// Shared by the scheduler's merge-time `DerivationState::union_wanted`,
 /// the gateway's multi-root DAG dedup, and (in SQL) the PG upsert's
@@ -111,7 +120,7 @@ pub fn union_wanted_saturating(dst: &mut Vec<String>, src: &[String]) {
 mod tests {
     use super::*;
 
-    // r[verify sched.merge.wanted-outputs]
+    // r[verify sched.merge.wanted-outputs+2]
     /// The saturation algebra of [`union_wanted_saturating`]: empty is
     /// the "all outputs wanted" sentinel, so the union of "all" with
     /// anything saturates to "all" (stays/becomes empty) regardless of

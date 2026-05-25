@@ -826,11 +826,13 @@ pub struct DerivationState {
     pub expected_output_paths: Vec<String>,
     /// Output NAMES any consumer actually references (∪ over parents'
     /// inputDrvs sets ∪ the root OutputsSpec). EMPTY = all declared
-    /// outputs wanted. Only the cache-hit/substitute classification and
-    /// the substitute-walk failure criterion consult this; everything
-    /// else (assignment token, GC pins, prefetch, client output report)
-    /// keeps using expected_output_paths. Grows monotonically via
-    /// union_wanted() — never shrink while any interested build is live.
+    /// outputs wanted. This is the STORED node-level union: it grows
+    /// monotonically via union_wanted(), never shrinks, and is what the
+    /// persistence upsert and recovery carry. Classification consults
+    /// it only as the conservative fallback when [`effective_wanted`]
+    /// cannot resolve a live-build union from [`Self::wanted_by_build`];
+    /// everything else (assignment token, GC pins, prefetch, client
+    /// output report) keeps using expected_output_paths.
     pub wanted_output_names: Vec<String>,
     /// Per-build wanted-output contributions: for each interested build,
     /// the `wanted_output_names` of THAT build's submission for this
@@ -1666,7 +1668,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.merge.wanted-outputs]
+    // r[verify sched.merge.wanted-outputs+2]
     /// `union_wanted` semantics: empty is the "all outputs wanted"
     /// sentinel, so the union of "all" with anything saturates to "all"
     /// (stays/becomes empty). Non-empty ∪ non-empty is a sorted,

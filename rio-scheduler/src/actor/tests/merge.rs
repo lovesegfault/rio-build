@@ -414,7 +414,7 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.stale-completed-verify+4]
+// r[verify sched.merge.stale-completed-verify+5]
 /// CA realisation cache-check: realisation row in PG ± path in store.
 ///
 /// - **stale** (I-048): realisation row exists but path GC'd from store
@@ -531,7 +531,7 @@ async fn test_fixed_ca_fod_path_based_lane(
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// THE incident scenario: a multi-output derivation whose only missing
 /// output is one nothing wants (glibc-debug) must classify as a cache
 /// hit, not fall through to a from-source build dispatch. Three cases:
@@ -1136,7 +1136,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: a root whose `wanted_output_names` matches NO
 /// declared output (a client sending `drv^bogus` — the gateway does
 /// not validate the root OutputsSpec against the drv's declared
@@ -1407,7 +1407,7 @@ enum GcState {
     StoreUnreachable,
 }
 
-// r[verify sched.merge.stale-completed-verify+4]
+// r[verify sched.merge.stale-completed-verify+5]
 // r[verify sched.merge.stale-substitutable]
 /// Pre-existing `Completed` node verification at merge time.
 ///
@@ -1545,8 +1545,8 @@ async fn test_preexisting_completed_gc_matrix(
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
-// r[verify sched.merge.stale-completed-verify+4]
+// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.stale-completed-verify+5]
 /// `verify_preexisting_completed` × the LIVE effective wanted set: a
 /// missing recorded output of a pre-existing Completed node is forgiven
 /// (no Completed→Ready reset) only when NO live interested build wants
@@ -1690,7 +1690,7 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// `check_cached_outputs` × the LIVE effective wanted set: the merge-time
 /// cache-hit classification must be evaluated against the union of the
 /// wanted contributions of LIVE interested builds, not the never-shrinking
@@ -1800,7 +1800,7 @@ async fn merge_cache_hit_classified_against_live_builds_effective_wanted(
 }
 
 // r[verify sched.merge.stale-substitutable]
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// `verify_preexisting_completed` ROUTING × wanted outputs: once the
 /// reset HAS fired (a wanted recorded output is missing), the choice
 /// between the detached re-substitution (`to_spawn`) and the ready
@@ -2590,7 +2590,7 @@ async fn merge_hydrates_resource_floor_from_db() -> TestResult {
 // deferred re-probe on Poisoned-at-limit
 // ===========================================================================
 
-// r[verify sched.merge.stale-completed-verify+4]
+// r[verify sched.merge.stale-completed-verify+5]
 /// I-047 dep-gating: when GC sweeps a chain {A→B}, both reset; A goes
 /// to `Queued` (NOT `Ready`) so it cannot dispatch ahead of B. Without
 /// the two-pass reset, A and B both reset to `Ready` and A can dispatch
@@ -2678,7 +2678,7 @@ async fn test_stale_reset_chain_gates_parent_at_queued() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.stale-completed-verify+4]
+// r[verify sched.merge.stale-completed-verify+5]
 /// I-047 covers `Skipped` too: a pre-existing `Skipped` node with GC'd
 /// output_paths resets the same as `Completed`. Skipped carries real
 /// output_paths and unlocks dependents via `all_deps_completed`; before
@@ -2990,7 +2990,7 @@ async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult
 }
 
 // r[verify sched.merge.reconcile-order]
-// r[verify sched.merge.stale-completed-verify+4]
+// r[verify sched.merge.stale-completed-verify+5]
 /// bug_089: `apply_cached_hits`' `reprobe_unlocked` advance fired
 /// BEFORE `verify_preexisting_completed` reset stale-Completed deps.
 /// D depends on {X, Y}. Y is stale-Completed (output GC'd). X is

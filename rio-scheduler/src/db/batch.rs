@@ -105,7 +105,10 @@ impl SchedulerDb {
         // It is therefore UNIONED on conflict, with empty saturating to
         // empty: '{}' is the "all declared outputs wanted" sentinel, so
         // all ∪ X = all (mirrors `DerivationState::union_wanted`). The
-        // wanted set only ever grows for a given drv_hash.
+        // stored union only ever grows for a given drv_hash; it is the
+        // persistence/recovery fallback — classification reads the live
+        // effective set (`effective_wanted`, in-memory per-build
+        // contributions) and only falls back to this column.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations

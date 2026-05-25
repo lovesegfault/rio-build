@@ -1114,7 +1114,7 @@ impl DagActor {
         let missing = self.batch_probe_orphan_outputs(all_outputs).await;
 
         for o in orphaned {
-            // r[impl sched.merge.wanted-outputs]
+            // r[impl sched.merge.wanted-outputs+2]
             // Did the build complete while the scheduler was down
             // (orphan completion)? All WANTED outputs present = none in
             // `missing` (the probe set stays all expected paths; an

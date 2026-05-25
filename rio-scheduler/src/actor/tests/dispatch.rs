@@ -1223,7 +1223,7 @@ async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// `batch_probe_cached_ready` × wanted outputs: a Ready node whose only
 /// missing output is one nothing wants must be completed inline by the
 /// dispatch-time batch probe instead of staying Ready forever / being
@@ -1270,7 +1270,7 @@ async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// `ready_check_or_spawn` × wanted outputs: same scenario as
 /// [`batch_probe_completes_on_missing_unwanted_output`] but through the
 /// per-drv fallback path. The multi-output node is a PARENT promoted to
@@ -1337,7 +1337,7 @@ async fn ready_check_completes_on_missing_unwanted_output() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// `batch_probe_cached_ready` × the LIVE effective wanted set: same
 /// liveness gate as the merge-time test, evaluated by the dispatch-time
 /// batch probe. Build A (wants ALL outputs via the empty sentinel)
@@ -4015,7 +4015,7 @@ async fn walk_demotes_after_not_found_retries_exhausted() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// A forgivable (unwanted) seed is forgiven on its FIRST failure of any
 /// kind — it must not burn the 8-attempt retry ladder first. The path
 /// is still attempted once (opportunistic completeness) but a transient
@@ -4232,7 +4232,7 @@ async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+3]
 /// End-to-end forgiveness: a derivation classified as
 /// pending-substitute whose UNWANTED seed fails the upstream GET must
@@ -4315,7 +4315,7 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+3]
 /// The substitute walk's forgivable-seed set × the LIVE effective wanted
 /// set: a declared output path is forgivable only when NO LIVE build
@@ -4422,7 +4422,7 @@ async fn substitute_forgivable_set_follows_live_builds_effective_wanted(
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+3]
 /// An UNRESOLVABLE wanted set (non-empty but matching no declared
 /// output name — a `drv^bogus` root the gateway didn't validate) must
@@ -4478,7 +4478,7 @@ async fn substitute_walk_unresolvable_wanted_set_forgives_nothing() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+3]
 /// The forgivable set is snapshotted at spawn time, but a detached
 /// fetch can run for minutes — a second build merging during that
@@ -4547,7 +4547,7 @@ async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> Test
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+3]
 /// Once a forgiven seed has triggered a downgrade (it became wanted
 /// mid-fetch), it must NEVER be treated as forgivable again for that
@@ -4678,7 +4678,7 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.merge.substitute-topdown+4]
 // r[verify sched.substitute.detached+3]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
@@ -4804,7 +4804,7 @@ async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+3]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// node whose dependency is Poisoned (the I-094 reprobe lane):

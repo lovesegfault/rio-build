@@ -677,7 +677,7 @@ impl DagActor {
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
             let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
-            // r[impl sched.merge.wanted-outputs]
+            // r[impl sched.merge.wanted-outputs+2]
             // Demand-driven completeness: only the WANTED outputs must
             // be present (→ complete inline) or present-or-
             // substitutable (→ detached fetch). A missing output
@@ -859,7 +859,7 @@ impl DagActor {
             ) {
                 state.retry.clear();
             }
-            // r[impl sched.merge.wanted-outputs]
+            // r[impl sched.merge.wanted-outputs+2]
             // The forgivable seed subset: declared output paths whose
             // name is OUTSIDE the (non-empty) wanted set. The walk
             // still attempts them (opportunistic completeness) but
@@ -1056,7 +1056,7 @@ impl DagActor {
             return;
         }
         let topdown_pruned = state.topdown_pruned;
-        // r[impl sched.merge.wanted-outputs]
+        // r[impl sched.merge.wanted-outputs+2]
         // The walk's forgiveness verdict was computed against the
         // wanted set as of SPAWN time. A build that merged during the
         // (potentially minutes-long) detached fetch can have made a
@@ -1228,7 +1228,7 @@ impl DagActor {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
-        // r[impl sched.merge.wanted-outputs]
+        // r[impl sched.merge.wanted-outputs+2]
         // Downgrade re-spawn: two revert targets must not wait for
         // "the next pass" to re-substitute the delta.
         //
@@ -1417,7 +1417,7 @@ impl DagActor {
             }
             state.probed_generation = probe_gen;
             let substitute_tried = state.substitute_tried;
-            // r[impl sched.merge.wanted-outputs]
+            // r[impl sched.merge.wanted-outputs+2]
             // Demand-driven completeness: the probe set stays ALL
             // expected paths, but the present/substitutable verdicts
             // below are evaluated over the WANTED subset only — the

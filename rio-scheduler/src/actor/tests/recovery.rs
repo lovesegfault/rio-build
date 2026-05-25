@@ -731,7 +731,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.wanted-outputs+2]
 /// Orphan adoption × wanted outputs: an orphaned assignment (worker
 /// gone) whose only missing output is one nothing wants must still be
 /// adopted as completed. The worker built and uploaded every output

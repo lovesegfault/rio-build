@@ -596,7 +596,7 @@ impl DagActor {
         // otherwise newly-inserted dependents would be unlocked against a
         // dep whose output is gone, and the worker fails on isValidPath.
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify+4]
+        // r[impl sched.merge.stale-completed-verify+5]
         let stale_reset = self
             .verify_preexisting_completed(
                 nodes,
@@ -1448,7 +1448,7 @@ impl DagActor {
                 continue;
             }
             state.output_paths.clear();
-            // r[impl sched.merge.stale-completed-verify+4]
+            // r[impl sched.merge.stale-completed-verify+5]
             // Pre-existing Ready parents of this reset node were Ready
             // against its now-gone output. Collect for demotion to
             // Queued after pass 2 (try_dispatch_one's `!= Ready` guard
@@ -1494,7 +1494,7 @@ impl DagActor {
             // metric above stays — output WAS gone, even if upstream
             // can re-provide it.
             //
-            // r[impl sched.merge.wanted-outputs]
+            // r[impl sched.merge.wanted-outputs+2]
             // Like the reset decision above, the routing forgives
             // `unwanted` paths: a recorded output no LIVE interested
             // build wants (typically never present and not
@@ -1851,7 +1851,7 @@ impl DagActor {
         // falls through to build — so a true miss costs one extra fetch
         // attempt, not a wrong build dispatch.
         //
-        // r[impl sched.merge.wanted-outputs]
+        // r[impl sched.merge.wanted-outputs+2]
         // Demand-driven completeness: only the WANTED outputs (the ones
         // some consumer's inputDrvs names, or the root asked for) must
         // be present for a hit / present-or-substitutable for
@@ -1997,7 +1997,7 @@ impl DagActor {
         }
 
         // --- Floating-CA store-existence verify (I-048) ----------------
-        // r[impl sched.merge.stale-completed-verify+4]
+        // r[impl sched.merge.stale-completed-verify+5]
         // The realisations table is scheduler-local PG; store GC doesn't
         // touch it. A realisation can point to a path that's been GC'd.
         // Without this verify, such a node flips to Completed here and
@@ -2330,7 +2330,7 @@ impl DagActor {
         );
 
         // --- All-or-nothing: every WANTED root output available? ----
-        // r[impl sched.merge.wanted-outputs]
+        // r[impl sched.merge.wanted-outputs+2]
         // "Available" = present in store (NOT in missing_paths) OR
         // substitutable upstream. A single unavailable wanted root
         // output → fall through to the full merge. Unwanted root

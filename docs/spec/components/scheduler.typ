@@ -767,15 +767,21 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   in the priority queue is updated.
 ]
 
-#r("sched.merge.wanted-outputs")[
+#r("sched.merge.wanted-outputs+2")[
   The cache-hit and substitutability classification of a derivation MUST be
-  evaluated over its *wanted* outputs only: the union of the output names
-  referenced by any consumer's `inputDrvs` entry for it and the root request's
-  output selection, with an empty wanted set meaning every declared output.
-  The wanted set MUST only ever grow --- unioned across consumers within one
-  submission, across roots of a multi-root submission, across concurrent
-  builds merging the same derivation, and across rows in the persistence
-  upsert --- and MUST never shrink while any interested build is live. The
+  evaluated over its *wanted* outputs only. Each submission contributes, per
+  node, the union of the output names referenced by any consumer's `inputDrvs`
+  entry for it and the root request's output selection, with an empty
+  contribution meaning every declared output. Two derived sets MUST be kept
+  distinct. The *stored* per-node union MUST only ever grow --- unioned across
+  consumers within one submission, across roots of a multi-root submission,
+  across concurrent builds merging the same derivation, and across rows in the
+  persistence upsert --- and serves as the persistence/recovery fallback. The
+  *effective* wanted set used for classification is the saturating union of
+  the wanted contributions of LIVE (non-terminal) interested builds: a
+  terminal build's contribution stops counting, and classification MUST fall
+  back to the stored union when live contributions are unavailable
+  (post-failover, pre-feature rows, or no live interested builds). The
   assignment-token output allowlist, the GC pin set, and the client-facing
   output report MUST continue to cover every declared output. A wanted set
   that resolves to no verifiable concrete path MUST take a conservative
@@ -789,7 +795,15 @@ gating, its entire build-time closure --- to a from-source rebuild when every
 output that is actually consumed is present or substitutable. The probe set
 stays all declared paths (probing an unwanted path is harmless and
 opportunistically fetches it if the upstream has it); only the classification
-predicates filter by the wanted subset.
+predicates filter by the wanted subset. Classification is scoped to live
+builds because a terminal or cancelled build's wants must not keep pinning a
+shared node: under a never-shrinking classification union, one wide
+submission that has long since failed or been cancelled forces every later
+narrow re-merge to keep resetting, re-fetching, or rebuilding outputs nothing
+live asks for --- the incident class that motivated live-scoping. Per-build
+contributions are in-memory only on this branch (nothing per-build is
+persisted): after a leader failover the effective set degrades conservatively
+to the stored union until live builds re-merge their contributions.
 
 #r("sched.merge.substitute-probe")[
   The merge-time cache check (`check_cached_outputs`) MUST forward the
@@ -1258,7 +1272,7 @@ Queue-level preemption is fully supported:
   or `ClearPoison` admin RPC to override).
 ]
 
-#r("sched.merge.stale-completed-verify+4")[
+#r("sched.merge.stale-completed-verify+5")[
   When a build merges and finds a pre-existing `completed` or `skipped` node in
   the global DAG, the scheduler batches a `FindMissingPaths` against rio-store
   with that node's `output_paths` before computing initial states for
@@ -1266,9 +1280,9 @@ Queue-level preemption is fully supported:
   resets to `ready` (or `queued` if a dependency was also reset --- "ready ⟹
   all deps' outputs available" must hold), clearing `output_paths`, and
   #(refs.metric)("rio_scheduler_stale_completed_reset_total") increments. A
-  missing recorded path that the current submission positively identifies as
-  declared-but-unwanted (listed in the node's `expected_output_paths` but
-  outside its wanted subset, #rref("sched.merge.wanted-outputs")) is forgiven
+  missing recorded path that no live interested build wants (listed in the
+  node's `expected_output_paths` but outside the effective wanted set,
+  #rref("sched.merge.wanted-outputs")) is forgiven
   --- it was legitimately never produced or substituted, and resetting on it
   would ping-pong the node `completed → ready` on every re-merge; a build that
   newly wants it gets the one reset that re-opens the node and substitutes the

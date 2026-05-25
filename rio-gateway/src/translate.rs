@@ -732,7 +732,7 @@ pub async fn filter_and_inline_drv(
         // before store ready → store_client=None → fallback dead).
         // All outputs present → cache hit → never dispatches → skip.
         //
-        // r[impl sched.merge.wanted-outputs]
+        // r[impl sched.merge.wanted-outputs+2]
         // The will-dispatch prediction mirrors the scheduler's
         // demand-driven cache-hit criterion: a node whose only missing
         // outputs are ones no consumer's inputDrvs names (and the root
@@ -1560,7 +1560,7 @@ mod tests {
         Ok(())
     }
 
-    // r[verify sched.merge.wanted-outputs]
+    // r[verify sched.merge.wanted-outputs+2]
     /// Will-dispatch prediction is evaluated over the WANTED subset: a
     /// node whose only missing output is one nothing wants classifies
     /// as a cache hit at the scheduler and never dispatches, so its
