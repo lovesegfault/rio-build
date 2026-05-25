@@ -712,14 +712,16 @@
                   docsLib
                   ;
                 xtaskBin = crateBuild.memberBins.xtask;
-                # The nextest reuse-build helpers plus rio-lease's
-                # prebuilt test binary, for the mbt-rio-lease conformance
-                # check in nix/quint.nix (it runs the #[ignore]d mbt_*
-                # tests against the committed Quint model with quint on
-                # PATH — same test binary nextest-rio-lease runs,
-                # different filter and environment).
+                # The nextest reuse-build helpers plus the prebuilt
+                # rio-lease and rio-store test binaries, for the
+                # mbt-rio-lease and mbt-rio-logservice conformance
+                # checks in nix/quint.nix (they run the #[ignore]d mbt_*
+                # tests against the committed Quint models with quint on
+                # PATH — same test binaries the per-member nextest
+                # checks run, different filter and environment).
                 inherit (crateChecks) mkNextestRun mkNextestMeta;
                 rioLeaseTestBin = crateChecks.testBins.rio-lease;
+                rioStoreTestBin = crateChecks.testBins.rio-store;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM

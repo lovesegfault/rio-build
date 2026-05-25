@@ -83,13 +83,15 @@
   pkgs,
   lib,
   unfilteredRoot,
-  # nix/checks.nix's nextest reuse-build helpers and rio-lease's prebuilt
-  # test binary, threaded through misc-checks.nix. Only the mbt-rio-lease
-  # conformance check below consumes them — the model checks need
+  # nix/checks.nix's nextest reuse-build helpers and the prebuilt
+  # rio-lease / rio-store test binaries, threaded through
+  # misc-checks.nix. Only the mbt-rio-lease and mbt-rio-logservice
+  # conformance checks below consume them — the model checks need
   # nothing from the Rust build.
   mkNextestRun,
   mkNextestMeta,
   rioLeaseTestBin,
+  rioStoreTestBin,
 }:
 let
   modelsDir = unfilteredRoot + "/docs/spec/models";
@@ -102,6 +104,13 @@ let
   leaseModel = lib.fileset.toSource {
     root = modelsDir;
     fileset = modelsDir + "/leaderElection.qnt";
+  };
+
+  # Same narrowing for the LogService model, consumed by the
+  # mbt-rio-logservice conformance check below.
+  logServiceModel = lib.fileset.toSource {
+    root = modelsDir;
+    fileset = modelsDir + "/logService.qnt";
   };
 
   # One `quint verify` run per (model, main-module, invariant-set,
@@ -838,6 +847,65 @@ in
         # exit code already covers failures.
         grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
           echo "mbt-rio-lease: the mbt_* filter matched no tests" >&2
+          exit 1
+        }
+      '';
+    };
+
+    # Implementation conformance for the LogService model: rio-store/
+    # src/logs/mbt_tests.rs replays traces from logService.qnt against
+    # the real open-gate / ingest-session / chunk-manifest / read-path /
+    # TTL-sweep code, diffing the projected state (the manifest, the
+    # session high-water/ceiling/buffer, the lifecycle row's terminal
+    # stamp) after every step and re-running the real TailLog dedup walk
+    # over the manifest after every step (the servedSpanExact invariant
+    # checked against the implementation's fold instead of the model's).
+    # Six named runs span all four regime modules (base, redispatch,
+    # resend, sweep); the #[quint_run] simulation random-walks the base
+    # regime under a pinned seed. Builder-side uploader actions and the
+    # in-place buffer drop of the abort path are driver bookkeeping —
+    # the scoping rationale lives in the test module's header.
+    #
+    # Wiring: the same prebuilt rio-store test binary nextest-rio-store
+    # runs, with quint on PATH, postgres on PATH (the `member`
+    # indirection pulls in rio-store's runtimeTestInputs — the ephemeral
+    # PG the projection reads real manifest rows from), and the model
+    # staged into the remapped nextest workspace so a model edit re-runs
+    # this check.
+    #
+    # The markers cover what the replayed traces exercise end-to-end:
+    # the latest-assignment + already-complete open rejections
+    # (append-auth), the open-time seal and the per-append ceiling with
+    # its mid-stream refresh (completeness-gate), and the
+    # overlapping-session manifest dedup on the read path
+    # (session-keyed).
+    # r[verify store.log.append-auth]
+    # r[verify store.log.completeness-gate]
+    # r[verify store.log.session-keyed]
+    mbt-rio-logservice = mkNextestRun {
+      name = "mbt-rio-logservice";
+      member = "rio-store";
+      meta = mkNextestMeta { rio-store = rioStoreTestBin; };
+      extraRuntimeInputs = [ pkgs.quint ];
+      extraArgs = [
+        "-E"
+        "package(rio-store) and test(/mbt_/)"
+        "--run-ignored"
+        "all"
+      ];
+      preRun = ''
+        export RIO_MBT_SPEC_PATH=$TMPDIR/ws/docs/spec/models/logService.qnt
+      '';
+      postWsSetup = ''
+        mkdir -p $ws/docs/spec/models
+        cp ${logServiceModel}/logService.qnt $ws/docs/spec/models/
+      '';
+      postRun = ''
+        # Same no-tests guard as mbt-rio-lease: --no-tests=warn would
+        # otherwise turn a filter that matches nothing into a green
+        # check that proved nothing.
+        grep -E ' [1-9][0-9]* tests? run:' $out/log > /dev/null || {
+          echo "mbt-rio-logservice: the mbt_* filter matched no tests" >&2
           exit 1
         }
       '';
