@@ -314,6 +314,17 @@ rec {
         store = {
           enable = true;
           inherit databaseUrl;
+          # `chunk_backend` is required config (P0583: every NAR is
+          # chunked) — a store without one refuses to start. Default
+          # every fixture to a filesystem backend under the service's
+          # StateDirectory; scenarios that pass `extraStoreConfig.
+          # extraConfig` replace this wholesale and must carry their
+          # own `[chunk_backend]` table.
+          extraConfig = ''
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio/store/chunks"
+          '';
         }
         // extraStoreConfig;
         scheduler = {

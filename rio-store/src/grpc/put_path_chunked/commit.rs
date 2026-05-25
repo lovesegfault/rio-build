@@ -256,7 +256,7 @@ async fn commit_one(
     if let Some((signer, was_tenant)) = resolved_signer {
         svc.sign_with_resolved(signer, *was_tenant, &mut info);
     }
-    metadata::complete_manifest_in_conn(&mut *tx, &info, claim, None)
+    metadata::complete_manifest_in_conn(&mut *tx, &info, claim)
         .await
         .map_err(|e| putpath_metadata_status("PutPathChunked: complete_manifest", e))?;
     // The index was written synchronously above — stop the background

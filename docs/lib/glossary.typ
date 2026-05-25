@@ -295,11 +295,6 @@
     short: [write-ahead manifest],
     description: [rio-store's pattern for durable writes: chunk references are written to a pending manifest before uploading chunks, then promoted to committed after all chunks are verified. Protects against orphaned chunks and broken manifests.],
   ),
-  (
-    key: "inline-storage",
-    short: [inline storage],
-    description: [A fast-path in rio-store for NARs below 256 KiB (`INLINE_THRESHOLD`, compile-time const) that bypasses FastCDC chunking. Stored directly in the PostgreSQL `manifests.inline_blob` BYTEA column --- inline blobs *never touch S3*.],
-  ),
   // build-request / build-derivation: removed — disambiguator entries
   // ("build (request)" vs "build (derivation)") that no prose references.
   // The distinction is made inline where it matters (e.g., gateway.typ's
@@ -307,7 +302,7 @@
   (
     key: "blob",
     short: [blob],
-    description: [An opaque binary object. In rio-store: chunks (FastCDC pieces keyed by BLAKE3) live in S3; inline NARs (\< 256 KiB) live in a PostgreSQL BYTEA column, not S3.],
+    description: [An opaque binary object. In rio-store: chunks (FastCDC pieces keyed by BLAKE3) live in the chunk backend (S3 in production); PostgreSQL holds only metadata.],
   ),
   (
     key: "derivedpath",

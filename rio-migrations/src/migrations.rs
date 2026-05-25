@@ -1083,6 +1083,30 @@ pub const M_063: () = ();
 /// sides — GC of either parent removes the row).
 pub const M_064: () = ();
 
+/// 065 — drop `manifests.inline_blob` (P0583: every NAR is chunked).
+///
+/// The "small NARs (< 256 KiB) go into a PG BYTEA column, no chunk
+/// backend needed" fast path is removed: `INLINE_THRESHOLD`,
+/// `ChunkBackendKind::Inline`, and every reader of this column
+/// (`metadata::get_manifest`, `cas.rs`, `get_path.rs`, `directory.rs`)
+/// are deleted **in the same commit as this DROP** — that pairing is
+/// why M_062 deferred the DROP. A chunk backend is now required
+/// config; a NAR shorter than `CHUNK_MIN` is a single chunk equal to
+/// the input (FastCDC behavior), so nothing special-cases small NARs.
+///
+/// **Pre-existing inline-stored paths become unreadable.** A
+/// persistent DB carrying `'complete'` manifests with `inline_blob IS
+/// NOT NULL` (and therefore no `manifest_data` row) loses that NAR
+/// content when this runs — `get_manifest` reports DATA_LOSS
+/// (`ManifestError::MissingChunkList`) for those rows instead of
+/// serving them. That is greenfield-acceptable per the project's
+/// no-dev-phase-flags posture: no production deployment carries
+/// inline rows, and re-uploading the same store path is the recovery
+/// path for any dev DB that does. P0584 (builder-chunked-only auth
+/// gate) sequences after this so the builder's legacy-RPC fallback is
+/// closed only once no store is inline-only.
+pub const M_065: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

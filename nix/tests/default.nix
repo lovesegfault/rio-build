@@ -431,7 +431,7 @@ in
   #   sigs in narinfo.signatures.
   # r[verify store.substitute.tenant-sig-visibility+2]
   # r[verify store.substitute.find-missing-gated]
-  # r[verify store.api.batch-manifest+2]
+  # r[verify store.api.batch-manifest+3]
   #   substitute-cross-tenant-gate: tenant C (untrusted key) → NotFound
   #   on A-substituted path via QueryPathInfo/GetPath/FindMissingPaths;
   #   PermissionDenied via BatchGetManifest (builder-internal). Tenant
@@ -478,7 +478,14 @@ in
         withHmac = true;
         extraStoreConfig = {
           signingKeyFile = "${rioSigningKey}";
+          # Setting `extraConfig` replaces mkControlNode's default
+          # wholesale, so the required `[chunk_backend]` table must be
+          # restated alongside the scenario-specific `[jwt]` table.
           extraConfig = ''
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio/store/chunks"
+
             [jwt]
             key_path = "${jwtPubkey}"
           '';
@@ -627,10 +634,9 @@ in
   # rio-builder/tests/chunked_upload.rs (see the scenario header for
   # the full subtest disposition).
   #
-  # The fixture MUST carry a [chunk_backend] — an inline-only store
-  # rejects PutPathChunked and the builder falls back to the legacy
-  # path, making every assertion vacuous (the roundtrip fragment
-  # detects that and fails loudly).
+  # The fixture carries a [chunk_backend] like every store (required
+  # config since P0583); the roundtrip fragment asserts the outputs
+  # landed with chunk manifests.
   vm-put-path-chunked =
     (put-path-chunked {
       inherit pkgs common;

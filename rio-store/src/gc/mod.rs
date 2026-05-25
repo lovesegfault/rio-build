@@ -377,7 +377,7 @@ pub(super) struct DecrementStats {
 /// enqueued are no-ops via `ON CONFLICT DO NOTHING`; actual insert
 /// count may be lower).
 ///
-/// No-op if `backend` is None (inline-only store has no S3 keys).
+/// No-op if `backend` is None (test-only shape — no S3 keys to compute).
 // r[impl store.gc.pending-deletes]
 pub(super) async fn enqueue_chunk_deletes(
     tx: &mut Transaction<'_, Postgres>,
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(refcount, 2, "corrupt manifest → no decrement");
     }
 
-    /// `backend: None` (inline store — no S3). Refcounts decremented
+    /// `backend: None` (no S3 keys to enqueue). Refcounts decremented
     /// + chunks marked deleted, but NO pending_s3_deletes rows
     /// (nothing to delete from S3).
     #[tokio::test]

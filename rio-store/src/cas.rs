@@ -3,10 +3,11 @@
 //! Write path: `put_chunked()` — FastCDC + write-ahead + parallel upload.
 //! Read path: `ChunkCache` — moka LRU + singleflight + BLAKE3 verify.
 // r[impl store.singleflight]
-// r[impl store.integrity.verify-on-get]
+// r[impl store.integrity.verify-on-get+2]
 //!
-//! The gRPC layer owns request parsing and the inline/chunked branch;
-//! this module owns everything below that.
+//! The gRPC layer owns request parsing; this module owns everything
+//! below that. Every NAR is chunked — a NAR shorter than `CHUNK_MIN`
+//! yields a single chunk equal to the input (FastCDC behavior).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,27 +25,6 @@ use crate::backend::ChunkBackend;
 use crate::chunker;
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::metadata;
-
-/// NARs below this size bypass chunking and go into `manifests.inline_blob`.
-///
-/// 256 KiB = CHUNK_MAX. A NAR smaller than one max-chunk gains nothing from
-/// chunking: it'd be 1-2 chunks at most, with manifest overhead + refcount
-/// bookkeeping for no dedup benefit. The `.drv` files that dominate nixpkgs
-/// closures by count are typically <10 KiB — all of those stay inline.
-pub const INLINE_THRESHOLD: usize = 256 * 1024;
-
-/// Decide whether a NAR should go through the chunked CAS.
-///
-/// Returns `Some(backend)` when a chunk backend is configured AND the
-/// NAR is at least [`INLINE_THRESHOLD`] bytes; `None` means take the
-/// inline path. Centralises the predicate so a per-tenant override or
-/// composefs-mode preference only needs touching here.
-pub fn should_chunk(
-    backend: Option<&Arc<dyn ChunkBackend>>,
-    nar_len: usize,
-) -> Option<&Arc<dyn ChunkBackend>> {
-    backend.filter(|_| nar_len >= INLINE_THRESHOLD)
-}
 
 /// Default max concurrent S3 chunk uploads per `put_chunked` call.
 ///
@@ -152,13 +132,12 @@ impl PutChunkedStats {
     }
 }
 
-/// Store a large NAR via the chunked path.
+/// Store a NAR via the chunked path.
 ///
 /// # Preconditions (caller's responsibility)
 ///
 /// - `nar_data` is the full NAR, already SHA-256 verified against
 ///   `info.nar_hash`.
-/// - `nar_data.len() >= INLINE_THRESHOLD` — caller gates on this.
 /// - `info.store_path_hash` is populated.
 /// - **The caller already owns an 'uploading' placeholder** from
 ///   `insert_manifest_uploading()` at step 3. We UPGRADE it to chunked;
@@ -232,10 +211,9 @@ pub async fn put_chunked(
 /// [`put_chunked`] — caller doesn't clean up).
 ///
 /// PutPathBatch calls this per-output BEFORE its atomic completion tx
-/// so the visibility flip for N outputs (inline + chunked) commits
-/// together. On batch-tx failure, `abort_batch` → `reap_one` (chunk-
-/// aware) decrements the staged refcounts; S3 blobs orphan and GC
-/// sweeps them.
+/// so the visibility flip for N outputs commits together. On batch-tx
+/// failure, `abort_batch` → `reap_one` (chunk-aware) decrements the
+/// staged refcounts; S3 blobs orphan and GC sweeps them.
 #[instrument(skip(pool, backend, info, nar_data), fields(
     store_path = %info.store_path.as_str(),
     nar_size = nar_data.len(),
@@ -860,7 +838,7 @@ impl ChunkCache {
 }
 
 // r[verify store.singleflight]
-// r[verify store.integrity.verify-on-get]
+// r[verify store.integrity.verify-on-get+2]
 #[cfg(test)]
 mod cache_tests {
     use super::*;

@@ -50,8 +50,13 @@ async fn main() -> anyhow::Result<()> {
     // migrations failed, the `?` above already bailed.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
+    // `chunk_backend` is a required field — `Config::validate` (run in
+    // bootstrap) already rejected `None` with the kind list, so this
+    // expect is unreachable.
     let chunk_cache = init_chunk_backend(
-        &cfg.chunk_backend,
+        cfg.chunk_backend
+            .as_ref()
+            .expect("validated: chunk_backend is required"),
         cfg.chunk_cache_capacity_bytes,
         cfg.s3_max_attempts,
     )
@@ -127,13 +132,11 @@ async fn main() -> anyhow::Result<()> {
     // always replace the constructor default; nar_buffer_budget only
     // overrides when explicitly set.
     let mut store_service = StoreServiceImpl::new(pool.clone())
+        .with_chunk_cache(Arc::clone(&chunk_cache))
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
         .with_max_batch_paths(cfg.max_batch_paths)
         .with_chunk_prefetch_k(cfg.chunk_prefetch_k)
         .with_nar_index_concurrency(cfg.nar_index_concurrency);
-    if let Some(cache) = &chunk_cache {
-        store_service = store_service.with_chunk_cache(Arc::clone(cache));
-    }
     if let Some(ts) = tenant_signer {
         store_service = store_service.with_signer(ts);
     }
@@ -162,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     // and the same TenantSigner (for sig_mode=add|replace). Always
     // enabled — a tenant with zero `tenant_upstreams` rows makes
     // `list_for_tenant` return [], which is a fast no-op.
-    let chunk_backend: Option<Arc<dyn ChunkBackend>> = chunk_cache.as_ref().map(|c| c.backend());
+    let chunk_backend: Arc<dyn ChunkBackend> = chunk_cache.backend();
     let substituter = {
         let mut s = Substituter::new(pool.clone(), chunk_backend)
             .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
@@ -202,9 +205,7 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
-    // on GetChunk, which is correct for an inline-only store (there
-    // ARE no chunks to get).
+    // ChunkServiceImpl: same cache Arc.
     let chunk_service = ChunkServiceImpl::new(pool.clone(), chunk_cache.clone());
 
     // Tenant-scoped via JWT or HMAC assignment-token claim — see
@@ -218,14 +219,12 @@ async fn main() -> anyhow::Result<()> {
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in
     // sweep's pending_s3_deletes enqueue + VerifyChunks HeadObject).
-    // None for inline-only stores — sweep does CASCADE delete only.
     //
     // Also spawn GC background tasks (orphan scanner + orphan-chunk
     // sweep + drain). All periodic (15min / 1h / 30s).
     // spawn_monitored: if one panics, logged; store keeps serving
     // (degraded GC, not down).
-    let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
-        chunk_cache.as_ref().map(|c| c.backend());
+    let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> = Some(chunk_cache.backend());
     let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone())
         .with_shutdown(shutdown.clone())
         .with_service_verifier(service_verifier)
@@ -237,12 +236,10 @@ async fn main() -> anyhow::Result<()> {
     );
     rio_store::gc::sweep::spawn_orphan_chunk_sweep(
         pool.clone(),
-        chunk_backend_for_gc.clone(),
+        chunk_backend_for_gc,
         shutdown.clone(),
     );
-    if let Some(backend) = chunk_backend_for_gc {
-        rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
-    }
+    rio_store::gc::drain::spawn_drain_task(pool.clone(), chunk_cache.backend(), shutdown.clone());
     // NAR indexer: drains the `WHERE NOT nar_indexed` work-queue for
     // paths the eager PutPath path skipped. Same disposition as the GC
     // tasks: panics logged, shutdown-on-cancel.

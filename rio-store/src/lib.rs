@@ -427,8 +427,8 @@ pub fn describe_metrics() {
     // sets these every 30s, but:
     //   - for the first 30s after boot, PromQL `_stuck > 0` can't tell
     //     "0" from "store hasn't reported yet"
-    //   - inline-only (non-S3) deployments never run drain_once, so the
-    //     gauges stay absent forever without this
+    //   - a deployment whose drain task fails to spawn would leave the
+    //     gauges absent forever without this
     // Zero is a placeholder; the first drain tick (≤30s) overwrites
     // with the real count.
     metrics::gauge!("rio_store_s3_deletes_pending").set(0.0);

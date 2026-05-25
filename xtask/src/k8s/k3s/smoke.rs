@@ -49,8 +49,8 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             chaos::step_pool_reconciled(&client, crate::k8s::NS_FETCHERS, "x86-64-fetcher")
         })
         .await?;
-        // 1 MiB NAR — over cas::INLINE_THRESHOLD (256 KiB) — forces
-        // the chunked object-store path. On k3s the backend is rook,
+        // 1 MiB NAR — spans many chunks through the object-store
+        // path. On k3s the backend is rook,
         // not S3 — but a misconfigured bucket endpoint or credential
         // fails the same way (I-006). Trivial-build + worker-kill
         // chaos are covered by the VM test suite.

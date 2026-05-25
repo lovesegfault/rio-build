@@ -38,8 +38,8 @@ rec {
   # submit. Drives vm-ca-cutoff-standalone.
   caChain = "${dir}/ca-chain.nix";
 
-  # 300KiB single-file output → exceeds INLINE_THRESHOLD, forces the
-  # chunked PutPath. Drives the chunks.nix chunk-count assertion.
+  # 300KiB single-file output → spans several FastCDC chunks. Drives
+  # the chunks.nix chunk-count assertion.
   bigblob = "${dir}/bigblob.nix";
 
   # Overlay-readdir correctness probe: 5-file dep + consumer that ls's

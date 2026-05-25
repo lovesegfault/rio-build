@@ -38,17 +38,10 @@ scope: with scope; ''
               f"{p} manifest status is {status!r}, expected complete"
           )
 
-      # The tiny single-file dev output was CHUNKED, not inlined. The
-      # legacy PutPath path inlines anything under INLINE_THRESHOLD
-      # (256 KiB); PutPathChunked never inlines. This is the structural
-      # proof that the upload took the chunked RPC and did not silently
-      # fall back to the legacy path.
-      dev_inline = manifest_row(dev_path, "(m.inline_blob IS NOT NULL)::text")
-      assert dev_inline == "false", (
-          f"dev output has inline_blob set ({dev_inline}) — the upload "
-          "took the legacy PutPath path, not PutPathChunked. Is the "
-          "store missing its [chunk_backend] config?"
-      )
+      # The tiny single-file dev output has a chunk manifest. Every NAR
+      # is chunked (P0583 dropped inline storage), so a complete
+      # manifest with no manifest_data row would mean the commit txn
+      # skipped the chunk-list write — an unreadable path.
       dev_chunked = psql(${gatewayHost},
           "SELECT count(*) FROM manifest_data md "
           "JOIN narinfo n USING (store_path_hash) "

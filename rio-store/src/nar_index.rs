@@ -19,7 +19,7 @@ use rio_proto::types::{NarEntryKind as ProtoNarEntryKind, NarIndex, NarIndexEntr
 
 use crate::cas::ChunkCache;
 use crate::castore::{self, DirectoryDag};
-use crate::metadata::{self, ManifestKind};
+use crate::metadata::{self, ChunkManifest};
 
 /// Poll interval; worst-case PutPath → index latency when eager
 /// indexing was skipped.
@@ -63,7 +63,7 @@ pub struct OverSyncCap {
 #[instrument(skip(pool, cache, budget))]
 pub async fn compute(
     pool: &PgPool,
-    cache: Option<&Arc<ChunkCache>>,
+    cache: &Arc<ChunkCache>,
     store_path: &str,
     max_bytes: u64,
     budget: Option<&Arc<tokio::sync::Semaphore>>,
@@ -195,28 +195,21 @@ pub fn maybe_spawn_eager(
     });
 }
 
-/// Reassemble a NAR from its manifest. Chunked paths fetch through the
+/// Reassemble a NAR from its manifest. Chunks fetch through the
 /// shared moka cache (BLAKE3 verify per-chunk; cross-warm with GetPath).
 async fn reassemble(
-    cache: Option<&Arc<ChunkCache>>,
-    manifest: ManifestKind,
+    cache: &Arc<ChunkCache>,
+    manifest: ChunkManifest,
     total: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    Ok(match manifest {
-        ManifestKind::Inline(b) => b.to_vec(),
-        ManifestKind::Chunked(entries) => {
-            let cache = cache
-                .ok_or_else(|| anyhow::anyhow!("chunked manifest but no chunk cache configured"))?;
-            // unwrap_or(0): a >usize::MAX NAR can't exist on a 64-bit
-            // host; on 32-bit (unsupported) degrade to organic growth
-            // rather than panic on a usize::MAX allocation.
-            let mut buf = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
-            for (h, _size) in entries {
-                buf.extend_from_slice(&cache.get_verified(&h).await?);
-            }
-            buf
-        }
-    })
+    // unwrap_or(0): a >usize::MAX NAR can't exist on a 64-bit
+    // host; on 32-bit (unsupported) degrade to organic growth
+    // rather than panic on a usize::MAX allocation.
+    let mut buf = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
+    for (h, _size) in manifest.0 {
+        buf.extend_from_slice(&cache.get_verified(&h).await?);
+    }
+    Ok(buf)
 }
 
 /// Background work-queue drain: polls `manifests_nar_index_pending_idx`,
@@ -224,7 +217,7 @@ async fn reassemble(
 // r[impl store.index.putpath-bg-warm]
 pub fn spawn_indexer_loop(
     pool: PgPool,
-    cache: Option<Arc<ChunkCache>>,
+    cache: Arc<ChunkCache>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     rio_common::task::spawn_periodic("nar-indexer", POLL_INTERVAL, shutdown, move || {
@@ -244,7 +237,7 @@ pub fn spawn_indexer_loop(
             debug!(count = pending.len(), "indexing pending paths");
             for (hash, path) in pending {
                 let timer = std::time::Instant::now();
-                match compute(&pool, cache.as_ref(), &path, u64::MAX, None).await {
+                match compute(&pool, &cache, &path, u64::MAX, None).await {
                     Ok(_) => {
                         metrics::histogram!("rio_store_nar_index_compute_seconds")
                             .record(timer.elapsed().as_secs_f64());

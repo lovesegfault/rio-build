@@ -82,11 +82,11 @@ pub(crate) fn max_transitive_inputs() -> usize {
 /// headroom; typical `.drv` NARs are <10KB.
 pub(crate) const DRV_NAR_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
 
-/// Max in-flight `GetPath` calls during BFS .drv resolution. The store's
-/// `inline_blob` reads are tiny (.drv NARs are KB-range) so the bound is
-/// a gateway-side connection-pool fan-out cap — independent of the
-/// store's per-replica admission. 32 matches I-052's
-/// `wopAddMultipleToStore` pipeline depth.
+/// Max in-flight `GetPath` calls during BFS .drv resolution. `.drv`
+/// NARs are KB-range single-chunk reads so the bound is a gateway-side
+/// connection-pool fan-out cap — independent of the store's
+/// per-replica admission. 32 matches I-052's `wopAddMultipleToStore`
+/// pipeline depth.
 pub(crate) const BFS_FETCH_CONCURRENCY: usize = 32;
 
 /// If `path` is a `.drv`, parse the ATerm from NAR data and cache it.

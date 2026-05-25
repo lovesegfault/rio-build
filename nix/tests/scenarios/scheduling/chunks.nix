@@ -1,21 +1,17 @@
 # scheduling subtest fragment — composed by scenarios/scheduling.nix mkTest.
 scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
-  # chunks — 300KiB output forces chunked PutPath, not inline
+  # chunks — 300KiB output writes multiple chunk files to disk
   # ══════════════════════════════════════════════════════════════════
-  #   300 KiB > INLINE_THRESHOLD (256 KiB) → nar_data.len() >= cas::
-  #   INLINE_THRESHOLD at put_path.rs:494 is true → chunked path.
-  #   chunk_after > chunk_baseline proves the threshold gate fired.
-  #   The chunked PutPath increments rio_store_put_path_bytes_total
-  #   (put_path.rs:574). bytes_after - bytes_before ≥ 300*1024 proves
-  #   the volume counter runs on the chunked path (tiny text-file
-  #   builds above probably went inline, so this is the first check
-  #   that hits the counter inside the chunked branch).
+  #   Every NAR is chunked; a 300 KiB output spans several FastCDC
+  #   chunks (CHUNK_AVG = 64 KiB), so chunk_after > chunk_baseline
+  #   proves the upload reached the filesystem chunk backend. The
+  #   PutPath commit increments rio_store_put_path_bytes_total;
+  #   bytes_after - bytes_before ≥ 300*1024 proves the volume counter
+  #   runs at real upload volume.
   with subtest("chunks: 300KiB bigblob writes chunk files to disk"):
-      # All builds above are tiny text files, likely inline — a
-      # post-build `chunk_count > 0` check would NOT prove the chunked
-      # path ran. Capture baseline, build bigblob (300 KiB >
-      # INLINE_THRESHOLD = 256 KiB), assert chunk count increased.
+      # Capture baseline, build bigblob (300 KiB), assert chunk count
+      # increased.
       chunk_baseline = int(${gatewayHost}.succeed(
           "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
       ).strip())
@@ -27,10 +23,9 @@ scope: with scope; ''
           "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
       ).strip())
       assert chunk_after > chunk_baseline, (
-          f"bigblob (300 KiB) MUST write chunks to disk "
-          f"(>INLINE_THRESHOLD). baseline={chunk_baseline}, "
-          f"after={chunk_after} — chunk backend not wired, or "
-          f"INLINE_THRESHOLD changed?"
+          f"bigblob (300 KiB) MUST write chunks to disk. "
+          f"baseline={chunk_baseline}, "
+          f"after={chunk_after} — chunk backend not wired?"
       )
 
       # transfer-volume: bigblob is 300 KiB of zeros. NAR framing

@@ -178,7 +178,7 @@ message BatchQueryPathInfoResponse {
 }
 
 // One entry in a chunked NAR's manifest: (BLAKE3 digest, chunk size).
-// Mirrors the store's `ManifestKind::Chunked` tuple.
+// Mirrors the store's `ChunkManifest` entry tuple.
 message ChunkRef {
   bytes hash = 1;   // 32-byte BLAKE3
   uint32 size = 2;
@@ -323,13 +323,16 @@ message NarIndexResponse {
 }
 
 // Pre-fetched (PathInfo, manifest) sufficient for GetPath to skip PG
-// entirely. `chunks` empty + `inline_blob` set = inline NAR; `chunks`
-// non-empty = chunked (inline_blob ignored). Exactly one of the two is
-// populated for a found path.
+// entirely. `chunks` is non-empty for every found path — every NAR is
+// chunked (a sub-CHUNK_MIN NAR is a single chunk equal to the input).
 message ManifestHint {
   PathInfo info = 1;
   repeated ChunkRef chunks = 2;
-  bytes inline_blob = 3;
+  // Field 3 was `inline_blob` (whole-NAR bytes for sub-256KiB paths).
+  // P0583 dropped inline storage; the store rejects hints with no
+  // chunks instead of falling back to an inline body.
+  reserved 3;
+  reserved "inline_blob";
 }
 
 // I-110c: batch (PathInfo, manifest) lookup. The builder's

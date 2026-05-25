@@ -3,45 +3,53 @@
 
 use super::*;
 
-// r[verify store.inline.threshold]
-/// Small NAR + chunked backend: should STILL go inline (under threshold).
+/// Small NAR: every NAR is chunked — a sub-CHUNK_MIN NAR is a single
+/// chunk equal to the input (FastCDC behavior, no special case). The
+/// pre-P0583 inline-in-PG fast path is gone.
 #[tokio::test]
-async fn test_chunked_small_nar_stays_inline() -> TestResult {
+async fn test_chunked_small_nar_is_single_chunk() -> TestResult {
     let (mut s, backend) = StoreSession::new_chunked().await?;
 
     let store_path = test_store_path("chunked-small");
     let nar = make_nar(b"tiny").0;
+    let nar_len = nar.len();
     let info = make_path_info_for_nar(&store_path, &nar);
 
     let created = put_path(&mut s.client, info, nar).await?;
     assert!(created);
 
-    // Chunk backend should be empty — went inline.
-    assert!(
-        backend.is_empty(),
-        "small NAR should not reach chunk backend"
+    // The whole NAR landed in the chunk backend as exactly one chunk.
+    assert_eq!(
+        backend.len(),
+        1,
+        "a sub-CHUNK_MIN NAR must be exactly one chunk"
     );
 
-    // Manifest should be Inline (has inline_blob).
-    let inline_blob: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
-         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    // The manifest has a one-entry chunk list whose size is the NAR.
+    let chunk_list: Vec<u8> = sqlx::query_scalar(
+        "SELECT md.chunk_list FROM manifest_data md JOIN narinfo n \
+         ON md.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
     )
     .bind(&store_path)
     .fetch_one(&s.db.pool)
     .await?;
-    assert!(inline_blob.is_some(), "small NAR should have inline_blob");
+    // 1 version byte + one 36-byte entry.
+    assert_eq!(chunk_list.len(), 1 + 36, "one manifest entry");
+    assert_eq!(
+        u32::from_le_bytes(chunk_list[33..37].try_into().unwrap()) as usize,
+        nar_len,
+        "the single chunk spans the whole NAR"
+    );
 
     Ok(())
 }
 
-/// Large NAR: chunked path activates. Backend gets chunks, inline_blob NULL,
-/// manifest_data populated.
+/// Large NAR: backend gets multiple chunks, manifest_data populated.
 #[tokio::test]
 async fn test_chunked_large_nar_chunks() -> TestResult {
     let (mut s, backend) = StoreSession::new_chunked().await?;
 
-    // 1 MiB — well over INLINE_THRESHOLD (256 KiB).
+    // 1 MiB — spans many FastCDC chunks.
     let (nar, info, store_path) = make_large_nar(1, 1024 * 1024);
 
     let created = put_path(&mut s.client, info, nar).await?;
@@ -56,19 +64,6 @@ async fn test_chunked_large_nar_chunks() -> TestResult {
     assert!(
         chunk_count > 4,
         "1 MiB at 64 KiB avg should be >4 chunks, got {chunk_count}"
-    );
-
-    // inline_blob should be NULL (chunked marker).
-    let inline_blob: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
-         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
-    )
-    .bind(&store_path)
-    .fetch_one(&s.db.pool)
-    .await?;
-    assert!(
-        inline_blob.is_none(),
-        "chunked NAR should have NULL inline_blob"
     );
 
     // manifest_data should exist.
@@ -169,9 +164,8 @@ async fn test_chunked_idempotent() -> TestResult {
 /// Validation fails → abort_upload. Verify: no manifest_data, no chunks,
 /// refcounts untouched.
 ///
-/// This exercises the OLD abort path (pre-chunking) — the validation
-/// failure happens at step 5, BEFORE put_chunked is called. So this is
-/// really testing that the inline abort path still works for large NARs.
+/// The validation failure happens at step 5, BEFORE put_chunked is
+/// called — this tests that the pre-persist abort path leaks nothing.
 #[tokio::test]
 async fn test_chunked_hash_mismatch_no_leaked_state() -> TestResult {
     let (mut s, backend) = StoreSession::new_chunked().await?;
@@ -210,14 +204,14 @@ async fn test_chunked_hash_mismatch_no_leaked_state() -> TestResult {
 /// the gap; `gt13_batch_rpc_atomic` below proves `PutPathBatch` closes it.
 ///
 /// Kept (not inverted) because independent PutPath is still the fallback
-/// when an output is too large for the v1 batch handler's inline-only
-/// limit — the gap persists in that case and this test documents it.
+/// when an output is too large for the batch handler's cumulative byte
+/// budget — the gap persists in that case and this test documents it.
 #[tokio::test]
 async fn gt13_multi_output_not_atomic() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    // Output 1: valid. Small NAR → inline (no chunking needed for this
-    // demonstration — the gap is at the per-RPC level, not per-chunk).
+    // Output 1: valid small NAR (the gap is at the per-RPC level, not
+    // per-chunk).
     let out1_path = test_store_path("gt13-out1");
     let (out1_nar, _) = make_nar(b"output one content");
     let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
@@ -507,7 +501,7 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     //
     // Can't call `rio_store::metadata::insert_manifest_uploading`
     // directly — the `metadata` module is `pub(crate)`. Inline the two
-    // INSERTs (see metadata/inline.rs:69-95). Skip the GC-lock
+    // INSERTs (see metadata/mod.rs insert_manifest_uploading). Skip the GC-lock
     // preamble (no GC running in a test).
     let out1_hash: Vec<u8> = out1_info.store_path.sha256_digest().to_vec();
     sqlx::query(
@@ -607,20 +601,18 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     Ok(())
 }
 
-/// `PutPathBatch` with a chunk backend, both outputs over
-/// `INLINE_THRESHOLD`: phase-2 stages each via `cas::stage_chunked`
-/// (chunks uploaded + refcounted, manifest still `'uploading'`),
-/// phase-3's atomic tx flips both to `'complete'` via
-/// `complete_manifest_in_conn`. Asserts both are queryable and
-/// both landed as chunked (`manifest_data.chunk_list IS NOT NULL`,
-/// `manifests.inline_blob IS NULL`).
+/// `PutPathBatch` with two multi-chunk outputs: phase-2 stages each
+/// via `cas::stage_chunked` (chunks uploaded + refcounted, manifest
+/// still `'uploading'`), phase-3's atomic tx flips both to
+/// `'complete'` via `complete_manifest_in_conn`. Asserts both are
+/// queryable and both landed with a `manifest_data.chunk_list`.
 #[tokio::test]
 async fn gt13_batch_chunked_happy_path() -> TestResult {
     let (s, backend) = StoreSession::new_chunked().await?;
     let mut client = s.client.clone();
 
-    // 512 KiB each — well over INLINE_THRESHOLD (256 KiB). Distinct
-    // seeds → distinct store_paths AND distinct chunk content.
+    // 512 KiB each — many chunks. Distinct seeds → distinct
+    // store_paths AND distinct chunk content.
     let (nar0, info0, path0) = make_large_nar(20, 512 * 1024);
     let (nar1, info1, path1) = make_large_nar(21, 512 * 1024);
 
@@ -647,13 +639,11 @@ async fn gt13_batch_chunked_happy_path() -> TestResult {
         assert_eq!(&info.store_path, p);
     }
 
-    // Both persisted as CHUNKED: manifest_data.chunk_list populated,
-    // manifests.inline_blob NULL, status='complete'.
+    // Both persisted with a chunk list and status='complete'.
     let chunked_complete: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM manifests m \
          JOIN manifest_data md ON m.store_path_hash = md.store_path_hash \
-         WHERE m.status = 'complete' AND m.inline_blob IS NULL \
-         AND md.chunk_list IS NOT NULL",
+         WHERE m.status = 'complete' AND md.chunk_list IS NOT NULL",
     )
     .fetch_one(&s.db.pool)
     .await?;
@@ -756,21 +746,20 @@ async fn gt13_batch_chunked_abort_decrements_refcounts() -> TestResult {
     Ok(())
 }
 
-/// `PutPathBatch` mixed inline+chunked: output-0 small (< threshold,
-/// → `NarPersist::Inline`), output-1 large (≥ threshold, →
-/// `NarPersist::ChunkedStaged`). Phase-3's atomic tx must flip BOTH
-/// to `'complete'` together — proves the two `complete_manifest_*_in_tx`
-/// variants compose inside one transaction.
+/// `PutPathBatch` mixed sizes: output-0 tiny (single chunk), output-1
+/// large (many chunks). Phase-3's atomic tx must flip BOTH to
+/// `'complete'` together and both must land with a chunk list — there
+/// is no size threshold below which an output skips the chunk backend.
 #[tokio::test]
-async fn gt13_batch_mixed_inline_chunked() -> TestResult {
+async fn gt13_batch_mixed_sizes_both_chunked() -> TestResult {
     let (s, _backend) = StoreSession::new_chunked().await?;
     let mut client = s.client.clone();
 
-    // Output-0: tiny → inline.
+    // Output-0: tiny → a single chunk.
     let path0 = test_store_path("batch-mixed-inline");
     let (nar0, _) = make_nar(b"tiny mixed-batch output");
     let info0 = make_path_info_for_nar(&path0, &nar0);
-    // Output-1: 512 KiB → chunked.
+    // Output-1: 512 KiB → many chunks.
     let (nar1, info1, path1) = make_large_nar(25, 512 * 1024);
 
     let (tx, rx) = mpsc::channel(16);
@@ -781,7 +770,7 @@ async fn gt13_batch_mixed_inline_chunked() -> TestResult {
     let resp = client
         .put_path_batch(ReceiverStream::new(rx))
         .await
-        .context("mixed inline+chunked batch should succeed")?
+        .context("mixed-size batch should succeed")?
         .into_inner();
     assert_eq!(resp.created, vec![true, true]);
 
@@ -792,34 +781,18 @@ async fn gt13_batch_mixed_inline_chunked() -> TestResult {
             .await?;
     assert_eq!(complete, 2, "both outputs committed in one tx");
 
-    // Output-0 is inline: inline_blob NOT NULL, no manifest_data row.
-    let inline0: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
-         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
-    )
-    .bind(&path0)
-    .fetch_one(&s.db.pool)
-    .await?;
-    assert!(inline0.is_some(), "small output stored inline");
-
-    // Output-1 is chunked: inline_blob NULL, manifest_data.chunk_list NOT NULL.
-    let inline1: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
-         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
-    )
-    .bind(&path1)
-    .fetch_one(&s.db.pool)
-    .await?;
-    assert!(inline1.is_none(), "large output NOT stored inline");
-
-    let chunk_list1: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT md.chunk_list FROM manifest_data md JOIN narinfo n \
-         ON md.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
-    )
-    .bind(&path1)
-    .fetch_one(&s.db.pool)
-    .await?;
-    assert!(chunk_list1.is_some(), "large output has chunk_list");
+    // Both outputs have a manifest_data.chunk_list — the tiny one is a
+    // single entry, the large one many.
+    for (p, what) in [(&path0, "tiny output"), (&path1, "large output")] {
+        let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT md.chunk_list FROM manifest_data md JOIN narinfo n \
+             ON md.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+        )
+        .bind(p)
+        .fetch_one(&s.db.pool)
+        .await?;
+        assert!(chunk_list.is_some(), "{what} has a chunk_list");
+    }
 
     Ok(())
 }
@@ -954,7 +927,7 @@ async fn batch_no_self_deadlock_under_budget() -> TestResult {
     send_batch_output(&tx, 2, info2.into(), nar2).await;
     drop(tx);
 
-    // 30s is enormous headroom for a sub-2-MiB inline batch on
+    // 30s is enormous headroom for a sub-2-MiB batch on
     // ephemeral PG; pre-fix this would hang forever once cumulative
     // bytes > 2 MiB budget.
     let resp = tokio::time::timeout(
@@ -983,7 +956,7 @@ async fn batch_no_self_deadlock_under_budget() -> TestResult {
 /// asserted cleanup but via the explicit `abort_batch` loop), this
 /// asserts the GUARD's drop-spawn does the work — `abort_batch` no
 /// longer exists.
-// r[verify store.put.drop-cleanup+2]
+// r[verify store.put.drop-cleanup+3]
 #[tokio::test]
 async fn batch_guard_drop_reaps_placeholders() -> TestResult {
     let s = StoreSession::new().await?;

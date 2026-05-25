@@ -55,7 +55,8 @@ pub struct RioStack {
 }
 
 impl RioStack {
-    /// Spawn + handshake + `wopSetOptions`. Inline-only store (no chunking).
+    /// Spawn + handshake + `wopSetOptions`. Store backed by the
+    /// constructor's default in-process memory chunk backend.
     /// Ready for opcodes.
     pub async fn ready() -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
@@ -63,10 +64,9 @@ impl RioStack {
         Self::build_inner(db, service).await
     }
 
-    /// Like [`ready()`](Self::ready) but with FastCDC chunking — NARs ≥
-    /// `INLINE_THRESHOLD` go through chunk+reassembly. Returns the backend
-    /// so tests can assert chunk counts, proving NARs round-tripped through
-    /// chunk→PG manifest→reassembly, not the inline-blob shortcut.
+    /// Like [`ready()`](Self::ready) but the chunk backend is held by
+    /// the test. Returns the backend so tests can assert chunk counts,
+    /// proving NARs round-tripped through chunk→PG manifest→reassembly.
     pub async fn ready_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
         let backend = Arc::new(MemoryChunkBackend::new());
         let cache = Arc::new(ChunkCache::new(

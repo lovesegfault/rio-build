@@ -60,8 +60,8 @@ impl Session {
         ));
         let store_service =
             StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
-        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(Arc::clone(&cache)));
-        let directory_service = DirectoryServiceImpl::new(db.pool.clone(), None, Some(cache));
+        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Arc::clone(&cache));
+        let directory_service = DirectoryServiceImpl::new(db.pool.clone(), None, cache);
 
         let max = rio_common::grpc::max_message_size();
         let router = Server::builder()
@@ -344,54 +344,5 @@ async fn real_store_references_scanned_and_verified() -> anyhow::Result<()> {
             .unwrap_or_default();
     assert_eq!(refs, vec![dep]);
     assert_eq!(s.manifest_status(&path).await.as_deref(), Some("complete"));
-    Ok(())
-}
-
-/// An inline-only store (no chunk backend) rejects `PutPathChunked`;
-/// the builder falls back to the legacy `PutPath` path and the build
-/// still succeeds end-to-end against the real server.
-#[tokio::test]
-async fn real_store_inline_only_falls_back_to_legacy() -> anyhow::Result<()> {
-    // A store WITHOUT a chunk cache: PutPathChunked → FailedPrecondition.
-    let db = TestDb::new(&MIGRATOR).await;
-    let service = StoreServiceImpl::new(db.pool.clone());
-    let max = rio_common::grpc::max_message_size();
-    let router = Server::builder()
-        .add_service(
-            rio_proto::StoreServiceServer::new(service)
-                .max_decoding_message_size(max)
-                .max_encoding_message_size(max),
-        )
-        .add_service(ChunkServiceServer::new(ChunkServiceImpl::new(
-            db.pool.clone(),
-            None,
-        )));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-    let ch = rio_proto::client::connect_channel(&addr.to_string()).await?;
-    let store = StoreServiceClient::new(ch.clone())
-        .max_decoding_message_size(max)
-        .max_encoding_message_size(max);
-    let chunk = ChunkServiceClient::new(ch);
-
-    let tmp = tempfile::tempdir()?;
-    let upper = tmp.path().join("nix/store");
-    std::fs::create_dir_all(&upper)?;
-    let b = rio_test_support::fixtures::test_store_basename("inline-fallback");
-    std::fs::create_dir_all(upper.join(&b))?;
-    std::fs::write(upper.join(&b).join("data"), b"small inline output")?;
-
-    let results = upload_all_outputs(&store, &chunk, &upper, "", "", &[], &[])
-        .await
-        .expect("legacy fallback succeeds");
-    assert_eq!(results.len(), 1);
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT m.status::text FROM manifests m JOIN narinfo n USING (store_path_hash) \
-         WHERE n.store_path = $1",
-    )
-    .bind(format!("/nix/store/{b}"))
-    .fetch_optional(&db.pool)
-    .await?;
-    assert_eq!(status.as_deref(), Some("complete"));
-    server.abort();
     Ok(())
 }

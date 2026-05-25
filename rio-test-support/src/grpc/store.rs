@@ -1211,14 +1211,26 @@ impl StoreService for MockStore {
             .into_iter()
             .map(|store_path| {
                 // MockStore stores whole NARs in-memory — represent
-                // as inline (no chunking in the mock).
-                let hint = paths
-                    .get(&store_path)
-                    .map(|(info, nar)| types::ManifestHint {
+                // each as a single chunk spanning the whole NAR (the
+                // real store never returns a chunkless hint; every NAR
+                // is chunked and a sub-CHUNK_MIN NAR is one chunk).
+                // The chunk body is registered in `state.chunks` so a
+                // follow-up GetChunk(s) for the hinted digest resolves.
+                let hint = paths.get(&store_path).map(|(info, nar)| {
+                    let digest = blake3::hash(nar).as_bytes().to_vec();
+                    self.state
+                        .chunks
+                        .write()
+                        .unwrap()
+                        .insert(digest.clone(), nar.clone());
+                    types::ManifestHint {
                         info: Some(info.clone()),
-                        chunks: Vec::new(),
-                        inline_blob: nar.clone(),
-                    });
+                        chunks: vec![types::ChunkRef {
+                            hash: digest,
+                            size: nar.len() as u32,
+                        }],
+                    }
+                });
                 types::ManifestEntry { store_path, hint }
             })
             .collect();

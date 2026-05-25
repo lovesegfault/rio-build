@@ -6,8 +6,7 @@
 //! 1. [`claim_placeholder`] — idempotency check, insert
 //!    `status='uploading'` row, hot-path stale-reclaim
 //! 2. caller acquires NAR bytes (gRPC stream / HTTP download)
-//! 3. [`persist_nar`] — branch on size: inline (`manifests.inline_blob`)
-//!    or chunked (`cas::put_chunked`)
+//! 3. [`persist_nar`] — chunk + upload via `cas::put_chunked`
 //! 4. on any error after step 1: [`abort_placeholder`]
 //!
 //! Before this module existed, `Substituter::ingest` open-coded steps
@@ -149,66 +148,56 @@ pub async fn claim_placeholder(
 
 /// How [`persist_nar`] failed. The caller maps this to its own error
 /// domain (`tonic::Status` for gRPC, `SubstituteError` for
-/// substitution) and decides whether to [`abort_placeholder`]: the
-/// chunked path already rolled back internally.
+/// substitution). `cas::put_chunked`'s internal rollback
+/// (`delete_manifest_chunked_uploading`) already ran; the placeholder
+/// is GONE (best-effort). Caller's `abort_placeholder` is a harmless
+/// no-op but not required.
 #[derive(Debug)]
-pub enum PersistError {
-    /// `cas::put_chunked` failed. Its internal rollback
-    /// (`delete_manifest_chunked_uploading`) already ran; the
-    /// placeholder is GONE (best-effort). Caller's `abort_placeholder`
-    /// is a harmless no-op but not required.
-    Chunked(anyhow::Error),
-    /// `complete_manifest_inline` failed. Caller still OWNS the
-    /// placeholder and MUST `abort_placeholder`.
-    Inline(MetadataError),
+pub struct PersistError(pub anyhow::Error);
+
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
-/// Persist a validated, hash-verified NAR for ONE output. Branches on
-/// `nar_data.len()` vs [`cas::INLINE_THRESHOLD`]: inline goes to
-/// `manifests.inline_blob` in one tx; chunked goes through
+/// Persist a validated, hash-verified NAR for ONE output via
 /// [`cas::put_chunked`] (FastCDC + S3 + refcounts, own write-ahead +
-/// rollback).
+/// rollback). A NAR shorter than `CHUNK_MIN` is a single chunk equal to
+/// the input — there is no inline fast path.
 ///
 /// Caller must hold a [`PlaceholderClaim::Owned`] for
-/// `info.store_path_hash`. Emits `rio_store_chunk_dedup_ratio` on the
-/// chunked branch.
+/// `info.store_path_hash`. Emits `rio_store_chunk_dedup_ratio`.
 /// `nar_data` is borrowed (not consumed) so the PutPath caller can keep
 /// the buffer alive for the post-commit eager `nar_index` pass
 /// (`r[store.index.putpath-eager]`) without cloning a multi-GiB Vec.
 pub async fn persist_nar(
     pool: &PgPool,
-    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
+    chunk_backend: &Arc<dyn ChunkBackend>,
     info: &ValidatedPathInfo,
     claim: Uuid,
     nar_data: &[u8],
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
 ) -> Result<(), PersistError> {
-    if let Some(backend) = cas::should_chunk(chunk_backend, nar_data.len()) {
-        let stats = cas::put_chunked(
-            pool,
-            backend,
-            info,
-            claim,
-            nar_data,
-            chunk_upload_max_concurrent,
-        )
-        .await
-        .map_err(PersistError::Chunked)?;
-        debug!(
-            store_path = %info.store_path.as_str(),
-            total_chunks = stats.total_chunks,
-            deduped = stats.deduped_chunks,
-            ratio = stats.dedup_ratio(),
-            "{}: chunked upload completed", hooks.ctx_label,
-        );
-        metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-    } else {
-        metadata::complete_manifest_inline(pool, info, claim, nar_data)
-            .await
-            .map_err(PersistError::Inline)?;
-        debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);
-    }
+    let stats = cas::put_chunked(
+        pool,
+        chunk_backend,
+        info,
+        claim,
+        nar_data,
+        chunk_upload_max_concurrent,
+    )
+    .await
+    .map_err(PersistError)?;
+    debug!(
+        store_path = %info.store_path.as_str(),
+        total_chunks = stats.total_chunks,
+        deduped = stats.deduped_chunks,
+        ratio = stats.dedup_ratio(),
+        "{}: chunked upload completed", hooks.ctx_label,
+    );
+    metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     Ok(())
 }
 
@@ -220,7 +209,7 @@ const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration:
 
 /// RAII owner of an `'uploading'` placeholder: heartbeats while held,
 /// reaps on drop. See [`spawn_placeholder_guard`].
-// r[impl store.put.drop-cleanup+2]
+// r[impl store.put.drop-cleanup+3]
 pub(crate) struct PlaceholderGuard {
     heartbeat: tokio::task::JoinHandle<()>,
     pool: PgPool,
@@ -274,7 +263,7 @@ impl Drop for PlaceholderGuard {
     }
 }
 
-// r[impl store.put.drop-cleanup+2]
+// r[impl store.put.drop-cleanup+3]
 /// Drop-safety + liveness for a [`PlaceholderClaim::Owned`] placeholder.
 /// Returns a [`PlaceholderGuard`] that:
 ///

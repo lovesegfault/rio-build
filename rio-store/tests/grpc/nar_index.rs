@@ -326,14 +326,19 @@ async fn compute_rejects_over_sync_cap() -> TestResult {
     let info = make_path_info(&path, &nar, nar_hash);
     put_path(&mut s.client, info, nar).await?;
 
+    // The cap check runs against the manifest's summed size BEFORE any
+    // chunk fetch, so an empty cache is fine for the over-cap arm; the
+    // at-cap arm only needs to NOT fail with OverSyncCap.
+    let cache = std::sync::Arc::new(rio_store::cas::ChunkCache::new(mem_backend()));
+
     // 1 byte over the cap → OverSyncCap.
-    let err = compute(&s.db.pool, None, &path, total - 1, None)
+    let err = compute(&s.db.pool, &cache, &path, total - 1, None)
         .await
         .unwrap_err();
     assert!(err.is::<OverSyncCap>(), "{err}");
 
     // Exactly at the cap → allowed (`>`, not `>=`).
-    let r = compute(&s.db.pool, None, &path, total, None).await;
+    let r = compute(&s.db.pool, &cache, &path, total, None).await;
     assert!(
         r.as_ref().err().is_none_or(|e| !e.is::<OverSyncCap>()),
         "{r:?}"

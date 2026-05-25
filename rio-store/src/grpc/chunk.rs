@@ -68,25 +68,14 @@ pub struct ChunkServiceImpl {
     /// Durable-presence lookups for `HasChunks` (the `chunks` table).
     pool: PgPool,
     /// Cache for GetChunk. Same cache as GetPath uses — a chunk fetched
-    /// by either RPC warms the other. `None` = ChunkService effectively
-    /// disabled (all RPCs return FAILED_PRECONDITION); main.rs only
-    /// constructs this when a chunk backend is configured.
-    chunk_cache: Option<Arc<ChunkCache>>,
+    /// by either RPC warms the other. Always present: a chunk backend
+    /// is a required part of store config.
+    chunk_cache: Arc<ChunkCache>,
 }
 
 impl ChunkServiceImpl {
-    pub fn new(pool: PgPool, chunk_cache: Option<Arc<ChunkCache>>) -> Self {
+    pub fn new(pool: PgPool, chunk_cache: Arc<ChunkCache>) -> Self {
         Self { pool, chunk_cache }
-    }
-
-    /// Shared guard: all ChunkService RPCs need a cache. Without a
-    /// backend, there's nothing to do at the chunk level.
-    fn require_cache(&self) -> Result<&Arc<ChunkCache>, Status> {
-        self.chunk_cache.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "ChunkService requires a chunk backend; this store is inline-only",
-            )
-        })
     }
 }
 
@@ -203,7 +192,7 @@ impl ChunkService for ChunkServiceImpl {
         request: Request<GetChunkRequest>,
     ) -> Result<Response<Self::GetChunkStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let cache = self.require_cache()?;
+        let cache = &self.chunk_cache;
         let digest = request.into_inner().digest;
         let hash = parse_digest(&digest)?;
 
@@ -251,7 +240,7 @@ impl ChunkService for ChunkServiceImpl {
         request: Request<Streaming<GetChunksRequest>>,
     ) -> Result<Response<Self::GetChunksStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let cache = Arc::clone(self.require_cache()?);
+        let cache = Arc::clone(&self.chunk_cache);
         let requests = request.into_inner();
 
         // Flatten the request frames into a flat digest sequence.

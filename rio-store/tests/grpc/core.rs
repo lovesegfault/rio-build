@@ -67,8 +67,8 @@ async fn test_batch_query_path_info() -> TestResult {
 ///
 /// The hint test deletes the narinfo+manifests rows AFTER fetching the
 /// hint, then issues GetPath WITH the hint — if the store skips PG it
-/// still streams the NAR (inline blob from the hint); without the hint
-/// the same GetPath is NotFound.
+/// still streams the NAR (chunks are content-addressed and stay in the
+/// backend); without the hint the same GetPath is NotFound.
 #[tokio::test]
 async fn test_batch_get_manifest_and_hint() -> TestResult {
     use rio_proto::types::{BatchGetManifestRequest, GetPathRequest};
@@ -79,8 +79,8 @@ async fn test_batch_get_manifest_and_hint() -> TestResult {
     let info = make_path_info_for_nar(&path, &nar);
     put_path(&mut s.client, info, nar.clone()).await?;
 
-    // Round-trip: present path returns hint with inline blob == NAR;
-    // absent path returns hint=None.
+    // Round-trip: present path returns hint with a non-empty chunk
+    // list; absent path returns hint=None.
     let resp = s
         .client
         .batch_get_manifest(BatchGetManifestRequest {
@@ -98,8 +98,15 @@ async fn test_batch_get_manifest_and_hint() -> TestResult {
         hint.info.as_ref().map(|i| i.store_path.as_str()),
         Some(path.as_str())
     );
-    assert_eq!(hint.inline_blob, nar, "small NAR stored inline");
-    assert!(hint.chunks.is_empty(), "inline → no chunks");
+    assert!(
+        !hint.chunks.is_empty(),
+        "every NAR is chunked — a found path's hint always carries chunks"
+    );
+    assert_eq!(
+        hint.chunks.iter().map(|c| u64::from(c.size)).sum::<u64>(),
+        nar.len() as u64,
+        "hint chunk sizes sum to the NAR size"
+    );
     assert!(resp.entries[1].hint.is_none(), "absent → hint=None");
 
     // Delete the PG rows so a no-hint GetPath would NotFound.
@@ -281,7 +288,6 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     // 1. Upload a valid NAR.
     let store_path = test_store_path("corruption-test");
     let good_nar = make_nar(b"valid content for corruption test").0;
-    let nar_len = good_nar.len();
     let info = make_path_info_for_nar(&store_path, &good_nar);
 
     let created = put_path(&mut s.client, info, good_nar)
@@ -289,21 +295,18 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
         .context("put should succeed")?;
     assert!(created);
 
-    // 2. Corrupt manifests.inline_blob directly via SQL. Same length so
-    // the pre-flight size sanity-check passes; different content so the
-    // post-stream SHA-256 check fails. This is the phase-2c equivalent
-    // of the old backend.corrupt_for_test(): simulates TOAST-storage
-    // bitrot or manual DB tampering.
-    let corrupt_data = vec![0xAAu8; nar_len]; // same len, wrong sha256
-    sqlx::query(
-        "UPDATE manifests SET inline_blob = $1 \
-         WHERE store_path_hash = (SELECT store_path_hash FROM narinfo WHERE store_path = $2)",
-    )
-    .bind(&corrupt_data)
-    .bind(&store_path)
-    .execute(&s.db.pool)
-    .await
-    .context("corrupt inline_blob")?;
+    // 2. Corrupt narinfo.nar_hash directly via SQL. The chunks and the
+    // manifest are intact (per-chunk BLAKE3 passes, the pre-flight size
+    // sanity-check passes), so the stream delivers every byte and only
+    // the POST-STREAM whole-NAR SHA-256 check can catch the drift.
+    // Simulates a stale/foreign nar_hash row (manual DB tampering, a
+    // PutPath bug); per-chunk corruption is covered by reassembly.rs.
+    sqlx::query("UPDATE narinfo SET nar_hash = $1 WHERE store_path = $2")
+        .bind(vec![0xAAu8; 32])
+        .bind(&store_path)
+        .execute(&s.db.pool)
+        .await
+        .context("corrupt narinfo.nar_hash")?;
 
     // 3. GetPath — stream should deliver chunks then DATA_LOSS at the end.
     let mut stream = s
@@ -921,14 +924,14 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
 /// GetPath on a path where narinfo.nar_size disagrees with the manifest's
 /// summed size should fail fast with DATA_LOSS — before streaming any
 /// bytes. Catches manifest/narinfo drift (PutPath bug, manual DB surgery).
-// r[verify store.get.size-sanity-check]
+// r[verify store.get.size-sanity-check+2]
 #[tokio::test]
 async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
     use rio_proto::types::GetPathRequest;
 
     let mut s = StoreSession::new().await?;
 
-    // 1. Upload a valid NAR (inline storage — no chunk backend).
+    // 1. Upload a valid NAR.
     let store_path = test_store_path("size-mismatch-test");
     let nar = make_nar(b"content for size mismatch test").0;
     let info = make_path_info_for_nar(&store_path, &nar);
@@ -939,8 +942,8 @@ async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
         .context("put should succeed")?;
     assert!(created);
 
-    // 2. Corrupt narinfo.nar_size to disagree with manifests.inline_blob
-    // length. The manifest's total_size() = blob.len() = real_size;
+    // 2. Corrupt narinfo.nar_size to disagree with the manifest's
+    // summed chunk sizes. The manifest's total_size() = real_size;
     // narinfo now says real_size + 1 → mismatch.
     sqlx::query("UPDATE narinfo SET nar_size = $1 WHERE store_path = $2")
         .bind((real_size + 1) as i64)
@@ -1036,7 +1039,5 @@ async fn accumulate_chunk_rejects_empty() -> TestResult {
 // for a race between query_path_info and get_manifest (both filter on
 // manifests.status='complete'). Not normally reachable; no test.
 //
-// The inline-storage path has no "blob-missing" race: the NAR lives in
-// the SAME transaction that flips status to complete. The chunked-path
-// equivalent (PG manifest present, S3 chunk missing) is covered by
+// The "PG manifest present, backend chunk missing" race is covered by
 // tests/grpc/reassembly.rs::test_chunked_getpath_missing_chunk_data_loss.

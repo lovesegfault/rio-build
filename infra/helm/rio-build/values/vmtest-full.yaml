@@ -3,7 +3,7 @@
 # 2-node k3s via nix/tests/fixtures/k3s-full.nix.
 #
 # Airgapped: all images preloaded via services.k3s.images. NodePort
-# gateway (no cloud LB). Inline chunk backend (no S3).
+# gateway (no cloud LB). Filesystem chunk backend on a hostPath (no S3).
 
 global:
   image:
@@ -70,8 +70,16 @@ store:
   enabled: true
   image: rio-store
   chunkBackend:
-    # inline = NARs in PG. No MinIO/Rook airgapped.
-    kind: inline
+    # No MinIO/Rook airgapped — chunks go to a local-path PVC.
+    # `chunk_backend` is required config (P0583: every NAR is chunked).
+    kind: filesystem
+    baseDir: /var/lib/rio/chunks
+  # The local-path PV is node-local. Pin the store to the k3s server
+  # node so the PV is provisioned there (deterministic placement) and a
+  # Deployment rollout (lifecycle/store-rollout.nix) brings the
+  # replacement pod up over the SAME chunk directory.
+  nodeSelector:
+    kubernetes.io/hostname: k3s-server
 
 scheduler:
   enabled: true

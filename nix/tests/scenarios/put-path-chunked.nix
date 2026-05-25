@@ -25,11 +25,9 @@
 #               a second manifest reference instead of a second S3
 #               object (subtest vi).
 #
-# The fixture MUST configure a `[chunk_backend]` — an inline-only store
-# rejects PutPathChunked and the builder silently falls back to the
-# legacy path, turning every assertion here vacuous. The `roundtrip`
-# fragment guards against that by asserting a SMALL output was chunked
-# (the legacy path would have inlined it).
+# The store always has a `[chunk_backend]` (required config since
+# P0583); the `roundtrip` fragment asserts even the tiny single-file
+# output landed with a chunk manifest.
 {
   pkgs,
   common,
@@ -51,10 +49,8 @@ let
   # NAR node kind the fused walk handles: a nested executable that
   # embeds a store path (reference detection), two byte-identical files
   # (repeated chunk_manifest digest, subtest ii), a multi-chunk blob,
-  # and a symlink. `dev` is a tiny single-file output — small enough
-  # that the LEGACY upload path would have stored it inline, so
-  # `manifest_data.chunk_list IS NOT NULL` on it proves PutPathChunked
-  # carried the upload.
+  # and a symlink. `dev` is a tiny single-file output — exercises the
+  # single-chunk-manifest shape alongside `out`'s multi-chunk one.
   multiDrv = drvs.mkCustom {
     name = "rio-chunked-multi";
     extraAttrs.outputs = [

@@ -65,8 +65,8 @@ impl ChunkedSession {
         ));
         let store_service =
             customize(StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache)));
-        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(Arc::clone(&cache)));
-        let directory_service = DirectoryServiceImpl::new(db.pool.clone(), None, Some(cache));
+        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Arc::clone(&cache));
+        let directory_service = DirectoryServiceImpl::new(db.pool.clone(), None, cache);
 
         let max = rio_common::grpc::max_message_size();
         let router = Server::builder()
@@ -827,9 +827,10 @@ async fn bounds_violations_rejected_before_any_write() -> TestResult {
 async fn partial_skip_does_not_block_new_outputs() -> TestResult {
     let mut s = ChunkedSession::new().await?;
 
-    // Output A: committed via the legacy inline path (small NAR, no
-    // chunk rows at all — the most hostile case for a re-drive that
-    // assumes A's chunks exist).
+    // Output A: committed via the legacy whole-NAR PutPath. Its CAS
+    // entries are NAR-level FastCDC chunks — none of the PER-FILE
+    // digests the fused walk below derives exist in the CAS (the most
+    // hostile case for a re-drive that assumes A's chunks exist).
     let tree_a = tempfile::tempdir()?;
     std::fs::write(tree_a.path().join("old"), b"legacy-uploaded contents")?;
     let path_a = test_store_path("chunked-partial-a");
@@ -846,9 +847,10 @@ async fn partial_skip_does_not_block_new_outputs() -> TestResult {
     // The builder re-drives both outputs in one Begin (it does not
     // know A is already complete) and — the hostile half — declares
     // A's chunks NOT novel, as a HasChunks probe that raced another
-    // uploader would. Those digests exist nowhere in the CAS (A went
-    // through the inline path); the walk must not try to fetch them
-    // for an output it is skipping anyway.
+    // uploader would. Those per-file digests exist nowhere in the CAS
+    // (A went through the whole-NAR path, which stores different
+    // digests); the walk must not try to fetch them for an output it
+    // is skipping anyway.
     let mut begin = assemble_begin(vec![out_a, out_b], vec![dirs_a, dirs_b]);
     let a_digests: std::collections::HashSet<Vec<u8>> =
         chunks_a.keys().map(|k| k.to_vec()).collect();

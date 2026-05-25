@@ -49,7 +49,7 @@ impl ChunkSession {
 
         let store_service =
             StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
-        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(cache));
+        let chunk_service = ChunkServiceImpl::new(db.pool.clone(), cache);
 
         let router = Server::builder()
             .add_service(StoreServiceServer::new(store_service))
@@ -150,36 +150,6 @@ async fn test_getchunk_bad_digest_length() -> TestResult {
         result.expect_err("short digest should fail").code(),
         tonic::Code::InvalidArgument
     );
-    Ok(())
-}
-
-/// Inline-only store: ChunkService RPCs → FAILED_PRECONDITION.
-#[tokio::test]
-async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
-    // Construct with cache=None explicitly. The pool is never touched
-    // on the no-cache path — a lazy unconnected one avoids spinning up
-    // postgres for a pure FAILED_PRECONDITION test.
-    let chunk_service =
-        ChunkServiceImpl::new(sqlx::PgPool::connect_lazy("postgres://unused")?, None);
-
-    let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    let mut client = ChunkServiceClient::new(channel);
-
-    let get = client
-        .get_chunk(GetChunkRequest {
-            digest: vec![0; 32],
-        })
-        .await;
-    assert_eq!(
-        get.expect_err("should fail").code(),
-        tonic::Code::FailedPrecondition
-    );
-
-    server.abort();
     Ok(())
 }
 
@@ -369,27 +339,5 @@ async fn test_getchunks_not_found_aborts() -> TestResult {
         .await
         .expect_err("unknown chunk should abort the stream");
     assert_eq!(err.code(), tonic::Code::NotFound);
-    Ok(())
-}
-
-/// Inline-only store → FAILED_PRECONDITION, same as GetChunk. The
-/// guard is shared so the two RPCs can't drift apart.
-#[tokio::test]
-async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
-    let chunk_service =
-        ChunkServiceImpl::new(sqlx::PgPool::connect_lazy("postgres://unused")?, None);
-    let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    let mut client = ChunkServiceClient::new(channel);
-
-    let err = collect_get_chunks(&mut client, vec![vec![vec![0; 32]]])
-        .await
-        .expect_err("no cache should fail");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-
-    server.abort();
     Ok(())
 }

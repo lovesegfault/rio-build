@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
 use futures_util::StreamExt;
 use prost::Message;
 use sqlx::PgPool;
@@ -79,17 +78,16 @@ pub struct DirectoryServiceImpl {
     /// `x-rio-assignment-token`; `claims.tenant` carries the tenant.
     hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// Shared with `StoreServiceImpl`/`ChunkServiceImpl`; `ReadBlob`
-    /// fetches chunked-manifest files through it. `None` on an
-    /// inline-only store: chunked files return `FAILED_PRECONDITION`,
-    /// inline files still resolve.
-    chunk_cache: Option<Arc<ChunkCache>>,
+    /// fetches file bytes through it. Always present: a chunk backend
+    /// is a required part of store config.
+    chunk_cache: Arc<ChunkCache>,
 }
 
 impl DirectoryServiceImpl {
     pub fn new(
         pool: PgPool,
         hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
-        chunk_cache: Option<Arc<ChunkCache>>,
+        chunk_cache: Arc<ChunkCache>,
     ) -> Self {
         Self {
             pool,
@@ -421,9 +419,9 @@ impl DirectoryService for DirectoryServiceImpl {
         // (M_063) is denormalized so this never decodes
         // `nar_index.entries` (O(files-in-NAR)) on the FUSE `open()`
         // fast path.
-        type BlobRow = (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
+        type BlobRow = (i64, i64, Option<Vec<u8>>);
         let row: Option<BlobRow> = sqlx::query_as(
-            "SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list \
+            "SELECT f.nar_offset, f.size, md.chunk_list \
                FROM file_blobs f \
                JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
@@ -437,31 +435,24 @@ impl DirectoryService for DirectoryServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(internal)?;
-        let Some((nar_offset, file_size, inline_blob, chunk_list)) = row else {
+        let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
         let (nar_offset, end) = nar_window(nar_offset, file_size)?;
 
-        let plan = match (inline_blob, chunk_list) {
-            (Some(blob), _) => BlobPlan::Inline(slice_inline(blob, nar_offset, end)?),
-            (None, Some(chunk_list)) => {
-                let cache = self.chunk_cache.clone().ok_or_else(|| {
-                    Status::failed_precondition(
-                        "ReadBlob requires a chunk backend for chunked manifests",
-                    )
-                })?;
-                BlobPlan::Chunked(cache, build_chunk_plan(&chunk_list, nar_offset, end)?)
-            }
-            // Same invariant `metadata::get_manifest` enforces: a
-            // complete manifest has exactly one of inline_blob /
-            // manifest_data. Surface as DATA_LOSS, not NotFound, so
-            // corruption isn't mistaken for a cache miss.
-            (None, None) => {
-                return Err(Status::data_loss(
-                    "manifest has neither inline_blob nor manifest_data",
-                ));
-            }
+        // Same invariant `metadata::get_manifest` enforces: a complete
+        // manifest has a manifest_data row. Surface its absence as
+        // DATA_LOSS, not NotFound, so corruption (or a pre-065 inline
+        // path) isn't mistaken for a cache miss.
+        let Some(chunk_list) = chunk_list else {
+            return Err(Status::data_loss(
+                "manifest has no manifest_data row (content unreadable)",
+            ));
         };
+        let plan = BlobPlan::Chunked(
+            Arc::clone(&self.chunk_cache),
+            build_chunk_plan(&chunk_list, nar_offset, end)?,
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel(READ_BLOB_CHANNEL_DEPTH);
         rio_common::task::spawn_monitored("read-blob-stream", async move {
@@ -526,10 +517,9 @@ impl DirectoryService for DirectoryServiceImpl {
                 .ok_or_else(|| Status::not_found("file blob not found"));
         }
 
-        // `IS NOT NULL`, not the bytes: only the classification matters.
-        type StatRow = (i64, i64, bool, Option<Vec<u8>>);
+        type StatRow = (i64, i64, Option<Vec<u8>>);
         let row: Option<StatRow> = sqlx::query_as(
-            "SELECT f.nar_offset, f.size, m.inline_blob IS NOT NULL, md.chunk_list \
+            "SELECT f.nar_offset, f.size, md.chunk_list \
                FROM file_blobs f \
                JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
@@ -542,20 +532,12 @@ impl DirectoryService for DirectoryServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(internal)?;
-        let Some((nar_offset, file_size, is_inline, chunk_list)) = row else {
+        let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
-        if is_inline {
-            // No chunk list to return; a synthetic ChunkMeta wouldn't be
-            // in the chunk store, and a file in an inline NAR is small
-            // enough for ReadBlob anyway.
-            return Err(Status::failed_precondition(
-                "file is in an inline manifest; use ReadBlob",
-            ));
-        }
         let Some(chunk_list) = chunk_list else {
             return Err(Status::data_loss(
-                "manifest has neither inline_blob nor manifest_data",
+                "manifest has no manifest_data row (content unreadable)",
             ));
         };
         let (nar_offset, end) = nar_window(nar_offset, file_size)?;
@@ -594,12 +576,10 @@ fn nar_window(nar_offset: i64, file_size: i64) -> Result<(u64, u64), Status> {
 
 /// Resolved fetch plan for one `ReadBlob`.
 enum BlobPlan {
-    /// File bytes already sliced from `manifests.inline_blob`.
-    Inline(Bytes),
     /// Chunk hashes in NAR order with the byte range to emit from each.
     /// Pre-slicing every chunk (not just first/last) keeps the stream
-    /// loop branch-free. Carrying the cache here proves a chunked plan
-    /// always has a backend.
+    /// loop branch-free. Carrying the cache here proves a plan always
+    /// has a backend.
     Chunked(Arc<ChunkCache>, Vec<ChunkSlice>),
 }
 
@@ -612,19 +592,6 @@ struct ChunkSlice {
     /// Byte range within the chunk to emit.
     start: usize,
     end: usize,
-}
-
-/// Slice `[nar_offset, end)` from an inline NAR.
-fn slice_inline(blob: Vec<u8>, nar_offset: u64, end: u64) -> Result<Bytes, Status> {
-    let blob = Bytes::from(blob);
-    if end > blob.len() as u64 {
-        return Err(Status::data_loss(format!(
-            "inline NAR is {} bytes but file ends at {end}",
-            blob.len()
-        )));
-    }
-    // Safe: end ≤ blob.len() ≤ usize::MAX (checked above).
-    Ok(blob.slice(nar_offset as usize..end as usize))
 }
 
 /// Compute the chunk slices covering NAR bytes `[nar_offset, end)`.
@@ -676,53 +643,43 @@ fn build_chunk_plan(
     Ok(plan)
 }
 
-/// Drive the `ReadBlob` body stream. Inline = one sliced buffer;
-/// chunked = K-parallel ordered prefetch via `cache.get_verified()`.
+/// Drive the `ReadBlob` body stream: K-parallel ordered prefetch via
+/// `cache.get_verified()`.
 ///
 /// Returns `true` only on a clean stream with the body matching
 /// `file_digest`, so the caller can gate the latency histogram.
 async fn stream_blob(tx: &FrameTx, plan: BlobPlan, file_digest: [u8; 32]) -> bool {
     let mut hasher = blake3::Hasher::new();
-    match plan {
-        BlobPlan::Inline(bytes) => {
-            for piece in bytes.chunks(rio_proto::client::NAR_CHUNK_SIZE) {
-                if !send_piece(tx, &mut hasher, piece).await {
-                    return false;
-                }
+    let BlobPlan::Chunked(cache, slices) = plan;
+    let mut chunk_stream = futures_util::stream::iter(slices)
+        .map(|s| {
+            let cache = Arc::clone(&cache);
+            async move { cache.get_verified(&s.hash).await.map(|b| (s, b)) }
+        })
+        .buffered(READ_BLOB_PREFETCH_K);
+    while let Some(result) = chunk_stream.next().await {
+        let (slice, bytes) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "ReadBlob: chunk fetch/verify failed");
+                let _ = tx
+                    .send(Err(Status::data_loss(format!(
+                        "chunk reassembly failed: {e}"
+                    ))))
+                    .await;
+                return false;
             }
-        }
-        BlobPlan::Chunked(cache, slices) => {
-            let mut chunk_stream = futures_util::stream::iter(slices)
-                .map(|s| {
-                    let cache = Arc::clone(&cache);
-                    async move { cache.get_verified(&s.hash).await.map(|b| (s, b)) }
-                })
-                .buffered(READ_BLOB_PREFETCH_K);
-            while let Some(result) = chunk_stream.next().await {
-                let (slice, bytes) = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!(error = %e, "ReadBlob: chunk fetch/verify failed");
-                        let _ = tx
-                            .send(Err(Status::data_loss(format!(
-                                "chunk reassembly failed: {e}"
-                            ))))
-                            .await;
-                        return false;
-                    }
-                };
-                let Some(piece) = bytes.get(slice.start..slice.end) else {
-                    let _ = tx
-                        .send(Err(Status::data_loss(
-                            "chunk shorter than manifest declared",
-                        )))
-                        .await;
-                    return false;
-                };
-                if !send_piece(tx, &mut hasher, piece).await {
-                    return false;
-                }
-            }
+        };
+        let Some(piece) = bytes.get(slice.start..slice.end) else {
+            let _ = tx
+                .send(Err(Status::data_loss(
+                    "chunk shorter than manifest declared",
+                )))
+                .await;
+            return false;
+        };
+        if !send_piece(tx, &mut hasher, piece).await {
+            return false;
         }
     }
     // Whole-file BLAKE3 verify, like GetPath's whole-NAR SHA-256.
@@ -884,16 +841,5 @@ mod tests {
         let runs = greedy_split_by_bytes(&big, 100);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len(), 1);
-    }
-
-    #[test]
-    fn slice_inline_end_boundary() {
-        // end == len: full slice, not data_loss.
-        assert_eq!(slice_inline(vec![1, 2, 3], 1, 3).unwrap().as_ref(), &[2, 3]);
-        // end > len: data_loss.
-        assert_eq!(
-            slice_inline(vec![1, 2, 3], 0, 4).unwrap_err().code(),
-            tonic::Code::DataLoss
-        );
     }
 }

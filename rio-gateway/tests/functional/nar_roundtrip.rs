@@ -23,15 +23,15 @@ use super::*;
 // r[verify store.cas.fastcdc]
 // r[verify gw.opcode.add-multiple.unaligned-frames]
 // r[verify gw.opcode.nar-from-path.raw-bytes]
-/// 3 paths via `wopAddMultipleToStore`, each >256 KiB (over
-/// `INLINE_THRESHOLD`), read each back via `wopNarFromPath`. Bytes must
-/// survive chunk → manifest → backend → reassembly byte-for-byte.
+/// 3 paths via `wopAddMultipleToStore`, each 512 KiB (a multi-chunk
+/// NAR), read each back via `wopNarFromPath`. Bytes must survive
+/// chunk → manifest → backend → reassembly byte-for-byte.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
     let (mut stack, chunk_backend) = RioStack::ready_chunked().await?;
 
-    // 3 paths at 512 KiB each — well over INLINE_THRESHOLD (256 KiB),
-    // chunks into ~8 pieces at FastCDC's 64 KiB normal-size. Different
+    // 3 paths at 512 KiB each — chunks into ~8 pieces at FastCDC's
+    // 64 KiB normal-size. Different
     // seeds so each path is distinct content (but the 7919-prime
     // generator means they share SOME chunks — incidental dedup).
     let paths: Vec<(String, Vec<u8>, [u8; 32])> = (0..3)
@@ -78,14 +78,13 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
     drain_stderr_until_last(&mut stack.stream).await?;
 
     // White-box: chunks actually landed in the backend. If this is zero,
-    // the store took the inline-blob shortcut (narinfo.inline_blob NOT
-    // NULL) and this test is NOT exercising reassembly. The exit
-    // criterion demands real chunking.
+    // the store didn't write through the chunk backend and this test is
+    // NOT exercising reassembly. The exit criterion demands real
+    // chunking.
     let chunk_count = chunk_backend.len();
     assert!(
         chunk_count > 0,
-        "NARs >INLINE_THRESHOLD must be chunked; backend is empty — \
-         store took inline shortcut and this test proves nothing"
+        "every NAR must be chunked; backend is empty — this test proves nothing"
     );
     // 3 paths × ~8 chunks each, minus dedup. Loose lower bound.
     assert!(
@@ -93,14 +92,14 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
         "suspiciously few chunks for 1.5 MiB of NARs: {chunk_count}"
     );
 
-    // White-box: manifests are chunked (inline_blob IS NULL).
+    // White-box: every manifest has a chunk list.
     let chunked_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM manifests WHERE inline_blob IS NULL")
+        sqlx::query_scalar("SELECT count(*) FROM manifest_data WHERE chunk_list IS NOT NULL")
             .fetch_one(&stack.db.pool)
             .await?;
     assert_eq!(
         chunked_count, 3,
-        "all 3 manifests should be chunked (inline_blob NULL)"
+        "all 3 manifests should have a manifest_data.chunk_list row"
     );
 
     // Read each back via wopNarFromPath. Bytes MUST be identical —
@@ -132,19 +131,19 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
 // r[verify store.nar.reassembly]
 /// Single-path variant via `wopAddToStoreNar` (39) — the framed path
 /// (not the unaligned-frames multi path). Same proof as above but through
-/// the other write opcode. Smaller NAR (still over threshold).
+/// the other write opcode. Smaller (single-digit-chunk) NAR.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_single_then_nar_from_path_chunked() -> TestResult {
     let (mut stack, chunk_backend) = RioStack::ready_chunked().await?;
     let path = test_store_path("func-nar-single");
-    // 300 KiB — just over INLINE_THRESHOLD. Minimum viable chunking.
+    // 300 KiB — a handful of FastCDC chunks.
     let (nar, info, _) = make_large_nar(99, 300 * 1024);
 
     add_to_store_nar(&mut stack.stream, &path, &nar, info.nar_hash, &[]).await?;
 
     assert!(
         !chunk_backend.is_empty(),
-        "300 KiB NAR > INLINE_THRESHOLD — must chunk"
+        "every NAR must be chunked — backend is empty"
     );
 
     wire_send!(&mut stack.stream; u64: 38, string: &path);

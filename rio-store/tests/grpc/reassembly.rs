@@ -15,7 +15,7 @@ async fn test_chunked_roundtrip() -> TestResult {
 
     let (mut s, _backend) = StoreSession::new_chunked().await?;
 
-    // 1 MiB NAR — well over INLINE_THRESHOLD, chunks into ~16 pieces.
+    // 1 MiB NAR — chunks into ~16 pieces at FastCDC's 64 KiB average.
     let (nar, info, store_path) = make_large_nar(42, 1024 * 1024);
     let original = nar.clone();
 
@@ -115,55 +115,9 @@ async fn test_chunked_getpath_missing_chunk_data_loss() -> TestResult {
     Ok(())
 }
 
-/// Inline-only store + chunked manifest: fail clearly at pre-flight,
-/// not deep in the spawned task with no context.
-#[tokio::test]
-async fn test_chunked_manifest_no_cache_preflight_fails() -> TestResult {
-    use rio_proto::types::GetPathRequest;
-
-    // Can't use StoreSession here — both servers need to share ONE PG
-    // (StoreSession::new() creates a fresh DB each time). Build manually
-    // via spawn_store_server.
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // First: use a CHUNKED store to write a chunked path.
-    {
-        let backend = mem_backend();
-        let cache = Arc::new(rio_store::cas::ChunkCache::new(
-            backend as Arc<dyn ChunkBackend>,
-        ));
-        let service = StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(cache);
-        let (mut cli, server) = spawn_store_server(service).await?;
-        let (nar, info, _) = make_large_nar(44, 512 * 1024);
-        put_path(&mut cli, info, nar).await?;
-        server.abort();
-    }
-
-    // Second: use an INLINE-ONLY store (same PG) to try reading it.
-    // Simulates a misconfigured deployment where one instance wrote
-    // chunked and another can't read it.
-    let service = StoreServiceImpl::new(db.pool.clone());
-    let (mut cli, server) = spawn_store_server(service).await?;
-    let store_path = test_store_path("large-nar-44");
-
-    let result = cli
-        .get_path(GetPathRequest {
-            store_path,
-            manifest_hint: None,
-        })
-        .await;
-    let status = result.expect_err("should fail at pre-flight");
-    assert_eq!(
-        status.code(),
-        tonic::Code::FailedPrecondition,
-        "should be FAILED_PRECONDITION (clear config error), got: {status:?}"
-    );
-    assert!(
-        status.message().contains("chunk backend"),
-        "message should explain the config issue: {}",
-        status.message()
-    );
-
-    server.abort();
-    Ok(())
-}
+// The "this replica's backend doesn't have the chunk" misconfiguration
+// (e.g. two store replicas pointed at different buckets) surfaces as
+// DATA_LOSS chunk-not-found mid-stream — covered by
+// test_chunked_getpath_missing_chunk_data_loss above. The pre-P0583
+// "store has no chunk backend at all" pre-flight FAILED_PRECONDITION is
+// gone: a chunk backend is required config.

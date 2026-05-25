@@ -36,11 +36,6 @@
 #   worker. Nonzero misses prove lookup()→ensure_cached()→materialize
 #   ran and the inode→realpath mapping is cached (ops.rs:52+).
 #
-# store.inline.threshold — verify marker at default.nix:subtests[chunks]
-#   chunks builds a 300 KiB blob (> INLINE_THRESHOLD=256 KiB) and asserts
-#   chunk_after > chunk_baseline. Proves put_path.rs:494 nar_data.len()
-#   >= INLINE_THRESHOLD gate fired (tiny-text builds go inline).
-#
 # obs.metric.transfer-volume — verify marker at default.nix:subtests[chunks]
 #   chunks asserts rio_store_put_path_bytes_total delta ≥300000 after
 #   bigblob upload. Proves the volume counter (put_path.rs:574) runs on

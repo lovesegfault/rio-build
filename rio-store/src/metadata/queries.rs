@@ -3,7 +3,7 @@
 //!
 //! All read queries filter on `manifests.status = 'complete'` — placeholders
 //! from in-progress or crashed uploads are invisible. `get_manifest` is the
-//! ONE place the inline-vs-chunked branch lives; callers never touch
+//! ONE place `manifest_data.chunk_list` is decoded; callers never touch
 //! `manifests`/`manifest_data` directly.
 
 use super::*;
@@ -17,7 +17,7 @@ use crate::narinfo_cols;
 /// `SELECT <narinfo cols>[extra] FROM narinfo n JOIN manifests m … WHERE
 /// <pred> AND m.status='complete'`. Every read query that returns full
 /// `NarinfoRow`s shares this shell; only the WHERE predicate (and
-/// `get_manifest_batch`'s extra `m.inline_blob` column) varies. Factored
+/// `get_manifest_batch`'s extra `md.chunk_list` column) varies. Factored
 /// so the JOIN clause + status filter can't drift between the four
 /// callers (I-078 made the index strategy load-bearing).
 macro_rules! narinfo_complete_select {
@@ -61,34 +61,34 @@ fn path_hash(store_path: &str) -> Result<[u8; 32]> {
         .sha256_digest())
 }
 
-/// Fetch the storage kind + content for a completed path.
+/// Fetch the chunk manifest for a completed path.
 ///
-/// This is THE one place the inline/chunked branch is implemented. Callers
-/// (GetPath) match on the result; they never query manifests or
+/// This is THE one place `manifest_data.chunk_list` is decoded. Callers
+/// (GetPath) consume the result; they never query manifests or
 /// manifest_data directly.
 ///
 /// `None` means the path has no complete manifest (either never uploaded,
 /// or stuck in 'uploading' from a crashed PutPath).
 #[instrument(skip(pool))]
-pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
+pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ChunkManifest>> {
     let hash = path_hash(store_path)?;
-    // Single LEFT JOIN: both halves of the inline/chunked branch in
-    // ONE statement = ONE MVCC snapshot. Filter on the manifests PK
-    // directly (no narinfo join needed — both tables key on
-    // store_path_hash). I-078: the previous narinfo-join +
-    // `n.store_path = $1` filter was a Seq Scan.
+    // Single LEFT JOIN: manifests + manifest_data in ONE statement =
+    // ONE MVCC snapshot. Filter on the manifests PK directly (no
+    // narinfo join needed — both tables key on store_path_hash).
+    // I-078: the previous narinfo-join + `n.store_path = $1` filter
+    // was a Seq Scan.
     //
     // Two separate `.fetch_optional(pool)` calls (the previous shape)
     // race with GC sweep: under READ COMMITTED each statement takes a
     // fresh snapshot, so sweep's `DELETE FROM narinfo` CASCADE can
-    // commit between them — query 1 sees the chunked `manifests` row,
-    // query 2 sees no `manifest_data` → spurious InvariantViolation
-    // for what is semantically NotFound. A READ COMMITTED `BEGIN` does
-    // NOT fix that (each statement re-snapshots); LEFT JOIN does.
-    type ManifestRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+    // commit between them — query 1 sees the `manifests` row, query 2
+    // sees no `manifest_data` → spurious DATA_LOSS for what is
+    // semantically NotFound. A READ COMMITTED `BEGIN` does NOT fix
+    // that (each statement re-snapshots); LEFT JOIN does.
+    type ManifestRow = (Option<Vec<u8>>,);
     let row: Option<ManifestRow> = sqlx::query_as(
         r#"
-        SELECT m.inline_blob, md.chunk_list
+        SELECT md.chunk_list
         FROM manifests m
         LEFT JOIN manifest_data md USING (store_path_hash)
         WHERE m.store_path_hash = $1 AND m.status = 'complete'
@@ -100,21 +100,12 @@ pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Opti
 
     match row {
         None => Ok(None),
-        Some((Some(blob), _)) => Ok(Some(ManifestKind::Inline(Bytes::from(blob)))),
-        Some((None, Some(chunk_list))) => Ok(Some(ManifestKind::Chunked(decode_chunk_list(
-            store_path,
-            &chunk_list,
-        )?))),
-        // manifest exists + inline_blob NULL but NO manifest_data row:
-        // invariant violation (store.typ says inline_blob NULL ⇔
-        // manifest_data exists). Single-snapshot read; this arm is now
-        // ONLY reachable via genuine corruption (manual DB surgery or
-        // a CASCADE bug) — concurrent GC cannot produce it. Surface
-        // it — don't silently return None (that would look like "path
-        // not found", masking corruption).
-        Some((None, None)) => Err(MetadataError::InvariantViolation(format!(
-            "manifest for {store_path} has NULL inline_blob but no manifest_data row"
-        ))),
+        // `manifest exists but NO manifest_data row` is folded into
+        // decode_chunk_list's None arm: the content is unreadable
+        // (pre-migration-065 inline-stored path or corruption) →
+        // DATA_LOSS. Don't silently return None (that would look like
+        // "path not found", masking the loss).
+        Some((chunk_list,)) => Ok(Some(decode_chunk_list(store_path, chunk_list.as_deref())?)),
     }
 }
 
@@ -125,12 +116,12 @@ pub(crate) async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Opti
 pub(crate) async fn get_manifest_for_index(
     pool: &PgPool,
     store_path: &str,
-) -> Result<Option<(ManifestKind, Option<uuid::Uuid>)>> {
+) -> Result<Option<(ChunkManifest, Option<uuid::Uuid>)>> {
     let hash = path_hash(store_path)?;
-    type Row = (Option<Vec<u8>>, Option<Vec<u8>>, Option<uuid::Uuid>);
+    type Row = (Option<Vec<u8>>, Option<uuid::Uuid>);
     let row: Option<Row> = sqlx::query_as(
         r#"
-        SELECT m.inline_blob, md.chunk_list, m.claim_id
+        SELECT md.chunk_list, m.claim_id
         FROM manifests m
         LEFT JOIN manifest_data md USING (store_path_hash)
         WHERE m.store_path_hash = $1 AND m.status = 'complete'
@@ -141,32 +132,39 @@ pub(crate) async fn get_manifest_for_index(
     .await?;
     match row {
         None => Ok(None),
-        Some((Some(blob), _, claim)) => Ok(Some((ManifestKind::Inline(Bytes::from(blob)), claim))),
-        Some((None, Some(chunk_list), claim)) => Ok(Some((
-            ManifestKind::Chunked(decode_chunk_list(store_path, &chunk_list)?),
+        Some((chunk_list, claim)) => Ok(Some((
+            decode_chunk_list(store_path, chunk_list.as_deref())?,
             claim,
-        ))),
-        Some((None, None, _)) => Err(MetadataError::InvariantViolation(format!(
-            "manifest for {store_path} has NULL inline_blob but no manifest_data row"
         ))),
     }
 }
 
 /// Deserialize a `manifest_data.chunk_list` blob into the
-/// `ManifestKind::Chunked` tuple shape. Shared by `get_manifest` and
+/// [`ChunkManifest`] tuple shape. Shared by `get_manifest` and
 /// `get_manifest_batch`.
-fn decode_chunk_list(store_path: &str, chunk_list: &[u8]) -> Result<Vec<([u8; 32], u32)>> {
+///
+/// `None` (a `'complete'` manifests row with no `manifest_data` row) →
+/// `CorruptManifest`/DATA_LOSS: the content is unreadable. Either a
+/// pre-migration-065 inline-stored path (whose `inline_blob` column was
+/// dropped) or genuine corruption.
+fn decode_chunk_list(store_path: &str, chunk_list: Option<&[u8]>) -> Result<ChunkManifest> {
+    let chunk_list = chunk_list.ok_or_else(|| MetadataError::CorruptManifest {
+        store_path: store_path.to_string(),
+        source: crate::manifest::ManifestError::MissingChunkList,
+    })?;
     let manifest = crate::manifest::Manifest::deserialize(chunk_list).map_err(|source| {
         MetadataError::CorruptManifest {
             store_path: store_path.to_string(),
             source,
         }
     })?;
-    Ok(manifest
-        .entries
-        .into_iter()
-        .map(|e| (e.hash, e.size))
-        .collect())
+    Ok(ChunkManifest(
+        manifest
+            .entries
+            .into_iter()
+            .map(|e| (e.hash, e.size))
+            .collect(),
+    ))
 }
 
 /// Query path info for a store path.
@@ -243,7 +241,7 @@ pub(crate) async fn query_path_info_batch(
 }
 
 /// Batch [`get_manifest`] + [`query_path_info`]: one call → (PathInfo,
-/// ManifestKind) for N paths.
+/// ChunkManifest) for N paths.
 ///
 /// I-110c: the builder's FUSE-warm stat loop drives one `GetPath` per
 /// input path; each GetPath does TWO PG lookups (narinfo + manifest).
@@ -254,7 +252,7 @@ pub(crate) async fn query_path_info_batch(
 /// Returns `(path, Option<(info, manifest)>)` per input, in INPUT
 /// ORDER. `None` = no complete manifest. Same `status='complete'`
 /// filter and PK-probe shape (I-078) as the single-path queries.
-pub(crate) type ManifestBatchEntry = (String, Option<(ValidatedPathInfo, ManifestKind)>);
+pub(crate) type ManifestBatchEntry = (String, Option<(ValidatedPathInfo, ChunkManifest)>);
 
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
 pub(crate) async fn get_manifest_batch(
@@ -266,22 +264,20 @@ pub(crate) async fn get_manifest_batch(
     }
     let hashes = batch_hashes(store_paths)?;
 
-    // Single query: narinfo + manifests.inline_blob + manifest_data.
-    // chunk_list via LEFT JOIN — one statement = one MVCC snapshot. A
-    // separate manifest_data query (the previous shape) raced with GC
-    // sweep: one chunked path GC'd between the two queries failed the
-    // ENTIRE batch with InvariantViolation. See `get_manifest` for the
-    // full READ COMMITTED reasoning.
+    // Single query: narinfo + manifest_data.chunk_list via LEFT JOIN —
+    // one statement = one MVCC snapshot. A separate manifest_data
+    // query (the previous shape) raced with GC sweep: one path GC'd
+    // between the two queries failed the ENTIRE batch. See
+    // `get_manifest` for the full READ COMMITTED reasoning.
     #[derive(sqlx::FromRow)]
     struct Row {
         #[sqlx(flatten)]
         narinfo: NarinfoRow,
-        inline_blob: Option<Vec<u8>>,
         chunk_list: Option<Vec<u8>>,
     }
     let rows: Vec<Row> = sqlx::query_as(narinfo_complete_select!(
         "n.store_path_hash = ANY($1)",
-        ", m.inline_blob, md.chunk_list",
+        ", md.chunk_list",
         // ON, not USING: `n` and `m` both expose store_path_hash on
         // the left side after the INNER JOIN ON, so USING is ambiguous
         // (PG 42702 "appears more than once in left table").
@@ -291,25 +287,15 @@ pub(crate) async fn get_manifest_batch(
     .fetch_all(pool)
     .await?;
 
-    // Index by store_path. Same 4-arm match as `get_manifest`.
-    let mut by_path: std::collections::HashMap<String, (ValidatedPathInfo, ManifestKind)> =
+    // Index by store_path. Same decode (and missing-chunk-list
+    // DATA_LOSS) as `get_manifest` — a single unreadable path fails
+    // the batch (corruption indicator, not a per-path miss).
+    let mut by_path: std::collections::HashMap<String, (ValidatedPathInfo, ChunkManifest)> =
         std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
         let info = row.narinfo.try_into_validated()?;
         let path = info.store_path.to_string();
-        let kind = match (row.inline_blob, row.chunk_list) {
-            (Some(blob), _) => ManifestKind::Inline(Bytes::from(blob)),
-            (None, Some(chunk_list)) => {
-                ManifestKind::Chunked(decode_chunk_list(&path, &chunk_list)?)
-            }
-            // Single-snapshot read; only reachable via genuine
-            // corruption — same arm as `get_manifest`. Fail the batch.
-            (None, None) => {
-                return Err(MetadataError::InvariantViolation(format!(
-                    "manifest for {path} has NULL inline_blob but no manifest_data row"
-                )));
-            }
-        };
+        let kind = decode_chunk_list(&path, row.chunk_list.as_deref())?;
         by_path.insert(path, (info, kind));
     }
 
@@ -720,21 +706,29 @@ mod tests {
     /// Seed a complete path (narinfo + manifests status='complete').
     /// Returns (store_path_hash, nar_hash). `nar_hash` is a fixed
     /// `[0xAA, 0, ..]` so callers can assert on `path_by_nar_hash`.
+    ///
+    /// `chunks`: `Some(entries)` seeds a `manifest_data` row with that
+    /// chunk list (readable manifest metadata); `None` seeds NO
+    /// `manifest_data` row — `get_manifest` reports DATA_LOSS for it.
     async fn seed_complete(
         pool: &PgPool,
         path: &str,
-        inline_blob: Option<&[u8]>,
+        chunks: Option<&[([u8; 32], u32)]>,
     ) -> (Vec<u8>, [u8; 32]) {
         let mut nar_hash = [0u8; 32];
         nar_hash[0] = 0xAA;
         let mut seed = StoreSeed::raw_path(path)
             .with_nar_hash(nar_hash)
             .with_nar_size(100);
-        if let Some(b) = inline_blob {
-            seed = seed.with_inline_blob(b);
+        if let Some(c) = chunks {
+            seed = seed.with_chunk_manifest(c);
         }
         (seed.seed(pool).await, nar_hash)
     }
+
+    /// The default `seed_complete` chunk list: one 100-byte chunk,
+    /// matching the seeded `nar_size` of 100.
+    const ONE_CHUNK: &[([u8; 32], u32)] = &[([0x55; 32], 100)];
 
     /// Empty input → empty output, no DB round-trip.
     #[tokio::test]
@@ -754,8 +748,8 @@ mod tests {
         let p_missing = test_store_path("batch-missing");
         let p_uploading = test_store_path("batch-uploading");
 
-        seed_complete(&db.pool, &p_a, Some(b"a")).await;
-        seed_complete(&db.pool, &p_b, Some(b"b")).await;
+        seed_complete(&db.pool, &p_a, Some(ONE_CHUNK)).await;
+        seed_complete(&db.pool, &p_b, Some(ONE_CHUNK)).await;
         // status='uploading' → invisible (same filter as single-path QPI).
         StoreSeed::raw_path(&p_uploading)
             .with_manifest_status("uploading")
@@ -802,7 +796,7 @@ mod tests {
     async fn path_by_nar_hash_found_and_not_found() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let path = test_store_path("found-by-hash");
-        let (_ph, nar_hash) = seed_complete(&db.pool, &path, Some(b"blob")).await;
+        let (_ph, nar_hash) = seed_complete(&db.pool, &path, Some(ONE_CHUNK)).await;
 
         // Found: nar_hash matches.
         let found = path_by_nar_hash(&db.pool, &nar_hash).await.unwrap();
@@ -813,20 +807,34 @@ mod tests {
         assert_eq!(missing, None);
     }
 
-    /// `get_manifest` invariant violation: manifest.inline_blob=NULL
-    /// but NO manifest_data row. Store doc says these are
-    /// mutually exclusive; this state indicates corruption.
+    /// `get_manifest` on a `'complete'` manifest with NO manifest_data
+    /// row: the row shape every pre-migration-065 inline-stored path
+    /// degrades to after the `inline_blob` column drop. Must be a
+    /// clear DATA_LOSS (CorruptManifest/MissingChunkList), not a
+    /// panic, a confusing decode error, or a silent NotFound.
     #[tokio::test]
-    async fn get_manifest_invariant_violation() {
+    async fn get_manifest_missing_chunk_list_is_data_loss() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let path = test_store_path("invariant-viol");
-        // inline_blob=NULL but we DON'T insert manifest_data.
+        // 'complete' but we DON'T insert manifest_data.
         seed_complete(&db.pool, &path, None).await;
 
         let err = get_manifest(&db.pool, &path).await.unwrap_err();
         assert!(
-            matches!(&err, MetadataError::InvariantViolation(s) if s.contains("NULL inline_blob")),
-            "expected InvariantViolation, got {err:?}"
+            matches!(
+                &err,
+                MetadataError::CorruptManifest {
+                    store_path,
+                    source: crate::manifest::ManifestError::MissingChunkList,
+                } if *store_path == path
+            ),
+            "expected CorruptManifest/MissingChunkList, got {err:?}"
+        );
+        // The gRPC mapping for CorruptManifest is DATA_LOSS — assert it
+        // here so the row shape's user-visible status is pinned.
+        assert_eq!(
+            crate::grpc::metadata_status("test", err).code(),
+            tonic::Code::DataLoss
         );
     }
 
@@ -855,65 +863,51 @@ mod tests {
     }
 
     /// I-110c: batch manifest returns one entry per input, in input
-    /// order, covering inline + chunked + missing + uploading. Mirrors
+    /// order, covering present + missing + uploading. Mirrors
     /// `query_path_info_batch_order_and_misses` for the manifest side.
     #[tokio::test]
     async fn get_manifest_batch_order_and_kinds() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let p_inline = test_store_path("mb-inline");
-        let p_chunked = test_store_path("mb-chunked");
+        let p_one = test_store_path("mb-one-chunk");
+        let p_multi = test_store_path("mb-multi-chunk");
         let p_missing = test_store_path("mb-missing");
         let p_uploading = test_store_path("mb-uploading");
 
-        seed_complete(&db.pool, &p_inline, Some(b"inline blob")).await;
-        let (ph, _) = seed_complete(&db.pool, &p_chunked, None).await;
-        let manifest = crate::manifest::Manifest {
-            entries: vec![crate::manifest::ManifestEntry {
-                hash: [0x22; 32],
-                size: 8192,
-            }],
-        }
-        .serialize();
-        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
-            .bind(&ph)
-            .bind(&manifest)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        seed_complete(&db.pool, &p_one, Some(&[([0x11; 32], 100)])).await;
+        seed_complete(
+            &db.pool,
+            &p_multi,
+            Some(&[([0x22; 32], 8192), ([0x33; 32], 64)]),
+        )
+        .await;
         StoreSeed::raw_path(&p_uploading)
             .with_manifest_status("uploading")
             .seed(&db.pool)
             .await;
 
-        // Input order: [chunked, missing, inline, uploading].
+        // Input order: [multi, missing, one, uploading].
         let req = vec![
-            p_chunked.clone(),
+            p_multi.clone(),
             p_missing.clone(),
-            p_inline.clone(),
+            p_one.clone(),
             p_uploading.clone(),
         ];
         let got = get_manifest_batch(&db.pool, &req).await.unwrap();
 
         assert_eq!(got.len(), 4);
-        // chunked
-        assert_eq!(got[0].0, p_chunked);
-        let (info, kind) = got[0].1.as_ref().expect("chunked present");
-        assert_eq!(info.store_path.as_str(), p_chunked);
-        match kind {
-            ManifestKind::Chunked(e) => {
-                assert_eq!(e.len(), 1);
-                assert_eq!(e[0], ([0x22; 32], 8192));
-            }
-            _ => panic!("expected Chunked"),
-        }
+        // multi-chunk
+        assert_eq!(got[0].0, p_multi);
+        let (info, kind) = got[0].1.as_ref().expect("multi present");
+        assert_eq!(info.store_path.as_str(), p_multi);
+        assert_eq!(kind.0, vec![([0x22; 32], 8192), ([0x33; 32], 64)]);
         // missing
         assert_eq!(got[1].0, p_missing);
         assert!(got[1].1.is_none(), "missing → None");
-        // inline
-        assert_eq!(got[2].0, p_inline);
-        let (info, kind) = got[2].1.as_ref().expect("inline present");
-        assert_eq!(info.store_path.as_str(), p_inline);
-        assert!(matches!(kind, ManifestKind::Inline(b) if &b[..] == b"inline blob"));
+        // single-chunk
+        assert_eq!(got[2].0, p_one);
+        let (info, kind) = got[2].1.as_ref().expect("one present");
+        assert_eq!(info.store_path.as_str(), p_one);
+        assert_eq!(kind.0, vec![([0x11; 32], 100)]);
         // uploading → invisible
         assert_eq!(got[3].0, p_uploading);
         assert!(got[3].1.is_none(), "uploading → None");
@@ -922,65 +916,43 @@ mod tests {
         assert!(get_manifest_batch(&db.pool, &[]).await.unwrap().is_empty());
     }
 
-    /// I-110c: chunked path with NULL inline_blob but no manifest_data
-    /// row → batch surfaces the same InvariantViolation as
-    /// `get_manifest_invariant_violation` (corruption indicator, not a
-    /// per-path miss).
+    /// I-110c: a `'complete'` path with no manifest_data row → batch
+    /// surfaces the same DATA_LOSS as
+    /// `get_manifest_missing_chunk_list_is_data_loss` (corruption
+    /// indicator, not a per-path miss).
     #[tokio::test]
-    async fn get_manifest_batch_invariant_violation() {
+    async fn get_manifest_batch_missing_chunk_list_is_data_loss() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let path = test_store_path("mb-broken");
         seed_complete(&db.pool, &path, None).await;
         let err = get_manifest_batch(&db.pool, &[path]).await.unwrap_err();
         assert!(
-            matches!(err, MetadataError::InvariantViolation(_)),
-            "expected InvariantViolation, got {err:?}"
+            matches!(
+                err,
+                MetadataError::CorruptManifest {
+                    source: crate::manifest::ManifestError::MissingChunkList,
+                    ..
+                }
+            ),
+            "expected CorruptManifest/MissingChunkList, got {err:?}"
         );
     }
 
-    /// `get_manifest` happy paths: inline and chunked both return
-    /// the right `ManifestKind` variant.
+    /// `get_manifest` happy path: a valid manifest_data row decodes to
+    /// the chunk list; absent and malformed paths behave.
     #[tokio::test]
-    async fn get_manifest_inline_and_chunked() {
+    async fn get_manifest_decodes_chunk_list() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Inline: inline_blob set.
-        let inline_path = test_store_path("inline");
-        seed_complete(&db.pool, &inline_path, Some(b"inline content")).await;
-        let kind = get_manifest(&db.pool, &inline_path).await.unwrap().unwrap();
-        assert!(
-            matches!(kind, ManifestKind::Inline(b) if &b[..] == b"inline content"),
-            "expected Inline variant"
-        );
-
-        // Chunked: inline_blob=NULL, valid manifest_data.
         let chunked_path = test_store_path("chunked");
-        let (ph, _) = seed_complete(&db.pool, &chunked_path, None).await;
-        let manifest = crate::manifest::Manifest {
-            entries: vec![crate::manifest::ManifestEntry {
-                hash: [0x11; 32],
-                size: 4096,
-            }],
-        }
-        .serialize();
-        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
-            .bind(&ph)
-            .bind(&manifest)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        seed_complete(&db.pool, &chunked_path, Some(&[([0x11; 32], 4096)])).await;
         let kind = get_manifest(&db.pool, &chunked_path)
             .await
             .unwrap()
             .unwrap();
-        match kind {
-            ManifestKind::Chunked(entries) => {
-                assert_eq!(entries.len(), 1);
-                assert_eq!(entries[0].0, [0x11; 32]);
-                assert_eq!(entries[0].1, 4096);
-            }
-            _ => panic!("expected Chunked variant"),
-        }
+        assert_eq!(kind.0.len(), 1);
+        assert_eq!(kind.0[0].0, [0x11; 32]);
+        assert_eq!(kind.0[0].1, 4096);
 
         // Not found: well-formed but absent path → None (no row).
         let missing = get_manifest(
@@ -1006,7 +978,7 @@ mod tests {
     async fn append_signatures_dedups() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let path = test_store_path("sigdedup");
-        seed_complete(&db.pool, &path, Some(b"x")).await;
+        seed_complete(&db.pool, &path, Some(ONE_CHUNK)).await;
 
         // Append the same sig twice, in separate calls.
         let r1 = append_signatures(&db.pool, &path, &["sig:abc".into()])
@@ -1046,7 +1018,7 @@ mod tests {
     async fn append_signatures_over_cap_rejects() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let path = test_store_path("sigcap");
-        seed_complete(&db.pool, &path, Some(b"x")).await;
+        seed_complete(&db.pool, &path, Some(ONE_CHUNK)).await;
 
         // Seed MAX_SIGNATURES distinct sigs first (at cap, no error).
         let at_cap: Vec<String> = (0..rio_common::limits::MAX_SIGNATURES)
@@ -1098,7 +1070,7 @@ mod tests {
         );
     }
 
-    // r[verify store.api.batch-manifest+2]
+    // r[verify store.api.batch-manifest+3]
     /// `get_manifest` racing GC sweep's CASCADE delete: every result
     /// is `Ok(Some(..))` or `Ok(None)`; never `InvariantViolation`.
     /// Previously: two separate `.fetch_optional(pool)` calls under
@@ -1150,41 +1122,28 @@ mod tests {
         let (results, _) = tokio::join!(reader, deleter);
         for r in results.unwrap() {
             match r {
-                Ok(Some(ManifestKind::Chunked(_))) | Ok(None) => {}
+                Ok(Some(_)) | Ok(None) => {}
                 other => panic!(
-                    "get_manifest under concurrent GC must be Ok(Some(Chunked)) \
+                    "get_manifest under concurrent GC must be Ok(Some(..)) \
                      or Ok(None); got {other:?}"
                 ),
             }
         }
     }
 
-    /// Batch variant of the GC-race test: one stable inline path + one
-    /// chunked path being deleted. Batch never errors; the inline path
-    /// always resolves.
+    /// Batch variant of the GC-race test: one stable path + one path
+    /// being deleted. Batch never errors; the stable path always
+    /// resolves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_manifest_batch_concurrent_gc_never_invariant_violation() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let p_inline = test_store_path("gcb-inline");
-        let p_chunked = test_store_path("gcb-chunked");
-        seed_complete(&db.pool, &p_inline, Some(b"stable")).await;
-        let (ph, _) = seed_complete(&db.pool, &p_chunked, None).await;
-        let manifest = crate::manifest::Manifest {
-            entries: vec![crate::manifest::ManifestEntry {
-                hash: [0x44; 32],
-                size: 4096,
-            }],
-        }
-        .serialize();
-        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
-            .bind(&ph)
-            .bind(&manifest)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        let p_stable = test_store_path("gcb-stable");
+        let p_deleted = test_store_path("gcb-deleted");
+        seed_complete(&db.pool, &p_stable, Some(&[([0x55; 32], 100)])).await;
+        let (ph, _) = seed_complete(&db.pool, &p_deleted, Some(&[([0x44; 32], 4096)])).await;
 
         let pool_r = db.pool.clone();
-        let req = vec![p_inline.clone(), p_chunked.clone()];
+        let req = vec![p_stable.clone(), p_deleted.clone()];
         let reader = tokio::spawn(async move {
             let mut results = Vec::with_capacity(200);
             for _ in 0..200 {
@@ -1207,15 +1166,15 @@ mod tests {
         for r in results.unwrap() {
             let batch = r.expect("batch must never Err under concurrent GC");
             assert_eq!(batch.len(), 2);
-            // Inline path always resolves (never deleted).
+            // Stable path always resolves (never deleted).
             assert!(
-                matches!(&batch[0].1, Some((_, ManifestKind::Inline(b))) if &b[..] == b"stable"),
-                "stable inline path must always resolve"
+                matches!(&batch[0].1, Some((_, m)) if m.0 == vec![([0x55; 32], 100)]),
+                "stable path must always resolve"
             );
-            // Chunked path: Some(Chunked) before delete, None after.
+            // Deleted path: Some before delete, None after.
             assert!(
-                matches!(&batch[1].1, Some((_, ManifestKind::Chunked(_))) | None),
-                "chunked path under GC: Some(Chunked) or None, got {:?}",
+                matches!(&batch[1].1, Some(_) | None),
+                "path under GC: Some(..) or None, got {:?}",
                 batch[1].1
             );
         }
@@ -1334,7 +1293,6 @@ mod tests {
         let nar_hash = [0xBB; 32];
         let hash_vec = StoreSeed::raw_path(&p)
             .with_nar_hash(nar_hash)
-            .with_inline_blob(b"x".as_slice())
             .seed(&db.pool)
             .await;
         let hash: [u8; 32] = hash_vec.as_slice().try_into().unwrap();
@@ -1421,7 +1379,6 @@ mod tests {
         let p_a = test_store_path("castore-a");
         let hash_a: [u8; 32] = StoreSeed::raw_path(&p_a)
             .with_nar_hash([0xC1; 32])
-            .with_inline_blob(b"a".as_slice())
             .seed(&db.pool)
             .await
             .as_slice()
@@ -1430,7 +1387,6 @@ mod tests {
         let p_b = test_store_path("castore-b");
         let hash_b: [u8; 32] = StoreSeed::raw_path(&p_b)
             .with_nar_hash([0xC2; 32])
-            .with_inline_blob(b"b".as_slice())
             .seed(&db.pool)
             .await
             .as_slice()

@@ -39,7 +39,7 @@ use rio_common::limits::{
 use crate::admission::{AdmissionError, AdmissionGate};
 use crate::backend::ChunkBackend;
 use crate::cas;
-use crate::ingest::{self, IngestHooks, PersistError, PlaceholderClaim};
+use crate::ingest::{self, IngestHooks, PlaceholderClaim};
 use crate::metadata::{self, SigMode, Upstream};
 use crate::signing::TenantSigner;
 
@@ -299,7 +299,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// substitutions of the same `(tenant, path)` pair.
 pub struct Substituter {
     pool: PgPool,
-    chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    chunk_backend: Arc<dyn ChunkBackend>,
     /// `None` if `reqwest::Client::builder().build()` failed (nix
     /// sandbox: no CA bundle → rustls-native-certs errors). In that
     /// case substitution is a no-op — every `try_substitute` returns
@@ -363,7 +363,7 @@ pub struct Substituter {
 const DEFAULT_SUBSTITUTE_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
 
 impl Substituter {
-    pub fn new(pool: PgPool, chunk_backend: Option<Arc<dyn ChunkBackend>>) -> Self {
+    pub fn new(pool: PgPool, chunk_backend: Arc<dyn ChunkBackend>) -> Self {
         // `Client::new()` panics if `.build()` fails; `.build()` fails
         // in the nix sandbox (rustls-native-certs finds no CA bundle).
         // Use the builder + `.ok()` so sandbox tests degrade to no-op
@@ -824,7 +824,7 @@ impl Substituter {
 
         let claim = match ingest::claim_placeholder(
             &self.pool,
-            self.chunk_backend.as_ref(),
+            Some(&self.chunk_backend),
             &store_path_hash,
             info.store_path.as_str(),
             &refs_str,
@@ -868,13 +868,13 @@ impl Substituter {
             }
         };
 
-        // r[impl store.put.drop-cleanup+2]
+        // r[impl store.put.drop-cleanup+3]
         // We OWN the placeholder. Guard against future-drop (client
         // RST_STREAM mid-fetch) — the guard's spawn reaps it if any
         // path between here and the defuse below is abandoned.
         let placeholder_guard = ingest::spawn_placeholder_guard(
             self.pool.clone(),
-            self.chunk_backend.clone(),
+            Some(Arc::clone(&self.chunk_backend)),
             store_path_hash.to_vec(),
             claim,
         );
@@ -939,7 +939,7 @@ impl Substituter {
             // — Step 5-6: persist via the shared write-ahead core —
             ingest::persist_nar(
                 &self.pool,
-                self.chunk_backend.as_ref(),
+                &self.chunk_backend,
                 &info,
                 claim,
                 &nar_bytes,
@@ -947,10 +947,7 @@ impl Substituter {
                 SUBSTITUTE_HOOKS,
             )
             .await
-            .map_err(|e| match e {
-                PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
-                PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
-            })
+            .map_err(|e| SubstituteError::Ingest(e.to_string()))
         }
         .await;
 
@@ -967,7 +964,7 @@ impl Substituter {
                 placeholder_guard.defuse();
                 ingest::abort_placeholder(
                     &self.pool,
-                    self.chunk_backend.as_ref(),
+                    Some(&self.chunk_backend),
                     &store_path_hash,
                     claim,
                 )
@@ -1812,7 +1809,7 @@ mod tests {
     }
 
     fn test_substituter(pool: PgPool) -> Substituter {
-        Substituter::new(pool, None).with_http_client(sandbox_http())
+        Substituter::new(pool, crate::test_helpers::mem_backend()).with_http_client(sandbox_http())
     }
 
     /// `check_available` deadline for tests that don't exercise the

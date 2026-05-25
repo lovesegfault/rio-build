@@ -83,6 +83,10 @@ processes:
       - RIO_LOG_FORMAT=pretty
       - RIO_METRICS_ADDR=127.0.0.1:9092
       - RIO_DRAIN_GRACE_SECS=0 # k8s-probe drain; pointless for local restarts
+      # chunk_backend is required (P0583: every NAR is chunked). Local
+      # filesystem under .data/ so chunks survive a process restart.
+      - RIO_CHUNK_BACKEND__KIND=filesystem
+      - RIO_CHUNK_BACKEND__BASE_DIR=.data/store/chunks
     readiness_probe:
       exec:
         command: nc -z 127.0.0.1 9002

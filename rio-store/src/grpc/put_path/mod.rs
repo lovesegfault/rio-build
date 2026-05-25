@@ -9,7 +9,7 @@
 //! 3. Insert manifest placeholder with status='uploading'
 //! 4. Accumulate NAR chunks (bounded by MAX_NAR_SIZE)
 //! 5. Verify SHA-256 matches trailer's declared nar_hash
-//! 6. Store NAR (inline or chunked) + flip status to 'complete'
+//! 6. Chunk + store the NAR + flip status to 'complete'
 //!
 //! Trailer-only: metadata.nar_hash MUST be empty; hash arrives in the
 //! PutPathTrailer after all chunks (stream-and-hash — the client doesn't

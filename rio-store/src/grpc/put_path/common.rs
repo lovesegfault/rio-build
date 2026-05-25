@@ -13,7 +13,7 @@
 //!    PutPath drains a linear stream via
 //!    [`StoreServiceImpl::ingest_nar_stream`]; PutPathBatch demuxes by
 //!    `output_index` then verifies each.
-//! 4. **finalize** — sign + persist inline-or-chunked
+//! 4. **finalize** — sign + persist chunked
 //!    ([`StoreServiceImpl::finalize_single`] for the standalone path;
 //!    PutPathBatch stages then commits in one tx)
 //!
@@ -21,6 +21,8 @@
 //! `put_path_batch_impl` and had already drifted once (batch lacked
 //! chunked support). Factoring here keeps both impls thin wrappers
 //! around the same state machine.
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -34,7 +36,7 @@ use rio_common::grpc::StatusExt;
 use rio_common::limits::{MAX_NAR_SIZE, nar_chunk_charge};
 
 use crate::cas;
-use crate::grpc::{StoreServiceImpl, putpath_metadata_status, storage_error};
+use crate::grpc::{StoreServiceImpl, storage_error};
 use crate::ingest;
 use crate::metadata;
 
@@ -49,18 +51,13 @@ const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
     ctx_label: "PutPath",
 };
 
-/// How the NAR was persisted. Batch uses this to pick the right
-/// `complete_manifest_*_in_tx` variant inside its atomic tx.
-pub(in crate::grpc) enum NarPersist {
-    /// `nar_data.len() < INLINE_THRESHOLD` (or no chunk backend).
-    /// Bytes carried so the batch tx can write `inline_blob`.
-    Inline(Bytes),
-    /// `nar_data.len() >= INLINE_THRESHOLD` and a chunk backend is
-    /// configured. Chunks already uploaded + refcounted via
-    /// [`cas::stage_chunked`]; the `status='complete'` flip and the
-    /// `durable = TRUE` flip for the carried chunk set remain for the
-    /// batch tx (ADR-022 §6.2 durable-presence).
-    ChunkedStaged { chunk_hashes: Vec<Vec<u8>> },
+/// Phase-2 staging result for one batch output. Chunks are already
+/// uploaded + refcounted via [`cas::stage_chunked`]; the
+/// `status='complete'` flip and the `durable = TRUE` flip for the
+/// carried chunk set remain for the batch tx (ADR-022 §6.2
+/// durable-presence).
+pub(in crate::grpc) struct ChunkedStaged {
+    pub(in crate::grpc) chunk_hashes: Vec<Vec<u8>>,
 }
 
 /// Auth context for PutPath / PutPathBatch: HMAC assignment claims
@@ -441,7 +438,7 @@ impl StoreServiceImpl {
     ) -> PlaceholderGuard {
         crate::ingest::spawn_placeholder_guard(
             self.pool.clone(),
-            self.chunk_backend.clone(),
+            Some(Arc::clone(&self.chunk_backend)),
             store_path_hash,
             claim,
         )
@@ -585,7 +582,7 @@ impl StoreServiceImpl {
     ) -> Result<PlaceholderClaim, metadata::MetadataError> {
         let claim = ingest::claim_placeholder(
             &self.pool,
-            self.chunk_backend.as_ref(),
+            Some(&self.chunk_backend),
             store_path_hash,
             store_path,
             refs,
@@ -607,28 +604,19 @@ impl StoreServiceImpl {
     }
 
     /// gRPC wrapper around [`ingest::persist_nar`]: maps
-    /// [`ingest::PersistError`] → `tonic::Status` with the
-    /// PutPath-specific code mapping (`storage_error` for the chunked
-    /// branch so `BackendAuthError` → `FailedPrecondition` and the
-    /// builder fails fast instead of retrying forever;
-    /// `putpath_metadata_status` for the inline branch so retriable PG
-    /// errors get retriable codes + the `putpath_retries_total`
-    /// counter).
-    ///
-    /// Returns `true` iff the chunked branch was taken (legacy — every
-    /// current caller `abort_upload`s on error regardless, which is a
-    /// safe no-op when chunked already rolled back).
+    /// [`ingest::PersistError`] → `tonic::Status` via `storage_error`
+    /// so `BackendAuthError` → `FailedPrecondition` and the builder
+    /// fails fast instead of retrying forever.
     pub(in crate::grpc) async fn persist_nar(
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: &[u8],
         ctx_label: &str,
-    ) -> Result<bool, Status> {
-        let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()).is_some();
+    ) -> Result<(), Status> {
         ingest::persist_nar(
             &self.pool,
-            self.chunk_backend.as_ref(),
+            &self.chunk_backend,
             info,
             claim,
             nar_data,
@@ -636,18 +624,14 @@ impl StoreServiceImpl {
             PUTPATH_HOOKS,
         )
         .await
-        .map_err(|e| match e {
-            ingest::PersistError::Chunked(e) => storage_error(ctx_label, e),
-            ingest::PersistError::Inline(e) => putpath_metadata_status(ctx_label, e),
-        })?;
-        Ok(chunked)
+        .map_err(|e| storage_error(ctx_label, e.0))?;
+        Ok(())
     }
 
-    /// Batch-phase staging: for outputs ≥ [`cas::INLINE_THRESHOLD`],
-    /// upload chunks + increment refcounts via [`cas::stage_chunked`]
-    /// WITHOUT flipping `status='complete'`. Returns the
-    /// [`NarPersist`] discriminant so the batch's atomic tx can pick
-    /// the `inline_blob` arg to [`metadata::complete_manifest_in_conn`].
+    /// Batch-phase staging: upload chunks + increment refcounts via
+    /// [`cas::stage_chunked`] WITHOUT flipping `status='complete'`.
+    /// Returns the staged chunk set so the batch's atomic tx can flip
+    /// it durable alongside [`metadata::complete_manifest_in_conn`].
     ///
     /// On `stage_chunked` error this output's placeholder is already
     /// rolled back; the batch's [`PlaceholderGuard`]s handle other
@@ -655,34 +639,27 @@ impl StoreServiceImpl {
     ///
     /// `nar_data` is the batch handler's refcounted buffer: it survives
     /// the phase-3 commit so the post-commit eager `nar_index` pass can
-    /// reuse it (`r[store.index.putpath-eager]`). The inline branch's
-    /// staged `Bytes` is a `clone()` of the same allocation — a refcount
-    /// bump, not a copy, so an inline-only store (where `should_chunk`
-    /// is `None` at ANY size) never holds two copies of a NAR.
+    /// reuse it (`r[store.index.putpath-eager]`).
     pub(in crate::grpc) async fn stage_nar_for_batch(
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: &Bytes,
-    ) -> Result<NarPersist, Status> {
-        if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
-            let stats = cas::stage_chunked(
-                &self.pool,
-                backend,
-                info,
-                claim,
-                nar_data,
-                self.chunk_upload_max_concurrent,
-            )
-            .await
-            .map_err(|e| storage_error("PutPathBatch: stage_chunked", e))?;
-            metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-            Ok(NarPersist::ChunkedStaged {
-                chunk_hashes: stats.chunk_hashes,
-            })
-        } else {
-            Ok(NarPersist::Inline(nar_data.clone()))
-        }
+    ) -> Result<ChunkedStaged, Status> {
+        let stats = cas::stage_chunked(
+            &self.pool,
+            &self.chunk_backend,
+            info,
+            claim,
+            nar_data,
+            self.chunk_upload_max_concurrent,
+        )
+        .await
+        .map_err(|e| storage_error("PutPathBatch: stage_chunked", e))?;
+        metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
+        Ok(ChunkedStaged {
+            chunk_hashes: stats.chunk_hashes,
+        })
     }
 }
 

@@ -3,45 +3,36 @@
 //! CRUD operations for the `narinfo` and `manifests` tables defined in
 //! `migrations/002_store.sql`.
 //!
-//! # Storage model (phase 2c)
+//! # Storage model
 //!
-//! NAR content lives in one of two places, determined by `manifests.inline_blob`:
-//!
-//! - **Inline** (`inline_blob IS NOT NULL`): whole NAR stored directly in the
-//!   manifests row. No `manifest_data` row. Used for small NARs (<256KB by
-//!   default).
-//! - **Chunked** (`inline_blob IS NULL`): NAR split by FastCDC; chunks in S3;
-//!   `manifest_data.chunk_list` holds the ordered (blake3, size) list.
-//!
-//! This invariant (`inline_blob IS NOT NULL <=> no manifest_data row`) is
-//! enforced by code, not by a CHECK constraint — PG can't express "row in
-//! another table must not exist".
+//! NAR content is FastCDC-chunked: chunk bodies live in the chunk
+//! backend (S3/filesystem), `manifest_data.chunk_list` holds the
+//! ordered (blake3, size) list. Every complete manifest has a
+//! `manifest_data` row. (The pre-P0583 `manifests.inline_blob` fast
+//! path for small NARs is gone — migration 065 dropped the column.)
 //!
 //! # Write-ahead pattern
 //!
 //! 1. `insert_manifest_uploading()` — writes placeholder narinfo + manifest
 //!    with `status='uploading'`. Protects the upload from concurrent GC.
-//! 2. Caller writes inline_blob or uploads chunks.
-//! 3. `complete_manifest_inline()` / `complete_manifest_chunked()` — fills
-//!    real narinfo metadata + flips `status='complete'` atomically.
+//! 2. Caller uploads chunks.
+//! 3. `complete_manifest_chunked()` — fills real narinfo metadata + flips
+//!    `status='complete'` atomically.
 //!
-//! On failure between 1 and 3, `delete_manifest_uploading()` reclaims the
-//! placeholder. It only touches rows where `nar_size = 0` (the placeholder
-//! marker — real NARs are always >0), so it's safe even if a concurrent
-//! upload already succeeded.
+//! On failure between 1 and 3, `gc::orphan::reap_one()` reclaims the
+//! placeholder. It only touches rows owned by the caller's `claim_id`,
+//! so it's safe even if a concurrent upload already succeeded.
 //!
 //! `query_path_info()` and `find_missing_paths()` filter on
 //! `manifests.status = 'complete'`, so placeholders are never exposed.
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use rio_proto::validated::ValidatedPathInfo;
-use tracing::warn;
+use tracing::{instrument, warn};
 
 mod chunked;
 mod cluster_key_history;
-mod inline;
 mod queries;
 pub(crate) mod tenant_keys;
 pub(crate) mod upstreams;
@@ -56,11 +47,6 @@ pub(crate) use chunked::{
     upgrade_manifest_to_chunked,
 };
 pub(crate) use cluster_key_history::load_cluster_key_history;
-pub(crate) use inline::{
-    check_manifest_complete, complete_manifest_inline, insert_manifest_uploading,
-};
-#[cfg(test)]
-pub(crate) use inline::{delete_manifest_uploading, manifest_uploading_age};
 pub(crate) use queries::{
     append_signatures, bump_nar_index_retry, find_missing_paths, get_manifest, get_manifest_batch,
     get_manifest_for_index, get_nar_index, list_nar_index_pending, path_by_nar_hash,
@@ -126,34 +112,25 @@ where
     }
 }
 
-/// How a NAR's content is stored. Returned by [`get_manifest`].
+/// A path's chunk manifest: the ordered `(blake3_digest, size)` list a
+/// NAR reassembles from. Returned by [`get_manifest`].
 ///
-/// This is the one place callers branch on inline-vs-chunked. GetPath reads
-/// this; the binary cache HTTP server reads this; future GC reads this.
-/// Encapsulating the branch here means the "check inline_blob FIRST, only
-/// then query manifest_data" rule lives in exactly one SQL query.
+/// Decoded from `manifest_data.chunk_list` in exactly one place
+/// (`queries::decode_chunk_list`); callers never query `manifest_data`
+/// directly.
 #[derive(Debug)]
-pub(crate) enum ManifestKind {
-    /// Whole NAR stored in `manifests.inline_blob`.
-    Inline(Bytes),
-    /// NAR chunked; reassemble from this ordered list.
-    /// Each entry is `(blake3_digest, chunk_size_bytes)`.
-    Chunked(Vec<([u8; 32], u32)>),
-}
+pub(crate) struct ChunkManifest(pub(crate) Vec<([u8; 32], u32)>);
 
-impl ManifestKind {
+impl ChunkManifest {
     /// Total NAR size in bytes this manifest will reassemble to.
     ///
-    /// Inline = blob length. Chunked = sum of chunk sizes (u64 — see
+    /// Sum of chunk sizes (u64 — see
     /// [`crate::manifest::Manifest::total_size`] for the u32-overflow
     /// rationale). GetPath checks this against `narinfo.nar_size`
     /// before streaming so manifest/narinfo drift fails fast with
     /// DATA_LOSS instead of delivering garbage.
     pub(crate) fn total_size(&self) -> u64 {
-        match self {
-            ManifestKind::Inline(bytes) => bytes.len() as u64,
-            ManifestKind::Chunked(entries) => entries.iter().map(|(_, size)| *size as u64).sum(),
-        }
+        self.0.iter().map(|(_, size)| *size as u64).sum()
     }
 }
 
@@ -244,10 +221,9 @@ pub(crate) fn validate_row(row: Option<NarinfoRow>) -> Result<Option<ValidatedPa
 
 /// Fill the real narinfo fields (replacing placeholder zeros).
 ///
-/// Shared by `complete_manifest_inline` and `complete_manifest_chunked` —
-/// both do the exact same 9-column UPDATE before their manifest-table
-/// operation diverges. Returns rows_affected so callers can check for
-/// the placeholder-raced-away case.
+/// Runs inside [`complete_manifest_in_conn`] after the claim-gated
+/// manifests UPDATE proves ownership. Returns rows_affected so callers
+/// can check for the placeholder-raced-away case.
 pub(super) async fn update_narinfo_complete(
     tx: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
@@ -285,11 +261,10 @@ pub(super) async fn update_narinfo_complete(
 }
 
 /// Finalize an upload inside a caller-owned tx/connection: flip
-/// `manifests.status = 'complete'` (binding `inline_blob` iff `Some`),
-/// then narinfo UPDATE. `PutPathBatch` calls this N times inside one
-/// `pool.begin()` for cross-output atomicity; the pool-wrapping
-/// [`complete_manifest_inline`] / [`complete_manifest_chunked`] each
-/// wrap a single call.
+/// `manifests.status = 'complete'`, then narinfo UPDATE. `PutPathBatch`
+/// calls this N times inside one `pool.begin()` for cross-output
+/// atomicity; the pool-wrapping [`complete_manifest_chunked`] wraps a
+/// single call.
 ///
 /// `claim` is the ownership token from [`insert_manifest_uploading`].
 /// The manifests UPDATE filters on it so a stale uploader whose row
@@ -305,42 +280,19 @@ pub(crate) async fn complete_manifest_in_conn(
     conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
-    inline_blob: Option<&[u8]>,
 ) -> Result<()> {
-    // Flip status. inline_blob stays NULL in the chunked case — that's
-    // what makes get_manifest() return Chunked instead of Inline.
-    let manifest_result = match inline_blob {
-        Some(blob) => {
-            sqlx::query(
-                r#"
-                UPDATE manifests SET
-                    status      = 'complete',
-                    inline_blob = $2,
-                    updated_at  = now()
-                WHERE store_path_hash = $1 AND claim_id = $3
-                "#,
-            )
-            .bind(&info.store_path_hash)
-            .bind(blob)
-            .bind(claim)
-            .execute(&mut *conn)
-            .await?
-        }
-        None => {
-            sqlx::query(
-                r#"
-                UPDATE manifests SET
-                    status     = 'complete',
-                    updated_at = now()
-                WHERE store_path_hash = $1 AND claim_id = $2
-                "#,
-            )
-            .bind(&info.store_path_hash)
-            .bind(claim)
-            .execute(&mut *conn)
-            .await?
-        }
-    };
+    let manifest_result = sqlx::query(
+        r#"
+        UPDATE manifests SET
+            status     = 'complete',
+            updated_at = now()
+        WHERE store_path_hash = $1 AND claim_id = $2
+        "#,
+    )
+    .bind(&info.store_path_hash)
+    .bind(claim)
+    .execute(&mut *conn)
+    .await?;
     if manifest_result.rows_affected() == 0 {
         // insert_manifest_uploading MUST have run first. If rows_affected
         // is 0, either delete_manifest_uploading raced us and won, OR
@@ -357,6 +309,186 @@ pub(crate) async fn complete_manifest_in_conn(
             store_path: info.store_path.to_string(),
         });
     }
+    Ok(())
+}
+
+/// Begin a new upload: insert placeholder narinfo + manifest rows.
+///
+/// The placeholder narinfo has `nar_hash = [0;32]` and `nar_size = 0`.
+/// `nar_size = 0` is the placeholder marker: the minimum valid NAR is ~100
+/// bytes, so 0 unambiguously means "not a real upload yet".
+///
+/// `references` is populated on the placeholder so the closure is protected
+/// from GC at the instant this tx commits — no advisory lock needed
+/// (I-192). Mark's CTE may or may not see this row depending on snapshot
+/// timing; either way the references reach sweep:
+///
+/// - Placeholder commits BEFORE mark's CTE snapshot → seed (b) walks it.
+/// - Placeholder commits AFTER mark's CTE snapshot → sweep's per-path
+///   re-check (`narinfo."references" @> ARRAY[Q]`, fresh READ-COMMITTED
+///   snapshot, scans `'uploading'` rows too) finds it and resurrects Q.
+///
+/// See `r[store.gc.sweep-recheck+2]` for the full race trace.
+///
+/// Returns `Some(claim_id)` if inserted (the caller now OWNS the
+/// placeholder and uses `claim_id` for its cleanup paths — see
+/// `r[store.put.placeholder-claim+2]`), `None` if another upload already
+/// holds a placeholder (caller should re-check `check_manifest_complete`
+/// — the race winner may have finished).
+// r[impl store.put.placeholder-claim+2]
+// r[impl store.put.placeholder-refs]
+#[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
+pub(crate) async fn insert_manifest_uploading(
+    pool: &sqlx::PgPool,
+    store_path_hash: &[u8],
+    store_path: &str,
+    references: &[String],
+) -> Result<Option<uuid::Uuid>> {
+    let mut tx = pool.begin().await?;
+
+    // narinfo placeholder first (manifests has FK to narinfo). ON CONFLICT
+    // DO NOTHING: if another uploader already inserted, we don't clobber.
+    // REFERENCES POPULATED HERE — this is what makes the placeholder itself
+    // protect its closure (via mark seed (b) or sweep re-check) without an
+    // advisory lock.
+    sqlx::query(
+        r#"
+        INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size,
+                             "references")
+        VALUES ($1, $2, $3, 0, $4)
+        ON CONFLICT (store_path_hash) DO NOTHING
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(store_path)
+    .bind(&[0u8; 32] as &[u8])
+    .bind(references)
+    .execute(&mut *tx)
+    .await?;
+
+    // manifests placeholder. ON CONFLICT DO NOTHING for the same reason.
+    // rows_affected = 0 means another uploader owns this slot. claim_id
+    // is the ownership token: every owner-side mutation (heartbeat,
+    // completion, abort_placeholder, the drop-guard, put_chunked's
+    // complete-failure rollback) filters on it so a late-firing op
+    // cannot match a fresh re-upload at the same store_path_hash.
+    let claim_id = uuid::Uuid::new_v4();
+    let result = sqlx::query(
+        r#"
+        INSERT INTO manifests (store_path_hash, status, claim_id)
+        VALUES ($1, 'uploading', $2)
+        ON CONFLICT (store_path_hash) DO NOTHING
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(claim_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok((result.rows_affected() > 0).then_some(claim_id))
+}
+
+/// Check if a store path already has a completed upload.
+///
+/// Idempotency pre-check for PutPath: if `true`, the path exists and the
+/// caller should return `created: false` without touching anything.
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub(crate) async fn check_manifest_complete(
+    pool: &sqlx::PgPool,
+    store_path_hash: &[u8],
+) -> Result<bool> {
+    // EXISTS returns a PG bool, which sqlx decodes cleanly. `SELECT 1` would
+    // return int4 and need i32 (not i64) — a type-width footgun that turns
+    // into an opaque "ColumnDecode" runtime error. EXISTS sidesteps it
+    // entirely and is also the idiomatic existence-check query.
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM manifests
+            WHERE store_path_hash = $1 AND status = 'complete'
+        )
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
+
+/// Age of an existing `'uploading'` placeholder, or `None` if no such
+/// placeholder exists (already completed, already cleaned up, or never
+/// inserted).
+///
+/// Test-only since I-040: `Substituter::ingest`'s reclaim now uses
+/// [`crate::gc::orphan::reap_one`], which does the stale check
+/// in-SQL. This survives as a test helper for asserting "placeholder
+/// still present" after a non-reclaiming flow.
+#[cfg(test)]
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub(crate) async fn manifest_uploading_age(
+    pool: &sqlx::PgPool,
+    store_path_hash: &[u8],
+) -> Result<Option<std::time::Duration>> {
+    // EXTRACT(EPOCH FROM interval) → float8 seconds. Avoids client-side
+    // PgInterval arithmetic (months*30d is calendar-incorrect; PG knows the
+    // real wall-clock delta). `updated_at` not `created_at`: manifests only
+    // has updated_at (002_store.sql:62); same column the orphan scanner
+    // checks. GREATEST(..., 0): negative age (clock skew, manual row tweak)
+    // clamps to zero → treated as young → not reclaimed, the safe direction.
+    let secs: Option<f64> = sqlx::query_scalar(
+        r#"
+        SELECT GREATEST(EXTRACT(EPOCH FROM (now() - updated_at)), 0)::float8
+          FROM manifests
+         WHERE store_path_hash = $1 AND status = 'uploading'
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(secs.map(std::time::Duration::from_secs_f64))
+}
+
+/// Reclaim placeholder rows from a failed upload — narinfo + manifests
+/// rows ONLY, no chunk-refcount decrement.
+///
+/// Test-only: production callers use [`crate::gc::orphan::reap_one`]
+/// (chunk-aware). This row-only delete is kept for the defense-in-depth
+/// test that asserts a leaked refcount no longer causes upload-skip.
+#[cfg(test)]
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub(crate) async fn delete_manifest_uploading(
+    pool: &sqlx::PgPool,
+    store_path_hash: &[u8],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM manifests
+        WHERE store_path_hash = $1 AND status = 'uploading'
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    // nar_size = 0 is the placeholder marker. A successful upload ALWAYS
+    // has nar_size > 0 (min valid NAR is ~100 bytes).
+    sqlx::query(
+        r#"
+        DELETE FROM narinfo
+        WHERE store_path_hash = $1 AND nar_size = 0
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -483,7 +615,7 @@ mod tests {
         }
     }
 
-    /// PlaceholderMissing: call complete_manifest_inline WITHOUT
+    /// PlaceholderMissing: call complete_manifest_chunked WITHOUT
     /// insert_manifest_uploading first. rows_affected() == 0 on both
     /// UPDATEs → PlaceholderMissing, NOT a sqlx error.
     #[tokio::test]
@@ -495,7 +627,7 @@ mod tests {
             [0xCCu8; 32],
         );
 
-        let err = complete_manifest_inline(&db.pool, &info, uuid::Uuid::new_v4(), b"nar")
+        let err = complete_manifest_chunked(&db.pool, &info, uuid::Uuid::new_v4(), &[])
             .await
             .expect_err("should fail without placeholder");
 
@@ -529,7 +661,7 @@ mod tests {
         // with the original claim and narinfo untouched (nar_size=0).
         let mut bad = info.clone();
         bad.signatures = vec!["evil:sig".into()];
-        let err = complete_manifest_inline(&db.pool, &bad, uuid::Uuid::new_v4(), b"nar")
+        let err = complete_manifest_chunked(&db.pool, &bad, uuid::Uuid::new_v4(), &[])
             .await
             .expect_err("foreign claim must fail");
         assert!(
@@ -550,7 +682,7 @@ mod tests {
         assert_eq!(nar_size, 0, "narinfo untouched (manifests gate runs first)");
 
         // Real claim → Ok; status flipped, OUR signatures landed.
-        complete_manifest_inline(&db.pool, &info, claim_a, b"nar")
+        complete_manifest_chunked(&db.pool, &info, claim_a, &[])
             .await
             .unwrap();
         let (status, sigs): (String, Vec<String>) = sqlx::query_as(

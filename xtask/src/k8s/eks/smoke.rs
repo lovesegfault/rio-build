@@ -125,10 +125,10 @@ impl CliCtx {
 ///
 /// `out_kb` controls output size — `@KB@` KiB of spaces via sh for+echo (word list + chunk from Rust)
 /// (stdenv bootstrap busybox lacks dd, $((arith)), AND printf — CONFIG_SH_MATH=n).
-/// `out_kb` ≥ 256 makes the resulting NAR exceed `cas::INLINE_THRESHOLD`
+/// `out_kb` ≥ 256 makes the resulting NAR span many FastCDC chunks
 /// (rio-store/src/cas.rs) and take the chunked-S3 path, exercising the
 /// store's IRSA credentials. The trivial-build step had a ~3-byte output
-/// and silently rode the inline-in-postgres path — an IRSA namespace
+/// (pre-P0583 it would have inlined into postgres) — an IRSA namespace
 /// drift went 3 days undetected (I-006) before this knob was added.
 const SMOKE_EXPR: &str = r#"
 let
@@ -182,12 +182,11 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             step_pool_reconciled(&client, NS_FETCHERS, FETCHER_POOL)
         })
         .await?;
-        // 1 MiB NAR — well over cas::INLINE_THRESHOLD (256 KiB) —
-        // forces PutPath down the chunked-S3 path. Catches store-side
-        // S3-credential faults (IRSA drift, bucket policy, endpoint
-        // misconfig) that the inline path silently skips. Trivial-
-        // build (inline-PG path) and worker-kill chaos are covered by
-        // the VM test suite; here we exercise only EKS-unique infra.
+        // 1 MiB NAR — spans many chunks through the S3 path. Catches
+        // store-side S3-credential faults (IRSA drift, bucket policy,
+        // endpoint misconfig) at real PutObject volume. Trivial-build
+        // and worker-kill chaos are covered by the VM test suite; here
+        // we exercise only EKS-unique infra.
         ui::step("large-NAR build (S3 chunked path)", || {
             smoke_build("large", 5, 1024, &store_url)
         })
@@ -529,7 +528,7 @@ pub const BUSYBOX_LET: &str = r#"let busybox = builtins.derivation {
   }; in"#;
 
 /// Render the busybox SMOKE_EXPR template. `out_kb >= 256` pushes the
-/// NAR over `cas::INLINE_THRESHOLD` and exercises the chunked-S3
+/// multi-chunk NAR and exercises the chunked-S3
 /// PutPath — see the doc on [`SMOKE_EXPR`] for why that matters.
 pub fn smoke_expr(tag: &str, secs: u32, out_kb: u32) -> String {
     SMOKE_EXPR

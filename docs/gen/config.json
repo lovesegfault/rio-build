@@ -338,8 +338,8 @@
       {
         "key": "chunk_backend",
         "type": "ChunkBackendKind",
-        "default": "{\"kind\":\"inline\"}",
-        "description": "Where chunks live."
+        "default": "",
+        "description": "Where chunks live. **Required** — every NAR is chunked, so a store without a backend cannot accept or serve anything. `validate()` rejects `None` at startup with the list of valid kinds."
       },
       {
         "key": "chunk_cache_capacity_bytes",

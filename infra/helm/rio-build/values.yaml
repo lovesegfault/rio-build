@@ -215,7 +215,7 @@ buildScheduler:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-store
 # ──────────────────────────────────────────────────────────────────────────
-# PG + S3/inline chunk storage. replicas=1 by default; multi-replica
+# PG metadata + S3 chunk storage. replicas=1 by default; multi-replica
 # is safe — startup migrations serialize via pg_try_advisory_lock
 # (r[store.db.migrate-try-lock]).
 store:
@@ -227,8 +227,11 @@ store:
     # NO static AWS keys.
     annotations: {}
   chunkBackend:
-    # inline = NARs in PG (works out of the box, doesn't scale).
-    # s3 requires bucket (+ endpoint/region/creds via env or IRSA).
+    # Required — every NAR is chunked; the store refuses to start
+    # without a backend. s3 requires bucket (+ endpoint/region/creds
+    # via env or IRSA); filesystem requires baseDir (+ a writable
+    # volume — the chart mounts a hostPath at baseDir for kind:
+    # filesystem); memory is test-only.
     kind: s3
     bucket: ""
     # Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).

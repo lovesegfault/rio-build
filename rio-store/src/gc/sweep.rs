@@ -404,9 +404,9 @@ async fn closure_remove_from_unreachable(
 /// `ROLLBACK` instead of `COMMIT` — operators can see what WOULD
 /// be deleted without committing.
 ///
-/// `chunk_backend` is only used for `key_for()` (no I/O). If None
-/// (inline-only store), chunks are never populated so steps 3-5
-/// are no-ops — just the narinfo CASCADE delete happens.
+/// `chunk_backend` is only used for `key_for()` (no I/O). `None` is a
+/// test-only shape (production always has a backend); steps 3-5 then
+/// skip the S3-key enqueue and only the narinfo CASCADE delete happens.
 ///
 /// `shutdown` is checked at each batch boundary (BEFORE `pool.begin`).
 /// If fired, returns [`SweepAbort::Shutdown`] — the in-progress batch
@@ -592,10 +592,10 @@ async fn sweep_one_batch(
     let mut to_delete: Vec<(&Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(batch.len());
 
     for store_path_hash in batch {
-        // Step 1: SELECT chunk_list FOR UPDATE. NULL for
-        // inline storage. The FOR UPDATE locks the MANIFEST
-        // row — a concurrent PutPath for the SAME path blocks
-        // until we COMMIT (prevents re-upload mid-sweep).
+        // Step 1: SELECT chunk_list FOR UPDATE. The FOR UPDATE
+        // locks the MANIFEST row — a concurrent PutPath for the
+        // SAME path blocks until we COMMIT (prevents re-upload
+        // mid-sweep).
         //
         // This does NOT guard chunk-level races: a DIFFERENT
         // path sharing chunk X can PutPath after we've already
@@ -605,9 +605,10 @@ async fn sweep_one_batch(
         // before calling S3 DeleteObject — PutPath's upsert
         // clears deleted=false, drain sees "not dead", skips.
         //
-        // LEFT JOIN manifest_data: inline paths have no row
-        // there. `chunk_list` is NULL for inline; we skip
-        // the chunk decrement loop.
+        // LEFT JOIN manifest_data: a placeholder that never
+        // reached upgrade_manifest_to_chunked has no row there.
+        // `chunk_list` is NULL for those; we skip the chunk
+        // decrement loop.
         let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
             r#"
                 SELECT md.chunk_list
@@ -942,9 +943,9 @@ async fn sweep_orphan_batch(
     let bf = zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
 
     // Enqueue S3 keys for zeroed chunks. If chunk_backend is None
-    // (inline-only store), there are no S3 keys to delete — `zeroed`
-    // is empty (no chunked uploads ever happened) and this is a
-    // no-op. The Option-check inside the helper is belt-and-suspenders.
+    // (test-only shape — production always has a backend), there are
+    // no S3 keys to compute; the Option-check inside the helper skips
+    // the enqueue.
     super::enqueue_chunk_deletes(&mut tx, &zeroed, chunk_backend).await?;
 
     tx.commit().await?;
@@ -1101,10 +1102,7 @@ mod tests {
             ("castore-gc-b", &[shared_dir][..]),
         ] {
             let p = test_store_path(n);
-            let h_vec = StoreSeed::raw_path(&p)
-                .with_inline_blob(b"x".as_slice())
-                .seed(&db.pool)
-                .await;
+            let h_vec = StoreSeed::raw_path(&p).seed(&db.pool).await;
             let h: [u8; 32] = h_vec.as_slice().try_into().unwrap();
             sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
                 .bind(h.as_slice())
@@ -1668,8 +1666,8 @@ mod tests {
             .seed(&db.pool)
             .await;
 
-        // Seed narinfo + manifest (chunked: inline_blob NULL → StoreSeed
-        // default). manifest_data with chunk_list seeded separately.
+        // Seed narinfo + manifest. manifest_data with chunk_list
+        // seeded separately.
         let seeded = StoreSeed::raw_path(&path).seed(&db.pool).await;
         assert_eq!(seeded, sp_hash);
         let chunk_list = Manifest {

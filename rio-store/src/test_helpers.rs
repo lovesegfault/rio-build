@@ -11,7 +11,7 @@
 //! with the migrations that own these tables — a column rename now breaks
 //! at this crate's `cargo test`, not at a downstream runtime panic. Helpers
 //! that exercise the production metadata functions
-//! (`insert_manifest_uploading` → `complete_manifest_inline`) stay in their
+//! (`insert_manifest_uploading` → `complete_manifest_chunked`) stay in their
 //! own modules — those test the real write path, not just seed DB state.
 
 use rio_test_support::fixtures::test_store_path;
@@ -465,7 +465,7 @@ pub struct StoreSeed {
     path: String,
     refs: Vec<String>,
     status: &'static str,
-    inline_blob: Option<Vec<u8>>,
+    chunk_list: Option<Vec<u8>>,
     created_hours_ago: Option<i32>,
     nar_hash: [u8; 32],
     nar_size: i64,
@@ -488,7 +488,7 @@ impl StoreSeed {
             path: path.into(),
             refs: Vec::new(),
             status: "complete",
-            inline_blob: None,
+            chunk_list: None,
             created_hours_ago: None,
             nar_hash: [0u8; 32],
             nar_size: 0,
@@ -509,12 +509,26 @@ impl StoreSeed {
         self
     }
 
-    /// Set `manifests.inline_blob`. `None` (the default) means NULL —
-    /// which per the inline/chunked invariant implies a `manifest_data`
-    /// row should exist (up to the test to seed that separately if the
-    /// code path reads it).
-    pub fn with_inline_blob(mut self, blob: impl Into<Vec<u8>>) -> Self {
-        self.inline_blob = Some(blob.into());
+    /// Seed a `manifest_data` row with a serialized chunk manifest
+    /// built from `(blake3_hash, size)` entries. Without this, the
+    /// seeded path has NO `manifest_data` row — fine for tests that
+    /// never read the manifest, but `get_manifest` reports DATA_LOSS
+    /// for a `'complete'` row with no chunk list.
+    ///
+    /// The chunks are NOT written to any backend — metadata-level
+    /// reads work; actual reassembly needs the test to `put()` the
+    /// chunk bytes itself.
+    pub fn with_chunk_manifest(mut self, entries: &[([u8; 32], u32)]) -> Self {
+        let manifest = crate::manifest::Manifest {
+            entries: entries
+                .iter()
+                .map(|(hash, size)| crate::manifest::ManifestEntry {
+                    hash: *hash,
+                    size: *size,
+                })
+                .collect(),
+        };
+        self.chunk_list = Some(manifest.serialize());
         self
     }
 
@@ -574,16 +588,21 @@ impl StoreSeed {
         .await
         .expect("StoreSeed narinfo INSERT failed");
 
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
-             VALUES ($1, $2, $3)",
-        )
-        .bind(&hash)
-        .bind(self.status)
-        .bind(self.inline_blob.as_deref())
-        .execute(pool)
-        .await
-        .expect("StoreSeed manifests INSERT failed");
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, $2)")
+            .bind(&hash)
+            .bind(self.status)
+            .execute(pool)
+            .await
+            .expect("StoreSeed manifests INSERT failed");
+
+        if let Some(chunk_list) = &self.chunk_list {
+            sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+                .bind(&hash)
+                .bind(chunk_list)
+                .execute(pool)
+                .await
+                .expect("StoreSeed manifest_data INSERT failed");
+        }
 
         hash
     }

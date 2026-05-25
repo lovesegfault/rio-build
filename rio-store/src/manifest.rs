@@ -81,6 +81,14 @@ pub enum ManifestError {
     #[error("manifest is empty (no version byte)")]
     Empty,
 
+    /// The `manifests` row is `'complete'` but has no `manifest_data`
+    /// row to reassemble from. Either a pre-migration-065 inline-stored
+    /// path (whose `inline_blob` column was dropped — content is
+    /// unrecoverable) or genuine corruption. Surfaced as DATA_LOSS so
+    /// it is not mistaken for a cache miss or a server bug.
+    #[error("no chunk list (manifest_data row missing — pre-065 inline path or corruption)")]
+    MissingChunkList,
+
     #[error("unknown manifest version {0} (expected {VERSION})")]
     UnknownVersion(u8),
 
@@ -242,9 +250,10 @@ mod tests {
 
     #[test]
     fn empty_manifest_roundtrips() {
-        // An empty manifest (no chunks) is valid — it's what you'd get for
-        // an empty NAR. Unusual (caller should use inline_blob for tiny
-        // NARs) but not an error.
+        // An empty manifest (no chunks) is valid at the format level —
+        // it's what you'd get for an empty NAR. Unreachable in practice
+        // (the minimum valid NAR is ~100 bytes → ≥1 chunk) but not a
+        // parse error.
         let m = Manifest { entries: vec![] };
         let bytes = m.serialize();
         assert_eq!(bytes, vec![VERSION]); // just the version byte

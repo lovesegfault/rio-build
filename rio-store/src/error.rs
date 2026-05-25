@@ -73,8 +73,7 @@ pub enum MetadataError {
     PlaceholderMissing { store_path: String },
 
     /// Database state violates a code-enforced invariant that PG's
-    /// schema can't express (e.g., `inline_blob IS NULL` but no
-    /// `manifest_data` row — PG can't CHECK "row in another table
+    /// schema can't express (PG can't CHECK "row in another table
     /// exists"). This is corruption: manual DB surgery, a CASCADE we
     /// didn't expect, or a bug in cleanup ordering. NOT retriable.
     /// Maps to `internal`.

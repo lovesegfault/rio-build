@@ -35,20 +35,6 @@ split.
   window.
 ]
 
-= Inline Storage Fast-Path
-
-#r("store.inline.threshold")[
-  NARs below 256KB (`INLINE_THRESHOLD`, a compile-time constant) are stored
-  directly in the `manifests.inline_blob` PostgreSQL `BYTEA` column, bypassing
-  FastCDC chunking, S3, and manifest indirection entirely. This eliminates
-  per-item overhead for the thousands of tiny `.drv` files found in nixpkgs
-  closures.
-]
-
-@inline-storage #glspl("blob") never touch S3 --- they live entirely in PostgreSQL.
-The inline/chunked decision is made at `PutPath` time based on @nar size; see the
-"Inline vs. chunked invariant" in @store-schema.
-
 = Layer 2: Nix Metadata Store
 
 - Maps store paths to their chunk manifests (ordered list of chunk digests)
@@ -78,9 +64,7 @@ The inline/chunked decision is made at `PutPath` time based on @nar size; see th
   )
 ]
 
-These domains must never be confused. Inline blobs are not separately keyed ---
-they are stored by `store_path_hash` in the `manifests` table alongside their
-narinfo.
+These domains must never be confused.
 
 = Content Integrity Verification
 
@@ -91,15 +75,11 @@ narinfo.
   served.
 ]
 
-#r("store.integrity.verify-on-get")[
-  - *On chunk read (S3 or cache):* Every chunk fetched from S3 or the
-    in-process LRU cache is BLAKE3-verified against its manifest-declared
-    digest. Corrupt chunks are re-fetched (from S3 on cache corruption) or
-    flagged as an error.
-  - *On inline blob read:* The inline NAR is served directly from PostgreSQL.
-    On `GetPath`, the client can verify the SHA-256 against `narinfo.nar_hash`
-    (the store does not re-hash on every read; integrity is guaranteed by
-    verify-on-put and PostgreSQL's own storage guarantees).
+#r("store.integrity.verify-on-get+2")[
+  *On chunk read (S3 or cache):* Every chunk fetched from S3 or the
+  in-process LRU cache is BLAKE3-verified against its manifest-declared
+  digest. Corrupt chunks are re-fetched (from S3 on cache corruption) or
+  flagged as an error.
 ]
 
 = Chunk Manifest Format
@@ -258,11 +238,11 @@ the `pending_s3_deletes` table.
   per-path → batch swap was the 130× scale unlock.
 ]
 
-#r("store.api.batch-manifest+2")[
+#r("store.api.batch-manifest+3")[
   `BatchGetManifest` returns `(store_path, Option<ManifestHint>)` for many
   paths in ONE PostgreSQL round-trip (`LEFT JOIN manifest_data`). A
-  `ManifestHint` carries the full `PathInfo` plus either `inline_blob` or the
-  `(blake3_hash, size)` chunk list. Same local-only / DoS-bound / validation /
+  `ManifestHint` carries the full `PathInfo` plus the `(blake3_hash, size)`
+  chunk list. Same local-only / DoS-bound / validation /
   end-user-tenant-rejection rules as #rref("store.api.batch-query"). I-110c:
   the builder issues this once per build (#rref("builder.warmgate.manifest-prime"))
   so each subsequent `GetPath` can supply `manifest_hint` and skip both PG
@@ -449,7 +429,7 @@ whose refcount drops to 0 become eligible for S3 deletion via
   caller supplies a staleness gate or its claim token.
 ]
 
-#r("store.put.drop-cleanup+2")[
+#r("store.put.drop-cleanup+3")[
   Once `PutPath` or `PutPathBatch` owns an `'uploading'` placeholder, it arms a
   `PlaceholderGuard` that (a) heartbeats `manifests.updated_at` every 30s while
   held, so #rref("store.put.stale-reclaim")'s
@@ -463,8 +443,8 @@ whose refcount drops to 0 become eligible for S3 deletion via
   `abort_upload`, after the orphan scanner reaped our row, or after a fresh
   re-upload took the slot is a harmless no-op
   (#rref("store.put.placeholder-claim")); firing after
-  `upgrade_manifest_to_chunked` correctly decrements the chunk refcounts the
-  inline-only delete would leak. The guard is defused only on success. I-125a:
+  `upgrade_manifest_to_chunked` correctly decrements the staged chunk
+  refcounts (a row-only delete would leak them). The guard is defused only on success. I-125a:
   pre-fix, a phantom-drained builder leaked the placeholder and the next
   uploader for the same path got `Aborted: concurrent PutPath` until the orphan
   scanner reaped it (15 min); the builder side polls for that case per
@@ -486,10 +466,10 @@ whose refcount drops to 0 become eligible for S3 deletion via
     in memory
 ]
 
-#r("store.get.manifest-hint+2")[
+#r("store.get.manifest-hint+3")[
   When `GetPathRequest.manifest_hint` is set with a non-null `info`, `GetPath`
   bypasses BOTH PG lookups (`query_path_info` and `get_manifest`) and streams
-  directly from the supplied `(PathInfo, chunk-list-or-inline-blob)`. The hint
+  directly from the supplied `(PathInfo, chunk list)`. The hint
   MUST be for the requested path (`hint.info.store_path == req.store_path`,
   else `INVALID_ARGUMENT`), structurally well-formed (32-byte chunk hashes,
   valid `PathInfo`), and bounded by `MAX_CHUNKS` and `MAX_NAR_SIZE`
@@ -503,9 +483,9 @@ whose refcount drops to 0 become eligible for S3 deletion via
   hits/input to zero on the JIT-fetch hot path.
 ]
 
-#r("store.get.size-sanity-check")[
-  Before streaming, `GetPath` MUST verify the manifest's summed size (inline
-  blob length, or sum of chunk sizes) equals `narinfo.nar_size`. A mismatch
+#r("store.get.size-sanity-check+2")[
+  Before streaming, `GetPath` MUST verify the manifest's summed chunk sizes
+  equal `narinfo.nar_size`. A mismatch
   indicates manifest/narinfo drift --- PutPath wrote inconsistent state, or the
   DB was manually modified. The store MUST return `DATA_LOSS` without streaming
   any NAR bytes. This is a fail-fast over the post-stream integrity check,
@@ -1111,7 +1091,7 @@ leaked chunks not covered by manifest-based cleanup.
   dev-mode pass-through.
 ]
 
-#r("store.admin.verify-chunks")[
+#r("store.admin.verify-chunks+2")[
   `StoreAdminService.VerifyChunks` server-streams
   `VerifyChunksProgress{scanned, missing, missing_hashes, is_complete}` while
   keyset-paginating `chunks WHERE deleted=FALSE AND blake3_hash > $cursor ORDER
@@ -1120,8 +1100,7 @@ leaked chunks not covered by manifest-based cleanup.
   `batch_size=0` → default; clamped at `VERIFY_BATCH_MAX`. `deleted=TRUE` rows
   are skipped (awaiting S3-delete drain --- presence is undefined);
   `refcount=0` IS verified (could be a mid-upload row in grace TTL --- the
-  object SHOULD exist once `uploaded_at` is set). Returns `FAILED_PRECONDITION`
-  for inline-only stores (no chunk backend). Read-only --- no `--repair`
+  object SHOULD exist once `uploaded_at` is set). Read-only --- no `--repair`
   (deleting the PG row would be wrong if the object is recoverable; the
   operator decides). Aborts on shutdown token per
   #rref("store.gc.shutdown-abort").
@@ -1188,10 +1167,11 @@ CREATE TABLE narinfo (
 #info[
   The `manifests` + `manifest_data` + `chunks` tables are the active schema as
   of Phase 2c (migration `002_store.sql` dropped the Phase 2a `nar_blobs`
-  table). Small NARs (\< 256 KiB) store inline in `manifests.inline_blob`;
-  larger NARs are FastCDC-chunked with BLAKE3 dedup. ChunkBackend is
-  constructed from config (`ChunkBackendKind` enum: `Inline` / `Filesystem` /
-  `S3`, default `Inline` for back-compat).
+  table; migration `065` dropped `manifests.inline_blob`). Every NAR is
+  FastCDC-chunked with BLAKE3 dedup --- a sub-`CHUNK_MIN` NAR is a single
+  chunk equal to the input. ChunkBackend is constructed from config
+  (`ChunkBackendKind` enum: `Memory` / `Filesystem` / `S3` / `Tiered`; the
+  field is required --- the store refuses to start without one).
 ]
 
 ```sql
@@ -1200,7 +1180,6 @@ CREATE TABLE manifests (
                      REFERENCES narinfo(store_path_hash),
     status           TEXT NOT NULL DEFAULT 'uploading'
                      CHECK (status IN ('uploading', 'complete')),
-    inline_blob      BYTEA,                   -- non-NULL ⇒ inline storage fast-path
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -1215,13 +1194,13 @@ CREATE TABLE manifest_data (
 );
 ```
 
-*Inline vs. chunked invariant:* If `manifests.inline_blob IS NOT NULL`, no
-corresponding `manifest_data` row exists --- the NAR content is stored entirely
-in the `inline_blob` field. Conversely, if `inline_blob IS NULL`, a
-`manifest_data` row MUST exist with a valid `chunk_list`. Code must check
-`inline_blob` first; only if it is NULL should `manifest_data` be queried. The
-`manifest_data` foreign key does not require a row to exist (no `ON DELETE`
-action forces creation).
+*Manifest-data invariant:* Every `'complete'` `manifests` row MUST have a
+`manifest_data` row with a valid `chunk_list`. A `'complete'` row without one
+is unreadable (`DATA_LOSS` on read) --- either corruption or a
+pre-migration-065 inline-stored path whose content was dropped with the
+`inline_blob` column. The `manifest_data` foreign key does not require a row
+to exist (no `ON DELETE` action forces creation), so the invariant is enforced
+by the commit transaction, not the schema.
 
 ```sql
 CREATE TABLE chunks (
@@ -1294,13 +1273,12 @@ CREATE INDEX idx_pending_s3_deletes_drain
 
 - `rio-store/src/grpc/` --- StoreService gRPC implementation
   - `mod.rs` --- service struct + shared state
-  - `put_path.rs` --- PutPath handler (buffer, verify, branch inline/chunked)
+  - `put_path.rs` --- PutPath handler (buffer, verify, chunk, persist)
   - `get_path.rs` --- GetPath handler (manifest load, parallel reassembly
     stream)
   - `chunk.rs` --- FindMissingChunks batch query RPC
 - `rio-store/src/metadata/` --- narinfo + manifest persistence (PostgreSQL)
   - `mod.rs` --- re-exports + shared types
-  - `inline.rs` --- inline-blob fast path (write `manifests.inline_blob` BYTEA)
   - `chunked.rs` --- chunked-path manifest + refcount UPSERT
   - `queries.rs` --- narinfo SELECT/UPDATE, QueryPathInfo, FindMissingPaths
 - `rio-store/src/validate.rs` --- NAR hash verification (HashingReader,
@@ -1337,21 +1315,20 @@ CREATE INDEX idx_pending_s3_deletes_drain
 NAR archives for different store paths often share significant content (common
 libraries, similar build outputs). Efficient storage and transfer require
 sub-NAR deduplication. NAR archives are chunked using content-defined chunking
-(FastCDC); identical chunks across store paths are stored once. Two tiers: an
-*inline fast-path* where NARs below 256KB are stored as a single PostgreSQL
-`BYTEA` blob with no chunking overhead and no S3 round-trip (most small
-derivations fall here), and a *chunked path* where larger NARs are split by
-FastCDC, a chunk manifest in PostgreSQL maps each NAR to its ordered list of
-chunk references, and the chunk bodies live in S3.
+(FastCDC); identical chunks across store paths are stored once. Every NAR is
+split by FastCDC (a sub-`CHUNK_MIN` NAR is a single chunk equal to the input),
+a chunk manifest in PostgreSQL maps each NAR to its ordered list of chunk
+references, and the chunk bodies live in S3.
 
 Hash domains are strictly separated: SHA-256 for all Nix-facing hashes (store
 path hashes, NAR hashes, output hashes) and BLAKE3 for internal chunk
 addressing only --- BLAKE3 is \~3× faster for chunking workloads and is never
 exposed to Nix, so it's a free performance win. Whole-NAR storage was rejected
 (no cross-path dedup; for large closures with shared libraries, storage and
-transfer costs are significantly higher). The inline fast-path avoids chunking
-overhead for small paths (the majority by count), and chunk-manifest lookup
-latency is mitigated by caching.
+transfer costs are significantly higher). An inline-in-PostgreSQL fast path
+for sub-256 KiB NARs existed through migration 064 and was dropped (P0583):
+one storage shape means one read path, one GC path, and no
+"store has no chunk backend" degraded mode.
 
 *The hard part: store path transfer efficiency.* Moving closures between
 rio-store and executors is the main bottleneck. NAR streaming avoids

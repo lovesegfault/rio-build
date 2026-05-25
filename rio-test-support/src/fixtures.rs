@@ -106,7 +106,7 @@ pub fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// Build a NAR of roughly `payload_size` bytes, large enough to
-/// trigger FastCDC chunking (> 256 KiB `INLINE_THRESHOLD`).
+/// span many FastCDC chunks (well past the 256 KiB `CHUNK_MAX`).
 ///
 /// Payload is [`pseudo_random_bytes`]`(seed, payload_size)` wrapped in
 /// single-file NAR framing (~100 bytes overhead; payload dominates).

@@ -31,6 +31,12 @@ spec:
       {{- if .Values.karpenter.enabled }}
       nodeSelector:
         rio.build/node-role: general
+      {{- else if $s.nodeSelector }}
+      # Explicit pin (VM tests: the filesystem chunk backend is a
+      # hostPath, so the pod must always land on the same node or a
+      # rollout orphans every previously-written chunk).
+      nodeSelector:
+        {{- toYaml $s.nodeSelector | nindent 8 }}
       {{- end }}
       # ≥ RIO_DRAIN_GRACE_SECS(6) + streamDrainSecs + slack. kubelet
       # SIGKILLs at this deadline; the store's own stream_drain timeout
@@ -86,6 +92,10 @@ spec:
             - name: RIO_CHUNK_BACKEND__KIND
               value: {{ .kind | quote }}
             {{- end }}
+            {{- if .baseDir }}
+            - name: RIO_CHUNK_BACKEND__BASE_DIR
+              value: {{ .baseDir | quote }}
+            {{- end }}
             {{- if .bucket }}
             - name: RIO_CHUNK_BACKEND__BUCKET
               value: {{ .bucket | quote }}
@@ -104,6 +114,18 @@ spec:
             {{- end }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- if eq ($s.chunkBackend).kind "filesystem" }}
+            # readOnlyRootFilesystem: the filesystem chunk backend needs
+            # a writable mount at baseDir. PVC (not hostPath — forbidden
+            # by the namespace's `restricted` PodSecurity level; not
+            # emptyDir — a Deployment rollout would orphan every
+            # already-written chunk) so a container restart and a
+            # rollout both keep the chunk store. The provisioned PV's
+            # nodeAffinity pins replacement pods to the node that first
+            # bound it.
+            - name: chunks
+              mountPath: {{ $s.chunkBackend.baseDir | quote }}
+            {{- end }}
           # tonic-health set_serving() runs AFTER migrations in main.rs —
           # "PG connected + migrations done" = Ready.
           readinessProbe:
@@ -120,9 +142,36 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
+        {{- if eq ($s.chunkBackend).kind "filesystem" }}
+        - name: chunks
+          persistentVolumeClaim:
+            claimName: rio-store-chunks
+        {{- end }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
 # resolve the headless name to pod IPs and p2c across them — a sticky
 # single-channel against the ClusterIP means scaling rio-store doesn't
 # help (I-077: 60 builders all hit pod-0).
 {{ include "rio.grpcServicePair" (dict "root" . "name" "rio-store" "ns" .Values.namespaces.store.name "component" "store" "port" 9002) }}
+{{- if eq ($s.chunkBackend).kind "filesystem" }}
+---
+# Backing volume for the filesystem chunk backend. RWO is node-scoped,
+# so a rolling update's surge pod (forced onto the same node by the
+# bound PV's nodeAffinity) can mount it alongside the terminating pod.
+# The cluster-default StorageClass provisions it (k3s: local-path, the
+# same provisioner the bundled PostgreSQL PVC binds against).
+# `kind: filesystem` is a single-replica/dev shape — production uses
+# `s3`/`tiered` and never renders this.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rio-store-chunks
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ ($s.chunkBackend).volumeSize | default "10Gi" }}
+{{- end }}
 {{- end }}

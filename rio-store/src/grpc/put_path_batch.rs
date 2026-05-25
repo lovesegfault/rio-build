@@ -14,13 +14,12 @@
 //! ## Chunked staging
 //!
 //! S3 uploads can't live inside a DB transaction (the spec says
-//! "blob-store writes are NOT rolled back"). Outputs ≥
-//! `INLINE_THRESHOLD` are staged via [`cas::stage_chunked`] BEFORE the
-//! atomic tx (chunks uploaded + refcounted, manifest still
-//! `status='uploading'`); the tx then flips inline AND chunked outputs
-//! to `'complete'` together. On batch failure the staged chunks orphan
-//! (refcount-zero after `PlaceholderGuard` drop-reap, GC-eligible).
-//! Bound: ≤1 NAR-size of orphaned blob per failed output.
+//! "blob-store writes are NOT rolled back"). Every output is staged via
+//! [`cas::stage_chunked`] BEFORE the atomic tx (chunks uploaded +
+//! refcounted, manifest still `status='uploading'`); the tx then flips
+//! all outputs to `'complete'` together. On batch failure the staged
+//! chunks orphan (refcount-zero after `PlaceholderGuard` drop-reap,
+//! GC-eligible). Bound: ≤1 NAR-size of orphaned blob per failed output.
 // r[impl store.atomic.multi-output]
 
 use std::collections::BTreeMap;
@@ -36,7 +35,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
-use super::put_path::common::{NarPersist, PlaceholderGuard};
+use super::put_path::common::{ChunkedStaged, PlaceholderGuard};
 use super::put_path::{
     PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
@@ -71,10 +70,10 @@ struct OutputAccum {
     /// we started. No placeholder, no commit for it — just
     /// `created=false` in the response.
     already_complete: bool,
-    /// Phase-2 staging result. `None` until phase 2 ran; then either
-    /// inline bytes or `ChunkedStaged` — feeds `inline_blob` of
+    /// Phase-2 staging result. `None` until phase 2 ran; carries the
+    /// staged chunk set phase-3 flips durable alongside
     /// [`metadata::complete_manifest_in_conn`].
-    staged: Option<NarPersist>,
+    staged: Option<ChunkedStaged>,
     /// Ownership token from `PlaceholderClaim::Owned` — set in phase-2
     /// for every output that is NOT `already_complete`. Threaded into
     /// phase-3's `complete_manifest_in_conn` so the status flip is
@@ -405,26 +404,19 @@ impl StoreServiceImpl {
             if let Some((signer, was_tenant)) = resolved_signer {
                 self.sign_with_resolved(signer, *was_tenant, &mut info);
             }
-            let inline_blob = match accum.staged.take().expect("staged in phase 2") {
-                NarPersist::Inline(data) => (Some(data), Vec::new()),
-                NarPersist::ChunkedStaged { chunk_hashes } => (None, chunk_hashes),
-            };
-            let (inline_blob, chunk_hashes) = inline_blob;
+            let ChunkedStaged { chunk_hashes } = accum.staged.take().expect("staged in phase 2");
             let claim = accum
                 .claim
                 .expect("set in phase-2 for non-already_complete");
-            if let Err(e) =
-                metadata::complete_manifest_in_conn(&mut tx, &info, claim, inline_blob.as_deref())
-                    .await
-            {
+            if let Err(e) = metadata::complete_manifest_in_conn(&mut tx, &info, claim).await {
                 drop(tx);
                 return Err(putpath_metadata_status(
                     "PutPathBatch: complete_manifest",
                     e,
                 ));
             }
-            // Chunked outputs: flip their chunk set durable in the same
-            // tx as the 'complete' flip (ADR-022 §6.2 durable-presence).
+            // Flip the output's chunk set durable in the same tx as the
+            // 'complete' flip (ADR-022 §6.2 durable-presence).
             if let Err(e) = metadata::mark_chunks_durable(&mut tx, &chunk_hashes).await {
                 drop(tx);
                 return Err(putpath_metadata_status(

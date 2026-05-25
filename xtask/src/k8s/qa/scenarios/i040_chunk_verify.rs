@@ -67,9 +67,9 @@ impl Scenario for ChunkVerify {
         // two evals can straddle a second boundary, yielding two
         // different drvs and a `target_out` that was never built.
         //
-        // ~305 KiB body (300 lines × ~1040 B) clears `INLINE_THRESHOLD`
-        // (256 KiB) with margin so the store's PutPath always takes the
-        // chunked CAS path — this scenario is dead if the output inlines.
+        // ~305 KiB body (300 lines × ~1040 B) spans several FastCDC
+        // chunks so the refcount=1 pick below has a chunk unique to
+        // this path to choose from.
         //
         // The iteration list is a Rust-generated word literal, NOT
         // `$(busybox seq 1 300)`: a `builtins.derivation` with no PATH
@@ -77,7 +77,7 @@ impl Scenario for ChunkVerify {
         // isn't resolvable inside the script and the command
         // substitution silently returns nothing — the loop runs 0
         // times and `> $out` creates an empty file (112 B of NAR
-        // framing, well under the inline threshold). That broken seed
+        // framing). That broken seed
         // shipped for months: the old unscoped chunk-pick (`WHERE
         // refcount=1 ORDER BY created_at DESC LIMIT 1`) didn't care
         // and deleted *some other path's* chunk every run — that was
@@ -252,7 +252,6 @@ async fn diagnose_missing_chunk(ctx: &QaCtx, target_out: &str) -> Result<String>
     let diag = sqlx::query(
         "SELECT m.store_path_hash IS NOT NULL AS has_manifest,
                 m.status,
-                m.inline_blob IS NOT NULL AS inlined,
                 n.nar_size,
                 (octet_length(md.chunk_list) - 1) / 36 AS n_chunks
          FROM narinfo n
@@ -268,17 +267,16 @@ async fn diagnose_missing_chunk(ctx: &QaCtx, target_out: &str) -> Result<String>
         Some(d) => {
             let has_manifest: bool = d.try_get("has_manifest")?;
             let status: Option<String> = d.try_get("status")?;
-            let inlined: bool = d.try_get("inlined")?;
             let nar_size: i64 = d.try_get("nar_size")?;
             let n_chunks: Option<i32> = d.try_get("n_chunks")?;
             if !has_manifest {
                 "narinfo exists but no manifest — PutPath never started".into()
             } else if status.as_deref() != Some("complete") {
                 format!("manifest status={status:?} — PutPath never completed")
-            } else if inlined {
+            } else if n_chunks.is_none() {
                 format!(
-                    "output was inlined (NAR {nar_size} B < 256 KiB INLINE_THRESHOLD) — \
-                     seed body too small to take the chunked-PutPath path"
+                    "manifest is complete (NAR {nar_size} B) but has no manifest_data \
+                     row — the commit txn must always write one"
                 )
             } else {
                 format!(

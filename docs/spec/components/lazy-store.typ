@@ -92,7 +92,7 @@ unfetched. Both also make `lookup`/`stat`/`readdir` kernel-native.
 Today (#(refs.gh)("rio-store/src/grpc/put_path/mod.rs")):
 
 ```text
-PutPath stream → buffer NAR (Vec<u8>) → SHA-256 verify → if ≥INLINE_THRESHOLD:
+PutPath stream → buffer NAR (Vec<u8>) → SHA-256 verify →
   cas::put_chunked(): chunker::chunk_nar(&nar)  # FastCDC 16/64/256 KiB over raw NAR bytes
     → upsert chunk refcounts (PG) → parallel S3 PUT new chunks → manifest row (ChunkRef[]) status=complete
 ```

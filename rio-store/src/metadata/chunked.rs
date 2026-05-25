@@ -347,7 +347,6 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
 /// Finalize a chunked upload: fill real narinfo + flip status to 'complete'
 /// + mark the manifest's chunks durable.
 ///
-/// Does NOT write inline_blob (stays NULL — that's the chunked marker).
 /// Does NOT touch manifest_data (already written at uploading time).
 /// Does NOT touch refcounts (already incremented at uploading time).
 ///
@@ -365,7 +364,7 @@ pub(crate) async fn complete_manifest_chunked(
     chunk_hashes: &[Vec<u8>],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, claim, None).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim).await?;
     mark_chunks_durable(&mut tx, chunk_hashes).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
@@ -1297,7 +1296,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(kind, Some(crate::metadata::ManifestKind::Chunked(_))),
+            kind.is_some(),
             "get_manifest still resolves B's chunked manifest, got {kind:?}"
         );
     }

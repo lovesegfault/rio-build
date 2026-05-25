@@ -1227,6 +1227,13 @@
     },
     {
       "enum": "ManifestError",
+      "name": "MissingChunkList",
+      "crate": "rio-store",
+      "msg": "no chunk list (manifest_data row missing — pre-065 inline path or corruption)",
+      "doc": "The `manifests` row is `'complete'` but has no `manifest_data` row to reassemble from. Either a pre-migration-065 inline-stored path (whose `inline_blob` column was dropped — content is unrecoverable) or genuine corruption. Surfaced as DATA_LOSS so it is not mistaken for a cache miss or a server bug."
+    },
+    {
+      "enum": "ManifestError",
       "name": "TooManyChunks",
       "crate": "rio-store",
       "msg": "manifest has {0} entries, exceeds MAX_CHUNKS {MAX_CHUNKS}",
@@ -1272,7 +1279,7 @@
       "name": "InvariantViolation",
       "crate": "rio-store",
       "msg": "invariant violation: {0}",
-      "doc": "Database state violates a code-enforced invariant that PG's schema can't express (e.g., `inline_blob IS NULL` but no `manifest_data` row — PG can't CHECK \"row in another table exists\"). This is corruption: manual DB surgery, a CASCADE we didn't expect, or a bug in cleanup ordering. NOT retriable. Maps to `internal`."
+      "doc": "Database state violates a code-enforced invariant that PG's schema can't express (PG can't CHECK \"row in another table exists\"). This is corruption: manual DB surgery, a CASCADE we didn't expect, or a bug in cleanup ordering. NOT retriable. Maps to `internal`."
     },
     {
       "enum": "MetadataError",
@@ -1584,11 +1591,6 @@
       "name": "MetadataError",
       "crate": "rio-store",
       "doc": "Typed error for the metadata/DB layer. Replaces `anyhow::Result` so callers can discriminate retriable failures (connection, serialization) from permanent ones (corruption) and map to precise gRPC status codes."
-    },
-    {
-      "name": "PersistError",
-      "crate": "rio-store",
-      "doc": "How [`persist_nar`] failed. The caller maps this to its own error domain (`tonic::Status` for gRPC, `SubstituteError` for substitution) and decides whether to [`abort_placeholder`]: the chunked path already rolled back internally."
     },
     {
       "name": "SignerError",

@@ -11,7 +11,7 @@ use rio_store::test_helpers::{put_path, spawn_store_service};
 pub(super) async fn setup_inproc_store(
     pool: sqlx::PgPool,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    // Inline storage in manifests.inline_blob (no chunk backend needed).
+    // In-process memory chunk backend (the constructor default).
     spawn_store_service(StoreServiceImpl::new(pool)).await
 }
 

@@ -73,23 +73,25 @@ keys (`jwt.required` ↔ TOML `[jwt] required = …` ↔ env `RIO_JWT__REQUIRED`
 
 #_cfg-table(_cfg.store)
 
-`chunk_backend` TOML syntax (tagged enum):
+`chunk_backend` TOML syntax (tagged enum). The field is *required* --- every
+NAR is chunked, so a store without a backend cannot store anything and refuses
+to start:
 
 ```toml
-# Default — all NARs inline in PG, no chunk backend
-chunk_backend = { kind = "inline" }
-
 # Local filesystem (256-subdir fanout by hash prefix)
 chunk_backend = { kind = "filesystem", base_dir = "/var/rio/chunks" }
 
 # S3 (credentials from aws-sdk default chain — env vars, IRSA, instance profile)
 chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
+
+# In-process memory (tests / single-process dev only — chunks do not persist)
+chunk_backend = { kind = "memory" }
 ```
 
 #info[
-  *Compile-time constants (not configurable):* `INLINE_THRESHOLD` = 256 KiB,
-  `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These
-  live in `rio-store/src/cas.rs` and `chunker.rs`. #gls("blake3")-verify-on-read and
+  *Compile-time constants (not configurable):* `CHUNK_MIN` = 16 KiB,
+  `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These
+  live in `rio-store/src/chunker.rs`. #gls("blake3")-verify-on-read and
   SHA-256-verify-on-put are always on (no config toggle).
 ]
 

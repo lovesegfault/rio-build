@@ -116,19 +116,11 @@ impl StoreServiceImpl {
         let auth = self.authorize(&request)?;
         let mut stream = request.into_inner();
 
-        // PutPathChunked is meaningless without a chunk backend: the
-        // entire point is per-chunk S3 writes. Reject before reading
-        // the stream so the builder fails fast on a misconfigured
-        // store instead of streaming gigabytes into an error. The
-        // message substring is a wire contract — the builder matches
-        // `CHUNKED_REQUIRES_BACKEND_MSG` to fall back to the legacy
-        // PutPath/PutPathBatch path on inline-only stores.
-        let Some(cache) = self.chunk_cache.clone() else {
-            return Err(Status::failed_precondition(format!(
-                "{}; this store is inline-only",
-                rio_proto::CHUNKED_REQUIRES_BACKEND_MSG
-            )));
-        };
+        // A chunk backend is always present (required config since
+        // P0583) — the `CHUNKED_REQUIRES_BACKEND_MSG` rejection that
+        // used to live here can no longer happen, so the builder's
+        // legacy-RPC fallback is dead in practice.
+        let cache = self.chunk_cache.clone();
         let backend = cache.backend();
 
         // --- Begin -----------------------------------------------------
@@ -279,7 +271,7 @@ impl StoreServiceImpl {
         }
 
         // --- Verify ----------------------------------------------------
-        // r[impl store.put.drop-cleanup+2]
+        // r[impl store.put.drop-cleanup+3]
         // The PlaceholderGuards reap on drop, so any error return from
         // here on cleans up every owned placeholder.
         let mut accs: Vec<Option<OutputAcc>> = validated

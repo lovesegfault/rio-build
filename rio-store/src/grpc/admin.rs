@@ -43,7 +43,7 @@ use crate::metadata;
 pub struct StoreAdminServiceImpl {
     pool: PgPool,
     /// Chunk backend for sweep's key_for (enqueue to pending_s3_
-    /// deletes). None = inline-only store, sweep does CASCADE
+    /// deletes). None = test-only shape, sweep does CASCADE
     /// delete only (no chunk refcounting).
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     /// Process-wide shutdown token. Threaded into the `run_gc`
@@ -296,7 +296,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// Read-only. No `--repair`: deleting the PG row would be the
     /// wrong move if the object is recoverable (backup, manual
     /// re-upload). The operator decides.
-    // r[impl store.admin.verify-chunks]
+    // r[impl store.admin.verify-chunks+2]
     #[instrument(skip(self, request), fields(rpc = "VerifyChunks"))]
     async fn verify_chunks(
         &self,
@@ -306,12 +306,12 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         self.ensure_service_caller(&request, &["rio-cli"])?;
         let req = request.into_inner();
 
-        // Inline-only stores have nothing to verify (no chunk
+        // Without a backend there is nothing to verify (no chunk
         // backend, no chunks table content). FAILED_PRECONDITION not
         // INTERNAL — config issue, not bug.
         let Some(backend) = self.chunk_backend.clone() else {
             return Err(Status::failed_precondition(
-                "VerifyChunks: no chunk backend configured (inline-only store)",
+                "VerifyChunks: no chunk backend configured",
             ));
         };
 
@@ -1080,7 +1080,7 @@ mod tests {
         );
     }
 
-    /// Inline-only store (no chunk_backend) → FAILED_PRECONDITION.
+    /// No chunk backend wired → FAILED_PRECONDITION.
     /// Config issue, not bug — operator gets a clear "wire a backend"
     /// instead of an empty success.
     #[tokio::test]

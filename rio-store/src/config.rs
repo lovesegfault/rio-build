@@ -11,7 +11,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend, TieredChunkBackend};
+use crate::backend::{
+    ChunkBackend, FilesystemChunkBackend, MemoryChunkBackend, S3ChunkBackend, TieredChunkBackend,
+};
 use crate::cas::ChunkCache;
 use rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS;
 
@@ -22,17 +24,17 @@ use rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS;
 /// `kind` not the serde default `type` — `type` is a Rust keyword
 /// and would need `r#type` everywhere we match on it.
 ///
-/// Default is `Inline`: backward-compatible with existing deployments
-/// that have no chunk-backend config. All NARs go into PG
-/// `manifests.inline_blob` regardless of size. Fine for dev/CI;
-/// production wants `s3` or `filesystem`.
-#[derive(Debug, Serialize, Deserialize, Default, schemars::JsonSchema)]
+/// There is no default: every NAR is chunked (P0583 dropped the
+/// `inline_blob` PG column), so a store without a chunk backend cannot
+/// store anything. `Config::validate` rejects a missing
+/// `[chunk_backend]` at startup.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ChunkBackendKind {
-    /// No chunk backend. All NARs inline in PG. ChunkService returns
-    /// FAILED_PRECONDITION.
-    #[default]
-    Inline,
+    /// In-process `HashMap`. Chunks do not survive a restart and are
+    /// not shared across replicas — tests and single-process dev
+    /// loops only. Never deploy this.
+    Memory,
     /// Local filesystem. 256-subdir fanout by hash prefix (same layout
     /// as git objects). `base_dir` is created at startup.
     Filesystem { base_dir: PathBuf },
@@ -74,13 +76,14 @@ pub struct Config {
     pub database_url: String,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,
-    /// Where chunks live. Default: inline (no backend). See
-    /// [`ChunkBackendKind`] for TOML syntax.
-    pub chunk_backend: ChunkBackendKind,
+    /// Where chunks live. **Required** — every NAR is chunked, so a
+    /// store without a backend cannot accept or serve anything.
+    /// `validate()` rejects `None` at startup with the list of valid
+    /// kinds. See [`ChunkBackendKind`] for TOML syntax.
+    pub chunk_backend: Option<ChunkBackendKind>,
     /// moka LRU capacity for chunk reads, in bytes. Default 2 GiB.
     /// One cache shared by StoreService + ChunkService — a chunk
-    /// warmed by either is hot for both. Only relevant when
-    /// chunk_backend != inline.
+    /// warmed by either is hot for both.
     pub chunk_cache_capacity_bytes: u64,
     /// Global NAR reassembly buffer budget in bytes — total permits
     /// across ALL concurrent PutPath handlers. Each handler acquires
@@ -192,7 +195,10 @@ impl Default for Config {
             listen_addr: rio_common::default_addr(9002),
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9092),
-            chunk_backend: ChunkBackendKind::default(),
+            // Required field: None here so an unconfigured store fails
+            // validate() with a clear error instead of silently picking
+            // a backend.
+            chunk_backend: None,
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
             // — the constant is crate-private so duplicated here,
             // but the config_defaults_are_stable test catches drift.
@@ -265,6 +271,15 @@ impl rio_common::config::ValidateConfig for Config {
         use rio_common::config::ensure_required as required;
         use rio_common::limits::MAX_NAR_SIZE;
         required(&self.database_url, "database_url", "store")?;
+        // Every NAR is chunked (P0583 dropped inline_blob storage), so
+        // a store without a chunk backend cannot store or serve
+        // anything. Reject at boot, not at the first PutPath.
+        anyhow::ensure!(
+            self.chunk_backend.is_some(),
+            "chunk_backend is required: set [chunk_backend] kind to one of \
+             `filesystem`, `s3`, `tiered`, or `memory` (tests only) — \
+             e.g. RIO_CHUNK_BACKEND__KIND=s3 RIO_CHUNK_BACKEND__BUCKET=..."
+        );
         // 0 → buffer_unordered(0) returns Pending forever (no waker):
         // every put_chunked silently hangs the data plane.
         anyhow::ensure!(
@@ -323,16 +338,17 @@ rio_common::impl_has_common_config!(Config);
 ///
 /// `?` on backend construction: filesystem mkdir fail or S3
 /// bad-region means we can't store chunks — startup error, not
-/// degraded mode. Inline backend can't fail (returns `None`).
+/// degraded mode.
 pub async fn init_chunk_backend(
     kind: &ChunkBackendKind,
     cache_capacity_bytes: u64,
     s3_max_attempts: u32,
-) -> anyhow::Result<Option<Arc<ChunkCache>>> {
+) -> anyhow::Result<Arc<ChunkCache>> {
     Ok(match kind {
-        ChunkBackendKind::Inline => {
-            info!("chunk backend: inline (all NARs in PG manifests.inline_blob)");
-            None
+        ChunkBackendKind::Memory => {
+            info!("chunk backend: memory (in-process, test/dev only — chunks do not persist)");
+            let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+            Arc::new(ChunkCache::with_capacity(backend, cache_capacity_bytes))
         }
         ChunkBackendKind::Filesystem { base_dir } => {
             info!(base_dir = %base_dir.display(), "chunk backend: filesystem");
@@ -341,10 +357,7 @@ pub async fn init_chunk_backend(
             // fail here than on the first PutPath with a cryptic
             // ENOENT deep in the put() call.
             let backend: Arc<dyn ChunkBackend> = Arc::new(FilesystemChunkBackend::new(base_dir)?);
-            Some(Arc::new(ChunkCache::with_capacity(
-                backend,
-                cache_capacity_bytes,
-            )))
+            Arc::new(ChunkCache::with_capacity(backend, cache_capacity_bytes))
         }
         ChunkBackendKind::S3 { bucket, prefix } => {
             info!(%bucket, %prefix, s3_max_attempts, "chunk backend: S3");
@@ -367,10 +380,7 @@ pub async fn init_chunk_backend(
             let client = rio_common::s3::default_client(s3_max_attempts).await;
             let backend: Arc<dyn ChunkBackend> =
                 Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
-            Some(Arc::new(ChunkCache::with_capacity(
-                backend,
-                cache_capacity_bytes,
-            )))
+            Arc::new(ChunkCache::with_capacity(backend, cache_capacity_bytes))
         }
         ChunkBackendKind::Tiered {
             bucket,
@@ -404,10 +414,7 @@ pub async fn init_chunk_backend(
                 None => None,
             };
             let backend: Arc<dyn ChunkBackend> = Arc::new(TieredChunkBackend::new(local, remote));
-            Some(Arc::new(ChunkCache::with_capacity(
-                backend,
-                cache_capacity_bytes,
-            )))
+            Arc::new(ChunkCache::with_capacity(backend, cache_capacity_bytes))
         }
     })
 }
@@ -423,8 +430,8 @@ mod tests {
         assert_eq!(d.listen_addr.to_string(), "[::]:9002");
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9092");
         assert!(d.database_url.is_empty());
-        // Chunk backend off by default for backward-compat with pre-chunking configs.
-        assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
+        // Chunk backend is required — no default. validate() rejects None.
+        assert!(d.chunk_backend.is_none());
         // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
         // constant changes, update this — the test catches drift.
         assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
@@ -470,6 +477,7 @@ mod tests {
     fn validate_rejects_zero_upload_concurrency() {
         let cfg = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             chunk_upload_max_concurrent: 0,
             ..Default::default()
         };
@@ -486,6 +494,7 @@ mod tests {
     fn validate_rejects_zero_s3_attempts() {
         let cfg = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             s3_max_attempts: 0,
             ..Default::default()
         };
@@ -500,6 +509,7 @@ mod tests {
     fn validate_rejects_zero_nar_budget() {
         let cfg = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             nar_buffer_budget_bytes: Some(0),
             ..Default::default()
         };
@@ -515,6 +525,7 @@ mod tests {
         for bad in [100u64, MAX_NAR_SIZE - 1] {
             let cfg = Config {
                 database_url: "postgres://x".into(),
+                chunk_backend: Some(ChunkBackendKind::Memory),
                 nar_buffer_budget_bytes: Some(bad),
                 ..Default::default()
             };
@@ -524,6 +535,7 @@ mod tests {
         // Exactly MAX_NAR_SIZE is the floor (concurrency = 1).
         let at_floor = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             nar_buffer_budget_bytes: Some(MAX_NAR_SIZE),
             ..Default::default()
         };
@@ -531,6 +543,7 @@ mod tests {
         // None (unset) is fine — that's the 32 GiB default.
         let ok = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             nar_buffer_budget_bytes: None,
             ..Default::default()
         };
@@ -541,6 +554,7 @@ mod tests {
     fn validate_rejects_zero_pg_connections() {
         let cfg = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             pg_max_connections: 0,
             ..Default::default()
         };
@@ -552,6 +566,7 @@ mod tests {
     fn validate_rejects_zero_max_batch_paths() {
         let cfg = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             max_batch_paths: 0,
             ..Default::default()
         };
@@ -566,6 +581,7 @@ mod tests {
     fn validate_rejects_zero_admission_permits() {
         let cfg = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             substitute_admission_permits: Some(0),
             ..Default::default()
         };
@@ -574,6 +590,7 @@ mod tests {
         // None (unset) is fine — derived from pg_max_connections.
         let ok = Config {
             database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             substitute_admission_permits: None,
             ..Default::default()
         };
@@ -611,14 +628,14 @@ mod tests {
     }
 
     #[test]
-    fn chunk_backend_kind_toml_inline() {
+    fn chunk_backend_kind_toml_memory() {
         let cfg = parse_toml(
             r#"
             [chunk_backend]
-            kind = "inline"
+            kind = "memory"
             "#,
         );
-        assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
+        assert!(matches!(cfg.chunk_backend, Some(ChunkBackendKind::Memory)));
     }
 
     #[test]
@@ -631,7 +648,7 @@ mod tests {
             "#,
         );
         match cfg.chunk_backend {
-            ChunkBackendKind::Filesystem { base_dir } => {
+            Some(ChunkBackendKind::Filesystem { base_dir }) => {
                 assert_eq!(base_dir, PathBuf::from("/var/lib/rio-store/chunks"));
             }
             other => panic!("expected Filesystem, got {other:?}"),
@@ -649,7 +666,7 @@ mod tests {
             "#,
         );
         match cfg.chunk_backend {
-            ChunkBackendKind::S3 { bucket, prefix } => {
+            Some(ChunkBackendKind::S3 { bucket, prefix }) => {
                 assert_eq!(bucket, "my-nar-chunks");
                 assert_eq!(prefix, "prod/");
             }
@@ -669,11 +686,11 @@ mod tests {
             "#,
         );
         match cfg.chunk_backend {
-            ChunkBackendKind::Tiered {
+            Some(ChunkBackendKind::Tiered {
                 bucket,
                 prefix,
                 express_bucket,
-            } => {
+            }) => {
                 assert_eq!(bucket, "rio-chunks");
                 assert_eq!(prefix, "prod");
                 assert_eq!(
@@ -699,24 +716,30 @@ mod tests {
             "#,
         );
         match cfg.chunk_backend {
-            ChunkBackendKind::Tiered { express_bucket, .. } => {
+            Some(ChunkBackendKind::Tiered { express_bucket, .. }) => {
                 assert!(express_bucket.is_none());
             }
             other => panic!("expected Tiered, got {other:?}"),
         }
     }
 
-    /// No [chunk_backend] section at all → default (Inline). This is
-    /// the backward-compat path: pre-phase3a configs have no such
-    /// section and should keep working.
+    /// No [chunk_backend] section at all → `None`, which `validate()`
+    /// rejects with an error naming the valid kinds. The backend is a
+    /// required field — there is no implicit default.
     #[test]
-    fn chunk_backend_kind_absent_defaults_inline() {
+    fn chunk_backend_kind_absent_is_rejected() {
         let cfg = parse_toml(
             r#"
             listen_addr = "0.0.0.0:9002"
+            database_url = "postgres://x"
             "#,
         );
-        assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
+        assert!(cfg.chunk_backend.is_none());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("chunk_backend"), "names the field: {err}");
+        for kind in ["filesystem", "s3", "memory"] {
+            assert!(err.contains(kind), "error must name `{kind}`: {err}");
+        }
     }
 
     /// Env-var tagged-enum parsing via the real rio_common::config::load
@@ -724,8 +747,8 @@ mod tests {
     /// deserialize). The deploy overlays set chunk_backend this way —
     /// regression guard for kustomization.yaml.
     ///
-    /// The defaults layer serializes Inline as {kind: "inline"}; the
-    /// defaults layer's per-key merge must correctly replace it with
+    /// The defaults layer serializes the absent backend as null; the
+    /// per-key merge must correctly replace it with
     /// {kind: "s3", bucket: ..., prefix: ...} from the env layer.
     /// Half-merges (stale kind, orphan fields) would fail tagged-enum
     /// deserialization.
@@ -739,11 +762,11 @@ mod tests {
             jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
             match cfg.chunk_backend {
-                ChunkBackendKind::S3 { bucket, prefix } => {
+                Some(ChunkBackendKind::S3 { bucket, prefix }) => {
                     assert_eq!(bucket, "rio-chunks");
                     assert_eq!(prefix, "");
                 }
-                other => panic!("env vars must override default Inline; got {other:?}"),
+                other => panic!("env vars must populate the backend; got {other:?}"),
             }
             Ok(())
         });
@@ -756,7 +779,7 @@ mod tests {
             jail.set_env("RIO_CHUNK_BACKEND__BASE_DIR", "/var/lib/chunks");
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
             match cfg.chunk_backend {
-                ChunkBackendKind::Filesystem { base_dir } => {
+                Some(ChunkBackendKind::Filesystem { base_dir }) => {
                     assert_eq!(base_dir, PathBuf::from("/var/lib/chunks"));
                 }
                 other => panic!("expected Filesystem; got {other:?}"),
@@ -780,11 +803,11 @@ mod tests {
             );
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
             match cfg.chunk_backend {
-                ChunkBackendKind::Tiered {
+                Some(ChunkBackendKind::Tiered {
                     bucket,
                     express_bucket,
                     ..
-                } => {
+                }) => {
                     assert_eq!(bucket, "rio-chunks");
                     assert_eq!(
                         express_bucket.as_deref(),
@@ -809,7 +832,7 @@ mod tests {
             jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
             let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
             match cfg.chunk_backend {
-                ChunkBackendKind::Tiered { express_bucket, .. } => {
+                Some(ChunkBackendKind::Tiered { express_bucket, .. }) => {
                     assert!(
                         express_bucket.is_none(),
                         "absent EXPRESS_BUCKET env var must default to None"
@@ -892,7 +915,7 @@ mod tests {
             assert_eq!(cfg.chunk_upload_max_concurrent, 64);
             assert_eq!(cfg.s3_max_attempts, 5);
             assert!(
-                matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
+                matches!(cfg.chunk_backend, Some(ChunkBackendKind::Filesystem { .. })),
                 "[chunk_backend] table must thread through the config layers"
             );
             assert!(
@@ -905,7 +928,7 @@ mod tests {
     );
 
     rio_test_support::jail_defaults!("store", r#"listen_addr = "0.0.0.0:9002""#, |cfg: Config| {
-        assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
+        assert!(cfg.chunk_backend.is_none());
         assert!(cfg.nar_buffer_budget_bytes.is_none());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.signing_key_path.is_none());
@@ -926,12 +949,13 @@ mod tests {
     // (rio-scheduler/src/main.rs) to the store.
     // -----------------------------------------------------------------------
 
-    /// `Config::default()` leaves `database_url` empty, which
-    /// validate_config rejects. Fill it with a placeholder so the
-    /// returned config passes as-is.
+    /// `Config::default()` leaves `database_url` empty and
+    /// `chunk_backend` unset, both of which validate_config rejects.
+    /// Fill them with placeholders so the returned config passes as-is.
     fn test_valid_config() -> Config {
         Config {
             database_url: "postgres://localhost/rio".into(),
+            chunk_backend: Some(ChunkBackendKind::Memory),
             ..Config::default()
         }
     }

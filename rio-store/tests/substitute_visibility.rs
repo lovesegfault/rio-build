@@ -114,7 +114,10 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     // return in sig_visibility_gate). The substituter itself won't hit
     // HTTP — the path is pre-seeded, not miss-then-fetch. But it must
     // be PRESENT.
-    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let sub = Arc::new(Substituter::new(
+        db.pool.clone(),
+        rio_store::test_helpers::mem_backend(),
+    ));
     let store_svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
     let admin_svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
 
@@ -171,14 +174,12 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     .bind(&[sig_k1][..])
     .execute(&db.pool)
     .await?;
-    sqlx::query(
-        "INSERT INTO manifests (store_path_hash, status, inline_blob) \
-         VALUES ($1, 'complete', $2)",
-    )
-    .bind(&path_hash[..])
-    .bind(&nar[..])
-    .execute(&db.pool)
-    .await?;
+    // No manifest_data: these tests only exercise QueryPathInfo's sig
+    // gate, which never reads the chunk manifest.
+    sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+        .bind(&path_hash[..])
+        .execute(&db.pool)
+        .await?;
 
     // Precondition: zero path_tenants rows → substitution-only path →
     // gate applies. If this fails, the test setup leaked a built-path
@@ -208,7 +209,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     // ── C trusts only K2 → NotFound on EVERY tenant-facing read RPC ────
     // r[verify store.api.hash-part+2]
     // r[verify store.api.batch-query+2]
-    // r[verify store.api.batch-manifest+2]
+    // r[verify store.api.batch-manifest+3]
     // r[verify store.substitute.find-missing-gated]
     // Pre-fix: only QueryPathInfo was gated; the other five leaked.
     switch.set(Some(tid_c));
@@ -452,7 +453,10 @@ async fn sig_visibility_gate_cluster_key_timing_window() -> TestResult {
 
     // ── Service WITH signer (cluster key available for the union) ──────
     // Substituter must be present or the gate short-circuits early.
-    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let sub = Arc::new(Substituter::new(
+        db.pool.clone(),
+        rio_store::test_helpers::mem_backend(),
+    ));
     let ts = TenantSigner::new(cluster_signer.clone(), db.pool.clone());
     let store_svc = StoreServiceImpl::new(db.pool.clone())
         .with_substituter(sub)
@@ -518,14 +522,12 @@ async fn sig_visibility_gate_cluster_key_timing_window() -> TestResult {
     .bind(&[sig_cluster][..])
     .execute(&db.pool)
     .await?;
-    sqlx::query(
-        "INSERT INTO manifests (store_path_hash, status, inline_blob) \
-         VALUES ($1, 'complete', $2)",
-    )
-    .bind(&path_hash[..])
-    .bind(&nar[..])
-    .execute(&db.pool)
-    .await?;
+    // No manifest_data: these tests only exercise QueryPathInfo's sig
+    // gate, which never reads the chunk manifest.
+    sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+        .bind(&path_hash[..])
+        .execute(&db.pool)
+        .await?;
 
     // ── Precondition: path_tenants count = 0 ───────────────────────────
     // Proves we're testing the timing window, not the post-scheduler
@@ -590,7 +592,10 @@ async fn sig_visibility_gate_tenant_key_timing_window() -> TestResult {
     // Cluster signer DIFFERENT from tenant key (proves it's the
     // tenant_keys union doing the work, not cluster).
     let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]);
-    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let sub = Arc::new(Substituter::new(
+        db.pool.clone(),
+        rio_store::test_helpers::mem_backend(),
+    ));
     let ts = TenantSigner::new(cluster, db.pool.clone());
     let store_svc = StoreServiceImpl::new(db.pool.clone())
         .with_substituter(sub)
@@ -643,13 +648,12 @@ async fn sig_visibility_gate_tenant_key_timing_window() -> TestResult {
     .bind(&[sig_tenant][..])
     .execute(&db.pool)
     .await?;
-    sqlx::query(
-        "INSERT INTO manifests (store_path_hash, status, inline_blob) VALUES ($1, 'complete', $2)",
-    )
-    .bind(&path_hash[..])
-    .bind(&nar[..])
-    .execute(&db.pool)
-    .await?;
+    // No manifest_data: these tests only exercise QueryPathInfo's sig
+    // gate, which never reads the chunk manifest.
+    sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+        .bind(&path_hash[..])
+        .execute(&db.pool)
+        .await?;
 
     // THE assertion: tenant sees its own tenant-key-signed path.
     switch.set(Some(tid));

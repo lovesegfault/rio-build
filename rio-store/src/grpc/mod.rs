@@ -188,21 +188,20 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
 
 /// The StoreService gRPC server.
 ///
-/// NAR content lives in `manifests.inline_blob` (small NARs) or as
-/// FastCDC chunks (large NARs). Inline blobs are stored directly in PG.
+/// NAR content lives as FastCDC chunks in the chunk backend; PG holds
+/// the metadata (narinfo + chunk manifests).
 pub struct StoreServiceImpl {
     pool: PgPool,
-    /// Chunk storage for NARs ≥ INLINE_THRESHOLD. `None` disables chunking
-    /// entirely (all NARs go inline, regardless of size).
-    chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    /// Chunk storage for every NAR. Always present — a chunk backend is
+    /// a required part of store config.
+    chunk_backend: Arc<dyn ChunkBackend>,
     /// Cache for chunk reads (GetPath). Created once at construction;
     /// shared across all GetPath calls (the moka LRU and singleflight map
-    /// are process-wide). `None` iff `chunk_backend` is None — they're
-    /// paired.
+    /// are process-wide). Wraps the same backend as `chunk_backend`.
     ///
     /// `Arc` because the spawned GetPath streaming task needs an owned
     /// handle (the task outlives the `&self` method call).
-    chunk_cache: Option<Arc<ChunkCache>>,
+    chunk_cache: Arc<ChunkCache>,
     /// Tenant-aware ed25519 signer for narinfo. Wraps the cluster
     /// `Signer` + PG pool for per-tenant key lookup. `None` = signing
     /// disabled (paths stored without our signature; still serveable,
@@ -296,15 +295,22 @@ pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
 const DEFAULT_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
 
 impl StoreServiceImpl {
-    /// Create a new StoreService with inline-only storage (no chunking).
+    /// Create a new StoreService backed by an in-process
+    /// [`crate::backend::MemoryChunkBackend`].
     ///
-    /// All NARs go into `manifests.inline_blob` regardless of size.
-    /// Existing test harnesses call this; they don't need a chunk backend.
+    /// Test harnesses call this bare; production (`main.rs`) always
+    /// chains [`Self::with_chunk_cache`] with the config-selected
+    /// backend, which replaces the memory default before anything is
+    /// stored. A chunk backend is mandatory — there is no inline-in-PG
+    /// fallback.
     pub fn new(pool: PgPool) -> Self {
+        let cache = Arc::new(ChunkCache::new(Arc::new(
+            crate::backend::MemoryChunkBackend::new(),
+        )));
         Self {
             pool,
-            chunk_backend: None,
-            chunk_cache: None,
+            chunk_backend: cache.backend(),
+            chunk_cache: cache,
             signer: None,
             hmac_verifier: None,
             service_verifier: None,
@@ -331,11 +337,11 @@ impl StoreServiceImpl {
     /// Use this when you want ONE cache shared across multiple
     /// services. main.rs constructs one `Arc<ChunkCache>`, passes
     /// clones here + to `ChunkServiceImpl::new` — a chunk warmed by
-    /// either is hot for both. Without this call, the service is inline-only (all
-    /// NARs go into `manifests.inline_blob` regardless of size).
+    /// either is hot for both. Without this call, the service uses the
+    /// in-process memory backend `new()` constructed (tests only).
     pub fn with_chunk_cache(mut self, cache: Arc<ChunkCache>) -> Self {
-        self.chunk_backend = Some(cache.backend());
-        self.chunk_cache = Some(cache);
+        self.chunk_backend = cache.backend();
+        self.chunk_cache = cache;
         self
     }
 
@@ -502,7 +508,7 @@ impl StoreServiceImpl {
     }
 
     // r[impl store.api.batch-query+2]
-    // r[impl store.api.batch-manifest+2]
+    // r[impl store.api.batch-manifest+3]
     /// Reject gateway-forwarded end-user tenant tokens on the
     /// builder-internal batch RPCs (`BatchQueryPathInfo`,
     /// `BatchGetManifest`). These intentionally skip
@@ -561,7 +567,7 @@ impl StoreServiceImpl {
     async fn abort_upload(&self, store_path_hash: &[u8], claim: uuid::Uuid) {
         crate::ingest::abort_placeholder(
             &self.pool,
-            self.chunk_backend.as_ref(),
+            Some(&self.chunk_backend),
             store_path_hash,
             claim,
         )
@@ -985,7 +991,7 @@ impl StoreServiceImpl {
             .ok_or_else(|| Status::not_found("no complete manifest for nar_hash"))?;
         crate::nar_index::compute(
             &self.pool,
-            self.chunk_cache.as_ref(),
+            &self.chunk_cache,
             &store_path,
             crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES,
             Some(&self.nar_bytes_budget),

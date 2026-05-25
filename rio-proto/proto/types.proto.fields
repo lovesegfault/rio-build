@@ -55,7 +55,6 @@ bytes file_digest = 1;
 bytes file_digest = 1;
 bytes file_digest = 7;
 bytes hash = 1;
-bytes inline_blob = 3;
 bytes nar_chunk = 2;
 bytes nar_chunk = 2;
 bytes nar_hash = 1;

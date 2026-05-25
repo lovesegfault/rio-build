@@ -183,7 +183,7 @@ async fn fixture() -> Fixture {
     let svc = DirectoryServiceImpl::new(
         db.pool.clone(),
         Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
-        Some(cache),
+        cache,
     );
     let router = Server::builder().add_service(DirectoryServiceServer::new(svc));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
@@ -474,10 +474,11 @@ fn make_blob_nar(file_len: usize, seed: u8) -> BlobNar {
     }
 }
 
-/// Persist a `(narinfo, manifests, path_tenants, file_blobs)` row set
-/// whose manifest is either inline (whole NAR in
-/// `manifests.inline_blob`) or chunked (`manifest_data.chunk_list` +
-/// chunks in `Fixture.chunks`). Returns the `file_digest`.
+/// Persist a `(narinfo, manifests, manifest_data, path_tenants,
+/// file_blobs)` row set, splitting the NAR into `chunk_size` pieces
+/// (`None` = one chunk spanning the whole NAR — what FastCDC produces
+/// for a sub-CHUNK_MIN input). Chunk bodies land in `Fixture.chunks`.
+/// Returns the `file_digest`.
 async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usize>) -> [u8; 32] {
     let path_hash = sha2::Sha256::digest(name.as_bytes()).to_vec();
     sqlx::query(
@@ -491,45 +492,34 @@ async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usiz
     .await
     .unwrap();
 
-    if let Some(chunk_size) = chunk_size {
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, nar_indexed) \
-             VALUES ($1, 'complete', TRUE)",
-        )
-        .bind(&path_hash)
-        .execute(&f.db.pool)
-        .await
-        .unwrap();
-        let mut entries = Vec::new();
-        for piece in b.nar.chunks(chunk_size) {
-            let hash: [u8; 32] = blake3::hash(piece).into();
-            f.chunks
-                .put(&hash, Bytes::copy_from_slice(piece))
-                .await
-                .unwrap();
-            entries.push(ManifestEntry {
-                hash,
-                size: piece.len() as u32,
-            });
-        }
-        let chunk_list = Manifest { entries }.serialize();
-        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
-            .bind(&path_hash)
-            .bind(&chunk_list)
-            .execute(&f.db.pool)
+    let chunk_size = chunk_size.unwrap_or(usize::MAX).min(b.nar.len().max(1));
+    sqlx::query(
+        "INSERT INTO manifests (store_path_hash, status, nar_indexed) \
+         VALUES ($1, 'complete', TRUE)",
+    )
+    .bind(&path_hash)
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    let mut entries = Vec::new();
+    for piece in b.nar.chunks(chunk_size) {
+        let hash: [u8; 32] = blake3::hash(piece).into();
+        f.chunks
+            .put(&hash, Bytes::copy_from_slice(piece))
             .await
             .unwrap();
-    } else {
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, inline_blob, nar_indexed) \
-             VALUES ($1, 'complete', $2, TRUE)",
-        )
+        entries.push(ManifestEntry {
+            hash,
+            size: piece.len() as u32,
+        });
+    }
+    let chunk_list = Manifest { entries }.serialize();
+    sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
         .bind(&path_hash)
-        .bind(&b.nar)
+        .bind(&chunk_list)
         .execute(&f.db.pool)
         .await
         .unwrap();
-    }
 
     sqlx::query(
         "INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size) \
@@ -575,11 +565,12 @@ async fn read_blob(f: &mut Fixture, digest: [u8; 32], tok: &str) -> Result<Vec<u
     Ok(body)
 }
 
-/// Inline-manifest path: server slices `manifests.inline_blob` and
-/// streams the file body.
+/// Single-chunk manifest path: the whole NAR is one chunk (what
+/// FastCDC produces for a sub-CHUNK_MIN input); the server slices the
+/// file window out of it.
 // r[verify store.castore.blob-read]
 #[tokio::test]
-async fn read_blob_inline_manifest() {
+async fn read_blob_single_chunk_manifest() {
     let mut f = fixture().await;
     let b = make_blob_nar(700, 1);
     let digest = seed_blob(&f, "rb-inline", &b, None).await;
@@ -659,50 +650,6 @@ async fn read_blob_zero_byte_file() {
         assert!(body.is_empty());
         assert_eq!(<[u8; 32]>::from(blake3::hash(&body)), digest);
     }
-}
-
-/// No chunk backend: chunked manifests fail FAILED_PRECONDITION up
-/// front, inline manifests still serve.
-// r[verify store.castore.blob-read]
-#[tokio::test]
-async fn read_blob_chunked_no_backend_failed_precondition() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let tenant_a = seed_tenant(&db.pool, "rb-noc-a").await;
-    let tenant_b = seed_tenant(&db.pool, "rb-noc-b").await;
-    let chunks = Arc::new(MemoryChunkBackend::new());
-    let svc = DirectoryServiceImpl::new(
-        db.pool.clone(),
-        Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
-        None, // no chunk backend
-    );
-    let router = Server::builder().add_service(DirectoryServiceServer::new(svc));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut f = Fixture {
-        db,
-        client: DirectoryServiceClient::new(channel),
-        server,
-        tenant_a,
-        tenant_b,
-        chunks,
-    };
-
-    // Inline still resolves without a backend.
-    let b_inline = make_blob_nar(8, 6);
-    let d_inline = seed_blob(&f, "rb-noc-inline", &b_inline, None).await;
-    let tok = token(f.tenant_a);
-    let body = read_blob(&mut f, d_inline, &tok).await.unwrap();
-    assert_eq!(body, b_inline.file);
-
-    // Chunked errors without one.
-    let b_chunked = make_blob_nar(200, 7);
-    let d_chunked = seed_blob(&f, "rb-noc-chunked", &b_chunked, Some(50)).await;
-    let err = read_blob(&mut f, d_chunked, &tok).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
 /// Corrupt `manifest_data.chunk_list` returns DATA_LOSS, not Internal:
@@ -868,24 +815,6 @@ async fn stat_blob_presence_probe() {
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
 
-/// Inline manifests have no chunk list: FAILED_PRECONDITION steers
-/// the caller to ReadBlob. Presence probe doesn't classify, so it
-/// still succeeds.
-// r[verify store.castore.blob-stat]
-#[tokio::test]
-async fn stat_blob_inline_failed_precondition() {
-    let mut f = fixture().await;
-    let b = make_blob_nar(64, 25);
-    let digest = seed_blob(&f, "sb-inline", &b, None).await;
-    let tok = token(f.tenant_a);
-
-    let err = stat_blob(&mut f, digest, &tok).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-
-    let resp = stat_blob_with(&mut f, digest, &tok, false).await.unwrap();
-    assert!(resp.chunks.is_empty());
-}
-
 /// Cross-tenant: a digest tenant A produced is NotFound for tenant B,
 /// same status as an unknown digest.
 // r[verify store.castore.blob-stat]
@@ -924,17 +853,17 @@ async fn stat_blob_size_overruns_chunked_data_loss() {
     assert_eq!(err.code(), tonic::Code::DataLoss);
 }
 
-/// A manifest with neither `inline_blob` nor `manifest_data` is
-/// corrupt PG state — the commit txn always writes one. Both RPCs
-/// report DATA_LOSS.
+/// A `'complete'` manifest with no `manifest_data` row is corrupt PG
+/// state (or a pre-065 inline path) — the commit txn always writes
+/// one. Both RPCs report DATA_LOSS.
 // r[verify store.castore.blob-stat]
 // r[verify store.castore.blob-read]
 #[tokio::test]
-async fn stat_blob_neither_inline_nor_chunked_data_loss() {
+async fn stat_blob_missing_manifest_data_data_loss() {
     let mut f = fixture().await;
     let b = make_blob_nar(64, 28);
     let digest = seed_blob(&f, "sb-neither", &b, None).await;
-    sqlx::query("UPDATE manifests SET inline_blob = NULL")
+    sqlx::query("DELETE FROM manifest_data")
         .execute(&f.db.pool)
         .await
         .unwrap();

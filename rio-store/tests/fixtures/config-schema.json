@@ -28,14 +28,19 @@
         "default": 6
       },
       "chunk_backend": {
-        "description": "Where chunks live. Default: inline (no backend). See\n[`ChunkBackendKind`] for TOML syntax.",
-        "$ref": "#/$defs/ChunkBackendKind",
-        "default": {
-          "kind": "inline"
-        }
+        "description": "Where chunks live. **Required** — every NAR is chunked, so a\nstore without a backend cannot accept or serve anything.\n`validate()` rejects `None` at startup with the list of valid\nkinds. See [`ChunkBackendKind`] for TOML syntax.",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ChunkBackendKind"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
       },
       "chunk_cache_capacity_bytes": {
-        "description": "moka LRU capacity for chunk reads, in bytes. Default 2 GiB.\nOne cache shared by StoreService + ChunkService — a chunk\nwarmed by either is hot for both. Only relevant when\nchunk_backend != inline.",
+        "description": "moka LRU capacity for chunk reads, in bytes. Default 2 GiB.\nOne cache shared by StoreService + ChunkService — a chunk\nwarmed by either is hot for both.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,
@@ -156,15 +161,15 @@
     },
     "$defs": {
       "ChunkBackendKind": {
-        "description": "Chunk storage backend selection.\n\nSerde internally-tagged (`kind`): TOML writes\n`[chunk_backend]\\nkind = \"s3\"\\nbucket = \"...\"`. The tag field is\n`kind` not the serde default `type` — `type` is a Rust keyword\nand would need `r#type` everywhere we match on it.\n\nDefault is `Inline`: backward-compatible with existing deployments\nthat have no chunk-backend config. All NARs go into PG\n`manifests.inline_blob` regardless of size. Fine for dev/CI;\nproduction wants `s3` or `filesystem`.",
+        "description": "Chunk storage backend selection.\n\nSerde internally-tagged (`kind`): TOML writes\n`[chunk_backend]\\nkind = \"s3\"\\nbucket = \"...\"`. The tag field is\n`kind` not the serde default `type` — `type` is a Rust keyword\nand would need `r#type` everywhere we match on it.\n\nThere is no default: every NAR is chunked (P0583 dropped the\n`inline_blob` PG column), so a store without a chunk backend cannot\nstore anything. `Config::validate` rejects a missing\n`[chunk_backend]` at startup.",
         "oneOf": [
           {
-            "description": "No chunk backend. All NARs inline in PG. ChunkService returns\nFAILED_PRECONDITION.",
+            "description": "In-process `HashMap`. Chunks do not survive a restart and are\nnot shared across replicas — tests and single-process dev\nloops only. Never deploy this.",
             "type": "object",
             "properties": {
               "kind": {
                 "type": "string",
-                "const": "inline"
+                "const": "memory"
               }
             },
             "required": [
@@ -268,9 +273,7 @@
     "database_url": "",
     "metrics_addr": "[::]:9092",
     "drain_grace_secs": 6,
-    "chunk_backend": {
-      "kind": "inline"
-    },
+    "chunk_backend": null,
     "chunk_cache_capacity_bytes": 2147483648,
     "nar_buffer_budget_bytes": null,
     "signing_key_path": null,

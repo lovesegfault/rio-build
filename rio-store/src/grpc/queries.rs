@@ -20,7 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 
-use crate::metadata::{self, ManifestKind};
+use crate::metadata;
 use crate::realisations;
 
 use super::{StoreServiceImpl, metadata_status, substitute_status, validate_store_path};
@@ -213,7 +213,7 @@ impl StoreServiceImpl {
     /// I-110c: builder FUSE-warm prefetch. Local-only — same caveats as
     /// `batch_query_path_info` (no upstream substitution, no
     /// sig-visibility gate; end-user tenant tokens rejected).
-    // r[impl store.api.batch-manifest+2]
+    // r[impl store.api.batch-manifest+3]
     pub(super) async fn batch_get_manifest_impl(
         &self,
         request: Request<BatchGetManifestRequest>,
@@ -229,25 +229,16 @@ impl StoreServiceImpl {
             .map_err(|e| metadata_status("BatchGetManifest: get_manifest_batch", e))?
             .into_iter()
             .map(|(store_path, found)| {
-                let hint = found.map(|(info, kind)| {
-                    let (chunks, inline_blob) = match kind {
-                        ManifestKind::Inline(b) => (Vec::new(), b.to_vec()),
-                        ManifestKind::Chunked(entries) => (
-                            entries
-                                .into_iter()
-                                .map(|(hash, size)| ChunkRef {
-                                    hash: hash.to_vec(),
-                                    size,
-                                })
-                                .collect(),
-                            Vec::new(),
-                        ),
-                    };
-                    ManifestHint {
-                        info: Some(info.into()),
-                        chunks,
-                        inline_blob,
-                    }
+                let hint = found.map(|(info, manifest)| ManifestHint {
+                    info: Some(info.into()),
+                    chunks: manifest
+                        .0
+                        .into_iter()
+                        .map(|(hash, size)| ChunkRef {
+                            hash: hash.to_vec(),
+                            size,
+                        })
+                        .collect(),
                 });
                 ManifestEntry { store_path, hint }
             })

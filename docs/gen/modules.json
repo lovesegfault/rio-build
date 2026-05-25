@@ -1430,11 +1430,6 @@
       "doc": "Prior cluster signing keys (`cluster_key_history` table, migration 027)."
     },
     {
-      "path": "metadata/inline.rs",
-      "depth": 1,
-      "doc": "Inline write-ahead: small NARs stored directly in `manifests.inline_blob`."
-    },
-    {
       "path": "metadata/queries.rs",
       "depth": 1,
       "doc": "Read-side queries: path info lookup, missing-path batch check, NAR"

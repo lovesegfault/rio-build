@@ -528,7 +528,10 @@ mod tests {
         // Gate only applies with substituter wired (`.is_none()`
         // short-circuits). The substituter itself won't be hit — the
         // path is pre-seeded, not miss-then-fetch.
-        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let sub = Arc::new(Substituter::new(
+            db.pool.clone(),
+            crate::test_helpers::mem_backend(),
+        ));
         let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
 
         let tid_a = seed_tenant(&db.pool, "sig-gate-a").await;
@@ -560,7 +563,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_k.clone()];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, &nar)
+        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
             .await
             .unwrap();
 
@@ -691,7 +694,7 @@ mod tests {
             .unwrap();
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &stored, claim, &nar)
+        metadata::complete_manifest_chunked(&db.pool, &stored, claim, &[])
             .await
             .unwrap();
         let stored = metadata::query_path_info(&db.pool, &path)
@@ -750,7 +753,10 @@ mod tests {
         use rio_test_support::TestDb;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let sub = Arc::new(Substituter::new(
+            db.pool.clone(),
+            crate::test_helpers::mem_backend(),
+        ));
         // Signer present (cluster key DIFFERENT from tenant key — proves
         // it's the tenant_keys union doing the work, not cluster).
         let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]);
@@ -789,7 +795,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_tenant];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, &nar)
+        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
             .await
             .unwrap();
 
@@ -836,7 +842,10 @@ mod tests {
         use rio_test_support::TestDb;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let sub = Arc::new(Substituter::new(
+            db.pool.clone(),
+            crate::test_helpers::mem_backend(),
+        ));
         let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
 
         let tid = seed_tenant(&db.pool, "drv-exempt").await;
@@ -867,7 +876,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            metadata::complete_manifest_inline(&db.pool, &info, claim, &nar)
+            metadata::complete_manifest_chunked(&db.pool, &info, claim, &[])
                 .await
                 .unwrap();
         }
@@ -916,7 +925,10 @@ mod tests {
         use rio_test_support::TestDb;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let sub = Arc::new(Substituter::new(
+            db.pool.clone(),
+            crate::test_helpers::mem_backend(),
+        ));
         let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
 
         let tid_b = seed_tenant(&db.pool, "batch-b").await;
@@ -966,7 +978,7 @@ mod tests {
                 vec![]
             };
             info_with_sig.store_path_hash = path_hash.to_vec();
-            metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, &nar)
+            metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
                 .await
                 .unwrap();
             paths.push(path);
@@ -1021,7 +1033,10 @@ mod tests {
         use rio_test_support::TestDb;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let sub = Arc::new(Substituter::new(
+            db.pool.clone(),
+            crate::test_helpers::mem_backend(),
+        ));
 
         // — Cluster key A: the OLD key. Sign the path with this. —
         let seed_a = [0xAAu8; 32];
@@ -1055,7 +1070,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_a];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, &nar)
+        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
             .await
             .unwrap();
 

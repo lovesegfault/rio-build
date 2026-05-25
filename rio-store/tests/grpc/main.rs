@@ -1,6 +1,6 @@
 //! gRPC-level integration tests for StoreService.
 //!
-//! These tests spin up an in-process tonic server (inline storage or
+//! These tests spin up an in-process tonic server (backed by a
 //! [`MemoryChunkBackend`]) with an ephemeral PostgreSQL database
 //! (bootstrapped by `rio-test-support`), then exercise the full gRPC
 //! request/response path including streaming.
@@ -88,8 +88,8 @@ impl StoreSession {
         Ok(Self { db, client, server })
     }
 
-    /// Inline-only store (no chunk backend). NARs of any size go into
-    /// `manifests.inline_blob`. Most tests use this.
+    /// Store backed by the constructor's default in-process memory
+    /// chunk backend. Most tests use this.
     pub async fn new() -> anyhow::Result<Self> {
         Self::build(StoreServiceImpl::new).await
     }
@@ -136,8 +136,8 @@ impl StoreSession {
         Ok(Self { db, client, server })
     }
 
-    /// Store WITH chunk backend. NARs ≥ 256 KiB are FastCDC-chunked.
-    /// Returns the `MemoryChunkBackend` so tests can inspect chunk counts.
+    /// Store with an EXTERNALLY VISIBLE chunk backend. Returns the
+    /// `MemoryChunkBackend` so tests can inspect/corrupt chunk state.
     pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
         let backend = mem_backend();
         let cache = Arc::new(rio_store::cas::ChunkCache::new(

@@ -75,10 +75,9 @@ pub struct Chunk<'a> {
 /// reconstructs the input bit-for-bit.
 ///
 /// Empty input → empty output. A NAR small enough to be one chunk
-/// (< CHUNK_MAX) → one chunk spanning the whole thing. In practice
-/// callers gate on INLINE_THRESHOLD (256 KiB) before calling this, so
-/// small NARs never reach here — but the function handles them correctly
-/// anyway (useful for tests).
+/// (< CHUNK_MAX) → one chunk spanning the whole thing. Every NAR is
+/// chunked — the thousands of sub-CHUNK_MIN `.drv`-sized NARs in a
+/// nixpkgs closure each become a single chunk equal to the input.
 ///
 /// # Cost
 ///

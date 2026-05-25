@@ -4,8 +4,8 @@
 //! 1. Look up narinfo + manifest from PostgreSQL
 //! 2. First response: PathInfo metadata
 // r[impl store.nar.reassembly]
-// r[impl store.integrity.verify-on-get]
-//! 3. Stream NAR bytes — branch on inline vs chunked
+// r[impl store.integrity.verify-on-get+2]
+//! 3. Stream NAR bytes chunk-by-chunk
 //! 4. Verify whole-NAR SHA-256 (belt-and-suspenders over per-chunk BLAKE3)
 //!
 //! The chunked path streams chunk-by-chunk without materializing the
@@ -32,7 +32,7 @@ use rio_proto::types::{
 
 use rio_common::grpc::StatusExt;
 
-use crate::metadata::{self, ManifestKind};
+use crate::metadata::{self, ChunkManifest};
 
 use super::{StoreServiceImpl, metadata_status, validate_store_path};
 
@@ -64,8 +64,7 @@ impl Drop for ActiveStreamGuard {
 ///
 /// Returns `false` if the client disconnected (send failed) — caller
 /// should stop streaming. This is the one place the "slice into wire-
-/// sized pieces + send" loop lives; both the inline and chunked paths
-/// call it.
+/// sized pieces + send" loop lives.
 ///
 /// `.to_vec()` is one copy into the proto bytes field (protobuf needs
 /// owned `Vec<u8>`, no way around it). The input `Bytes` stays valid
@@ -87,16 +86,16 @@ async fn stream_bytes(
 }
 
 /// Convert a client-supplied [`ManifestHint`] into the
-/// `(ValidatedPathInfo, ManifestKind)` pair `stream_path` consumes.
+/// `(ValidatedPathInfo, ChunkManifest)` pair `stream_path` consumes.
 ///
 /// Returns `Ok(None)` if `hint.info` is unset (caller falls through to
 /// PG). Returns `Err(InvalidArgument)` if the hint is structurally
-/// malformed (wrong path, bad hash length) — that's a client bug, not
-/// a fall-through case.
+/// malformed (wrong path, bad hash length, no chunks) — that's a
+/// client bug, not a fall-through case.
 fn hint_into_manifest(
     store_path: &str,
     hint: ManifestHint,
-) -> Result<Option<(rio_proto::validated::ValidatedPathInfo, ManifestKind)>, Status> {
+) -> Result<Option<(rio_proto::validated::ValidatedPathInfo, ChunkManifest)>, Status> {
     let Some(raw_info) = hint.info else {
         return Ok(None);
     };
@@ -111,7 +110,7 @@ fn hint_into_manifest(
     let info = rio_proto::validated::ValidatedPathInfo::try_from(raw_info)
         .status_invalid("manifest_hint.info malformed")?;
 
-    // r[impl store.get.manifest-hint+2]
+    // r[impl store.get.manifest-hint+3]
     // Bound the client-supplied hint at the trust boundary. The PG
     // path's `Manifest::deserialize` enforces MAX_CHUNKS; the hint
     // path bypasses that. nar_size on the hint path is also client-
@@ -134,25 +133,29 @@ fn hint_into_manifest(
         )));
     }
 
-    let manifest = if hint.chunks.is_empty() {
-        ManifestKind::Inline(Bytes::from(hint.inline_blob))
-    } else {
-        let entries: Vec<([u8; 32], u32)> = hint
-            .chunks
-            .into_iter()
-            .map(|c| {
-                let hash: [u8; 32] = c.hash.try_into().map_err(|v: Vec<u8>| {
-                    Status::invalid_argument(format!(
-                        "manifest_hint chunk hash must be 32 bytes, got {}",
-                        v.len()
-                    ))
-                })?;
-                Ok::<_, Status>((hash, c.size))
-            })
-            .collect::<Result<_, _>>()?;
-        ManifestKind::Chunked(entries)
-    };
-    Ok(Some((info, manifest)))
+    // Every NAR is chunked and the minimum valid NAR is ~100 bytes →
+    // every found path has ≥1 chunk. An empty chunk list is a
+    // malformed hint (or a stale pre-P0583 inline hint), not a
+    // fall-through case.
+    if hint.chunks.is_empty() {
+        return Err(Status::invalid_argument(
+            "manifest_hint has no chunks (every NAR is chunked; inline hints are no longer valid)",
+        ));
+    }
+    let entries: Vec<([u8; 32], u32)> = hint
+        .chunks
+        .into_iter()
+        .map(|c| {
+            let hash: [u8; 32] = c.hash.try_into().map_err(|v: Vec<u8>| {
+                Status::invalid_argument(format!(
+                    "manifest_hint chunk hash must be 32 bytes, got {}",
+                    v.len()
+                ))
+            })?;
+            Ok::<_, Status>((hash, c.size))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some((info, ChunkManifest(entries))))
 }
 
 impl StoreServiceImpl {
@@ -166,7 +169,7 @@ impl StoreServiceImpl {
 
         validate_store_path(&req.store_path)?;
 
-        // r[impl store.get.manifest-hint+2]
+        // r[impl store.get.manifest-hint+3]
         // I-110c: client-supplied (PathInfo, manifest) — skip both PG
         // lookups. The whole-NAR SHA-256 verify (step 4) checks the
         // reassembled bytes against `hint.info.nar_hash`, so a
@@ -253,9 +256,9 @@ impl StoreServiceImpl {
     async fn stream_path(
         &self,
         info: rio_proto::validated::ValidatedPathInfo,
-        manifest: ManifestKind,
+        manifest: ChunkManifest,
     ) -> Result<Response<GetPathStream>, Status> {
-        // r[impl store.get.size-sanity-check]
+        // r[impl store.get.size-sanity-check+2]
         // Pre-flight: manifest's summed size must match narinfo.nar_size.
         // Drift means PutPath wrote inconsistent state (bug, or manual DB
         // surgery). Fail fast with DATA_LOSS — better than streaming a
@@ -268,17 +271,6 @@ impl StoreServiceImpl {
                 "manifest/narinfo size mismatch for {}: manifest sums to {} bytes, narinfo says {} bytes",
                 info.store_path, manifest_size, info.nar_size
             )));
-        }
-
-        // Pre-flight: chunked manifest but no cache configured = we can't
-        // serve this path. Inline-only stores (tests, or a misconfigured
-        // deployment) hitting this means a PREVIOUS store instance wrote
-        // chunked data and this one can't read it. Fail clearly rather
-        // than the spawned task erroring with no context.
-        if matches!(manifest, ManifestKind::Chunked(_)) && self.chunk_cache.is_none() {
-            return Err(Status::failed_precondition(
-                "path is stored chunked but this store instance has no chunk backend configured",
-            ));
         }
 
         let expected_hash = info.nar_hash;
@@ -315,76 +307,58 @@ impl StoreServiceImpl {
                     return;
                 }
 
-                // Step 3+4: stream + verify. Both branches feed the hasher
-                // incrementally and check at the end. The chunked path
-                // streams chunk-by-chunk; the inline path is one blob.
+                // Step 3+4: stream + verify. Feed the hasher
+                // incrementally and check at the end.
                 let mut hasher = Sha256::new();
                 let mut total_bytes = 0u64;
 
-                match manifest {
-                    ManifestKind::Inline(bytes) => {
-                        hasher.update(&bytes);
-                        total_bytes = bytes.len() as u64;
-                        if !stream_bytes(&tx, &bytes).await {
-                            return; // client disconnected
+                // r[impl store.get.chunk-prefetch]
+                // K-parallel prefetch. `buffered()` preserves
+                // order — chunk i arrives before chunk i+1 even if
+                // i+1's fetch finishes first. `buffer_unordered`
+                // would scramble the NAR.
+                //
+                // Each future is a cache.get_verified() call.
+                // BLAKE3 verify happens inside that; any corrupt
+                // chunk surfaces as ChunkError here.
+                use futures_util::stream::{self, StreamExt};
+
+                let mut chunk_stream = stream::iter(manifest.0)
+                    .map(|(hash, _size)| {
+                        let cache = Arc::clone(&cache);
+                        async move { cache.get_verified(&hash).await }
+                    })
+                    .buffered(prefetch_k);
+
+                while let Some(result) = chunk_stream.next().await {
+                    let chunk_bytes = match result {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!(error = %e, "GetPath: chunk fetch/verify failed");
+                            // DATA_LOSS: the manifest says this
+                            // chunk exists, but we can't get
+                            // good bytes for it. S3 lost it,
+                            // or it's corrupt.
+                            let _ = tx
+                                .send(Err(Status::data_loss(format!(
+                                    "chunk reassembly failed: {e}"
+                                ))))
+                                .await;
+                            return;
                         }
-                    }
-                    ManifestKind::Chunked(entries) => {
-                        // Pre-flight checked cache is Some.
-                        let cache = cache.expect("pre-flight checked chunk_cache is Some");
-
-                        // r[impl store.get.chunk-prefetch]
-                        // K-parallel prefetch. `buffered()` preserves
-                        // order — chunk i arrives before chunk i+1 even if
-                        // i+1's fetch finishes first. `buffer_unordered`
-                        // would scramble the NAR.
-                        //
-                        // Each future is a cache.get_verified() call.
-                        // BLAKE3 verify happens inside that; any corrupt
-                        // chunk surfaces as ChunkError here.
-                        use futures_util::stream::{self, StreamExt};
-
-                        let mut chunk_stream = stream::iter(entries)
-                            .map(|(hash, _size)| {
-                                let cache = Arc::clone(&cache);
-                                async move { cache.get_verified(&hash).await }
-                            })
-                            .buffered(prefetch_k);
-
-                        while let Some(result) = chunk_stream.next().await {
-                            let chunk_bytes = match result {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    error!(error = %e, "GetPath: chunk fetch/verify failed");
-                                    // DATA_LOSS: the manifest says this
-                                    // chunk exists, but we can't get
-                                    // good bytes for it. S3 lost it,
-                                    // or it's corrupt.
-                                    let _ = tx
-                                        .send(Err(Status::data_loss(format!(
-                                            "chunk reassembly failed: {e}"
-                                        ))))
-                                        .await;
-                                    return;
-                                }
-                            };
-                            hasher.update(&chunk_bytes);
-                            total_bytes += chunk_bytes.len() as u64;
-                            if !stream_bytes(&tx, &chunk_bytes).await {
-                                return; // client disconnected
-                            }
-                        }
+                    };
+                    hasher.update(&chunk_bytes);
+                    total_bytes += chunk_bytes.len() as u64;
+                    if !stream_bytes(&tx, &chunk_bytes).await {
+                        return; // client disconnected
                     }
                 }
 
-                // Step 4: whole-NAR SHA-256 verify. The chunked path
-                // already BLAKE3-verified each chunk, so this is belt-
-                // and-suspenders: catches (a) the manifest being WRONG
+                // Step 4: whole-NAR SHA-256 verify. Each chunk is
+                // already BLAKE3-verified, so this is belt-and-
+                // suspenders: catches (a) the manifest being WRONG
                 // (right chunks, wrong order / missing one), (b) a bug
                 // in our reassembly, (c) narinfo.nar_hash being stale.
-                //
-                // For inline, this is the PRIMARY check (no per-piece
-                // verify for inline blobs).
                 let actual: [u8; 32] = hasher.finalize().into();
                 if actual != expected_hash || total_bytes != expected_size {
                     error!(
@@ -456,11 +430,10 @@ mod tests {
                 };
                 n_chunks
             ],
-            inline_blob: vec![],
         }
     }
 
-    // r[verify store.get.manifest-hint+2]
+    // r[verify store.get.manifest-hint+3]
     /// Client-supplied hints are bounded by MAX_CHUNKS — same bound the
     /// PG path's `Manifest::deserialize` enforces. Pre-fix: hint path
     /// bypassed it (200_001-entry Vec allocated unconditionally).
@@ -481,7 +454,25 @@ mod tests {
         assert!(hint_into_manifest(&path, ok).is_ok());
     }
 
-    // r[verify store.get.manifest-hint+2]
+    // r[verify store.get.manifest-hint+3]
+    /// A hint with no chunks is malformed: every NAR is chunked (P0583
+    /// dropped inline storage), so a found path always has ≥1 chunk. A
+    /// stale pre-P0583 inline hint must be rejected, not served as an
+    /// empty NAR.
+    #[test]
+    fn hint_into_manifest_rejects_empty_chunks() {
+        let path = test_store_path("hint-nochunks");
+        let hint = hint_with_chunks(&path, 0, 100);
+        let err = hint_into_manifest(&path, hint).expect_err("no chunks → InvalidArgument");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("no chunks"),
+            "msg: {}",
+            err.message()
+        );
+    }
+
+    // r[verify store.get.manifest-hint+3]
     /// nar_size on the hint path is client-controlled — bound it.
     #[test]
     fn hint_into_manifest_rejects_oversize_nar() {
