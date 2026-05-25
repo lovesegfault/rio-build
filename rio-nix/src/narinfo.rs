@@ -176,6 +176,54 @@ impl NarInfo {
         })
     }
 
+    /// Render this narinfo as the stock-Nix text format.
+    ///
+    /// The inverse of [`NarInfo::parse`]: `parse(render(x)) == x` for
+    /// any well-formed value. Field order follows reference Nix's
+    /// `NarInfo::to_string()` (`nar-info.cc`): StorePath, URL,
+    /// Compression, FileHash, FileSize, NarHash, NarSize, References,
+    /// Deriver, Sig (one line each), CA. Stock Nix's parser accepts
+    /// any order, but emitting the canonical order keeps the objects
+    /// byte-comparable with what `nix copy --to s3://…` itself writes.
+    ///
+    /// `References:` is always emitted (with an empty value when there
+    /// are none) — exactly what reference Nix does. `FileHash`/
+    /// `FileSize`/`Deriver`/`CA` are emitted only when present; `Sig`
+    /// once per signature.
+    ///
+    /// Used by rio-store's binary-cache compat writer to publish
+    /// `{hash}.narinfo` objects that plain `nix` clients consume
+    /// directly from the bucket.
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(256);
+        // Writing to a String is infallible; `let _ =` keeps clippy
+        // quiet without an unwrap chain.
+        let _ = writeln!(out, "StorePath: {}", self.store_path);
+        let _ = writeln!(out, "URL: {}", self.url);
+        let _ = writeln!(out, "Compression: {}", self.compression);
+        if let Some(fh) = &self.file_hash {
+            let _ = writeln!(out, "FileHash: {fh}");
+        }
+        if let Some(fs) = self.file_size {
+            let _ = writeln!(out, "FileSize: {fs}");
+        }
+        let _ = writeln!(out, "NarHash: {}", self.nar_hash);
+        let _ = writeln!(out, "NarSize: {}", self.nar_size);
+        let _ = writeln!(out, "References: {}", self.references.join(" "));
+        if let Some(d) = &self.deriver {
+            let _ = writeln!(out, "Deriver: {d}");
+        }
+        for sig in &self.sigs {
+            let _ = writeln!(out, "Sig: {sig}");
+        }
+        if let Some(ca) = &self.ca {
+            let _ = writeln!(out, "CA: {ca}");
+        }
+        out
+    }
+
     /// Verify that at least one `Sig:` entry is signed by a trusted key.
     ///
     /// `trusted_keys` is a slice of `name:base64(pubkey)` strings —
@@ -552,6 +600,117 @@ References:
             NarInfo::parse(text),
             Err(NarInfoError::InvalidNarSize { .. })
         ));
+    }
+
+    // ========================================================================
+    // render()
+    // ========================================================================
+
+    /// Golden render: every field populated, byte-exact against the
+    /// stock-Nix text layout (`NarInfo::to_string()` field order from
+    /// nar-info.cc). This string IS the contract with plain `nix`
+    /// clients reading the compat bucket — a reordered or reformatted
+    /// line is technically still parseable, but the golden keeps us
+    /// byte-comparable with what `nix copy --to s3://…` writes.
+    #[test]
+    fn render_full_golden() {
+        let ni = NarInfo {
+            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2".into(),
+            url: format!("nar/{}.nar.zst", "2".repeat(52)),
+            compression: "zstd".into(),
+            nar_hash: format!("sha256:{}", "1".repeat(52)),
+            nar_size: 226_560,
+            references: vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2".into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.42".into(),
+            ],
+            deriver: Some("cccccccccccccccccccccccccccccccc-hello-2.12.2.drv".into()),
+            sigs: vec!["cache.example.org-1:c2lnbmF0dXJl".into()],
+            ca: Some("fixed:r:sha256:1abc".into()),
+            file_hash: Some(format!("sha256:{}", "2".repeat(52))),
+            file_size: Some(73_120),
+        };
+        let expected = format!(
+            "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2\n\
+             URL: nar/{file_b32}.nar.zst\n\
+             Compression: zstd\n\
+             FileHash: sha256:{file_b32}\n\
+             FileSize: 73120\n\
+             NarHash: sha256:{nar_b32}\n\
+             NarSize: 226560\n\
+             References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2 \
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.42\n\
+             Deriver: cccccccccccccccccccccccccccccccc-hello-2.12.2.drv\n\
+             Sig: cache.example.org-1:c2lnbmF0dXJl\n\
+             CA: fixed:r:sha256:1abc\n",
+            file_b32 = "2".repeat(52),
+            nar_b32 = "1".repeat(52),
+        );
+        assert_eq!(ni.render(), expected);
+    }
+
+    /// Minimal render: optional fields absent → lines absent;
+    /// `References:` still emitted (empty value), matching stock Nix.
+    #[test]
+    fn render_minimal_omits_optional_lines() {
+        let ni = NarInfo {
+            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".into(),
+            url: "nar/abc.nar".into(),
+            compression: "none".into(),
+            nar_hash: "sha256:0000".into(),
+            nar_size: 120,
+            references: vec![],
+            deriver: None,
+            sigs: vec![],
+            ca: None,
+            file_hash: None,
+            file_size: None,
+        };
+        let text = ni.render();
+        assert_eq!(
+            text,
+            "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\n\
+             URL: nar/abc.nar\n\
+             Compression: none\n\
+             NarHash: sha256:0000\n\
+             NarSize: 120\n\
+             References: \n"
+        );
+        assert!(!text.contains("Deriver:"));
+        assert!(!text.contains("Sig:"));
+        assert!(!text.contains("FileHash:"));
+    }
+
+    /// parse(render(x)) == x for a fully-populated value (and the
+    /// multi-Sig case round-trips in order).
+    #[test]
+    fn render_parse_roundtrip() -> anyhow::Result<()> {
+        let ni = NarInfo {
+            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-rt".into(),
+            url: "nar/deadbeef.nar.xz".into(),
+            compression: "xz".into(),
+            nar_hash: format!("sha256:{}", "3".repeat(52)),
+            nar_size: 4096,
+            references: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep".into()],
+            deriver: Some("dddddddddddddddddddddddddddddddd-rt.drv".into()),
+            sigs: vec!["k1:s1".into(), "k2:s2".into()],
+            ca: None,
+            file_hash: Some("sha256:abcd".into()),
+            file_size: Some(999),
+        };
+        assert_eq!(NarInfo::parse(&ni.render())?, ni);
+
+        // Empty-references round-trip: "References: " parses back to [].
+        let bare = NarInfo {
+            references: vec![],
+            sigs: vec![],
+            deriver: None,
+            file_hash: None,
+            file_size: None,
+            ..ni
+        };
+        assert_eq!(NarInfo::parse(&bare.render())?, bare);
+        Ok(())
     }
 
     /// All set-once fields reject a second occurrence with
