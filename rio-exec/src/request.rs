@@ -194,10 +194,14 @@ impl ExecutionRequest {
 
         // Rule 1+2: absoluteness and lexical cleanliness.
         //
-        // `program` only needs to be absolute (it is resolved by
-        // execve inside the chroot, never prefix-matched). `cwd`,
-        // mount targets, inline-file paths, and declared outputs are
-        // all prefix-matched against mount targets below, so they must
+        // `program`, mount sources, and extra devices only need to be
+        // absolute: program is resolved by execve inside the chroot
+        // and never prefix-matched; sources and devices are host paths
+        // the caller already resolved (a `..` in a host path is legal)
+        // but a *relative* one would silently resolve against the
+        // executor's cwd at mount(2) time. `cwd`, mount targets,
+        // inline-file paths, and declared outputs are all
+        // prefix-matched against mount targets below, so they must
         // also be lexically clean — `/a/../b`.starts_with(`/a`) is
         // true component-wise while the path actually escapes `/a`.
         if !self.program.is_absolute() {
@@ -219,6 +223,20 @@ impl ExecutionRequest {
                     "mount target must be an absolute, lexically clean path (no `..`, `.`, or \
                      empty components): {}",
                     m.target.display()
+                ));
+            }
+            if !m.source.is_absolute() {
+                return invalid(format!(
+                    "mount source must be absolute: {}",
+                    m.source.display()
+                ));
+            }
+        }
+        for d in &self.extra_devices {
+            if !d.is_absolute() {
+                return invalid(format!(
+                    "extra device path must be absolute: {}",
+                    d.display()
                 ));
             }
         }
@@ -280,8 +298,16 @@ impl ExecutionRequest {
             if has_nul(k) || has_nul(v) {
                 return invalid(format!(
                     "env entry must not contain NUL bytes: {}",
-                    Path::new(k).display()
+                    k.display()
                 ));
+            }
+            // execve takes the environment as `KEY=VALUE` C strings:
+            // an empty key or a `=` inside the key cannot round-trip.
+            if k.is_empty() {
+                return invalid("env key must not be empty".to_string());
+            }
+            if k.as_bytes().contains(&b'=') {
+                return invalid(format!("env key must not contain `=`: {}", k.display()));
             }
         }
 
@@ -471,6 +497,20 @@ mod tests {
         assert_rejected(&req, "work/build");
     }
 
+    #[test]
+    fn rejects_relative_mount_source() {
+        let mut req = minimal_valid_request();
+        req.mounts[0].source = PathBuf::from("host/scratch/build");
+        assert_rejected(&req, "host/scratch/build");
+    }
+
+    #[test]
+    fn rejects_relative_extra_device() {
+        let mut req = minimal_valid_request();
+        req.extra_devices.push(PathBuf::from("dev/kvm"));
+        assert_rejected(&req, "dev/kvm");
+    }
+
     // Rule 2: lexical cleanliness.
 
     #[test]
@@ -492,6 +532,20 @@ mod tests {
         let mut req = minimal_valid_request();
         req.declared_outputs[0] = PathBuf::from("/work/outputs//result");
         assert_rejected(&req, "/work/outputs//result");
+    }
+
+    #[test]
+    fn rejects_trailing_slash_in_mount_target() {
+        let mut req = minimal_valid_request();
+        req.mounts[0].target = PathBuf::from("/work/build/");
+        assert_rejected(&req, "/work/build/");
+    }
+
+    #[test]
+    fn rejects_trailing_curdir_in_mount_target() {
+        let mut req = minimal_valid_request();
+        req.mounts[0].target = PathBuf::from("/work/build/.");
+        assert_rejected(&req, "/work/build/.");
     }
 
     #[test]
@@ -551,6 +605,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nul_in_program() {
+        let mut req = minimal_valid_request();
+        req.program = PathBuf::from("/bin/s\0h");
+        assert_rejected(&req, "NUL");
+    }
+
+    #[test]
     fn rejects_nul_in_arg() {
         let mut req = minimal_valid_request();
         req.args.push(OsString::from("a\0b"));
@@ -563,6 +624,21 @@ mod tests {
         req.env
             .push((OsString::from("EVIL"), OsString::from("a\0b")));
         assert_rejected(&req, "EVIL");
+    }
+
+    #[test]
+    fn rejects_empty_env_key() {
+        let mut req = minimal_valid_request();
+        req.env.push((OsString::new(), OsString::from("value")));
+        assert_rejected(&req, "env key must not be empty");
+    }
+
+    #[test]
+    fn rejects_equals_in_env_key() {
+        let mut req = minimal_valid_request();
+        req.env
+            .push((OsString::from("KEY=BAD"), OsString::from("value")));
+        assert_rejected(&req, "KEY=BAD");
     }
 
     // Rule 7: cwd must be under some mount.
