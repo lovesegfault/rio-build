@@ -1588,3 +1588,274 @@ module logService {
     sweepExecRowAny,
   }
 }
+
+// =========================================================================
+// THE BASE REGIME: one execution, one session, no reconnects, no sweep.
+// The adversaries are the builder's own batch stream (fabricated forward
+// gaps, re-sends below the high water, lines at or past the recorded
+// final count) and the unbiased interleaving of production, transmission,
+// cutting, acking, the terminal stamp, and the mid-stream ceiling
+// refresh. A regression in the core ingest/cut/read/complete lifecycle —
+// the accept predicate, the per-append completeness ceiling, the
+// contiguous-prefix cut, the read fold, the completeness fold — surfaces
+// in this small fast check instead of buried in the multi-session
+// regimes.
+//
+// Constants are chosen for COVERAGE — the smallest state space that
+// still reaches every interleaving class the invariants are about:
+//   - 1 execution: the supersession scenarios need a second execution
+//     and live in the redispatch regime.
+//   - 1 session: the overlap/dedup scenarios need a second session and
+//     live in the resend regime.
+//   - 3 line numbers: a forward gap ({0,2}), a batch straddling the
+//     completeness ceiling, and a partial ack are the smallest shapes
+//     that exercise the cut's gap split, the ceiling truncation, and
+//     the conservation law's buffer accounting.
+//
+// NON-VACUITY at these constants (machine-checked by the
+// quint-log-service-witness-* checks in nix/quint.nix): a log reads
+// complete, a past-final batch is rejected, a non-monotone batch is
+// rejected, a session learns its ceiling mid-stream, a manifest carries
+// a forward gap, and an uploader abandons un-acked lines.
+// =========================================================================
+module logServiceBase {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = true,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false
+  ).*
+
+  // --- deterministic protocol runs --------------------------------------
+  // Executable sanity checks of the happy path and the known-critical
+  // scenarios; `quint test --main=logServiceBase --match=<run>` replays
+  // them. They do not change the verified state space (runs are not
+  // part of `step`).
+
+  /// The happy path: dispatch, produce two lines, stream them, cut,
+  /// ack, finish, stamp, and the log reads complete with every produced
+  /// line served.
+  run happyPathRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(cutChunk(1, 1))
+      .then(deliverAck(1))
+      .then(buildFinishes(1))
+      .then(recordFinalLineCount(1))
+      .expect(all {
+        ackedBelow.get(1) == 2,
+        chunks.get(1) == Set({ sess: 1, first: 0, count: 2 }),
+        dbFinalCount.get(1) == Count(2),
+        logIsComplete(1),
+        readTail(1).served == Set(0, 1),
+        builderBuf(1) == Set(),
+      })
+
+  /// The per-append completeness ceiling: the execution goes terminal
+  /// at 1 line while the session is open; the refresh observes it; a
+  /// fabricated batch at the recorded end is rejected whole and a
+  /// straddling batch is truncated, so the manifest never grows past
+  /// the recorded count.
+  run pastFinalRejectionRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(buildFinishes(1))
+      .then(recordFinalLineCount(1))
+      .then(refreshCeiling(1, 1))
+      .expect(sessCeiling(1, 1) == Ceiling({ value: 1, hwAtLearn: 1 }))
+      .then(appendFabricated(1, 1, 3))
+      .expect(all {
+        wit.pastFinalRejected,
+        sessBuf(1, 1) == Set(0),
+        sessAccepted(1, 1).forall(n => n < 1),
+      })
+
+  /// The mid-stream seal residual: lines accepted before the session
+  /// learns the ceiling are kept (over-coverage the completeness fold
+  /// tolerates), lines at or past it offered afterwards are dropped.
+  run midStreamCeilingResidualRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendFabricated(1, 0, 3))
+      .expect(sessBuf(1, 1) == Set(0, 1, 2))
+      .then(buildFinishes(1))
+      .then(recordFinalLineCount(1))
+      .then(refreshCeiling(1, 1))
+      // The residual (lines 1 and 2, accepted before the learn) stays;
+      // completenessGate excludes it via hwAtLearn = 3.
+      .expect(all {
+        sessCeiling(1, 1) == Ceiling({ value: 1, hwAtLearn: 3 }),
+        completenessGate,
+      })
+}
+
+// =========================================================================
+// THE REDISPATCH REGIME: two executions of one derivation, one session
+// each. Execution 1 is superseded by execution 2 mid-stream: its
+// already-open session keeps writing to its OWN (old) execution's log,
+// its builder's next reconnect is rejected by the auth gate and discards
+// its un-stored tail, and the two executions' manifests grow
+// concurrently under disjoint key namespaces. This is the regime where
+// `authGateExcludesForeignWriters` and `noCrossExecContamination` are
+// load-bearing; the witness checks pin the superseded-open rejection and
+// the concurrent-writers state as reachable.
+//
+// Fabrication is DISABLED: the adversarial batch stream is the base
+// regime's subject, and none of the supersession scenarios depend on it
+// — a fabricated line lands in the fabricating execution's own keyspace
+// regardless of whether that execution is the latest assignment, which
+// the base regime already proves. Enabling it here multiplies two
+// already-independent per-execution state machines by the fabrication
+// branching factor squared and pushes the check past the per-check
+// budget without adding an interleaving class any invariant observes.
+// =========================================================================
+module logServiceRedispatch {
+  import logService(
+    MAX_EXECS = 2,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = false
+  ).*
+
+  /// The superseded writer: execution 1's session is open and holding
+  /// lines when execution 2 is dispatched. Execution 1's session keeps
+  /// cutting (to execution 1's manifest only); execution 1's builder is
+  /// rejected at its next open and abandons; execution 2's log is
+  /// untouched by any of it.
+  run supersededWriterRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(dispatch)
+      .expect(not(openAdmitted(1)) and openAdmitted(2))
+      .then(cutChunk(1, 1))
+      .expect(all {
+        chunks.get(1) == Set({ sess: 1, first: 0, count: 1 }),
+        chunks.get(2) == Set(),
+        noCrossExecContamination,
+      })
+      .then(builderDisconnects(1))
+      .then(openRejectedSuperseded(1))
+      .expect(all {
+        wit.supersededOpenRejected,
+        uploader.get(1) == Abandoned,
+      })
+}
+
+// =========================================================================
+// THE RESEND REGIME: one execution, two sessions, reconnects enabled.
+// The at-least-once shape: a chunk is committed but its ack never
+// reaches the builder (the stream dies first), the builder reopens a
+// fresh session and retransmits its whole un-acked buffer, and the
+// detached predecessor's final drain commits chunks that overlap the
+// successor's. This is the regime where `servedSpanExact`'s dedup and
+// `ackImpliesDurable` are load-bearing; the witness checks pin the
+// overlapping-chunks state and the suppressed duplicate as reachable.
+// Fabrication is disabled — the adversary here is the retransmission
+// protocol itself, and the fabricated-batch branching multiplies a
+// state space that the two-session product already dominates.
+// =========================================================================
+module logServiceResend {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false
+  ).*
+
+  /// The ambiguous-disconnect overlap: session 1 commits a chunk for
+  /// lines [0, 2) but the builder disconnects before the ack arrives;
+  /// the builder replays the same lines to session 2, which commits an
+  /// overlapping chunk; the read path serves each line exactly once.
+  run ambiguousAckOverlapRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(cutChunk(1, 1))
+      .expect(chunks.get(1) == Set({ sess: 1, first: 0, count: 2 }))
+      // The ack is never delivered: the builder disconnects first.
+      .then(builderDisconnects(1))
+      .then(openSession(1))
+      .expect(sentBelow.get(1) == 0)
+      .then(appendHonest(1))
+      .then(cutChunk(1, 2))
+      .expect(all {
+        chunks.get(1) == Set(
+          { sess: 1, first: 0, count: 2 },
+          { sess: 2, first: 0, count: 2 }
+        ),
+        // Two overlapping chunks, two yield opportunities per line,
+        // each line served exactly once.
+        readTail(1).served == Set(0, 1),
+        readTail(1).count == 2,
+        servedSpanExact,
+      })
+}
+
+// =========================================================================
+// THE SWEEP REGIME: the resend regime plus expiry and the TTL sweep.
+// The sweep's expired-only guard, the chunks-before-execution-row
+// deletion order (with a live session's cut interleavable between the
+// two DELETEs), and the disclosed-loss accounting for swept lines are
+// the load-bearing pieces; the witness check pins the non-empty-manifest
+// deletion as reachable. Sessions are capped at one — the sweep's
+// interaction is with the manifest and the lifecycle row, not with the
+// session overlap, and the two-session product is already covered by the
+// resend regime.
+// =========================================================================
+module logServiceSweep {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_SESSIONS = 1,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = false,
+    ENABLE_SWEEP = true
+  ).*
+
+  /// The TTL sweep deletes a complete log: the manifest and the
+  /// lifecycle row go, the log stops reading complete (the disclosure),
+  /// and the conservation law's disclosed-loss disjunct absorbs the
+  /// deleted lines.
+  run sweepCompleteLogRun =
+    init
+      .then(dispatch)
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(cutChunk(1, 1))
+      .then(deliverAck(1))
+      .then(buildFinishes(1))
+      .then(recordFinalLineCount(1))
+      .expect(logIsComplete(1))
+      .then(executionExpires(1))
+      .then(sweepChunks(1))
+      .expect(all {
+        chunks.get(1) == Set(),
+        not(logIsComplete(1)),
+        wit.sweptChunks,
+        noSilentLineLoss,
+      })
+      .then(sweepExecRow(1))
+      .expect(not(execRowExists.get(1)))
+}

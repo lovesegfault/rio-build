@@ -540,6 +540,245 @@ in
       witness = "noReclaimAfterRestore";
     };
 
+    # ------------------------------------------------------------------
+    # rio-store's LogService: the build-log session/chunk/dedup protocol
+    # (model C of the log-formal campaign — the successor to the retired
+    # in-scheduler logBufferLifecycle model). The model covers the
+    # builder's at-least-once ack-trimmed uploader, the open-time
+    # binding + completeness gate, the per-stream ingest session and its
+    # accept predicate, the immutable chunk manifest, the read path's
+    # ordered-walk dedup over overlapping sessions, the completeness
+    # fold, and the TTL sweep. The acceptance test for the model is the
+    # 22-bug calibration table in docs/spec/models/log-invariant-map.md
+    # re-run against this architecture. State counts, depths, and
+    # wall-clocks are in the introducing commit's message and each
+    # check's transcript.
+    #
+    # Marker scope: append-auth, completeness-gate, session-keyed, and
+    # exec-keyed are marked on the regime that makes each load-bearing.
+    # store.log.chunk-immutable is NOT marked (the model has no
+    # overwrite action, so immutability is by construction rather than
+    # checked; the seq-burning and object-before-manifest halves are
+    # unit-tested code branches). store.log.ingest-bounds and
+    # store.log.tail-reconnect are NOT marked (resource bounds and the
+    # since_line reconnect cursor are outside the model's scope — see
+    # the model header's priced omissions).
+    # ------------------------------------------------------------------
+
+    # The single-writer core: one execution, one session, the
+    # adversarial batch stream (fabricated gaps, re-sends, lines past
+    # the recorded final count) against the accept predicate, the
+    # per-append completeness ceiling, the contiguous-prefix cut, the
+    # read fold, and the completeness fold. ackImpliesDurable is NOT
+    # asserted here: the fabricating client can poison its own ack
+    # watermark (see the val's doc in the model) and the per-ack
+    # durability claim is only made for the honest uploader.
+    # r[verify store.log.completeness-gate]
+    quint-log-service-base = mkQuintCheck {
+      name = "log-service-base";
+      spec = "logService";
+      main = "logServiceBase";
+      invariants = [
+        "boundsOK"
+        "noCrossExecContamination"
+        "authGateExcludesForeignWriters"
+        "noSilentLineLoss"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+      ];
+    };
+
+    # Two executions of one derivation: the supersession scenarios. The
+    # auth gate rejects the superseded execution's reopen; the
+    # superseded execution's still-open session keeps writing to its own
+    # (old) execution's log only; the two manifests grow concurrently
+    # under disjoint exec-keyed namespaces.
+    # r[verify store.log.append-auth]
+    # r[verify obs.log.exec-keyed+2]
+    quint-log-service-redispatch = mkQuintCheck {
+      name = "log-service-redispatch";
+      spec = "logService";
+      main = "logServiceRedispatch";
+      invariants = [
+        "boundsOK"
+        "noCrossExecContamination"
+        "authGateExcludesForeignWriters"
+        "noSilentLineLoss"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+      ];
+    };
+
+    # Two sessions for one execution: the at-least-once re-send shape.
+    # A chunk commits but its ack is lost, the builder replays the same
+    # lines to a fresh session, the detached predecessor's drain commits
+    # overlapping chunks, and the read path's (first_line, session_id)
+    # ordered walk serves each line exactly once. The honest uploader's
+    # ack-implies-durable refinement is asserted here (no fabrication).
+    # r[verify store.log.session-keyed]
+    quint-log-service-resend = mkQuintCheck {
+      name = "log-service-resend";
+      spec = "logService";
+      main = "logServiceResend";
+      invariants = [
+        "boundsOK"
+        "noCrossExecContamination"
+        "authGateExcludesForeignWriters"
+        "noSilentLineLoss"
+        "ackImpliesDurable"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+      ];
+    };
+
+    # The TTL sweep against a live ingest pipeline: the expired-only
+    # guard, the chunks-before-execution-row deletion order with a cut
+    # interleavable between the two DELETEs, and the disclosed-loss
+    # accounting for swept lines.
+    quint-log-service-sweep = mkQuintCheck {
+      name = "log-service-sweep";
+      spec = "logService";
+      main = "logServiceSweep";
+      invariants = [
+        "boundsOK"
+        "noCrossExecContamination"
+        "authGateExcludesForeignWriters"
+        "noSilentLineLoss"
+        "ackImpliesDurable"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+      ];
+    };
+
+    # Non-vacuity witnesses for the LogService regimes. Each check
+    # passes only when the checker violates its witness — machine-checked
+    # evidence that the scenario a regime's headline invariant constrains
+    # is actually reachable in that regime's explored space. Deliberately
+    # no tracey markers here: the spec rules are verified by the regime
+    # checks above; these guard those checks against going vacuous.
+
+    # A log reads complete in the base regime: the conservation law and
+    # the open-time seal only bite against a complete log.
+    quint-log-service-witness-completed-log = mkQuintWitnessCheck {
+      name = "log-service-witness-completed-log";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noCompletedLog";
+    };
+
+    # The per-append completeness ceiling actually drops or truncates a
+    # batch — the post-terminal injection the gate exists for is
+    # attempted, not merely encodable.
+    quint-log-service-witness-past-final = mkQuintWitnessCheck {
+      name = "log-service-witness-past-final";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noPastFinalRejection";
+    };
+
+    # The monotone floor actually rejects a batch numbered below the
+    # session's high-water mark.
+    quint-log-service-witness-non-monotone = mkQuintWitnessCheck {
+      name = "log-service-witness-non-monotone";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noNonMonotoneRejection";
+    };
+
+    # A session learns its completeness ceiling AFTER accepting lines
+    # (the seal lands mid-stream): the case that distinguishes the
+    # per-append gate from the open-time gate and produces the disclosed
+    # pre-refresh residual completenessGate carves out.
+    quint-log-service-witness-mid-stream-ceiling = mkQuintWitnessCheck {
+      name = "log-service-witness-mid-stream-ceiling";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noMidStreamCeiling";
+    };
+
+    # An uploader abandons its drain with un-acked lines: the
+    # disclosed-loss channel the conservation law's fourth disjunct
+    # routes through actually fires.
+    quint-log-service-witness-abandoned = mkQuintWitnessCheck {
+      name = "log-service-witness-abandoned";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noAbandonedWithUnacked";
+    };
+
+    # A manifest carries a forward gap: the completeness fold's gap arm
+    # and the cut's split-at-gaps behavior are exercised.
+    quint-log-service-witness-gapped-manifest = mkQuintWitnessCheck {
+      name = "log-service-witness-gapped-manifest";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noGappedManifest";
+    };
+
+    # The open-time seal rejects a stream open for an already-complete
+    # log.
+    quint-log-service-witness-complete-open-rejected = mkQuintWitnessCheck {
+      name = "log-service-witness-complete-open-rejected";
+      spec = "logService";
+      main = "logServiceBase";
+      witness = "noCompleteOpenRejection";
+    };
+
+    # Two chunks of one execution from different sessions overlap in
+    # line range: the re-sent-batch-after-ambiguous-disconnect shape the
+    # read path's dedup exists for. servedSpanExact's verdict in the
+    # resend regime is about a state space that actually contains the
+    # overlap.
+    quint-log-service-witness-overlap = mkQuintWitnessCheck {
+      name = "log-service-witness-overlap";
+      spec = "logService";
+      main = "logServiceResend";
+      witness = "noOverlappingChunks";
+    };
+
+    # The read path's watermark actually suppresses a duplicate (the
+    # total yield count falls short of the sum of the chunks' claimed
+    # counts): the dedup is exercised, not merely encoded.
+    quint-log-service-witness-dedup = mkQuintWitnessCheck {
+      name = "log-service-witness-dedup";
+      spec = "logService";
+      main = "logServiceResend";
+      witness = "noDuplicateSuppressed";
+    };
+
+    # The auth gate rejects a superseded execution's reopen — the
+    # foreign-token rejection authGateExcludesForeignWriters is about.
+    quint-log-service-witness-superseded-rejected = mkQuintWitnessCheck {
+      name = "log-service-witness-superseded-rejected";
+      spec = "logService";
+      main = "logServiceRedispatch";
+      witness = "noSupersededOpenRejection";
+    };
+
+    # Two executions' logs grow concurrently (the superseded execution's
+    # session still holds lines while both manifests are non-empty): the
+    # contended state noCrossExecContamination constrains.
+    quint-log-service-witness-concurrent-execs = mkQuintWitnessCheck {
+      name = "log-service-witness-concurrent-execs";
+      spec = "logService";
+      main = "logServiceRedispatch";
+      witness = "noConcurrentExecWriters";
+    };
+
+    # The TTL sweep deletes a non-empty manifest: the sweep's deletion
+    # arm is reachable and the disclosed-loss accounting for swept lines
+    # is exercised against a real deletion.
+    quint-log-service-witness-swept = mkQuintWitnessCheck {
+      name = "log-service-witness-swept";
+      spec = "logService";
+      main = "logServiceSweep";
+      witness = "noSweptChunks";
+    };
+
     # Implementation conformance (model-based testing). The regime checks
     # above prove the PROTOCOL; this one proves rio-lease implements
     # that protocol: rio-lease/src/mbt_tests.rs replays traces generated
