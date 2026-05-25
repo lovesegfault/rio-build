@@ -2642,9 +2642,13 @@ impl SubstituteAuth {
 /// codes; the last one is what the walk gave up on). A small fixed set
 /// — never the raw store message or the path.
 ///
-/// - `not_found`: the final attempt was a plain path-not-found — every
-///   configured upstream definitively missed (the HEAD probe and the
-///   GET really did disagree).
+/// - `not_found`: the final attempt was a plain path-not-found — no
+///   configured upstream produced the path, or the store skipped
+///   substitution entirely (no upstreams configured for the tenant /
+///   the replica's HTTP client failed at boot). The skip cases are
+///   counted store-side in `rio_store_substitute_skipped_total`; the
+///   bare message gives the scheduler no way to tell them apart from a
+///   genuine all-upstreams miss.
 /// - `not_found_infra`: the final attempt's NotFound message indicates
 ///   the request never reached an upstream (auth chain / substituter
 ///   config) — fix the infrastructure, the path is probably fine. The
@@ -3033,9 +3037,11 @@ pub(super) async fn walk_substitute_closure(
             // tenant context on request" / "substituter not
             // configured" mean that request never reached
             // cache.nixos.org (fix the auth chain / config); a bare
-            // "path not found" means every configured upstream
-            // definitively missed it (the HEAD probe and the GET
-            // really did disagree). Indistinguishable before
+            // "path not found" means no configured upstream produced
+            // it — or the store skipped substitution entirely (no
+            // upstreams configured for the tenant / no HTTP client on
+            // the replica; rio_store_substitute_skipped_total carries
+            // the store-side cause). Indistinguishable before
             // 2026-05-23.
             let store_msg = last_err
                 .as_ref()
@@ -3096,7 +3102,12 @@ mod tests {
                 )),
                 "not_found_infra",
             ),
-            // queries.rs: the genuine all-upstreams-missed terminal.
+            // queries.rs: the bare terminal. Reached on a genuine
+            // all-upstreams miss, but ALSO when the store skipped
+            // substitution entirely (no upstreams configured for the
+            // tenant / no HTTP client on the replica) — same message
+            // either way; the store-side cause is only visible in
+            // rio_store_substitute_skipped_total.
             (
                 tonic::Status::not_found(format!("path not found: {p}")),
                 "not_found",
