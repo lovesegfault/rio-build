@@ -75,7 +75,7 @@
       "name": "BuildFailed",
       "crate": "rio-builder",
       "msg": "build failed: {0}",
-      "doc": "The build itself failed (daemon reported failure)."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
@@ -89,7 +89,7 @@
       "name": "Cgroup",
       "crate": "rio-builder",
       "msg": "cgroup resource tracking failed: {0}",
-      "doc": "Per-build cgroup resource tracking failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
@@ -103,35 +103,28 @@
       "name": "DaemonSetup",
       "crate": "rio-builder",
       "msg": "daemon setup failed: {0}",
-      "doc": "Post-handshake daemon setup (settings exchange) failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "DaemonSpawn",
       "crate": "rio-builder",
       "msg": "daemon spawn failed: {0}",
-      "doc": "Spawning the nix-daemon subprocess failed."
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "DiskFull",
-      "crate": "rio-builder",
-      "msg": "disk full during build (overlay prjquota exhausted); bumping disk floor",
-      "doc": "The build failed with its overlay prjquota at/over the hard limit while the node fs had headroom (live_057-a — in-build ENOSPC; FUSE deliberately surfaces StorageFull as ENOSPC). The derivation isn't broken — this builder's DISK is undersized: maps to `InfrastructureFailure`, and the report carries the TYPED `FailureClassification{DiskFull, quota}` field — the ONLY channel the scheduler's floor gate consumes — quantifier: census(forged_free_text_never_moves_resource_floors) — (bug_090/bug_102: the scheduler band-corroborates the typed claim against its assigned shape and bumps the disk `resource_floor`; the [`Self::CgroupOom`] twin; classification predicate at [`crate::quota::classify_quota_exhaustion`], thresholds R17-typed beside it). Display pinned to `rio_proto::DISK_FULL_MSG` for STABLE OPERATOR NARRATION only (DISPLAY/NARRATION ONLY per the rio-proto const docs — quantifier: census(forged_free_text_never_moves_resource_floors) — free text drives no floor decision; `disk_full_display_contains_proto_constant` pins the wording, not a trust contract)."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "Grpc",
       "crate": "rio-builder",
       "msg": "gRPC error: {0}",
-      "doc": "A gRPC call failed (store or scheduler)."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "Handshake",
       "crate": "rio-builder",
       "msg": "daemon handshake failed: {0}",
-      "doc": "The daemon wire-protocol handshake failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
@@ -145,56 +138,133 @@
       "name": "MetadataFetch",
       "crate": "rio-builder",
       "msg": "input metadata fetch failed for {path}: {source}",
-      "doc": "Input path metadata fetch failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "NixConf",
       "crate": "rio-builder",
       "msg": "failed to write nix.conf: {0}",
-      "doc": "Writing the per-build nix.conf failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "Overlay",
       "crate": "rio-builder",
       "msg": "overlay setup failed: {0}",
-      "doc": "Overlayfs setup failed (mount, upper/work dir creation)."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "OverlayTaskPanic",
       "crate": "rio-builder",
       "msg": "overlay setup task panicked: {0}",
-      "doc": "The blocking overlay-setup task panicked."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "SynthDb",
       "crate": "rio-builder",
       "msg": "synthetic DB generation failed: {0}",
-      "doc": "Synthetic Nix store SQLite generation failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "Upload",
       "crate": "rio-builder",
       "msg": "upload failed: {0}",
-      "doc": "Output upload to the store failed."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "Wire",
       "crate": "rio-builder",
       "msg": "wire protocol error: {0}",
-      "doc": "Daemon wire-protocol framing error."
+      "doc": ""
     },
     {
       "enum": "ExecutorError",
       "name": "WrongKind",
       "crate": "rio-builder",
       "msg": "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}",
-      "doc": "The derivation's FOD-ness does not match this executor kind."
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Codec",
+      "crate": "rio-builder",
+      "msg": "postcard: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Eof",
+      "crate": "rio-builder",
+      "msg": "peer closed the connection",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Io",
+      "crate": "rio-builder",
+      "msg": "socket: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Oversize",
+      "crate": "rio-builder",
+      "msg": "frame exceeds MAX_FRAME_BYTES ({0} > {MAX_FRAME_BYTES})",
+      "doc": ""
+    },
+    {
+      "enum": "FrameError",
+      "name": "Truncated",
+      "crate": "rio-builder",
+      "msg": "frame truncated by the kernel (MSG_TRUNC) — peer sent an oversize datagram",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Closed",
+      "crate": "rio-builder",
+      "msg": "mountd connection closed",
+      "doc": "The daemon closed the connection or the reader thread died. Every outstanding and future request fails with this — the build's mount is gone and the build must fail as infra."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Connect",
+      "crate": "rio-builder",
+      "msg": "connect {path}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Frame",
+      "crate": "rio-builder",
+      "msg": "mountd request: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "Rejected",
+      "crate": "rio-builder",
+      "msg": "mountd rejected request: {0}",
+      "doc": "A typed protocol rejection. `ErrKind::is_build_fatal` decides whether the caller surfaces a build failure or an infra retry."
+    },
+    {
+      "enum": "MountdError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "mountd did not reply within {0:?}",
+      "doc": ""
+    },
+    {
+      "enum": "MountdError",
+      "name": "UnexpectedReply",
+      "crate": "rio-builder",
+      "msg": "mountd reply has unexpected variant for this request",
+      "doc": ""
     },
     {
       "enum": "OverlayError",
@@ -243,6 +313,55 @@
       "name": "UpperOnOverlayfs",
       "crate": "rio-builder",
       "msg": "overlay upperdir {path} is itself on an overlayfs mount (statfs f_type=OVERLAYFS_SUPER_MAGIC); the kernel refuses to use an overlayfs as upperdir/workdir. Set --overlay-base-dir to a directory on a real filesystem (e.g., a local SSD emptyDir volume), not the merged view of another overlay.",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadDigestLen",
+      "crate": "rio-builder",
+      "msg": "castore digest under {context:?} is {got} bytes, want 32",
+      "doc": "`context` is the input root's store path, or the parent directory's hex digest when the bad entry is inside a streamed `Directory` body."
+    },
+    {
+      "enum": "TreeError",
+      "name": "BadStorePath",
+      "crate": "rio-builder",
+      "msg": "store path {store_path:?} has no basename",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "DuplicateBasename",
+      "crate": "rio-builder",
+      "msg": "duplicate store-path basename {basename:?} in input_roots",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingDirectory",
+      "crate": "rio-builder",
+      "msg": "directory {digest} is referenced by the DAG but was not returned by GetDirectory ({returned} bodies returned)",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "MissingRootNode",
+      "crate": "rio-builder",
+      "msg": "input root {store_path:?} has no root_node (path not yet NAR-indexed)",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "Rpc",
+      "crate": "rio-builder",
+      "msg": "GetDirectory: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "TreeError",
+      "name": "Timeout",
+      "crate": "rio-builder",
+      "msg": "GetDirectory(recursive) timed out after {0:?}",
       "doc": ""
     },
     {
@@ -396,29 +515,8 @@
       "enum": "StreamProcessError",
       "name": "EofWithoutTerminal",
       "crate": "rio-gateway",
-      "msg": "build event stream ended without a terminal event",
-      "doc": "Stream returned `Ok(None)` (EOF) without a Completed/ Failed/Cancelled event. This IS the primary failover signature: k8s pod kill → SIGTERM → graceful shutdown → TCP FIN → clean stream close. NOT a Transport error. Reconnect-worthy for the same reason as Transport. (live_064 retired the \"(scheduler disconnected?)\" parenthetical this Display used to carry: the owner's incident surfaced it as the build's failure cause while the scheduler was perfectly healthy and the real cause — eleven UNAUTHENTICATED re-attach rejections — never reached the message. Stream-death classification stays descriptive; causes belong to the re-attach evidence below.)"
-    },
-    {
-      "enum": "StreamProcessError",
-      "name": "ReattachAuthRejected",
-      "crate": "rio-gateway",
-      "msg": "WatchBuild re-attach rejected as unauthenticated even after a session-token re-mint",
-      "doc": "live_064: a WatchBuild re-attach was rejected `UNAUTHENTICATED` even after the one-shot session-token re-mint — the session's key material no longer verifies (revoked tenant, signer mismatch). NOT retried further: every later cycle would carry the same verdict, and burning the budget on it is exactly how the live_064 incident spent its last six minutes. The client message states the auth-rejection FACT only; the upstream Status body is operator-log material (the warn at the branch site carries it with the build_id) — scheduler-internal error detail never rides the client wire."
-    },
-    {
-      "enum": "StreamProcessError",
-      "name": "ReattachExhausted",
-      "crate": "rio-gateway",
-      "msg": "WatchBuild re-attach failed {attempts} times; last attempt: {last_reattach}",
-      "doc": "live_064: the re-attach budget exhausted. The surfaced cause is the LAST RE-ATTACH failure (what actually kept the watch from resuming), never the benign stream EOF that opened the episode — the incident's exhaustion message blamed a healthy scheduler while the auth rejections never reached it. `last_reattach` is a SANITIZED classification (fixed sentences + gRPC codes, built at the recording sites); the full upstream Status bodies live in the per-attempt operator warns, never on the client wire."
-    },
-    {
-      "enum": "StreamProcessError",
-      "name": "ResyncRequired",
-      "crate": "rio-gateway",
-      "msg": "scheduler signalled event loss; resync via snapshot",
-      "doc": "The scheduler signalled irrecoverable event loss for this watcher (broadcast ring overrun → `BuildEvent.resync_required`). Reconnect-worthy with ZERO backoff: the server is healthy, this WATCHER fell behind — the fresh WatchBuild's snapshot is the recovery (gw.resync.loss-signal)."
+      "msg": "build event stream ended unexpectedly (scheduler disconnected?)",
+      "doc": "Stream returned `Ok(None)` (EOF) without a Completed/ Failed/Cancelled event. This IS the primary failover signature: k8s pod kill → SIGTERM → graceful shutdown → TCP FIN → clean stream close. NOT a Transport error. Reconnect-worthy for the same reason as Transport."
     },
     {
       "enum": "StreamProcessError",
@@ -890,6 +988,34 @@
       "doc": ""
     },
     {
+      "enum": "DirectoryError",
+      "name": "BadDigestLen",
+      "crate": "rio-proto",
+      "msg": "child digest for entry {0:?} is {1} bytes, expected 32",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "DuplicateName",
+      "crate": "rio-proto",
+      "msg": "duplicate entry name {0:?} across the directory's kind lists",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "InvalidName",
+      "crate": "rio-proto",
+      "msg": "entry name {0:?} is not a valid single path component",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "Unsorted",
+      "crate": "rio-proto",
+      "msg": "entries not sorted byte-lexicographically by name within a kind list at {0:?}",
+      "doc": ""
+    },
+    {
       "enum": "NarCollectError",
       "name": "Io",
       "crate": "rio-proto",
@@ -993,13 +1119,6 @@
       "crate": "rio-scheduler",
       "msg": "permission denied: build {build_id} belongs to a different tenant",
       "doc": "`r[sched.tenant.authz]`: caller's attested `claims.sub` does not own the build. Maps to gRPC PERMISSION_DENIED."
-    },
-    {
-      "enum": "ActorError",
-      "name": "StaleGeneration",
-      "crate": "rio-scheduler",
-      "msg": "merge fenced: serving generation {serving} is below the durable claims floor {floor} (a newer leader has claimed); retry against the current leader",
-      "doc": "The merge transaction's claims-floor fence rejected the write: this replica's serving generation sits below the durable floor (a successor has claimed), so committing the merge would let a deposed believer write evidence over the new tenure's. Maps to gRPC UNAVAILABLE (the `ensure_leader` \"not leader\" family): the fence trips exactly in the deposed-believer window — the lease loss precedes the successor's claim, so a health-aware balanced channel has usually ejected this replica already, and a client that still reaches it must RETRY (bounded), not surface a terminal error for a request that is perfectly valid on the live leader. No client retries FAILED_PRECONDITION; mapping the refusal there turned every fence trip into a user-visible failure (bug_393)."
     },
     {
       "enum": "ActorError",
@@ -1125,7 +1244,7 @@
       "name": "Saturated",
       "crate": "rio-store",
       "msg": "substitute admission saturated; retry (transient)",
-      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — the gateway caller retries (`r[gw.store.transient-retry]`); the in-process materialization executor re-arms through its job budget."
+      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — caller retries per `r[sched.substitute.detached+5]`."
     },
     {
       "enum": "ChunkError",
@@ -1140,55 +1259,6 @@
       "crate": "rio-store",
       "msg": "chunk {} not found in backend (data loss if manifest claims it exists)",
       "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
-    },
-    {
-      "enum": "CutError",
-      "name": "Compress",
-      "crate": "rio-store",
-      "msg": "compressing log chunk: {0}",
-      "doc": "zstd compression failed (effectively unreachable for in-memory I/O, but the encoder API is fallible)."
-    },
-    {
-      "enum": "CutError",
-      "name": "Join",
-      "crate": "rio-store",
-      "msg": "log chunk compression task failed: {0}",
-      "doc": "The compression task was cancelled or panicked."
-    },
-    {
-      "enum": "CutError",
-      "name": "Manifest",
-      "crate": "rio-store",
-      "msg": "recording log chunk manifest row: {0}",
-      "doc": "The `drv_log_chunks` manifest INSERT failed. The object may already be durable in S3 — that is fine, the retry burns a new seq and the unreferenced object is invisible to readers (the S3 lifecycle rule collects it)."
-    },
-    {
-      "enum": "CutError",
-      "name": "Store",
-      "crate": "rio-store",
-      "msg": "storing log chunk: {0}",
-      "doc": "The S3 PUT failed."
-    },
-    {
-      "enum": "LogChunkError",
-      "name": "Backend",
-      "crate": "rio-store",
-      "msg": "log chunk backend error: {0:#}",
-      "doc": "Backend I/O failure (S3 unreachable, throttled, auth denied). Permanent auth failures root the chain at [`crate::backend::BackendAuthError`]."
-    },
-    {
-      "enum": "LogChunkError",
-      "name": "Codec",
-      "crate": "rio-store",
-      "msg": "log chunk codec error: {0}",
-      "doc": "The blob is not valid zstd / not a valid line payload."
-    },
-    {
-      "enum": "LogChunkError",
-      "name": "NotFound",
-      "crate": "rio-store",
-      "msg": "log chunk not found: {key}",
-      "doc": "The object is not in the backend. When the key came from a `drv_log_chunks` manifest row this is a data-loss condition, not a cache miss — the caller decides how loudly to surface it."
     },
     {
       "enum": "ManifestError",
@@ -1244,7 +1314,7 @@
       "name": "Deadlock",
       "crate": "rio-store",
       "msg": "deadlock detected (retry)",
-      "doc": "Deadlock detected (PG code 40P01). Two transactions have a circular lock-wait on overlapping row sets. Retriable — PG aborted one txn; retry will likely succeed. Prevention: sort batch row-locking input so all writers acquire locks in the same order (the chunk lock-order rule). Maps to `aborted`."
+      "doc": "Deadlock detected (PG code 40P01). Two transactions have a circular lock-wait on overlapping row sets. Retriable — PG aborted one txn; retry will likely succeed. Prevention: sort batch-UPDATE input so all writers acquire locks in the same order (see `metadata::with_sorted_retry`). Maps to `aborted`."
     },
     {
       "enum": "MetadataError",
@@ -1353,13 +1423,6 @@
     },
     {
       "enum": "SubstituteError",
-      "name": "ContentMismatch",
-      "crate": "rio-store",
-      "msg": "upstream narinfo names the path but claims different bytes than the stored row (nar_hash/nar_size/reference disagreement)",
-      "doc": "merged_bug_046: every non-serving upstream that HAD the path answered with a narinfo whose content DISAGREES with the locally-stored row (the AlreadyComplete dedup arm's nar_hash/nar_size/reference-set check) and nothing served, stalled, 429'd, errored, or trust-refused. Returned as `Err` so moka does NOT cache it — pinning the disagreement as a definitive miss would let the content-blind HEAD confirmation contradict it into a per-retry infrastructure charge (the merged_bug_005 laundering loop, one axis over). The materialization executor settles it Unobtainable-with-cause, UNCHARGED, skipping the HEAD confirmation."
-    },
-    {
-      "enum": "SubstituteError",
       "name": "Fetch",
       "crate": "rio-store",
       "msg": "upstream fetch failed: {0}",
@@ -1374,17 +1437,10 @@
     },
     {
       "enum": "SubstituteError",
-      "name": "HoldDeadlineExceeded",
-      "crate": "rio-store",
-      "msg": "nar-budget hold exceeded its transfer deadline ({declared} declared bytes, {hold_budget:?} hold budget); aborted",
-      "doc": "A NAR-budget hold outlived its typed transfer-deadline envelope (`NarHoldEnvelope`): the leg held budget permits past `NarHoldEnvelope`'s deadline (grace + byte-basis at the floor rate) without completing. The per-read stall clock cannot see this shape — an adversarial trickle (or a black-holed persist) satisfies every per-read window while pinning the pool indefinitely. Returned as `Err` so moka does NOT cache it; the reservation is credited back by drop on the return path, so a parked sibling's whole-NAR head is granted within the residual holder bounds. `hold_budget` is the envelope's derived total (operator-meaningful; the raw deadline instant is not)."
-    },
-    {
-      "enum": "SubstituteError",
       "name": "Ingest",
       "crate": "rio-store",
       "msg": "ingest failed: {0}",
-      "doc": "Metadata-layer failure during ingest (write-ahead, complete_manifest, chunked S3 upload / chunk-row upsert)."
+      "doc": "Metadata-layer failure during ingest (write-ahead, complete_manifest, chunked S3/refcount)."
     },
     {
       "enum": "SubstituteError",
@@ -1405,7 +1461,7 @@
       "name": "RateLimited",
       "crate": "rio-store",
       "msg": "transient: upstream rate-limited (retry after {retry_after:?})",
-      "doc": "Transient upstream-429 (`r[store.substitute.probe-429-retry+3]`). `retry_after` is the parsed `Retry-After` header (delta-seconds or HTTP-date), `None` if absent or unparseable. Returned as `Err` so moka does NOT cache it; the admission permit is dropped on return so the wait happens caller-side without holding per-replica capacity. gRPC maps to `Unavailable` so the scheduler's 8-attempt backoff retries — a bare 429 (no `Retry-After`) is still a real rate-limit, NOT a miss."
+      "doc": "Transient upstream-429 (`r[store.substitute.probe-429-retry+2]`). `retry_after` is the parsed `Retry-After` header (delta-seconds or HTTP-date), `None` if absent or unparseable. Returned as `Err` so moka does NOT cache it; the admission permit is dropped on return so the wait happens caller-side without holding per-replica capacity. gRPC maps to `Unavailable` so the scheduler's 8-attempt backoff retries — a bare 429 (no `Retry-After`) is still a real rate-limit, NOT a miss."
     },
     {
       "enum": "SubstituteError",
@@ -1416,31 +1472,31 @@
     },
     {
       "enum": "SubstituteError",
-      "name": "Stalled",
-      "crate": "rio-store",
-      "msg": "download stalled: no body bytes for {window:?}; claim released in place",
-      "doc": "Owner-side download-stall abort (`r[store.substitute.stall-abort]`): no NAR body bytes arrived for the configured stall window, so this owner aborted its own download and released the placeholder claim **in place** (claim cleared, progress NULLed, durable `stall_count` incremented). Returned as `Err` so moka does NOT cache it — every coalesced singleflight waiter sees the stall (the singleflight-leader blind spot: no competing `claim_placeholder` would ever observe it) and the next attempt re-claims the released row immediately. The materialization executor classifies this as infrastructure trouble (retryable), never a miss."
-    },
-    {
-      "enum": "SubstituteError",
-      "name": "TenantBudgetExhausted",
-      "crate": "rio-store",
-      "msg": "tenant nar-budget reservation cap reached ({cap} bytes outstanding); retry",
-      "doc": "The tenant's AGGREGATE outstanding reservation charge would exceed `TENANT_RESERVATION_CAP` — the budget law's COST axis: substitution charge is declaration-priced (a hostile upstream's lies cost nothing to make), so per-tenant accounting refuses at the constructor instead of letting one tenant's declarations pin the shared pool. Typed REFUSAL, never queueing — returned as `Err` so moka does NOT cache it; the executor's retry machinery absorbs it once earlier reservations drain."
-    },
-    {
-      "enum": "SubstituteError",
       "name": "TooLarge",
       "crate": "rio-store",
       "msg": "upstream {what} exceeds {limit}-byte cap",
       "doc": "An upstream-supplied body exceeded a size cap (narinfo, `/nix-cache-info`, declared `NarSize`, or decompressed NAR). `tenant_upstreams` rows are tenant-supplied; one tenant's hostile upstream must not OOM the process-global substituter."
     },
     {
-      "enum": "SubstituteError",
-      "name": "UntrustedPresent",
+      "enum": "WalkError",
+      "name": "BadRoot",
       "crate": "rio-store",
-      "msg": "upstream narinfo present but no signature verified against trusted_keys (rotated or mistyped key?)",
-      "doc": "merged_bug_005: every non-serving upstream that HAD the path answered present-but-untrusted (no sig verified against its `trusted_keys`) and nothing served, stalled, 429'd, or errored. Returned as `Err` so moka does NOT cache it — keys can be fixed; pinning the refusal as a miss would hide the repair for the TTL window. The materialization executor settles it as Unobtainable-with-cause, UNCHARGED."
+      "msg": "malformed root node: {0}",
+      "doc": "`RootNode.node` is unset or a digest field has the wrong length."
+    },
+    {
+      "enum": "WalkError",
+      "name": "MissingDirectory",
+      "crate": "rio-store",
+      "msg": "directory {0} referenced but not supplied",
+      "doc": "A `DirectoryEntry.digest` reachable from the root has no body in the supplied map. For `PutPathChunked` this means the builder omitted a body from `Begin.directories`."
+    },
+    {
+      "enum": "WalkError",
+      "name": "TooManyNodes",
+      "crate": "rio-store",
+      "msg": "walk exceeded {0} nodes",
+      "doc": "The walk visited more nodes than the caller's cap. A Directory *DAG* expands to a *tree* on walk — a deliberately deep-and-wide DAG can reference the same subtree exponentially many times, so the node count must be bounded independently of the (already-bounded) distinct-body count."
     }
   ],
   "enums": [
@@ -1457,7 +1513,17 @@
     {
       "name": "ExecutorError",
       "crate": "rio-builder",
-      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site. `IntoStaticStr` generates the discriminant-name `&'static str` the banner footer's `failed (executor: <variant>)` summary uses (`<&str>::from(&e)`); the full error chain is on `CompletionReport.error_msg`."
+      "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
+    },
+    {
+      "name": "FrameError",
+      "crate": "rio-builder",
+      "doc": "Frame-level decode/encode errors (not protocol errors — those are [`ErrKind`])."
+    },
+    {
+      "name": "MountdError",
+      "crate": "rio-builder",
+      "doc": ""
     },
     {
       "name": "OverlayError",
@@ -1465,14 +1531,14 @@
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
     },
     {
+      "name": "TreeError",
+      "crate": "rio-builder",
+      "doc": "Errors from DAG prefetch / tree construction. All of them mean the build never started — the caller classifies every variant as an infrastructure failure and re-queues."
+    },
+    {
       "name": "UploadError",
       "crate": "rio-builder",
       "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
-    },
-    {
-      "name": "CellDecodeError",
-      "crate": "rio-common",
-      "doc": "Why a cell-event string failed to decode. Carried into typed refusals (the scheduler's ack apply plan) so an undecodable entry is a loud producer-skew signal, never a silent drop (bug_094)."
     },
     {
       "name": "NameError",
@@ -1535,6 +1601,11 @@
       "doc": ""
     },
     {
+      "name": "DirectoryError",
+      "crate": "rio-proto",
+      "doc": "Why a client-supplied [`Directory`] body was rejected."
+    },
+    {
       "name": "NarCollectError",
       "crate": "rio-proto",
       "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`]."
@@ -1543,11 +1614,6 @@
       "name": "PathInfoValidationError",
       "crate": "rio-proto",
       "doc": ""
-    },
-    {
-      "name": "AckApplyError",
-      "crate": "rio-scheduler",
-      "doc": "Why an `AckSpawnedIntents` payload was not (fully) applied (merged_bug_005 — ack means applied under leadership; bug_094 — validate-then-commit: every refusal is computed by `AckApplyPlan::validate` BEFORE the first state mutation, so an erring Ack names what did NOT land). Mapped to a gRPC error by the admin layer; the controller's commit-on-Ack buffer survives an erring Ack and redelivers the whole buffer — safe, because every plane that DID land is redelivery-idempotent (merged_bug_008: cell events carry producer evidence epochs and the ladder no-ops `epoch <= last_applied[cell]`; observed types upsert; binding snapshots rebuild wholesale), and a refused plane applied nothing. bug_142 (R30 + OQ-15): refusal granularity is PER-PLANE. `NotLeader` is the one whole-request lane (the payload was dropped entire); `PlanesRefused` is the per-plane aggregate — every plane it does NOT name landed. The leaf variants (`PlaneEntryUndecodable`, `ArmEchoSkewed`) appear only inside `PlanesRefused.refused` (one per refused plane, first error each) — never nested, never top-level on the reply wire."
     },
     {
       "name": "ActorError",
@@ -1580,16 +1646,6 @@
       "doc": "Error from `ChunkCache::get_verified`."
     },
     {
-      "name": "CutError",
-      "crate": "rio-store",
-      "doc": "A chunk-cut failure. The handler logs it, lets the failure counter (already incremented by [`IngestSession::cut`]) feed [`IngestSession::should_abort`], and keeps the stream open until the abort threshold is reached — every failure mode here is either transient (S3/PG blips, retried by the next cut) or terminal for the replica (in which case the abort hands the builder to a healthier one)."
-    },
-    {
-      "name": "LogChunkError",
-      "crate": "rio-store",
-      "doc": "Errors from the log-chunk codec and storage backends. A typed enum (not `anyhow`) so the gRPC layer can map each failure class to a precise status code, mirroring [`crate::error::MetadataError`]: `NotFound` → the manifest points at a missing object (data loss, surfaced loudly, not retried); `Backend` → transient or auth S3 failure (the inner `anyhow` chain roots at [`crate::backend::BackendAuthError`] for permanent auth errors, so the existing `grpc::storage_error` downcast keeps working); `Codec` → the stored blob is not valid zstd (corruption)."
-    },
-    {
       "name": "ManifestError",
       "crate": "rio-store",
       "doc": ""
@@ -1613,6 +1669,11 @@
       "name": "SubstituteError",
       "crate": "rio-store",
       "doc": "Errors surfaced by the substitution path. Callers map these to gRPC status; `NotFound` is the normal miss case (no upstream has the path, or the tenant has no upstreams configured). `Clone` so moka's `try_get_with` can hand the same error to every coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned)."
+    },
+    {
+      "name": "WalkError",
+      "crate": "rio-store",
+      "doc": ""
     }
   ]
 }

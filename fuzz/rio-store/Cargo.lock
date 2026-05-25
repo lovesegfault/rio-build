@@ -1245,16 +1245,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-deque"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-epoch"
 version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2887,6 +2877,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3008,6 +3007,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3814,26 +3814,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3978,6 +3958,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "blake3",
  "ed25519-dalek",
  "hmac 0.13.0",
  "jsonwebtoken",
@@ -4056,6 +4037,7 @@ name = "rio-nix"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake3",
  "ed25519-dalek",
  "hex",
  "serde_json",
@@ -4072,6 +4054,7 @@ name = "rio-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "futures-util",
  "opentelemetry",
  "prost",
@@ -4113,7 +4096,7 @@ dependencies = [
  "httpdate",
  "metrics",
  "moka",
- "rayon",
+ "prost",
  "reqwest",
  "rio-auth",
  "rio-authz-kernel",
@@ -6200,6 +6183,7 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
+ "cc",
  "chacha20",
  "cipher",
  "crossbeam-epoch",

@@ -4,6 +4,7 @@ package rio.store;
 import "google/protobuf/empty.proto";
 import "types.proto";
 import "build_types.proto"; // LogService.AppendLog → BuildLogBatch
+import "castore.proto"; // DirectoryService.GetDirectory → Directory
 
 // Store service for NAR storage and path metadata.
 // Inspired by tvix castore/store protos (MIT).
@@ -18,6 +19,23 @@ service StoreService {
   // for multi-output derivations — partial registration breaks the
   // "all outputs or none" contract).
   rpc PutPathBatch(stream rio.types.PutPathBatchRequest) returns (rio.types.PutPathBatchResponse);
+
+  // ADR-022 §6 (P0586): chunked output upload. The builder runs the
+  // FastCDC chunking, sends a per-file chunk manifest + the castore
+  // Directory DAG up front, then streams only the chunks the store
+  // doesn't already have (per ChunkService.HasChunks). The store
+  // verifies each chunk's BLAKE3 on arrival, recomputes
+  // nar_hash/references/per-file digests from the regenerated NAR
+  // framing and the chunk bodies, and commits all outputs in one
+  // transaction — without ever buffering a whole NAR in memory. Same
+  // atomicity contract as PutPathBatch.
+  //
+  // Stream shape: Begin (1) → Chunk (one per Begin.novel entry, in
+  // novel order).
+  //
+  // r[impl store.put.chunked]
+  // r[impl store.put.chunked-wire]
+  rpc PutPathChunked(stream rio.types.PutPathChunkedRequest) returns (rio.types.PutPathChunkedResponse);
 
   // Download a store path's NAR data (streaming).
   rpc GetPath(rio.types.GetPathRequest) returns (stream rio.types.GetPathResponse);
@@ -38,11 +56,9 @@ service StoreService {
   // round-trips. Callers that need those semantics use QueryPathInfo.
   rpc BatchQueryPathInfo(rio.types.BatchQueryPathInfoRequest) returns (rio.types.BatchQueryPathInfoResponse);
 
-  // Batch (PathInfo, manifest) lookup. I-110c: the builder's FUSE-warm
-  // stat loop is a SECOND ~800-GetPath/builder burst (each FUSE
-  // lookup() → GetPath → store-side PG narinfo+manifest lookup). One
-  // BatchGetManifest BEFORE the loop primes the builder's hint cache
-  // so each GetPath carries its manifest and the store skips PG.
+  // Batch (PathInfo + complete-manifest availability) lookup — one PG
+  // round-trip for many paths. Manifest content is never returned;
+  // clients that want the NAR call GetPath.
   //
   // Local-only: same caveats as BatchQueryPathInfo (no substitution,
   // no sig-visibility gate). Returns hint=None for not-found.
@@ -113,16 +129,84 @@ service StoreService {
   // side — a failed append degrades
   // normalization (hw_class stays factor=1.0), not the build itself.
   rpc AppendHwPerfSample(rio.types.AppendHwPerfSampleRequest) returns (google.protobuf.Empty);
+
+  // ADR-022: per-file NAR index for one store path. The index is
+  // derived, non-authoritative state (`r[store.index.non-authoritative]`):
+  // a missing row triggers a synchronous recompute from the stored NAR
+  // (`r[store.index.sync-on-miss]`). NOT_FOUND only if the path itself
+  // has no complete manifest.
+  rpc GetNarIndex(rio.types.GetNarIndexRequest) returns (rio.types.NarIndex);
+
+  // Batch variant. Build-start fetches O(closure) indices; per-path
+  // RTT × ~357 paths is the I-110 PG-wall pattern again. One streamed
+  // call, request order preserved.
+  rpc GetNarIndexBatch(rio.types.GetNarIndexBatchRequest) returns (stream rio.types.NarIndexResponse);
+}
+
+// ADR-022 castore RPC surface (P0573). Tenant-scoped: every RPC joins
+// the directory_tenants/file_blob_tenants junction on the caller's
+// tenant_id (JWT or HMAC assignment-token claim) — Directory bodies
+// leak child names/digests, so cross-tenant exposure is a
+// confidentiality issue. See `r[store.castore.tenant-scope]`.
+service DirectoryService {
+  // recursive=true BFS-walks the subtree server-side; multi-root via
+  // field 3. Field semantics in types.proto.
+  rpc GetDirectory(rio.types.GetDirectoryRequest) returns (stream rio.castore.Directory);
+
+  // Batch presence probe for the delta-sync pruning loop (ADR-022 §5).
+  // A bit set ⇔ the digest is present and tenant-visible.
+  rpc HasDirectories(rio.types.HasDirectoriesRequest) returns (rio.types.HasBitmap);
+  rpc HasBlobs(rio.types.HasBlobsRequest) returns (rio.types.HasBitmap);
+
+  // Fetch a regular file's bytes by blake3 digest (P0577). The server
+  // resolves the digest to a NAR chunk window via file_blobs and the
+  // manifest cumsum, then streams the chunks sliced to the file
+  // boundary. The caller never sees rio's chunk layout. NotFound if
+  // no tenant-visible row.
+  rpc ReadBlob(rio.types.ReadBlobRequest) returns (stream rio.types.BlobChunk);
+
+  // Resolve a regular file's chunk window by blake3 digest (P0570).
+  // The castore-FUSE open() path calls this for files above the
+  // streaming threshold so it can fetch chunks itself (local cache,
+  // then GetChunks); smaller files use ReadBlob. NotFound if no
+  // tenant-visible row; FailedPrecondition for inline manifests
+  // (no chunk list — use ReadBlob).
+  rpc StatBlob(rio.types.StatBlobRequest) returns (rio.types.StatBlobResponse);
 }
 
 // Chunk-level storage service for content-defined chunking.
-// Server-side chunking only — PutPath chunks via cas::put_chunked, and
-// GetPath streams whole NARs back. GetChunk has no production caller
-// today; it is the chunk-level retrieval surface for future
+// PutPath chunks server-side via cas::put_chunked; PutPathChunked
+// (ADR-022 §6) accepts builder-side chunks. GetChunk has no production
+// caller today; it is the chunk-level retrieval surface for
 // out-of-process reassembly, exercised only by tests.
 service ChunkService {
   // Download a chunk by its digest.
   rpc GetChunk(rio.types.GetChunkRequest) returns (stream rio.types.GetChunkResponse);
+
+  // Batched chunk download (P0568). The castore-FUSE fill task (P0559)
+  // sends GetChunksRequest frames as it discovers local-cache misses;
+  // the server fans out K concurrent backend fetches and streams
+  // ChunkData back in completion order. ChunkData carries the digest so
+  // the client matches by content, not by request position. Aborts the
+  // stream on the first chunk error (NOT_FOUND / DATA_LOSS /
+  // UNAVAILABLE) — the client retries the gap, not the whole batch.
+  // Unscoped, like GetChunk: knowing a BLAKE3 hash already proves you
+  // have (or had) the bytes.
+  rpc GetChunks(stream rio.types.GetChunksRequest) returns (stream rio.types.ChunkData);
+
+  // Batch durable-presence probe (ADR-022 §6.2, P0586). Bit i of the
+  // response is set IFF digests[i] is referenced by at least one
+  // *complete* manifest (`chunks.durable`), not merely refcount ≥ 1 —
+  // a chunk mid-upload by a concurrent builder reads as absent, so
+  // both builders send it and the second S3 PutObject is an idempotent
+  // overwrite (I-201 stranded-chunk race). The builder calls this to
+  // compute `PutPathChunkedBegin.novel`. Unscoped, like GetChunk:
+  // chunks are content-addressed and tenant-agnostic
+  // (`r[store.castore.tenant-scope]` covers Directory/file reads, not
+  // chunk presence).
+  //
+  // r[impl store.chunk.has-chunks-durable]
+  rpc HasChunks(rio.types.HasChunksRequest) returns (rio.types.HasBitmap);
 }
 
 // Store-side administrative operations. The scheduler's AdminService.

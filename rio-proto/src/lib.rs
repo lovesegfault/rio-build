@@ -77,6 +77,7 @@ pub const DISK_FULL_MSG: &str = "disk full during build";
 /// update this note with the observed bytes-per-intent.
 pub const SPAWN_INTENTS_DEFAULT_PAGE: u32 = 2048;
 
+pub mod castore_util;
 pub mod client;
 pub mod interceptor;
 pub mod refusal;
@@ -284,6 +285,15 @@ pub mod admin {
     tonic::include_proto!("rio.admin");
 }
 
+/// Content-addressed Directory DAG types (ADR-022 §2.2/§8).
+///
+/// `Directory`/`DirectoryEntry`/`FileEntry`/`SymlinkEntry` mirror snix
+/// `castore.proto` so `dir_digest` is interoperable; `RootNode` is the
+/// rio-local discriminated root encoded into `nar_index.root_node`.
+pub mod castore {
+    tonic::include_proto!("rio.castore");
+}
+
 /// Binary `FileDescriptorSet` covering every `.proto` file compiled by
 /// `build.rs` (all six services + shared `rio.types`, with transitive
 /// imports — `prost_build` always passes `--include_imports`).
@@ -315,6 +325,7 @@ pub use builder::executor_service_server::{ExecutorService, ExecutorServiceServe
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
+pub use store::directory_service_server::{DirectoryService, DirectoryServiceServer};
 pub use store::log_service_client::LogServiceClient;
 pub use store::log_service_server::{LogService, LogServiceServer};
 pub use store::store_admin_service_client::StoreAdminServiceClient;

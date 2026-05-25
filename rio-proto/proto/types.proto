@@ -13,6 +13,8 @@ package rio.types;
 // Rust callers see every type at `rio_proto::types::*` regardless of source
 // file.
 
+import "castore.proto"; // ChunkedOutput.root_node, PutPathChunkedBegin.directories
+
 // Build result status codes. Lives here (not build_types.proto) to break
 // the dag.proto ↔ build_types.proto circular import — DerivationFailed.status
 // (dag) and BuildResult.status (build_types) both reference it.
@@ -160,16 +162,90 @@ message PutPathBatchResponse {
   repeated bool created = 1;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// PutPathChunked (ADR-022 §6, P0586)
+// ───────────────────────────────────────────────────────────────────────────
+
+// One output of a derivation in a PutPathChunked Begin frame.
+//
+// Unlike PutPath's PathInfo, `nar_hash`/`nar_size`/`references` are
+// populated UP FRONT — the builder's fused walk computed them before
+// the stream opened. They are *claimed*, not attested: the store
+// recomputes all three from the reassembled NAR before commit
+// (`r[store.put.narhash-sync]`, `r[store.put.refs-sync]`).
+message ChunkedOutput {
+  string store_path = 1;
+  // Claimed SHA-256 of the canonical NAR serialization (32 bytes).
+  bytes nar_hash = 2;
+  // Claimed NAR byte count.
+  uint64 nar_size = 3;
+  // Claimed runtime references (full store paths, sorted).
+  repeated string references = 4;
+  // Root of this output's castore Directory DAG. Every dir_digest
+  // reachable from it MUST appear in `PutPathChunkedBegin.directories`.
+  rio.castore.RootNode root_node = 5;
+  // Per-file FastCDC chunks of every regular file reachable from
+  // `root_node`, in canonical NAR walk order. A file appearing N times
+  // in the tree contributes its chunk run N times. For each regular
+  // file, the contiguous run of `size` values sums to that
+  // FileEntry.size. Chunks contain file CONTENT bytes only — never NAR
+  // framing (framing is regenerated from the Directory tree).
+  repeated ChunkMeta chunk_manifest = 6;
+}
+
+// First frame of a PutPathChunked stream. Carries everything except
+// the novel chunk bodies. The HMAC assignment token travels in the
+// `x-rio-assignment-token` request header (same as PutPath), not in
+// this message.
+message PutPathChunkedBegin {
+  // Derivation that produced these outputs. `hash_part(deriver)` MUST
+  // equal the assignment token's `drv_hash`.
+  string deriver = 1;
+  // All outputs of the derivation. Committed atomically
+  // (`r[store.atomic.multi-output]`).
+  repeated ChunkedOutput outputs = 2;
+  // Bodies for every dir_digest reachable from any output's
+  // `root_node`, deduplicated across outputs. The store recomputes
+  // each body's digest (`blake3(canonical-encode)`) — the digest is
+  // derived, never trusted from the entry that referenced it.
+  repeated rio.castore.Directory directories = 3;
+  // Exactly the chunk digests the builder will send as Chunk frames,
+  // ordered by global first occurrence across
+  // `outputs[0].chunk_manifest`, `outputs[1].chunk_manifest`, ….
+  // The builder populates this with the HasChunks-false subset; the
+  // server trusts membership (not durability) so a chunk that became
+  // durable between the probe and Begin cannot wedge the verify walk.
+  repeated bytes novel = 4;
+  // Refscan candidate set (the build's input closure, sorted). Attested
+  // via the assignment token's `input_closure_digest`.
+  repeated string input_closure = 5;
+}
+
+// Client-stream frame for PutPathChunked: one Begin, then one Chunk
+// per `Begin.novel` entry, in `novel` order.
+message PutPathChunkedRequest {
+  oneof msg {
+    PutPathChunkedBegin begin = 1;
+    // Chunk body for the next unsent `Begin.novel` digest.
+    // `blake3(chunk.data)` MUST equal `chunk.digest` MUST equal
+    // `novel[i]` for the i-th Chunk frame.
+    ChunkData chunk = 2;
+  }
+}
+
+message PutPathChunkedResponse {
+  // Per-output created flag, indexed by `Begin.outputs` position.
+  // true = newly committed, false = already complete (idempotency hit).
+  repeated bool created = 1;
+}
+
 // Request to download a store path's NAR data.
 message GetPathRequest {
   string store_path = 1;
-  // I-110c: pre-fetched (PathInfo, manifest) so the store can skip its
-  // two PG lookups and go straight to S3 chunk reassembly. Populated by
-  // BatchGetManifest. The store still SHA-256-verifies the reassembled
-  // NAR against hint.info.nar_hash, so a stale/forged hint surfaces as
-  // DATA_LOSS — same as a corrupt manifest_data row would. Unset → the
-  // store queries PG as before.
-  optional ManifestHint manifest_hint = 2;
+  // 2 was manifest_hint (client-supplied PG-skip hint); the store
+  // always resolves PathInfo + manifest from PG.
+  reserved 2;
+  reserved "manifest_hint";
 }
 
 // Response containing NAR data chunks. First message may include metadata.
@@ -210,22 +286,163 @@ message ChunkRef {
   uint32 size = 2;
 }
 
-// Pre-fetched (PathInfo, manifest) sufficient for GetPath to skip PG
-// entirely. `chunks` empty + `inline_blob` set = inline NAR; `chunks`
-// non-empty = chunked (inline_blob ignored). Exactly one of the two is
-// populated for a found path.
-message ManifestHint {
-  PathInfo info = 1;
-  repeated ChunkRef chunks = 2;
-  bytes inline_blob = 3;
+// ───────────────────────────────────────────────────────────────────────────
+// NAR index (ADR-022)
+// ───────────────────────────────────────────────────────────────────────────
+
+enum NarEntryKind {
+  NAR_ENTRY_KIND_UNSPECIFIED = 0;
+  NAR_ENTRY_KIND_REGULAR = 1;
+  NAR_ENTRY_KIND_DIRECTORY = 2;
+  NAR_ENTRY_KIND_SYMLINK = 3;
 }
 
-// I-110c: batch (PathInfo, manifest) lookup. The builder's
-// warm_inputs_in_fuse stat loop was the SECOND ~800-GetPath/builder PG
-// burst (kernel→FUSE-callback driven, can't batch the syscalls). One
-// BatchGetManifest before the loop primes a builder-side hint cache;
-// each GetPath then carries its hint and the store skips PG. The S3
-// chunk fetch stays per-path (it's content; can't avoid).
+// One file/dir/symlink within a store path's NAR. Computed at PutPath
+// time (`r[store.index.putpath-eager]`) by `nar_ls`; persisted to the
+// `nar_index` table (`r[store.index.table-cascade]`); exposed via
+// GetNarIndex/GetNarIndexBatch (`r[store.index.rpc]`).
+message NarIndexEntry {
+  // Path within the NAR, '/'-joined NAR component names. `bytes`, not
+  // `string`: NAR names are arbitrary non-NUL/non-slash byte sequences;
+  // non-UTF8 is legal.
+  bytes path = 1;
+  NarEntryKind kind = 2;
+  uint64 size = 3;           // regular files only; 0 for dirs/symlinks
+  bool executable = 4;       // regular files only
+  // Byte offset of file content within the canonical NAR encoding,
+  // after the `"contents"` length-prefix. Lets a holder of the NAR
+  // chunk cumsum slice one file's bytes without re-parsing. Regular
+  // files only (`r[store.index.nar-ls-offset]`).
+  uint64 nar_offset = 5;
+  bytes target = 6;          // symlinks only; same byte-not-string rule as `path`
+  // blake3(file content), 32 bytes. Empty for dirs/symlinks.
+  // (`r[store.index.file-digest]`)
+  bytes file_digest = 7;
+  // blake3(canonical-encode(rio.castore.Directory)), 32 bytes. Empty
+  // for files/symlinks. (`r[store.index.dir-digest]`)
+  bytes dir_digest = 8;
+}
+
+message NarIndex {
+  repeated NarIndexEntry entries = 1;
+  // `dir_digest` of the root directory; empty when the NAR root is a
+  // single file or symlink (no Directory body to digest).
+  bytes root_digest = 2;
+}
+
+message GetNarIndexRequest {
+  bytes nar_hash = 1;        // 32-byte SHA-256
+}
+
+// ADR-022 castore RPC surface (P0573). Wire-compatible with snix's
+// castore.proto DirectoryService.Get for fields 1/2 (singular root).
+message GetDirectoryRequest {
+  // snix-compat: a single root, addressable by digest only today.
+  // Kept as a oneof so a future name-based selector slots in without
+  // a wire bump.
+  oneof by_what {
+    bytes digest = 1;        // 32-byte blake3 dir_digest
+  }
+  // false → exactly the requested body. true → server-side BFS of the
+  // whole subtree, deduped by digest (snix DirectoryService.Get
+  // semantics: roots first, then children).
+  bool recursive = 2;
+  // rio multi-root extension: BFS frontier seeded from {digest} ∪
+  // digests, deduped across all roots. The builder sends every closure
+  // dir_digest in one call (1 RPC instead of one per root — I-110
+  // lesson). snix clients omit the field (proto3 unknown-field) and
+  // stay wire-compatible.
+  repeated bytes digests = 3;
+}
+
+message HasDirectoriesRequest {
+  repeated bytes digests = 1;  // 32-byte blake3 dir_digests
+}
+
+message HasBlobsRequest {
+  repeated bytes digests = 1;  // 32-byte blake3 file_digests
+}
+
+// One bit per request index, LSB-first within each byte. Bit i set ⇔
+// digests[i] is present and tenant-visible. Length is
+// ceil(len(digests) / 8) bytes; trailing bits of the last byte are 0.
+message HasBitmap {
+  bytes bitmap = 1;
+}
+
+// ADR-022 P0577: fetch a regular file's bytes by blake3 digest.
+// Wire-compatible with snix castore.proto BlobService.Read; snix
+// names the field `digest`, both are field 1 / bytes.
+message ReadBlobRequest {
+  bytes file_digest = 1;  // 32-byte blake3 of the file content
+}
+
+// One frame of file content. blake3(concat(frames.data)) ==
+// request.file_digest.
+message BlobChunk {
+  bytes data = 1;
+}
+
+// ADR-022 P0570: resolve a regular file's chunk window by blake3
+// digest. Same field shape as snix castore.proto BlobService.Stat
+// (digest=1, send_chunks=2); rio's response adds slice offsets for
+// window-slicing generality. Chunks are per-regular-file FastCDC
+// (ADR-022 §6.1), so file boundaries are always chunk boundaries and a
+// v2 manifest's window is an exact entry range — first_chunk_skip is
+// always 0 and last_chunk_take always equals the last chunk's size.
+// Clients should still apply the offsets as documented on
+// StatBlobResponse rather than assuming the degenerate values.
+message StatBlobRequest {
+  bytes file_digest = 1;  // 32-byte blake3 of the file content
+  // false (default): presence probe — empty response or NotFound.
+  // true: also resolve and return the chunk window.
+  bool send_chunks = 2;
+}
+
+message ChunkMeta {
+  bytes digest = 1;  // 32-byte blake3 of the chunk bytes
+  uint64 size = 2;   // full chunk size, not the sliced contribution
+}
+
+// Chunk window covering one file. Reassemble as:
+//   chunks[0][first_chunk_skip..]   (len > 1)
+//   chunks[1..len-1]                whole
+//   chunks[len-1][..last_chunk_take]
+//   chunks[0][first_chunk_skip..last_chunk_take]  (len == 1)
+// blake3 of the concatenation == request.file_digest. Empty `chunks`
+// with skip=take=0: zero-byte file, or send_chunks=false.
+message StatBlobResponse {
+  repeated ChunkMeta chunks = 1;
+  uint32 first_chunk_skip = 2;
+  uint32 last_chunk_take = 3;
+}
+
+message GetNarIndexBatchRequest {
+  repeated bytes nar_hashes = 1;
+}
+
+// One per requested nar_hash, request order preserved. `index` absent
+// = path is not in the store or has no complete manifest.
+message NarIndexResponse {
+  bytes nar_hash = 1;
+  optional NarIndex index = 2;
+}
+
+// Per-path BatchGetManifest result: the PathInfo of a path that has a
+// complete manifest. Manifest content is never returned — a per-file
+// chunk list cannot reassemble a NAR without the Directory DAG, so
+// clients that want the NAR call GetPath (framing regenerated
+// server-side).
+message ManifestHint {
+  PathInfo info = 1;
+  // 2/3 were chunks / inline_blob (manifest content for a GetPath
+  // PG-skip fast path).
+  reserved 2, 3;
+  reserved "chunks", "inline_blob";
+}
+
+// Batch (PathInfo + complete-manifest availability) lookup — one PG
+// round-trip for many paths.
 //
 // Same local-only caveat as BatchQueryPathInfo: no upstream
 // substitution, no sig-visibility gate.
@@ -336,6 +553,40 @@ message GetChunkRequest {
 
 message GetChunkResponse {
   bytes data = 1;                         // Chunk data
+}
+
+// Bidi-stream batch fetch (P0568). Each message carries a slice of the
+// caller's miss list — the §7 fill task pipelines local-cache misses to
+// the server as it walks the chunk list rather than front-loading a
+// full-list `stat()` scan. The server fans out fetches and replies
+// out of order, so digests within and across request frames are
+// interchangeable; ordering is by content, not position.
+message GetChunksRequest {
+  // BLAKE3 digests of chunks to fetch. Each MUST be 32 bytes.
+  repeated bytes digests = 1;
+}
+
+// One chunk per message. `digest` keys the response — the server fans
+// out concurrent fetches (`K_server`, see chunk.rs) and yields in
+// completion order, not request order. The server never sends a
+// partial or unverified chunk: any miss/corruption/backend error
+// aborts the whole stream with a gRPC status (NOT_FOUND / DATA_LOSS /
+// UNAVAILABLE), and the client retries only the digests it didn't
+// receive (chunks are content-addressed; arrival order doesn't carry
+// information).
+message ChunkData {
+  bytes digest = 1;                       // BLAKE3 digest (32 bytes)
+  bytes data = 2;                         // Chunk bytes; blake3(data) == digest
+}
+
+// Batch durable-presence probe (ADR-022 §6.2, P0586). The chunk-granular
+// sibling of HasDirectories/HasBlobs; the response reuses HasBitmap.
+// A bit is set ONLY if the chunk is S3-durable — referenced by at least
+// one *complete* manifest — not merely refcount ≥ 1. Two builders racing
+// on the same novel chunk both see `false`, both upload, and the second
+// S3 PutObject is an idempotent overwrite of identical content (I-201).
+message HasChunksRequest {
+  repeated bytes digests = 1;  // 32-byte blake3 chunk digests
 }
 
 // ───────────────────────────────────────────────────────────────────────────

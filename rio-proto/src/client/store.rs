@@ -353,14 +353,11 @@ pub async fn batch_query_path_info(
         .collect()
 }
 
-/// BatchGetManifest with timeout. I-110c: builder calls this once
-/// before the FUSE-warm stat loop and primes its hint cache so each
-/// subsequent `GetPath` carries `manifest_hint` and the store skips PG.
+/// BatchGetManifest with timeout: batch (PathInfo + complete-manifest
+/// availability) lookup in one store round-trip.
 ///
 /// Returns `(path, Option<ManifestHint>)` per requested path, request
-/// order. `None` = no complete manifest. `Err(Unimplemented)` means
-/// the store predates I-110c — caller skips the prefetch (per-path
-/// `GetPath` falls back to PG as before).
+/// order. `None` = no complete manifest.
 pub async fn batch_get_manifest(
     client: &mut StoreServiceClient<Channel>,
     store_paths: Vec<String>,
@@ -392,20 +389,15 @@ pub async fn batch_get_manifest(
 /// layout determines whether tokio's auto-advance fires the timeout
 /// before in-process gRPC I/O completes. See
 /// `rio-gateway/tests/wire_opcodes/build.rs` reconnect tests comment.
-///
-/// `manifest_hint` (I-110c): pre-fetched (PathInfo, manifest) so the
-/// store skips its two PG lookups. `None` → store queries PG as before.
 pub async fn get_path_nar(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
     max_nar_size: u64,
-    manifest_hint: Option<crate::types::ManifestHint>,
     extra_metadata: &[(&'static str, &str)],
 ) -> Result<Option<(ValidatedPathInfo, Vec<u8>)>, NarCollectError> {
     let mut req = tonic::Request::new(GetPathRequest {
         store_path: store_path.to_string(),
-        manifest_hint,
     });
     crate::interceptor::inject_current(req.metadata_mut());
     inject_metadata(req.metadata_mut(), extra_metadata).map_err(NarCollectError::Stream)?;
@@ -448,13 +440,11 @@ pub async fn get_path_nar_to_file(
     store_path: &str,
     timeout: Duration,
     max_nar_size: u64,
-    manifest_hint: Option<crate::types::ManifestHint>,
     extra_metadata: &[(&'static str, &str)],
     spool: &mut (impl AsyncWrite + Unpin),
 ) -> Result<Option<ValidatedPathInfo>, NarCollectError> {
     let mut req = tonic::Request::new(GetPathRequest {
         store_path: store_path.to_string(),
-        manifest_hint,
     });
     crate::interceptor::inject_current(req.metadata_mut());
     inject_metadata(req.metadata_mut(), extra_metadata).map_err(NarCollectError::Stream)?;

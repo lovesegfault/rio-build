@@ -157,6 +157,7 @@ field_snapshot_tests! {
     admin_types_fields_frozen, regenerate_admin_types => "admin_types";
     build_types_fields_frozen, regenerate_build_types => "build_types";
     builder_fields_frozen,     regenerate_builder     => "builder";
+    castore_fields_frozen,     regenerate_castore     => "castore";
     dag_fields_frozen,         regenerate_dag         => "dag";
     scheduler_fields_frozen,   regenerate_scheduler   => "scheduler";
     store_fields_frozen,       regenerate_store       => "store";
