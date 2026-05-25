@@ -200,6 +200,9 @@
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
+    "rio_store_compat_write_bytes_total",
+    "rio_store_compat_write_failures_total",
+    "rio_store_compat_write_seconds",
     "rio_store_directory_get_seconds",
     "rio_store_directory_has_batch_size",
     "rio_store_directory_read_seconds",
@@ -1265,6 +1268,21 @@
         "name": "rio_store_chunk_dedup_ratio",
         "kind": "gauge",
         "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)"
+      },
+      {
+        "name": "rio_store_compat_write_bytes_total",
+        "kind": "counter",
+        "help": "Compressed bytes published as nar/*.nar.<ext> compat objects (the S3-storage cost of binary_cache_compat.enabled)."
+      },
+      {
+        "name": "rio_store_compat_write_failures_total",
+        "kind": "counter",
+        "help": "Binary-cache compat writes that failed (compress/S3/PG). The originating upload still succeeded; narinfo.compat_file_hash stays NULL until the compat reconciler backfills. Sustained nonzero = the compat bucket is unhealthy while the chunk store is fine."
+      },
+      {
+        "name": "rio_store_compat_write_seconds",
+        "kind": "histogram",
+        "help": "Binary-cache compat write latency per committed path (compress + nar/ PUT + .narinfo PUT + compat_file_hash update), labeled by result (ok|error). Runs post-commit inside the upload handler; sustained growth here is PutPath latency the client sees."
       },
       {
         "name": "rio_store_directory_get_seconds",

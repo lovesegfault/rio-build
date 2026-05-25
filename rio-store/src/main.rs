@@ -160,6 +160,40 @@ async fn main() -> anyhow::Result<()> {
         store_service = store_service.with_nar_budget(budget as usize);
     }
 
+    // Stock-Nix binary-cache compat writer (ADR-022 §10). Constructed
+    // only when enabled — the absence of a writer IS the OFF state
+    // (r[store.compat.runtime-toggle]). bucket unset → compat objects
+    // go through the chunk backend's blob namespace (same bucket +
+    // prefix as chunks/); bucket set → a dedicated S3-standard target
+    // at the bucket root, independent of the chunk backend kind.
+    if cfg.binary_cache_compat.enabled {
+        let blob_target: Arc<dyn ChunkBackend> = match &cfg.binary_cache_compat.bucket {
+            Some(bucket) => {
+                let client = rio_common::s3::default_client(cfg.s3_max_attempts).await;
+                Arc::new(rio_store::backend::S3ChunkBackend::new(
+                    client,
+                    bucket.clone(),
+                    String::new(),
+                ))
+            }
+            None => chunk_cache.backend(),
+        };
+        info!(
+            bucket = cfg.binary_cache_compat.bucket.as_deref().unwrap_or("<chunk backend>"),
+            compression = ?cfg.binary_cache_compat.compression,
+            write_mode = ?cfg.binary_cache_compat.write_mode,
+            "binary-cache compat writer enabled"
+        );
+        store_service =
+            store_service.with_compat_writer(Arc::new(rio_store::compat::CompatWriter::new(
+                pool.clone(),
+                blob_target,
+                cfg.binary_cache_compat.compression,
+            )));
+    } else {
+        info!("binary-cache compat writer disabled (binary_cache_compat.enabled = false)");
+    }
+
     // Substituter: upstream binary-cache fetch-on-miss. Shares the same
     // chunk backend as PutPath (NAR chunks go to the same S3 bucket)
     // and the same TenantSigner (for sig_mode=add|replace). Always

@@ -601,6 +601,15 @@ impl StoreServiceImpl {
             claim,
             &nar_data,
         );
+        // r[impl store.compat.write-after-commit]
+        // Stock-Nix compat objects, written only AFTER persist_nar's
+        // commit flipped the path to 'complete' (sync_after_commit
+        // semantics: the RPC response waits for it, but a failure is
+        // logged + metered inside write_after_commit and never reaches
+        // the client — the rio-native upload already succeeded).
+        if let Some(compat) = &self.compat_writer {
+            compat.write_after_commit(&info, &nar_data).await;
+        }
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         Ok(())

@@ -421,6 +421,14 @@ impl StoreServiceImpl {
         )
         .await?;
 
+        // TODO: binary-cache compat objects (.narinfo + nar/*.nar.zst) are
+        // NOT written inline here, unlike the buffered PutPath/PutPathBatch
+        // paths — the whole NAR isn't in RAM and an inline reassemble +
+        // compress + S3 PUT would add minutes to large builder uploads.
+        // These outputs keep `narinfo.compat_file_hash IS NULL`, which is
+        // exactly what the P0582 compat reconciler scans to backfill them
+        // off the hot path.
+
         for g in guards {
             g.defuse();
         }

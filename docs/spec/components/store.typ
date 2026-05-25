@@ -930,12 +930,53 @@ the bucket as a plain binary cache while rio rolls out) and the
 disaster-recovery floor (PG outage degrades to the slower stock-Nix path
 instead of a total substitution outage); operators flip it OFF ("pure rio
 mode") once every consumer is rio-aware to reclaim roughly half the S3
-storage. The compat writer itself, its post-commit ordering, the
-`nix-cache-info` bootstrap object, and GC of compat objects are specified by
-the companion requirements (`store.compat.nar-on-put`,
-`store.compat.narinfo-on-put`, `store.compat.write-after-commit`,
-`store.compat.stock-nix-substitute`, `store.compat.gc-coupled`), which land
-with the writer implementation.
+storage. The remaining companion requirements
+(`store.compat.stock-nix-substitute` for the end-to-end stock-`nix` VM proof,
+`store.compat.gc-coupled` for GC of compat objects) land with their own plan
+items.
+
+#r("store.compat.nar-on-put")[
+  For each path it publishes, the compat writer MUST upload the path's
+  complete NAR --- compressed with the configured codec --- to the compat
+  bucket at `nar/<file-hash>.nar.<ext>`, where `<file-hash>` is the nixbase32
+  SHA-256 of the *compressed* object itself and `<ext>` matches the codec
+  (`nar.zst` for `zstd`, `nar.xz` for `xz`, bare `nar` for `none`). The NAR
+  object MUST be uploaded before the narinfo that references it, so any
+  narinfo a client can observe always resolves.
+]
+
+#r("store.compat.narinfo-on-put")[
+  For each path it publishes, the compat writer MUST upload a stock-Nix
+  narinfo text object at `<store-path-hash-part>.narinfo` whose `URL` names
+  the published NAR object and whose `StorePath`, `Compression`, `FileHash`,
+  `FileSize`, `NarHash`, `NarSize`, `References` (store-path basenames),
+  `Deriver` (basename, when known), `Sig`, and `CA` fields reproduce the
+  committed metadata. The `Sig:` lines are the ed25519 signatures the store
+  produced at commit time, copied verbatim --- the compat layer never
+  re-signs. On its first write the writer MUST ensure a `nix-cache-info`
+  object exists in the bucket (`StoreDir: /nix/store`, `WantMassQuery: 1`).
+]
+
+#r("store.compat.write-after-commit")[
+  The compat write for a path MUST run only after the rio-native commit has
+  flipped the path's manifest to `'complete'`, and a compat-write failure
+  MUST NOT fail or roll back the originating upload RPC --- the failure is
+  logged, counted on
+  #(refs.metric)("rio_store_compat_write_failures_total"), and
+  `narinfo.compat_file_hash` is left NULL. A successful compat write MUST
+  record the SHA-256 of the published compressed NAR object in
+  `narinfo.compat_file_hash` (NULL therefore always means "objects not yet
+  written / not trustworthy").
+]
+
+The synchronous post-commit hook (`write_mode: sync_after_commit`) covers the
+buffered upload RPCs (`PutPath`, `PutPathBatch`) where the verified NAR is
+already in RAM; the response returns after the compat write, so its cost is
+one compression pass plus two S3 PUTs, bounded by the NAR size. Paths
+committed through `PutPathChunked` or upstream substitution are not written
+inline --- they are exactly the rows the compat reconciler (P0582) finds via
+`compat_file_hash IS NULL` and backfills off the hot path, which keeps
+builder-upload latency unaffected by the compat layer.
 
 = Two-Phase Garbage Collection
 

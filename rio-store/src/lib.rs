@@ -50,6 +50,8 @@ pub mod castore;
 #[cfg(feature = "server")]
 pub mod chunker;
 #[cfg(feature = "server")]
+pub mod compat;
+#[cfg(feature = "server")]
 pub mod config;
 #[cfg(feature = "server")]
 pub mod gc;
@@ -119,6 +121,13 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         &[
             1.0, 8.0, 32.0, 128.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
         ],
+    ),
+    (
+        // Same envelope as substitution: zstd/xz of a multi-GiB NAR plus
+        // two S3 PUTs spans ~10ms (kilobyte paths) to minutes (4 GiB at
+        // xz). The default 10s top would lose the large-path tail.
+        "rio_store_compat_write_seconds",
+        SUBSTITUTE_DURATION_BUCKETS,
     ),
 ];
 
@@ -385,6 +394,28 @@ pub fn describe_metrics() {
         "PG connection-pool utilization: (size - num_idle) / max_connections. \
          Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). \
          Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+    );
+
+    // Stock-Nix binary-cache compat writer (ADR-022 §10 / P0566).
+    // r[impl obs.metric.compat]
+    describe_histogram!(
+        "rio_store_compat_write_seconds",
+        "Binary-cache compat write latency per committed path (compress + \
+         nar/ PUT + .narinfo PUT + compat_file_hash update), labeled by \
+         result (ok|error). Runs post-commit inside the upload handler; \
+         sustained growth here is PutPath latency the client sees."
+    );
+    describe_counter!(
+        "rio_store_compat_write_failures_total",
+        "Binary-cache compat writes that failed (compress/S3/PG). The \
+         originating upload still succeeded; narinfo.compat_file_hash stays \
+         NULL until the compat reconciler backfills. Sustained nonzero = \
+         the compat bucket is unhealthy while the chunk store is fine."
+    );
+    describe_counter!(
+        "rio_store_compat_write_bytes_total",
+        "Compressed bytes published as nar/*.nar.<ext> compat objects \
+         (the S3-storage cost of binary_cache_compat.enabled)."
     );
 
     describe_counter!(

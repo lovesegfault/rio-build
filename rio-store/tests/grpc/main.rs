@@ -146,6 +146,38 @@ impl StoreSession {
         let s = Self::build(|pool| StoreServiceImpl::new(pool).with_chunk_cache(cache)).await?;
         Ok((s, backend))
     }
+
+    /// Store with the binary-cache compat writer enabled (zstd), a
+    /// cluster signer (so published narinfo carries `Sig:` lines), and
+    /// an externally visible chunk backend whose blob namespace
+    /// receives the compat objects. Returns the backend for
+    /// object-level assertions (`get_blob("….narinfo")` etc).
+    ///
+    /// Mirrors main.rs's enabled-default wiring: compat objects land in
+    /// the same backend as the chunks (`binary_cache_compat.bucket`
+    /// unset).
+    pub async fn new_with_compat() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
+        let backend = mem_backend();
+        let cache = Arc::new(rio_store::cas::ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
+        let blob_target: Arc<dyn ChunkBackend> = Arc::clone(&backend) as Arc<dyn ChunkBackend>;
+        let s = Self::build(|pool| {
+            let signer = rio_store::signing::Signer::from_seed("rio-test-1", &[7u8; 32]);
+            let ts = rio_store::signing::TenantSigner::new(signer, pool.clone());
+            let compat = rio_store::compat::CompatWriter::new(
+                pool.clone(),
+                blob_target,
+                rio_store::config::CompatCompression::Zstd,
+            );
+            StoreServiceImpl::new(pool)
+                .with_chunk_cache(cache)
+                .with_signer(ts)
+                .with_compat_writer(Arc::new(compat))
+        })
+        .await?;
+        Ok((s, backend))
+    }
 }
 
 impl Drop for StoreSession {
@@ -243,6 +275,7 @@ pub async fn put_path_with_token(
 mod admin;
 mod chunk_service;
 mod chunked;
+mod compat;
 mod core;
 mod directory;
 mod hash_part;

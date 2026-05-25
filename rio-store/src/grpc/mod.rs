@@ -282,6 +282,12 @@ pub struct StoreServiceImpl {
     ///
     /// [`wait_for_active_drain`]: rio_common::server::wait_for_active_drain
     active_get_path_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Stock-Nix binary-cache compat writer (ADR-022 §10). `Some` iff
+    /// `binary_cache_compat.enabled` — main.rs only constructs one for
+    /// enabled deployments, so this Option IS the runtime toggle
+    /// (`r[store.compat.runtime-toggle]`). Called after a successful
+    /// commit on the buffered upload paths; never on the error path.
+    compat_writer: Option<Arc<crate::compat::CompatWriter>>,
 }
 
 /// Default `GetPath` chunk-prefetch depth. See
@@ -323,6 +329,7 @@ impl StoreServiceImpl {
                 crate::nar_index::DEFAULT_NAR_INDEX_CONCURRENCY,
             )),
             active_get_path_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            compat_writer: None,
         }
     }
 
@@ -436,6 +443,15 @@ impl StoreServiceImpl {
     /// out from under them.
     pub fn with_nar_index_concurrency(mut self, n: usize) -> Self {
         self.index_sem = Arc::new(tokio::sync::Semaphore::new(n));
+        self
+    }
+
+    /// Enable the stock-Nix binary-cache compat writer. Builder-style.
+    /// main.rs constructs the [`crate::compat::CompatWriter`] only when
+    /// `binary_cache_compat.enabled`, so leaving this un-called IS the
+    /// "compat OFF" state — no extra flag to keep in sync.
+    pub fn with_compat_writer(mut self, writer: Arc<crate::compat::CompatWriter>) -> Self {
+        self.compat_writer = Some(writer);
         self
     }
 

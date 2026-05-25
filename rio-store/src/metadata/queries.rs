@@ -695,6 +695,29 @@ pub async fn bump_nar_index_retry(pool: &PgPool, store_path_hash: &[u8]) -> Resu
     Ok(())
 }
 
+/// Record a successful binary-cache compat write: `compat_file_hash`
+/// is the SHA-256 of the *compressed* `nar/…` object the compat writer
+/// just published (NULL = not yet written). The compat GC coupling
+/// (P0581) reads it to enqueue the object pair for deletion; the
+/// reconciler (P0582) selects `WHERE compat_file_hash IS NULL` to find
+/// backfill work.
+///
+/// Returns rows affected — 0 means the narinfo row vanished (GC won a
+/// race with the post-commit write); the caller cleans up the orphaned
+/// objects it just wrote.
+pub(crate) async fn set_compat_file_hash(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    file_hash: &[u8; 32],
+) -> Result<u64> {
+    let res = sqlx::query("UPDATE narinfo SET compat_file_hash = $2 WHERE store_path_hash = $1")
+        .bind(store_path_hash)
+        .bind(file_hash.as_slice())
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

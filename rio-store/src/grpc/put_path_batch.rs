@@ -212,6 +212,10 @@ impl StoreServiceImpl {
         // permit independently, so a 16-output batch indexes the first
         // `nar_index_concurrency` eagerly and leaves the rest for the
         // indexer_loop. r[store.index.putpath-eager]
+        //
+        // The binary-cache compat write rides the same loop: per
+        // output, after the batch commit, while the NAR bytes are
+        // still in RAM. Same never-fails contract as finalize_single.
         for accum in outputs.values_mut() {
             if accum.already_complete {
                 continue;
@@ -228,6 +232,10 @@ impl StoreServiceImpl {
                 claim,
                 &nar,
             );
+            // r[impl store.compat.write-after-commit]
+            if let Some(compat) = &self.compat_writer {
+                compat.write_after_commit(info, &nar).await;
+            }
         }
 
         for g in placeholder_guards {
@@ -425,6 +433,10 @@ impl StoreServiceImpl {
                     e.into(),
                 ));
             }
+            // Keep the signed copy: the post-commit compat write
+            // publishes the narinfo's `Sig:` lines from `accum.info`,
+            // which until here held the unsigned phase-2 value.
+            accum.info = Some(info);
             created[*idx as usize] = true;
         }
 

@@ -1212,6 +1212,27 @@
       "doc": "Backend returned None — chunk not in S3. If the manifest says this hash exists, this is data loss. Caller should propagate as a hard error (not retry — retrying NotFound is pointless)."
     },
     {
+      "enum": "CompatError",
+      "name": "Compress",
+      "crate": "rio-store",
+      "msg": "NAR compression ({codec}) failed: {source}",
+      "doc": "The compression codec failed (I/O error from the encoder)."
+    },
+    {
+      "enum": "CompatError",
+      "name": "Db",
+      "crate": "rio-store",
+      "msg": "compat_file_hash update failed: {0}",
+      "doc": "Recording `narinfo.compat_file_hash` failed. The S3 objects are in place but invisible to GC/reconciler bookkeeping; the reconciler re-writes them (idempotent — same content, same keys) once the column update succeeds on a later pass."
+    },
+    {
+      "enum": "CompatError",
+      "name": "Upload",
+      "crate": "rio-store",
+      "msg": "compat object upload failed for {key}: {source}",
+      "doc": "`put_blob` to the compat bucket failed (S3 fault, auth, …)."
+    },
+    {
       "enum": "ManifestError",
       "name": "BadLength",
       "crate": "rio-store",
@@ -1581,6 +1602,11 @@
       "name": "ChunkError",
       "crate": "rio-store",
       "doc": "Error from `ChunkCache::get_verified`."
+    },
+    {
+      "name": "CompatError",
+      "crate": "rio-store",
+      "doc": "How a compat write failed. The caller never propagates this into the RPC result — see [`CompatWriter::write_after_commit`]."
     },
     {
       "name": "ManifestError",

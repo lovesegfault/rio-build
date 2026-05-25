@@ -339,8 +339,9 @@ r[obs.metric.compat]
 | `rio_builder_castore_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"getattr"\|"readdir"\|"readlink"\|"open"\|"read"}` |
 | `rio_builder_castore_dag_prefetch_seconds` | `GetDirectory(recursive)` wall-clock per build |
 | `rio_store_tiered_local_hit_ratio` | Express-tier hits ÷ total `get()` per replica |
-| `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"err"}` |
+| `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"error"}` |
 | `rio_store_compat_write_failures_total` | compat writes that failed post-commit (reconciler backlog) |
+| `rio_store_compat_write_bytes_total` | compressed bytes published as compat `nar/` objects (the S3 cost of compat-ON) |
 | `rio_store_nar_index_compute_seconds` | `nar_ls` + blake3 pass duration at PutPath |
 | `rio_builder_castore_fuse_open_mode_total` | per-`open()` reply, labeled `{mode="passthrough"\|"keep_cache"}` — passthrough-not-negotiated visible as `passthrough`=0 |
 | `rio_builder_castore_fuse_open_case_total` | per-`open()` decision, labeled `{case="hit"\|"miss_small"\|"miss_stream"\|"wait_fetching"}` |

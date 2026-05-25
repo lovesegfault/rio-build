@@ -1305,6 +1305,16 @@
       "doc": "Content-defined chunking for NAR deduplication."
     },
     {
+      "path": "compat/",
+      "depth": 0,
+      "doc": "Stock-Nix binary-cache compatibility layer (ADR-022 Design Overview"
+    },
+    {
+      "path": "compat/writer.rs",
+      "depth": 1,
+      "doc": "Post-commit writer for the stock-Nix binary-cache object pair."
+    },
+    {
       "path": "config.rs",
       "depth": 0,
       "doc": "rio-store binary configuration."

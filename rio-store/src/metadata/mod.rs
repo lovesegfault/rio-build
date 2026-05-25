@@ -50,7 +50,8 @@ pub(crate) use cluster_key_history::load_cluster_key_history;
 pub(crate) use queries::{
     append_signatures, bump_nar_index_retry, find_missing_paths, get_manifest, get_manifest_batch,
     get_manifest_for_index, get_nar_index, list_nar_index_pending, path_by_nar_hash,
-    query_by_hash_part, query_path_info, query_path_info_batch, set_nar_index,
+    query_by_hash_part, query_path_info, query_path_info_batch, set_compat_file_hash,
+    set_nar_index,
 };
 pub(crate) use tenant_keys::get_active_signer;
 pub(crate) use upstreams::{SigMode, Upstream};
