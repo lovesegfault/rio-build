@@ -160,10 +160,15 @@ impl<W: Write> RewritingSink<W> {
 
         // Hold back the last (max_from - 1) bytes: they could be the
         // start of a match whose remainder arrives in the next write.
-        // (A match that *ended* inside the held-back region was
-        // already replaced above and is safe to forward next round —
-        // replacement output is never rescanned, matching CppNix.)
-        let keep = (self.max_from - 1).min(buf.len());
+        // Bytes already *replaced* above may land in the held-back
+        // region and be scanned again next round; that is harmless for
+        // hash-part rewrites because a replacement value is never one
+        // of the `from` patterns (scratch hashes are replaced *by*
+        // final hashes, never the other way around), so the rescan can
+        // never match. The forwarded region is final either way.
+        // (saturating_sub keeps the empty-rewrites invariant local even
+        // though that case already returned above.)
+        let keep = self.max_from.saturating_sub(1).min(buf.len());
         let forward = buf.len() - keep;
         self.inner.write_all(&buf[..forward])?;
         self.tail = buf[forward..].to_vec();
@@ -173,6 +178,11 @@ impl<W: Write> RewritingSink<W> {
 
 impl<W: Write> Write for RewritingSink<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // TODO(perf): this allocates a fresh working buffer (tail +
+        // chunk) per write call and a fresh tail Vec per call — one
+        // extra copy of the whole stream. A persistent reusable buffer
+        // would remove both; not worth it until a profile shows CA
+        // uploads spending time here.
         let mut buf = std::mem::take(&mut self.tail);
         buf.extend_from_slice(data);
         self.process(buf)?;
@@ -252,6 +262,12 @@ pub struct HashModuloSink {
 impl HashModuloSink {
     /// `modulus` is the 32-char nixbase32 hash part to zero out;
     /// `algo` is the output's declared hash algorithm.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `modulus` is empty. Callers always pass a store path's
+    /// hash part (32 characters by construction); an empty modulus is a
+    /// caller bug, not an input condition.
     pub fn new(algo: HashAlgo, modulus: &str) -> Self {
         let rewrites = vec![(modulus.as_bytes().to_vec(), vec![0u8; modulus.len()])];
         let inner = RewritingSink::new(rewrites, HashWriter::new(algo))

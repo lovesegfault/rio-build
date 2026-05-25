@@ -1000,10 +1000,12 @@ mod tests {
         // Pin the exact value so an accidental change to the recipe is
         // loud (the recipe itself is internal — see the doc comment —
         // but determinism across versions of rio matters for resumed
-        // builds and debugging).
+        // builds and debugging). The literal was produced by this very
+        // function and cross-checked against the construction documented
+        // above; it is a regression pin, not an external golden value.
         assert_eq!(
             out.as_str(),
-            StorePath::make_scratch_output_path(&StorePath::parse(drv.as_str())?, "out")?.as_str()
+            "/nix/store/j59587sic2b090w3ckpv8l82rhfiwm3i-rio-selfref-fixture"
         );
         Ok(())
     }
