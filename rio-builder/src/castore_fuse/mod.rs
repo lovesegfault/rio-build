@@ -10,6 +10,8 @@
 //!   cache promotion) and its UDS wire protocol.
 //! - [`mountd_client`] — the builder-side in-process client for that
 //!   protocol.
+//! - [`sweep`] — the daemon's disk-pressure eviction over the shared
+//!   cache/chunk trees and orphaned staging dirs.
 //! - [`tree`] — the mount-time Directory-DAG prefetch and the
 //!   content-addressed inode table.
 //! - [`open`] — the `open()` data path: backing-cache lookup, JIT
@@ -27,6 +29,7 @@ pub mod mountd;
 pub mod mountd_client;
 pub mod mountd_proto;
 pub mod open;
+pub mod sweep;
 pub mod tree;
 
 /// Cross-module tests that need a gRPC store and/or a mountd peer

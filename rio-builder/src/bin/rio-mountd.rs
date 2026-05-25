@@ -48,6 +48,12 @@ struct Args {
     /// supplementary group, which SO_PEERCRED never reports).
     #[arg(long)]
     allowed_gid: u32,
+    /// Disk-pressure sweep period in seconds: how often statvfs probes
+    /// the cache/chunks/staging trees and, below 10% free, evicts
+    /// (orphaned staging, then chunks, then cache, oldest first) until
+    /// 20% is free again. 0 disables the sweep.
+    #[arg(long, default_value_t = 30)]
+    sweep_interval_secs: u64,
     /// Prometheus exporter listen address.
     #[arg(long, default_value = "[::]:9095")]
     metrics_addr: std::net::SocketAddr,
@@ -90,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         staging_quota_bytes: args.staging_quota_bytes,
         max_promote_bytes: args.max_promote_bytes,
         allowed_gid: args.allowed_gid,
+        sweep_interval: std::time::Duration::from_secs(args.sweep_interval_secs),
     });
     tokio::select! {
         r = serve => r,

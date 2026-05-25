@@ -109,6 +109,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         ],
     ),
     (
+        // A triggered sweep unlinks anywhere from a handful of staging
+        // orphans (ms) to hundreds of thousands of cache entries on a
+        // nearly-full node SSD (minutes). The [0.005..10.0] default
+        // truncates the slow tail that matters for alerting.
+        "rio_mountd_sweep_seconds",
+        &[0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+    ),
+    (
         // Bimodal: a backing-cache hit is one stat + one mountd
         // round-trip (sub-ms to low ms); a miss is a whole-file
         // ReadBlob bounded by jit_fetch_timeout (60 s). The default
@@ -204,6 +212,17 @@ pub fn describe_metrics() {
         "rio_builder_castore_dag_prefetch_seconds",
         "Mount-time GetDirectory(recursive=true) Directory-DAG prefetch wall-clock \
          per build (one multi-root call for the whole input closure)."
+    );
+    describe_counter!(
+        "rio_builder_objects_cache_hit_total",
+        "Castore-FUSE open()s whose file_digest was already present in the node-shared \
+         backing cache (/var/rio/cache) — no fetch, straight to passthrough. The \
+         cross-build amortization signal for the mountd-owned objects cache (P0571)."
+    );
+    describe_counter!(
+        "rio_builder_objects_cache_bytes",
+        "Bytes served from the node-shared backing cache on open() hits (the file sizes \
+         that did NOT have to be re-fetched from rio-store)."
     );
 
     describe_counter!(

@@ -217,9 +217,14 @@ impl OpenPath {
     /// fuser threads: exactly one performs the fetch, the rest wait.
     pub fn ensure_backing(&self, file_digest: &[u8; 32], size: u64) -> Result<OpenCase, Errno> {
         // (a) Cache hit — the common steady-state case. No locks, no
-        // RPCs: one stat against the node SSD.
+        // RPCs: one stat against the node SSD. The objects-cache
+        // observables count exactly this case: the digest was already
+        // present in the shared backing cache, so `size` bytes did not
+        // have to be re-fetched from the store (P0571).
         // r[impl builder.fs.passthrough-on-hit]
         if self.cache_path(file_digest).exists() {
+            metrics::counter!("rio_builder_objects_cache_hit_total").increment(1);
+            metrics::counter!("rio_builder_objects_cache_bytes").increment(size);
             return Ok(OpenCase::Hit);
         }
 

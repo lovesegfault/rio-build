@@ -103,6 +103,11 @@
       "doc": "The castore-FUSE `open()` data path (ADR-022 §2.6–§2.7)."
     },
     {
+      "path": "castore_fuse/sweep.rs",
+      "depth": 1,
+      "doc": "Disk-pressure sweep over the mountd-owned `/var/rio` trees (P0571)."
+    },
+    {
       "path": "castore_fuse/tree.rs",
       "depth": 1,
       "doc": "DAG prefetch + content-addressed inode model (ADR-022 §2.2–§2.3)."

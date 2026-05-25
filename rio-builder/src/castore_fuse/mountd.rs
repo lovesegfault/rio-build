@@ -48,6 +48,7 @@ use tracing::{info, warn};
 use super::mountd_proto::{
     self as proto, ErrKind, FrameError, PROMOTE_CHUNKS_MAX, Reply, Req, Request, Resp,
 };
+use super::sweep;
 use crate::IgnorePoison;
 use crate::quota::apply_project_quota;
 
@@ -104,6 +105,11 @@ pub struct MountdConfig {
     /// `SO_PEERCRED.gid` allowed to connect. Connections from any other
     /// gid are dropped before a single frame is read.
     pub allowed_gid: u32,
+    /// How often the disk-pressure sweep ([`super::sweep`]) probes the
+    /// cache/chunks/staging trees. `Duration::ZERO` disables it (unit
+    /// and bring-up environments where the daemon does not own the
+    /// disk).
+    pub sweep_interval: Duration,
 }
 
 /// `^[A-Za-z0-9_-]{1,64}$` without pulling a regex into the hot path.
@@ -167,6 +173,43 @@ fn backing_close(fuse_fd: BorrowedFd<'_>, id: u32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Bump the mtime of the shared-cache entry behind a successful
+/// `BackingOpen` so the disk-pressure sweep — which evicts oldest-mtime
+/// first because every production `/var/rio` mount is `noatime` — sees
+/// it as recently used (a true LRU stamp, not promote-time FIFO).
+///
+/// Best-effort and narrowly gated: the fd came from the builder, so it
+/// is touched only when it looks exactly like a published shared-cache
+/// entry (regular file, owned by the daemon's own uid, mode 0444, on
+/// the same filesystem as the cache/chunk roots). Anything else — the
+/// builder's own staging files, castore-FUSE inodes, random host files
+/// it can read — is left alone; the broker must not become a
+/// touch-arbitrary-files oracle.
+fn touch_backing_entry(cache_base: &OwnedFd, chunks_base: &OwnedFd, backing: BorrowedFd<'_>) {
+    let Ok(st) = nix::sys::stat::fstat(backing) else {
+        return;
+    };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || (st.st_mode & 0o7777) != 0o444
+        || st.st_uid != nix::unistd::geteuid().as_raw()
+    {
+        return;
+    }
+    let on_shared_fs = [cache_base, chunks_base]
+        .into_iter()
+        .any(|base| nix::sys::stat::fstat(base).is_ok_and(|b| b.st_dev == st.st_dev));
+    if !on_shared_fs {
+        return;
+    }
+    let now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_NOW,
+    };
+    // SAFETY: `backing` is a live fd for the duration of the call; the
+    // two-element timespec array outlives it.
+    let _ = unsafe { libc::futimens(backing.as_raw_fd(), [now, now].as_ptr()) };
 }
 
 // ─── Promote ───────────────────────────────────────────────────────────
@@ -487,6 +530,8 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
         cfg,
     });
 
+    spawn_sweep(&shared);
+
     let listener = bind_socket(&shared.cfg)?;
     info!(socket = %shared.cfg.socket_path.display(), "rio-mountd listening");
     let listener = AsyncFd::with_interest(listener, Interest::READABLE)?;
@@ -516,6 +561,43 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
             }
         });
     }
+}
+
+/// Spawn the periodic disk-pressure sweep (P0571). One pass per
+/// [`MountdConfig::sweep_interval`]: `statvfs` the three trees, and
+/// when the low-water mark trips, evict orphaned staging, then chunks,
+/// then backing-cache entries (oldest mtime first) until the high-water
+/// mark clears — see [`super::sweep`] for the policy. The pass does
+/// blocking filesystem I/O, so it runs on the blocking pool; the
+/// `live_build_ids` set keeps it from ever touching a live build's
+/// staging dir.
+fn spawn_sweep(shared: &Arc<Shared>) {
+    if shared.cfg.sweep_interval.is_zero() {
+        info!("disk-pressure sweep disabled (sweep_interval = 0)");
+        return;
+    }
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        let dirs = sweep::SweepDirs {
+            cache: shared.cfg.cache_dir.clone(),
+            chunks: shared.cfg.chunks_dir.clone(),
+            staging: shared.cfg.staging_dir.clone(),
+        };
+        let mut ticker = tokio::time::interval(shared.cfg.sweep_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let shared = Arc::clone(&shared);
+            let dirs = dirs.clone();
+            let pass = tokio::task::spawn_blocking(move || {
+                sweep::sweep_pass(&dirs, &shared.live_build_ids)
+            })
+            .await;
+            if let Err(e) = pass {
+                warn!(error = %e, "disk-pressure sweep pass panicked");
+            }
+        }
+    });
 }
 
 /// `SOCK_SEQPACKET` listener at `cfg.socket_path`, mode 0660, group
@@ -813,6 +895,14 @@ async fn handle_frame(
                     ) {
                         Ok(id) => {
                             state.live_backing_ids += 1;
+                            // A successful BackingOpen of a shared-cache
+                            // entry is the "this content is in use"
+                            // signal the LRU sweep orders evictions by.
+                            touch_backing_entry(
+                                &shared.cache_base,
+                                &shared.chunks_base,
+                                backing.as_fd(),
+                            );
                             Resp::BackingId(id)
                         }
                         Err(e) => Resp::Err(ErrKind::Retryable(format!("BACKING_OPEN: {e}"))),
@@ -1193,6 +1283,30 @@ pub fn describe_metrics() {
         "rio_mountd_connections_current",
         "Live UDS connections (== builds being served on this node)"
     );
+    describe_gauge!(
+        "rio_mountd_cache_free_bytes",
+        "Free bytes (statvfs f_bavail × f_frsize) on the filesystem hosting the shared \
+         backing cache, sampled at the disk-pressure sweep interval"
+    );
+    describe_counter!(
+        "rio_mountd_sweep_low_space_total",
+        "Disk-pressure sweep activations: min(free%) across cache/chunks/staging dropped \
+         below the low-water mark (10%)"
+    );
+    describe_counter!(
+        "rio_mountd_sweep_removed_total",
+        "Entries removed by the disk-pressure sweep, labeled by tier \
+         (staging = orphaned per-build staging trees, chunks, cache)"
+    );
+    describe_counter!(
+        "rio_mountd_sweep_bytes_freed_total",
+        "Bytes reclaimed by the disk-pressure sweep, labeled by tier (staging/chunks/cache)"
+    );
+    describe_histogram!(
+        "rio_mountd_sweep_seconds",
+        "Wall-clock duration of one triggered disk-pressure sweep pass (eviction until \
+         the high-water mark clears or candidates run out)"
+    );
 }
 
 #[cfg(test)]
@@ -1214,6 +1328,60 @@ mod tests {
         assert!(!validate_build_id("a b"));
         assert!(!validate_build_id("a\0b"));
         assert!(!validate_build_id("ünïcode"));
+    }
+
+    /// `BackingOpen` refreshes the LRU stamp of a published cache entry
+    /// (mode 0444, daemon-owned, on the cache filesystem) — and only of
+    /// such files: anything that does not look like a published entry
+    /// keeps its mtime.
+    #[test]
+    fn touch_backing_entry_bumps_only_published_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let chunks = tmp.path().join("chunks");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&chunks).unwrap();
+        let cache_base = dirfd(&cache);
+        let chunks_base = dirfd(&chunks);
+
+        let old = libc::timespec {
+            tv_sec: 1_000_000,
+            tv_nsec: 0,
+        };
+        let make = |path: &Path, mode: u32| {
+            std::fs::write(path, b"x").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let f = std::fs::File::open(path).unwrap();
+            // SAFETY: `f` is live for the call; the array outlives it.
+            assert_eq!(
+                unsafe { libc::futimens(f.as_raw_fd(), [old, old].as_ptr()) },
+                0
+            );
+            f
+        };
+
+        // Published entry: 0444, our uid, on the cache fs → touched.
+        let published = cache.join("ab-entry");
+        let f = make(&published, 0o444);
+        touch_backing_entry(&cache_base, &chunks_base, f.as_fd());
+        let mtime = std::fs::metadata(&published).unwrap().modified().unwrap();
+        assert!(
+            mtime > std::time::UNIX_EPOCH + Duration::from_secs(2_000_000),
+            "published entry's mtime must be refreshed"
+        );
+
+        // Builder-writable file (not 0444): left alone.
+        let foreign = cache.join("not-an-entry");
+        let f = make(&foreign, 0o644);
+        touch_backing_entry(&cache_base, &chunks_base, f.as_fd());
+        let mtime = std::fs::metadata(&foreign).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime,
+            std::time::UNIX_EPOCH + Duration::from_secs(1_000_000),
+            "non-0444 file must keep its mtime"
+        );
     }
 
     /// A staging dir and a cache root in a tempdir, plus the path

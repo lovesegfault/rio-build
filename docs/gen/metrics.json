@@ -28,6 +28,8 @@
     "rio_builder_jit_inputs_registered",
     "rio_builder_log_lines_suppressed_total",
     "rio_builder_memory_fraction",
+    "rio_builder_objects_cache_bytes",
+    "rio_builder_objects_cache_hit_total",
     "rio_builder_overlay_teardown_failures_total",
     "rio_builder_prefetch_filtered_total",
     "rio_builder_prefetch_total",
@@ -79,11 +81,16 @@
     "rio_gateway_opcodes_total",
     "rio_gateway_putpath_aborted_retries_total",
     "rio_gateway_quota_rejections_total",
+    "rio_mountd_cache_free_bytes",
     "rio_mountd_connections_current",
     "rio_mountd_promote_bytes_total",
     "rio_mountd_promote_inflight",
     "rio_mountd_promote_reject_total",
     "rio_mountd_request_seconds",
+    "rio_mountd_sweep_bytes_freed_total",
+    "rio_mountd_sweep_low_space_total",
+    "rio_mountd_sweep_removed_total",
+    "rio_mountd_sweep_seconds",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -385,6 +392,16 @@
         "help": "Worker cgroup memory utilization: memory.current / memory.max. 0.0 if memory.max is unbounded ('max' literal)."
       },
       {
+        "name": "rio_builder_objects_cache_bytes",
+        "kind": "counter",
+        "help": "Bytes served from the node-shared backing cache on open() hits (the file sizes that did NOT have to be re-fetched from rio-store)."
+      },
+      {
+        "name": "rio_builder_objects_cache_hit_total",
+        "kind": "counter",
+        "help": "Castore-FUSE open()s whose file_digest was already present in the node-shared backing cache (/var/rio/cache) — no fetch, straight to passthrough. The cross-build amortization signal for the mountd-owned objects cache (P0571)."
+      },
+      {
         "name": "rio_builder_overlay_teardown_failures_total",
         "kind": "counter",
         "help": "Overlay unmount failures (leaked mount); alert if rate > 0"
@@ -646,6 +663,11 @@
     ],
     "mountd": [
       {
+        "name": "rio_mountd_cache_free_bytes",
+        "kind": "gauge",
+        "help": "Free bytes (statvfs f_bavail × f_frsize) on the filesystem hosting the shared backing cache, sampled at the disk-pressure sweep interval"
+      },
+      {
         "name": "rio_mountd_connections_current",
         "kind": "gauge",
         "help": "Live UDS connections (== builds being served on this node)"
@@ -669,6 +691,26 @@
         "name": "rio_mountd_request_seconds",
         "kind": "histogram",
         "help": "UDS request latency (labeled by op: mount/backing_open/backing_close/promote/promote_chunks)"
+      },
+      {
+        "name": "rio_mountd_sweep_bytes_freed_total",
+        "kind": "counter",
+        "help": "Bytes reclaimed by the disk-pressure sweep, labeled by tier (staging/chunks/cache)"
+      },
+      {
+        "name": "rio_mountd_sweep_low_space_total",
+        "kind": "counter",
+        "help": "Disk-pressure sweep activations: min(free%) across cache/chunks/staging dropped below the low-water mark (10%)"
+      },
+      {
+        "name": "rio_mountd_sweep_removed_total",
+        "kind": "counter",
+        "help": "Entries removed by the disk-pressure sweep, labeled by tier (staging = orphaned per-build staging trees, chunks, cache)"
+      },
+      {
+        "name": "rio_mountd_sweep_seconds",
+        "kind": "histogram",
+        "help": "Wall-clock duration of one triggered disk-pressure sweep pass (eviction until the high-water mark clears or candidates run out)"
       }
     ],
     "scheduler": [
