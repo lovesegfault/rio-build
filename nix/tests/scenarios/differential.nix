@@ -246,7 +246,11 @@ pkgs.testers.runNixOSTest {
                 # Floating-CA outputs have no static path and `nix-store -q
                 # --outputs` refuses CA derivations entirely; those entries
                 # are only ever compared as documented divergences, so skip.
-                rc_out, out_lines = machine.execute(f"nix-store -q --outputs {drv}")
+                # stderr is dropped: the refusal is expected and its error
+                # text in the console log reads like a test failure.
+                rc_out, out_lines = machine.execute(
+                    f"nix-store -q --outputs {drv} 2>/dev/null"
+                )
                 lines = out_lines.strip().splitlines() if rc_out == 0 else []
                 if len(lines) == 1:
                     path = lines[0]
@@ -277,10 +281,34 @@ pkgs.testers.runNixOSTest {
         return json.loads(machine.succeed(f"cat /tmp/native/{name}/report.json"))
 
 
+    def dump_native_failure(name, report):
+        """Print everything the driver knows about a failed entry, so the
+        test log alone explains a failure (no VM re-run needed)."""
+        print(f"--- {name}: native report (failure evidence) ---")
+        print(f"  classification: {report.get('classification')}")
+        print(f"  error_msg:      {report.get('error_msg')}")
+        print(f"  glue_error:     {report.get('glue_error')}")
+        print(f"  fod_check:      {report.get('fod_check')}")
+        for line in report.get("log", {}).get("tail", []):
+            print(f"  build| {line}")
+        rc_log, driver_log = machine.execute(f"cat /tmp/native/{name}/driver.log")
+        if rc_log == 0 and driver_log.strip():
+            for line in driver_log.strip().splitlines()[-40:]:
+                print(f"  driver| {line}")
+
+
     def check_entry(name, meta):
         with subtest(f"corpus entry: {name}"):
             drv = instantiate(name)
             report = native_build(name, drv)
+            try:
+                run_entry_assertions(name, meta, drv, report)
+            except AssertionError:
+                dump_native_failure(name, report)
+                raise
+
+
+    def run_entry_assertions(name, meta, drv, report):
             ok, oracle = oracle_build(drv)
 
             # The @nix side-channel must never reach the forwarded log.

@@ -90,7 +90,16 @@ pub struct LogReport {
     /// setPhase values seen, in order.
     pub phases: Vec<String>,
     pub cap_exceeded: bool,
+    /// The last forwarded log lines (lossy UTF-8), so a failing corpus
+    /// entry's report is self-explanatory without re-running the VM
+    /// with a debugger attached. Bounded by [`LOG_TAIL_LINES`].
+    pub tail: Vec<String>,
 }
+
+/// How many trailing forwarded log lines the report keeps. Enough to
+/// see why a builder script failed; small enough that report.json stays
+/// readable in the test log.
+const LOG_TAIL_LINES: usize = 40;
 
 /// The driver's full result for one derivation.
 #[derive(Debug, Serialize)]
@@ -253,6 +262,10 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
                         if l.starts_with(b"@nix ") {
                             log.forwarded_atnix = true;
                         }
+                        if log.tail.len() == LOG_TAIL_LINES {
+                            log.tail.remove(0);
+                        }
+                        log.tail.push(String::from_utf8_lossy(&l).into_owned());
                     }
                     LineAction::Phase(p) => log.phases.push(p),
                     LineAction::Consumed => {}
