@@ -72,6 +72,11 @@
     "rio_gateway_channels_active",
     "rio_gateway_connections_active",
     "rio_gateway_connections_total",
+    "rio_gateway_dagsync_blobs_fetched_total",
+    "rio_gateway_dagsync_bytes_fetched_total",
+    "rio_gateway_dagsync_bytes_saved_total",
+    "rio_gateway_dagsync_dirs_fetched_total",
+    "rio_gateway_dagsync_subtrees_pruned_total",
     "rio_gateway_errors_total",
     "rio_gateway_handshakes_total",
     "rio_gateway_jwt_mint_degraded_total",
@@ -614,6 +619,31 @@
         "name": "rio_gateway_connections_total",
         "kind": "counter",
         "help": "Total SSH connections (labeled by result: new/accepted/rejected/rejected_jwt)"
+      },
+      {
+        "name": "rio_gateway_dagsync_blobs_fetched_total",
+        "kind": "counter",
+        "help": "Delta-sync file contents fetched from the remote peer via ReadBlob (= changed files)"
+      },
+      {
+        "name": "rio_gateway_dagsync_bytes_fetched_total",
+        "kind": "counter",
+        "help": "Delta-sync file-content bytes transferred from the remote peer"
+      },
+      {
+        "name": "rio_gateway_dagsync_bytes_saved_total",
+        "kind": "counter",
+        "help": "Delta-sync file-content bytes sourced from the local store instead of the remote peer"
+      },
+      {
+        "name": "rio_gateway_dagsync_dirs_fetched_total",
+        "kind": "counter",
+        "help": "Delta-sync Directory bodies fetched from the remote peer (= changed directories discovered)"
+      },
+      {
+        "name": "rio_gateway_dagsync_subtrees_pruned_total",
+        "kind": "counter",
+        "help": "Delta-sync BFS subtrees skipped because the local store already held the dir_digest (each one is a whole subtree never enumerated against the remote)"
       },
       {
         "name": "rio_gateway_errors_total",

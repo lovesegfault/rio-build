@@ -255,7 +255,7 @@ const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Back
 /// stream without copying the buffer. `info` is `Clone` (cheap — strings
 /// and Vecs already heap-allocated).
 // r[impl gw.put.aborted-retry]
-pub(super) async fn grpc_put_path(
+pub(crate) async fn grpc_put_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     service_signer: Option<&rio_auth::hmac::HmacSigner>,

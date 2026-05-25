@@ -25,6 +25,10 @@ const SOURCES: &[(&str, &str)] = &[
     ("session.rs", include_str!("../src/session.rs")),
     ("translate.rs", include_str!("../src/translate.rs")),
     ("drv_cache.rs", include_str!("../src/drv_cache.rs")),
+    (
+        "substitute/mod.rs",
+        include_str!("../src/substitute/mod.rs"),
+    ),
 ];
 
 /// Is `line` a gRPC client call we want to audit? Matches

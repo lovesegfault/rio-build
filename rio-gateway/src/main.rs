@@ -74,17 +74,26 @@ async fn main() -> anyhow::Result<()> {
     //   loop. Held in _balance_guard.
     // - Single (non-K8s): plain connect. VM tests and local dev.
     //
+    // The store connect goes through `connect_raw` so the same
+    // `Channel` can back both the `StoreServiceClient` (every opcode
+    // handler) and, when delta-sync is configured, the local
+    // `DirectoryServiceClient` (HasDirectories/HasBlobs/ReadBlob
+    // against the gateway's own store) — one TCP connection, not two.
+    //
     // `connect_forever` → `None` only on shutdown (clean exit).
-    let Some((store_client, scheduler_client, _balance_guard)) =
+    use rio_proto::client::ProtoClient as _;
+    type StoreClient = rio_proto::StoreServiceClient<tonic::transport::Channel>;
+    let Some((store_channel, scheduler_client, _balance_guard)) =
         rio_proto::client::connect_forever(&shutdown, || async {
-            let (store, _) = rio_proto::client::connect(&cfg.store).await?;
+            let (store_ch, _) = rio_proto::client::connect_raw::<StoreClient>(&cfg.store).await?;
             let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-            anyhow::Ok((store, sched, guard))
+            anyhow::Ok((store_ch, sched, guard))
         })
         .await
     else {
         return Ok(());
     };
+    let store_client = StoreClient::wrap(store_channel.clone());
 
     // SERVING gate: retry loop above exited ⇒ both store + scheduler
     // are reachable. A gateway that can't reach the scheduler would
@@ -158,6 +167,37 @@ async fn main() -> anyhow::Result<()> {
     let server = match service_signer {
         Some(s) => server.with_service_hmac_signer(s),
         None => server,
+    };
+    // Directory-DAG delta-sync peer (r[gw.substitute.dag-delta-sync]).
+    // The peer channel is LAZY — connect_lazy never fails and never
+    // blocks startup on an unreachable peer (a cross-region store
+    // being down must not keep the local gateway from serving). The
+    // first sync attempt against a dead peer fails its probe and the
+    // client falls back to the whole-NAR push.
+    let server = match &cfg.substitute_store_addr {
+        None => server,
+        Some(addr) => {
+            let remote_channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "substitute_store_addr {addr:?} is not a valid URI authority: {e}"
+                    )
+                })?
+                .connect_timeout(std::time::Duration::from_secs(10))
+                // Same h2 keepalive posture as connect_store_lazy: a
+                // half-open cross-region connection should be detected
+                // in ~40s, not at the kernel TCP timeout.
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .keep_alive_timeout(std::time::Duration::from_secs(10))
+                .keep_alive_while_idle(true)
+                .connect_lazy();
+            info!(peer = %addr, "directory-DAG delta-sync substituter enabled");
+            server.with_dag_sync_peer(rio_gateway::substitute::DagSyncPeer::new(
+                store_channel.clone(),
+                remote_channel,
+                addr.clone(),
+            ))
+        }
     };
     // I-109: hot-reload the key set when the Secret mount refreshes.
     // Tied to serve_shutdown so the watcher exits with the accept loop;

@@ -678,6 +678,16 @@
       "doc": "Per-SSH-channel protocol session state machine."
     },
     {
+      "path": "substitute/",
+      "depth": 0,
+      "doc": "Gateway-side delta-sync substituter (ADR-022 §8, P0574)."
+    },
+    {
+      "path": "substitute/dag_sync.rs",
+      "depth": 1,
+      "doc": "Directory-DAG delta-sync: discover what changed, fetch only that."
+    },
+    {
       "path": "translate.rs",
       "depth": 0,
       "doc": "DAG reconstruction and gRPC request building."

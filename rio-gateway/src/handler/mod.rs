@@ -359,6 +359,13 @@ pub struct SessionContext {
     /// Handlers that emit version-gated wire fields (e.g.
     /// `BuildResult.cpu_user` at ≥1.37) read this.
     pub negotiated_version: u64,
+    /// Directory-DAG delta-sync peer (ADR-022 §8, P0574). `None` =
+    /// no `substitute_store_addr` configured — `wopQueryValidPaths`
+    /// with `substitute = true` behaves exactly as before (the missing
+    /// set is reported back and the client pushes whole NARs). Set via
+    /// [`SessionContext::with_dag_peer`] rather than a constructor arg
+    /// so the (many) existing test call sites don't churn.
+    pub dag_peer: Option<crate::substitute::DagSyncPeer>,
 }
 
 impl SessionContext {
@@ -383,7 +390,16 @@ impl SessionContext {
             limiter,
             quota_cache,
             negotiated_version: rio_nix::protocol::handshake::PROTOCOL_VERSION,
+            dag_peer: None,
         }
+    }
+
+    /// Attach the delta-sync peer. Builder-style so the (many) existing
+    /// `SessionContext::new` call sites in tests don't grow an argument.
+    #[must_use]
+    pub fn with_dag_peer(mut self, peer: Option<crate::substitute::DagSyncPeer>) -> Self {
+        self.dag_peer = peer;
+        self
     }
 }
 

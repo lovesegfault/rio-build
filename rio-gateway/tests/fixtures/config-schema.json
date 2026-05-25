@@ -110,6 +110,14 @@
         "format": "uint",
         "minimum": 0,
         "default": 1048576
+      },
+      "substitute_store_addr": {
+        "description": "Peer rio-store `host:port` for the directory-DAG delta-sync\nsubstituter (`r[gw.substitute.dag-delta-sync]`). When set, a\n`nix copy --substitute-on-destination` against this gateway\nmakes the gateway pull the missing closure from the peer —\ntransferring only the subtrees and file contents the local\nstore doesn't already hold — instead of having the client push\nwhole NARs. Unset (default) = disabled; the `substitute` flag\non `wopQueryValidPaths` is ignored as before. The connection is\nlazy: an unreachable peer surfaces on the first sync attempt\n(which falls back to the whole-NAR push), never at startup.\nEnv: `RIO_SUBSTITUTE_STORE_ADDR`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
       }
     },
     "$defs": {
@@ -207,6 +215,7 @@
     "rate_limit": null,
     "service_hmac_key_path": null,
     "max_connections": 1000,
-    "max_transitive_inputs": 1048576
+    "max_transitive_inputs": 1048576,
+    "substitute_store_addr": null
   }
 }

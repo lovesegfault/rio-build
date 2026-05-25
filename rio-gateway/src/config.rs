@@ -103,6 +103,18 @@ pub struct Config {
     /// (100k — ~8 MB of path strings). Set via
     /// `RIO_MAX_TRANSITIVE_INPUTS`.
     pub max_transitive_inputs: usize,
+    /// Peer rio-store `host:port` for the directory-DAG delta-sync
+    /// substituter (`r[gw.substitute.dag-delta-sync]`). When set, a
+    /// `nix copy --substitute-on-destination` against this gateway
+    /// makes the gateway pull the missing closure from the peer —
+    /// transferring only the subtrees and file contents the local
+    /// store doesn't already hold — instead of having the client push
+    /// whole NARs. Unset (default) = disabled; the `substitute` flag
+    /// on `wopQueryValidPaths` is ignored as before. The connection is
+    /// lazy: an unreachable peer surfaces on the first sync attempt
+    /// (which falls back to the whole-NAR push), never at startup.
+    /// Env: `RIO_SUBSTITUTE_STORE_ADDR`.
+    pub substitute_store_addr: Option<String>,
 }
 
 impl Default for Config {
@@ -131,6 +143,7 @@ impl Default for Config {
             service_hmac_key_path: None,
             max_connections: crate::server::DEFAULT_MAX_CONNECTIONS,
             max_transitive_inputs: crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS,
+            substitute_store_addr: None,
         }
     }
 }
@@ -217,6 +230,18 @@ impl rio_common::config::ValidateConfig for Config {
              would reject every SSH connection (set RIO_JWT__KEY_PATH or \
              unset RIO_JWT__REQUIRED)"
         );
+        // An empty peer addr would only fail at the first sync attempt
+        // (lazy channel) with an opaque URI-parse error. Catch it at
+        // startup with the env var named. Unset means disabled; empty
+        // means the operator set the var to nothing by mistake.
+        if let Some(addr) = &self.substitute_store_addr {
+            anyhow::ensure!(
+                !addr.trim().is_empty(),
+                "substitute_store_addr is set but empty — unset \
+                 RIO_SUBSTITUTE_STORE_ADDR to disable delta-sync, or point it \
+                 at a peer rio-store host:port"
+            );
+        }
         Ok(())
     }
 }
@@ -255,6 +280,9 @@ mod tests {
         // (the right value is workload-dependent).
         assert!(d.rate_limit.is_none());
         assert_eq!(d.max_connections, crate::server::DEFAULT_MAX_CONNECTIONS);
+        // Delta-sync disabled by default — there is no sensible
+        // compiled-in peer address.
+        assert!(d.substitute_store_addr.is_none());
     }
 
     /// clap --help must still work (no panics in derive expansion).
@@ -272,6 +300,7 @@ mod tests {
         r#"
         max_connections = 555
         max_transitive_inputs = 250000
+        substitute_store_addr = "store-b.example:9002"
 
 
         [jwt]
@@ -285,6 +314,10 @@ mod tests {
         |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
             assert_eq!(cfg.max_transitive_inputs, 250_000);
+            assert_eq!(
+                cfg.substitute_store_addr.as_deref(),
+                Some("store-b.example:9002")
+            );
             assert!(
                 cfg.jwt.required,
                 "[jwt] table must thread through the config layers into JwtConfig"
@@ -314,6 +347,7 @@ mod tests {
             cfg.max_transitive_inputs,
             crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS
         );
+        assert!(cfg.substitute_store_addr.is_none());
     });
 
     // -----------------------------------------------------------------------

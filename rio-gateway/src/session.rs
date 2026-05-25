@@ -133,9 +133,9 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
-// 8 args is one over clippy's default of 7. The alternatives
+// 10 args is over clippy's default of 7. The alternatives
 // (grouping into a struct, or building SessionContext at the call
-// site) both add more noise than the extra arg costs. The session
+// site) both add more noise than the extra args cost. The session
 // entry point is the natural narrowing-point: everything before is
 // SSH plumbing, everything after is protocol handling.
 #[allow(clippy::too_many_arguments)]
@@ -161,6 +161,8 @@ pub async fn run_protocol<R, W>(
     // Per-tenant store-quota cache (30s TTL). Checked alongside
     // `limiter` before `SubmitBuild`. Shared via inner `Arc`.
     quota_cache: QuotaCache,
+    // Directory-DAG delta-sync peer. `None` = feature disabled.
+    dag_peer: Option<crate::substitute::DagSyncPeer>,
     // Fired by `ChannelSession::Drop` (server.rs) when russh signals
     // `channel_close`. The opcode-read select picks this up and runs
     // the cancel loop — same outcome as the UnexpectedEof arm, but
@@ -181,7 +183,8 @@ where
         service_signer,
         limiter,
         quota_cache,
-    );
+    )
+    .with_dag_peer(dag_peer);
     run_protocol_loop(reader, writer, &mut ctx, shutdown).await
 }
 

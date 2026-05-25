@@ -11,6 +11,7 @@ pub(crate) mod quota;
 pub(crate) mod ratelimit;
 pub mod server;
 pub mod session;
+pub mod substitute;
 pub(crate) mod translate;
 
 pub use quota::QuotaCache;
@@ -95,5 +96,30 @@ pub fn describe_metrics() {
         "PutPath retries on store Code::Aborted (labeled by attempt). \
          attempt=PUT_PATH_ABORTED_MAX_ATTEMPTS means budget exhausted and the \
          error surfaced to the client (I-168)."
+    );
+    // Directory-DAG delta-sync substituter (ADR-022 §8, P0574). All five
+    // are zero until a peer store is configured (substitute_store_addr)
+    // AND a `nix copy --substitute-on-destination` triggers a sync.
+    describe_counter!(
+        "rio_gateway_dagsync_subtrees_pruned_total",
+        "Delta-sync BFS subtrees skipped because the local store already held the dir_digest \
+         (each one is a whole subtree never enumerated against the remote)"
+    );
+    describe_counter!(
+        "rio_gateway_dagsync_dirs_fetched_total",
+        "Delta-sync Directory bodies fetched from the remote peer (= changed directories \
+         discovered)"
+    );
+    describe_counter!(
+        "rio_gateway_dagsync_blobs_fetched_total",
+        "Delta-sync file contents fetched from the remote peer via ReadBlob (= changed files)"
+    );
+    describe_counter!(
+        "rio_gateway_dagsync_bytes_saved_total",
+        "Delta-sync file-content bytes sourced from the local store instead of the remote peer"
+    );
+    describe_counter!(
+        "rio_gateway_dagsync_bytes_fetched_total",
+        "Delta-sync file-content bytes transferred from the remote peer"
     );
 }

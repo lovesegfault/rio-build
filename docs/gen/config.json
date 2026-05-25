@@ -120,6 +120,12 @@
         "type": "uint",
         "default": "1048576",
         "description": "DAG-reconstruction cap on transitive input derivations per build (DoS guard)."
+      },
+      {
+        "key": "substitute_store_addr",
+        "type": "string",
+        "default": "",
+        "description": "Peer rio-store `host:port` for the directory-DAG delta-sync substituter (`r[gw.substitute.dag-delta-sync]`)."
       }
     ],
     "scheduler": [

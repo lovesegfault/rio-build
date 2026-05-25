@@ -177,6 +177,9 @@ pub struct ConnectionHandler {
     /// Per-tenant quota cache, cloned from `GatewayServer`. Shared
     /// state — a quota fetched by one channel is warm for all.
     pub(super) quota_cache: QuotaCache,
+    /// Directory-DAG delta-sync peer, cloned from `GatewayServer`.
+    /// `None` = no peer configured.
+    pub(super) dag_peer: Option<crate::substitute::DagSyncPeer>,
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
@@ -738,6 +741,7 @@ impl Handler for ConnectionHandler {
         let service_signer = self.service_signer.clone();
         let limiter = self.limiter.clone();
         let quota_cache = self.quota_cache.clone();
+        let dag_peer = self.dag_peer.clone();
         // Graceful-shutdown link: Drop fires this, run_protocol selects
         // on it. One token per channel — each channel's cancel loop is
         // independent. Child of the server-wide `sessions_shutdown`
@@ -761,6 +765,7 @@ impl Handler for ConnectionHandler {
                     service_signer,
                     limiter,
                     quota_cache,
+                    dag_peer,
                     shutdown_child,
                 )
                 .await

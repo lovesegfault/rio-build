@@ -199,19 +199,25 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
 
 // r[impl gw.opcode.query-valid-paths]
 /// wopQueryValidPaths (31): Batch validity check.
+///
+/// `substitute = true` (`nix copy --substitute-on-destination`, the
+/// `maybeSubstitute` flag of `Store::queryValidPaths`) asks the
+/// destination to try materializing the missing paths itself before
+/// answering. With a delta-sync peer configured, the gateway runs the
+/// directory-DAG substituter over the missing set; whatever it could
+/// not sync is reported missing and the client falls through to the
+/// whole-NAR `wopAddToStoreNar` push.
 #[instrument(skip_all, fields(count = tracing::field::Empty))]
 pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
-    let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt.token();
     let path_strs = wire::read_strings(reader).await?;
-    let _substitute = wire::read_bool(reader).await?;
+    let substitute = wire::read_bool(reader).await?;
     tracing::Span::current().record("count", path_strs.len());
 
-    debug!(count = path_strs.len(), "wopQueryValidPaths");
+    debug!(count = path_strs.len(), substitute, "wopQueryValidPaths");
 
     // Use FindMissingPaths and invert to get valid paths.
     //
@@ -225,19 +231,35 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
         types::FindMissingPathsRequest {
             store_paths: path_strs.clone(),
         },
-        jwt_token,
+        ctx.jwt.token(),
     )?;
     let resp = rio_common::grpc::with_timeout(
         "FindMissingPaths",
         GATEWAY_FMP_TIMEOUT,
-        store_client.find_missing_paths(req),
+        ctx.store_client.find_missing_paths(req),
     )
     .await;
 
-    let missing_set: HashSet<String> = match resp {
+    let mut missing_set: HashSet<String> = match resp {
         Ok(r) => r.into_inner().missing_paths.into_iter().collect(),
         Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
+
+    // r[impl gw.substitute.dag-delta-sync]
+    // Capability dispatch: only when the client opted in (substitute
+    // flag), a peer is configured, and something is actually missing.
+    // `try_substitute_missing` never errors — anything it cannot sync
+    // (peer unreachable, path not on the peer, no NAR index, no
+    // root_digest) stays in the missing set and the client pushes the
+    // whole NAR exactly as it would without a peer.
+    if substitute && ctx.dag_peer.is_some() && !missing_set.is_empty() {
+        let peer = ctx.dag_peer.clone().expect("checked is_some above");
+        let mut missing: Vec<String> = missing_set.iter().cloned().collect();
+        // Deterministic probe order (HashSet iteration is arbitrary).
+        missing.sort_unstable();
+        let still_missing = crate::substitute::try_substitute_missing(ctx, &peer, &missing).await;
+        missing_set = still_missing.into_iter().collect();
+    }
 
     let valid_strs: Vec<String> = path_strs
         .into_iter()

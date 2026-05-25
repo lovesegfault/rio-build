@@ -81,6 +81,11 @@ pub struct GatewayServer {
     /// skips the check inside the cache, so there's no disabled
     /// variant. See `r[store.gc.tenant-quota-enforce]`.
     quota_cache: QuotaCache,
+    /// Directory-DAG delta-sync peer (`r[gw.substitute.dag-delta-sync]`).
+    /// `None` = no `substitute_store_addr` configured. Cloned into
+    /// every `SessionContext`; the inner `tonic::transport::Channel`s
+    /// are `Arc`-backed so all sessions share the peer connections.
+    dag_peer: Option<crate::substitute::DagSyncPeer>,
     // r[impl gw.conn.cap]
     /// Global connection cap. `try_acquire_owned()` in `new_client`;
     /// the permit is moved into the `ConnectionHandler` and dropped
@@ -132,10 +137,20 @@ impl GatewayServer {
             service_signer: None,
             limiter: TenantLimiter::disabled(),
             quota_cache: QuotaCache::new(),
+            dag_peer: None,
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             active_conns: Arc::new(AtomicUsize::new(0)),
             sessions_shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Enable the directory-DAG delta-sync substituter against a peer
+    /// rio-store. Until called, `wopQueryValidPaths` ignores the
+    /// `substitute` flag exactly as before. Builder-style so main.rs
+    /// composes it alongside `with_jwt_signing_key`.
+    pub fn with_dag_sync_peer(mut self, peer: crate::substitute::DagSyncPeer) -> Self {
+        self.dag_peer = Some(peer);
+        self
     }
 
     /// Clone of the live-connection counter. Call BEFORE [`Self::run`]
@@ -471,6 +486,7 @@ impl russh::server::Server for GatewayServer {
             service_signer: self.service_signer.clone(),
             limiter: self.limiter.clone(),
             quota_cache: self.quota_cache.clone(),
+            dag_peer: self.dag_peer.clone(),
             sessions: HashMap::new(),
             tenant_name: None,
             jwt_token: None,
