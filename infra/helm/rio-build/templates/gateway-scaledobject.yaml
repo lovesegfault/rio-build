@@ -1,0 +1,70 @@
+{{- if and .Values.gateway.enabled .Values.gateway.autoscaling.enabled }}
+{{- $a := .Values.gateway.autoscaling -}}
+# KEDA ScaledObject for rio-gateway. In the chart (not terraform) so
+# `helm rollback` takes scaling config with the rest; gated on
+# gateway.autoscaling.enabled because the keda.sh CRDs don't exist
+# until helm_release.keda (infra/eks/keda.tf) applies — same pattern
+# as karpenter.yaml / servicemonitor.yaml.
+#
+# Why sessions-per-pod is the signal: gateway memory is dominated by
+# per-session state — each active protocol session costs ~550 KiB of
+# duplex buffers + 3 tasks (rio-gateway/src/server/connection.rs), plus
+# drv_cache for large closures. The per-pod ceiling is the OOM
+# backstop: max_sessions (4096 ≈ 2.2 GiB of the 4 Gi limit) before the
+# gateway starts rejecting exec requests (r[gw.conn.session-cap]).
+# Scaling at targetSessionsPerPod (1024 = 25% of that ceiling) adds
+# capacity long before the hard cap turns clients away.
+#
+# Why scale-down is heavily damped: gateway pods drain for up to an
+# hour (sessionDrainSecs=3600 → terminationGracePeriodSeconds ≈ 3660).
+# A scale-down decision doesn't free resources until the victim pod's
+# in-flight sessions finish, so flapping the replica count just
+# accumulates Terminating pods that still hold their full memory
+# footprint. 1800s stabilization + at most 1 pod per 600s means a
+# burst has to be over for 30 minutes before the first pod is
+# released, and the fleet contracts no faster than it can actually
+# drain. Scale-up has no stabilization — adding a pod is cheap and the
+# failure mode of being late is OOM/refused connections.
+#
+# Limitation: a single ControlMaster connection multiplexes all of its
+# channels onto ONE TCP connection, which lands on one pod — the NLB
+# balances connections, not channels. Scale-out therefore only spreads
+# load across *additional client machines* (new connections); it does
+# not relieve a single client that is hammering one pod with channels.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rio-gateway
+  namespace: {{ .Values.namespaces.system.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    # apps/v1 Deployment is KEDA's default target kind; name matches
+    # gateway.yaml's metadata.name.
+    name: rio-gateway
+  minReplicaCount: {{ $a.minReplicas }}
+  maxReplicaCount: {{ $a.maxReplicas }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 1800
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 600
+        scaleUp:
+          stabilizationWindowSeconds: 0
+  triggers:
+    # AverageValue: KEDA divides the query result (total active
+    # channels across the fleet) by the current replica count, so
+    # desiredReplicas = ceil(sum(channels) / targetSessionsPerPod).
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheusAddress | quote }}
+        query: sum(rio_gateway_channels_active)
+        threshold: {{ $a.targetSessionsPerPod | quote }}
+{{- end }}

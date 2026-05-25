@@ -807,6 +807,31 @@ gateway:
   enabled: true
   image: rio-gateway
   replicas: 2
+  # KEDA-driven horizontal autoscaling on active session count.
+  # Disabled by default: existing static-replica deployments unchanged.
+  # Requires the KEDA operator (infra/eks/keda.tf) AND a reachable
+  # prometheus scraping rio_gateway_channels_active (monitoring.enabled
+  # + kube-prometheus-stack on the reference deploy). With enabled=true,
+  # gateway.replicas (above) is IGNORED — gateway.yaml omits
+  # .spec.replicas so helm upgrade doesn't fight the autoscaler.
+  #
+  # Sizing rationale + the ControlMaster single-connection caveat live
+  # in templates/gateway-scaledobject.yaml.
+  autoscaling:
+    enabled: false
+    # Floor matches the static `replicas: 2` above so flipping
+    # autoscaling on never scales BELOW today's topology.
+    minReplicas: 2
+    maxReplicas: 8
+    # Desired replicas = ceil(sum(rio_gateway_channels_active) / this).
+    # 1024 = 25% of the per-pod session cap (max_sessions, default 4096
+    # = the OOM backstop) — capacity is added long before the gateway
+    # starts rejecting exec requests.
+    targetSessionsPerPod: 1024
+    # In-cluster prometheus the KEDA scaler queries. Default matches
+    # the reference deploy (kube-prometheus-stack release in the
+    # `monitoring` namespace, infra/eks/monitoring.tf).
+    prometheusAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
   # actBuild machineName field (what nom shows as "on <name>"). Defaults
   # to karpenter.clusterName; set explicitly to override. The cluster
   # appears as one machine to ssh-ng clients — per-pod IDs are not sent.

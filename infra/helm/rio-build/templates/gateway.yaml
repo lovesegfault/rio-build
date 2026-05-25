@@ -8,7 +8,15 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
 spec:
+  {{- if not $g.autoscaling.enabled }}
+  # OMITTED when gateway.autoscaling.enabled=true: the KEDA-managed HPA
+  # owns the replica count; if helm also rendered .spec.replicas here,
+  # every `helm upgrade` would reset it and fight the autoscaler. Same
+  # shape as store.yaml + componentScaler. K8s defaults an absent
+  # .spec.replicas to 1 on first apply; KEDA's first reconcile raises
+  # it to minReplicaCount.
   replicas: {{ $g.replicas }}
+  {{- end }}
   # I-064: surge first so the NLB has a healthy target throughout the
   # rollout. With maxUnavailable: 0 the old pod stays Serving until the
   # new one is Ready; then old goes NotReady → drains sessions → exits.
