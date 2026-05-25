@@ -328,16 +328,20 @@ as-built defect; a falsification *not* on this list is a stop-and-report
 
 ## Verify-marker status
 
-New rules whose verification is deliberately deferred to the Stage-B model
+*(Stage-A snapshot; superseded by the Stage-B wiring — see the Stage-B
+verify-marker status subsection at the end of this document.)*
+
+New rules whose verification was deliberately deferred to the Stage-B model
 (`retryPolicy.qnt`) and therefore expected to appear in
-`tracey query untested` until the model's checks are wired:
+`tracey query untested` until the model's checks were wired:
 `sched.retry.verdict-channel-invariant` (expected to *falsify* on the
 as-built encoding — D1), `sched.retry.no-double-count` (expected to falsify
 or hold depending on the dedup encoding — the G5 family),
 `sched.retry.recovery-projection` (the model's failover action),
 `sched.poison.cascade-dependents` (the model's cascade action; the existing
 keep-going and recovery-cascade tests verify the build-level consequences
-but not the reaches-exactly-the-dependents set property).
+but not the reaches-exactly-the-dependents set property). All four are now
+wired (`nix/quint.nix`, the `quint-retry-policy-*` checks).
 
 `sched.retry.transient-budget`, `sched.retry.attempts-bounded+2`, and
 `sched.retry.counters-refine-history+2` carry `r[verify]` markers on the
@@ -346,6 +350,163 @@ the fold against hand-computed histories covering every counter, the window
 reset (including the exempt-event fall-through), the exemption, a poison, a
 TTL expiry, and a per-executor exclusion.
 The model's exhaustive form of `counters-refine-history` — the *live*
-counters compared against the fold over every observation ordering — is
-still Stage-B work; the unit tests verify the fold, the model verifies the
-code against the fold.
+counters compared against the fold over every observation ordering — is the
+Stage-B `quint-retry-policy-worker` check; the unit tests verify the fold,
+the model verifies the code against the fold.
+
+## Stage-B results (`retryPolicy.qnt`, the as-built model)
+
+The model is `docs/spec/models/retryPolicy.qnt`: the nine entry points
+encoded as the code implements them (every divergent arm included), the
+reference fold carried as a specification ghost advanced at each observed
+accounting event, the signal-channel dedup state, the four PG mirror
+columns, the leader-failover selective forgiveness, the resets, and the
+cascade to one dependent. Scope boundaries and encoding decisions
+(the floor ladder abstracted to a bounded promotion budget per design §3's
+G6 pre-registration; the substitution and cancel paths out of scope; the
+fold ghost re-seeded from the recovered projection at failover so
+`countersRefineHistory` is an intra-tenure invariant; dispatch-time and
+recovery-time poisons excluded from the fold-refinement comparisons and
+covered by their own invariants) are documented in the model header. Four
+regimes are checked exhaustively under TLC and wired into `nix/quint.nix`
+(`quint-retry-policy-*`): worker-channel (two slots, every failure
+worker-reported), dual-channel (pod deaths, controller reports with
+race-ahead/late/lost delivery, wedge backstop, crash, one slot), crash
+(the C2 loop in isolation), and fault-persist/failover (one failover, one
+lost mirror write). Deterministic reproducer runs pin every documented
+divergence shape; the named-run checks replay them in CI.
+
+### Verdict table
+
+Distinct-state counts are as measured at the introducing commit (also in
+that commit's message and the CI transcripts): worker 376,318 distinct
+(916,846 generated), dual 3,112,250 (7,549,719), crash 60 (79), failover
+9,228,949 (26,783,975).
+
+| Design invariant | Model form | worker | dual | crash | failover |
+|---|---|---|---|---|---|
+| `AttemptsBounded` (charge discipline) | `attemptsChargedOnce` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `AttemptsBounded` (boundedness clause) | `attemptsBoundedGlobal` | not checked (no uncharged end in the alphabet) | not checked (subsumed by the crash regime) | **FALSIFIES-AS-PRE-REGISTERED** — C2 (`c2CrashLoopRun`) | not checked |
+| `PoisonIsTerminalUntilCleared` | `poisonIsTerminalUntilCleared` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `CascadeReachesExactlyTheDependents` | `cascadeReachesExactlyTheDependents` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `CountersRefineHistory` | `countersRefineHistory` | HOLDS | **FALSIFIES-AS-PRE-REGISTERED** — D2/D3 histories, plus the D1 history's `poisoned_at` (see the deviations note) (`d2AtCapAnchorRun`, `d3PromotedChargesNothingRun`, `d1ControllerTimeoutCapPoisonRun`, `lateInstallmentAfterRedispatchRun`) | HOLDS (vacuously: nothing charges) | not checked (falsifies exactly as in dual) |
+| `VerdictIsChannelInvariant` | `verdictMatchesFold` | HOLDS | **FALSIFIES-AS-PRE-REGISTERED** — D1 (`d1ControllerTimeoutCapPoisonRun`) | HOLDS | not checked |
+| `PlacementIsAFunctionOfExclusionAndFleet` | `placementSound` (+ the E9 action's empty-fleet-defers guard) | HOLDS | HOLDS | HOLDS | HOLDS |
+| `NoDoubleCount` | `noDoubleCount` | HOLDS (vacuous — no deaths in the alphabet) | HOLDS | HOLDS | HOLDS |
+| `RecoveryIsTheDocumentedProjection` | `recoveryIsTheDocumentedProjection` | vacuous (no failover) | vacuous | vacuous | HOLDS |
+| `RecoveryNeverFabricatesFailures` | `recoveryNeverFabricatesFailures` | HOLDS | HOLDS | HOLDS | HOLDS |
+| durable-mirror completeness (D4's surface) | `durableMirrorsCharges` | HOLDS | **FALSIFIES-AS-PRE-REGISTERED** — D4 (`d4BackstopUnmirroredRun`) | HOLDS | not checked (falsifies via D4 and via injected mirror faults) |
+
+The HOLD column entries are exhaustive TLC results over the regime's full
+reachable space; the falsification entries are wired as expect-violation
+checks (`quint-retry-policy-divergence-*`, `quint-retry-policy-crash-unbounded`)
+that pass only while the documented defect is still reproducible, and flip
+to HOLD checks when Phase 1 lands the corresponding fix.
+
+### Pre-registered falsifications: confirmed vs not reachable
+
+- `VerdictIsChannelInvariant` via the D1 history — **confirmed**
+  (controller-observed timeout-cap exhaustion lands `Poisoned` where the
+  fold and the worker-observed path produce `Cancelled`).
+- `CountersRefineHistory` on D2 histories — **confirmed** (at-cap
+  controller termination charges `infra_count` without stamping
+  `last_infra_failure_at`).
+- `CountersRefineHistory` on D3 histories — **confirmed** (promoted
+  controller termination charges nothing; the fold charges
+  `exempt_infra_count`).
+- `CountersRefineHistory` on D4, durable view — **confirmed**, surfaced
+  through the dedicated `durableMirrorsCharges` invariant (E8's
+  `failed_builders` charge never reaches PG; in the fault regime a lost
+  `append_failed_worker` produces the same shape).
+- `AttemptsBounded` on the C2 no-report crash loop — **confirmed**
+  (uncounted dispatch–crash–requeue cycles exceed any budget-justified
+  bound; nothing in the retry machinery ever charges).
+- `RecoveryIsTheDocumentedProjection` / `NoDoubleCount` via the G8/G5
+  shapes — **not falsified**: the as-built dedup
+  (`recently_disconnected` first-report-wins removal, `last_completed`
+  suppression, the non-promoting early return, pod-identity-scoped
+  correlation) holds `NoDoubleCount` over every observation subset and
+  order the dual regime explores, and the failover projection matches the
+  code's two recovery constructors over the fault-persist regime. This is
+  the expected outcome the map's pre-registration left open ("only if the
+  dedup encoding admits them"); the G5/G8 fix families are exercised by
+  the Stage-C reverts, not falsified as-built.
+
+### Witness results
+
+Reachability is machine-checked by the `quint-retry-policy-witness-*`
+expect-violation checks plus the named runs: every budget terminal
+(distinct-worker threshold, non-exempt infra cap, exempt-infra cap,
+worker-reported timeout `Cancelled`, controller-reported timeout poison,
+fleet exhaust), the I-127 window reset and its exempt fall-through, the
+TTL expiry, the cache-hit clear, the resubmit cycle, the cascade, the
+race-ahead and late-installment controller deliveries, the dual
+observation of one death, a failover landing on a non-empty under-budget
+history, and a lost best-effort mirror write. One witness is deliberately
+NOT wired: `noTransientCapPoison` (see the next section).
+
+### What Stage B found that Stage A's artifacts had wrong or incomplete
+
+- **The poisoned-row recovery projection does not recover `count`.**
+  `from_poisoned_row` constructs the retry state from `resubmit_cycles`,
+  `failed_builders` and `poisoned_at` only (plus the derived
+  `failure_count`); it never reads `derivations.retry_count`. The
+  `sched.retry.recovery-projection` rule text and
+  `retry_policy.rs::Counters::recovery_projection` both state the
+  4-recovered split unconditionally, which is accurate for non-terminal
+  rows (`from_recovery_row`) but over-claims for poisoned rows. The model
+  encodes the code (two distinct projections); the rule prose and the
+  fold's doc comment should be tightened in Phase 1 (no behavioural
+  consequence today: a recovered poisoned node's `count` is reset by the
+  resubmit path before it can matter).
+- **The per-cycle transient cap is unreachable under production defaults.**
+  With `require_distinct_workers = true` and `hard_filter` excluding
+  `failed_builders` from placement, the same worker is never given the
+  derivation twice in a poison cycle, so the distinct-worker threshold
+  always fires at or before the moment `count` could reach `max_retries`
+  (threshold 3 vs `max_retries` 2 in production; threshold 2 vs 2 at
+  model scale). The "max_retries exhausted" poison arm is live only in
+  the non-distinct (dev) mode or if placement stops excluding failed
+  builders. The `noTransientCapPoison` witness is therefore not wired,
+  and the arm is a Phase-1 simplification/clarification candidate.
+- **The D1 history also falsifies `CountersRefineHistory`.** The as-built
+  E7 cap poison stamps `poisoned_at` where the fold's adjudicated verdict
+  is `Cancel` (no stamp), so the counter vector diverges on the same
+  history that falsifies the verdict invariant. Same documented defect,
+  second surface; recorded here so the Stage-B falsification bookkeeping
+  is exact (the pre-registered list attributed counter falsifications to
+  D2/D3/D4 only).
+- **A late controller report can poison a derivation while its next
+  attempt is in flight.** The E6/E7 status guard admits
+  `Ready|Assigned|Running`, and the `recently_disconnected` correlation is
+  per-derivation, not per-execution — so a report for attempt N's death
+  charges (and at the cap, poisons) while attempt N+1 is running; the
+  in-flight execution becomes a zombie whose eventual completion the
+  status guard drops. As-built behaviour (the model's consistency
+  invariant deliberately permits it); it is the strongest concrete
+  illustration of the two-installment correlation gap the design's
+  Phase-1 `exec_id` mechanism closes.
+- **Executor-slot identity needed pod-identity scoping to stay faithful.**
+  Encoding executors as reusable slots initially allowed a stale
+  controller report to be race-ahead-matched to a *later* incarnation of
+  the slot and a deadline report to consume an *older* incarnation's
+  `recently_disconnected` entry — interleavings impossible in production,
+  where every pod has a fresh name. The model marks a pending report
+  stale across respawn and requires the entry consumed by a report to be
+  the report's own death's; without those two guards `noDoubleCount`
+  falsifies on artefact interleavings (a finding about the Stage-A plan's
+  "2 executors" framing, not about the code).
+
+### Stage-B verify-marker status
+
+The four rules listed above as deferred to the model are now wired:
+`sched.retry.counters-refine-history+2`, `sched.retry.transient-budget`
+and `sched.retry.attempts-bounded+2` on `quint-retry-policy-worker`
+(the model-checked refinement over the shared alphabet, on top of the
+referenceFold unit-test markers), `sched.retry.no-double-count` and
+`sched.poison.cascade-dependents` on `quint-retry-policy-dual`,
+`sched.retry.recovery-projection` on `quint-retry-policy-failover`, and
+`sched.retry.verdict-channel-invariant` on
+`quint-retry-policy-divergence-verdict` (an expect-violation check while
+the as-built code still carries D1; it flips to a HOLD check with the
+Phase-1 fix).
