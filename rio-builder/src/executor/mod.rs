@@ -49,6 +49,12 @@ pub(crate) mod glue;
 mod inputs;
 mod monitors;
 mod native_result;
+// Differential-harness driver (vm-differential-standalone). Test-only:
+// composes glue + rio-exec + native_result for one derivation so the VM
+// scenario can diff the result against real Nix. Public so the
+// `differential-driver` bin target can call it; hidden from docs.
+#[doc(hidden)]
+pub mod differential;
 mod outputs;
 mod sandbox;
 

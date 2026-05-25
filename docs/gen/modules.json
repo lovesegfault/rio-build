@@ -28,9 +28,14 @@
       "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
     },
     {
-      "path": "builtin_fetchurl.rs",
+      "path": "bin/",
       "depth": 0,
-      "doc": "Native `builtin:fetchurl` — the in-sandbox half."
+      "doc": ""
+    },
+    {
+      "path": "bin/differential-driver.rs",
+      "depth": 1,
+      "doc": "Differential-harness driver binary."
     },
     {
       "path": "cgroup.rs",
@@ -63,6 +68,11 @@
       "doc": "Daemon I/O after spawn: handshake, wopBuildDerivation, STDERR loop, log batching."
     },
     {
+      "path": "executor/differential.rs",
+      "depth": 1,
+      "doc": "Differential-harness driver: build one derivation with the native"
+    },
+    {
       "path": "executor/glue/",
       "depth": 1,
       "doc": "Nix request glue: `Derivation` → [`rio_exec::ExecutionRequest`]."
@@ -71,11 +81,6 @@
       "path": "executor/glue/attrs.rs",
       "depth": 2,
       "doc": "`__structuredAttrs` materialization: `.attrs.json` and `.attrs.sh`."
-    },
-    {
-      "path": "executor/glue/builtin.rs",
-      "depth": 2,
-      "doc": "Request construction for `builtin:fetchurl` derivations."
     },
     {
       "path": "executor/glue/env.rs",
