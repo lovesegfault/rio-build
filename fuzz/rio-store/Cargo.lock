@@ -4098,7 +4098,9 @@ name = "rio-store-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "rio-proto",
  "rio-store",
+ "uuid",
 ]
 
 [[package]]

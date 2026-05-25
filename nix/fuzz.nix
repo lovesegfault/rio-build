@@ -148,6 +148,11 @@ let
         fuzzBins = rio-store-fuzz-build.members.rio-store-fuzz;
         corpusRoot = unfilteredRoot + "/fuzz/rio-store/corpus";
       }
+      {
+        target = "log_chunk_ingest";
+        fuzzBins = rio-store-fuzz-build.members.rio-store-fuzz;
+        corpusRoot = unfilteredRoot + "/fuzz/rio-store/corpus";
+      }
     ];
 
   # Per-target fuzz run: 2 minutes, seed-corpus only. Cheap

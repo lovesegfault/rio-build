@@ -13034,11 +13034,23 @@
           "packageId": "libfuzzer-sys"
         },
         {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         }
       ],
       "crateBin": [
+        {
+          "name": "log_chunk_ingest",
+          "path": "fuzz_targets/log_chunk_ingest.rs"
+        },
         {
           "name": "manifest_deserialize",
           "path": "fuzz_targets/manifest_deserialize.rs"
