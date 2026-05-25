@@ -3622,9 +3622,11 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
 /// nowhere → batch returns None for B AND per-path QPI returns
 /// NotFound → ok=false. This is the bug class the store-side
 /// `ensure_references` couldn't surface (it returned `()`).
-#[tokio::test]
+/// `start_paused` + in-process transport: B's NotFound now walks the
+/// full retry ladder (~32 s of backoff) before the walk gives up.
+#[tokio::test(start_paused = true)]
 async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
-    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (store, client) = rio_test_support::grpc::spawn_mock_store_inproc().await?;
     let a = test_store_path("miss-a");
     let b = test_store_path("miss-b");
     seed_with_refs(&store, &a, &[&b]);
@@ -3703,10 +3705,17 @@ async fn walk_forgives_unwanted_seed_not_found() -> TestResult {
 }
 
 /// The same scenario with an empty `forgivable` set (= every seed
-/// wanted) keeps today's behaviour: any seed miss fails the walk.
-#[tokio::test]
+/// wanted) keeps today's verdict: a seed miss fails the walk. The miss
+/// is no longer accepted on the first occurrence, though — every path
+/// in the walk was either HEAD-probed as available or named in a
+/// narinfo the upstream just served, so a NotFound here contradicts an
+/// earlier observation and must burn the full retry ladder before the
+/// walk gives up. `start_paused` virtualizes the ~32 s of backoff;
+/// in-process transport so auto-advance can't fire a timeout on a
+/// kernel-side TCP handshake.
+#[tokio::test(start_paused = true)]
 async fn walk_fails_on_wanted_seed_not_found() -> TestResult {
-    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (store, client) = rio_test_support::grpc::spawn_mock_store_inproc().await?;
     let out = test_store_path("fgva-out");
     let dbg = test_store_path("fgva-debug");
     store.state.substitutable.write().unwrap().push(out.clone());
@@ -3726,6 +3735,227 @@ async fn walk_fails_on_wanted_seed_not_found() -> TestResult {
         !ok,
         "every seed wanted (empty forgivable set) → a seed miss must \
          still fail the walk"
+    );
+    // Structural: the contradicted NotFound must consume the whole
+    // retry budget before the walk demotes — a first-occurrence
+    // demotion is the 235-path incident shape.
+    assert_eq!(
+        store
+            .calls
+            .qpi_attempts_by_path
+            .read()
+            .unwrap()
+            .get(&dbg)
+            .copied(),
+        Some(crate::actor::SUBSTITUTE_FETCH_MAX_ATTEMPTS),
+        "a wanted seed's NotFound must retry up to the attempt budget \
+         before demoting, not give up on the first occurrence"
+    );
+    Ok(())
+}
+
+/// Sum every series of counter `name` in a debugging-recorder snapshot,
+/// returning `(total, per-series labels)`. The labels let demotion
+/// tests assert the `reason` value without hard-coding series order.
+fn counter_series(
+    snap: &metrics_util::debugging::Snapshotter,
+    name: &str,
+) -> (u64, Vec<Vec<(String, String)>>) {
+    use metrics_util::debugging::DebugValue;
+    let mut total = 0u64;
+    let mut labels = Vec::new();
+    for (ck, _, _, v) in snap.snapshot().into_vec() {
+        if ck.key().name() != name {
+            continue;
+        }
+        if let DebugValue::Counter(c) = v {
+            total += c;
+            labels.push(
+                ck.key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect(),
+            );
+        }
+    }
+    (total, labels)
+}
+
+// r[verify sched.substitute.detached+3]
+/// A wanted seed whose `SubstitutePath` returns `NotFound` twice and
+/// then succeeds must be FETCHED, not demoted: every path in the walk
+/// was HEAD-probed as available minutes earlier or named in a narinfo
+/// the upstream just served, so a NotFound inside the walk is a
+/// contradiction (auth/overload short-circuit, not a genuine miss) and
+/// joins the same retry ladder as transient errors. The 2026-05 incident
+/// demoted 235 such paths to from-source builds on their FIRST NotFound;
+/// all 235 substituted fine 80 seconds later.
+#[tokio::test(start_paused = true)]
+async fn walk_retries_not_found_then_succeeds() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (store, client) = rio_test_support::grpc::spawn_mock_store_inproc().await?;
+    let out = test_store_path("nfrt-out");
+    // Substitutable (the GET would succeed) but the first 2 attempts
+    // short-circuit with NotFound before reaching the upstream.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store
+        .faults
+        .fail_qpi_not_found_per_path_n
+        .store(2, Ordering::SeqCst);
+
+    let rec = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let (ok, forgiven) = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![out.clone()],
+        &HashSet::new(),
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(
+        ok,
+        "a NotFound that clears on retry must not demote the derivation"
+    );
+    assert!(forgiven.is_empty(), "nothing was forgiven — it was fetched");
+    // Structural: 2 NotFounds + 1 success = 3 attempts.
+    assert_eq!(
+        store
+            .calls
+            .qpi_attempts_by_path
+            .read()
+            .unwrap()
+            .get(&out)
+            .copied(),
+        Some(3),
+        "expected 2 NotFound retries + 1 success"
+    );
+    // The path was ultimately fetched (success arm reached once).
+    assert!(
+        store.calls.qpi_calls.read().unwrap().contains(&out),
+        "the path must reach the success arm after the NotFounds clear"
+    );
+    let (demotions, _) = counter_series(&snap, "rio_scheduler_substitute_demotions_total");
+    assert_eq!(
+        demotions, 0,
+        "a recovered NotFound must not count as a demotion"
+    );
+    let (failures, _) = counter_series(&snap, "rio_scheduler_substitute_fetch_failures_total");
+    assert_eq!(
+        failures, 0,
+        "a recovered NotFound must not count as a fetch failure"
+    );
+    Ok(())
+}
+
+// r[verify sched.substitute.detached+3]
+/// A wanted seed that returns `NotFound` on EVERY attempt exhausts the
+/// retry ladder and only then demotes: ok=false, exactly
+/// `SUBSTITUTE_FETCH_MAX_ATTEMPTS` attempts, and ONE
+/// `substitute_demotions_total{reason=not_found}` increment (the page-
+/// worthy "a derivation and its build-time closure are about to be
+/// compiled from source because a download failed" event).
+#[tokio::test(start_paused = true)]
+async fn walk_demotes_after_not_found_retries_exhausted() -> TestResult {
+    let (store, client) = rio_test_support::grpc::spawn_mock_store_inproc().await?;
+    // Not seeded anywhere → the mock's SubstitutePath returns a plain
+    // "path not found" NotFound on every attempt.
+    let out = test_store_path("nfex-out");
+
+    let rec = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![out.clone()],
+        &HashSet::new(),
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(!ok, "a NotFound on every attempt must still demote");
+    assert_eq!(
+        store
+            .calls
+            .qpi_attempts_by_path
+            .read()
+            .unwrap()
+            .get(&out)
+            .copied(),
+        Some(crate::actor::SUBSTITUTE_FETCH_MAX_ATTEMPTS),
+        "the demotion must come AFTER the full retry budget, not on the \
+         first NotFound"
+    );
+    let (demotions, labels) = counter_series(&snap, "rio_scheduler_substitute_demotions_total");
+    assert_eq!(
+        demotions, 1,
+        "exactly one demotion for one exhausted path; labels={labels:?}"
+    );
+    assert_eq!(
+        labels,
+        vec![vec![("reason".to_string(), "not_found".to_string())]],
+        "a plain path-not-found after retries must be reason=not_found"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs]
+/// A forgivable (unwanted) seed is forgiven on its FIRST failure of any
+/// kind — it must not burn the 8-attempt retry ladder first. The path
+/// is still attempted once (opportunistic completeness) but a transient
+/// error on something nobody consumes is not worth ~32 s of backoff
+/// serialized into the walk's per-path loop.
+#[tokio::test(start_paused = true)]
+async fn walk_forgives_unwanted_seed_without_retrying() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (store, client) = rio_test_support::grpc::spawn_mock_store_inproc().await?;
+    let dbg = test_store_path("fgv1-debug");
+    // Unavailable — TRANSIENT. Pre-change this routed to the retry
+    // ladder and the seed was only forgiven by the post-loop
+    // exhaustion arm after 8 attempts.
+    store
+        .faults
+        .fail_query_path_info
+        .store(true, Ordering::SeqCst);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let forgivable: HashSet<String> = [dbg.clone()].into();
+    let (ok, forgiven) = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![dbg.clone()],
+        &forgivable,
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(ok, "a forgivable seed's transient failure must be forgiven");
+    assert_eq!(
+        forgiven,
+        vec![dbg.clone()],
+        "the forgiven set must record the seed"
+    );
+    assert_eq!(
+        store
+            .calls
+            .qpi_attempts_by_path
+            .read()
+            .unwrap()
+            .get(&dbg)
+            .copied(),
+        Some(1),
+        "a forgivable seed must be forgiven on the FIRST failure — \
+         attempted once, zero retries"
     );
     Ok(())
 }
@@ -3790,16 +4020,20 @@ async fn walk_forgives_unwanted_seed_non_transient_error() -> TestResult {
 }
 
 /// The RETRY-EXHAUST fallthrough (after `SUBSTITUTE_FETCH_MAX_ATTEMPTS`
-/// transient errors) has its own forgiveness gate: a forgivable seed
-/// whose retries exhaust must not fail the walk; a non-forgivable one
-/// must. `start_paused` virtualizes the ~32 s of backoff between the 8
-/// attempts; the per-seed attempt count is asserted to be exactly
-/// `SUBSTITUTE_FETCH_MAX_ATTEMPTS` so a spurious auto-advance through
-/// an in-flight RPC (which would surface as a non-transient
-/// `DeadlineExceeded` and route to the WRONG arm) fails the test
-/// instead of silently passing via the error gate.
+/// transient errors) demotes a non-forgivable seed with
+/// `reason=exhausted`. `start_paused` virtualizes the ~32 s of backoff
+/// between the 8 attempts; the per-seed attempt count is asserted to
+/// be exactly `SUBSTITUTE_FETCH_MAX_ATTEMPTS` so a spurious
+/// auto-advance through an in-flight RPC (which would surface as a
+/// non-transient `DeadlineExceeded` and route to the WRONG arm) fails
+/// the test instead of silently passing via the error gate.
+///
+/// This used to be an A/B pair proving the fallthrough had its own
+/// forgiveness gate; a forgivable seed is now forgiven on its FIRST
+/// failure and never reaches the fallthrough — that side lives in
+/// `walk_forgives_unwanted_seed_without_retrying`.
 #[tokio::test(start_paused = true)]
-async fn walk_forgives_unwanted_seed_retry_exhaust() -> TestResult {
+async fn walk_demotes_after_transient_retries_exhausted() -> TestResult {
     use std::sync::atomic::Ordering;
     let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
     // Unavailable — transient → the retry ladder runs to exhaustion.
@@ -3808,45 +4042,45 @@ async fn walk_forgives_unwanted_seed_retry_exhaust() -> TestResult {
         .fail_query_path_info
         .store(true, Ordering::SeqCst);
 
+    let rec = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    for (tag, forgivable_dbg, expect_ok) in [("fgvx-f", true, true), ("fgvx-w", false, false)] {
-        let dbg = test_store_path(&format!("{tag}-debug"));
-        let forgivable: HashSet<String> = if forgivable_dbg {
-            [dbg.clone()].into()
-        } else {
-            HashSet::new()
-        };
-        let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
-            &client,
-            vec![dbg.clone()],
-            &forgivable,
-            &auth,
-            &shutdown,
-            |_, _, _| {},
-        )
-        .await;
-        assert_eq!(
-            ok, expect_ok,
-            "{tag}: exhausted retries on a seed must be forgiven iff \
-             the seed is forgivable"
-        );
-        // Structural: all attempts reached the store — the transient
-        // ladder ran to exhaustion and the post-loop fallthrough made
-        // the decision, not the NotFound or generic-error arm.
-        assert_eq!(
-            store
-                .calls
-                .qpi_attempts_by_path
-                .read()
-                .unwrap()
-                .get(&dbg)
-                .copied(),
-            Some(crate::actor::SUBSTITUTE_FETCH_MAX_ATTEMPTS),
-            "{tag}: every attempt must reach the store before the \
-             exhaust fallthrough fires"
-        );
-    }
+    let dbg = test_store_path("fgvx-w-debug");
+    let (ok, _) = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![dbg.clone()],
+        &HashSet::new(),
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
+    assert!(!ok, "exhausted retries on a wanted seed must fail the walk");
+    // Structural: all attempts reached the store — the transient
+    // ladder ran to exhaustion and the post-loop fallthrough made
+    // the decision, not the NotFound or generic-error arm.
+    assert_eq!(
+        store
+            .calls
+            .qpi_attempts_by_path
+            .read()
+            .unwrap()
+            .get(&dbg)
+            .copied(),
+        Some(crate::actor::SUBSTITUTE_FETCH_MAX_ATTEMPTS),
+        "every attempt must reach the store before the exhaust \
+         fallthrough fires"
+    );
+    let (demotions, labels) = counter_series(&snap, "rio_scheduler_substitute_demotions_total");
+    assert_eq!(demotions, 1, "one exhausted path = one demotion");
+    assert_eq!(
+        labels,
+        vec![vec![("reason".to_string(), "exhausted".to_string())]],
+        "transient retries exhausted must be reason=exhausted"
+    );
     Ok(())
 }
 
@@ -3856,10 +4090,12 @@ async fn walk_forgives_unwanted_seed_retry_exhaust() -> TestResult {
 /// walk is about to declare complete (`SubstituteComplete{ok=true}` →
 /// `Substituting → Completed` → a dependent ENOENTs at exec time). The
 /// unwanted seed's miss is forgiven AND the wanted seed's missing ref
-/// still fails the walk, in the same run.
-#[tokio::test]
+/// still fails the walk, in the same run. `start_paused` + in-process
+/// transport: the non-forgivable reference's NotFound now walks the
+/// full retry ladder (~32 s of backoff) before the walk gives up.
+#[tokio::test(start_paused = true)]
 async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
-    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (store, client) = rio_test_support::grpc::spawn_mock_store_inproc().await?;
     let out = test_store_path("fgvr-out");
     let dbg = test_store_path("fgvr-debug");
     let r = test_store_path("fgvr-ref");
@@ -3896,9 +4132,18 @@ async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
 ///
 /// P_out is substitutable (probe + GET agree). P_debug is
 /// indeterminate at probe time (treated optimistically →
-/// pending_substitute) but the GET definitively misses (NotFound) —
-/// the HEAD-says-maybe / GET-misses divergence that condemns a whole
-/// closure to a from-source rebuild over an output nothing consumes.
+/// pending_substitute) but the GET fails. The forgiven arm fails it
+/// with the natural NotFound (the HEAD-says-maybe / GET-misses
+/// divergence that condemns a whole closure to a from-source rebuild
+/// over an output nothing consumes). The all-wanted arm fails it with
+/// a per-path non-retryable Internal instead: a non-forgivable
+/// NotFound now burns the full ~32 s retry ladder in real time before
+/// demoting (the actor-driven test can't virtualize the clock), and
+/// the retry-then-demote path is structurally covered by
+/// `walk_demotes_after_not_found_retries_exhausted`. What this arm
+/// uniquely covers — the wanted-set plumbing that makes the seed
+/// non-forgivable, and the SubstituteComplete{ok=false} → Ready revert
+/// — is error-kind-agnostic.
 #[tokio::test]
 async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -3910,7 +4155,7 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
             vec!["out".to_string()],
             DerivationStatus::Completed,
         ),
-        // Empty wanted = all wanted → P_debug's GET miss is fatal →
+        // Empty wanted = all wanted → P_debug's GET failure is fatal →
         // demoted to Ready for a from-source dispatch.
         ("fgv-a", vec![], DerivationStatus::Ready),
     ] {
@@ -3918,6 +4163,14 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
         let dbg = test_store_path(&format!("{tag}-debug"));
         store.state.substitutable.write().unwrap().push(out.clone());
         store.state.indeterminate.write().unwrap().push(dbg.clone());
+        if tag == "fgv-a" {
+            store
+                .faults
+                .fail_qpi_internal_paths
+                .write()
+                .unwrap()
+                .insert(dbg.clone());
+        }
 
         let mut n = make_node(tag);
         n.output_names = vec!["out".into(), "debug".into()];
@@ -3935,9 +4188,17 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
         );
         // Opportunistic completeness: the unwanted seed is still
         // ATTEMPTED (it stays in the seed list) — forgiveness changes
-        // the verdict, not the fetch.
+        // the verdict, not the fetch. `qpi_attempts_by_path` (recorded
+        // on RPC entry) rather than `qpi_calls` (recorded after the
+        // fault-injection block, which the fgv-a arm's injected
+        // Internal short-circuits).
         assert!(
-            store.calls.qpi_calls.read().unwrap().contains(&dbg),
+            store
+                .calls
+                .qpi_attempts_by_path
+                .read()
+                .unwrap()
+                .contains_key(&dbg),
             "{tag}: the unwanted seed must still be attempted"
         );
     }
@@ -3964,13 +4225,23 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
 /// run unguarded.
 #[tokio::test]
 async fn substitute_walk_unresolvable_wanted_set_forgives_nothing() -> TestResult {
+    use std::sync::atomic::Ordering;
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out = test_store_path("fgv-bogus-out");
     // Indeterminate at probe time (treated optimistically → routed to
-    // the detached fetch) but the GET definitively misses — the only
-    // seed, and the walk must NOT forgive it.
+    // the detached fetch) but the GET fails — the only seed, and the
+    // walk must NOT forgive it. Internal (non-retryable) rather than
+    // the natural NotFound: a non-forgivable NotFound now burns the
+    // full ~32 s retry ladder in real time before demoting, and what
+    // this test covers — the conservative empty-forgivable-set branch
+    // for an unresolvable wanted set — is decided before the walk ever
+    // sees the error.
     store.state.indeterminate.write().unwrap().push(out.clone());
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, Ordering::SeqCst);
 
     let mut n = make_node("fgv-bogus");
     n.output_names = vec!["out".into()];
