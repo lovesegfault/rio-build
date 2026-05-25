@@ -678,14 +678,30 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 ## Phase 6 — Observability + finalize
 
 ### P0563 — metrics + dashboard + alerts
-**Crate:** `infra` · **Deps:** P0544, P0548, P0559 · **Complexity:** LOW
-| File | Change |
-|---|---|
-| `infra/helm/rio-build/dashboards/castore-fuse.json` | panels: `rio_builder_castore_fuse_open_seconds` p50/p99, `rio_builder_castore_fuse_upcalls_total{op="lookup"}` rate (cold-metadata pressure), `fetch_bytes_total` rate by `hit` label, `objects_cache_bytes` per node, `integrity_fail_total`, `nar_index_compute_seconds` |
-| `infra/helm/rio-build/templates/prometheusrule.yaml` | `RioBuilderDigestFuseStall`: `increase(open_seconds_count[2m]) == 0 AND increase(open_seconds_sum[2m]) > 0 for 60s` (opens started but none completed). `RioBuilderIntegrityFail`: `increase(integrity_fail_total[5m]) > 0`. `RioStoreNarIndexBacklog`: `nar_index_pending > 1000 for 10m`. |
-| `xtask/src/regen/grafana.rs` | include dashboard |
+**Crate:** `infra` · **Deps:** P0544, P0548, P0559 · **Complexity:** LOW · **Status: DONE 2026-05-25** (adr-022-p0563 worktree)
 
-**Exit:** `/nixbuild --checks` green; `xtask grafana` shows dashboard.
+Visualizes what the branch already emits (metric names verified against `docs/gen/metrics.json` + emission sites); adds **no** new metrics.
+
+| File | Change (landed) |
+|---|---|
+| `infra/helm/rio-build/dashboards/castore-fuse.json` | "rio-build: Castore FUSE" (uid `rio-castore-fuse`, 10 panels): upcall rate by `op`, open latency p50/p99 (+ p99 `hit="remote"`), open reply mode `passthrough`/`keep_cache`, open dispatch case `hit`/`miss_small`/`miss_stream`/`wait_fetching`, JIT fetch Bps by `hit`, fill chunk source by `src`, integrity-fail/EIO/circuit, DAG-prefetch p50/p99, mountd request p99 by `op`, mountd promote rejects by `reason`. |
+| `infra/helm/rio-build/dashboards/chunk-cache-tier.json` | "rio-build: Chunk Cache Tier" (uid `rio-chunk-cache-tier`, 12 panels): Express tier hit/miss/error + computed hit ratio + write-through failures, moka chunk-cache hits/misses, `chunk_dedup_ratio`, builder upload chunks `novel`/`deduped`, PutPathChunked verification-failure counters (incomplete / verify-unavailable / narhash / refs / file_digest), HMAC rejects by `reason`, eager-index outcomes, `nar_index_compute_seconds` p50/p99, GetDirectory/ReadBlob p99, Has* batch-size p99 by `rpc`. |
+| `infra/helm/rio-build/templates/prometheusrule.yaml` | new group `rio.castore.rules`: **critical** `RioBuilderCastoreIntegrityFail` (`increase(integrity_fail_total[5m]) > 0`), `RioBuilderCastoreEio` (`sum(increase(eio_total[10m])) > 5` for 5m), `RioStoreFileDigestMismatch` (`increase[5m] > 0`); **warning** `RioMountdPromoteRejectMismatch` (`reason="mismatch"`), `RioBuilderDagPrefetchSlow` (p99 > 10s for 10m), `RioStoreNarIndexEagerErrors` (`outcome="error"`, >10/15m for 5m). |
+| `nix/tests/helm/27-castore-obs.sh` | locks: both dashboard ConfigMaps render under `monitoring.enabled=true` with the sidecar label and parseable embedded JSON; the `rio.castore.rules` alert set + severity split + `reason="mismatch"` / `outcome="error"` selectors; nothing renders with monitoring off. |
+| `nix/tests/helm/10-dashboard-labels.sh` | ALLOW extended with the new (metric, label) pairs the two dashboards reference. |
+| `docs/gen/alerts.json` | regenerated (new alert names). |
+| ~~`xtask/src/regen/grafana.rs`~~ | dropped — no such generator exists; dashboards ship via `dashboards-configmap.yaml`'s `.Files.Glob "dashboards/*.json"`, so adding the JSON file is sufficient. |
+
+**Metric gaps found vs the original sketch / spec §14 (handoffs, not fixed here):**
+
+- `rio_builder_objects_cache_{bytes,hit_total}` (sketched "objects_cache_bytes per node" panel) do not exist — they land with P0571's mountd-owned cache; add the per-node cache panel then. Same for `rio_mountd_cache_free_bytes` (spec §14).
+- `rio_store_nar_index_pending` (sketched `RioStoreNarIndexBacklog` alert) does not exist; the landed warn keys on `nar_index_eager_total{outcome="error"}` instead. A queue-depth gauge sampled from `list_nar_index_pending` would make the backlog alert possible — P0557/P0552 follow-up.
+- The sketched `RioBuilderDigestFuseStall` expr (`open_seconds_count` flat while `_sum` rises) is structurally impossible — a Prometheus histogram's `_sum`/`_count` move together at observation time (reply), never mid-open. A real stall detector needs an in-flight-opens gauge (or upcall-vs-completion rate comparison once `op="open"` upcalls and completions are both high-rate); deferred.
+- `rio_store_express_{bytes,evicted_total}` are described but not emitted until P0585's eviction sweeper — no panels yet.
+- Spec §14 names `rio_store_tiered_local_hit_ratio` (gauge) — the implementation emits `tiered_local_{hits,misses}_total` counters; the dashboard computes the ratio in PromQL. Spec §14 also labels `castore_fuse_open_seconds` with `streamed` — only `hit` is emitted today (P0575 streaming window).
+- `fetch_bytes_total{hit="node_ssd"}` / `chunk_source_total{src="node_ssd"}` series appear only after P0571/P0575; panels show the `remote` series until then. Legacy `rio_builder_fuse_*` metrics intentionally not panelled (deleted at P0560).
+
+**Exit:** `helm-lint` green (incl. the new fragment); dashboards render via the existing grafana sidecar ConfigMap flow.
 
 ### P0564 — helm cleanup + mountd DS wiring + kernel-feature assertion
 **Crate:** `infra` · **Deps:** P0554, P0560, P0567 · **Complexity:** LOW
@@ -898,7 +914,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":575,"title":"streaming open() for files > STREAM_THRESHOLD (StatBlob → ChunkMeta[]; during-fill KEEP_CACHE; priority-bump read; Promote on completion)","deps":[559,570,571],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"LOW","note":"~80 LoC; spike 15a9db79 proves no mode-flip; chunk list from StatBlob (P0570), no client resolver; unit-level exit via tests/stream.rs"}
 {"plan":560,"title":"[ATOMIC] castore-FUSE cutover: §A mount+overlay+DELETE old-FUSE (~-4600 LoC) §B fixture kernel + vm:castore-e2e + spike-regression cherry-pick","deps":[576,557,559,567,571,575,589],"crate":"rio-builder,nix","priority":80,"status":"UNIMPL","complexity":"HIGH","note":"hard cutover; one worktree, one PR, one checks gate; P0556 dep dropped (abandoned); needs P0589 so builder HMAC tokens carry tenant_id at cutover"}
 {"plan":562,"title":"Post-cutover audit (tracey builder.fuse.* empty; grep clean incl. cachefiles/boot_blob; checks re-run)","deps":[560],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"LOW","note":"CUTOVER GATE"}
-{"plan":563,"title":"Metrics: digest-fuse + tiered dashboards + alerts","deps":[544,548,559],"crate":"infra","priority":70,"status":"UNIMPL","complexity":"LOW","note":""}
+{"plan":563,"title":"Metrics: digest-fuse + tiered dashboards + alerts","deps":[544,548,559],"crate":"infra","priority":70,"status":"DONE","complexity":"LOW","note":"castore-fuse + chunk-cache-tier dashboards (existing metrics only) + rio.castore.rules alert group (3 critical / 3 warning) + helm-lint fragment 27 + dashboard-label ALLOW; gaps handed off: objects_cache/cache_free gauges (P0571), nar_index_pending gauge, express bytes/evicted (P0585), stall alert needs an inflight-opens gauge"}
 {"plan":564,"title":"helm cleanup + mountd DS wiring + kernel assertion (drop smarter-device-manager entirely)","deps":[554,560,567],"crate":"infra,rio-controller,nix","priority":75,"status":"UNIMPL","complexity":"LOW","note":"builders privileged:false; DELETE device-plugin.yaml + both NodeOverlays + nixos-node/smarter-device-manager; kvm via hostPath CharDevice + nodeSelector + extra-sandbox-paths (vm-kvm-hostpath-spike PASS)"}
 {"plan":565,"title":"Cutover runbooks (cache-tier, castore-FUSE)","deps":[555,562,564],"crate":"docs","priority":65,"status":"UNIMPL","complexity":"LOW","note":""}
 {"plan":572,"title":"Directory merkle layer: dir_digest/root_digest in NarIndex + directories+file_blobs tables + nar_index.root_node column + bottom-up compute in castore.rs","deps":[545,546,551,552],"crate":"rio-proto,rio-store","priority":90,"status":"DONE","complexity":"LOW","note":"LOAD-BEARING for P0559 mount path (ADR §2.2); also U5 foundation; snix castore.proto vendored (MIT); pin canonical encoding (snix #111); pass lives in rio-store not rio-nix (rio-nix can't depend on rio-proto)"}
