@@ -32,9 +32,10 @@ spec:
       nodeSelector:
         rio.build/node-role: general
       {{- else if $s.nodeSelector }}
-      # Explicit pin (VM tests: the filesystem chunk backend is a
-      # hostPath, so the pod must always land on the same node or a
-      # rollout orphans every previously-written chunk).
+      # Explicit pin (VM tests: the filesystem chunk backend's PVC is
+      # provisioned by local-path, so the pod must always land on the
+      # node holding the bound PV or a rollout orphans every
+      # previously-written chunk).
       nodeSelector:
         {{- toYaml $s.nodeSelector | nindent 8 }}
       {{- end }}

@@ -3,7 +3,8 @@
 # 2-node k3s via nix/tests/fixtures/k3s-full.nix.
 #
 # Airgapped: all images preloaded via services.k3s.images. NodePort
-# gateway (no cloud LB). Filesystem chunk backend on a hostPath (no S3).
+# gateway (no cloud LB). Filesystem chunk backend on a local-path PVC
+# (no S3).
 
 global:
   image:

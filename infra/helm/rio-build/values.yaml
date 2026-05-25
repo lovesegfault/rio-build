@@ -241,6 +241,17 @@ store:
     prefix: ""
     # For Rook RGW in dev: http://rook-ceph-rgw-rio-store.rook-ceph:80
     endpoint: ""
+    # kind: filesystem only — chunk directory inside the pod; the chart
+    # mounts the `rio-store-chunks` PVC here (vmtest-full.yaml sets it).
+    # baseDir: /var/lib/rio/chunks
+    # kind: filesystem only — size of the `rio-store-chunks` PVC the
+    # chart provisions. Default 10Gi.
+    # volumeSize: 10Gi
+  # Pin the store pod to one node. Only rendered when
+  # karpenter.enabled=false. Used with kind: filesystem so the pod
+  # follows the local-path PV it bound (vmtest-full.yaml pins to the
+  # k3s server node); leave unset for s3/tiered.
+  # nodeSelector: {}
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   # Upstream binary-cache egress allowlist. Each entry opens 443/TCP
