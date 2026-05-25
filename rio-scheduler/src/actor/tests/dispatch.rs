@@ -1337,6 +1337,113 @@ async fn ready_check_completes_on_missing_unwanted_output() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
+/// `batch_probe_cached_ready` × the LIVE effective wanted set: same
+/// liveness gate as the merge-time test, evaluated by the dispatch-time
+/// batch probe. Build A (wants ALL outputs via the empty sentinel)
+/// saturated the stored union before going terminal; build B (live)
+/// wants only `out`. P_out appears in the store after B's merge; P_debug
+/// stays missing and unsubstitutable. The probe must complete the node
+/// inline when A is terminal (only B's wants count) and leave it Ready
+/// when A is live.
+#[rstest::rstest]
+#[case::interested_build_terminal(true, DerivationStatus::Completed)]
+#[case::interested_build_live(false, DerivationStatus::Ready)]
+#[tokio::test]
+async fn batch_probe_classifies_against_live_builds_effective_wanted(
+    #[case] a_terminal: bool,
+    #[case] expect_status: DerivationStatus,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("lpw-out");
+    let dbg = test_store_path("lpw-debug");
+    // aarch64 so the x86_64 worker connected below can never take it —
+    // the node leaves Ready only via the batch probe's verdict.
+    let mk = |wanted: &[&str]| {
+        let mut d = make_node("lpw-drv");
+        d.system = "aarch64-linux".into();
+        d.output_names = vec!["out".into(), "debug".into()];
+        d.expected_output_paths = vec![out.clone(), dbg.clone()];
+        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        d
+    };
+
+    // Build A wants ALL declared outputs (empty sentinel).
+    let build_a = Uuid::new_v4();
+    if a_terminal {
+        // Dispatch A's node on a matching (aarch64) worker and fail it
+        // permanently: keep_going=true routes the build through
+        // check_build_completion → Failed without the cancel sweep, so
+        // A's interest and terminal BuildInfo stay behind.
+        let mut w1 = connect_executor(&handle, "lpw-w1", "aarch64-linux").await?;
+        let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
+        let assn = recv_assignment(&mut w1).await;
+        complete_failure(
+            &handle,
+            "lpw-w1",
+            &assn.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "precondition: A is terminal, interest retained"
+        );
+        // The aarch64 worker leaves so the re-merged node stays Ready.
+        disconnect(&handle, "lpw-w1").await?;
+    } else {
+        let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
+    }
+
+    // x86_64 worker: triggers dispatch passes but can never take the node.
+    let _rx = connect_executor(&handle, "lpw-b", "x86_64-linux").await?;
+
+    // Build B wants only {out}. Nothing is in the store yet, so B's merge
+    // classifies nothing — the decision under test happens at dispatch
+    // time.
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "lpw-drv").await.status,
+        DerivationStatus::Ready,
+        "precondition: nothing in store at merge time → Ready"
+    );
+
+    // P_out appears in the store AFTER the merges (another tenant
+    // uploaded it); P_debug stays missing and unsubstitutable. The next
+    // heartbeat-driven dispatch pass batch-probes the Ready node.
+    store.seed_with_content(&out, b"out");
+    send_heartbeat(&handle, "lpw-b", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "lpw-drv").await.status,
+        expect_status,
+        "a_terminal={a_terminal}: the dispatch-time verdict must follow \
+         the live builds' effective wanted set, not the stored union"
+    );
+    let status_b = query_status(&handle, build_b).await?;
+    if a_terminal {
+        assert_eq!(
+            status_b.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "all of B's wanted outputs present → completed inline"
+        );
+    } else {
+        assert_eq!(
+            status_b.state,
+            rio_proto::types::BuildState::Active as i32,
+            "A (live) still wants the missing P_debug → left Ready"
+        );
+    }
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test
@@ -4210,6 +4317,113 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
 
 // r[verify sched.merge.wanted-outputs]
 // r[verify sched.substitute.detached+3]
+/// The substitute walk's forgivable-seed set × the LIVE effective wanted
+/// set: a declared output path is forgivable only when NO LIVE build
+/// wants it. Build A wants ALL outputs (the empty sentinel) and saturates
+/// the stored union; build B wants only `out`. P_out is substitutable;
+/// P_debug's fetch always fails (injected non-retryable Internal).
+///
+/// - A TERMINAL (still interested, pre-cleanup): only B counts → P_debug
+///   is forgivable → its failure is forgiven → the walk completes the
+///   node and B succeeds.
+/// - A LIVE: P_debug is still effectively wanted → not forgivable → its
+///   failure fails the walk → the node demotes to Ready for a
+///   from-source dispatch.
+#[rstest::rstest]
+#[case::interested_build_terminal(true, "x86_64-linux", DerivationStatus::Completed)]
+#[case::interested_build_live(false, "aarch64-linux", DerivationStatus::Ready)]
+#[tokio::test]
+async fn substitute_forgivable_set_follows_live_builds_effective_wanted(
+    #[case] a_terminal: bool,
+    #[case] system: &str,
+    #[case] expect_status: DerivationStatus,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut w1 = connect_executor(&handle, "lfw-w1", "x86_64-linux").await?;
+
+    let out = test_store_path("lfw-out");
+    let dbg = test_store_path("lfw-debug");
+    let mk = |wanted: &[&str]| {
+        let mut d = make_node("lfw-drv");
+        d.system = system.into();
+        d.output_names = vec!["out".into(), "debug".into()];
+        d.expected_output_paths = vec![out.clone(), dbg.clone()];
+        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        d
+    };
+
+    // Build A wants ALL declared outputs; the store has nothing armed
+    // yet, so A's own merge classifies nothing (no hit, nothing
+    // substitutable) and the node seeds Ready.
+    let build_a = Uuid::new_v4();
+    let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
+
+    if a_terminal {
+        // Same terminal-but-still-interested staging as the merge-time
+        // test: dispatched (x86_64 in this case), permanent failure,
+        // keep_going=true → Failed via check_build_completion.
+        let assn = recv_assignment(&mut w1).await;
+        complete_failure(
+            &handle,
+            "lfw-w1",
+            &assn.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "precondition: A is terminal, interest retained"
+        );
+    }
+
+    // Now arm the store: P_out substitutable (probe + GET agree),
+    // P_debug indeterminate at probe time (optimistically routed to the
+    // walk) but its GET always fails with a non-retryable Internal.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store.state.indeterminate.write().unwrap().push(dbg.clone());
+    store
+        .faults
+        .fail_qpi_internal_paths
+        .write()
+        .unwrap()
+        .insert(dbg.clone());
+
+    // Build B re-merges the node wanting only {out} → classified
+    // pending-substitute → the detached walk runs with the forgivable
+    // set under test.
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    settle_substituting(&handle, &["lfw-drv"]).await;
+
+    assert_eq!(
+        expect_drv(&handle, "lfw-drv").await.status,
+        expect_status,
+        "a_terminal={a_terminal}: P_debug's fetch failure is forgiven iff \
+         no LIVE build wants it"
+    );
+    let status_b = query_status(&handle, build_b).await?;
+    if a_terminal {
+        assert_eq!(
+            status_b.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "B's wanted output substituted; the unwanted P_debug failure \
+             is forgiven"
+        );
+    } else {
+        assert_eq!(
+            status_b.state,
+            rio_proto::types::BuildState::Active as i32,
+            "A (live) wants P_debug → its failure must fail the walk"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs]
+// r[verify sched.substitute.detached+3]
 /// An UNRESOLVABLE wanted set (non-empty but matching no declared
 /// output name — a `drv^bogus` root the gateway didn't validate) must
 /// not invert the forgiveness gate. `wanted_output_paths()` resolves to
@@ -4329,6 +4543,137 @@ async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> Test
          wanted mid-fetch must downgrade the completion to a revert — \
          build B would otherwise observe a Completed node missing an \
          output it asked for"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs]
+// r[verify sched.substitute.detached+3]
+/// Once a forgiven seed has triggered a downgrade (it became wanted
+/// mid-fetch), it must NEVER be treated as forgivable again for that
+/// node — even if the build that wanted it later goes terminal. Without
+/// this, the walk chain could oscillate forgivable↔wanted indefinitely
+/// under build churn (the live effective wanted set shrinks when a build
+/// goes terminal and re-grows when a new one merges); with it, every
+/// downgrade permanently consumes one of the node's finitely many
+/// declared outputs, so the chain is bounded.
+///
+/// Staging: build B wants {out}; walk 1 forgives P_debug's failure;
+/// build C (wanting {debug}) merges mid-fetch → the completion is
+/// downgraded (P_debug is now wanted by a live build) and P_debug's
+/// forgiveness is spent. C is then cancelled, so no live build wants
+/// P_debug anymore. The next probe re-spawns the walk: P_debug must NOT
+/// be forgivable (it already triggered a downgrade), so its genuine
+/// failure fails the walk and the node demotes for a from-source
+/// dispatch — it must NOT complete.
+#[tokio::test]
+async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("nfg-out");
+    let dbg = test_store_path("nfg-debug");
+    // P_out: substitutable (probe + GET agree; the mock GET does not
+    // materialize it locally, so every later probe still sees it as
+    // missing-but-substitutable and a re-walk is spawned each pass).
+    // P_debug: indeterminate at probe time; its GET always fails with a
+    // non-retryable Internal.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store.state.indeterminate.write().unwrap().push(dbg.clone());
+    store
+        .faults
+        .fail_qpi_internal_paths
+        .write()
+        .unwrap()
+        .insert(dbg.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("nfg-drv");
+        // aarch64 with only an x86_64 worker connected: the node can
+        // never dispatch from source, so the final state isolates the
+        // walk verdict.
+        n.system = "aarch64-linux".into();
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // x86_64 worker: provides the heartbeat-driven dispatch passes.
+    let _rx = connect_executor(&handle, "nfg-b", "x86_64-linux").await?;
+
+    // Build B wants only {out} → pending-substitute → walk 1 spawned
+    // with forgivable = {P_debug}, parked at the QPI gate.
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    wait_for_status(&handle, "nfg-drv", DerivationStatus::Substituting).await;
+
+    // Build C merges mid-fetch and wants {debug}.
+    let build_c = Uuid::new_v4();
+    let _ev_c = merge_dag(&handle, build_c, vec![mk(&["debug"])], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Release walk 1: P_out substitutes, P_debug fails and is forgiven
+    // against the spawn-time forgivable set → the task posts ok=true
+    // with forgiven=[P_debug] → the handler downgrades (P_debug is now
+    // wanted by the live build C); that downgrade spends P_debug's
+    // forgiveness for this node.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    settle_substituting(&handle, &["nfg-drv"]).await;
+    assert_eq!(
+        expect_drv(&handle, "nfg-drv").await.status,
+        DerivationStatus::Ready,
+        "precondition: the downgraded completion reverts to Ready for \
+         re-substitution of the delta"
+    );
+
+    // Build C goes terminal: nothing live wants P_debug anymore.
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: build_c,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: cancel_tx,
+        })
+        .await?;
+    assert!(cancel_rx.await??, "cancel C");
+
+    // Walk 1's successful fetch materialized P_out in the local store —
+    // a re-probe right now would legitimately complete the node for the
+    // live demand ({out} present) without ever re-walking. Simulate a GC
+    // of P_out between the walks (it stays substitutable upstream) so
+    // the next probe must re-spawn the walk and the spent forgiveness is
+    // what decides the verdict.
+    store.state.paths.write().unwrap().remove(&out);
+
+    // The next dispatch pass re-probes the Ready node and re-spawns the
+    // walk. P_debug already triggered a downgrade, so it must NOT be
+    // forgivable — its (genuine) failure must fail the walk and demote
+    // the node, NOT complete it without the output.
+    send_heartbeat(&handle, "nfg-b", "x86_64-linux").await?;
+    settle_substituting(&handle, &["nfg-drv"]).await;
+
+    assert_eq!(
+        expect_drv(&handle, "nfg-drv").await.status,
+        DerivationStatus::Ready,
+        "a path that already triggered a downgrade must never be \
+         forgiven again for this node — the re-spawned walk must fail on \
+         P_debug and demote, not complete the node without it"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B keeps building from source; the node must not complete behind \
+         a forgiveness that was already spent"
     );
     Ok(())
 }

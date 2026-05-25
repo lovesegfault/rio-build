@@ -894,6 +894,26 @@ pub struct DerivationState {
     /// substitute-topdown]. In-mem only — same recovery semantics as
     /// `substitute_tried`.
     pub topdown_pruned: bool,
+    /// Output paths that have already triggered a forgiven-seed-became-
+    /// wanted DOWNGRADE of a substitute completion for this node
+    /// (`handle_substitute_complete`). A path in this set is NEVER
+    /// included in a later walk's forgivable set for this node, no
+    /// matter how the live effective wanted set shrinks (a build goes
+    /// terminal) or re-grows (a new build merges) between walks. This
+    /// is what keeps the downgrade → re-spawn chain monotone and
+    /// terminating: each downgrade permanently consumes at least one of
+    /// the node's finitely many declared outputs, so a node can take at
+    /// most |declared outputs| downgrades per substitution chain.
+    ///
+    /// Cleared when a chain ends in success (the ok=true arm of
+    /// `handle_substitute_complete` — no re-spawn follows, so clearing
+    /// cannot re-open a loop); a resubmit-reset rebuilds the node state
+    /// from scratch (fresh empty set) and `rollback_merge` restores the
+    /// removed node wholesale, so the set never outlives the node
+    /// lifetime it was accumulated in. In-mem only — never persisted;
+    /// recovery resets `Substituting` nodes through the dep-walk anyway
+    /// (same recovery semantics as `substitute_tried`).
+    pub never_forgive_paths: HashSet<String>,
 }
 
 impl DerivationState {
@@ -974,6 +994,7 @@ impl DerivationState {
             probed_generation: 0,
             substitute_tried: false,
             topdown_pruned: false,
+            never_forgive_paths: HashSet::new(),
         })
     }
 
@@ -1098,6 +1119,7 @@ impl DerivationState {
             probed_generation: 0,
             substitute_tried: false,
             topdown_pruned: false,
+            never_forgive_paths: HashSet::new(),
         })
     }
 
@@ -1175,6 +1197,7 @@ impl DerivationState {
             probed_generation: 0,
             substitute_tried: false,
             topdown_pruned: false,
+            never_forgive_paths: HashSet::new(),
         })
     }
 

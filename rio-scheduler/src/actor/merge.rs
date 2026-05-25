@@ -12,7 +12,8 @@ use uuid::Uuid;
 use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{
-    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, verifiable_wanted_paths,
+    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, effective_wanted,
+    verifiable_wanted_paths,
 };
 
 use super::{ActorError, DagActor, MergeDagRequest};
@@ -1848,12 +1849,19 @@ impl DagActor {
         // is empty (pre-migration rows, the BasicDerivation fallback,
         // ^* roots). The wanted set is read from the DAG state, not the
         // submission node: dag.merge already ran (step 2), so the DAG
-        // carries the union over EVERY interested build — using only
-        // this submission's narrower set could complete a shared
-        // re-probed node while another build still wants a missing
-        // output. The hit/pending VALUES stay `expected_output_paths`
-        // (the realized-output stamp, the GC pin set, and the client
-        // output report keep covering every declared output).
+        // carries the per-build contributions of EVERY interested build
+        // — using only this submission's narrower set could complete a
+        // shared re-probed node while another build still wants a
+        // missing output. The slice fed to the predicate is the LIVE
+        // effective wanted set (`effective_wanted`: the saturating
+        // union of live interested builds' contributions), so a
+        // terminal build's wants stop pinning the verdict; when that
+        // set is unavailable (no live builds, post-failover unknown
+        // contributions) the stored node-level union is the
+        // conservative fallback. The hit/pending VALUES stay
+        // `expected_output_paths` (the realized-output stamp, the GC
+        // pin set, and the client output report keep covering every
+        // declared output).
         let mut pending_substitute: Vec<(DrvHash, Vec<String>)> = Vec::new();
         for h in probe_set {
             if hits.contains_key(h) {
@@ -1868,13 +1876,16 @@ impl DagActor {
             // A wanted set that resolves to no verifiable path cannot
             // be classified — fall through to build, same as the
             // all-declared guard above.
+            let dag_state = self.dag.node(h);
+            let eff = dag_state.and_then(|s| effective_wanted(s, &self.builds));
             let Some(wanted) = verifiable_wanted_paths(
                 &n.output_names,
                 &n.expected_output_paths,
-                self.dag
-                    .node(h)
-                    .map(|s| s.wanted_output_names.as_slice())
-                    .unwrap_or(&n.wanted_output_names),
+                eff.as_deref().unwrap_or_else(|| {
+                    dag_state
+                        .map(|s| s.wanted_output_names.as_slice())
+                        .unwrap_or(&n.wanted_output_names)
+                }),
             ) else {
                 continue;
             };

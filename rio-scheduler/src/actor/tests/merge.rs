@@ -1652,6 +1652,115 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
+/// `check_cached_outputs` × the LIVE effective wanted set: the merge-time
+/// cache-hit classification must be evaluated against the union of the
+/// wanted contributions of LIVE interested builds, not the never-shrinking
+/// stored node-level union. Build A wants ALL outputs (the empty sentinel)
+/// and saturates the stored union; build B wants only `out`. P_out is in
+/// the store, P_debug is missing and not substitutable.
+///
+/// - A TERMINAL (a failed keep_going build whose interest and BuildInfo
+///   are still around — the ≤60 s pre-cleanup window): only B's
+///   contribution counts → all wanted outputs present → cache hit → B
+///   completes all-cached.
+/// - A LIVE: its all-outputs contribution still counts → P_debug missing
+///   → NOT a hit → the node stays pending and B stays Active.
+#[rstest::rstest]
+// A terminal → only B's {out} is effectively wanted → hit.
+#[case::interested_build_terminal(true, "x86_64-linux", DerivationStatus::Completed)]
+// A live → its all-wanted contribution keeps P_debug wanted → no hit.
+#[case::interested_build_live(false, "aarch64-linux", DerivationStatus::Ready)]
+#[tokio::test]
+async fn merge_cache_hit_classified_against_live_builds_effective_wanted(
+    #[case] a_terminal: bool,
+    #[case] system: &str,
+    #[case] expect_status: DerivationStatus,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut w1 = connect_executor(&handle, "lew-w1", "x86_64-linux").await?;
+
+    let out = test_store_path("lew-dep-out");
+    let dbg = test_store_path("lew-dep-debug");
+    let mk = |wanted: &[&str]| {
+        let mut d = make_node("lew-dep");
+        d.system = system.into();
+        d.output_names = vec!["out".into(), "debug".into()];
+        d.expected_output_paths = vec![out.clone(), dbg.clone()];
+        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        d
+    };
+    // P_out is in the store from the start; P_debug never is (and is not
+    // substitutable). With an all-outputs wanted set the node can never
+    // be a cache hit; with {out} it always is.
+    store.seed_with_content(&out, b"out");
+
+    // Build A wants ALL declared outputs (empty sentinel) — saturates the
+    // stored union for everyone. keep_going so a derivation failure
+    // routes through check_build_completion (no cancel sweep).
+    let build_a = Uuid::new_v4();
+    let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
+
+    if a_terminal {
+        // Drive A terminal WITHOUT losing its DAG interest: the node is
+        // dispatched (x86_64 in this case) and fails permanently;
+        // keep_going=true means the build fails via
+        // check_build_completion, which does NOT strip interest — A's
+        // membership and terminal BuildInfo linger for
+        // TERMINAL_CLEANUP_DELAY, exactly the window under test.
+        let assn = recv_assignment(&mut w1).await;
+        assert!(assn.drv_path.ends_with("lew-dep.drv"));
+        complete_failure(
+            &handle,
+            "lew-w1",
+            &assn.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        assert_eq!(
+            expect_drv(&handle, "lew-dep").await.status,
+            DerivationStatus::Poisoned,
+            "precondition: A's permanent failure poisons the node"
+        );
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "precondition: A is terminal but not yet cleaned up"
+        );
+    }
+
+    // Build B re-merges the node wanting only {out}.
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "lew-dep").await.status,
+        expect_status,
+        "a_terminal={a_terminal}: the merge-time cache-hit verdict must \
+         follow the live builds' effective wanted set, not the stored \
+         union"
+    );
+    let status_b = query_status(&handle, build_b).await?;
+    if a_terminal {
+        assert_eq!(
+            status_b.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "all of B's wanted outputs are present → all-cached build"
+        );
+        assert_eq!(status_b.cached_derivations, 1);
+    } else {
+        assert_eq!(
+            status_b.state,
+            rio_proto::types::BuildState::Active as i32,
+            "A (live) still wants P_debug → no hit → B keeps building"
+        );
+    }
+    Ok(())
+}
+
 // r[verify sched.merge.stale-substitutable]
 // r[verify sched.merge.wanted-outputs]
 /// `verify_preexisting_completed` ROUTING × wanted outputs: once the

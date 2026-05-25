@@ -12,7 +12,9 @@ use tracing::{debug, error, info, warn};
 
 use rio_proto::types::FindMissingPathsRequest;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId, verifiable_wanted_paths};
+use crate::state::{
+    DerivationStatus, DrvHash, ExecutorId, effective_wanted, verifiable_wanted_paths, wanted_subset,
+};
 
 use super::DagActor;
 #[cfg(test)]
@@ -680,23 +682,28 @@ impl DagActor {
             // be present (→ complete inline) or present-or-
             // substitutable (→ detached fetch). A missing output
             // nothing consumes must not force a from-source dispatch.
-            // `verifiable_wanted_paths` returns None for a wanted set
-            // that resolves to no verifiable path; degrade to all of
-            // `paths` then (and for a node that vanished from the DAG
-            // mid-probe). The probe set and the `to_spawn` walk seeds
-            // stay ALL expected paths (opportunistic completeness —
-            // fetch the unwanted output too if the upstream has it).
+            // The wanted slice is the LIVE effective wanted set
+            // (`effective_wanted` over live interested builds'
+            // contributions; a terminal build's wants stop counting),
+            // falling back to the stored node-level union when it is
+            // unavailable. `verifiable_wanted_paths` returns None for a
+            // wanted set that resolves to no verifiable path; degrade
+            // to all of `paths` then (and for a node that vanished from
+            // the DAG mid-probe). The probe set and the `to_spawn` walk
+            // seeds stay ALL expected paths (opportunistic completeness
+            // — fetch the unwanted output too if the upstream has it).
             let wanted: Vec<String> = self
                 .dag
                 .node(&drv_hash)
                 .and_then(|s| {
+                    let eff = effective_wanted(s, &self.builds);
                     verifiable_wanted_paths(
                         &s.output_names,
                         &s.expected_output_paths,
-                        &s.wanted_output_names,
+                        eff.as_deref().unwrap_or(&s.wanted_output_names),
                     )
+                    .map(|w| w.into_iter().map(str::to_owned).collect::<Vec<String>>())
                 })
-                .map(|w| w.into_iter().map(str::to_owned).collect())
                 .unwrap_or_else(|| paths.clone());
             if wanted.iter().all(|p| !missing.contains(p)) {
                 // `substitute_tried` ⇒ the closure walk ingested the
@@ -812,6 +819,14 @@ impl DagActor {
         }
         let mut spawned: Vec<Spawned> = Vec::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
+            // Live effective wanted set for the forgivable complement
+            // below (terminal builds' contributions excluded; stored-
+            // union fallback on None) — computed before the `node_mut`
+            // borrow since it needs `self.builds`.
+            let eff = self
+                .dag
+                .node(&drv_hash)
+                .and_then(|s| effective_wanted(s, &self.builds));
             let Some(state) = self.dag.node_mut(&drv_hash) else {
                 continue;
             };
@@ -846,19 +861,24 @@ impl DagActor {
             }
             // r[impl sched.merge.wanted-outputs]
             // The forgivable seed subset: declared output paths whose
-            // name is OUTSIDE the node's (non-empty) wanted set. The
-            // walk still attempts them (opportunistic completeness)
-            // but their failure must not demote the derivation to a
-            // from-source build. Computed from the DAG state's
-            // post-merge wanted union — the same source the cache-hit
-            // classification uses — so a path is only forgiven when
-            // NO interested build wants it. Empty wanted set = all
-            // wanted = nothing forgivable (today's behaviour). Only
-            // paths positively identifiable as unwanted (declared in
-            // `expected_output_paths` but outside the wanted subset)
-            // qualify; a seed that matches no declared path (the
-            // realized floating-CA path from the reprobe lane) is
-            // never forgiven.
+            // name is OUTSIDE the (non-empty) wanted set. The walk
+            // still attempts them (opportunistic completeness) but
+            // their failure must not demote the derivation to a
+            // from-source build. Computed from the LIVE effective
+            // wanted set (`effective_wanted` over live interested
+            // builds' contributions, stored-union fallback) — the same
+            // source the cache-hit classification uses — so a path is
+            // only forgiven when NO LIVE build wants it; a terminal
+            // build's wants stop pinning seeds as unforgivable. Empty
+            // wanted set = all wanted = nothing forgivable (today's
+            // behaviour). Only paths positively identifiable as
+            // unwanted (declared in `expected_output_paths` but outside
+            // the wanted subset) qualify; a seed that matches no
+            // declared path (the realized floating-CA path from the
+            // reprobe lane) is never forgiven, and neither is a path
+            // that already triggered a forgiven-seed-became-wanted
+            // downgrade (`never_forgive_paths` — see
+            // `handle_substitute_complete`'s termination argument).
             //
             // The complement MUST be taken against the *verifiable*
             // wanted subset. A wanted set that resolves to no
@@ -872,7 +892,7 @@ impl DagActor {
             let forgivable: HashSet<String> = match verifiable_wanted_paths(
                 &state.output_names,
                 &state.expected_output_paths,
-                &state.wanted_output_names,
+                eff.as_deref().unwrap_or(&state.wanted_output_names),
             ) {
                 Some(wanted) => {
                     let wanted: HashSet<&str> = wanted.into_iter().collect();
@@ -880,7 +900,10 @@ impl DagActor {
                         .expected_output_paths
                         .iter()
                         .filter(|p| {
-                            !p.is_empty() && !wanted.contains(p.as_str()) && paths.contains(*p)
+                            !p.is_empty()
+                                && !wanted.contains(p.as_str())
+                                && paths.contains(*p)
+                                && !state.never_forgive_paths.contains(p.as_str())
                         })
                         .cloned()
                         .collect()
@@ -1036,28 +1059,70 @@ impl DagActor {
         // r[impl sched.merge.wanted-outputs]
         // The walk's forgiveness verdict was computed against the
         // wanted set as of SPAWN time. A build that merged during the
-        // (potentially minutes-long) detached fetch can have grown the
-        // node's wanted union to include a seed the walk forgave —
-        // completing now would hand that build a node missing an
-        // output it wants. Downgrade to a revert WITHOUT setting
-        // `substitute_tried`: the next dispatch pass re-probes and
-        // re-spawns the walk with the corrected forgivable set, so the
-        // delta is re-substituted (and a genuine miss then fails the
-        // walk → `substitute_tried` → from-source build). Two revert
-        // targets cannot wait for "the next pass" — a topdown-pruned
-        // childless root and a node whose dep is terminally failed —
-        // so for those the walk is re-spawned immediately below
-        // instead (see the downgrade re-spawn ahead of the generic
-        // revert).
-        let forgiven_now_wanted =
-            ok && !forgiven.is_empty() && state.wanted_output_paths().any(|p| forgiven.contains(p));
+        // (potentially minutes-long) detached fetch can have made a
+        // seed the walk forgave wanted by a live build — completing
+        // now would hand that build a node missing an output it wants.
+        // The re-check is evaluated against the LIVE effective wanted
+        // set (`effective_wanted`, computed at this call site because
+        // liveness needs `self.builds`, which the node cannot see),
+        // falling back to the stored node-level union — same source as
+        // the spawn-time forgivable complement. Downgrade to a revert
+        // WITHOUT setting `substitute_tried`: the next dispatch pass
+        // re-probes and re-spawns the walk with the corrected
+        // forgivable set, so the delta is re-substituted (and a genuine
+        // miss then fails the walk → `substitute_tried` → from-source
+        // build). Two revert targets cannot wait for "the next pass" —
+        // a topdown-pruned childless root and a node whose dep is
+        // terminally failed — so for those the walk is re-spawned
+        // immediately below instead (see the downgrade re-spawn ahead
+        // of the generic revert).
+        //
+        // The trigger paths (forgiven at spawn time AND wanted now) are
+        // collected — not just detected — so the downgrade can record
+        // them in `never_forgive_paths` below.
+        let forgiven_now_wanted_paths: Vec<String> = if ok && !forgiven.is_empty() {
+            let eff = effective_wanted(state, &self.builds);
+            wanted_subset(
+                &state.output_names,
+                &state.expected_output_paths,
+                eff.as_deref().unwrap_or(&state.wanted_output_names),
+            )
+            .filter(|p| forgiven.contains(p))
+            .cloned()
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let forgiven_now_wanted = !forgiven_now_wanted_paths.is_empty();
         let ok = ok && !forgiven_now_wanted;
         if forgiven_now_wanted {
+            // Spend the trigger paths' forgiveness BEFORE any re-spawn
+            // (immediate or next-pass): a path that has triggered a
+            // downgrade once is never forgivable again for this node,
+            // no matter how the live effective wanted set later shrinks
+            // (the wanting build goes terminal) or re-grows. This is
+            // the monotone step the walk chain's termination argument
+            // rests on — see the downgrade re-spawn comment below.
+            if let Some(s) = self.dag.node_mut(drv_hash) {
+                s.never_forgive_paths
+                    .extend(forgiven_now_wanted_paths.iter().cloned());
+            }
             info!(%drv_hash,
                   "substitute walk forgave a seed that became wanted \
                    mid-fetch; reverting for re-substitution of the delta");
         }
         if ok {
+            // The substitution chain ends in success — the spent-
+            // forgiveness bookkeeping is scoped to the chain, so clear
+            // it. Safe: no re-spawn follows the ok=true arm, and a NEW
+            // chain only starts after an external reset (re-merge of a
+            // failed node, stale-Completed verify, recovery), each of
+            // which is bounded by the same |declared outputs| argument
+            // again — clearing here cannot re-open an unbounded
+            // downgrade loop.
+            if let Some(s) = self.dag.node_mut(drv_hash) {
+                s.never_forgive_paths.clear();
+            }
             // complete_ready_from_store does Substituting→Completed
             // (valid transition) + the full post-completion machinery
             // (output_paths, persist, upsert_path_tenants, promote_
@@ -1182,20 +1247,30 @@ impl DagActor {
         //    hazard the fail-fast arm above exists to prevent.
         //
         // For both, re-spawn the walk NOW: `spawn_substitute_fetches`
-        // recomputes the forgivable set from the CURRENT wanted union,
-        // so the newly-wanted delta gets a real, retry-laddered attempt
-        // before any terminal verdict. If that walk genuinely fails it
-        // lands back here with `forgiven_now_wanted = false` and takes
-        // the normal arms (fail-fast / epilogue). Terminates: the
-        // wanted union only grows (`union_wanted_saturating`), so each
-        // re-spawn's forgivable set excludes every previously-forgiven
-        // now-wanted path — another downgrade needs ANOTHER declared
-        // output to flip unwanted→wanted mid-walk, and there are
-        // finitely many declared outputs.
+        // recomputes the forgivable set from the CURRENT effective
+        // wanted set, so the newly-wanted delta gets a real,
+        // retry-laddered attempt before any terminal verdict. If that
+        // walk genuinely fails it lands back here with
+        // `forgiven_now_wanted = false` and takes the normal arms
+        // (fail-fast / epilogue). Terminates: every downgrade first
+        // adds its trigger paths to `never_forgive_paths` (above), and
+        // a path in that set is excluded from every later walk's
+        // forgivable set for this node — so it can never be reported
+        // forgiven (and trigger another downgrade) again, regardless of
+        // how the live effective wanted set shrinks (a build goes
+        // terminal) and re-grows (a new build merges) between walks.
+        // The trigger paths were forgivable, hence not yet in the set,
+        // so each downgrade strictly grows it — the walk chain takes at
+        // most |declared outputs| downgrades, and the set only resets
+        // when the chain itself ends (successful completion, or the
+        // node is reset/removed by a resubmit-reset or rollback).
         //
         // The in-memory revert to `to` only satisfies the transition
         // table (there is no Substituting→Substituting); PG keeps
-        // `Substituting`, which the re-spawn re-persists. The ordinary
+        // `Substituting`, which the re-spawn re-persists (one nuance:
+        // for the DependencyFailed/Poisoned-origin arm the re-spawn's
+        // best-effort `clear_poison` transiently writes status
+        // 'created' to PG before that re-persist lands). The ordinary
         // Ready/Queued downgrade keeps today's behaviour (revert; the
         // next pass re-probes and re-substitutes — and a from-source
         // dispatch there is safe because the node's deps ARE in the
@@ -1230,9 +1305,10 @@ impl DagActor {
         // the fetch did not definitively fail a wanted path (it never
         // tried the now-wanted one as wanted), so the next pass MUST
         // re-substitute with the corrected forgivable set. Bounded:
-        // that second walk either succeeds or fails the now-unforgiven
-        // seed → lands back here with `forgiven_now_wanted = false` →
-        // sets the one-shot flag. (The hazardous DependencyFailed /
+        // the trigger path is in `never_forgive_paths`, so that second
+        // walk either succeeds or fails the now-unforgivable seed →
+        // lands back here with `forgiven_now_wanted = false` → sets the
+        // one-shot flag. (The hazardous DependencyFailed /
         // topdown-childless targets never reach here — they re-spawned
         // above.)
         if !forgiven_now_wanted {
@@ -1315,6 +1391,13 @@ impl DagActor {
     /// (an earlier dispatch on another scheduler/build uploaded it).
     async fn ready_check_or_spawn(&mut self, drv_hash: &DrvHash) -> bool {
         let probe_gen = self.probe_generation;
+        // Live effective wanted set (terminal builds' contributions
+        // excluded; stored-union fallback on None) — computed before
+        // the `node_mut` borrow below since it needs `self.builds`.
+        let eff = self
+            .dag
+            .node(drv_hash)
+            .and_then(|s| effective_wanted(s, &self.builds));
         let (paths, wanted, substitute_tried, mut store) = {
             let Some(state) = self.dag.node_mut(drv_hash) else {
                 return false;
@@ -1337,7 +1420,9 @@ impl DagActor {
             // r[impl sched.merge.wanted-outputs]
             // Demand-driven completeness: the probe set stays ALL
             // expected paths, but the present/substitutable verdicts
-            // below are evaluated over the WANTED subset only.
+            // below are evaluated over the WANTED subset only — the
+            // live effective wanted set computed above, with the stored
+            // node-level union as the fallback.
             // `verifiable_wanted_paths` returns None for a wanted set
             // that resolves to no verifiable path; degrade to all
             // expected paths then — same shape as
@@ -1345,7 +1430,7 @@ impl DagActor {
             let wanted: Vec<String> = verifiable_wanted_paths(
                 &state.output_names,
                 &state.expected_output_paths,
-                &state.wanted_output_names,
+                eff.as_deref().unwrap_or(&state.wanted_output_names),
             )
             .map(|w| w.into_iter().map(str::to_owned).collect())
             .unwrap_or_else(|| state.expected_output_paths.clone());
