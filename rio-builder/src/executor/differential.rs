@@ -16,6 +16,7 @@
 //! the VM test (it needs root + namespaces + a populated /nix/store).
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -174,6 +175,18 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     let chroot_dir = cfg.work_dir.join("chroot");
     for d in [&store_dir, &build_dir, &chroot_dir] {
         std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    }
+    // The sandboxed build runs as cfg.uid/cfg.gid but creates its outputs
+    // directly under the writable /nix/store mount (and scratch files under
+    // /build), whose bind SOURCES are these root-owned directories. In
+    // production the overlay upper store is prepared build-writable (mode
+    // 1775, build gid — the same contract real Nix gives its chroot store);
+    // mirror that here or every output `mkdir` fails EACCES.
+    for d in [&store_dir, &build_dir] {
+        std::os::unix::fs::chown(d, Some(cfg.uid), Some(cfg.gid))
+            .with_context(|| format!("chowning {} to the sandbox user", d.display()))?;
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o1775))
+            .with_context(|| format!("chmodding {}", d.display()))?;
     }
     for p in &closure_paths {
         let dest = store_dir.join(basename(p).unwrap_or(p.as_str()));
