@@ -266,6 +266,11 @@ impl ExecutorState {
 /// fields mean this is a BITWISE compare — acceptable for config
 /// (the test just asserts default-constructed identity, not
 /// computed-value equality).
+// r[impl sched.retry.attempts-bounded]
+// The budget caps. Every failure-driven retry loop is bounded by one
+// of these (or by `PoisonConfig.threshold` / POISON_RESUBMIT_RETRY_
+// LIMIT); the per-site charge/check discipline is the reference fold
+// in retry_policy.rs.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RetryPolicy {

@@ -475,6 +475,167 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   `ClearPoison` after the underlying condition is fixed.
 ]
 
+== Retry decision invariants
+
+The nine failure entry points (worker-reported transient / infra /
+permanent / timeout completions, the stream disconnect, the
+controller-reported termination and deadline-exceeded paths, the
+scheduler-side backstop timer, and the dispatch-time fleet-exhaust check)
+each consult and mutate a subset of the per-derivation retry counters. The
+rules in this subsection state the properties the nine sites must
+collectively preserve; the executable specification of the counter
+arithmetic is the reference fold in `rio-scheduler/src/retry_policy.rs`,
+and the per-site ↔ per-rule cross-reference is
+`docs/spec/models/retry-invariant-map.md`.
+
+#r("sched.retry.transient-budget")[
+  A worker-reported `TransientFailure` (the build ran and exited non-zero;
+  an `Unspecified` result status is treated identically) MUST record the
+  reporting executor into `failed_builders`, increment `failure_count`, and
+  then decide: if the poison threshold is reached
+  (#rref("sched.retry.per-executor-budget")) or every eligible worker has
+  already failed this derivation (#rref("sched.dispatch.fleet-exhaust")),
+  the derivation is poisoned; otherwise, while the per-cycle transient
+  count is below `RetryPolicy.max_retries`, the derivation MUST be requeued
+  with an exponential backoff (`backoff_until = now + backoff(count)`,
+  applied as a dispatch-time defer, cleared on successful dispatch) and the
+  count incremented; at or above `max_retries` the derivation is poisoned.
+]
+The transient budget is per poison cycle: a resubmit reset
+(#rref("sched.merge.poisoned-resubmit-bounded")) restores the full
+`max_retries` budget and charges `resubmit_cycles` instead. The backoff is
+the only one among the failure classes (infra, timeout, disconnect, and
+backstop requeues are immediate) --- the asymmetry is recorded in the
+invariant map as a Phase-1 policy decision, not specified away here.
+
+#r("sched.retry.attempts-bounded")[
+  Every failure-driven retry loop MUST be bounded: each counted attempt
+  charges exactly one of the named budgets --- the per-cycle transient
+  count (`max_retries`), the non-exempt infrastructure count
+  (`max_infra_retries`), the exempt-infrastructure count
+  (`max_exempt_infra_retries`), the timeout count (`max_timeout_retries`),
+  the poison threshold (`PoisonConfig.threshold`), or the cross-cycle
+  resubmit count (`POISON_RESUBMIT_RETRY_LIMIT`) --- and every budget has a
+  finite cap whose exhaustion produces a terminal state (`Poisoned` or
+  `Cancelled`); an attempt exempted from one budget MUST be charged to
+  another.
+]
+The budget values are configuration (`[retry]` / `[poison]` tables above),
+not normative numbers. The clause that bites is the partition: an attempt
+charged to no budget is an unbounded retry loop (the 9,748-redispatch
+incident, the pre-I-200 cold-start timeout loop, the pre-cap exempt-infra
+livelock), and an attempt charged to two budgets poisons early (the at-cap
+OOM double-count). The per-counter fencepost conventions (whether the cap
+fires on the Nth or the N+1th attempt) currently differ between counters;
+the reference fold reproduces each counter's own convention and the
+invariant map flags the inconsistency for Phase-1 unification.
+
+#r("sched.retry.counters-refine-history")[
+  The per-derivation retry counters (`count`, `resubmit_cycles`,
+  `infra_count`, `timeout_count`, `last_infra_failure_at`,
+  `exempt_infra_count`, `failed_builders`, `failure_count`, `poisoned_at`,
+  `backoff_until`) MUST at every point equal the reference fold of the
+  derivation's observed failure-event history: each observed event charges
+  the counters its class charges and no others; a non-exempt infrastructure
+  failure observed more than `infra_retry_window_secs` (default 300 s)
+  after the previous counted one resets `infra_count` before charging it,
+  unless the resource floor is at its ceiling; a floor-promoted or
+  CONCURRENT_PUTPATH infrastructure failure charges `exempt_infra_count`
+  instead of `infra_count`; the cache-hit and resubmit resets are
+  themselves history events that zero the per-cycle counters; and no code
+  path mutates a counter outside the fold's event alphabet.
+]
+The fold is `rio-scheduler/src/retry_policy.rs` (a pure function with unit
+tests against hand-computed histories); the model-checked form quantifies
+over observation orderings and is deferred to the `retryPolicy.qnt` model.
+The 300 s window appears here because no other rule states it --- it is the
+I-127 forgiveness that distinguishes a burst of misclassified permanent
+failures from sparse independent incidents, and a fold that omits it
+poisons healthy derivations on long builds.
+
+#r("sched.retry.verdict-channel-invariant")[
+  For a fixed physical failure history, the budget verdict (requeue,
+  poison-on-budget-exhaustion, terminal cancel, or TTL-expire) and the
+  counter deltas MUST NOT depend on which observation channel (worker
+  completion report, stream disconnect, controller termination report,
+  scheduler backstop timer) delivered each physical event or in what order
+  the channels delivered them.
+]
+The as-built code violates this on at least one reachable history,
+recorded as divergence D1 in the invariant map: the same exhausted timeout
+budget lands as `Cancelled` (worker-reported `TimedOut`) or `Poisoned`
+(controller-reported `DeadlineExceeded`) depending on which observer
+reports the deadline overrun first --- the two reports describe one
+physical fact and which arrives first is a race. The rule is added
+marker-first so the model run that falsifies it is confirming a documented
+defect; the code fix is a Phase-1 disposition. The related
+which-counter-does-a-promoted-OOM-charge inconsistency (divergence D3) is
+*not* a channel race --- a cgroup-level OOM and a pod-level OOM are
+physically distinct events --- and is recorded as a contradiction of
+#rref("sched.retry.exempt-infra-cap") instead.
+
+#r("sched.retry.no-double-count")[
+  One physical executor death MUST produce at most one counted accounting
+  event per derivation, regardless of which subset of the observation
+  channels (stream close, heartbeat timeout, controller termination report,
+  backstop timer) observes the death and in which order their reports
+  arrive.
+]
+The enforcement is the signal-channel dedup state: `recently_disconnected`
+(insert on mid-build disconnect only, first-report-wins removal, 60 s TTL
+sweep), the `last_completed` discriminator (an expected one-shot exit
+records no entry; a race-ahead termination report sets it so the imminent
+disconnect does not re-insert), and the non-promoting-reason early return
+(a `Completed`/`Error` report must not consume the dedup entry that the
+real classification needs). Each of those mechanisms exists because its
+absence double-counted a death (the G5 fix family); the rule states the
+property they collectively enforce so the model can check the conjunction.
+
+#r("sched.retry.recovery-projection")[
+  After a leader change, each recovered derivation's retry state MUST equal
+  the documented projection of its persisted columns and nothing more:
+  `count` from `derivations.retry_count`, `resubmit_cycles` from
+  `derivations.resubmit_cycles`, `failed_builders` from
+  `derivations.failed_builders`, `poisoned_at` from
+  `derivations.poisoned_at` (with rows past the 24 h TTL cleared rather
+  than reloaded), `failure_count` derived as `failed_builders.len()`, and
+  the remaining counters (`infra_count`, `timeout_count`,
+  `last_infra_failure_at`, `exempt_infra_count`, `backoff_until`) reset to
+  their defaults; no recovered counter may exceed the value the persisted
+  columns support.
+]
+This is the as-built selective forgiveness, stated so the model's failover
+action reproduces the 4-recovered / 1-derived / 5-defaulted split rather
+than resetting all ten or preserving all ten. The forgiveness is
+deliberately conservative (a restart never spuriously poisons) and
+deliberately lossy (`failure_count`'s same-worker repeats are forgotten;
+the in-memory budgets refresh on every leader flap). Whether the infra,
+timeout, and exempt budgets should instead survive failover once the
+attempt history is durable is the `sched.retry.failover-budget` decision
+the Phase-0 exit gate requires before any decision site changes; this rule
+pins the current contract, not the future one.
+
+#r("sched.poison.cascade-dependents")[
+  When a derivation reaches a failure-terminal state (`Poisoned`,
+  `Cancelled` via budget exhaustion, or a permanent failure), every
+  ancestor reachable from it through edges whose intermediate nodes are all
+  in a not-yet-started state (`Created`, `Queued`, `Ready`) MUST be
+  transitioned to `DependencyFailed` and persisted; nodes that have already
+  started (`Assigned`, `Running`) or already terminated MUST NOT be
+  preempted by the cascade; and every interested build of every cascaded
+  node MUST observe the cascade (a per-node terminal event and a build-level
+  completion check), including builds interested in a cascaded ancestor but
+  not in the trigger.
+]
+This is the runtime cascade (`cascade_dependency_failure` + the
+terminal-failure epilogue's union over interested builds). Its merge-time
+counterpart (#rref("sched.merge.dep-failed-transitive")) seeds nodes that
+join the DAG after the trigger already failed; its recovery-time
+counterpart (#rref("sched.recovery.failed-dep-cascade")) re-runs it for
+parents whose cascade was interrupted by a crash. All three exist because a
+keep-going build with a poisoned leaf otherwise hangs Active forever ---
+`completed + failed` never reaches `total`.
+
 #r("sched.admin.list-executors-leader-age")[
   `ListExecutorsResponse.leader_for_secs` is the seconds since this replica
   acquired leadership (`LeaderState::leader_for()`). Consumers MUST treat the

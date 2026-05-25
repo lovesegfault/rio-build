@@ -1116,6 +1116,7 @@ impl DerivationState {
     /// be defensive against PG corruption / manual edits. On error,
     /// returns `(drv_hash, err)` so the caller can log without
     /// having cloned drv_hash up front.
+    // r[impl sched.retry.recovery-projection]
     pub(crate) fn from_recovery_row(
         row: crate::db::RecoveryDerivationRow,
         status: DerivationStatus,
@@ -1234,6 +1235,7 @@ impl DerivationState {
     /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
     /// Duration::from_secs_f64(elapsed)` — approximate but good enough
     /// for a 24h TTL.
+    // r[impl sched.retry.recovery-projection]
     pub(crate) fn from_poisoned_row(
         row: crate::db::PoisonedDerivationRow,
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {

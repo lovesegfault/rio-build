@@ -763,6 +763,7 @@ impl DagActor {
             && worker.running_build.as_ref() == Some(drv_hash)
         {
             worker.running_build = None;
+            // r[impl sched.retry.no-double-count]
             // I-197: record that THIS drv terminated on THIS executor.
             // `reassign_derivations` reads it on disconnect to tell
             // OOMKilled-mid-build (last_completed != running) from the
@@ -1971,6 +1972,7 @@ impl DagActor {
     /// "permanent failures forgot to unpin" can't recur per-handler.
     ///
     /// [`poison_and_cascade`]: Self::poison_and_cascade
+    // r[impl sched.poison.cascade-dependents]
     pub(super) async fn terminal_failure_epilogue(
         &mut self,
         drv_hash: &DrvHash,
@@ -2174,6 +2176,7 @@ impl DagActor {
         true
     }
 
+    // r[impl sched.retry.transient-budget]
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,
@@ -2671,6 +2674,7 @@ impl DagActor {
     /// leaf hang forever: parents stay Queued, so completed+failed
     /// never reaches total.
     //
+    // r[impl sched.poison.cascade-dependents]
     // r[impl sched.db.batch-unnest]
     // Collect-then-batch-persist: the BFS runs entirely in-memory
     // (transitions, ready_queue removes), then ONE persist_status_batch

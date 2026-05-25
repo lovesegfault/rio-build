@@ -407,6 +407,7 @@ impl DagActor {
         // churn).
         let lost_last_completed = worker.last_completed.clone();
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
+        // r[impl sched.retry.no-double-count]
         // Record for the controller's follow-up report. Only when the
         // worker died MID-BUILD (last_completed != running_build) — an
         // expected one-shot exit needs no entry.
@@ -602,6 +603,7 @@ impl DagActor {
             return false;
         };
 
+        // r[impl sched.retry.no-double-count]
         // Resolve drv. remove() = first-report-wins dedup.
         let drv_hash = match self.recently_disconnected.remove(executor_id) {
             Some((drv, _)) => drv,
