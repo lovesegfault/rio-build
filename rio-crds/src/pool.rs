@@ -281,6 +281,15 @@ pub struct PoolSpec {
     #[serde(default)]
     pub features: Vec<String>,
 
+    /// Hashed-mirror base URLs for the native `builtin:fetchurl`
+    /// (tried as `<mirror>/<algo>/<base16-hash>` before the origin
+    /// URL). Maps to `RIO_HASHED_MIRRORS`. Mostly relevant for
+    /// `kind=Fetcher` pools, but allowed on both kinds — builders may
+    /// also run non-builtin FODs that never consult it. `None` = no
+    /// mirrors (origin URLs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hashed_mirrors: Option<Vec<String>>,
+
     /// Container imagePullPolicy. None = K8s default (IfNotPresent
     /// for tagged images, Always for `:latest`). Airgap/dev clusters
     /// (k3s with `ctr images import`) MUST set "IfNotPresent" or

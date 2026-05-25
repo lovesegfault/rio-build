@@ -92,6 +92,18 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              hashedMirrors:
+                description: |-
+                  Hashed-mirror base URLs for the native `builtin:fetchurl`
+                  (tried as `<mirror>/<algo>/<base16-hash>` before the origin
+                  URL). Maps to `RIO_HASHED_MIRRORS`. Mostly relevant for
+                  `kind=Fetcher` pools, but allowed on both kinds — builders may
+                  also run non-builtin FODs that never consult it. `None` = no
+                  mirrors (origin URLs only).
+                items:
+                  type: string
+                nullable: true
+                type: array
               hostNetwork:
                 description: |-
                   Use the node's network namespace (`hostNetwork: true`).

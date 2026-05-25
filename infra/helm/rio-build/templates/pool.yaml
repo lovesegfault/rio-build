@@ -47,6 +47,13 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- end }}
+  {{- with $p.hashedMirrors }}
+  {{- /* builtin:fetchurl content-addressed mirrors → RIO_HASHED_MIRRORS
+         on the worker pods (native executor; the nixConf ConfigMap copy
+         serves only the legacy daemon path until it is removed). */}}
+  hashedMirrors:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with $p.tolerations }}
   tolerations:
     {{- toYaml . | nindent 4 }}

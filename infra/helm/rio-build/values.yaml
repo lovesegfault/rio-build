@@ -119,6 +119,11 @@ networkPolicy:
 # nix.conf knobs for the rio-nix-conf ConfigMap (mounted into worker
 # pods at /etc/rio/nix-conf/nix.conf; see rio-builder/src/executor/
 # sandbox.rs for the compiled-in fallback).
+#
+# NOTE: the native executor does not read nix.conf. Its hashed-mirrors
+# successor is the per-pool `hashedMirrors` list (poolDefaults below /
+# Pool spec.hashedMirrors → RIO_HASHED_MIRRORS). This ConfigMap copy
+# only feeds the legacy daemon path and goes away with it.
 nixConf:
   # Content-addressed mirror(s) for builtin:fetchurl. When a flat-hash
   # FOD's origin URL is dead, nix-daemon tries {mirror}/{algo}/{hex}
@@ -1190,6 +1195,12 @@ poolDefaults:
   enabled: false
   features: []
   image: rio-builder
+  # Content-addressed mirrors for the native builtin:fetchurl
+  # (Pool spec.hashedMirrors → RIO_HASHED_MIRRORS; tried as
+  # {mirror}/{algo}/{base16} before the origin URL, flat-hash FODs
+  # only). Same default the legacy nixConf.hashedMirrors carried.
+  hashedMirrors:
+    - "http://tarballs.nixos.org/"
   # 50Gi. Reconciler adds this verbatim to every BUILDER pod's
   # ephemeral-storage request/limit AND the fuse-cache emptyDir
   # sizeLimit. Single-sourced through controller.toml

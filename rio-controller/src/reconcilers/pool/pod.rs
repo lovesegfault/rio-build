@@ -938,6 +938,15 @@ fn build_executor_container(
                     ));
                 }
             }
+            // builtin:fetchurl hashed mirrors (both kinds: fetchers run
+            // the builtin path; builders may run non-builtin FODs that
+            // simply ignore it). Comma-separated per the RIO_ env
+            // layer's comma_vec convention.
+            if let Some(mirrors) = &pool.spec.hashed_mirrors
+                && !mirrors.is_empty()
+            {
+                e.push(env("RIO_HASHED_MIRRORS", &mirrors.join(",")));
+            }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively). `$(RIO_EXECUTOR_ID)` (downward-API
             // metadata.name, defined ABOVE so kubelet's dependent-var
