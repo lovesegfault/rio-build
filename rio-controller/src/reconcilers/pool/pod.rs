@@ -562,21 +562,24 @@ pub fn build_executor_pod_spec(
         // SecurityContext.
         //
         // TODO: P0559 (the in-process rio-mountd client) needs this pod
-        // to pass rio-mountd's connection gate on /run/rio-mountd.sock
-        // (0660 root:990, plus an `SO_PEERCRED.gid == 990` check —
-        // 990 is `mountd.allowedGid` in helm values.yaml and
-        // `users.groups.rio-builder.gid` in nix/nixos-node/eks-node.nix).
-        // The plan row says `fsGroup: rio-builder`, but fsGroup only
-        // grants a SUPPLEMENTARY group (enough for the socket-inode DAC,
-        // not for SO_PEERCRED, which reports the egid) — the field that
+        // to pass rio-mountd's connection gate on
+        // /run/rio-mountd/mountd.sock (0660 root:990, plus an
+        // `SO_PEERCRED.gid == 990` check — 990 is `mountd.allowedGid`
+        // in helm values.yaml and `users.groups.rio-builder.gid` in
+        // nix/nixos-node/eks-node.nix). The plan row says
+        // `fsGroup: rio-builder`, but fsGroup only grants a
+        // SUPPLEMENTARY group (enough for the socket-inode DAC, not
+        // for SO_PEERCRED, which reports the egid) — the field that
         // changes the egid is `runAsGroup`. And under the production
         // `hostUsers: false` the pod's gid is userns-remapped to a
         // per-pod offset, so NO static in-pod gid maps to host gid 990.
-        // Wire the correct field (and resolve the userns question) in
-        // the same change that adds the socket hostPath mount and the
-        // client — landing `fs_group: Some(990)` now would change
-        // emptyDir ownership for zero functional benefit and bake in
-        // the wrong half of the answer.
+        // The owning work item is the "socket access under
+        // hostUsers:false" row in §P0559 of the ADR-022 implementation
+        // plan — it must pick the mechanism (and the matching pod-spec
+        // field here) before the client lands. Landing
+        // `fs_group: Some(990)` now would change emptyDir ownership
+        // for zero functional benefit and bake in the wrong half of
+        // the answer.
         security_context: if !privileged {
             Some(PodSecurityContext {
                 seccomp_profile: Some(if seccomp_localhost {

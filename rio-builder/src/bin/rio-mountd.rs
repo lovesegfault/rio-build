@@ -16,8 +16,9 @@ use rio_builder::castore_fuse::mountd::{self, DEFAULT_MAX_PROMOTE_BYTES, MountdC
     about = "Privileged per-node broker: /dev/fuse handoff, BACKING_OPEN, verified cache promotion"
 )]
 struct Args {
-    /// UDS listen path (created mode 0660, group --allowed-gid).
-    #[arg(long, default_value = "/run/rio-mountd.sock")]
+    /// UDS listen path (created mode 0660, group --allowed-gid; the
+    /// parent directory is created if missing).
+    #[arg(long, default_value = "/run/rio-mountd/mountd.sock")]
     socket: PathBuf,
     /// Per-build FUSE mountpoint root.
     #[arg(long, default_value = "/var/rio/castore")]

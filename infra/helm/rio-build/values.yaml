@@ -890,8 +890,8 @@ gateway:
 # FUSE_DEV_IOC_BACKING_OPEN (init-ns CAP_SYS_ADMIN), and writes into the
 # shared node-local cache (integrity boundary — content is re-hashed
 # before publication). Talks to builder pods over
-# /run/rio-mountd.sock (hostPath); needs no cluster networking beyond
-# the Prometheus scrape of :9095.
+# /run/rio-mountd/mountd.sock (hostPath); needs no cluster networking
+# beyond the Prometheus scrape of :9095.
 mountd:
   enabled: true
   # Reuses the rio-builder image: rio-mountd is a [[bin]] of the
@@ -995,16 +995,24 @@ karpenter:
   amiTag: ""
   # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).
   # boot.growPartition expands / to fill on first boot. MUST cover the
-  # largest pod ephemeral-storage request a NodeClaim can carry:
+  # largest pod ephemeral-storage request a NodeClaim can carry PLUS
+  # the /var/rio XFS loopback the AMI carves out of the same volume
+  # for rio-mountd (nix/nixos-node/eks-node.nix
+  # `services.rio.eksNode.varRioSize`, 100Gi — when that backing file
+  # fills with cache/staging blocks they come out of this volume, and
+  # a root volume that actually fills force-shuts-down the XFS on the
+  # next metadata write, EIO-ing every build on the node):
   # pod_ephemeral_request(sla.maxDisk, headroom(n_eff=1), poolDefaults.fuseCacheBytes)
   #   = maxDisk × 1.95 + fuseCacheBytes + 1Gi   (worst-case headroom; jobs.rs::pod_ephemeral_request)
   #   = 200×1.95 + 50 + 1 = 441Gi
   # `max_node_disk` is dataVolumeSize × 0.9 (kubelet eviction/image-cache
-  # reserve), so the binding inequality is 500×0.9 = 450 ≥ 441 — only ~9Gi
-  # of slack. Bumping `maxDisk` or `fuseCacheBytes` will trip
-  # 14-disk-ceiling.sh; raise `dataVolumeSize` first. nvme hw-classes
-  # ignore this (instance-store provides ephemeral-storage).
-  dataVolumeSize: 500Gi
+  # reserve), so the binding inequality is
+  #   dataVolumeSize×0.9 − varRioSize = 610×0.9 − 100 = 449 ≥ 441
+  # — only ~8Gi of slack. Bumping `maxDisk`, `fuseCacheBytes`, or
+  # `varRioSize` will trip 14-disk-ceiling.sh; raise `dataVolumeSize`
+  # first. nvme hw-classes ignore the pod-ephemeral half (instance-store
+  # provides ephemeral-storage) but still pay for the /var/rio half.
+  dataVolumeSize: 610Gi
   # gp3 provisioned IOPS+throughput (max for gp3). Build workloads are
   # IOPS-bound; baseline 3000 throttles -j32+. gp3 has no separate
   # provisioned-IOPS account quota — io1/io2 do (300k/100k → 18/6

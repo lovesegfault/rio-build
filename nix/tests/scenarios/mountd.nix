@@ -122,17 +122,17 @@ pkgs.testers.runNixOSTest {
         # readiness wait below cannot pass against the old inode.
         # covShellEnv sets LLVM_PROFILE_FILE in coverage mode (empty
         # otherwise); %p keeps the per-instance profraws distinct.
-        machine.succeed("rm -f /run/rio-mountd.sock")
+        machine.succeed("rm -f /run/rio-mountd/mountd.sock")
         machine.succeed(
             "${common.covShellEnv}"
-            "${rio-workspace}/bin/rio-mountd --socket /run/rio-mountd.sock"
+            "${rio-workspace}/bin/rio-mountd --socket /run/rio-mountd/mountd.sock"
             " --castore-dir /var/rio/castore --staging-dir /var/rio/staging"
             " --cache-dir /var/rio/cache --chunks-dir /var/rio/chunks"
             f" --staging-quota-bytes {quota_bytes} --allowed-gid 990"
             " --metrics-addr 127.0.0.1:9095"
             " >>/var/log/rio-mountd.log 2>&1 & echo $! > /run/rio-mountd.pid"
         )
-        machine.wait_until_succeeds("test -S /run/rio-mountd.sock", timeout=15)
+        machine.wait_until_succeeds("test -S /run/rio-mountd/mountd.sock", timeout=15)
 
     def stop_mountd():
         # SIGTERM, not SIGKILL: the daemon returns from main so atexit
@@ -144,7 +144,7 @@ pkgs.testers.runNixOSTest {
             "! kill -0 $(cat /run/rio-mountd.pid) 2>/dev/null", timeout=15
         )
 
-    CLIENT = "${clientCov}${rio-workspace}/bin/spike_mountd_client --socket /run/rio-mountd.sock"
+    CLIENT = "${clientCov}${rio-workspace}/bin/spike_mountd_client --socket /run/rio-mountd/mountd.sock"
 
     def client(user, args):
         return f"runuser -u {user} -- {CLIENT} {args}"

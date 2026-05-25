@@ -6,7 +6,7 @@
 # (a) open /dev/fuse, (b) call FUSE_DEV_IOC_BACKING_OPEN (init-ns
 # CAP_SYS_ADMIN), or (c) write the shared node-local cache (integrity
 # boundary). This DaemonSet brokers all three over a SOCK_SEQPACKET UDS
-# at /run/rio-mountd.sock.
+# at /run/rio-mountd/mountd.sock.
 #
 # Namespace: rio-builders (PSA privileged). CAP_SYS_ADMIN + hostPath are
 # both rejected by PSA baseline/restricted, and rio-system is
@@ -81,7 +81,7 @@ spec:
           # rio-mountd ships in the same image (same crate).
           command: ["/bin/rio-mountd"]
           args:
-            - --socket=/run/rio-mountd.sock
+            - --socket=/run/rio-mountd/mountd.sock
             - --castore-dir=/var/rio/castore
             - --staging-dir=/var/rio/staging
             - --cache-dir=/var/rio/cache
@@ -122,16 +122,17 @@ spec:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
             {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 12 }}
           volumeMounts:
-            # The socket lives in the HOST /run so builder pods can
-            # reach it via their own hostPath mount. The PARENT
-            # directory is mounted (not the socket file): the daemon
-            # unlinks and re-binds the socket on restart, and a
-            # single-file hostPath pins the dead inode on both sides.
-            # /run/rio-mountd.sock is a cross-component contract — the
-            # binary default, the P0559 client, and the vm-mountd
-            # scenario all use it — so the parent is /run itself.
-            - name: run
-              mountPath: /run
+            # The socket's PARENT DIRECTORY is mounted, not the socket
+            # file: the daemon unlinks and re-binds the socket on
+            # restart, and a single-file hostPath pins the dead inode
+            # on both sides. A dedicated /run/rio-mountd/ directory
+            # (not all of host /run) so a CAP_SYS_ADMIN pod is not
+            # handed the host's containerd/systemd/dbus sockets it has
+            # no business touching. Builder pods hostPath-mount the
+            # same directory read-only (P0559) — connect(2) on a
+            # socket inode under a read-only mount is allowed.
+            - name: run-rio-mountd
+              mountPath: /run/rio-mountd
             - name: var-rio-cache
               mountPath: /var/rio/cache
             - name: var-rio-chunks
@@ -157,10 +158,14 @@ spec:
           resources:
             {{- toYaml $m.resources | nindent 12 }}
       volumes:
-        - name: run
+        # DirectoryOrCreate: /run is a tmpfs, wiped every boot —
+        # kubelet creates the dir (0755 root:root) before the
+        # container starts; the daemon's bind_socket() also
+        # create_dir_all()s it for non-k8s deployments.
+        - name: run-rio-mountd
           hostPath:
-            path: /run
-            type: Directory
+            path: /run/rio-mountd
+            type: DirectoryOrCreate
         # `type: Directory` (not DirectoryOrCreate): the four trees are
         # created by the AMI's tmpfiles rules ON the XFS-prjquota
         # /var/rio mount (nix/nixos-node/eks-node.nix). DirectoryOrCreate

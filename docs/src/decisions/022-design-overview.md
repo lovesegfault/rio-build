@@ -60,7 +60,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 │                                                                                    │
 └────────────────────────────────────────────────────────────────────────────────────┘
 
-┌── rio-mountd (DaemonSet, hostPID, CAP_SYS_ADMIN) ──┐
+┌── rio-mountd (DaemonSet, root, CAP_SYS_ADMIN) ─────┐
 │  setup:  open("/dev/fuse") (keep dup), mount fuse  │──── SCM_RIGHTS ───► builder
 │          mkdir staging/{build_id} (builder uid)    │
 │  serve:  BackingOpen{fd} → ioctl BACKING_OPEN → id │◄─── per-open ─────► builder
@@ -236,7 +236,7 @@ With compat enabled and at least one `nix-cache-info` object present at the buck
 
 r[builder.mountd.fuse-handoff]
 
-The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not openable from the pod and `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN`, so a node-level `rio-mountd` DaemonSet (host PID namespace, `CAP_SYS_ADMIN`) does the privileged operations and nothing else:
+The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not openable from the pod and `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN`, so a node-level `rio-mountd` DaemonSet (root, `CAP_SYS_ADMIN`, not `privileged` — `infra/helm/rio-build/templates/mountd-ds.yaml`) does the privileged operations and nothing else:
 
 | Step | Actor | Action |
 |---|---|---|
@@ -259,7 +259,7 @@ r[builder.mountd.concurrency]
 
 `Promote` and `PromoteChunks` (≤64 per batch, ≤16 MiB I/O) both run on `spawn_blocking` bounded by `Semaphore(num_cpus)`; replies correlate via `seq`. `BackingOpen`/`BackingClose` are answered inline (sub-ms). Per-conn state is `Send + Sync` and replies are `seq`-correlated, so out-of-order completion is well-defined.
 
-`rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote`/`PromoteChunks` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge`/`BadBuildId`/`AlreadyMounted` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`: the brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only), and `Promote` is the integrity boundary for the shared cache. The five hardening invariants:
+`rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote`/`PromoteChunks` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge`/`BadBuildId`/`AlreadyMounted` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. **Userns caveat:** both the socket-inode DAC and `SO_PEERCRED` observe the peer's *init-namespace* gid, and a `hostUsers: false` builder pod (`r[sec.pod.host-users-false]`) has every gid kubelet-remapped into a per-pod range — no static in-pod gid maps to the host's `rio-builder` gid, so as stated this gate admits no userns-confined builder. How the production builder client authenticates is owned by the "socket access under `hostUsers: false`" row in implementation-plan §P0559. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`: the brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only), and `Promote` is the integrity boundary for the shared cache. The five hardening invariants:
 
 r[builder.mountd.build-id-validated]
 

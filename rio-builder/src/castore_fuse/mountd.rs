@@ -79,8 +79,10 @@ const PROMOTE_BUF: usize = 64 * 1024;
 /// populate it from a tempdir.
 #[derive(Debug, Clone)]
 pub struct MountdConfig {
-    /// UDS listen path, e.g. `/run/rio-mountd.sock`. Created mode 0660
-    /// owned `root:allowed_gid`.
+    /// UDS listen path, e.g. `/run/rio-mountd/mountd.sock`. Created
+    /// mode 0660 owned `root:allowed_gid`; the parent directory is
+    /// created if missing (it lives on a tmpfs `/run` that is wiped
+    /// every boot).
     pub socket_path: PathBuf,
     /// Per-build FUSE mountpoints: `{castore_dir}/{build_id}`.
     pub castore_dir: PathBuf,
@@ -520,6 +522,16 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
 /// `cfg.allowed_gid`. A stale socket from a previous incarnation is
 /// unlinked first (the DaemonSet is the only writer of this path).
 fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
+    // The default socket lives in a dedicated /run/rio-mountd/
+    // directory (so the DaemonSet hostPath-mounts one directory, not
+    // all of /run) and /run is a tmpfs wiped every boot — own the
+    // parent's existence here rather than requiring every deployment
+    // (k8s DirectoryOrCreate, VM tests, bare `cargo run`) to pre-create
+    // it. 0755: builder uids need search permission to reach the
+    // socket; the 0660 socket inode is the access gate.
+    if let Some(parent) = cfg.socket_path.parent() {
+        std::fs::create_dir_all(parent).context("create socket parent dir")?;
+    }
     let _ = std::fs::remove_file(&cfg.socket_path);
     let fd = socket(
         AddressFamily::Unix,

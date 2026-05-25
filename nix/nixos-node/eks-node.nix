@@ -186,7 +186,7 @@ in
       }
     ];
 
-    # Host-side group owning /run/rio-mountd.sock (created 0660
+    # Host-side group owning /run/rio-mountd/mountd.sock (created 0660
     # root:rio-builder by rio-mountd). The gid is FIXED and must agree
     # with two other sites:
     #   - helm `mountd.allowedGid` → rio-mountd `--allowed-gid` (the

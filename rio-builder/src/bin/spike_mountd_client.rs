@@ -216,7 +216,7 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 #[command(name = "spike_mountd_client", about = "VM-test client for rio-mountd")]
 struct Args {
     /// rio-mountd UDS socket path.
-    #[arg(long, default_value = "/run/rio-mountd.sock")]
+    #[arg(long, default_value = "/run/rio-mountd/mountd.sock")]
     socket: PathBuf,
     #[command(subcommand)]
     cmd: Cmd,

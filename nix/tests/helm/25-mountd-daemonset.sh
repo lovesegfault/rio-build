@@ -26,12 +26,23 @@ test "$(yq "$ds | .spec.template.spec.containers[0].securityContext.privileged" 
   echo "FAIL: rio-mountd container privileged != false" >&2
   exit 1
 }
-test "$(yq "$ds | .spec.template.spec.containers[0].securityContext.capabilities.add[0]" "$out")" = "SYS_ADMIN" || {
-  echo "FAIL: rio-mountd container capabilities.add[0] != SYS_ADMIN" >&2
+# Exact capability sets, not just first-element: the whole point of
+# this fragment is locking the privilege surface, and `add[0] ==
+# SYS_ADMIN` is satisfied by `add: [SYS_ADMIN, SYS_PTRACE]`.
+test "$(yq "$ds | .spec.template.spec.containers[0].securityContext.capabilities.add | join(\",\")" "$out")" = "SYS_ADMIN" || {
+  echo "FAIL: rio-mountd container capabilities.add != [SYS_ADMIN] exactly" >&2
   exit 1
 }
-test "$(yq "$ds | .spec.template.spec.containers[0].securityContext.capabilities.drop[0]" "$out")" = "ALL" || {
-  echo "FAIL: rio-mountd container capabilities.drop[0] != ALL" >&2
+test "$(yq "$ds | .spec.template.spec.containers[0].securityContext.capabilities.drop | join(\",\")" "$out")" = "ALL" || {
+  echo "FAIL: rio-mountd container capabilities.drop != [ALL] exactly" >&2
+  exit 1
+}
+# Explicit runAsUser 0: the rio-builder image has no config.User, so
+# omitting this would still run as root today — but a future image
+# User field (or a copy-paste of rio.podSecurityContext's 65532) would
+# silently break the chown/0444-publication paths.
+test "$(yq "$ds | .spec.template.spec.securityContext.runAsUser" "$out")" = "0" || {
+  echo "FAIL: rio-mountd pod runAsUser != 0" >&2
   exit 1
 }
 test "$(yq "$ds | .spec.template.spec.securityContext.seccompProfile.type" "$out")" = "RuntimeDefault" || {
