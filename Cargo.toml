@@ -108,6 +108,7 @@ nix = { version = "0.31", features = [
   "hostname",
   "process",
   "signal",
+  "socket",
 ] }
 # raw_os_error()/raise()/errno constants where the `nix` crate is
 # overkill. Used as a normal dep in rio-gateway (EMFILE/ENFILE accept
@@ -171,6 +172,12 @@ smallvec = "1"
 hdrhistogram = { version = "7", default-features = false, features = [
   "serialization",
 ] }
+
+# rio-mountd UDS wire format (rio-builder castore_fuse/mountd_proto.rs):
+# one length-prefixed postcard datagram per request/response. no_std serde
+# wire format, varint-packed; replaces bincode 2.x (RUSTSEC-2025-0141
+# unmaintained).
+postcard = { version = "1", features = ["use-std"] }
 
 # Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
 # keyed on tenant_name (bounded keyspace — authorized_keys comment is
