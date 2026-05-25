@@ -1547,32 +1547,45 @@ async fn test_preexisting_completed_gc_matrix(
 
 // r[verify sched.merge.wanted-outputs]
 // r[verify sched.merge.stale-completed-verify+4]
-/// `verify_preexisting_completed` × wanted outputs: a pre-existing
-/// Completed node whose recorded `output_paths` include a path that is
-/// missing from the store but POSITIVELY UNWANTED by the current
-/// submission must NOT reset to Ready — its absence is legitimate (it
-/// was never substituted because nothing wanted it) and resetting on
-/// every re-merge would ping-pong Completed↔Ready forever. The same
-/// node merged by a build that DOES want the missing output must reset
-/// (the one re-open that lets the delta be substituted or rebuilt).
+/// `verify_preexisting_completed` × the LIVE effective wanted set: a
+/// missing recorded output of a pre-existing Completed node is forgiven
+/// (no Completed→Ready reset) only when NO live interested build wants
+/// it. Build A merges first wanting ALL outputs (the empty sentinel);
+/// build B re-merges with a per-case wanted set while the recorded
+/// P_debug is missing from the store:
+///
+/// - A LIVE: A's all-outputs contribution keeps P_debug in the
+///   effective wanted set, so even a build-B-only-wants-`out` re-merge
+///   must reset the node (the re-open that lets A's delta be
+///   substituted or rebuilt).
+/// - A TERMINAL (a failed keep_going build inside the ≤60 s pre-cleanup
+///   window — interest and BuildInfo still present): only B's {out}
+///   counts → P_debug is unwanted by every live build → forgiven →
+///   stays Completed (it was legitimately never substituted; resetting
+///   it on every re-merge would ping-pong Completed↔Ready forever).
 ///
 /// Setup: Build A merges `app-a → dep` where dep declares {out, debug};
 /// the worker reports both outputs but only P_out is ever uploaded to
 /// the store (P_debug is recorded in `output_paths` yet missing). Build
 /// B re-merges dep with a per-case wanted set.
 #[rstest::rstest]
-// P_debug missing but build B only wants {out} → forgiven → stays Completed.
-#[case::missing_unwanted_not_reset(&["out"], DerivationStatus::Completed, 1)]
+// P_debug missing, build B only wants {out}, but build A is LIVE and
+// wants ALL outputs → the live effective set still wants P_debug → reset.
+#[case::missing_unwanted_but_live_build_wants_resets(false, &["out"], DerivationStatus::Ready, 0)]
+// Same shape but build A is TERMINAL: no live build wants P_debug →
+// forgiven → stays Completed.
+#[case::missing_unwanted_no_live_build_wants_forgiven(true, &["out"], DerivationStatus::Completed, 1)]
 // P_debug missing and build B wants everything (empty sentinel) → reset.
-#[case::missing_wanted_resets(&[], DerivationStatus::Ready, 0)]
+#[case::missing_wanted_resets(false, &[], DerivationStatus::Ready, 0)]
 // P_debug missing and build B's wanted set resolves to no declared
 // output (a `drv^bogus` root) → nothing is POSITIVELY identifiable as
 // unwanted, so nothing is forgiven → reset. The complement of an
 // unresolvable wanted subset must be empty, not every declared path —
 // otherwise a GC'd output is never re-opened.
-#[case::missing_unresolvable_wanted_resets(&["bogus"], DerivationStatus::Ready, 0)]
+#[case::missing_unresolvable_wanted_resets(false, &["bogus"], DerivationStatus::Ready, 0)]
 #[tokio::test]
 async fn test_preexisting_completed_missing_unwanted_output_not_reset(
+    #[case] a_terminal: bool,
     #[case] wanted: &[&str],
     #[case] expect_dep_status: DerivationStatus,
     #[case] expect_cached: u32,
@@ -1593,12 +1606,16 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     // Build A: app-a → dep. dep dispatches first (leaf). The worker
     // reports BOTH outputs so output_paths records both, but only
     // P_out is uploaded to the store — P_debug stays missing.
+    // keep_going=true in the terminal case so app-a's permanent failure
+    // routes through check_build_completion (no cancel sweep) — A's DAG
+    // interest and terminal BuildInfo linger, the window under test.
+    let build_a = Uuid::new_v4();
     merge_dag(
         &handle,
-        Uuid::new_v4(),
+        build_a,
         vec![make_node("vw-app-a"), mk_dep(&[])],
         vec![make_test_edge("vw-app-a", "vw-dep")],
-        false,
+        a_terminal,
     )
     .await?;
     let assn = recv_assignment(&mut w1).await;
@@ -1612,9 +1629,28 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     )
     .await?;
     barrier(&handle).await;
-    // Hold app-a Running so Build A stays Active and dep stays in DAG.
-    let mut _w2 = connect_executor(&handle, "vw-w2", "x86_64-linux").await?;
-    let _ = recv_assignment(&mut _w2).await;
+    // app-a dispatches next. Live case: hold it Running so Build A stays
+    // Active and dep stays in DAG. Terminal case: fail it permanently so
+    // Build A goes Failed while its interest + BuildInfo linger.
+    let mut w2 = connect_executor(&handle, "vw-w2", "x86_64-linux").await?;
+    let assn_app = recv_assignment(&mut w2).await;
+    if a_terminal {
+        assert!(assn_app.drv_path.ends_with("vw-app-a.drv"));
+        complete_failure(
+            &handle,
+            "vw-w2",
+            &assn_app.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "precondition: A is terminal but not yet cleaned up"
+        );
+    }
     let pre = expect_drv(&handle, "vw-dep").await;
     assert_eq!(pre.status, DerivationStatus::Completed, "precondition");
     assert_eq!(
@@ -1625,7 +1661,8 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
 
     // Build B: app-b → dep (pre-existing Completed). The stale-verify
     // probe finds P_debug missing; whether that triggers the reset
-    // depends on whether build B wants `debug`.
+    // depends on whether any LIVE build (A if still live, B's new
+    // contribution) wants `debug`.
     let build_b = Uuid::new_v4();
     merge_dag(
         &handle,
@@ -1640,13 +1677,14 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
     assert_eq!(
         expect_drv(&handle, "vw-dep").await.status,
         expect_dep_status,
-        "wanted={wanted:?}: a missing recorded output triggers the \
-         Completed→Ready reset iff the current submission wants it"
+        "a_terminal={a_terminal} wanted={wanted:?}: a missing recorded \
+         output triggers the Completed→Ready reset iff some LIVE \
+         interested build wants it"
     );
     assert_eq!(
         query_status(&handle, build_b).await?.cached_derivations,
         expect_cached,
-        "wanted={wanted:?}"
+        "a_terminal={a_terminal} wanted={wanted:?}"
     );
 
     Ok(())

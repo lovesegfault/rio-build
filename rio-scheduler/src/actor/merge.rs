@@ -1210,19 +1210,32 @@ impl DagActor {
         // verify (shouldn't happen for a real done node, but defensive
         // against test fixtures).
         //
-        // `unwanted_paths` is the set of declared-but-not-wanted output
-        // paths of the CURRENT submission's node: a recorded output
-        // whose absence is forgiven by the demand-driven criterion. A
-        // Completed node whose only missing recorded output is one this
-        // build doesn't want must NOT reset (it was legitimately never
+        // `unwanted_paths` is the set of declared output paths that NO
+        // LIVE interested build wants: a recorded output whose absence
+        // is forgiven by the demand-driven criterion. The wanted source
+        // is the live effective set (`effective_wanted` over the node's
+        // interested builds' contributions), falling back to the stored
+        // node-level union (`wanted_output_names`) when that set is
+        // unavailable (no live interested builds, or a live build's
+        // contribution is unknown — post-failover). The submitting
+        // build's wants are already included: `dag.merge`
+        // (validate_and_ingest step 2) recorded this submission's
+        // contribution + interest and step 3 inserted its live
+        // BuildInfo, both before reconcile_merged_state calls this
+        // verifier — so reading the contribution map alone suffices. A
+        // Completed node whose only missing recorded output is one no
+        // live build wants must NOT reset (it was legitimately never
         // substituted — resetting it on every merge would ping-pong
         // Completed↔Ready forever). A build that wants a previously-
         // unwanted output finds it missing → one reset → re-classifies
-        // under the new wanted set → substitutes the delta. Only paths
-        // positively identifiable as unwanted (declared in
-        // expected_output_paths but outside the wanted subset) are
-        // forgiven; a missing recorded path NOT in expected (a realized
-        // floating-CA path) keeps triggering the reset as today.
+        // under the new wanted set → substitutes the delta; conversely
+        // a terminal build's wide wanted set stops pinning the node —
+        // its missing extras are forgiven as soon as no live build
+        // wants them. Only paths positively identifiable as unwanted
+        // (declared in expected_output_paths but outside the wanted
+        // subset) are forgiven; a missing recorded path NOT in expected
+        // (a realized floating-CA path) keeps triggering the reset as
+        // today.
         let mut candidates: Vec<(String, Vec<String>, HashSet<String>)> = Vec::new();
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
@@ -1254,10 +1267,11 @@ impl DagActor {
             // identifiable as unwanted → forgive nothing → every
             // missing recorded path triggers the reset (the
             // conservative pre-feature behaviour).
+            let eff = effective_wanted(state, &self.builds);
             let unwanted: HashSet<String> = match verifiable_wanted_paths(
                 &node.output_names,
                 &node.expected_output_paths,
-                &node.wanted_output_names,
+                eff.as_deref().unwrap_or(&state.wanted_output_names),
             ) {
                 Some(wanted) => {
                     let wanted: HashSet<&str> = wanted.into_iter().collect();
@@ -1379,9 +1393,8 @@ impl DagActor {
         // Collected in `demote_parents` and applied after pass 2.
         //
         // Pass 1: collect reset_set (no mutation). A missing recorded
-        // output that the current submission positively does not want
-        // does not trigger the reset — see the candidate-collection
-        // comment above.
+        // output that no LIVE interested build wants does not trigger
+        // the reset — see the candidate-collection comment above.
         let reset_set: HashSet<DrvHash> = candidates
             .iter()
             .filter(|(_, paths, unwanted)| {
@@ -1483,12 +1496,12 @@ impl DagActor {
             //
             // r[impl sched.merge.wanted-outputs]
             // Like the reset decision above, the routing forgives
-            // `unwanted` paths: a recorded output the current
-            // submission positively does not want (typically never
-            // present and not substitutable — the steady state the
-            // demand-driven criterion leaves behind) must not push the
-            // node onto the ready queue when every WANTED missing path
-            // is substitutable. The routing must never be stricter than
+            // `unwanted` paths: a recorded output no LIVE interested
+            // build wants (typically never present and not
+            // substitutable — the steady state the demand-driven
+            // criterion leaves behind) must not push the node onto the
+            // ready queue when every WANTED missing path is
+            // substitutable. The routing must never be stricter than
             // the reset that put the node here, otherwise the detached
             // re-substitution lane is skipped and only the
             // dispatch-time batch probe (cap-truncated, fail-open)
