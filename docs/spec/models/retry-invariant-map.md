@@ -618,3 +618,271 @@ None of these corrections touches the fold's input alphabet, the ten
 `RetryState` counters, the poison/cascade tails, or `drv_executions`
 stamping, so they are inventory-row corrections for Stage C, not model or
 fold changes.
+
+## Stage-C calibration: the historical-fix corpus replayed against the model
+
+The 45-commit fix corpus (inventory §5, eight families G1–G8) replayed
+against `retryPolicy.qnt`: for each commit, the pre-fix behavior is either
+expressed as an override of the as-built model and shown to falsify an
+invariant (the model would re-find that bug), or its non-encodability is
+dispositioned. Method per the log campaign's Phase-3 procedure: each
+override is a module in `docs/spec/models/calibration/retry-<family>.qnt`
+that instantiates the as-built model, replaces ONE entry-point action with
+a local PRE-FIX variant, and exposes it as a `calibStep` selected with
+`quint verify --step=calibStep` (the retry model has no per-fix const
+switches, so the override is an action+step swap rather than a const flip;
+the reference-fold ghost keeps the as-built/post-fix semantics in every
+override — it is the oracle, not part of the reverted behavior). Where the
+distinguishing baseline needs the same restricted alphabet, the module also
+carries a `baselineStep` (the as-built actions over the same alphabet) and
+the table records its HOLDS verdict. Verdicts below are exhaustive TLC
+results (violation runs stop at the first counterexample); depths and
+state counts are from the recorded transcripts; wall-clocks live in the
+introducing commit's message.
+
+Two invariants were added to the main model as part of the calibration
+(the "unstated property" disposition): `clearedPoisonClearsDurably` (the
+PG-first clear discipline; G4) and `recoveryPreservesPoisonStatus` (the
+poison set survives failover minus TTL expiry; G8). Both were confirmed to
+HOLD on the unmodified as-built model before any override was run —
+worker / dual / failover regimes re-checked exhaustively with bit-identical
+distinct-state counts (376,318 / 3,112,250 / 9,228,949) — so neither is a
+new as-built falsification. They are wired into the corresponding
+`quint-retry-policy-*` regime checks; their non-vacuity is guarded by the
+two wired calibration witnesses that falsify them.
+
+**Hash relocation after the harden-subst rebase.** The rebase replayed
+only the formal-sprint commits; the corpus commits that predate the
+`d79d63368` merge base kept their hashes (verified by ancestry against the
+rebased HEAD). Three corpus entries were formal-sprint work and were
+relocated by subject: `bfbe07cfa → 0fce3e697`, `473a6df0f → 43a7df620`,
+`e2b5be98b → 0745c2ce4`. All other old↔new pairs are identical.
+
+### Calibration table
+
+Classification legend: **ENC** — encodable, override written and run;
+**ENC-A** — encodable, covered by the named sibling override (disposition
+by analogy within the family, per design §3); **NOT-ENC** — the model
+abstracts the mechanism away (the missing dimension is named); **SUBS** —
+the fix's subject no longer exists in the integrated tree; **ORIGIN** —
+the feature commit that introduced the machinery (no pre-fix defect to
+revert). Verdict format: invariant @ step (depth, states generated /
+distinct).
+
+#### G1 — counter incremented on the wrong path / not incremented where needed (10 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module (calibration/retry-g1.qnt) | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `8283d4362` (unchanged), half a | the I-127 window reset not gated on the event's at-cap outcome (reset wipes at-cap accounting) | ENC | `retryCalibG1WindowResetUngated` | countersRefineHistory | **FALSIFIES** countersRefineHistory @ calibStep (depth 18, 2,649/1,266) |
+| `8283d4362` (unchanged), half b | controller-reported at-cap OOM/DiskPressure never cap-checked (loop at ceiling) | ENC | `retryCalibG1ControllerOomUncapped` | boundsOK | **FALSIFIES** boundsOK @ calibStep (depth 15, 50 gen) |
+| `172776b1b` (unchanged) | controller-reported DeadlineExceeded had no cap action (loop at cap; the fix introduced today's D1 poison) | ENC | `retryCalibG1DeadlineUncapped` | boundsOK | **FALSIFIES** boundsOK @ calibStep (depth 15, 61 gen) |
+| `9c20d04e3` (unchanged) | E4 timeout charge gated on a floor promotion that a cold start never produces (I-200 infinite retry) | ENC | `retryCalibG1TimeoutChargeSkipped` | countersRefineHistory | **FALSIFIES** countersRefineHistory @ calibStep (depth 4, 4 gen) |
+| `db457374f` (unchanged), deadline-accounting half | E7 charge gated on the floor outcome (~free ladder rungs before any counting) | ENC-A | covered by `retryCalibG1TimeoutChargeSkipped` (same charge-gated-on-floor-outcome shape, sibling channel) | countersRefineHistory | by analogy (sibling falsified) |
+| `db457374f` (unchanged), backstop half | the wedge backstop recorded nothing and quarantined nothing (unbounded wedge loop) | ENC | `retryCalibG1BackstopUncounted` | countersRefineHistory, attemptsBoundedGlobal | **FALSIFIES** countersRefineHistory @ calibStep (depth 4, 7 gen); **FALSIFIES** attemptsBoundedGlobal @ calibStep (depth 8, 22/21); baseline HOLDS both (29/21, depth 9) |
+| `db457374f` (unchanged), stream-epoch + heartbeat-binding halves | stale-stream disconnect / heartbeat re-adopt races | NOT-ENC | — (stream epochs and heartbeat machinery outside the model's scope by design) | — | n/a |
+| `8a016a393` (unchanged) | at-cap cgroup-OOM double-counted into infra_count (bump + handler) | ENC | `retryCalibG1AtCapOomDoubleCount` | countersRefineHistory | **FALSIFIES** countersRefineHistory @ calibStep (depth 4, 4 gen) |
+| `c13f6a277` (unchanged) | floor-promoted failures consumed max_retries (I-213) | ENC-A | covered by `retryCalibG1DisconnectCharges` (the pre-I-213 disconnect/eviction accounting) | countersRefineHistory, verdictMatchesFold | by analogy (shared override falsified) |
+| `8d38cb999` (unchanged) | the disconnect path charged failed_builders / failure_count for floor-promoted evictions (I-213 premature poison) | ENC | `retryCalibG1DisconnectCharges` | countersRefineHistory, verdictMatchesFold | **FALSIFIES** countersRefineHistory @ calibStep (depth 4, 15 gen); **FALSIFIES** verdictMatchesFold @ calibStep (depth 8, 120/96); baseline HOLDS both (993/489, depth 17) |
+| `dc094dd0c` (unchanged) | assigned-only disconnects counted toward poison | ENC-A | covered by `retryCalibG1DisconnectCharges`; the Assigned-vs-Running distinction itself is below the model's resolution (DStatus collapses both) | countersRefineHistory | by analogy (shared override falsified) |
+| `a60d58a32` (unchanged) | no CONCURRENT_PUTPATH exemption, no 300 s window (I-127 poison at 99.7 %) | ENC | `retryCalibG1PutPathNotExempt` | countersRefineHistory | **FALSIFIES** countersRefineHistory @ calibStep (depth 4, 4 gen) |
+| `699ad52e1` (unchanged), exempt-cap root cause | the exempt path had no budget of its own (leaked-store-lock livelock) | ENC | `retryCalibG1ExemptPathUncapped` | countersRefineHistory | **FALSIFIES** countersRefineHistory @ calibStep (depth 4, 4 gen) |
+
+#### G2 — counter splits (2 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `a4bcb5623` (unchanged) | retry.count overloaded as per-cycle and cross-cycle gate: resubmit reset neither restores the per-cycle budget nor advances a cycle counter, the resubmit bound never fires | ENC | `retryCalibG2ResubmitSharedCounter` (calibration/retry-g2.qnt) | countersRefineHistory | **FALSIFIES** countersRefineHistory @ calibStep (depth 12, 114/72) |
+| `2f07ea909` (unchanged) | the K8s-aware-retry origin feature (cancel signal, failed_workers placement exclusion, disconnect accounting, backstop) | ORIGIN | — no pre-fix defect to revert. Note for Phase 1: the placement exclusion this commit introduced is exactly why the per-cycle transient cap is unreachable under production defaults (the Stage-B finding above) — removing either mechanism re-opens the other's reachability. | — | n/a |
+
+#### G3 — cascade missing / double / hanging build (8 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `af0eb62c6` (unchanged) | poison did not cascade DependencyFailed to dependents at all | ENC | `retryCalibG3PoisonWithoutCascade` (calibration/retry-g3.qnt) | cascadeReachesExactlyTheDependents | **FALSIFIES** cascadeReachesExactlyTheDependents @ calibStep (depth 4, 4 gen) |
+| `3973a4f54` (unchanged), recovery-cascade half | recovery did not re-seed DependencyFailed for dependents of recovered failure-terminal nodes | ENC | `retryCalibG3RecoveryNoRecascade` | cascadeReachesExactlyTheDependents | **FALSIFIES** cascadeReachesExactlyTheDependents @ calibStep (depth 12, 130/99 — poison, lost clear_poison_batch write, failover, dependent left Ready) |
+| `5b4543c3a` (unchanged), transitive-depfailed half | recovery-time cascade not persisted for depth-≥2 ancestors | ENC-A / NOT-ENC | the recovery-re-cascade behavior is covered by `retryCalibG3RecoveryNoRecascade`; the depth-≥2 / per-dependent persistence half is NOT-ENC (one dependent, no per-dependent durable row) | cascadeReachesExactlyTheDependents | by analogy (shared override falsified) |
+| `891a6520d` (unchanged), build-summary half | poisoned drvs missing from recovery's id_to_hash → spurious Succeeded in the build summary | NOT-ENC | — (build-level summary accounting not modeled); the poison-set-preservation half of the same commit is the G8 row below | — | n/a |
+| `d91df7e9f` (unchanged) | DAG-removal paths forgot derivation_hashes pruning → keep_going build hung | NOT-ENC | — (build-level totals/derivation_hashes not modeled) | — | n/a |
+| `e45f2d966` (unchanged), dep-failed-seed half | merge-time transitive DependencyFailed seeding at depth > 1 missing | NOT-ENC | — (no merge action, single dependent at depth 1) | — | n/a |
+| `33b1f855c` (unchanged) | cascaded dependency failures didn't finalize retained exec logs | SUBS | — the in-scheduler log-buffer/`drv_logs` machinery this patched was deleted by harden-logs (LogService owns logs; 065_drop_drv_logs) | — | n/a |
+| `699ad52e1` (unchanged), drv_name-cascade-key part | the cascade walk keyed by name instead of hash | NOT-ENC | — (derivation identity is structural in the model; no name/hash distinction) | — | n/a |
+
+#### G4 — poison state desynced between memory and PG, or never cleared (8 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `b874e5120` (unchanged) | ClearPoison ran in-mem first, PG second best-effort → a PG blip left the stores permanently disagreeing | ENC | `retryCalibG4ClearInMemFirst` (calibration/retry-g4.qnt) | clearedPoisonClearsDurably (new) | **FALSIFIES** clearedPoisonClearsDurably @ calibStep (depth 5, 6 gen). Disposition of the prior gap: unstated property → invariant added to the main model, HOLDS on the unmodified worker/dual/failover regimes (state counts unchanged), wired into those checks |
+| `f9adf3c76` (unchanged) | poison expired during downtime reloaded anyway, with poisoned_at re-stamped to now (fresh 24 h TTL) | ENC | `retryCalibG4ReloadExpiredPoison` | recoveryIsTheDocumentedProjection | **FALSIFIES** recoveryIsTheDocumentedProjection @ calibStep (depth 10, 166/123) |
+| `7078da256` (unchanged) | poisoned nodes reset in place on clear/TTL → recovered stub fields (empty outputs/features) wedged the resubmit | NOT-ENC | — (derivation metadata fields are not modeled; the post-fix removal IS the modeled behavior) | — | n/a |
+| `b09c5b312` (unchanged), X6 half | reassign_derivations had no threshold check (3 disconnects → deferred forever, pre-2f07ea909-era accounting) | ENC | probe `retryCalibG4DisconnectThresholdProbe` (as-built step, two slots, full alphabet) | expected HOLDS | **HOLDS** noDisconnectThresholdPoison @ as-built step (exhaustive, 38,980,303/12,146,371, depth 26). Disposition: **redundant** — in today's structure the charging sites poison at record time (record-then-check) and E9 covers the placement-starvation shape, so E5's threshold re-check is unreachable; it was load-bearing only while disconnects recorded failures (the pre-I-213 world, see the G1 disconnect override where the arm IS reachable). Phase-1 simplification candidate. |
+| `b09c5b312` (unchanged), X13 half | poison-TTL clear left PG failed_workers behind | NOT-ENC | — (the harm needs a re-merge after the TTL clear; DAbsent is a sink in the model) | — | n/a |
+| `84a692492` (unchanged) | transient retry persisted Failed instead of Ready → post-recovery hang in the backoff window | NOT-ENC | — (the Failed-vs-Ready persisted-status taxonomy inside non-terminal rows, and the recovery queue-push distinction, are not modeled) | — | n/a |
+| `cbda4119a` (unchanged) | poison_and_cascade on an unexpected state still wrote Poisoned to PG and cascaded | NOT-ENC | — (the in-mem transition-guard failure mode is not modeled; the fix itself was defense-in-depth for a state all callers already excluded) | — | n/a |
+| `ea36f98f2` (unchanged) | poison persistence wrote bytes not text | NOT-ENC | — (SQL/serialization encoding) | — | n/a |
+| `01faf80b7` (unchanged) | reset-from-poison kept a stale traceparent | NOT-ENC | — (tracing metadata) | — | n/a |
+
+#### G5 — the same dead executor counted twice (4 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `ee9302b86` (unchanged) | the race-ahead termination report did not set last_completed → the disconnect re-inserted the dedup entry and the controller's re-report charged the same death again | ENC | `retryCalibG5RaceAheadKeepsPending` (calibration/retry-g5.qnt) | noDoubleCount | **FALSIFIES** noDoubleCount @ calibStep (depth 15, 63/55); the documented incident shape (race-ahead charge → disconnect inserts entry → re-report charges again) is pinned by the module's `g5RaceAheadDoubleCountRun` |
+| `e872b2b49` (unchanged) | a non-promoting termination report consumed the recently_disconnected entry before the reason gate → the same-tick DeadlineExceeded report found nothing (controller-side timeout backstop structurally defeated) | ENC | `retryCalibG5NonPromotingConsumesEntry` | local invariant `pendingReportKeepsItsEntry` | **FALSIFIES** pendingReportKeepsItsEntry @ calibStep (depth 16, 19 gen); baseline HOLDS (61/54, depth 16). The downstream unbounded-wedge consequence is fairness-dependent (a report that simply never arrives produces the same uncounted cycle as-built), so the calibration pins the structural conservation property instead |
+| `c5c5ccd17` (unchanged) | reassign_derivations not leader-gated → a deposed leader poisoned/re-queued from a stale DAG | NOT-ENC | — (a second, deposed leader acting concurrently is outside this model; the lease fence and its calibration live in leaderElection.qnt and the rio-lease campaign) | — | n/a |
+| `db457374f` (unchanged), stream-epoch half | a late disconnect from the previous stream removed the freshly-reconnected worker | NOT-ENC | — (stream epochs outside the model's scope by design) | — | n/a |
+
+#### G6 — floor ladder vs retry budget (9 commits)
+
+`2acd1b327`, `c55467cbc`, `37c21bb7b`, `1184d1bb8`, `775f19023`,
+`a76589e37`, `12b86c285`, `79fa0dbbc`, `2f150c585` (all unchanged):
+**NOT-ENCODED**, exactly as pre-registered in design §3 and the model
+header — the floor ladder enters the model only as the `{promoted, at_cap}`
+outcome each OOM-class event consumes (a bounded promotion budget stands in
+for the ladder), so which signals trigger a promotion, the ladder's
+persistence/hydration (`79fa0dbbc`), the configuration plumbing
+(`a76589e37`), the deadline alignment (`12b86c285`) and the at-cap
+comparison baseline (`2f150c585`) are all inside the abstracted oracle.
+Coverage stays with `floor.rs`'s unit tests. The charging consequences of
+floor outcomes (what a promoted / at-cap attempt charges) ARE in the model
+and are calibrated through the G1 rows above (the at-cap double-count, the
+window-reset gate, the promoted-eviction accounting).
+
+#### G7 — fleet-exhaust / placement (3 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `a62631c90` (unchanged) | the exhaust check filtered by kind only → mismatched-system workers padded the fleet and a drv deferred forever | NOT-ENC | — (static eligibility is uniform in the model by stated scope; the harm is also liveness-shaped) | — | n/a |
+| `699ad52e1` (unchanged), draining-exclusion root cause | the exhaust check counted draining workers as eligible → a one-shot pool poisoned on its first failure instead of deferring | ENC | `retryCalibG7ExhaustCountsDraining` (calibration/retry-g7.qnt) | noFleetExhaustPoison (as invariant on the restricted no-respawn alphabet) | **FALSIFIES** noFleetExhaustPoison @ calibStep (depth 7, 22/18); baseline HOLDS (19/15, depth 6) — the as-built empty-fleet defer of sched.dispatch.fleet-exhaust+3 |
+| `c03d52787` (unchanged) | a resubmitted build joining a pre-existing poisoned node hung instead of failing fast | NOT-ENC | — (multi-build merge interaction; build-level) | — | n/a |
+
+#### G8 — failover loses or fabricates attempt history (6 commits)
+
+| Commit (old → new) | Pre-fix behavior reverted | Class | Override module | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `891a6520d` (unchanged), poison-set half | recovery dropped poisoned rows from the rebuilt state | ENC | `retryCalibG8PoisonedRowNotReloaded` (calibration/retry-g8.qnt) | recoveryPreservesPoisonStatus (new) | **FALSIFIES** recoveryPreservesPoisonStatus @ calibStep (depth 6, 14/13). Disposition of the prior gap: unstated property → invariant added to the main model, HOLDS on the unmodified failover regime (state count unchanged), wired into that check |
+| `5b4543c3a` (unchanged), recovery halves | wrong recovered failed-count / dropped recovery cascade | ENC-A | the cascade half is `retryCalibG3RecoveryNoRecascade` (falsified above); the reconstruction half is the family-level override below | — | by analogy |
+| family-level reconstruction row (anchors: `5b4543c3a`, `891a6520d`, the from_poisoned_row gap recorded in `a4bcb5623`'s message) | failure_count not derived from the persisted exclusion set at recovery | ENC | `retryCalibG8FailureCountNotDerived` | recoveryIsTheDocumentedProjection | **FALSIFIES** recoveryIsTheDocumentedProjection @ calibStep (depth 6, 14/13) |
+| `f9adf3c76` (unchanged) | expired poison reloaded with a fresh TTL | ENC | (G4 row above — same commit, listed in both families by the inventory) | recoveryIsTheDocumentedProjection | **FALSIFIES** (see G4) |
+| `bfbe07cfa → 0fce3e697` | recovery retained the entry generation on an unclaimed PG floor tie | NOT-ENC | — the lease generation fence is outside retryPolicy.qnt (assume–guarantee with the leader-election layer); the behavior is modeled and checked by leaderElection.qnt's deletion/pg-faults regimes and witnesses | — | n/a (covered by the rio-lease campaign's checks) |
+| `473a6df0f → 43a7df620` | recovery ungated dispatch without flooring/claiming the generation when the DAG load failed | NOT-ENC | — same scope note as above | — | n/a (covered by the rio-lease campaign's checks) |
+| `e2b5be98b → 0745c2ce4` | the floor-unreadable fallback skipped the post-claim confirmation | NOT-ENC | — same scope note as above | — | n/a (covered by the rio-lease campaign's checks) |
+
+### HOLDS rows and their dispositions
+
+Only one calibration target returned HOLDS where a falsification could
+have been expected, and it was predicted: the `b09c5b312` X6 probe
+(E5's poison-threshold re-check) — dispositioned **redundant** (Phase-1
+simplification candidate) with the exhaustive probe transcript as the
+evidence and the G1 disconnect-charges override as the demonstration of
+the historical world in which the arm was load-bearing. Every other
+override falsified its predicted invariant on the first run; the
+restricted-alphabet baselines (backstop, disconnect-charges,
+non-promoting-consumes, exhaust-draining) all HOLD as required for the
+falsifications to be attributable to the reverted behavior rather than to
+the alphabet restriction. No new invariant falsified on the unmodified
+model (no stop-and-report event).
+
+### Permanent expect-violation witnesses (wired into nix/quint.nix)
+
+Six of the twenty override modules are wired as `quint-retry-calib-*`
+checks — one representative per family that has a plausible regression
+path in the as-built code and a cheap state space (the same ~5-of-22
+proportion the log campaign kept):
+
+| Check | Module | Violated invariant | Guards against |
+|---|---|---|---|
+| `quint-retry-calib-g1-controller-cap` | `retryCalibG1ControllerOomUncapped` | `boundsOK` | losing the E6 at-cap infra cap check (8283d4362) |
+| `quint-retry-calib-g2-resubmit-split` | `retryCalibG2ResubmitSharedCounter` | `countersRefineHistory` | re-merging the per-cycle and cross-cycle counters (a4bcb5623) |
+| `quint-retry-calib-g3-cascade` | `retryCalibG3PoisonWithoutCascade` | `cascadeReachesExactlyTheDependents` | decoupling the cascade from the poison transition (af0eb62c6) |
+| `quint-retry-calib-g4-clear-ordering` | `retryCalibG4ClearInMemFirst` | `clearedPoisonClearsDurably` | reverting the PG-first clear ordering (b874e5120); also the new invariant's non-vacuity guard |
+| `quint-retry-calib-g5-race-ahead` | `retryCalibG5RaceAheadKeepsPending` | `noDoubleCount` | weakening the race-ahead/last_completed dedup (ee9302b86) |
+| `quint-retry-calib-g8-poison-reload` | `retryCalibG8PoisonedRowNotReloaded` | `recoveryPreservesPoisonStatus` | dropping poisoned rows at recovery (891a6520d); also the new invariant's non-vacuity guard |
+
+The remaining fourteen modules are evidence modules: committed, typechecked
+with the tree, re-runnable with the command in `calibration/README.md`,
+not in CI.
+
+### Phase-0 exit-gate verdict
+
+**Met.** Every one of the eight families either falsifies at least one
+invariant through a representative override (G1: 8 overrides falsify; G2:
+1; G3: 2; G4: 2; G5: 2; G7: 1; G8: 3 — all as predicted), or carries an
+explicit disposition for every commit: G6 is NOT-ENCODED exactly as
+pre-registered in design §3 (the floor ladder is priced out of this model;
+coverage stays with floor.rs's unit tests), and the per-commit NOT-ENCODED
+/ SUBSUMED rows inside the other families name their missing dimension and
+what covers them instead. The single ENCODABLE-but-HOLDS row
+(b09c5b312-X6) carries the redundant disposition with machine-checked
+evidence. The invariant list that survives calibration — the eight design
+invariants plus `durableMirrorsCharges`, `clearedPoisonClearsDurably`,
+`recoveryPreservesPoisonStatus`, and the per-event charge discipline — is
+the replacement's contract going into Phase 1.
+
+### Phase-1 input list
+
+What the calibration adds to the Phase-1 plan beyond the divergence
+dispositions already recorded above (D1–D4, C1–C4, A5–A10):
+
+- **Redundant mechanisms (simplification candidates):**
+  - E5's poison-threshold re-check in `reassign_derivations` is
+    unreachable in today's structure (the b09c5b312-X6 probe); it can go
+    when the Phase-1 collapse lands, provided the disconnect path's
+    accounting question (C2) is settled first.
+  - The per-cycle transient-cap poison arm ("max_retries exhausted") is
+    unreachable under production defaults (Stage-B finding); its fate is
+    coupled to the placement exclusion introduced by 2f07ea909 — remove
+    either and the other becomes reachable. decide() should state one
+    behavior deliberately.
+- **Invariants added during calibration** (now part of the contract):
+  `clearedPoisonClearsDurably`, `recoveryPreservesPoisonStatus`; plus two
+  calibration-local properties worth carrying into the post-refactor
+  model: `pendingReportKeepsItsEntry` (the correlation-state conservation
+  e872b2b49 protects — subsumed in Phase 1 by the two-installment exec_id
+  mechanism, which should make it true by construction) and the
+  E5-threshold-unreachable probe (drops out when the re-check is deleted).
+- **NOT-ENCODED dimensions** (the §3.6-style evidence for what, if
+  anything, needs a different verification vehicle than this model):
+  - The resource-floor ladder's internals (all of G6, 9 commits): which
+    signals promote, hydration/persistence, config plumbing, the at-cap
+    baseline. Stays with floor.rs unit tests; if Phase 1 wants it
+    machine-checked, it is a small separate model of the ladder, not an
+    extension of this one (the design's `classify()` split makes that
+    natural).
+  - Build-level bookkeeping (d91df7e9f, e45f2d966, c03d52787, the
+    891a6520d build-summary half): summaries, derivation_hashes,
+    merge-time transitive seeding, multi-build joins. Model-B territory
+    (a build/DAG-level model), not retryPolicy.qnt.
+  - Recovered-node metadata and the persisted-status taxonomy
+    (7078da256, 84a692492, ea36f98f2, 01faf80b7, cbda4119a): the ledger
+    schema work in Phase 1a is the structural fix; specific regression
+    tests stay unit-level.
+  - Cross-leader concurrency (c5c5ccd17) and the lease generation floor
+    (0fce3e697, 43a7df620, 0745c2ce4): owned by leaderElection.qnt and
+    the rio-lease campaign; the retry model composes with them by
+    assume–guarantee.
+  - Stream epochs / heartbeat binding (db457374f halves), heterogeneous
+    static eligibility (a62631c90): outside the model's stated scope;
+    re-evaluate only if Phase 1's placement work touches them.
+- **Substitution-path corrections Phase 1 must respect** (from the
+  post-integration re-validation section above): the substitution-failure
+  decider stays carved out of the collapse; its inventory rows must be
+  re-derived against the integrated tree (`forgiven` seed re-check, the
+  8-attempt NotFound ladder, `substitute_tried` no longer charged on
+  every failure-arm entry, the topdown-pruned re-spawn exception, the
+  stale-Completed re-substitution routing, the demotion-reason taxonomy,
+  and the line-number drift).
+- **Sequencing note for the D1 fix:** 172776b1b added the off-spec E7
+  poison precisely to break a livelock; the Phase-1 Cancel-at-cap
+  adjudication must keep the loop broken (the calibration's
+  `retryCalibG1DeadlineUncapped` shows what the model says about the
+  no-terminal-action world: boundsOK falsifies, i.e. the budget itself is
+  breached). The fix is "Cancel at the cap", never "no action at the
+  cap".
+
+### Stage-C verify-marker status
+
+No new tracey markers: the calibration checks are regression guards for
+the model's encoding (same no-marker policy as every other witness
+check), and the two new invariants strengthen checks that already carry
+the relevant rules' markers (`sched.retry.recovery-projection` on the
+failover regime check; the clear-ordering discipline is part of
+`sched.admin.clear-poison`'s existing code-level verification).
