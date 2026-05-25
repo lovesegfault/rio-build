@@ -503,6 +503,287 @@ module logService {
           else Accept(minInt(hi, c.value))
       }
 
+  // --- 7. invariants ----------------------------------------------------
+  //
+  // The three surviving invariants of the predecessor model
+  // (`noCrossExecContamination`, the binding/auth gate, `noSilentLineLoss`)
+  // restated over the new state, `lineSpanExact` restated over the
+  // manifest + dedup read path as `servedSpanExact`, the completeness
+  // gate, and the load-bearing ack-ordering refinement of the
+  // conservation law. Each carries the spec rule it verifies; the
+  // r[verify ...] markers live at the check wiring points in
+  // nix/quint.nix. Defined before the actions (Quint definitions are
+  // order-independent).
+
+  /// The runtime residual of TypeOK: the integer ranges the ceiling
+  /// preconditions are supposed to enforce, plus the structural facts
+  /// the other invariants' encodings rely on (at most one Open session
+  /// per execution; session buffers and high-water marks within the
+  /// line domain). The acked watermark is deliberately NOT asserted to
+  /// trail the transmit cursor: an ack for a fabricated high-numbered
+  /// chunk legitimately overtakes the honest replay's cursor (see
+  /// `ackImpliesDurable`).
+  val boundsOK = and {
+    dispatched >= 0 and dispatched <= MAX_EXECS,
+    EXECS.forall(e => producedEnd.get(e) >= 0 and producedEnd.get(e) <= MAX_LINE),
+    EXECS.forall(e => ackedBelow.get(e) >= 0 and ackedBelow.get(e) <= MAX_LINE),
+    EXECS.forall(e => sessionsOpened.get(e) >= 0 and sessionsOpened.get(e) <= MAX_SESSIONS),
+    EXECS.forall(e => SESSION_IDS.forall(s =>
+      hasSession(e, s) implies and {
+        s <= sessionsOpened.get(e),
+        sessHw(e, s) >= 0 and sessHw(e, s) <= MAX_LINE,
+        sessBuf(e, s).forall(n => n >= 0 and n < MAX_LINE),
+      })),
+    // At most one Open session per execution: the builder holds one
+    // AppendLog stream at a time, and `openSession` requires the
+    // previous session to be detached first.
+    EXECS.forall(e => SESSION_IDS.forall(s1 => SESSION_IDS.forall(s2 =>
+      (sessIsOpen(e, s1) and sessIsOpen(e, s2)) implies s1 == s2))),
+    // An execution's lifecycle row exists iff it was dispatched and the
+    // sweep has not deleted it.
+    EXECS.forall(e => execRowExists.get(e) implies e <= dispatched),
+  }
+
+  /// `NoCrossExecContamination` (obs.log.exec-keyed+2,
+  /// store.log.append-auth's downstream half): execution E's manifest
+  /// holds only lines E's own bound builder sent — its build's real
+  /// output plus its own fabrications — never another execution's. The
+  /// defense is structural (the chunk key embeds the exec_id the stream
+  /// was bound to at open, and a re-dispatch mints a new exec_id and a
+  /// new key namespace); this invariant is the model-side regression
+  /// guard that the cut action keys its chunk by the cutting session's
+  /// execution and nothing else. Its calibration value is the
+  /// non-vacuity of the quantifier — the contended state (two
+  /// executions of one derivation with concurrently growing logs, the
+  /// superseded one still being written by its not-yet-rejected
+  /// session) is pinned reachable by `noConcurrentExecWriters`.
+  val noCrossExecContamination = EXECS.forall(e =>
+    chunks.get(e).forall(c =>
+      chunkLines(c).subseteq(delivered(e).union(fabricated.get(e)))))
+
+  /// `BindingGateExcludesForeignWriters` (store.log.append-auth): the
+  /// stream-open predicate admits a claimed execution only when it is
+  /// the derivation's latest assignment attempt. Quantified over the
+  /// predicate's inputs rather than over a provenance ghost: the
+  /// invariant falsifies if the latest-assignment conjunct is dropped
+  /// from `openAdmitted`, which is the model-side regression the rule
+  /// guards against. A superseded execution's already-open stream is
+  /// NOT excluded — it keeps writing to its own (superseded)
+  /// execution's log until it closes, which is contained (see
+  /// noCrossExecContamination), not contaminating. The
+  /// presenter-identity and derivation-match halves of the gate are
+  /// pure equality checks on signed token fields, outside the model
+  /// (see the header's scope notes).
+  val authGateExcludesForeignWriters = EXECS.forall(e =>
+    openAdmitted(e) implies e == dispatched)
+
+  /// `NoSilentLineLoss` (the conservation law), the four-disjunct
+  /// disclosed-loss form from log-invariant-map.md's campaign close-out:
+  /// every line the build emitted into its uploader is, at all times,
+  ///   (1) in the builder's ack-trimmed retransmit buffer (it will be
+  ///       replayed to the next session), or
+  ///   (2) in a store-side ingest buffer (accepted, awaiting a cut), or
+  ///   (3) covered by a manifest chunk (durable and servable), or
+  ///   (4) the loss is disclosed: the log does not read as complete
+  ///       (`is_complete = false` is the reader-facing incomplete
+  ///       indicator, and a swept execution's missing lifecycle row
+  ///       reads as incomplete too), or the uploader recorded its
+  ///       abandonment (the `rio_builder_log_drain_abandoned_total`
+  ///       counter / the permanent-rejection warn).
+  /// The disjuncts collapse: completeness REQUIRES the manifest to
+  /// contiguously cover `[0, final_line_count)` and the count is the
+  /// build's own line total, so the bite is concentrated at "a log that
+  /// reads complete while its uploader has not given up" — where every
+  /// produced line must already be durable. The load-bearing refinement
+  /// that does not route through the completeness definition is
+  /// `ackImpliesDurable` below.
+  val noSilentLineLoss = EXECS.forall(e =>
+    delivered(e).forall(n => or {
+      builderBuf(e).contains(n),
+      storeBufHolds(e, n),
+      manifestHolds(e, n),
+      not(logIsComplete(e)),
+      uploader.get(e) == Abandoned,
+    }))
+
+  /// The conservation law's load-bearing refinement FOR THE HONEST
+  /// UPLOADER: a line leaves the retransmit buffer only when an ack
+  /// covers it, an ack is sent only after the chunk's manifest INSERT
+  /// commits, and the honest uploader's batches are contiguous from its
+  /// acked watermark — so every line below that watermark is durably in
+  /// the manifest until the TTL sweep (the one sanctioned deleter)
+  /// removes it. This is the invariant that falsifies if an ack is ever
+  /// emitted before the manifest commit, or if anything other than the
+  /// sweep deletes a manifest row (an early ack lets the builder trim a
+  /// line that a store-side abort then silently drops, with no replay
+  /// and no disclosure beyond the log never completing).
+  ///
+  /// NOT asserted in the fabrication-enabled regimes, by design: the
+  /// acked watermark is a max over committed chunk ENDS
+  /// (`log_upload.rs::trim` sets `last_acked_line =
+  /// max(durable_through_line)` and pops every frame whose last line
+  /// the ack covers), so a client that violates the LogBatcher's
+  /// monotone-numbering contract — sending a high-numbered fabricated
+  /// batch before its real low-numbered lines — gets an ack for the
+  /// fabricated chunk that pops the real lines' frames from its own
+  /// retransmit buffer without their ever being stored. The model
+  /// reaches that state (fabricate [k, k+1), cut, ack -> ackedBelow =
+  /// k+1 with [0, k) never durable) and the code does too. The loss is
+  /// confined to the contract-violating builder's own log and is
+  /// disclosed by the log never reading complete (`noSilentLineLoss`'s
+  /// fourth disjunct holds over the same trace in every regime); the
+  /// per-ack durability claim is simply not a property the code offers
+  /// to a client that mis-numbers its own lines.
+  val ackImpliesDurable = EXECS.forall(e =>
+    not(expired.get(e)) implies
+      interval(0, ackedBelow.get(e)).forall(n => manifestHolds(e, n)))
+
+  /// `ServedSpanExact` (store.log.session-keyed's read half; the
+  /// successor of the predecessor's `lineSpanExact`): the read path's
+  /// ordered-walk-with-watermark over the manifest — including
+  /// overlapping chunks from concurrent or successive sessions — yields
+  /// exactly the union of the chunks' line ranges, each line exactly
+  /// once. `served == union` is the no-loss half (a wrong visit order
+  /// strands a low-numbered chunk behind an already-advanced watermark
+  /// and silently drops its lines); `count == size` is the no-duplicate
+  /// half (the same line yielded from two overlapping chunks would
+  /// double-print in the client's stream and corrupt its reconnect
+  /// cursor).
+  val servedSpanExact = EXECS.forall(e =>
+    val r = readTail(e)
+    and {
+      r.served == manifestUnion(e),
+      r.count == r.served.size(),
+    })
+
+  /// The user-facing restatement of the conservation law's bite: a log
+  /// that reads COMPLETE serves every line the build produced. Implied
+  /// by `servedSpanExact` + the completeness fold's definition + the
+  /// honest terminal stamp; stated independently so an encoding bug in
+  /// any one of those three is caught by the others' conjunction.
+  val completeLogServesAllProduced = EXECS.forall(e =>
+    logIsComplete(e) implies delivered(e).subseteq(readTail(e).served))
+
+  /// `CompletenessGate` (store.log.completeness-gate's per-append half):
+  /// once an ingest session has learned the execution's recorded
+  /// `final_line_count`, every line it subsequently accepts is below
+  /// that count — a batch starting at or past the ceiling is dropped
+  /// whole, a straddling batch is truncated. Lines accepted BEFORE the
+  /// session learned the ceiling (the seal landed mid-stream and the
+  /// heartbeat refresh had not yet observed it) are the disclosed
+  /// bounded residual: they are over-coverage the completeness fold
+  /// already tolerates, not silent loss, and they are excluded here by
+  /// the `>= hwAtLearn` filter (accepted line numbers are strictly
+  /// increasing within a session, so "accepted after the learn" is
+  /// exactly "numbered at or above the learn-time high water"). The
+  /// open-time half of the rule (a COMPLETE log rejects the open
+  /// outright) is `openAdmitted`'s `not(logIsComplete)` conjunct,
+  /// witnessed by `noCompleteOpenRejection`.
+  val completenessGate = EXECS.forall(e =>
+    SESSION_IDS.forall(s =>
+      match sessCeiling(e, s) {
+        | NoCeiling => true
+        | Ceiling(c) =>
+          sessAccepted(e, s).forall(n => n >= c.hwAtLearn implies n < c.value)
+      }))
+
+  // --- expect-violation witnesses (non-vacuity probes) ------------------
+  //
+  // The vals below are NOT invariants and must never be added to a
+  // regime check's invariant list. Each states "the interesting thing
+  // never happens"; the quint-log-service-witness-* checks in
+  // nix/quint.nix verify one each and PASS only when the checker reports
+  // a violation — machine-checked evidence that the scenario a regime's
+  // headline invariant constrains is actually reachable in that regime's
+  // explored space. A witness that stops being violated means the model
+  // (or a regime's constants) no longer reaches the behavior the code
+  // can exhibit — a model bug, not a reason to delete the witness.
+
+  /// Violated when an execution's log reads complete. The headline
+  /// non-vacuity probe: `noSilentLineLoss` and
+  /// `completeLogServesAllProduced` only bite for a complete log, and
+  /// the open-time seal only fires against one.
+  val noCompletedLog = not(EXECS.exists(e => logIsComplete(e)))
+
+  /// Violated when two chunks of one execution from DIFFERENT sessions
+  /// overlap in line range — the re-sent-batch-after-ambiguous-
+  /// disconnect shape the read path's dedup exists for. A regime that
+  /// never reaches it proves `servedSpanExact` only over disjoint
+  /// manifests.
+  val noOverlappingChunks = not(EXECS.exists(e =>
+    chunks.get(e).exists(c1 => chunks.get(e).exists(c2 => and {
+      c1.sess != c2.sess,
+      chunkLines(c1).intersect(chunkLines(c2)) != Set(),
+    }))))
+
+  /// Violated when the read path's watermark actually suppresses a
+  /// duplicate (the total yield count over all chunks falls short of
+  /// the sum of the chunks' claimed counts) — the dedup is exercised,
+  /// not merely encoded.
+  val noDuplicateSuppressed = not(EXECS.exists(e =>
+    readTail(e).count < chunks.get(e).fold(0, (acc, c) => acc + c.count)))
+
+  /// Violated when a manifest contains a forward gap (two chunks with
+  /// uncovered line numbers between them) — the shape the completeness
+  /// fold's gap arm and the cut's split-at-gaps behavior exist for.
+  val noGappedManifest = not(EXECS.exists(e =>
+    chunks.get(e).exists(c1 => chunks.get(e).exists(c2 => and {
+      c1.first + c1.count < c2.first,
+      not(manifestHolds(e, c1.first + c1.count)),
+    }))))
+
+  /// Violated when the auth gate rejects a stream open for a superseded
+  /// execution — the foreign-token rejection (a token for an assignment
+  /// that is no longer the derivation's latest).
+  val noSupersededOpenRejection = not(wit.supersededOpenRejected)
+
+  /// Violated when the open-time seal rejects a stream open for an
+  /// already-complete log.
+  val noCompleteOpenRejection = not(wit.completeOpenRejected)
+
+  /// Violated when the per-append completeness ceiling drops or
+  /// truncates a batch — the post-terminal injection the gate exists to
+  /// stop is actually attempted.
+  val noPastFinalRejection = not(wit.pastFinalRejected)
+
+  /// Violated when the monotone floor rejects a batch numbered below
+  /// the session's high-water mark.
+  val noNonMonotoneRejection = not(wit.nonMonotoneRejected)
+
+  /// Violated when a session learns its completeness ceiling AFTER it
+  /// has already accepted lines (the seal lands mid-stream and the
+  /// heartbeat refresh picks it up) — the case that distinguishes the
+  /// per-append gate from the open-time gate, and the source of the
+  /// disclosed pre-refresh residual.
+  val noMidStreamCeiling = not(EXECS.exists(e => SESSION_IDS.exists(s =>
+    match sessCeiling(e, s) { | NoCeiling => false | Ceiling(c) => c.hwAtLearn > 0 })))
+
+  /// Violated when an uploader abandons its drain with un-acked lines —
+  /// the disclosed-loss channel (`rio_builder_log_drain_abandoned_total`
+  /// / the permanent-rejection discard) actually fires.
+  val noAbandonedWithUnacked = not(EXECS.exists(e => and {
+    uploader.get(e) == Abandoned,
+    ackedBelow.get(e) < producedEnd.get(e),
+  }))
+
+  /// Violated when two executions of the derivation hold committed
+  /// chunks while neither's sessions are all closed — the concurrent-
+  /// writers state `noCrossExecContamination` is about (the superseded
+  /// execution's session still committing while the successor's
+  /// session also commits).
+  val noConcurrentExecWriters = not(EXECS.exists(e1 => EXECS.exists(e2 => and {
+    e1 < e2,
+    chunks.get(e1) != Set(),
+    chunks.get(e2) != Set(),
+    SESSION_IDS.exists(s => hasSession(e1, s) and sessBuf(e1, s) != Set()),
+  })))
+
+  /// Violated when the TTL sweep deletes a non-empty manifest — the
+  /// sweep's deletion arm is reachable, so `ackImpliesDurable`'s
+  /// expired carve-out and the conservation law's disclosed-loss
+  /// disjunct are exercised against a real deletion.
+  val noSweptChunks = not(wit.sweptChunks)
+
   // --- 6. actions -------------------------------------------------------
   //
   // Each action's precondition is the corresponding code path's guard
