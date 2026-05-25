@@ -76,7 +76,8 @@ rio-build is the right choice when:
 - You need a *self-hosted* build backend (air-gapped environments, compliance,
   data residency)
 - You want *zero client-side changes* --- `nix build --store ssh-ng://rio` just
-  works
+  works (one caveat for `ControlMaster` users; see the
+  #cross-link("/guide/setup.typ")[Setup guide])
 
 It is NOT the right choice when:
 
