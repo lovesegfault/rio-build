@@ -44,8 +44,9 @@
 # UUID — the same state the scheduler's upsert_path_tenants would have
 # produced had the closures been built through rio.
 #
-# r[verify gw.substitute.dag-delta-sync] markers live at the
-# default.nix wiring point per the P0341 convention.
+# This scenario verifies the gw.substitute dag-delta-sync rule; the
+# tracey verify marker lives at the default.nix wiring point per the
+# P0341 convention, not here.
 {
   pkgs,
   common,

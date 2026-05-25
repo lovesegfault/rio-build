@@ -349,6 +349,21 @@ async fn sync_candidates(
     stats: &mut SyncStats,
     candidates: &[SyncCandidate],
 ) -> Result<std::collections::HashSet<String>, DagSyncError> {
+    // TODO: two scaling characteristics bite when a closure is heavily
+    // divergent from the local store (the opposite of the substitution
+    // use case this was built for, where deltas are small):
+    //   (a) every stage runs sequentially — one probe, one
+    //       GetDirectory, one ReadBlob, one PutPath at a time; no
+    //       request pipelining or bounded concurrency;
+    //   (b) `fetch_missing_blobs` holds ALL missing blobs for the
+    //       whole path set in memory at once (each blob is capped at
+    //       MAX_NAR_SIZE but the aggregate is uncapped), whereas the
+    //       whole-NAR fallback path buffers one NAR at a time.
+    // Future fix: bounded-concurrency fetches plus per-path (or
+    // streaming) blob retrieval so the working set is one path's
+    // contents, like upload_one already is. Acceptable today because a
+    // mostly-missing closure declines cheaply at the probe/HasBlobs
+    // stage anyway and the client's whole-NAR push takes over.
     let walk = dag_sync::walk_dag(local, remote, roots, stats).await?;
     let fetched =
         dag_sync::fetch_missing_blobs(local, remote, &walk.candidate_files, stats).await?;

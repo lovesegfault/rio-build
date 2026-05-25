@@ -133,11 +133,11 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
-// 10 args is over clippy's default of 7. The alternatives
-// (grouping into a struct, or building SessionContext at the call
-// site) both add more noise than the extra args cost. The session
-// entry point is the natural narrowing-point: everything before is
-// SSH plumbing, everything after is protocol handling.
+// Over clippy's 7-argument default. The alternatives (grouping into
+// a struct, or building SessionContext at the call site) both add
+// more noise than the extra args cost. The session entry point is
+// the natural narrowing-point: everything before is SSH plumbing,
+// everything after is protocol handling.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "session",
