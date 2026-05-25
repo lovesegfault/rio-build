@@ -44,12 +44,19 @@ let
     uid = 0;
     gid = 0;
   };
+  # 0666 for the same reason as /dev/fuse above: the nix sandbox build
+  # user is unprivileged and unmapped relative to the node's 0:0 owner,
+  # so the world bits are the only permission class it can ever match —
+  # anything narrower is EACCES on open(2) before KVM_CREATE_VM is even
+  # reached. Opening /dev/kvm is designed to be safe for unprivileged
+  # users (that is the point of the device's permission model), and
+  # these are dedicated single-tenant build nodes.
   kvmDev = {
     path = "/dev/kvm";
     type = "c";
     major = 10;
     minor = 232;
-    fileMode = 432; # 0660
+    fileMode = 438; # 0666
     uid = 0;
     gid = 0;
   };

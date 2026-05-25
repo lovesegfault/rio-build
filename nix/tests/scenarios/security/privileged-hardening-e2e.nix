@@ -336,7 +336,9 @@ pkgs.testers.runNixOSTest {
         spec = json.loads(node.succeed(
             f"k3s crictl inspect {cid} | "
             "${pkgs.jq}/bin/jq -c '.info.runtimeSpec.linux | "
-            "{devs: [.devices[].path], resdevs: .resources.devices}'"
+            "{devs: [.devices[].path], "
+            "modes: [.devices[] | {path, fileMode}], "
+            "resdevs: .resources.devices}'"
         ))
         devs, resdevs = spec["devs"], spec["resdevs"]
         # /dev/kvm is host-conditional: the k3s ExecStartPre picks
@@ -356,6 +358,21 @@ pkgs.testers.runNixOSTest {
             f"/dev/kvm presence in OCI spec must match host. "
             f"pick-base-runtime-spec ExecStartPre symlinked wrong "
             f"variant? See nix/tests/fixtures/k3s-full.nix."
+        )
+        # Both injected devices must be world-rw: the nix sandbox
+        # build user is unprivileged and unmapped relative to the
+        # node's owner, so only the world bits grant it anything —
+        # a narrower mode is EACCES on open. The base-runtime-spec-
+        # devices check pins this in the generated spec; this proves
+        # CRI didn't rewrite it on the way to runc.
+        bad_modes = [
+            m for m in spec["modes"]
+            if m["path"] in ("/dev/fuse", "/dev/kvm") and m["fileMode"] != 0o666
+        ]
+        assert not bad_modes, (
+            f"injected device(s) not world-rw in the OCI spec handed "
+            f"to runc: {bad_modes!r} — the unmapped sandbox build "
+            f"user gets EACCES. See nix/base-runtime-spec.nix."
         )
         assert any(
             r.get("allow") and r.get("major") == 10 and r.get("minor") == 229

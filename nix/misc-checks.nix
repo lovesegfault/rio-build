@@ -765,6 +765,39 @@ in
     EOF
   '';
 
+  # /dev/{fuse,kvm} in the OCI base runtime spec must be world-rw
+  # (0666). The nix sandbox build user inside the pod is unprivileged
+  # and unmapped relative to the device node's owner, so the world bits
+  # are the only permission class it can ever match — a group-rw node
+  # is EACCES on open for every build that needs the device, and for
+  # kvm that only surfaces on a .metal node running a kvm-requiring
+  # derivation (no cheaper signal). Pins the fileMode of every injected
+  # device in both spec variants; the vm-security-nonpriv-k3s
+  # passthrough subtest proves the entries reach runc, this proves they
+  # leave the spec with a usable mode.
+  base-runtime-spec-devices =
+    let
+      baseRuntimeSpec = import ./base-runtime-spec.nix { inherit pkgs; };
+    in
+    pkgs.runCommand "rio-base-runtime-spec-devices" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      check() {
+        spec=$1 want=$2
+        jq -e --argjson n "$want" '
+          [.linux.devices[] | select(.path == "/dev/fuse" or .path == "/dev/kvm")]
+          | length == $n and all(.fileMode == 438)
+        ' "$spec" >/dev/null || {
+          echo "FAIL: $spec — expected $want of /dev/{fuse,kvm} in linux.devices, all fileMode=438 (0666)." >&2
+          echo "      The unprivileged, unmapped sandbox build user only matches the world permission" >&2
+          echo "      bits; anything narrower is EACCES on open. See nix/base-runtime-spec.nix." >&2
+          jq '.linux.devices' "$spec" >&2
+          exit 1
+        }
+      }
+      check ${baseRuntimeSpec.fuseSpec} 1
+      check ${baseRuntimeSpec.kvmSpec} 2
+      touch $out
+    '';
+
   # nginx allow-list (docker.nix dashboardReadonlyMethods) MUST equal
   # the Cilium Gateway rio-scheduler-readonly HTTPRoute's Exact paths.
   # Both implement r[dash.auth.method-gate+3]; before this check the
