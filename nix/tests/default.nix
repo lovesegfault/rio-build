@@ -261,6 +261,19 @@ in
   #   empty-connection grace once the last protocol session ends — NOT
   #   on last-session-close, which would kill a ControlMaster
   #   mid-batch); `ssh gateway echo` (rejected exec) must exit ≠124.
+  # r[verify builder.stderr.forward-set-phase]
+  #   phase-reporter entry: the @nix setPhase frames are consumed by the
+  #   native log filter (none may reach the forwarded log) and surface
+  #   as ordered phases in the driver report.
+  # r[verify builder.fod.verify-hash]
+  #   fod-flat / fod-recursive / fod-mismatch / fod-unknown-algo entries:
+  #   the declared fixed-output hash is verified fail-closed by the
+  #   native result path (mismatch and unverifiable algorithms are
+  #   rejections, never skips).
+  vm-differential-standalone = import ./scenarios/differential.nix {
+    inherit pkgs rio-workspace;
+  };
+
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
