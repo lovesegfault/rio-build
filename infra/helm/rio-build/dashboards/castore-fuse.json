@@ -1,0 +1,333 @@
+{
+  "uid": "rio-castore-fuse",
+  "title": "rio-build: Castore FUSE",
+  "tags": ["rio-build", "builder", "castore-fuse"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "FUSE upcalls by op",
+      "description": "rate(rio_builder_castore_fuse_upcalls_total[5m]) by op — the cold-metadata counter. With every cache TTL infinite, lookup/readdir fire ~once per distinct dentry per build (dcache + FOPEN_CACHE_DIR absorb repeats). A sustained op=read rate means passthrough is not engaging — cross-check the open() reply mode panel.",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(rio_builder_castore_fuse_upcalls_total[5m]))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "open() latency p50/p99",
+      "description": "rio_builder_castore_fuse_open_seconds — open() upcall-to-reply. Bimodal by design: a backing-cache hit is one stat + one mountd round-trip (sub-ms); a remote fill is a whole-file ReadBlob bounded by jit_fetch_timeout. The hit=remote p99 isolates the fill tail.",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_builder_castore_fuse_open_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_builder_castore_fuse_open_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_builder_castore_fuse_open_seconds_bucket{hit=\"remote\"}[5m])))",
+          "legendFormat": "p99 (remote fill)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "open() reply mode: passthrough vs keep_cache",
+      "description": "rate(rio_builder_castore_fuse_open_mode_total[5m]) by mode. passthrough = reads bypass FUSE entirely; keep_cache = userspace pread per uncached read. passthrough=0 with keep_cache>0 means FUSE_PASSTHROUGH was not negotiated — check the node kernel (>=6.9) and RIO_DISABLE_PASSTHROUGH.",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (mode) (rate(rio_builder_castore_fuse_open_mode_total[5m]))",
+          "legendFormat": "{{mode}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "open() dispatch case",
+      "description": "rate(rio_builder_castore_fuse_open_case_total[5m]) by case. hit = backing-cache hit (no fetch); miss_small = whole-file JIT fetch; miss_stream = above stream_threshold (streaming fill, P0575); wait_fetching = piggybacked on another open's in-flight fill. Rising miss share on repeat builds means the node cache is not retaining (P0571 LRU).",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (case) (rate(rio_builder_castore_fuse_open_case_total[5m]))",
+          "legendFormat": "{{case}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "JIT fetch throughput by source",
+      "description": "rate(rio_builder_castore_fuse_fetch_bytes_total[5m]) by hit — bytes fetched on behalf of open(). hit=remote comes from rio-store; hit=node_ssd (shared node chunk cache) only appears once P0571/P0575 land. Compare against rio_builder_upload_bytes_total to see whether builders are input- or output-bound.",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (hit) (rate(rio_builder_castore_fuse_fetch_bytes_total[5m]))",
+          "legendFormat": "{{hit}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Fill chunks by source",
+      "description": "rate(rio_builder_castore_fuse_chunk_source_total[5m]) by src — where fill bytes came from. src=remote is rio-store; src=node_ssd (the shared /var/rio/chunks cache) appears with P0575. The node_ssd fraction is the cross-build dedup ratio.",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (src) (rate(rio_builder_castore_fuse_chunk_source_total[5m]))",
+          "legendFormat": "{{src}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Integrity failures / EIO / fetch circuit",
+      "description": "increase(rio_builder_castore_fuse_integrity_fail_total[5m]) — fetched bytes did not blake3-hash to the requested file_digest (corrupt store content or transport corruption; investigate immediately). increase(rio_builder_castore_fuse_eio_total[5m]) — EIO replies to the kernel; every one fails a build attempt as an infrastructure failure. rio_builder_castore_fuse_circuit_open — 1 when the fetch breaker is open (rio-store unreachable/degraded).",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(increase(rio_builder_castore_fuse_integrity_fail_total[5m]))",
+          "legendFormat": "integrity failures (5m)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(rio_builder_castore_fuse_eio_total[5m]))",
+          "legendFormat": "EIO replies (5m)",
+          "refId": "B"
+        },
+        {
+          "expr": "max(rio_builder_castore_fuse_circuit_open)",
+          "legendFormat": "fetch circuit open (any builder)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "DAG prefetch latency p50/p99",
+      "description": "rio_builder_castore_dag_prefetch_seconds — mount-time GetDirectory(recursive=true) Directory-DAG prefetch per build (one multi-root call for the whole input closure). Sustained p99 above ~10s delays every build start on the node — check rio-store GetDirectory latency and the directories table.",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_builder_castore_dag_prefetch_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_builder_castore_dag_prefetch_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "rio-mountd request latency p99 by op",
+      "description": "histogram_quantile(0.99, rio_mountd_request_seconds) by op — UDS request latency on the node-local mountd. backing_open/backing_close are a single ioctl (sub-ms), mount is a handful of syscalls, promote/promote_chunks copy+hash staged outputs (seconds for multi-GiB). backing_open p99 above ~1ms means mountd is CPU-starved on that node.",
+      "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, op) (rate(rio_mountd_request_seconds_bucket[5m])))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "rio-mountd promote rejects by reason",
+      "description": "rate(rio_mountd_promote_reject_total[5m]) by reason. reason=mismatch means a builder presented bytes that do not hash to the claimed digest — rio-store corruption or a compromised builder; identify the build_id in the mountd log and cross-check rio_store_narhash_mismatch_total. not-regular/too-large/race-timeout are protocol misuse or contention.",
+      "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(rio_mountd_promote_reject_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.001}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    }
+  ]
+}

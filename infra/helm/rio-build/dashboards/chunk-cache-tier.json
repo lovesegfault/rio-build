@@ -1,0 +1,420 @@
+{
+  "uid": "rio-chunk-cache-tier",
+  "title": "rio-build: Chunk Cache Tier",
+  "tags": ["rio-build", "store", "chunk-cache"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Express tier reads: hit / miss / error",
+      "description": "rio_store_tiered_local_{hits,misses,errors}_total rates — TieredChunkBackend get() path. hit = chunk served from the per-AZ S3 Express bucket (no S3-standard RTT); miss = fell through to S3 standard (then write-through filled Express); error = Express read failed (degraded, falls through). All zero/empty when store.chunkBackend.kind != tiered or the replica's AZ has no Express bucket.",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_tiered_local_hits_total[5m]))",
+          "legendFormat": "local hit",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_store_tiered_local_misses_total[5m]))",
+          "legendFormat": "miss (S3-standard fallback)",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(rio_store_tiered_local_errors_total[5m]))",
+          "legendFormat": "read error (degraded)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Express tier hit ratio",
+      "description": "tiered_local_hits / (hits + misses) — the spec's tiered_local_hit_ratio, computed in PromQL from the counters the backend emits. Expect this to climb toward ~1.0 on warm chunk sets after the cache tier is enabled; gaps mean no tiered get() traffic in the window.",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_tiered_local_hits_total[5m])) / (sum(rate(rio_store_tiered_local_hits_total[5m])) + sum(rate(rio_store_tiered_local_misses_total[5m])))",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.5},
+              {"color": "green", "value": 0.8}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Express write-through failures",
+      "description": "rate(rio_store_tiered_writethrough_errors_total[5m]) — the chunk was served from S3 standard but the Express fill failed, so the next read of the same chunk pays the S3-standard RTT again. Sustained nonzero means Express PUTs are failing (throttling, IAM, bucket missing for this AZ).",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_tiered_writethrough_errors_total[5m]))",
+          "legendFormat": "write-through errors/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.01},
+              {"color": "red", "value": 0.1}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "In-process chunk cache (moka): hits vs misses",
+      "description": "rio_store_chunk_cache_{hits,misses}_total rates — the per-replica in-memory verified-chunk LRU in front of whichever ChunkBackend is configured. Sits above the Express tier: a moka hit never reaches the tiered backend at all.",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_chunk_cache_hits_total[5m]))",
+          "legendFormat": "hits/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_store_chunk_cache_misses_total[5m]))",
+          "legendFormat": "misses/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Chunk dedup ratio per upload",
+      "description": "rio_store_chunk_dedup_ratio — per-upload dedup (1.0 - missing/total after chunking), set by the most recent PutPath/PutPathChunked on each replica. Near 1.0 = mostly duplicate content (warm store); near 0.0 = novel content.",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_store_chunk_dedup_ratio",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Builder upload chunks: novel vs deduped",
+      "description": "rate(rio_builder_upload_chunks_total[5m]) by kind — PutPathChunked outcome as seen from the builder. kind=novel: absent per HasChunks, body sent as a Chunk frame; kind=deduped: already durable, only the manifest entry sent. deduped/(novel+deduped) is the builder-observed durable-presence ratio.",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(rio_builder_upload_chunks_total[5m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "PutPathChunked verification failures",
+      "description": "increase[5m] of the PutPathChunked verify-walk failure counters. incomplete = stream ended before all novel chunks arrived; verify unavailable = chunk store unreachable during verify; nar_hash / refs / file_digest mismatch = the assembled output does not match what the builder claimed (file_digest mismatch is a castore identity violation — paged by RioStoreFileDigestMismatch).",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(increase(rio_store_putpath_incomplete_total[5m]))",
+          "legendFormat": "incomplete stream",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(rio_store_putpath_verify_unavailable_total[5m]))",
+          "legendFormat": "verify unavailable",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(rio_store_narhash_mismatch_total[5m]))",
+          "legendFormat": "nar_hash mismatch",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(increase(rio_store_refs_mismatch_total[5m]))",
+          "legendFormat": "refs mismatch",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(increase(rio_store_file_digest_mismatch_total[5m]))",
+          "legendFormat": "file_digest mismatch",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Store authn rejects by reason",
+      "description": "rate(rio_store_hmac_rejected_total[5m]) by reason — requests rejected by the store's HMAC token checks (missing/invalid assignment tokens, service callers not allowlisted or not permitted, builder-role tokens on legacy PutPath). A step change after a deploy usually means key or role-claim drift, not an attack.",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(rio_store_hmac_rejected_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "NAR index eager outcomes",
+      "description": "rate(rio_store_nar_index_eager_total[5m]) by outcome — eager nar_index/file_digest compute at PutPath. spawned - error = paths indexed without touching the work queue; sustained skipped means nar_index_concurrency is undersized for the upload rate (the indexer_loop picks the slack up later); error = compute failed (indexer_loop retries from storage).",
+      "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(rio_store_nar_index_eager_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "NAR index compute latency p50/p99",
+      "description": "rio_store_nar_index_compute_seconds — per-path NAR reassemble + nar_ls + blake3 + persist (eager PutPath path and indexer_loop). The eager path holds the upload's accumulation buffer for this long; a rising p99 with rising eager skipped means the semaphore is the bottleneck.",
+      "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_store_nar_index_compute_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_nar_index_compute_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Castore directory RPC latency p99",
+      "description": "rio_store_directory_get_seconds (GetDirectory recursive BFS over the Directory DAG — the builder mount-time prefetch source) and rio_store_directory_read_seconds (ReadBlob chunk fetch + slice + stream — the castore-FUSE open() fill source), p99. These are the store-side halves of the builder's dag-prefetch and open() latency panels.",
+      "gridPos": {"x": 0, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_directory_get_seconds_bucket[5m])))",
+          "legendFormat": "GetDirectory p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_directory_read_seconds_bucket[5m])))",
+          "legendFormat": "ReadBlob p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Has* batch sizes p99 by rpc",
+      "description": "histogram_quantile(0.99, rio_store_directory_has_batch_size) by rpc — digest-list length per HasDirectories/HasBlobs/HasChunks call. These RPCs are batch-by-design (the I-110 lesson); a p99 stuck at 1 means some client is calling them per-digest and will hit the PG wall at scale.",
+      "gridPos": {"x": 12, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, rpc) (rate(rio_store_directory_has_batch_size_bucket[5m])))",
+          "legendFormat": "{{rpc}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    }
+  ]
+}

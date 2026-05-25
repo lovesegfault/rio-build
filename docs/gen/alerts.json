@@ -2,8 +2,12 @@
   "names": [
     "KubeBuildSchedulerDown",
     "KubeBuildSchedulerPendingStuck",
+    "RioBuilderCastoreEio",
+    "RioBuilderCastoreIntegrityFail",
+    "RioBuilderDagPrefetchSlow",
     "RioControllerRestarts",
     "RioDispatchStarved",
+    "RioMountdPromoteRejectMismatch",
     "RioNodeclaimPoolAllCellsIceMasked",
     "RioNodeclaimPoolBootTimeoutLoop",
     "RioNodeclaimPoolIceMaskedHigh",
@@ -14,6 +18,8 @@
     "RioSlaHwCostStale",
     "RioSlaPredictionDrift",
     "RioSlaPriorDivergenceClamped",
+    "RioStoreFileDigestMismatch",
+    "RioStoreNarIndexEagerErrors",
     "RioStorePutPathRetries"
   ]
 }

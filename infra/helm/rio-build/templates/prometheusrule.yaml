@@ -455,4 +455,142 @@ spec:
             description: >-
               PutPath retry rate is {{`{{ $value | humanize }}`}}/s.
               Check S3 5xx rate and PG connection-pool saturation.
+
+    # ADR-022 castore-FUSE builder path + chunked-upload identity (P0563).
+    # Severity convention: critical = content-integrity violation or
+    # build-failing infra (page); warning = degradation that the system
+    # routes around (retry loops, slower builds) but an operator should
+    # look at within the day.
+    - name: rio.castore.rules
+      rules:
+        # Design overview §14 / castore_fuse/open.rs: fetched bytes did
+        # not blake3-hash to the requested file_digest. The bytes are
+        # discarded and the open fails EIO, so builds are already
+        # failing — but the cause is corrupt store content or transport
+        # corruption, which never self-heals. Any single occurrence is
+        # page-worthy (the metric help says "investigate immediately").
+        # No `for:`: increase() over 5m already debounces scrape jitter.
+        - alert: RioBuilderCastoreIntegrityFail
+          expr: increase(rio_builder_castore_fuse_integrity_fail_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: castore-FUSE fetched bytes failing digest verification
+            description: >-
+              {{`{{ $value | humanize }}`}} castore-FUSE fetch(es) on
+              {{`{{ $labels.pod }}`}} did not blake3-hash to the requested
+              file_digest in the last 5m. Corrupt chunk content in
+              rio-store or transport corruption — cross-check
+              rio_store_file_digest_mismatch_total and
+              rio_store_narhash_mismatch_total, and identify the digest
+              from the builder's castore-fuse warn logs.
+
+        # Every EIO reply fails a build attempt (classified as an
+        # infrastructure failure and retried), so a low background rate
+        # during a store rollout self-heals. Page only when sustained:
+        # >5 failed opens fleet-wide over 10m, still true 5m later —
+        # that is a stuck circuit breaker, a dead rio-store, or a mountd
+        # outage, not a blip. Threshold is deliberately conservative;
+        # the dashboard panel shows individual blips.
+        - alert: RioBuilderCastoreEio
+          expr: sum(increase(rio_builder_castore_fuse_eio_total[10m])) > 5
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: castore-FUSE returning EIO to builds
+            description: >-
+              {{`{{ $value | humanize }}`}} EIO replies from the
+              castore-FUSE open()/read() path fleet-wide over 10m
+              (sustained 5m). Each one failed a build attempt. Check
+              rio_builder_castore_fuse_circuit_open (rio-store
+              unreachable), rio-mountd health on the affected nodes, and
+              rio_builder_castore_fuse_integrity_fail_total.
+
+        # PutPathChunked verify-walk: an output's chunk list does not
+        # reproduce the file_digest the builder claimed — the castore
+        # identity (file_digest → bytes) would be violated if accepted.
+        # The RPC is rejected, so the store stays clean; the page is for
+        # the cause: a buggy or compromised builder, or chunk corruption
+        # between builder and store. Any occurrence pages.
+        - alert: RioStoreFileDigestMismatch
+          expr: increase(rio_store_file_digest_mismatch_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: PutPathChunked file_digest mismatch (castore identity violation)
+            description: >-
+              {{`{{ $value | humanize }}`}} PutPathChunked upload(s) on
+              {{`{{ $labels.pod }}`}} presented chunks that do not hash to
+              the claimed file_digest in the last 5m. The upload was
+              rejected. Identify the deriver/builder from the rio-store
+              warn log, and cross-check
+              rio_mountd_promote_reject_total{reason="mismatch"} and
+              rio_builder_castore_fuse_integrity_fail_total to tell a
+              bad builder from corrupt chunk transport.
+
+        # rio-mountd refused a Promote because the staged bytes do not
+        # hash to the digest the builder claimed. One reject is already
+        # suspicious (the builder computed that digest itself moments
+        # earlier) but the build merely retries, so warn — the operator
+        # should identify the build_id in the mountd log and decide
+        # whether to cordon the node. 15m window keeps a single event
+        # visible long enough to be seen.
+        - alert: RioMountdPromoteRejectMismatch
+          expr: increase(rio_mountd_promote_reject_total{reason="mismatch"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-mountd rejecting Promotes for digest mismatch
+            description: >-
+              {{`{{ $value | humanize }}`}} Promote(s) rejected with
+              reason=mismatch on {{`{{ $labels.pod }}`}} over 15m — a
+              builder presented bytes that do not hash to the claimed
+              digest. Find the build_id in the rio-mountd log; if
+              rio_store_narhash_mismatch_total is clean, treat the
+              builder pod as suspect (cordon the node, preserve
+              /var/rio/staging for forensics).
+
+        # Mount-time GetDirectory(recursive) DAG prefetch gates every
+        # build start. The histogram's top bucket is 30s; p99 over 10s
+        # for 10m means builds are queueing behind store-side Directory
+        # reads (directories table bloat, PG pressure, or store CPU) —
+        # cross-check the chunk-cache-tier dashboard's GetDirectory p99.
+        - alert: RioBuilderDagPrefetchSlow
+          expr: histogram_quantile(0.99, sum by (le) (rate(rio_builder_castore_dag_prefetch_seconds_bucket[10m]))) > 10
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: castore DAG prefetch p99 >10s
+            description: >-
+              Mount-time Directory-DAG prefetch p99 is
+              {{`{{ $value | humanizeDuration }}`}} over the last 10m.
+              Every build start on the affected nodes is delayed by this
+              long. Check rio_store_directory_get_seconds p99 and
+              rio-store PG pool utilization.
+
+        # Eager nar_index/file_digest compute failed at PutPath. The
+        # indexer_loop retries from storage so nothing is lost, but a
+        # sustained error rate means new paths are not indexable
+        # (castore mounts of fresh outputs stall on sync-on-miss) and
+        # usually points at chunk-store reads failing or nar_ls choking
+        # on a malformed NAR. outcome="skipped" is NOT an error (just
+        # concurrency-cap deferral) and is excluded.
+        - alert: RioStoreNarIndexEagerErrors
+          expr: sum(increase(rio_store_nar_index_eager_total{outcome="error"}[15m])) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: eager NAR indexing failing repeatedly
+            description: >-
+              {{`{{ $value | humanize }}`}} eager nar_index computes
+              failed over 15m (indexer_loop will retry them). Check
+              rio-store logs for "eager nar_index compute failed",
+              chunk-backend read errors, and
+              rio_store_nar_index_compute_seconds for timeouts.
 {{- end }}
