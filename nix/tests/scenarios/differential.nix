@@ -120,22 +120,19 @@ let
       rio_status = "TransientFailure";
     };
     ca-multi-output = {
-      expect = "diverge";
-      nix = "succeeds";
-      rio_status = "success";
-      note = "floating-CA finalization lands in M6b; native side builds at scratch paths";
+      # M6b floating-CA finalization is merged: the native side must
+      # now realize the same content-addressed paths as the oracle.
+      expect = "parity";
     };
     ca-selfref = {
-      expect = "diverge";
-      nix = "succeeds";
-      rio_status = "success";
-      note = "floating-CA finalization lands in M6b; native side builds at scratch paths";
+      # M6b floating-CA finalization is merged: the native side must
+      # now realize the same content-addressed paths as the oracle.
+      expect = "parity";
     };
     ca-structured = {
-      expect = "diverge";
-      nix = "succeeds";
-      rio_status = "success";
-      note = "floating-CA finalization lands in M6b; native side builds at scratch paths";
+      # M6b floating-CA finalization is merged: the native side must
+      # now realize the same content-addressed paths as the oracle.
+      expect = "parity";
     };
   };
 in
