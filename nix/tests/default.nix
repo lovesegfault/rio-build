@@ -297,9 +297,19 @@ in
   #   sends exit-status before eof); `connections_active` must return
   #   to 0 within 15s (gateway disconnects on last-channel-close);
   #   `ssh gateway echo` (rejected exec) must exit ≠124.
+  # r[verify store.index.putpath-eager]
+  #   eager-nar-index subtest: seedBusybox's `nix copy` → legacy PutPath
+  #   must increment rio_store_nar_index_eager_total{outcome=spawned}
+  #   (≥1, skipped=0, error=0) and commit nar_indexed + the castore
+  #   junction rows without a GetNarIndex call. Structural assertions,
+  #   not the plan's literal <100ms stopwatch — see the scenario's
+  #   eagerIndexScript header for why.
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
+      # psql for the eager-nar-index subtest's manifests/castore-table
+      # assertions.
+      extraPackages = [ pkgs.postgresql_18 ];
       extraClientModules = [
         {
           environment.systemPackages = [ pkgs.nix-output-monitor ];
@@ -314,6 +324,7 @@ in
     };
     cold = false;
     withNomExitTest = true;
+    withEagerIndexTest = true;
   };
 
   # r[verify gw.compat.version-range+2]

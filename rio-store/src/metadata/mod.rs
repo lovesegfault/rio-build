@@ -495,14 +495,9 @@ mod tests {
             [0xCCu8; 32],
         );
 
-        let err = complete_manifest_inline(
-            &db.pool,
-            &info,
-            uuid::Uuid::new_v4(),
-            Bytes::from_static(b"nar"),
-        )
-        .await
-        .expect_err("should fail without placeholder");
+        let err = complete_manifest_inline(&db.pool, &info, uuid::Uuid::new_v4(), b"nar")
+            .await
+            .expect_err("should fail without placeholder");
 
         assert!(
             matches!(err, MetadataError::PlaceholderMissing { .. }),
@@ -534,14 +529,9 @@ mod tests {
         // with the original claim and narinfo untouched (nar_size=0).
         let mut bad = info.clone();
         bad.signatures = vec!["evil:sig".into()];
-        let err = complete_manifest_inline(
-            &db.pool,
-            &bad,
-            uuid::Uuid::new_v4(),
-            Bytes::from_static(b"nar"),
-        )
-        .await
-        .expect_err("foreign claim must fail");
+        let err = complete_manifest_inline(&db.pool, &bad, uuid::Uuid::new_v4(), b"nar")
+            .await
+            .expect_err("foreign claim must fail");
         assert!(
             matches!(err, MetadataError::PlaceholderMissing { .. }),
             "expected PlaceholderMissing, got {err:?}"
@@ -560,7 +550,7 @@ mod tests {
         assert_eq!(nar_size, 0, "narinfo untouched (manifests gate runs first)");
 
         // Real claim → Ok; status flipped, OUR signatures landed.
-        complete_manifest_inline(&db.pool, &info, claim_a, Bytes::from_static(b"nar"))
+        complete_manifest_inline(&db.pool, &info, claim_a, b"nar")
             .await
             .unwrap();
         let (status, sigs): (String, Vec<String>) = sqlx::query_as(

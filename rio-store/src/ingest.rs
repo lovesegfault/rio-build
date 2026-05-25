@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use sqlx::PgPool;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -173,12 +172,15 @@ pub enum PersistError {
 /// Caller must hold a [`PlaceholderClaim::Owned`] for
 /// `info.store_path_hash`. Emits `rio_store_chunk_dedup_ratio` on the
 /// chunked branch.
+/// `nar_data` is borrowed (not consumed) so the PutPath caller can keep
+/// the buffer alive for the post-commit eager `nar_index` pass
+/// (`r[store.index.putpath-eager]`) without cloning a multi-GiB Vec.
 pub async fn persist_nar(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     info: &ValidatedPathInfo,
     claim: Uuid,
-    nar_data: Vec<u8>,
+    nar_data: &[u8],
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
 ) -> Result<(), PersistError> {
@@ -188,7 +190,7 @@ pub async fn persist_nar(
             backend,
             info,
             claim,
-            &nar_data,
+            nar_data,
             chunk_upload_max_concurrent,
         )
         .await
@@ -202,7 +204,7 @@ pub async fn persist_nar(
         );
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     } else {
-        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(nar_data))
+        metadata::complete_manifest_inline(pool, info, claim, nar_data)
             .await
             .map_err(PersistError::Inline)?;
         debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);

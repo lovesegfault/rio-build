@@ -90,6 +90,12 @@ pub struct Config {
     /// charging a NAR larger than the budget. Lower toward MAX_NAR_SIZE
     /// on small-memory nodes (concurrency drops to 1); raise it if you
     /// have >8 concurrent max-size uploads and RAM to match.
+    ///
+    /// NOT the only bound on resident NAR buffers: eager indexing
+    /// (`nar_index_concurrency`) holds up to `nar_index_concurrency ×
+    /// MAX_NAR_SIZE` (16 GiB at defaults) of upload buffers *past* the
+    /// handler's lifetime, outside this budget's accounting. Size node
+    /// memory for the sum of both.
     pub nar_buffer_budget_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
@@ -165,6 +171,19 @@ pub struct Config {
     /// 128)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.
     #[serde(default)]
     pub substitute_admission_permits: Option<usize>,
+    /// Max concurrent eager NAR-index computations spawned by the
+    /// legacy `PutPath`/`PutPathBatch` paths (P0557). After a
+    /// successful upload the handler `try_acquire`s a permit; if one
+    /// is free it spawns `nar_ls` over the still-in-RAM NAR so
+    /// `GetNarIndex`/`GetDirectory` see the path immediately. If not,
+    /// the path falls back to the `indexer_loop` (≤5 s pickup) — no
+    /// queueing, no added upload latency. Each in-flight computation
+    /// holds its NAR buffer past the handler's lifetime (outside
+    /// `nar_buffer_budget_bytes`), so this also bounds that extra RSS
+    /// to `nar_index_concurrency × NAR size`. `0` disables eager
+    /// indexing entirely (everything defers to the `indexer_loop`).
+    /// Default 4. Set via `RIO_NAR_INDEX_CONCURRENCY`.
+    pub nar_index_concurrency: usize,
 }
 
 impl Default for Config {
@@ -191,6 +210,7 @@ impl Default for Config {
             stream_drain: std::time::Duration::from_secs(90),
             pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
             substitute_admission_permits: None,
+            nar_index_concurrency: crate::nar_index::DEFAULT_NAR_INDEX_CONCURRENCY,
         }
     }
 }
@@ -424,6 +444,9 @@ mod tests {
         assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
         // None → main.rs derives via derive_substitute_admission_cap.
         assert!(d.substitute_admission_permits.is_none());
+        // 4 eager nar_ls passes in flight; 0 would silently disable
+        // the optimization, larger risks unbounded post-handler RSS.
+        assert_eq!(d.nar_index_concurrency, 4);
     }
 
     #[test]
@@ -892,6 +915,10 @@ mod tests {
             crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
         );
         assert_eq!(cfg.s3_max_attempts, DEFAULT_S3_MAX_ATTEMPTS);
+        assert_eq!(
+            cfg.nar_index_concurrency,
+            crate::nar_index::DEFAULT_NAR_INDEX_CONCURRENCY
+        );
     });
 
     // -----------------------------------------------------------------------

@@ -25,6 +25,14 @@ use crate::metadata::{self, ManifestKind};
 /// indexing was skipped.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Default for `Config::nar_index_concurrency`: max concurrent eager
+/// index computations spawned by the legacy PutPath/PutPathBatch
+/// paths. Sizes the `try_acquire`-only semaphore — a 5th concurrent
+/// upload skips eager indexing and falls back to [`spawn_indexer_loop`]
+/// instead of queueing. Also bounds the post-handler RSS of retained
+/// NAR buffers to `4 × NAR size`.
+pub const DEFAULT_NAR_INDEX_CONCURRENCY: usize = 4;
+
 /// Drain batch size. `compute()` runs serially so peak RAM is one NAR;
 /// 32 just amortizes the PG round-trip.
 const POLL_BATCH: i64 = 32;
@@ -98,6 +106,93 @@ pub async fn compute(
     metadata::set_nar_index(pool, &hash, claim_id, &encoded, &dag).await?;
     metrics::counter!("rio_store_nar_index_compute_total").increment(1);
     Ok(encoded)
+}
+
+/// [`compute`] minus the manifest read and chunk fetch: index a NAR
+/// whose bytes the caller already holds (the PutPath accumulation
+/// buffer). Same `nar_ls` → `castore::build` → `metadata::set_nar_index`
+/// pipeline, so the persisted rows are byte-identical to what the
+/// indexer loop would have written.
+///
+/// `claim_id` is the caller's placeholder-ownership token (the one its
+/// `complete_manifest_*` just flipped to `'complete'` with) —
+/// `set_nar_index`'s `claim_id IS NOT DISTINCT FROM` fence then
+/// no-ops if GC + a re-upload raced us between the commit and this
+/// write, exactly like the indexer loop's read-then-fence.
+pub async fn compute_from_bytes(
+    pool: &PgPool,
+    nar: &[u8],
+    store_path: &str,
+    claim_id: Option<uuid::Uuid>,
+) -> anyhow::Result<()> {
+    let hash = StorePath::parse(store_path)?.sha256_digest();
+    // Same off-worker treatment as `compute()`: nar_ls BLAKE3s every
+    // file's content.
+    let (encoded, dag) = crate::cas::cpu_bound(|| -> anyhow::Result<_> {
+        let entries = nar_ls(Cursor::new(nar))?;
+        let dag = castore::build(&entries);
+        Ok((encode_entries(&entries, &dag), dag))
+    })?;
+    metadata::set_nar_index(pool, &hash, claim_id, &encoded, &dag).await?;
+    metrics::counter!("rio_store_nar_index_compute_total").increment(1);
+    Ok(())
+}
+
+// r[impl store.index.putpath-eager]
+/// Best-effort eager index after a successful legacy `PutPath` /
+/// `PutPathBatch` commit, while the NAR bytes are still in RAM.
+///
+/// `try_acquire` — never waits. A free permit → spawn
+/// [`compute_from_bytes`] on the shared buffer; at capacity → skip and
+/// let [`spawn_indexer_loop`] pick the path up within `POLL_INTERVAL`
+/// (≤5 s; it re-fetches the NAR from storage). Either way the upload's
+/// response latency is unaffected. The permit rides inside the spawned
+/// task so it releases when the computation finishes, not when the
+/// handler returns.
+///
+/// Failures are logged + counted, never propagated: the index is
+/// non-authoritative and `nar_indexed` stays FALSE on error, so the
+/// indexer loop retries from storage.
+///
+/// Observability: `rio_store_nar_index_eager_total{outcome=
+/// spawned|skipped|error}`. `spawned - error` = paths indexed without
+/// touching the work queue; sustained `skipped` means
+/// `nar_index_concurrency` is undersized for the upload rate.
+///
+/// `nar` is the upload's refcounted accumulation buffer; the spawned
+/// task holds a `Bytes` clone (refcount bump, no copy) until the
+/// compute finishes.
+pub fn maybe_spawn_eager(
+    pool: &PgPool,
+    sem: &Arc<tokio::sync::Semaphore>,
+    store_path: &str,
+    claim_id: uuid::Uuid,
+    nar: &bytes::Bytes,
+) {
+    let Ok(permit) = Arc::clone(sem).try_acquire_owned() else {
+        metrics::counter!("rio_store_nar_index_eager_total", "outcome" => "skipped").increment(1);
+        debug!(%store_path, "eager nar_index skipped (at concurrency cap); deferring to indexer_loop");
+        return;
+    };
+    metrics::counter!("rio_store_nar_index_eager_total", "outcome" => "spawned").increment(1);
+    let pool = pool.clone();
+    let nar = nar.clone();
+    let store_path = store_path.to_owned();
+    rio_common::task::spawn_monitored("nar-index-eager", async move {
+        let _permit = permit;
+        let timer = std::time::Instant::now();
+        match compute_from_bytes(&pool, &nar, &store_path, Some(claim_id)).await {
+            Ok(()) => {
+                metrics::histogram!("rio_store_nar_index_compute_seconds")
+                    .record(timer.elapsed().as_secs_f64());
+            }
+            Err(e) => {
+                metrics::counter!("rio_store_nar_index_eager_total", "outcome" => "error")
+                    .increment(1);
+                warn!(%store_path, error = %e, "eager nar_index compute failed; indexer_loop will retry");
+            }
+        }
+    });
 }
 
 /// Reassemble a NAR from its manifest. Chunked paths fetch through the

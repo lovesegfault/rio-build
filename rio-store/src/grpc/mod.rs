@@ -264,6 +264,15 @@ pub struct StoreServiceImpl {
     /// cost is `K × CHUNK_MAX` (≤ 16 MiB at 64). Override via
     /// `.with_chunk_prefetch_k()`.
     chunk_prefetch_k: usize,
+    /// Eager NAR-index concurrency gate for the legacy PutPath /
+    /// PutPathBatch paths (`r[store.index.putpath-eager]`).
+    /// `try_acquire`-only — a permit free right after a successful
+    /// commit means [`crate::nar_index::compute_from_bytes`] is spawned
+    /// on the still-buffered NAR; otherwise the path waits for the
+    /// `indexer_loop`. Sized by `Config::nar_index_concurrency`
+    /// (default [`crate::nar_index::DEFAULT_NAR_INDEX_CONCURRENCY`]);
+    /// 0 permits = eager indexing disabled.
+    index_sem: Arc<tokio::sync::Semaphore>,
     /// Count of GetPath body-stream tasks currently writing. Incremented
     /// synchronously in `stream_path` BEFORE the response is returned,
     /// decremented on the spawned task's drop (any exit path).
@@ -305,6 +314,9 @@ impl StoreServiceImpl {
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
             chunk_prefetch_k: DEFAULT_CHUNK_PREFETCH_K,
+            index_sem: Arc::new(tokio::sync::Semaphore::new(
+                crate::nar_index::DEFAULT_NAR_INDEX_CONCURRENCY,
+            )),
             active_get_path_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -408,6 +420,17 @@ impl StoreServiceImpl {
     /// main.rs threads `RIO_CHUNK_PREFETCH_K` here.
     pub fn with_chunk_prefetch_k(mut self, k: usize) -> Self {
         self.chunk_prefetch_k = k;
+        self
+    }
+
+    /// Override the eager NAR-index concurrency gate. Builder-style.
+    /// main.rs threads `RIO_NAR_INDEX_CONCURRENCY` here. `0` disables
+    /// eager indexing (every `try_acquire` fails → everything defers
+    /// to the `indexer_loop`) — tests that exercise sync-on-miss or
+    /// the background loop use this to keep PutPath from indexing
+    /// out from under them.
+    pub fn with_nar_index_concurrency(mut self, n: usize) -> Self {
+        self.index_sem = Arc::new(tokio::sync::Semaphore::new(n));
         self
     }
 

@@ -101,10 +101,10 @@ pub(crate) async fn complete_manifest_inline(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
-    nar_data: Bytes,
+    nar_data: &[u8],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, claim, Some(nar_data.as_ref())).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim, Some(nar_data)).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())

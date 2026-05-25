@@ -942,7 +942,7 @@ impl Substituter {
                 self.chunk_backend.as_ref(),
                 &info,
                 claim,
-                nar_bytes.into(),
+                &nar_bytes,
                 self.chunk_upload_max_concurrent,
                 SUBSTITUTE_HOOKS,
             )

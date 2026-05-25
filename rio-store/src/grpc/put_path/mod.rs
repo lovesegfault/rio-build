@@ -228,7 +228,11 @@ impl StoreServiceImpl {
         }
         let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
 
-        self.finalize_single(info, claim, nar_data, auth.tenant_id)
+        // Zero-copy Vec→Bytes so the buffer outlives the persist call:
+        // finalize_single's post-commit eager nar_index spawn holds a
+        // refcounted clone of these exact bytes instead of re-fetching
+        // the NAR (r[store.index.putpath-eager]).
+        self.finalize_single(info, claim, bytes::Bytes::from(nar_data), auth.tenant_id)
             .await?;
         if let Some(g) = placeholder_guard {
             g.defuse();

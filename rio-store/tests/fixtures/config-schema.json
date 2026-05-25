@@ -42,7 +42,7 @@
         "default": 2147483648
       },
       "nar_buffer_budget_bytes": {
-        "description": "Global NAR reassembly buffer budget in bytes — total permits\nacross ALL concurrent PutPath handlers. Each handler acquires\n`chunk.len()` permits before extending its accumulation Vec.\nNone → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Must be\n≥ MAX_NAR_SIZE (4 GiB) — a smaller budget deadlocks any caller\ncharging a NAR larger than the budget. Lower toward MAX_NAR_SIZE\non small-memory nodes (concurrency drops to 1); raise it if you\nhave >8 concurrent max-size uploads and RAM to match.",
+        "description": "Global NAR reassembly buffer budget in bytes — total permits\nacross ALL concurrent PutPath handlers. Each handler acquires\n`chunk.len()` permits before extending its accumulation Vec.\nNone → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Must be\n≥ MAX_NAR_SIZE (4 GiB) — a smaller budget deadlocks any caller\ncharging a NAR larger than the budget. Lower toward MAX_NAR_SIZE\non small-memory nodes (concurrency drops to 1); raise it if you\nhave >8 concurrent max-size uploads and RAM to match.\n\nNOT the only bound on resident NAR buffers: eager indexing\n(`nar_index_concurrency`) holds up to `nar_index_concurrency ×\nMAX_NAR_SIZE` (16 GiB at defaults) of upload buffers *past* the\nhandler's lifetime, outside this budget's accounting. Size node\nmemory for the sum of both.",
         "type": [
           "integer",
           "null"
@@ -145,6 +145,13 @@
         "format": "uint",
         "minimum": 0,
         "default": null
+      },
+      "nar_index_concurrency": {
+        "description": "Max concurrent eager NAR-index computations spawned by the\nlegacy `PutPath`/`PutPathBatch` paths (P0557). After a\nsuccessful upload the handler `try_acquire`s a permit; if one\nis free it spawns `nar_ls` over the still-in-RAM NAR so\n`GetNarIndex`/`GetDirectory` see the path immediately. If not,\nthe path falls back to the `indexer_loop` (≤5 s pickup) — no\nqueueing, no added upload latency. Each in-flight computation\nholds its NAR buffer past the handler's lifetime (outside\n`nar_buffer_budget_bytes`), so this also bounds that extra RSS\nto `nar_index_concurrency × NAR size`. `0` disables eager\nindexing entirely (everything defers to the `indexer_loop`).\nDefault 4. Set via `RIO_NAR_INDEX_CONCURRENCY`.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 4
       }
     },
     "$defs": {
@@ -283,6 +290,7 @@
     "chunk_prefetch_k": 64,
     "stream_drain_secs": 90,
     "pg_max_connections": 50,
-    "substitute_admission_permits": null
+    "substitute_admission_permits": null,
+    "nar_index_concurrency": 4
   }
 }

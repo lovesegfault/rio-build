@@ -539,19 +539,32 @@ impl StoreServiceImpl {
     /// output. On `persist_nar` error the placeholder is `abort_upload`ed
     /// here; the caller's drop-guard spawn is then a harmless no-op.
     /// `info.store_path_hash` MUST be populated.
+    ///
+    /// `nar_data` is a refcounted `Bytes` (zero-copy from the
+    /// accumulation `Vec`) so the post-commit eager `nar_index` pass can
+    /// hold the buffer from a spawned task without copying it
+    /// (`r[store.index.putpath-eager]`). The eager gate fires only after
+    /// a successful persist — an aborted upload never indexes.
     // r[impl obs.metric.transfer-volume]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
         claim: uuid::Uuid,
-        nar_data: Vec<u8>,
+        nar_data: Bytes,
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
-        if let Err(e) = self.persist_nar(&info, claim, nar_data, "PutPath").await {
+        if let Err(e) = self.persist_nar(&info, claim, &nar_data, "PutPath").await {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
+        crate::nar_index::maybe_spawn_eager(
+            &self.pool,
+            &self.index_sem,
+            info.store_path.as_str(),
+            claim,
+            &nar_data,
+        );
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         Ok(())
@@ -609,7 +622,7 @@ impl StoreServiceImpl {
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
-        nar_data: Vec<u8>,
+        nar_data: &[u8],
         ctx_label: &str,
     ) -> Result<bool, Status> {
         let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()).is_some();
@@ -639,11 +652,18 @@ impl StoreServiceImpl {
     /// On `stage_chunked` error this output's placeholder is already
     /// rolled back; the batch's [`PlaceholderGuard`]s handle other
     /// outputs' placeholders on Drop.
+    ///
+    /// `nar_data` is the batch handler's refcounted buffer: it survives
+    /// the phase-3 commit so the post-commit eager `nar_index` pass can
+    /// reuse it (`r[store.index.putpath-eager]`). The inline branch's
+    /// staged `Bytes` is a `clone()` of the same allocation — a refcount
+    /// bump, not a copy, so an inline-only store (where `should_chunk`
+    /// is `None` at ANY size) never holds two copies of a NAR.
     pub(in crate::grpc) async fn stage_nar_for_batch(
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
-        nar_data: Vec<u8>,
+        nar_data: &Bytes,
     ) -> Result<NarPersist, Status> {
         if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
             let stats = cas::stage_chunked(
@@ -651,7 +671,7 @@ impl StoreServiceImpl {
                 backend,
                 info,
                 claim,
-                &nar_data,
+                nar_data,
                 self.chunk_upload_max_concurrent,
             )
             .await
@@ -661,7 +681,7 @@ impl StoreServiceImpl {
                 chunk_hashes: stats.chunk_hashes,
             })
         } else {
-            Ok(NarPersist::Inline(Bytes::from(nar_data)))
+            Ok(NarPersist::Inline(nar_data.clone()))
         }
     }
 }

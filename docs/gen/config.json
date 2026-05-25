@@ -430,6 +430,12 @@
         "type": "integer",
         "default": "",
         "description": "Per-replica cap on concurrent `try_substitute` calls."
+      },
+      {
+        "key": "nar_index_concurrency",
+        "type": "uint",
+        "default": "4",
+        "description": "Max concurrent eager NAR-index computations spawned by the legacy `PutPath`/`PutPathBatch` paths (P0557)."
       }
     ],
     "builder": [

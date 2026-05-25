@@ -40,27 +40,33 @@ fn make_dir_nar(name: &str, payload: &[u8]) -> (Vec<u8>, [u8; 32], String) {
 /// `file_digest` populated for regular files only. Second call is a
 /// cache hit (no recompute) — verified structurally via the
 /// `manifests.nar_indexed` flag flipping after the first call.
+///
+/// `nar_index_concurrency = 0` keeps PutPath's eager index (P0557)
+/// from racing this test's "still unindexed" precondition — the point
+/// here is the sync-on-miss recompute, not the eager path.
 // r[verify store.index.rpc]
 // r[verify store.index.sync-on-miss]
 #[tokio::test]
 async fn get_nar_index_sync_on_miss_then_cache_hit() -> TestResult {
-    let mut s = StoreSession::new().await?;
+    let db = TestDb::new(&MIGRATOR).await;
+    let service = StoreServiceImpl::new(db.pool.clone()).with_nar_index_concurrency(0);
+    let (mut client, _server) = spawn_store_server(service).await?;
     let (nar, nar_hash, path) = make_dir_nar("nar-index-rt", b"hello nar index");
     let info = make_path_info(&path, &nar, nar_hash);
-    put_path(&mut s.client, info, nar).await?;
+    put_path(&mut client, info, nar).await?;
 
-    // Pre-condition: PutPath does NOT eagerly index (P0557 not landed).
+    // Pre-condition: with 0 eager permits PutPath leaves the path
+    // unindexed (the gate is `try_acquire`, never a wait).
     let indexed: bool = sqlx::query_scalar("SELECT nar_indexed FROM manifests LIMIT 1")
-        .fetch_one(&s.db.pool)
+        .fetch_one(&db.pool)
         .await?;
     assert!(
         !indexed,
-        "PutPath should leave the path unindexed (eager = P0557)"
+        "PutPath with nar_index_concurrency=0 must not eagerly index"
     );
 
     // Sync-on-miss: first call recomputes and write-throughs.
-    let idx = s
-        .client
+    let idx = client
         .get_nar_index(GetNarIndexRequest {
             nar_hash: nar_hash.to_vec(),
         })
@@ -93,20 +99,19 @@ async fn get_nar_index_sync_on_miss_then_cache_hit() -> TestResult {
 
     // Write-through: nar_index row exists, manifest flagged.
     let indexed: bool = sqlx::query_scalar("SELECT nar_indexed FROM manifests LIMIT 1")
-        .fetch_one(&s.db.pool)
+        .fetch_one(&db.pool)
         .await?;
     assert!(
         indexed,
         "sync-on-miss should write-through and flip nar_indexed"
     );
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_index")
-        .fetch_one(&s.db.pool)
+        .fetch_one(&db.pool)
         .await?;
     assert_eq!(rows, 1);
 
     // Second call: PG hit, identical result.
-    let idx2 = s
-        .client
+    let idx2 = client
         .get_nar_index(GetNarIndexRequest {
             nar_hash: nar_hash.to_vec(),
         })
@@ -114,6 +119,110 @@ async fn get_nar_index_sync_on_miss_then_cache_hit() -> TestResult {
         .into_inner();
     assert_eq!(idx2.entries, idx.entries);
 
+    Ok(())
+}
+
+/// P0557: PutPath with a free eager-index permit (the default) indexes
+/// the path from the still-in-RAM NAR — `manifests.nar_indexed` flips
+/// and the `nar_index` + castore junction rows land WITHOUT any
+/// `GetNarIndex` call and without the `indexer_loop` running (the test
+/// harness never spawns it). The poll is for the spawned task's commit,
+/// not a wall-clock gate — there is no other writer in this process.
+///
+/// The castore-table assertions are the read-side contract: the rows
+/// the eager pass writes are exactly what `GetDirectory`/`StatBlob`
+/// resolve digests through, so an eager write that skipped them would
+/// leave the path invisible to the castore-FUSE builder until GC.
+// r[verify store.index.putpath-eager]
+#[tokio::test]
+async fn put_path_eagerly_indexes_without_get() -> TestResult {
+    let mut s = StoreSession::new().await?;
+    let (nar, nar_hash, path) = make_dir_nar("nar-index-eager", b"eager payload");
+    let info = make_path_info(&path, &nar, nar_hash);
+    put_path(&mut s.client, info, nar).await?;
+
+    // The eager task is spawned (not awaited by the handler); poll for
+    // its commit. 50×20ms is the same budget every other spawned-task
+    // assertion in this suite uses.
+    let indexed = poll_scalar_until(
+        &s.db.pool,
+        "SELECT nar_indexed FROM manifests LIMIT 1",
+        true,
+    )
+    .await;
+    assert!(
+        indexed,
+        "PutPath must eagerly index with a free permit (no GetNarIndex, no indexer_loop)"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_index")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(rows, 1, "eager pass must write the nar_index row");
+    // Castore junctions: 1 directory (the root), 2 file_blobs (a, c).
+    let dirs: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(dirs, 1, "eager pass must populate directory_paths");
+    let blobs: i64 = sqlx::query_scalar("SELECT count(*) FROM file_blobs")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(blobs, 2, "eager pass must populate file_blobs");
+    Ok(())
+}
+
+/// The eager gate is per-output for `PutPathBatch` too: both outputs of
+/// a 2-output batch index without a `GetNarIndex` call.
+// r[verify store.index.putpath-eager]
+#[tokio::test]
+async fn put_path_batch_eagerly_indexes() -> TestResult {
+    use rio_proto::types::{PutPathBatchRequest, PutPathMetadata, PutPathRequest, PutPathTrailer};
+
+    let mut s = StoreSession::new().await?;
+    let outputs = [
+        make_dir_nar("batch-eager-0", b"first output"),
+        make_dir_nar("batch-eager-1", b"second output"),
+    ];
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    for (i, (nar, nar_hash, path)) in outputs.iter().enumerate() {
+        let mut info: rio_proto::types::PathInfo = make_path_info(path, nar, *nar_hash).into();
+        info.nar_hash = Vec::new();
+        let trailer = PutPathTrailer {
+            nar_hash: nar_hash.to_vec(),
+            nar_size: std::mem::take(&mut info.nar_size),
+        };
+        for msg in [
+            put_path_request::Msg::Metadata(PutPathMetadata { info: Some(info) }),
+            put_path_request::Msg::NarChunk(nar.clone()),
+            put_path_request::Msg::Trailer(trailer),
+        ] {
+            tx.send(PutPathBatchRequest {
+                output_index: i as u32,
+                inner: Some(PutPathRequest { msg: Some(msg) }),
+            })
+            .await
+            .expect("fresh channel");
+        }
+    }
+    drop(tx);
+    let resp = s
+        .client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    assert_eq!(resp.created, vec![true, true]);
+
+    let n = poll_scalar_until(
+        &s.db.pool,
+        "SELECT count(*) FROM manifests WHERE nar_indexed",
+        2i64,
+    )
+    .await;
+    assert_eq!(n, 2, "both batch outputs must be eagerly indexed");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_index")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(rows, 2);
     Ok(())
 }
 

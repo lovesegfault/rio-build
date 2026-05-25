@@ -210,6 +210,7 @@
     "rio_store_nar_index_cache_hits_total",
     "rio_store_nar_index_compute_seconds",
     "rio_store_nar_index_compute_total",
+    "rio_store_nar_index_eager_total",
     "rio_store_narhash_mismatch_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
@@ -1296,12 +1297,17 @@
       {
         "name": "rio_store_nar_index_compute_seconds",
         "kind": "histogram",
-        "help": "Per-path NAR reassemble + nar_ls + persist (indexer_loop only)"
+        "help": "Per-path NAR reassemble + nar_ls + persist (indexer_loop + eager PutPath)"
       },
       {
         "name": "rio_store_nar_index_compute_total",
         "kind": "counter",
         "help": "NAR-index computations (eager PutPath + indexer_loop + sync-on-miss)"
+      },
+      {
+        "name": "rio_store_nar_index_eager_total",
+        "kind": "counter",
+        "help": "PutPath/PutPathBatch eager-index gate decisions, labeled by `outcome`: `spawned` (permit free, indexed from the in-RAM NAR), `skipped` (at nar_index_concurrency cap, deferred to the indexer_loop), `error` (spawned but the compute failed; the indexer_loop retries). Sustained `skipped` under normal load = raise RIO_NAR_INDEX_CONCURRENCY."
       },
       {
         "name": "rio_store_narhash_mismatch_total",

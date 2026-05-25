@@ -29,6 +29,13 @@
   # `connections_active` returns to 0. Only the CppNix warm variant
   # opts in — Lix's nom compatibility isn't load-bearing for this fix.
   withNomExitTest ? false,
+  # Exercise `r[store.index.putpath-eager]`: after seedBusybox's legacy
+  # PutPath, the store must have taken the eager-index path (metric
+  # gate) and committed the nar_index + castore rows without waiting
+  # for the indexer_loop. Store-side behavior, client-agnostic — only
+  # the CppNix warm variant opts in (the fixture needs psql in
+  # extraPackages; the Lix variant would just repeat the assertion).
+  withEagerIndexTest ? false,
   nameSuffix ? "",
 }:
 let
@@ -157,6 +164,8 @@ let
 
     ${common.seedBusybox gatewayHost}
 
+    ${pkgs.lib.optionalString withEagerIndexTest eagerIndexScript}
+
     # ── phase1a: wopQueryPathInfo exact narHash/narSize ──────────────
     with subtest("path-info exact narHash/narSize (vs local ground truth)"):
         path_info = client.succeed(
@@ -249,6 +258,83 @@ let
         )
 
     ${pkgs.lib.optionalString withNomExitTest nomExitScript}
+  '';
+
+  # ── P0557: eager nar_index on the legacy PutPath path ────────────────
+  #
+  # seedBusybox just drove `nix copy` → gateway wopAddToStoreNar → store
+  # PutPath (the LEGACY path: this fixture has no chunk backend, so
+  # PutPathChunked's synchronous-index commit is not in play). The eager
+  # gate must have taken a permit and spawned the in-RAM nar_ls for
+  # every copied path.
+  #
+  # Structural, not a stopwatch: the plan's literal "GetNarIndex within
+  # 100 ms" is (a) the documented wall-clock-gate flake pattern under
+  # TCG/builder load and (b) vacuous anyway — GetNarIndex has a
+  # sync-on-miss recompute, so it succeeds fast whether or not the eager
+  # path exists. The discriminating observables are the gate counter and
+  # the absence of an error outcome; the psql poll only proves the
+  # spawned task committed (its timeout is slack, not the assertion).
+  eagerIndexScript = ''
+    with subtest("eager-nar-index (PutPath indexes from RAM, no indexer_loop wait)"):
+        store_metrics = scrape_metrics(${gatewayHost}, 9092)
+        spawned = metric_value(
+            store_metrics, "rio_store_nar_index_eager_total", '{outcome="spawned"}'
+        )
+        all_eager = store_metrics.get("rio_store_nar_index_eager_total")
+        assert spawned is not None and spawned >= 1, (
+            f"PutPath did not take the eager-index path; all series: {all_eager!r}"
+        )
+        # No upload should have been deferred: the store is idle, the
+        # default permit count is 4, and the closure is copied serially.
+        skipped = metric_value(
+            store_metrics, "rio_store_nar_index_eager_total", '{outcome="skipped"}'
+        )
+        assert not skipped, f"eager index unexpectedly skipped {skipped} paths on an idle store"
+
+        # The spawned compute committed: nar_indexed flips for the
+        # seeded path. wait_until_succeeds because the task is async wrt
+        # the PutPath response; 10s is generous slack for a ~1 MiB NAR,
+        # not a latency assertion.
+        ${gatewayHost}.wait_until_succeeds(
+            "sudo -u postgres psql rio -qtAc \""
+            "SELECT m.nar_indexed FROM manifests m"
+            " JOIN narinfo n USING (store_path_hash)"
+            " WHERE n.store_path = '${common.busybox}'\" | grep -qx t",
+            timeout=10,
+        )
+        # ...and it must not have failed-and-self-healed-via-the-loop:
+        # an eager task that errors increments outcome=error and leaves
+        # nar_indexed FALSE for the 5s loop to repair. Both signals
+        # together prove the EAGER task (not the loop) wrote the index.
+        err = metric_value(
+            scrape_metrics(${gatewayHost}, 9092),
+            "rio_store_nar_index_eager_total", '{outcome="error"}'
+        )
+        assert not err, f"eager nar_index compute failed {err} time(s); see rio-store journal"
+
+        # Read-side contract: the eager pass writes the same castore
+        # junction rows (directory_paths / file_blobs) that
+        # GetDirectory/StatBlob resolve digests through. A tenant-scoped
+        # RPC round-trip is not possible in this fixture (no JWT/HMAC ->
+        # castore RPCs return UNAUTHENTICATED before the tenancy join,
+        # and nothing ever writes path_tenants for a copied-in path), so
+        # assert the tables directly. busybox is a directory tree with
+        # at least /bin/busybox -> >=1 of each.
+        n_dirs = int(psql(
+            ${gatewayHost},
+            "SELECT count(*) FROM directory_paths WHERE store_path_hash ="
+            " (SELECT store_path_hash FROM narinfo"
+            "   WHERE store_path = '${common.busybox}')",
+        ))
+        assert n_dirs >= 1, f"eager index wrote no directory_paths rows ({n_dirs})"
+        n_blobs = int(psql(
+            ${gatewayHost},
+            "SELECT count(*) FROM file_blobs WHERE store_path_hash ="
+            " (SELECT store_path_hash FROM narinfo"
+            "   WHERE store_path = '${common.busybox}')",
+        ))
+        assert n_blobs >= 1, f"eager index wrote no file_blobs rows ({n_blobs})"
   '';
 
   # ── nom-exit / SSH connection teardown ────────────────────────────────

@@ -393,7 +393,15 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         "rio_store_nar_index_compute_seconds",
-        "Per-path NAR reassemble + nar_ls + persist (indexer_loop only)"
+        "Per-path NAR reassemble + nar_ls + persist (indexer_loop + eager PutPath)"
+    );
+    describe_counter!(
+        "rio_store_nar_index_eager_total",
+        "PutPath/PutPathBatch eager-index gate decisions, labeled by `outcome`: \
+         `spawned` (permit free, indexed from the in-RAM NAR), `skipped` \
+         (at nar_index_concurrency cap, deferred to the indexer_loop), \
+         `error` (spawned but the compute failed; the indexer_loop retries). \
+         Sustained `skipped` under normal load = raise RIO_NAR_INDEX_CONCURRENCY."
     );
     describe_counter!(
         "rio_store_nar_index_cache_hits_total",

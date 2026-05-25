@@ -54,7 +54,14 @@ struct OutputAccum {
     /// Computed store_path_hash (SHA-256 of the store path string).
     store_path_hash: Vec<u8>,
     /// Accumulated NAR bytes. Bounded by `MAX_NAR_SIZE` per output.
+    /// Phase-1 only: phase 2 freezes it into [`Self::nar_bytes`].
     nar_data: Vec<u8>,
+    /// [`Self::nar_data`] frozen into a refcounted `Bytes` at the top
+    /// of phase 2 (zero-copy `Vec → Bytes`). Shared by the staged
+    /// inline blob (a `clone()` of the same allocation) and the
+    /// post-commit eager `nar_index` pass, so neither costs a second
+    /// copy of the NAR.
+    nar_bytes: Option<bytes::Bytes>,
     /// Incremental NAR digest, fed by `accumulate_chunk`. Finalized in
     /// phase 2 for [`verify_nar`].
     hasher: sha2::Sha256,
@@ -177,11 +184,16 @@ impl StoreServiceImpl {
             accum.claim = Some(claim);
 
             info.store_path_hash = accum.store_path_hash.clone();
-            let nar_data = std::mem::take(&mut accum.nar_data);
-            match self.stage_nar_for_batch(info, claim, nar_data).await {
+            // Freeze the accumulation Vec into a refcounted Bytes
+            // (zero-copy). The staged inline blob and the post-commit
+            // eager nar_index pass both clone this same allocation
+            // (r[store.index.putpath-eager]).
+            let nar = bytes::Bytes::from(std::mem::take(&mut accum.nar_data));
+            match self.stage_nar_for_batch(info, claim, &nar).await {
                 Ok(p) => accum.staged = Some(p),
                 Err(e) => bail!(e),
             }
+            accum.nar_bytes = Some(nar);
         }
 
         let resolved_signer = self.resolve_batch_signer(auth.tenant_id).await;
@@ -194,6 +206,29 @@ impl StoreServiceImpl {
             Ok(c) => c,
             Err(e) => bail!(e),
         };
+
+        // Post-commit eager nar_index, same gate as PutPath's
+        // finalize_single: each freshly-created output races for a
+        // permit independently, so a 16-output batch indexes the first
+        // `nar_index_concurrency` eagerly and leaves the rest for the
+        // indexer_loop. r[store.index.putpath-eager]
+        for accum in outputs.values_mut() {
+            if accum.already_complete {
+                continue;
+            }
+            let (Some(info), Some(claim), Some(nar)) =
+                (accum.info.as_ref(), accum.claim, accum.nar_bytes.take())
+            else {
+                continue;
+            };
+            crate::nar_index::maybe_spawn_eager(
+                &self.pool,
+                &self.index_sem,
+                info.store_path.as_str(),
+                claim,
+                &nar,
+            );
+        }
 
         for g in placeholder_guards {
             g.defuse();

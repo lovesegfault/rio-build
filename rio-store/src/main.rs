@@ -129,7 +129,8 @@ async fn main() -> anyhow::Result<()> {
     let mut store_service = StoreServiceImpl::new(pool.clone())
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
         .with_max_batch_paths(cfg.max_batch_paths)
-        .with_chunk_prefetch_k(cfg.chunk_prefetch_k);
+        .with_chunk_prefetch_k(cfg.chunk_prefetch_k)
+        .with_nar_index_concurrency(cfg.nar_index_concurrency);
     if let Some(cache) = &chunk_cache {
         store_service = store_service.with_chunk_cache(Arc::clone(cache));
     }
