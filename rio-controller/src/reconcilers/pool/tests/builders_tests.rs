@@ -473,6 +473,73 @@ fn job_pod_overlays_volume_mounted() {
     assert_eq!(mount.mount_path, "/var/rio/overlays");
 }
 
+/// P0571: every executor pod mounts the four mountd-owned /var/rio
+/// trees — cache and chunks read-only (only rio-mountd's verified
+/// Promote writes the node-shared caches), staging and castore
+/// read-write — and the legacy per-pod FUSE cache moves out of the way
+/// to /var/rio/fuse-cache so the shared cache can own /var/rio/cache.
+#[test]
+fn job_pod_mounts_mountd_owned_node_trees() {
+    let wp = test_wp();
+    let pod = test_pod_spec(&wp);
+    let volumes = pod.volumes.as_ref().unwrap();
+    let mounts = pod.containers[0].volume_mounts.as_ref().unwrap();
+
+    for (name, path, read_only) in [
+        ("var-rio-cache", "/var/rio/cache", true),
+        ("var-rio-chunks", "/var/rio/chunks", true),
+        ("var-rio-staging", "/var/rio/staging", false),
+        ("var-rio-castore", "/var/rio/castore", false),
+    ] {
+        let vol = volumes
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("{name} volume must exist"));
+        let hp = vol
+            .host_path
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} must be a hostPath"));
+        assert_eq!(hp.path, path);
+        // DirectoryOrCreate (NOT Directory like the mountd DaemonSet):
+        // executor pods also schedule on k3s VM-test nodes with no
+        // /var/rio provisioning; an empty dir there is a cache miss,
+        // a scheduling failure would break every scenario.
+        assert_eq!(hp.type_, Some("DirectoryOrCreate".into()));
+        let mount = mounts
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{name} volumeMount must exist"));
+        assert_eq!(mount.mount_path, path);
+        assert_eq!(
+            mount.read_only,
+            read_only.then_some(true),
+            "{name}: cache/chunks are mountd-owned read-only, staging/castore read-write"
+        );
+    }
+
+    // The old per-pod FUSE cache emptyDir must NOT shadow the shared
+    // /var/rio/cache hostPath: it lives at /var/rio/fuse-cache (and the
+    // env var follows) until P0560 deletes the old FUSE module.
+    let fuse_cache = mounts
+        .iter()
+        .find(|m| m.name == "fuse-cache")
+        .expect("fuse-cache volumeMount");
+    assert_eq!(fuse_cache.mount_path, "/var/rio/fuse-cache");
+    let env = pod.containers[0].env.as_ref().unwrap();
+    let cache_dir = env
+        .iter()
+        .find(|e| e.name == "RIO_FUSE_CACHE_DIR")
+        .and_then(|e| e.value.as_deref())
+        .expect("RIO_FUSE_CACHE_DIR env");
+    assert_eq!(cache_dir, "/var/rio/fuse-cache");
+    assert!(
+        !mounts
+            .iter()
+            .any(|m| m.name != "var-rio-cache" && m.mount_path == "/var/rio/cache"),
+        "nothing else may claim /var/rio/cache"
+    );
+}
+
 // ── ADR-023 §13a ship-standalone wiring ──────────────────────────────
 
 const GIB: u64 = 1 << 30;

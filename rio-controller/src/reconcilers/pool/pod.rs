@@ -77,6 +77,36 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     ("nix-var", "/nix/var", None, None),
 ];
 
+/// The four mountd-owned `/var/rio` hostPath trees mounted into every
+/// executor pod (P0571). Container path == host path; volume names
+/// match `mountd-ds.yaml` so the two sides of the contract grep alike.
+///
+/// Cache and chunks are READ-ONLY: only rio-mountd's verified
+/// `Promote`/`PromoteChunks` may write the node-shared caches (the
+/// integrity boundary that keeps them trustworthy against a compromised
+/// builder). Staging is the builder-writable half (per-build
+/// `staging/{build_id}` is created and quota'd by mountd at `Mount`
+/// time); castore is where the per-build FUSE mountpoints appear —
+/// whether the mount is propagated host→container or performed by the
+/// builder in its own namespace is the P0560 mount-propagation
+/// decision (see the TODO in `mountd-ds.yaml`), and either way the pod
+/// needs the directory.
+///
+/// `DirectoryOrCreate`, unlike the DaemonSet's `type: Directory`: the
+/// mountd pod is the integrity/quota owner and must fail loudly when
+/// the AMI's `/var/rio` XFS mount is absent, but executor pods also run
+/// on k3s VM-test nodes that have no `/var/rio` provisioning at all —
+/// an empty kubelet-created dir there just means cache misses, while a
+/// scheduling failure would break every existing scenario.
+///
+/// Tuple: `(volume name, host/container path, read_only)`.
+const CASTORE_NODE_MOUNTS: &[(&str, &str, bool)] = &[
+    ("var-rio-cache", "/var/rio/cache", true),
+    ("var-rio-chunks", "/var/rio/chunks", true),
+    ("var-rio-staging", "/var/rio/staging", false),
+    ("var-rio-castore", "/var/rio/castore", false),
+];
+
 /// Default FUSE cache emptyDir sizeLimit for builder pods. Kubelet
 /// evicts on overshoot. Pods are one-shot so the cache never outlives
 /// one build's input closure.
@@ -671,6 +701,19 @@ pub fn build_executor_pod_spec(
                     });
                 }
             }
+            // The mountd-owned node trees (P0571): hostPath, shared
+            // with the rio-mountd DaemonSet. RO/RW split and the
+            // DirectoryOrCreate rationale live on CASTORE_NODE_MOUNTS.
+            for (name, path, _) in CASTORE_NODE_MOUNTS {
+                v.push(Volume {
+                    name: (*name).into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: (*path).into(),
+                        type_: Some("DirectoryOrCreate".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: non-privileged path needs no volume —
             // containerd base_runtime_spec mknods the device node
@@ -868,7 +911,12 @@ fn build_executor_container(
                 env("RIO_SCHEDULER__ADDR", &scheduler.addr),
                 env("RIO_STORE__ADDR", &store.addr),
                 env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
-                env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
+                // /var/rio/fuse-cache, NOT /var/rio/cache: the latter is
+                // the node-shared mountd-owned backing cache (P0571's
+                // read-only hostPath below); the old per-pod FUSE cache
+                // keeps its emptyDir under a non-colliding path until
+                // P0560 deletes the old FUSE module entirely.
+                env("RIO_FUSE_CACHE_DIR", "/var/rio/fuse-cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
                 env("RIO_LOG_FORMAT", "json"),
                 env("RIO_SYSTEMS", &pool.spec.systems.join(",")),
@@ -954,7 +1002,7 @@ fn build_executor_container(
             let mut m = vec![
                 VolumeMount {
                     name: "fuse-cache".into(),
-                    mount_path: "/var/rio/cache".into(),
+                    mount_path: "/var/rio/fuse-cache".into(),
                     ..Default::default()
                 },
                 VolumeMount {
@@ -969,6 +1017,16 @@ fn build_executor_container(
                     ..Default::default()
                 },
             ];
+            // The four mountd-owned /var/rio trees (P0571) — see
+            // CASTORE_NODE_MOUNTS for the RO/RW rationale.
+            for (name, path, read_only) in CASTORE_NODE_MOUNTS {
+                m.push(VolumeMount {
+                    name: (*name).into(),
+                    mount_path: (*path).into(),
+                    read_only: read_only.then_some(true),
+                    ..Default::default()
+                });
+            }
             if read_only_root_fs {
                 for (name, mount_path, _, _) in READ_ONLY_ROOT_MOUNTS {
                     m.push(VolumeMount {

@@ -141,8 +141,11 @@ pub async fn setup(
     //   /tmp (tempfile crate)       | `tmp` emptyDir, 64Mi tmpfs
     //                               |   (readOnlyRoot only)
     //   cfg.fuse_cache_dir          | `fuse-cache` emptyDir
-    //     (/var/rio/cache —         |   (always)
-    //      Cache::new above)        |
+    //     (/var/rio/fuse-cache in   |   (always)
+    //      pods — Cache::new above; |
+    //      /var/rio/cache is the    |
+    //      mountd-owned shared      |
+    //      cache, RO hostPath)      |
     //   /sys/fs/cgroup/**           | cgroupfs, not rootfs —
     //     (cgroup.rs)               |   remounted rw at cgroup.rs
     //                               |   ns-root-remount
