@@ -38,6 +38,19 @@ resource "helm_release" "keda" {
       name  = "metricsServer.useHostNetwork"
       value = "true"
     },
+    # On a hostNetwork pod every listener is a host port, not just the
+    # serving port. Besides 6443 the adapter always runs a plain-HTTP
+    # metrics listener (prometheus.metricServer.port — declared as a
+    # containerPort, so the scheduler reserves it even with scraping
+    # disabled). Its 8080 default is taken on the system nodes by the
+    # external-secrets and aws-lbc metrics endpoints, so move it into
+    # the 1027x block carved out for the webhook below (10250 kubelet,
+    # 10260 external-secrets/prometheus-operator). Health probes need
+    # no extra port — the adapter serves /healthz on 6443 itself.
+    {
+      name  = "prometheus.metricServer.port"
+      value = "10271"
+    },
     # The admission webhook only validates ScaledObjects
     # (failurePolicy=Ignore — unreachable just skips validation), but
     # leave it functional rather than silently dead. Port 10270: 9443
@@ -51,6 +64,22 @@ resource "helm_release" "keda" {
     {
       name  = "webhooks.port"
       value = "10270"
+    },
+    # Same port-namespace problem for the webhook pod's auxiliary
+    # listeners: controller-runtime always binds its metrics endpoint
+    # (prometheus.webhooks.port, default 8080) and health probe
+    # (webhooks.healthProbePort, default 8081) regardless of whether
+    # anything scrapes them, and both defaults are taken on the system
+    # nodes by external-secrets'/aws-lbc's own hostNetwork metrics and
+    # probe endpoints. Distinct from the apiserver's 10271 so the two
+    # KEDA pods can share a node.
+    {
+      name  = "prometheus.webhooks.port"
+      value = "10272"
+    },
+    {
+      name  = "webhooks.healthProbePort"
+      value = "10273"
     },
   ]
 
