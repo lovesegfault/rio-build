@@ -84,6 +84,13 @@ pub(crate) fn prepare_structured_attrs(
         }
     }
 
+    // CppNix serializes `.attrs.json` with nlohmann::json, whose object
+    // keys are lexicographically sorted at every nesting level. The
+    // workspace's serde_json enables `preserve_order` (insertion order),
+    // so sort recursively before serializing — the differential harness
+    // asserts byte-identical `.attrs.json` against real Nix, and key
+    // order is the only representational difference.
+    sort_json_keys(&mut prepared);
     let json_text = serde_json::to_string(&prepared).map_err(GlueError::AttrsJsonSerialize)?;
     let sh_text = write_structured_attrs_shell(&prepared);
 
@@ -91,6 +98,29 @@ pub(crate) fn prepare_structured_attrs(
         attrs_json: rewrite(&json_text, rewrites).into_bytes(),
         attrs_sh: rewrite(&sh_text, rewrites).into_bytes(),
     })
+}
+
+/// Recursively rebuild every JSON object with lexicographically sorted
+/// keys (nlohmann::json's iteration order, hence CppNix's `.attrs.json`
+/// byte layout). Arrays keep their element order; only object key order
+/// changes.
+fn sort_json_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (_, v) in &mut entries {
+                sort_json_keys(v);
+            }
+            *map = entries.into_iter().collect();
+        }
+        Value::Array(items) => {
+            for v in items {
+                sort_json_keys(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Bash serialization of the prepared attrs (CppNix
@@ -237,6 +267,56 @@ mod tests {
                 "declare -A outputs=(['out']='/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo' )"
             ),
             "got:\n{sh}"
+        );
+    }
+
+    #[test]
+    fn attrs_json_keys_are_sorted_at_every_level() {
+        // CppNix (nlohmann::json) emits lexicographically sorted keys at
+        // every nesting level; the differential harness asserts byte
+        // identity, so the serialized order must match regardless of the
+        // __json blob's insertion order.
+        let json = json!({
+            "zeta": {"b": 1, "a": 2},
+            "alpha": "first",
+            "__structuredAttrs": true,
+            "midList": [{"z": 1, "a": 2}]
+        });
+        let files = prepare_structured_attrs(
+            &json,
+            &["out".to_string()],
+            &empty_closure(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let text = String::from_utf8(files.attrs_json).unwrap();
+
+        // Top level: __structuredAttrs < alpha < midList < outputs < zeta.
+        let order: Vec<usize> = [
+            "\"__structuredAttrs\"",
+            "\"alpha\"",
+            "\"midList\"",
+            "\"outputs\"",
+            "\"zeta\"",
+        ]
+        .iter()
+        .map(|k| text.find(*k).expect("key present"))
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "top-level keys not sorted: {text}"
+        );
+        // Nested object inside zeta: a before b.
+        let zeta = &text[text.find("\"zeta\"").unwrap()..];
+        assert!(
+            zeta.find("\"a\"").unwrap() < zeta.find("\"b\"").unwrap(),
+            "nested keys not sorted: {zeta}"
+        );
+        // Objects inside arrays are sorted too.
+        let mid = &text[text.find("\"midList\"").unwrap()..text.find("\"outputs\"").unwrap()];
+        assert!(
+            mid.find("\"a\"").unwrap() < mid.find("\"z\"").unwrap(),
+            "array-element object keys not sorted: {mid}"
         );
     }
 
