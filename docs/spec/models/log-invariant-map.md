@@ -402,3 +402,82 @@ invariant checks it". Model B is cancelled outright — its subject
 not exist in the new architecture — and the Phase-6 simplification ledger
 closes with "the architecture change was the simplification": the cutover
 deleted every mechanism the calibration proved redundant, and the rest.
+
+## Model C — the LogService acceptance table
+
+`docs/spec/models/logService.qnt` is the successor model: the builder's
+at-least-once ack-trimmed uploader, the open-time binding + completeness
+gate, the per-stream ingest session and its accept predicate, the
+INSERT-only chunk manifest, the read path's ordered-walk dedup over
+overlapping sessions, the read-time completeness fold, and the TTL sweep.
+Four exhaustive TLC regimes (`quint-log-service-{base,redispatch,resend,
+sweep}` in `nix/quint.nix`) assert its invariants over their full
+reachable state spaces; twelve expect-violation witness checks pin the
+contended states as reachable. Measured state counts and wall-clocks are
+in the introducing commit's message and the checks' transcripts.
+
+### The model-C invariants
+
+| Invariant | Predecessor | What it checks |
+|---|---|---|
+| `noCrossExecContamination` | `noCrossExecContamination` | Execution E's manifest holds only lines E's own bound builder sent. The defense is structural (the chunk key embeds the exec_id the stream was bound to at open); the invariant is the regression guard that the cut keys its chunk by the cutting session's execution. |
+| `authGateExcludesForeignWriters` | `bindingGateExcludesForeignExecutors` | The stream-open predicate admits a claimed execution only when it is the derivation's latest assignment attempt. |
+| `noSilentLineLoss` | `noSilentLineLoss` | The four-disjunct disclosed-loss form: every line the build emitted is in the builder's retransmit buffer, in a store-side ingest buffer, covered by a manifest chunk, or the loss is disclosed (the log does not read as complete / the uploader recorded its abandonment). |
+| `ackImpliesDurable` | — (new) | The honest uploader's load-bearing refinement of the conservation law: every line below the builder's acked watermark is manifest-covered until the TTL sweep removes it. Asserted only in the regimes without the fabricating client (see the val's doc for why a client that mis-numbers its own lines forfeits the per-ack durability claim). |
+| `servedSpanExact` | `lineSpanExact` | The read path's ordered-walk-with-watermark over the manifest — including overlapping chunks from two sessions — yields exactly the union of the chunks' line ranges, each line exactly once. The fold is encoded as the code's walk, not as the union it is supposed to compute. |
+| `completeLogServesAllProduced` | — (the conservation law's bite, restated) | A log that reads complete serves every line the build produced. |
+| `completenessGate` | — (new; the audit's defect #1) | Once a session has learned the execution's recorded `final_line_count`, every line it subsequently accepts is below it. Lines accepted before the mid-stream refresh observed the seal are the disclosed bounded residual. |
+
+### The 22-bug corpus against model C
+
+Verdict legend: **CONSTRUCTION** = the state or mechanism the bug lived
+in does not exist in the new architecture; the model's transition
+relation cannot represent the harmful write. **CHECKED(inv, regime)** =
+the equivalent hazard exists at the named site and the named invariant
+holds over the named regime's full reachable state space, with the
+contended scenario pinned reachable by the named witness check.
+**OUTSIDE** = no model footprint then, no model footprint now;
+conventional tests own it.
+
+| Original row | Old fix | Model-C verdict | Where the hazard went |
+|---|---|---|---|
+| `3a55474ac` | accounted-floor accept gate | **CHECKED**(`servedSpanExact`, resend) | The re-delivered batch after an ambiguous disconnect lands as a *manifest overlap* (a second session's chunk covering the same line range), not a span overstatement — there is no gap-merge fold to double-count it. The hazard moved to the read path's `(first_line, session_id)` ordered walk and `LineCursor` watermark (`tail.rs`), which must serve each overlapped line exactly once; `quint-log-service-witness-overlap` and `-dedup` pin the overlap and the suppressed duplicate as reachable. The within-one-session re-delivery is rejected by `high_water_line` (the monotone floor — the `accounted_below` fix built in from the start, never reset by the buffer emptying). |
+| `496e6fb14` | recv-task (executor, drv) binding gate | **CHECKED**(`authGateExcludesForeignWriters`, redispatch) | Relocated to `gate.rs::check_append_open`: HMAC token, token-vs-header derivation match, latest-assignment + builder binding. The model checks the latest-assignment half (the superseded-token rejection, pinned by `quint-log-service-witness-superseded-rejected`); the identity comparisons are pure equality on signed token fields. The content/provenance harm is still erased by the line-as-integer encoding — the same documented price the predecessor paid. |
+| `496e6fb14` (residual) | legacy `push()`'s `or_default()` unstamped-entry allocation | **CONSTRUCTION** | There is no entry to allocate: a stream that fails the gate never creates a session, and the per-replica stream-count and byte-budget semaphores bound the resource the unstamped entry leaked. Resource bounds, outside the model. |
+| `7beb1ca00` #1 | gateway `ForwardLogBatch` gated on the accept verdict | **CONSTRUCTION** | The live-tail fan-out happens inside `accept()` after every gate (`ingest.rs`), so a rejected batch is never fanned out. The fan-out sink itself is read-side plumbing outside the model. |
+| `7beb1ca00` #2 | `FlushRequest.exec_id` stale-drain pin | **CONSTRUCTION** | No finalizing drain exists. A cut drains the cutting session's own buffer into the cutting session's own `(exec, session)` keyspace; there is no request that names an execution other than the one the stream was bound to at open. `noCrossExecContamination` is the regression guard. |
+| `7beb1ca00` #3 | `LogFlusher` periodic arms leader-gated | **CONSTRUCTION** | No leader, no flusher. The periodic cut is per-stream and INSERT-only; two replicas concurrently cutting for one execution are two sessions whose chunk sets union at read time instead of two writers racing an UPSERT. |
+| `7ffbf1415` | `BuildPhase` actor-side executor gate | **OUTSIDE** | A sibling message type with no log-subsystem footprint in either architecture. |
+| `6c26e85f8` | cross-exec restamp clears the retained lines | **CONSTRUCTION** + **CHECKED**(`noCrossExecContamination`, redispatch) | There is no restamp and no in-memory carrier that survives a re-dispatch: the new execution gets a new exec_id, a new session, a new buffer, and a new chunk-key namespace. The contended state — both executions' logs growing concurrently while the superseded session still holds lines — is reachable (`quint-log-service-witness-concurrent-execs`) and the invariant holds over it. |
+| `699ea1692` | cross-exec restamp clears the seal | **CONSTRUCTION** | No seal latch. Completeness is a predicate computed per read from the execution's own lifecycle row and manifest; a prior execution's completeness cannot mute a live execution's stream because the gate consults the *claimed* execution's state, not a shared per-derivation tombstone. The muting state (`noStaleSealOnLiveCarrier`'s subject) is unrepresentable. |
+| `2f9a747d0` | same-exec restamp clears the seal + final-pending mark | **CONSTRUCTION** | Same as above for the seal half. The final-pending mark has no analog (no deferred final). A reconnecting builder opens a fresh session whose admission is recomputed from the DB. |
+| `6aab70b47` | enqueue-failure reap | **CONSTRUCTION** | No flush queue, no enqueue failure, no orphaned entry. The per-stream buffer's lifetime is the gRPC stream's (a panic-safe scopeguard deregisters it on every exit path). |
+| `463090eb7` | one-shot finalized-elsewhere consult | **CONSTRUCTION** | No finalized-elsewhere state to consult and no retained entry to reap. |
+| `f8ce10b8e` | recurring refused-UPSERT reap | **CONSTRUCTION** | No UPSERT to refuse. The manifest is INSERT-only with `ON CONFLICT DO NOTHING` on a per-attempt key. |
+| `81824cfbb` | periodic sealed-empty reap | **CONSTRUCTION** | No sealed entry. |
+| `84ac79b84` | stale-request guard atomic with the drain | **CONSTRUCTION** | No `flush_final` and no drain of state another actor can restamp. The cut's drain and commit operate on the cutting session's own buffer under its own mutex; the await-granularity window between them is the seam invariant (`buffer`/`in_flight`/manifest), pinned by the `subscribe_during_in_flight_cut_sees_drained_lines` unit test rather than the model (the same whole-action-atomicity boundary the predecessor drew). |
+| `3ce5d03e4` | deferred-final tenure pin | **CONSTRUCTION** | The harm — a stale writer overwriting the row a fresher writer extended — requires a writer that overwrites. Chunks are write-once, the manifest is INSERT-only, and there is no deferred request that outlives the authority that enqueued it. |
+| `646022e37` | tenure pin hoisted before the destructive arms | **CONSTRUCTION** | No destructive arms and no tenure to pin against. |
+| `825cdd478` | atomic tenure-drop reap + post-await re-validation | **CONSTRUCTION** | No tenure-drop reap. |
+| `2c301438d` | disconnect-time discard gated on an authoritative DAG | **CHECKED**(`noSilentLineLoss`, all four regimes) | The one undisclosed-loss bug of the old design. The new design's disconnect paths either *drain* the buffer (the clean half-close cuts every remaining run) or *drop* it (the abort path) — and every dropped line is still in the builder's ack-trimmed retransmit buffer, because an ack is sent only after the manifest INSERT commits. The four-disjunct conservation law holds over every regime's full state space, including the abort-then-replay and abandon-with-unacked paths (`quint-log-service-witness-abandoned` pins the disclosure channel as exercised). `ackImpliesDurable` is the no-early-ack refinement that keeps disjunct 1 honest. |
+| `e6c18add2` | acquisition-time stale-buffer sweep | **CONSTRUCTION** | No acquisition and no stale retained buffer to sweep. |
+| `8e97c2220` | sweep spares only non-terminal DAG entries | **CHECKED**(`noSilentLineLoss` + `ackImpliesDurable`, sweep) | The old sweep's hazard was deleting an entry whose data was still needed. The new TTL sweep's only guard is wall-clock age; the model checks that only an expired execution's chunks are ever deleted, that the deletion is disclosed (the log stops reading complete the moment its manifest or lifecycle row goes), and that the chunks-before-execution-row deletion order's crash window violates nothing. `quint-log-service-witness-swept` pins the deletion as reachable. |
+| `abfade4d5` | periodic frozen-row UPSERT latch | **CONSTRUCTION** | `is_complete` is not stored; it is computed per read from monotone inputs (a terminal status never un-sets, the manifest only grows until the TTL sweep). A downgrade is unrepresentable in the transition relation — no action removes a chunk or a count except the sweep, whose deletion is the retention policy, not a regression. |
+| `44905298b` | `flush_final` already-finalized consult | **CHECKED**(`completenessGate`, base) | No finalizing write to race; the one decide-once datum (`final_line_count`) is stamped by a single-threaded actor and a duplicate stamp writes the same value. The closest surviving analog is the open-time seal — a complete log rejects further `AppendLog` opens — checked by `openAdmitted`'s `not(logIsComplete)` conjunct and pinned reachable by `quint-log-service-witness-complete-open-rejected`. |
+| `d8944727e` | gap-merge fold counts the gap, not the marker | **CHECKED**(`completeLogServesAllProduced`, base) | No gap-merge fold. A forward gap splits the cut into two chunks and is *visible in the manifest* as non-contiguous rows; the completeness fold (`gate.rs::manifest_covers_contiguously`) reports it as incomplete instead of counting it into a span. The gapped manifest is reachable (`quint-log-service-witness-gapped-manifest`) and a log never reads complete across a gap. |
+| `effefb0a1` | flush span = line-number span, not physical count | **CHECKED**(`servedSpanExact`, base + resend) | A chunk's recorded `line_count` is the physical length of the contiguous run it was cut from, so its line-number span and its physical count are equal by construction — the two quantities the old fix had to reconcile cannot diverge. `servedSpanExact` checks the read path serves exactly the recorded intervals. |
+| `e1fd179b9` | stored-coverage reconcile folds any non-subsumed row | **CONSTRUCTION** | No reconcile and no fold of a stored row into a new write. Coverage is the union of INSERT-only manifest rows; the interim-leader-extended-row scenario maps to "session B committed chunks while session A was partitioned", which the read path unions instead of overwriting. |
+| `e10deb9f6` | `req_in_tenure` keyed on the acquire-epoch | **CONSTRUCTION** | No tenure and no deferred request to validate against one. (Model B's calibration entry #1; model B is cancelled.) |
+
+**Summary.** Of the 27 calibration rows covering the 22 historical bugs:
+**18 are closed by construction** — the state they lived in (the shared
+ring entry, the seal latch, the finalizing write, the four orphan shapes,
+the lease-coupled flusher) does not exist, and the model's transition
+relation cannot express the harmful write; **7 are checked by an
+invariant** over an exhaustive regime whose contended scenario a witness
+check pins as reachable (the re-delivery overlap, the foreign-writer
+rejection, the disconnect-time loss, the sweep's deletion scope, the
+finalize-once seal, the gap accounting, and the span arithmetic); **2
+are outside the model** in both architectures (display-stream and
+sibling-message-type gates owned by conventional tests). No row is
+exposed without a check.
