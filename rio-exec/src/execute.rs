@@ -42,9 +42,11 @@
 //!
 //! The caller must keep draining the [`ExecEvent`] receiver: log
 //! delivery awaits channel capacity, so a stalled (but alive) receiver
-//! suspends log processing and with it silence/log-volume enforcement.
-//! A *dropped* receiver is fine — events are discarded and execution
-//! continues.
+//! suspends log processing and with it **all** limit enforcement —
+//! silence, log-volume, and the wall-clock timeout alike (the
+//! supervision loop cannot reach its deadline arms while parked on the
+//! send). A *dropped* receiver is fine — events are discarded and
+//! execution continues.
 
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -249,9 +251,11 @@ pub async fn execute(
     // ---- The supervision loop ----------------------------------------------
     let mut splitter = LineSplitter::default();
     let mut events_open = true;
+    let mut started_sent = false;
     let mut status_report: Option<StatusReport> = None;
     let mut kill_reason: Option<KillReason> = None;
     let mut wait_status: Option<Result<i32, std::io::Error>> = None;
+    let mut chunks_done = false;
     let mut log_bytes: u64 = 0;
     let mut last_output = Instant::now();
     let mut status_task = status_task;
@@ -268,6 +272,7 @@ pub async fn execute(
                 status_report = Some(report);
                 match report {
                     StatusReport::ExecStarted => {
+                        started_sent = true;
                         if events_open
                             && events
                                 .send(ExecEvent::Started { pid: intermediate.as_raw() })
@@ -284,8 +289,11 @@ pub async fn execute(
                     }
                 }
             }
-            // Captured output.
-            chunk = chunk_rx.recv() => {
+            // Captured output. Disabled once the readers hit EOF — the
+            // wait/timeout/silence arms below stay live regardless, so
+            // a program that closes its own stdout/stderr and keeps
+            // running is still bounded by the limits.
+            chunk = chunk_rx.recv(), if !chunks_done => {
                 match chunk {
                     Some(chunk) => {
                         last_output = Instant::now();
@@ -303,13 +311,9 @@ pub async fn execute(
                         }
                     }
                     // Both readers finished (EOF / EIO). Nothing more to
-                    // enforce on the log side; just wait for the reap.
-                    None => {
-                        wait_status = Some(match (&mut wait_task).await {
-                            Ok(result) => result,
-                            Err(join_error) => Err(std::io::Error::other(join_error)),
-                        });
-                    }
+                    // enforce on the log side; the reap (and the
+                    // deadlines) finish the loop.
+                    None => chunks_done = true,
                 }
             }
             // The process tree was reaped.
@@ -351,7 +355,8 @@ pub async fn execute(
         let _ = events.send(line).await;
     }
     // The status report normally resolved long ago; give a straggler
-    // (e.g. a setup failure racing the reap) a bounded window.
+    // (e.g. a setup failure racing the reap, or a program so fast that
+    // the reap won the final select) a bounded window.
     if status_report.is_none() {
         status_report = Some(
             tokio::time::timeout(FINAL_DRAIN_TIMEOUT, &mut status_task)
@@ -359,6 +364,17 @@ pub async fn execute(
                 .map(|r| r.unwrap_or(StatusReport::Corrupt))
                 .unwrap_or(StatusReport::Corrupt),
         );
+    }
+    // A very fast program can be reaped before the status arm ever ran;
+    // the Started event is still owed to the caller. Best-effort: it is
+    // the last event this execution emits, so a closed channel needs no
+    // bookkeeping.
+    if !started_sent && status_report == Some(StatusReport::ExecStarted) && events_open {
+        let _ = events
+            .send(ExecEvent::Started {
+                pid: intermediate.as_raw(),
+            })
+            .await;
     }
 
     // ---- Interpret ----------------------------------------------------------
@@ -534,6 +550,9 @@ impl KillGuard {
 
 impl Drop for KillGuard {
     fn drop(&mut self) {
+        // Deliberately blocking inside Drop: there is no async Drop,
+        // and the kill is a single tiny cgroupfs write (or a kill(2)),
+        // not something worth a runtime handle.
         kill_tree(self.cgroup.as_deref(), self.pid, &self.armed);
     }
 }

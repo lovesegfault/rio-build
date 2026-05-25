@@ -543,9 +543,36 @@ async fn log_limit_kills_the_tree() {
     "#;
     let mut req = env.request(script);
     req.limits.max_log_bytes = Some(10_000);
+    let started = Instant::now();
     let (result, _) = run(&req).await;
     let outcome = result.expect("execution itself succeeds");
     assert_eq!(outcome.exit, ExitOutcome::LogLimitExceeded);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the kill must take effect promptly, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
+async fn timeout_applies_after_the_program_closes_its_output() {
+    require_root!();
+    let env = TestEnv::new();
+    // The program closes its stdout and stderr (EOF on the capture
+    // side) and then keeps running: limit enforcement must not stop
+    // with the capture stream.
+    let mut req = env.request("exec >&- 2>&-; sleep 60");
+    req.limits.timeout = Some(Duration::from_secs(2));
+    let started = Instant::now();
+    let (result, _) = run(&req).await;
+    let outcome = result.expect("execution itself succeeds");
+    assert_eq!(outcome.exit, ExitOutcome::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the kill must take effect promptly, took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
