@@ -98,8 +98,13 @@ fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec
     }
 }
 
-/// Verify FOD output hashes match the declared outputHash (defense-in-depth;
-/// nix-daemon also verifies, but we re-check BEFORE upload).
+/// Verify FOD output hashes match the declared outputHash.
+///
+/// This is the **sole** verifier and the integrity boundary that makes
+/// the fetcher's open egress safe (`fetcher.upload.hash-verify-before`):
+/// nothing downstream re-checks the content, so it is fail-closed — an
+/// output whose declared `outputHashAlgo` we cannot verify is rejected,
+/// never skipped.
 ///
 /// Dispatches on outputHashAlgo (sha1/sha256/sha512) and computes the
 /// hash LOCALLY before upload — a bad output is rejected before it
@@ -124,17 +129,21 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
         let expected = hex::decode(output.hash())
             .with_context(|| format!("FOD outputHash is not valid hex: {}", output.hash()))?;
 
-        // Dispatch on outputHashAlgo. Unknown algo →
-        // skip (log warn, don't false-reject). nix-daemon's own
-        // verification still runs; we're just defense-in-depth.
+        // Dispatch on outputHashAlgo. Unknown algo → reject. This gate
+        // is the only content verification between an egress-open
+        // fetcher and the signed cache; an algorithm we cannot verify
+        // (md5, or garbage in a hand-written .drv) must fail the build
+        // rather than ship unverified content. The gateway additionally
+        // rejects such derivations at submission so the failure lands on
+        // the client instead of burning a fetcher pod.
         let Some(algo) = FodHashAlgo::from_nix_str(output.hash_algo()) else {
-            tracing::warn!(
-                output = output.name(),
-                hash_algo = output.hash_algo(),
-                "FOD output uses unsupported hash algo — skipping worker-side verification \
-                 (nix-daemon still verifies)"
+            bail!(
+                "FOD output '{}' declares unsupported hash algorithm '{}' \
+                 (supported: sha1, sha256, sha512, each optionally prefixed 'r:'); \
+                 refusing to upload unverified fetched content",
+                output.name(),
+                output.hash_algo(),
             );
-            continue;
         };
 
         let is_recursive = output.hash_algo().starts_with("r:");
@@ -563,24 +572,23 @@ mod tests {
         verify_fod_hashes(&drv, &store_dir)
     }
 
-    /// Unknown algo (e.g., md5 — Nix doesn't support it, but be defensive):
-    /// skip verification (log warn) rather than false-reject.
+    /// Unknown algo (e.g., md5): fail-closed. This function is the sole
+    /// content verifier for fetched outputs; an algorithm it cannot
+    /// verify must reject the build, not skip the check.
     #[test]
-    fn test_verify_fod_unknown_algo_skipped() -> anyhow::Result<()> {
+    fn test_verify_fod_unknown_algo_rejected() -> anyhow::Result<()> {
         let (_tmp, store_dir) = seed_output("test-md5-fod", b"content")?;
-        // 32-char hex that's NOT the md5 of "content" — would fail
-        // if we actually tried to verify. Skip means it passes.
         let drv = make_fod_drv(
             "/nix/store/test-md5-fod",
             "md5",
             "deadbeefdeadbeefdeadbeefdeadbeef",
         );
 
-        // Skipped — should NOT error. nix-daemon's own verify catches
-        // the actual mismatch; we just don't double-check unknowns.
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("unknown algo must be rejected, not skipped");
         assert!(
-            verify_fod_hashes(&drv, &store_dir).is_ok(),
-            "unknown algo should be skipped (warn + Ok), not false-rejected"
+            err.to_string().contains("unsupported hash algorithm 'md5'"),
+            "error must name the algorithm: {err}"
         );
         Ok(())
     }

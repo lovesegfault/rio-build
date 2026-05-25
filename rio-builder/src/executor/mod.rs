@@ -41,6 +41,7 @@ use crate::upload;
 mod daemon;
 mod inputs;
 mod monitors;
+mod native_result;
 mod outputs;
 mod sandbox;
 

@@ -1188,6 +1188,31 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         );
     }
 
+    // Same early rejection for unverifiable FOD hash algorithms as
+    // validate_dag performs on the cached DAG: the builder's FOD hash
+    // gate is fail-closed, so an `outputHashAlgo` it cannot verify can
+    // only ever fail the build after burning a fetcher pod. The inline
+    // BasicDerivation is all we have on the single-node fallback path.
+    if let Some(out) = basic_drv
+        .outputs()
+        .iter()
+        .find(|o| !o.hash().is_empty() && !translate::fod_algo_verifiable(o.hash_algo()))
+    {
+        warn!(
+            drv_path = %drv_path_str,
+            output = out.name(),
+            algo = out.hash_algo(),
+            "rejecting unverifiable outputHashAlgo via inline BasicDerivation"
+        );
+        stderr_err!(
+            stderr,
+            "output '{}' declares unsupported outputHashAlgo '{}' \
+             (supported: sha1, sha256, sha512, optionally 'r:'-prefixed)",
+            out.name(),
+            out.hash_algo()
+        );
+    }
+
     // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
     // The .drv should have been uploaded via wopAddToStoreNar before this call.
     let full_drv = resolve_derivation(&drv_path, store_client, drv_cache).await;

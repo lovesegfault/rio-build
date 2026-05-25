@@ -68,6 +68,21 @@
       "doc": "Per-build cgroup monitor tasks: CPU peak poller, OOM watcher, drain."
     },
     {
+      "path": "executor/native_result/",
+      "depth": 1,
+      "doc": "Native-executor result processing: everything nix-daemon does between"
+    },
+    {
+      "path": "executor/native_result/canonicalise.rs",
+      "depth": 2,
+      "doc": "Output canonicalisation: the filesystem-normalization pass nix-daemon"
+    },
+    {
+      "path": "executor/native_result/policy.rs",
+      "depth": 2,
+      "doc": "Output policy checks: `allowedReferences` / `disallowedReferences` /"
+    },
+    {
       "path": "executor/outputs.rs",
       "depth": 1,
       "doc": "Output collection: FOD verify, upload, daemon→proto BuildResult mapping."

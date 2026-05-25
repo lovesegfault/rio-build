@@ -19075,6 +19075,10 @@
           "packageId": "hex"
         },
         {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
@@ -19093,6 +19097,10 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-exec",
+          "packageId": "rio-exec"
         },
         {
           "name": "rio-nix",

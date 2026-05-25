@@ -76,6 +76,7 @@
     "rio-builder": {
       "prod": [
         "rio-common",
+        "rio-exec",
         "rio-nix",
         "rio-proto"
       ],

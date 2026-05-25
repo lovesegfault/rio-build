@@ -24,6 +24,11 @@ test-fixtures = ["dep:toml"]
 
 [dependencies]
 rio-common = { workspace = true }
+# ExitOutcome consumed by the native-executor result classification
+# (executor/native_result). The full execute() integration lands at
+# activation; the dependency exists now so the classification is written
+# against the real type rather than a local mirror of it.
+rio-exec = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 schemars = { workspace = true }
@@ -36,6 +41,10 @@ prost-types = { workspace = true }
 fuser = { workspace = true }
 sqlx = { workspace = true }
 nix = { workspace = true }
+# llistxattr/lremovexattr in output canonicalisation (executor/
+# native_result/canonicalise.rs) — the `nix` crate does not wrap the
+# xattr family.
+libc = { workspace = true }
 sha2 = { workspace = true }
 # FOD hash verification: Nix FODs can declare sha1/sha256/sha512.
 # Round 4 Z8: sha1 FODs were rejected with a false-positive because

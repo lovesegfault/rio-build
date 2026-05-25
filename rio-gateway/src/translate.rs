@@ -414,6 +414,9 @@ fn populate_wanted_outputs(
 /// Checks:
 /// - `__noChroot=1` in any node's env → reject (sandbox escape)
 /// - `nodes.len() > MAX_DAG_NODES` → reject (early, before gRPC)
+/// - any output with a declared hash whose `outputHashAlgo` the builder
+///   cannot verify → reject (the FOD hash gate is fail-closed; the build
+///   could only ever fail after burning a fetcher pod)
 ///
 /// The scheduler ALSO enforces MAX_DAG_NODES (grpc/mod.rs:298);
 /// this is an early reject to save the gRPC round-trip for obvious
@@ -459,7 +462,42 @@ pub fn validate_dag(
         ));
     }
 
+    // Fixed-output outputs whose declared hash uses an algorithm the
+    // builder cannot verify are rejected at submission. The builder's
+    // `verify_fod_hashes` is fail-closed (it is the sole content check
+    // between an egress-open fetcher and the signed cache), so such a
+    // build can only ever fail — rejecting it here lands the error on
+    // the submitting client instead of burning a fetcher pod first.
+    // Floating-CA outputs (hash_algo set, hash empty) are not affected:
+    // they have no declared hash to verify.
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+        if let Some(out) = drv
+            .outputs()
+            .iter()
+            .find(|o| !o.hash().is_empty() && !fod_algo_verifiable(o.hash_algo()))
+        {
+            return Err(format!(
+                "derivation {} output '{}' declares unsupported outputHashAlgo '{}' \
+                 (supported: sha1, sha256, sha512, optionally 'r:'-prefixed)",
+                node.drv_path,
+                out.name(),
+                out.hash_algo()
+            ));
+        }
+    }
+
     Ok(())
+}
+
+/// True iff `algo` (`"sha256"`, `"r:sha512"`, …) is an outputHashAlgo
+/// the builder's FOD verifier can check. Mirrors rio-builder's
+/// `FodHashAlgo::from_nix_str` — the two must stay in sync, which is
+/// cheap because Nix's supported set has been fixed for years.
+pub(crate) fn fod_algo_verifiable(algo: &str) -> bool {
+    matches!(
+        algo.strip_prefix("r:").unwrap_or(algo),
+        "sha1" | "sha256" | "sha512"
+    )
 }
 
 /// `__structuredAttrs`-aware env lookup, mirroring Nix's
@@ -1026,6 +1064,59 @@ mod tests {
     // NOCHROOT_DRV_ATERM into the mock store so resolve_derivation
     // populates drv_cache, then drive opcodes 36 + 46 and assert
     // the failure BuildResult carries the "sandbox escape" message).
+
+    /// A FOD whose declared hash uses an algorithm the builder cannot
+    /// verify (md5) is rejected at submission; verifiable algorithms
+    /// (sha256, r:sha512) and floating-CA outputs (algo set, hash empty)
+    /// pass.
+    #[test]
+    fn validate_dag_rejects_unverifiable_fod_algo() {
+        let fod_drv = |algo: &str, hash: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+
+        // md5 → rejected, naming the algorithm.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_drv("md5", &"de".repeat(16)));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("outputHashAlgo 'md5'"), "{err}");
+
+        // sha256 and r:sha512 → accepted.
+        for algo in ["sha256", "r:sha512"] {
+            let mut cache = HashMap::new();
+            cache.insert(key.clone(), fod_drv(algo, &"ab".repeat(32)));
+            assert!(
+                validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+                "{algo} must be accepted"
+            );
+        }
+
+        // Floating-CA (algo set, hash EMPTY) → accepted; there is no
+        // declared hash to verify.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_drv("r:sha256", ""));
+        assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
+    }
+
+    #[test]
+    fn fod_algo_verifiable_table() {
+        for ok in ["sha1", "sha256", "sha512", "r:sha1", "r:sha256", "r:sha512"] {
+            assert!(fod_algo_verifiable(ok), "{ok} must be verifiable");
+        }
+        for bad in ["md5", "r:md5", "blake3", "sha3-256", ""] {
+            assert!(!fod_algo_verifiable(bad), "{bad} must not be verifiable");
+        }
+    }
 
     #[test]
     fn test_single_node_no_features() -> anyhow::Result<()> {
