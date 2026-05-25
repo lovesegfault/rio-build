@@ -387,13 +387,14 @@ fn compute_closure(
         if !seen.insert(path.clone()) {
             continue;
         }
+        // Every sibling output — including the one under check, where
+        // the walk starts — is in `siblings_by_path`; anything else must
+        // be covered by the input-closure metadata or the check cannot
+        // be performed soundly.
         let refs: &[String] = if let Some(sib) = siblings_by_path.get(path.as_str()) {
             &sib.references
         } else if let Some((refs, _)) = closure_info.get(&path) {
             refs
-        } else if path == output.store_path {
-            // The output itself (its references are right here).
-            &output.references
         } else {
             return Err(path);
         };

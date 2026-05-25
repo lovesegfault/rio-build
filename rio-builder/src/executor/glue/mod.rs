@@ -86,6 +86,9 @@ pub(crate) enum GlueError {
     #[error("derivation builder path is empty")]
     EmptyBuilder,
 
+    #[error("derivation path {path} is not a valid store path: {message}")]
+    BadDerivationPath { path: String, message: String },
+
     #[error("constructed execution request failed validation: {0}")]
     InvalidRequest(#[from] rio_exec::ExecError),
 }
@@ -370,12 +373,9 @@ fn plan_outputs(
     drv_path: &str,
     drv: &BasicDerivation,
 ) -> Result<(BTreeMap<String, String>, Vec<PlannedOutput>), GlueError> {
-    let drv_basename = store_path::basename(drv_path).unwrap_or(drv_path);
-    let drv_name = drv_basename
-        .split_once('-')
-        .map_or(drv_basename, |(_, n)| n)
-        .strip_suffix(".drv")
-        .unwrap_or(drv_basename);
+    // Parsed lazily: only derivations with floating-CA outputs need the
+    // structured form (for the scratch-path computation).
+    let mut parsed_drv_path: Option<store_path::StorePath> = None;
 
     let mut rewrites = BTreeMap::new();
     let mut outputs = Vec::with_capacity(drv.outputs().len());
@@ -383,7 +383,28 @@ fn plan_outputs(
         let (path, floating) = if !o.path().is_empty() {
             (o.path().to_owned(), false)
         } else if o.has_hash_algo() {
-            (scratch_output_path(drv_basename, drv_name, o.name()), true)
+            let drv_sp = match &parsed_drv_path {
+                Some(p) => p,
+                None => {
+                    let p = store_path::StorePath::parse(drv_path).map_err(|e| {
+                        GlueError::BadDerivationPath {
+                            path: drv_path.to_owned(),
+                            message: e.to_string(),
+                        }
+                    })?;
+                    parsed_drv_path.insert(p)
+                }
+            };
+            // The shared rio-nix implementation of CppNix's
+            // `makeFallbackPath` — the result glue's CA finalization
+            // recomputes paths with the same crate, so the recipe can
+            // never silently diverge between the two sides.
+            let scratch = store_path::StorePath::make_scratch_output_path(drv_sp, o.name())
+                .map_err(|e| GlueError::BadDerivationPath {
+                    path: drv_path.to_owned(),
+                    message: e.to_string(),
+                })?;
+            (scratch.as_str().to_owned(), true)
         } else {
             return Err(GlueError::MissingOutputPath {
                 output: o.name().to_owned(),
@@ -397,36 +418,6 @@ fn plan_outputs(
         });
     }
     Ok((rewrites, outputs))
-}
-
-/// The deterministic scratch path a floating-CA output is built at
-/// before content-addressed finalization (CppNix `makeFallbackPath`):
-/// `makeStorePath("rewrite:<drv basename>:name:<output>", zero-sha256,
-/// outputPathName(drv name, output))`.
-///
-/// The "rewrite:" pseudo-type guarantees no collision with any real
-/// store path type. The result glue replaces every occurrence of this
-/// path's hash part with the final CA path's hash part after hashing
-/// the output.
-fn scratch_output_path(drv_basename: &str, drv_name: &str, output_name: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let name = store_path::output_path_name(drv_name, output_name);
-    let fingerprint = format!(
-        "rewrite:{drv_basename}:name:{output_name}:sha256:{}:{}:{name}",
-        hex::encode([0u8; 32]),
-        store_path::STORE_DIR,
-    );
-    let digest = Sha256::digest(fingerprint.as_bytes());
-    // XOR-fold to 20 bytes (same compression as every other store path).
-    let mut compressed = [0u8; 20];
-    for (i, &b) in digest.iter().enumerate() {
-        compressed[i % 20] ^= b;
-    }
-    format!(
-        "{}/{}-{name}",
-        store_path::STORE_DIR,
-        store_path::nixbase32::encode(&compressed)
-    )
 }
 
 /// 32-bit personality selection: building a 32-bit system on its 64-bit
@@ -793,7 +784,14 @@ mod tests {
 
     #[test]
     fn scratch_path_matches_known_shape() {
-        let p = scratch_output_path("dddddddddddddddddddddddddddddddd-demo.drv", "demo", "dev");
+        // The shared rio-nix `make_scratch_output_path` (CppNix
+        // `makeFallbackPath`) is what plan_outputs uses; its exact value
+        // is pinned in rio-nix — here we only assert the shape the rest
+        // of the glue relies on (store dir prefix, outputPathName
+        // naming, 32-char hash part).
+        let drv = StorePath::parse("/nix/store/dddddddddddddddddddddddddddddddd-demo.drv").unwrap();
+        let p = StorePath::make_scratch_output_path(&drv, "dev").unwrap();
+        let p = p.as_str();
         assert!(p.starts_with("/nix/store/"));
         assert!(p.ends_with("-demo-dev"));
         // 32-char nixbase32 hash part.

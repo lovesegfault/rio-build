@@ -16,11 +16,10 @@
 //!   policy checks (`allowedReferences` family, `outputChecks`,
 //!   `unsafeDiscardReferences`, the FOD no-references rule).
 //!
-//! Floating-CA finalization (scratch→final path rewriting) is **not**
-//! here yet: it slots in between the topological ordering and the policy
-//! checks (see the marked seam in [`process_outputs`]) and is added by
-//! the CA-finalization milestone (M6b). Until then floating-CA outputs
-//! pass through under their scratch paths.
+//! Floating-CA finalization (scratch→final path rewriting) lives in
+//! [`ca`] and runs between the topological ordering and the policy
+//! checks, so the policy checks (and the upload metadata) always see
+//! the final, content-derived store paths and reference sets.
 //!
 //! Nothing in this module is wired into the live build path yet — the
 //! activation milestone (M7) replaces the daemon lifecycle with
@@ -28,6 +27,7 @@
 
 #![allow(dead_code)] // removed at activation (M7)
 
+pub(crate) mod ca;
 pub(crate) mod canonicalise;
 pub(crate) mod policy;
 
@@ -36,6 +36,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::Digest;
+use tracing::{debug, warn};
 
 use rio_exec::ExitOutcome;
 use rio_nix::derivation::{Derivation, DerivationLike};
@@ -121,6 +122,16 @@ pub(crate) fn classify_exit(
                  full (<8 MiB free) — attributing the failure to the worker, not the build"
             ),
         },
+        // A signal-killed build on a full disk gets the same attribution
+        // (CppNix's `decideWhetherDiskFull` looks only at the disk, not
+        // at how the builder died — ENOSPC often surfaces as a crash).
+        ExitOutcome::Signaled(sig) if disk_full => Failed {
+            status: BuildResultStatus::InfrastructureFailure,
+            error_msg: format!(
+                "builder was killed by signal {sig} and the worker's scratch space is nearly \
+                 full (<8 MiB free) — attributing the failure to the worker, not the build"
+            ),
+        },
         ExitOutcome::Exited(code) if is_network_dependent => Failed {
             status: BuildResultStatus::TransientFailure,
             error_msg: format!(
@@ -180,6 +191,9 @@ pub(crate) struct OutputToProcess {
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessedOutput {
     pub(crate) name: String,
+    /// Final store path. For floating-CA outputs this is the realized
+    /// (content-derived) path after [`ca`] finalization — the value the
+    /// `built_outputs` map and the realisations table report.
     pub(crate) store_path: String,
     pub(crate) host_path: PathBuf,
     /// SHA-256 of the NAR serialization (the store's content hash).
@@ -188,6 +202,11 @@ pub(crate) struct ProcessedOutput {
     pub(crate) nar_size: u64,
     /// Sorted full-store-path references (post `unsafeDiscardReferences`).
     pub(crate) references: Vec<String>,
+    /// Nix content-address descriptor (`fixed:r:sha256:…`) for
+    /// floating-CA outputs; `None` for input-addressed and fixed-output
+    /// outputs. Destined for the uploaded `PathInfo.content_address` /
+    /// narinfo `CA:` field so substituting clients can verify the path.
+    pub(crate) content_address: Option<String>,
 }
 
 /// All outputs of a successful build, in topological order (an output
@@ -200,9 +219,12 @@ pub(crate) struct ProcessedOutputs {
 
 /// Why the outputs of a successful build were rejected.
 ///
-/// All variants map to `BuildResultStatus::OutputRejected` — the build
-/// *ran*, but what it produced is not acceptable. The distinction the
-/// variants carry is for tests and for precise tenant-facing messages.
+/// Variants map to `BuildResultStatus::OutputRejected` — the build
+/// *ran*, but what it produced is not acceptable — except
+/// [`FodHasReferences`](Self::FodHasReferences), which the activation
+/// maps to `HashMismatch` (it is a content-integrity failure of a
+/// fixed-output derivation, not a policy rejection). The distinction
+/// the variants carry is for tests and precise tenant-facing messages.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OutputRejection {
     #[error("{0}")]
@@ -225,6 +247,18 @@ pub(crate) enum OutputRejection {
         output: String,
         references: Vec<String>,
     },
+    #[error(
+        "floating content-addressed output '{output}' declares unsupported outputHashAlgo \
+         '{algo}' (supported: sha1, sha256, sha512, optionally 'r:'-prefixed)"
+    )]
+    CaUnsupportedAlgo { output: String, algo: String },
+    #[error(
+        "floating content-addressed output '{output}' uses flat ingestion but is not a \
+         single non-executable regular file"
+    )]
+    CaFlatNotSingleFile { output: String },
+    #[error("finalizing floating content-addressed output '{output}': {message}")]
+    CaFinalize { output: String, message: String },
 }
 
 /// Run the full output pipeline for a successful build.
@@ -246,8 +280,22 @@ pub(crate) fn process_outputs(
     build_uid: u32,
     input_closure: &[ValidatedPathInfo],
 ) -> Result<ProcessedOutputs, OutputRejection> {
+    let result = process_outputs_inner(drv, outputs, build_uid, input_closure);
+    if let Err(rejection) = &result {
+        warn!(error = %rejection, "build outputs rejected");
+    }
+    result
+}
+
+fn process_outputs_inner(
+    drv: &Derivation,
+    outputs: &[OutputToProcess],
+    build_uid: u32,
+    input_closure: &[ValidatedPathInfo],
+) -> Result<ProcessedOutputs, OutputRejection> {
     let policy = OutputPolicy::parse(drv.env());
     let is_fod = drv.is_fixed_output();
+    let ca_spec = ca::FloatingCaSpec::from_outputs(drv.outputs())?;
 
     // Candidate set for the reference scan: the transitive input closure
     // plus every output of this derivation (self- and cross-output
@@ -277,8 +325,15 @@ pub(crate) fn process_outputs(
             references.clear();
         }
 
-        // A self-reference is legal but is not recorded in PathInfo
-        // references? — it is: Nix records self-references. Keep them.
+        // Self-references are legal and are recorded in the reference
+        // set, exactly as Nix registers them.
+        debug!(
+            output = %out.name,
+            store_path = %out.store_path,
+            nar_size,
+            references = references.len(),
+            "processed build output"
+        );
         processed.push(ProcessedOutput {
             name: out.name.clone(),
             store_path: out.store_path.clone(),
@@ -286,6 +341,7 @@ pub(crate) fn process_outputs(
             nar_hash,
             nar_size,
             references,
+            content_address: None,
         });
     }
 
@@ -294,11 +350,10 @@ pub(crate) fn process_outputs(
     // declared hash alone). Self-references are equally disallowed.
     if is_fod {
         for out in &processed {
-            let refs_excluding_nothing: Vec<String> = out.references.clone();
-            if !refs_excluding_nothing.is_empty() {
+            if !out.references.is_empty() {
                 return Err(OutputRejection::FodHasReferences {
                     output: out.name.clone(),
-                    references: refs_excluding_nothing,
+                    references: out.references.clone(),
                 });
             }
         }
@@ -308,14 +363,16 @@ pub(crate) fn process_outputs(
     // (dependencies first). Kahn's algorithm over the sibling-reference
     // edges.
     let order = topo_order(&processed)?;
-    let processed: Vec<ProcessedOutput> = order.into_iter().map(|i| processed[i].clone()).collect();
+    let mut processed: Vec<ProcessedOutput> =
+        order.into_iter().map(|i| processed[i].clone()).collect();
 
-    // --- CA finalization seam (M6b) ---------------------------------
-    // Floating-CA outputs are finalized here, in this topological order:
+    // Pass 2b: floating-CA finalization, in that topological order —
     // apply accumulated sibling rewrites, hash-modulo, compute the final
-    // store path, rewrite content, and update `store_path`/`references`
-    // before the policy checks below see them.
-    // -----------------------------------------------------------------
+    // store path, rewrite content on disk, and update
+    // `store_path`/`references`/`content_address` before the policy
+    // checks below see them.
+    ca::finalize_floating_ca(&mut processed, &ca_spec)?;
+    let processed = processed;
 
     // Pass 3: output policy checks (both sources).
     let closure_info: HashMap<String, (Vec<String>, u64)> = input_closure
@@ -386,9 +443,9 @@ fn topo_order(outputs: &[ProcessedOutput]) -> Result<Vec<usize>, OutputRejection
         .map(|(i, o)| (o.store_path.as_str(), i))
         .collect();
 
-    // edges[i] = set of sibling indexes that output i references
-    // (i depends on them, so they must come first).
-    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); outputs.len()];
+    // For each output i, count how many siblings it references
+    // (in_degree) and record the reverse edges (dependents) — all
+    // Kahn's algorithm needs.
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); outputs.len()];
     let mut in_degree: Vec<usize> = vec![0; outputs.len()];
     for (i, out) in outputs.iter().enumerate() {
@@ -396,7 +453,6 @@ fn topo_order(outputs: &[ProcessedOutput]) -> Result<Vec<usize>, OutputRejection
             if let Some(&j) = path_to_idx.get(r.as_str())
                 && i != j
             {
-                deps[i].push(j);
                 dependents[j].push(i);
                 in_degree[i] += 1;
             }
@@ -530,6 +586,23 @@ mod tests {
         format!("/nix/store/{}-{name}", String::from(c).repeat(32))
     }
 
+    /// Minimal input-closure metadata for a store path (everything the
+    /// pipeline reads: the path itself, empty references, size 1).
+    fn input_info(path: &str) -> ValidatedPathInfo {
+        ValidatedPathInfo {
+            store_path: rio_nix::store_path::StorePath::parse(path).unwrap(),
+            store_path_hash: vec![],
+            deriver: None,
+            nar_hash: [0u8; 32],
+            nar_size: 1,
+            references: vec![],
+            registration_time: 0,
+            ultimate: false,
+            signatures: vec![],
+            content_address: None,
+        }
+    }
+
     fn drv_from_aterm(outputs: &[(&str, &str)], env: &[(&str, &str)]) -> Derivation {
         let outs = outputs
             .iter()
@@ -644,18 +717,7 @@ mod tests {
 
         // The embedded path must be a scan candidate → supply it as input
         // closure metadata.
-        let input_info = ValidatedPathInfo {
-            store_path: rio_nix::store_path::StorePath::parse(&input).unwrap(),
-            store_path_hash: vec![],
-            deriver: None,
-            nar_hash: [0u8; 32],
-            nar_size: 1,
-            references: vec![],
-            registration_time: 0,
-            ultimate: false,
-            signatures: vec![],
-            content_address: None,
-        };
+        let input_info = input_info(&input);
         let err = process_outputs(&drv, &outputs, my_uid(), &[input_info]).unwrap_err();
         assert!(
             matches!(err, OutputRejection::FodHasReferences { .. }),
@@ -669,18 +731,7 @@ mod tests {
         let bad = sp('d', "bootstrap-tools");
         let (_tmp, outputs) = fake_outputs(&[("out", &out_p, format!("uses {bad}").as_bytes())]);
         let drv = drv_from_aterm(&[("out", &out_p)], &[("disallowedRequisites", &bad)]);
-        let bad_info = ValidatedPathInfo {
-            store_path: rio_nix::store_path::StorePath::parse(&bad).unwrap(),
-            store_path_hash: vec![],
-            deriver: None,
-            nar_hash: [0u8; 32],
-            nar_size: 1,
-            references: vec![],
-            registration_time: 0,
-            ultimate: false,
-            signatures: vec![],
-            content_address: None,
-        };
+        let bad_info = input_info(&bad);
         let err = process_outputs(&drv, &outputs, my_uid(), &[bad_info]).unwrap_err();
         assert!(matches!(err, OutputRejection::Policy(_)), "got {err}");
     }
@@ -693,18 +744,7 @@ mod tests {
             fake_outputs(&[("out", &out_p, format!("embeds {input}").as_bytes())]);
         let json = serde_json::json!({ "unsafeDiscardReferences": { "out": true } }).to_string();
         let drv = drv_from_aterm(&[("out", &out_p)], &[("__json", &json)]);
-        let input_info = ValidatedPathInfo {
-            store_path: rio_nix::store_path::StorePath::parse(&input).unwrap(),
-            store_path_hash: vec![],
-            deriver: None,
-            nar_hash: [0u8; 32],
-            nar_size: 1,
-            references: vec![],
-            registration_time: 0,
-            ultimate: false,
-            signatures: vec![],
-            content_address: None,
-        };
+        let input_info = input_info(&input);
         let processed = process_outputs(&drv, &outputs, my_uid(), &[input_info]).unwrap();
         assert!(
             processed.outputs[0].references.is_empty(),
@@ -722,6 +762,275 @@ mod tests {
         assert!(
             matches!(&err, OutputRejection::Policy(v) if v.rule == "maxSize"),
             "got {err}"
+        );
+    }
+
+    // -- floating-CA finalization -------------------------------------------
+
+    /// ATerm derivation with full per-output specs `(name, path, algo, hash)`
+    /// — needed for floating-CA outputs (`("out","","r:sha256","")`).
+    fn drv_from_aterm_ca(outputs: &[(&str, &str, &str, &str)], env: &[(&str, &str)]) -> Derivation {
+        let outs = outputs
+            .iter()
+            .map(|(n, p, a, h)| format!(r#"("{n}","{p}","{a}","{h}")"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let envs = env
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    r#"("{k}","{}")"#,
+                    v.replace('\\', r"\\").replace('"', r#"\""#)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let aterm = format!(r#"Derive([{outs}],[],[],"x86_64-linux","/bin/sh",[],[{envs}])"#);
+        Derivation::parse(&aterm).expect("test ATerm parses")
+    }
+
+    /// Hand-compute the final CA path of a *standalone* recursive
+    /// SHA-256 output (no references, no self-reference) from its
+    /// canonicalised on-disk content — what finalization must produce.
+    fn expected_standalone_ca_path(host: &Path, name: &str) -> String {
+        let mut nar = Vec::new();
+        rio_nix::nar::dump_path_streaming(host, &mut nar).unwrap();
+        let hash = rio_nix::hash::NixHash::compute(rio_nix::hash::HashAlgo::SHA256, &nar);
+        rio_nix::store_path::StorePath::make_fixed_output_with_self(name, &hash, true, &[], false)
+            .unwrap()
+            .as_str()
+            .to_owned()
+    }
+
+    #[test]
+    fn floating_ca_sibling_reference_finalized() {
+        // Two floating-CA outputs; "doc" embeds a reference to "out"'s
+        // scratch path. Finalization must (1) finalize out, (2) rewrite
+        // doc's content to out's *final* path before hashing doc.
+        let out_scratch = sp('s', "demo");
+        let doc_scratch = sp('w', "demo-doc");
+        let (_tmp, mut outputs) = fake_outputs(&[
+            (
+                "doc",
+                &doc_scratch,
+                format!("see {out_scratch}/payload").as_bytes(),
+            ),
+            ("out", &out_scratch, b"standalone content"),
+        ]);
+        // OutputToProcess order is declaration order; topo order will
+        // put "out" first.
+        let drv = drv_from_aterm_ca(
+            &[("doc", "", "r:sha256", ""), ("out", "", "r:sha256", "")],
+            &[],
+        );
+        outputs.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic input order
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let out = processed.outputs.iter().find(|o| o.name == "out").unwrap();
+        let doc = processed.outputs.iter().find(|o| o.name == "doc").unwrap();
+
+        // "out" is standalone: its final path is the hand-computable CA
+        // path of its (unchanged) content.
+        assert_ne!(
+            out.store_path, out_scratch,
+            "out must leave its scratch path"
+        );
+        assert_eq!(
+            out.store_path,
+            expected_standalone_ca_path(&out.host_path, "demo"),
+            "standalone output's final path is the content-derived CA path"
+        );
+        assert!(out.host_path.ends_with(std::path::Path::new(
+            out.store_path.strip_prefix("/nix/store/").unwrap()
+        )));
+        assert_eq!(
+            out.content_address.as_deref().map(|s| &s[..14]),
+            Some("fixed:r:sha256"),
+        );
+
+        // "doc" referenced the scratch path; after finalization its
+        // reference set and its *content* must carry out's final path.
+        assert_eq!(doc.references, vec![out.store_path.clone()]);
+        let doc_payload = std::fs::read_to_string(doc.host_path.join("payload")).unwrap();
+        assert!(
+            doc_payload.contains(&out.store_path),
+            "doc's content must be rewritten to out's final path: {doc_payload}"
+        );
+        assert!(
+            !doc_payload.contains(&out_scratch),
+            "no scratch path may survive in doc's content"
+        );
+        assert_ne!(doc.store_path, doc_scratch);
+        // The scratch trees are gone from disk.
+        assert!(
+            !_tmp
+                .path()
+                .join(out_scratch.strip_prefix("/nix/store/").unwrap())
+                .exists()
+        );
+        assert!(
+            !_tmp
+                .path()
+                .join(doc_scratch.strip_prefix("/nix/store/").unwrap())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn floating_ca_self_reference_fixed_point() {
+        let scratch = sp('s', "selfy");
+        let (_tmp, outputs) =
+            fake_outputs(&[("out", &scratch, format!("I live at {scratch}").as_bytes())]);
+        let drv = drv_from_aterm_ca(&[("out", "", "r:sha256", "")], &[]);
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let out = &processed.outputs[0];
+        assert_ne!(out.store_path, scratch);
+        // The self-reference is recorded at the final path.
+        assert_eq!(out.references, vec![out.store_path.clone()]);
+        // Content has been rewritten to the final path.
+        let payload = std::fs::read_to_string(out.host_path.join("payload")).unwrap();
+        assert!(payload.contains(&out.store_path));
+        assert!(!payload.contains(&scratch));
+
+        // Fixed point: hashing the final on-disk content modulo the
+        // *final* hash part and re-deriving the path must yield the same
+        // path (this is exactly the check rio-store's upload gate runs).
+        let final_path = rio_nix::store_path::StorePath::parse(&out.store_path).unwrap();
+        let mut nar = Vec::new();
+        rio_nix::nar::dump_path_streaming(&out.host_path, &mut nar).unwrap();
+        let mut sink = rio_nix::ca::HashModuloSink::new(
+            rio_nix::hash::HashAlgo::SHA256,
+            &final_path.hash_part(),
+        );
+        sink.write_all(&nar).unwrap();
+        let (modulo, n) = sink.finish();
+        assert!(n > 0, "the self-reference must be present in the final NAR");
+        let rederived = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "selfy",
+            &modulo,
+            true,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            rederived.as_str(),
+            out.store_path,
+            "self-reference fixed point"
+        );
+        // NAR hash/size describe the *final* content.
+        let expect_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+        assert_eq!(out.nar_hash, expect_hash);
+        assert_eq!(out.nar_size, nar.len() as u64);
+    }
+
+    #[test]
+    fn floating_ca_flat_single_file_renamed() {
+        let scratch = sp('s', "blob");
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp
+            .path()
+            .join(scratch.strip_prefix("/nix/store/").unwrap());
+        std::fs::write(&host, b"flat bytes, no references").unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outputs = [OutputToProcess {
+            name: "out".into(),
+            store_path: scratch.clone(),
+            host_path: host,
+        }];
+        let drv = drv_from_aterm_ca(&[("out", "", "sha256", "")], &[]);
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let out = &processed.outputs[0];
+        assert_ne!(out.store_path, scratch);
+        assert_eq!(
+            out.content_address.as_deref().map(|s| &s[..12]),
+            Some("fixed:sha256")
+        );
+        assert!(out.host_path.exists());
+        assert!(out.references.is_empty());
+    }
+
+    #[test]
+    fn floating_ca_flat_rejects_directory() {
+        let scratch = sp('s', "blob");
+        let (_tmp, outputs) = fake_outputs(&[("out", &scratch, b"inside a dir")]);
+        let drv = drv_from_aterm_ca(&[("out", "", "sha256", "")], &[]);
+        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        assert!(
+            matches!(err, OutputRejection::CaFlatNotSingleFile { .. }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn floating_ca_unsupported_algo_rejected() {
+        let scratch = sp('s', "old");
+        let (_tmp, outputs) = fake_outputs(&[("out", &scratch, b"x")]);
+        let drv = drv_from_aterm_ca(&[("out", "", "md5", "")], &[]);
+        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        assert!(
+            matches!(err, OutputRejection::CaUnsupportedAlgo { ref algo, .. } if algo == "md5"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn mixed_ca_and_input_addressed_outputs() {
+        // "lib" is input-addressed (declared path); "out" is floating-CA.
+        // lib references out → after finalization lib's reference must
+        // point at out's final path, and lib's own path must be
+        // untouched.
+        let lib_p = sp('a', "demo-lib");
+        let out_scratch = sp('s', "demo");
+        let (_tmp, outputs) = fake_outputs(&[
+            ("lib", &lib_p, format!("needs {out_scratch}").as_bytes()),
+            ("out", &out_scratch, b"ca content"),
+        ]);
+        let drv = drv_from_aterm_ca(&[("lib", &lib_p, "", ""), ("out", "", "r:sha256", "")], &[]);
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let lib = processed.outputs.iter().find(|o| o.name == "lib").unwrap();
+        let out = processed.outputs.iter().find(|o| o.name == "out").unwrap();
+        assert_eq!(lib.store_path, lib_p, "input-addressed path untouched");
+        assert!(lib.content_address.is_none());
+        assert_ne!(out.store_path, out_scratch);
+        assert_eq!(
+            lib.references,
+            vec![out.store_path.clone()],
+            "IA output's reference to the CA sibling is remapped to the final path"
+        );
+    }
+
+    #[test]
+    fn policy_checks_see_final_ca_paths() {
+        // "doc" references its CA sibling "out" but declares an empty
+        // allowedReferences list → the policy violation must name out's
+        // *final* path, proving the checks run after finalization.
+        let out_scratch = sp('s', "demo");
+        let doc_scratch = sp('w', "demo-doc");
+        let (_tmp, outputs) = fake_outputs(&[
+            ("doc", &doc_scratch, format!("see {out_scratch}").as_bytes()),
+            ("out", &out_scratch, b"standalone"),
+        ]);
+        let json = serde_json::json!({
+            "outputChecks": { "doc": { "allowedReferences": [] } }
+        })
+        .to_string();
+        let drv = drv_from_aterm_ca(
+            &[("doc", "", "r:sha256", ""), ("out", "", "r:sha256", "")],
+            &[("__json", &json)],
+        );
+        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let OutputRejection::Policy(violation) = &err else {
+            panic!("expected a policy violation, got {err}");
+        };
+        assert!(
+            !violation.to_string().contains(&out_scratch),
+            "the violation must NOT name the scratch path: {violation}"
+        );
+        assert!(
+            violation.to_string().contains("/nix/store/"),
+            "the violation names the offending (final) path: {violation}"
         );
     }
 }
