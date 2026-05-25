@@ -4333,6 +4333,255 @@ async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> Test
     Ok(())
 }
 
+// r[verify sched.merge.wanted-outputs]
+// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.substitute.detached+3]
+/// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
+/// topdown-pruned CHILDLESS root: the dependency closure was dropped
+/// from the submission, so the generic revert (childless ⇒ vacuously
+/// Ready, `substitute_tried` left unset) re-arms exactly the doomed
+/// dispatch the topdown fail-fast arm exists to prevent — the next pass
+/// probes, finds the now-wanted path definitively missing, and routes
+/// the root to a worker that ENOENTs on its never-scheduled inputDrvs.
+///
+/// The downgrade must instead re-attempt the delta with the corrected
+/// forgivable set (and fail-fast with the resubmit-directing error if
+/// it is genuinely missing), or take the fail-fast arm directly. It
+/// must NOT leave the node dispatchable from source.
+///
+/// Staged like `test_topdown_pruned_flag_ignored_after_full_merge_adds_
+/// deps`: `debug_force_status`/`debug_set_topdown_pruned`/
+/// `debug_set_output_paths` + an injected `SubstituteComplete` (the
+/// actor only checks `status == Substituting`, so an injected message
+/// is indistinguishable from the spawned task's).
+#[tokio::test]
+async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch_from_source()
+-> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("fnw-td-out");
+    let dbg = test_store_path("fnw-td-debug");
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("fnw-td");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // Build A wants only {out}. No store lanes are seeded yet, so the
+    // merge classifies nothing as substitutable and R seeds Ready.
+    let build_a = Uuid::new_v4();
+    merge_dag(&handle, build_a, vec![mk(&["out"])], vec![], false).await?;
+
+    // Stage: an earlier topdown prune left R mid-fetch — Substituting,
+    // topdown_pruned, childless, output_paths stashed by the spawn.
+    assert!(
+        handle
+            .debug_force_status("fnw-td", DerivationStatus::Substituting)
+            .await?
+    );
+    assert!(handle.debug_set_topdown_pruned("fnw-td", true).await?);
+    assert!(
+        handle
+            .debug_set_output_paths("fnw-td", vec![out.clone(), dbg.clone()])
+            .await?
+    );
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the downgrade leaves R plain-Ready.
+    let _erx = connect_executor(&handle, "fnw-td-w", "x86_64-linux").await?;
+
+    // Build B merges mid-fetch and wants {debug}: the union grows to
+    // {debug, out} while the (staged) walk still holds the spawn-time
+    // forgivable snapshot.
+    let build_b = Uuid::new_v4();
+    merge_dag(&handle, build_b, vec![mk(&["debug"])], vec![], false).await?;
+
+    // At any post-downgrade re-attempt the now-wanted P_debug is
+    // definitively missing: GETs fail hard (Internal — no retry
+    // ladder) and FMP keeps reporting it missing-not-substitutable.
+    // P_out stays fetchable so a corrected re-walk fails on the delta,
+    // not on the output the first walk already handled.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store
+        .faults
+        .fail_qpi_internal_paths
+        .write()
+        .unwrap()
+        .insert(dbg.clone());
+
+    // The staged walk posts ok=true with the seed it forgave against
+    // the stale {out}-only wanted set.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "fnw-td".into(),
+            ok: true,
+            forgiven: vec![dbg.clone()],
+        })
+        .await?;
+    settle_substituting(&handle, &["fnw-td"]).await;
+    tick(&handle).await?;
+
+    let r = expect_drv(&handle, "fnw-td").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "downgraded substitute completion left a topdown-pruned childless root \
+         dispatchable from source (status={:?}, substitute_tried={}); its dep \
+         closure was never scheduled, so a worker dispatch ENOENTs on inputDrvs",
+        r.status,
+        r.substitute_tried
+    );
+    // Both interested builds must get the crisp resubmit-directing
+    // fail-fast (directly, or after a corrected re-walk finds the delta
+    // genuinely missing) — not hang Active behind a doomed dispatch.
+    for (label, build_id) in [("A", build_a), ("B", build_b)] {
+        let s = query_status(&handle, build_id).await?;
+        assert_eq!(
+            s.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "build {label} must be failed by the topdown fail-fast after the \
+             downgrade (the now-wanted delta is unfetchable), not left \
+             Active/dispatched; got state={} error={:?}",
+            s.state,
+            s.error_summary
+        );
+        assert!(
+            s.error_summary.contains("resubmit"),
+            "build {label} should carry the resubmit-directing fail-fast error; \
+             got {:?}",
+            s.error_summary
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs]
+// r[verify sched.substitute.detached+3]
+/// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
+/// node whose dependency is Poisoned (the I-094 reprobe lane):
+/// `revert_target_for` says DependencyFailed and the generic revert's
+/// DependencyFailed arm runs `terminal_failure_epilogue` — terminally
+/// failing EVERY interested build: the one whose entire wanted subset
+/// was just successfully fetched AND the one whose newly-wanted seed
+/// has never had a single real attempt (forgivable seeds are forgiven
+/// on their FIRST failure). That contradicts the downgrade's stated
+/// intent — "the next pass re-substitutes the delta" — because there is
+/// no next pass out of DependencyFailed.
+///
+/// The newly-wanted path must get a real substitution attempt (a
+/// re-spawned walk with the corrected forgivable set) before any
+/// terminal verdict; the build whose wanted subset was fully fetched
+/// must not be failed by the downgrade itself.
+#[tokio::test]
+async fn substitute_downgrade_with_poisoned_dep_reattempts_delta_before_failing_builds()
+-> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let p_out = test_store_path("fnw-dep-out");
+    let p_dbg = test_store_path("fnw-dep-debug");
+    let mk_p = |wanted: &[&str]| {
+        let mut n = make_node("fnw-dep-p");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![p_out.clone(), p_dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // Build A submits P→C; C is the dep that will be terminally failed.
+    let build_a = Uuid::new_v4();
+    let mut c = make_node("fnw-dep-c");
+    c.expected_output_paths = vec![test_store_path("fnw-dep-c-out")];
+    merge_dag(
+        &handle,
+        build_a,
+        vec![mk_p(&["out"]), c],
+        vec![make_test_edge("fnw-dep-p", "fnw-dep-c")],
+        false,
+    )
+    .await?;
+    // Build B wants only {out} — its entire wanted subset is what the
+    // staged walk fetched.
+    let build_b = Uuid::new_v4();
+    merge_dag(&handle, build_b, vec![mk_p(&["out"])], vec![], false).await?;
+
+    // Stage the I-094 shape: C terminally failed while P is mid-walk
+    // (Substituting), with P's spawn-time output_paths stashed.
+    assert!(handle.debug_force_poisoned("fnw-dep-c", 0).await?);
+    assert!(
+        handle
+            .debug_force_status("fnw-dep-p", DerivationStatus::Substituting)
+            .await?
+    );
+    assert!(
+        handle
+            .debug_set_output_paths("fnw-dep-p", vec![p_out.clone(), p_dbg.clone()])
+            .await?
+    );
+
+    // Build D merges mid-fetch and wants {debug}: the union grows while
+    // the walk still holds the spawn-time forgivable snapshot.
+    let build_d = Uuid::new_v4();
+    merge_dag(&handle, build_d, vec![mk_p(&["debug"])], vec![], false).await?;
+
+    // The delta IS fetchable upstream — a corrected re-walk succeeds.
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(p_out.clone());
+        subs.push(p_dbg.clone());
+    }
+
+    // The staged walk posts ok=true, having forgiven P_debug against
+    // the stale {out}-only wanted set.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "fnw-dep-p".into(),
+            ok: true,
+            forgiven: vec![p_dbg.clone()],
+        })
+        .await?;
+    settle_substituting(&handle, &["fnw-dep-p"]).await;
+    barrier(&handle).await;
+
+    // No interested build may be terminally failed on the heels of the
+    // downgrade: B's entire wanted subset was fetched, and D's newly-
+    // wanted output is fetchable — a corrected re-walk completes both.
+    for (label, build_id) in [
+        ("B (wanted subset fully fetched)", build_b),
+        ("D (newly-wanted delta, never attempted)", build_d),
+    ] {
+        let s = query_status(&handle, build_id).await?;
+        assert_ne!(
+            s.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "build {label} was terminally failed by the downgrade (error={:?}) — \
+             terminal_failure_epilogue ran before the newly-wanted path got a \
+             single real substitution attempt",
+            s.error_summary
+        );
+    }
+    // The downgrade must not hand the node to the DependencyFailed
+    // terminal arm before the delta has been re-attempted.
+    let p = expect_drv(&handle, "fnw-dep-p").await;
+    assert_ne!(
+        p.status,
+        DerivationStatus::DependencyFailed,
+        "the downgraded completion took the DependencyFailed terminal arm \
+         instead of re-attempting the newly-wanted delta"
+    );
+    // And the delta must actually have been attempted: the re-spawned
+    // walk's fetch for P_debug reached the store.
+    assert!(
+        store.calls.qpi_calls.read().unwrap().contains(&p_dbg),
+        "the newly-wanted path must get a real substitution attempt (no fetch \
+         for it ever reached the store)"
+    );
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+3]
 /// Cold path: A is NOT in `state.paths` (batch returns None) but IS
 /// in `state.substitutable` (per-path QPI materializes it with

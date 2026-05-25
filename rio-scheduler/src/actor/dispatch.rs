@@ -1043,7 +1043,12 @@ impl DagActor {
         // `substitute_tried`: the next dispatch pass re-probes and
         // re-spawns the walk with the corrected forgivable set, so the
         // delta is re-substituted (and a genuine miss then fails the
-        // walk → `substitute_tried` → from-source build).
+        // walk → `substitute_tried` → from-source build). Two revert
+        // targets cannot wait for "the next pass" — a topdown-pruned
+        // childless root and a node whose dep is terminally failed —
+        // so for those the walk is re-spawned immediately below
+        // instead (see the downgrade re-spawn ahead of the generic
+        // revert).
         let forgiven_now_wanted =
             ok && !forgiven.is_empty() && state.wanted_output_paths().any(|p| forgiven.contains(p));
         let ok = ok && !forgiven_now_wanted;
@@ -1097,10 +1102,10 @@ impl DagActor {
         // Also gate on `!forgiven_now_wanted`: that downgrade means
         // the fetch did NOT definitively fail — it forgave a seed
         // that has since become wanted. Failing the build here would
-        // be premature; fall through to the revert so the next pass
-        // re-substitutes with the corrected forgivable set. A genuine
-        // failure on that second walk lands back here with
-        // `forgiven_now_wanted = false` and fails the build then.
+        // be premature; fall through to the downgrade re-spawn below,
+        // which re-walks immediately with the corrected forgivable
+        // set. A genuine failure on that second walk lands back here
+        // with `forgiven_now_wanted = false` and fails the build then.
         if topdown_pruned && !self.dag.get_children(drv_hash).is_empty() {
             debug!(%drv_hash,
                    "topdown-pruned root gained DAG children via later \
@@ -1158,6 +1163,64 @@ impl DagActor {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
+        // r[impl sched.merge.wanted-outputs]
+        // Downgrade re-spawn: two revert targets must not wait for
+        // "the next pass" to re-substitute the delta.
+        //
+        //  - `DependencyFailed` (a dep is Poisoned — the I-094 lane):
+        //    the arm below runs `terminal_failure_epilogue`, terminally
+        //    failing every interested build — including the build whose
+        //    wanted subset WAS fully fetched and the build whose newly
+        //    wanted seed never had a single real attempt (forgivable
+        //    seeds are forgiven on their first failure). There is no
+        //    "next pass" out of DependencyFailed.
+        //  - a topdown-pruned childless root (revert target `Ready`):
+        //    its dep closure was dropped from the submission, so plain
+        //    Ready without `substitute_tried` is a doomed from-source
+        //    dispatch (worker ENOENTs on inputDrvs) if the next probe
+        //    finds the now-wanted path definitively missing — the exact
+        //    hazard the fail-fast arm above exists to prevent.
+        //
+        // For both, re-spawn the walk NOW: `spawn_substitute_fetches`
+        // recomputes the forgivable set from the CURRENT wanted union,
+        // so the newly-wanted delta gets a real, retry-laddered attempt
+        // before any terminal verdict. If that walk genuinely fails it
+        // lands back here with `forgiven_now_wanted = false` and takes
+        // the normal arms (fail-fast / epilogue). Terminates: the
+        // wanted union only grows (`union_wanted_saturating`), so each
+        // re-spawn's forgivable set excludes every previously-forgiven
+        // now-wanted path — another downgrade needs ANOTHER declared
+        // output to flip unwanted→wanted mid-walk, and there are
+        // finitely many declared outputs.
+        //
+        // The in-memory revert to `to` only satisfies the transition
+        // table (there is no Substituting→Substituting); PG keeps
+        // `Substituting`, which the re-spawn re-persists. The ordinary
+        // Ready/Queued downgrade keeps today's behaviour (revert; the
+        // next pass re-probes and re-substitutes — and a from-source
+        // dispatch there is safe because the node's deps ARE in the
+        // DAG and Completed). Falls through to that plain revert if the
+        // store/self handles are gone (shutdown) — pre-fix behaviour.
+        if forgiven_now_wanted
+            && (to == DerivationStatus::DependencyFailed || state.topdown_pruned)
+            && !state.output_paths.is_empty()
+            && self.store_client.is_some()
+            && self.self_tx.is_some()
+        {
+            if let Err(e) = state.transition(to) {
+                warn!(%drv_hash, %e, "SubstituteComplete downgrade: revert-for-respawn rejected");
+                return;
+            }
+            let paths = state.output_paths.clone();
+            info!(%drv_hash, revert_target = ?to,
+                  "downgraded substitute completion would land in a \
+                   terminal/fail-fast arm; re-spawning the walk with the \
+                   corrected forgivable set");
+            let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
+            self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], auth)
+                .await;
+            return;
+        }
         // One-shot fall-through: FMP said substitutable, QPI said no.
         // Next dispatch pass skips substitution and routes to a worker
         // — without this the partition re-includes it every Tick (~1/s
@@ -1169,7 +1232,9 @@ impl DagActor {
         // re-substitute with the corrected forgivable set. Bounded:
         // that second walk either succeeds or fails the now-unforgiven
         // seed → lands back here with `forgiven_now_wanted = false` →
-        // sets the one-shot flag.
+        // sets the one-shot flag. (The hazardous DependencyFailed /
+        // topdown-childless targets never reach here — they re-spawned
+        // above.)
         if !forgiven_now_wanted {
             state.substitute_tried = true;
         }
