@@ -150,7 +150,7 @@ pub enum ActorCommand {
     /// wanted set — a build that merged during the walk can have grown
     /// the wanted union to include one — and downgrades a stale
     /// `ok=true` to a revert so the delta gets re-substituted.
-    /// r[sched.substitute.detached+3]
+    /// r[sched.substitute.detached+4]
     SubstituteComplete {
         drv_hash: DrvHash,
         ok: bool,

@@ -157,6 +157,74 @@ fn test_merge_records_per_build_contribution() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One submission carrying the SAME drv twice with different wanted
+/// sets (e.g. two roots whose closures both name it): the recorded
+/// per-build contribution is the union of both occurrences, not
+/// whichever came last, and a failed merge restores the exact pre-merge
+/// contribution (the rollback bookkeeping captures the prior before the
+/// first mutation and replays in reverse, so the true pre-merge value
+/// sticks).
+#[test]
+fn test_merge_duplicate_drv_in_submission_unions_contribution() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+
+    // build_a pre-existing with the empty all-wanted sentinel, so the
+    // node-level union stays saturated throughout and only the
+    // per-build contribution is exercised below.
+    let mut node = make_node("hashDU", "x86_64-linux");
+    node.wanted_output_names = vec![];
+    dag.merge(build_a, &[node.clone()], &[], "")?;
+
+    // build_b's submission lists the same drv twice with different
+    // wanted sets → its contribution is the union of both occurrences.
+    let mut occ1 = node.clone();
+    occ1.wanted_output_names = vec!["out".into()];
+    let mut occ2 = node.clone();
+    occ2.wanted_output_names = vec!["dev".into()];
+    dag.merge(build_b, &[occ1, occ2], &[], "")?;
+    let n = &dag.nodes["hashDU"];
+    assert_eq!(
+        n.wanted_by_build.get(&build_b),
+        Some(&vec!["dev".to_string(), "out".to_string()]),
+        "the second occurrence must union into the first, not overwrite it"
+    );
+    assert_eq!(
+        n.wanted_by_build.get(&build_a),
+        Some(&Vec::<String>::new()),
+        "the other build's all-wanted contribution must be untouched"
+    );
+
+    // A FAILED merge (cycle) by build_b, again carrying the drv twice:
+    // rollback must restore build_b's contribution to the pre-merge
+    // value ({dev, out}), not to the mid-merge value of either
+    // occurrence.
+    let mut occ3 = node.clone();
+    occ3.wanted_output_names = vec!["man".into()];
+    let mut occ4 = node.clone();
+    occ4.wanted_output_names = vec!["lib".into()];
+    let nodes = vec![
+        occ3,
+        occ4,
+        make_node("hashDUy", "x86_64-linux"),
+        make_node("hashDUz", "x86_64-linux"),
+    ];
+    let cycle = vec![
+        make_edge("hashDUy", "hashDUz"),
+        make_edge("hashDUz", "hashDUy"),
+    ];
+    assert!(dag.merge(build_b, &nodes, &cycle, "").is_err());
+    let n = &dag.nodes["hashDU"];
+    assert_eq!(
+        n.wanted_by_build.get(&build_b),
+        Some(&vec!["dev".to_string(), "out".to_string()]),
+        "rollback must restore the pre-merge contribution, not a mid-merge union"
+    );
+    assert_eq!(n.wanted_by_build.get(&build_a), Some(&Vec::<String>::new()));
+    Ok(())
+}
+
 /// The resubmit-reset path destructively removes a retriable node and
 /// re-inserts fresh state; prior interest AND prior per-build
 /// contributions are carried over so the other still-interested builds'
@@ -194,7 +262,7 @@ fn test_merge_resubmit_reset_carries_contributions() -> anyhow::Result<()> {
 }
 
 /// A failed merge (cycle) must restore per-build contributions exactly:
-/// an entry the merge ADDED is removed, and an entry the merge OVERWROTE
+/// an entry the merge ADDED is removed, and an entry the merge GREW
 /// (the same build re-merging the node with a different wanted set) is
 /// restored to its prior value — mirroring the `wanted_grown` rollback.
 #[test]
@@ -228,9 +296,9 @@ fn test_merge_rollback_restores_contributions() -> anyhow::Result<()> {
         Some(&vec!["out".to_string()])
     );
 
-    // Failed merge by the SAME build overwriting its own prior entry: the
+    // Failed merge by the SAME build growing its own prior entry: the
     // prior contribution must be restored (not removed, not left at the
-    // overwritten value).
+    // mid-merge unioned value).
     assert!(dag.merge(build_a, &nodes, &cycle, "").is_err());
     let n = &dag.nodes["hashRB"];
     assert_eq!(

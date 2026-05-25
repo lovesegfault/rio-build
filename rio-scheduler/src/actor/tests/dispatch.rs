@@ -2995,7 +2995,7 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// `SubstituteComplete{ok=false}` sets `substitute_tried` so the next
 /// dispatch pass falls through to a worker instead of re-spawning the
 /// fetch every Tick (~1/s livelock when FMP HEAD says substitutable
@@ -3052,7 +3052,7 @@ async fn substitute_ok_false_suppresses_respawn() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// `walk_substitute_closure` may ingest the seed (output) then fail on
 /// a ref → `ok=false` → `substitute_tried=true`. The seed is now in
 /// PG. Next-tick FMP probes OUTPUT paths only, sees present, and
@@ -3671,7 +3671,7 @@ fn seed_with_refs(store: &rio_test_support::grpc::MockStore, path: &str, refs: &
     store.seed(info, nar);
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// `walk_substitute_closure` MUST walk transitively. Diamond:
 /// A → [B, C]; B → [D]; C → [D]. All four end up in `state.paths`
 /// (warm) so the layer-batched `BatchQueryPathInfo` fast-path covers
@@ -3723,7 +3723,7 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// A reference miss MUST set ok=false (not silently truncate). A is
 /// seeded substitutable (per-path QPI returns it with refs=[B]); B is
 /// nowhere → batch returns None for B AND per-path QPI returns
@@ -3888,7 +3888,7 @@ fn counter_series(
     (total, labels)
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// A wanted seed whose `SubstitutePath` returns `NotFound` twice and
 /// then succeeds must be FETCHED, not demoted: every path in the walk
 /// was HEAD-probed as available minutes earlier or named in a narinfo
@@ -3960,7 +3960,7 @@ async fn walk_retries_not_found_then_succeeds() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// A wanted seed that returns `NotFound` on EVERY attempt exhausts the
 /// retry ladder and only then demotes: ok=false, exactly
 /// `SUBSTITUTE_FETCH_MAX_ATTEMPTS` attempts, and ONE
@@ -4233,7 +4233,7 @@ async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// End-to-end forgiveness: a derivation classified as
 /// pending-substitute whose UNWANTED seed fails the upstream GET must
 /// still complete (the walk forgives the unwanted seed); the same
@@ -4316,7 +4316,7 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// The substitute walk's forgivable-seed set × the LIVE effective wanted
 /// set: a declared output path is forgivable only when NO LIVE build
 /// wants it. Build A wants ALL outputs (the empty sentinel) and saturates
@@ -4423,10 +4423,10 @@ async fn substitute_forgivable_set_follows_live_builds_effective_wanted(
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// An UNRESOLVABLE wanted set (non-empty but matching no declared
 /// output name — a `drv^bogus` root the gateway didn't validate) must
-/// not invert the forgiveness gate. `wanted_output_paths()` resolves to
+/// not invert the forgiveness gate. The wanted subset resolves to
 /// nothing, so the complement "expected − wanted" would be EVERY
 /// declared path — and a forgivable set of everything turns a total
 /// fetch failure into `ok=true` with zero outputs present: the node
@@ -4479,7 +4479,7 @@ async fn substitute_walk_unresolvable_wanted_set_forgives_nothing() -> TestResul
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// The forgivable set is snapshotted at spawn time, but a detached
 /// fetch can run for minutes — a second build merging during that
 /// window can grow the node's wanted union to include an output the
@@ -4548,7 +4548,7 @@ async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> Test
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// Once a forgiven seed has triggered a downgrade (it became wanted
 /// mid-fetch), it must NEVER be treated as forgivable again for that
 /// node — even if the build that wanted it later goes terminal. Without
@@ -4680,7 +4680,7 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
 
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.merge.substitute-topdown+4]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// topdown-pruned CHILDLESS root: the dependency closure was dropped
 /// from the submission, so the generic revert (childless ⇒ vacuously
@@ -4805,7 +4805,7 @@ async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// node whose dependency is Poisoned (the I-094 reprobe lane):
 /// `revert_target_for` says DependencyFailed and the generic revert's
@@ -4927,7 +4927,7 @@ async fn substitute_downgrade_with_poisoned_dep_reattempts_delta_before_failing_
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// Cold path: A is NOT in `state.paths` (batch returns None) but IS
 /// in `state.substitutable` (per-path QPI materializes it with
 /// refs=[B]); B is seeded warm. Asserts the absent→QPI→push-refs arm
@@ -5033,7 +5033,7 @@ async fn walk_substitute_closure_progress_monotone_and_bounded() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// merged_001: a hostile upstream returning > `MAX_SUBSTITUTE_CLOSURE`
 /// references on a SINGLE path must trip the per-path cap check
 /// immediately — not after the next BFS layer. Without the per-insert-

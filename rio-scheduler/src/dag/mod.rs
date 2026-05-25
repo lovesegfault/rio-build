@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::state::{DerivationState, DerivationStatus, DrvHash};
+use crate::state::{DerivationState, DerivationStatus, DrvHash, union_wanted_saturating};
 
 /// CA-cutoff cascade result-size cap. Bounds the number of nodes
 /// transitioned `Queued`→`Skipped` per cascade so an adversarial DAG
@@ -75,11 +75,12 @@ pub struct MergeResult {
     /// Pre-existing nodes where this merge recorded the submitting
     /// build's `wanted_by_build` contribution, with the prior entry
     /// value (`None` = the build had no entry). Rollback removes the
-    /// inserted entry or restores the overwritten one — a leaked
-    /// contribution would make the rejected build look live-and-
-    /// interested to the effective-wanted computation. Newly-inserted
-    /// and resubmit-reset nodes don't need this: rollback removes the
-    /// former wholesale and restores the latter's full prior state.
+    /// inserted entry or restores the prior value of one this merge
+    /// grew — a leaked contribution would make the rejected build look
+    /// live-and-interested to the effective-wanted computation.
+    /// Newly-inserted and resubmit-reset nodes don't need this:
+    /// rollback removes the former wholesale and restores the latter's
+    /// full prior state.
     pub contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)>,
 }
 
@@ -385,13 +386,22 @@ impl DerivationDag {
                 }
                 // Per-build contribution: remember WHAT this submission
                 // wanted so the effective-wanted computation can stop
-                // counting it once this build goes terminal. The prior
-                // entry (usually absent; present when the same build
-                // re-merges the node) is kept for rollback, mirroring
-                // `wanted_grown`.
-                let prior_contribution = existing
+                // counting it once this build goes terminal. Union (not
+                // overwrite) so a submission that carries the same drv
+                // twice with different wanted sets accumulates both
+                // occurrences instead of keeping only the last one. The
+                // prior entry (usually absent; present when the same
+                // build re-merges the node) is captured BEFORE the
+                // mutation for rollback, mirroring `wanted_grown`;
+                // rollback_merge replays these in reverse, so the
+                // first-captured (true pre-merge) value is the one that
+                // sticks even when one merge records the node twice.
+                let prior_contribution = existing.wanted_by_build.get(&build_id).cloned();
+                existing
                     .wanted_by_build
-                    .insert(build_id, node.wanted_output_names.clone());
+                    .entry(build_id)
+                    .and_modify(|w| union_wanted_saturating(w, &node.wanted_output_names))
+                    .or_insert_with(|| node.wanted_output_names.clone());
                 contributions_recorded.push((drv_hash.clone(), prior_contribution));
                 // First submitter's traceparent wins — but recovery/
                 // poison-reset set "", which isn't a submitter. Upgrade
@@ -722,10 +732,11 @@ impl DerivationDag {
 
         // Undo the submitting build's per-build contribution on
         // pre-existing nodes where this merge recorded it: remove the
-        // entry it inserted (`None` prior), or restore the entry it
-        // overwrote. Reverse order so that, if the same node was
-        // somehow recorded twice in one merge, the oldest (true
-        // pre-merge) prior is the one that sticks.
+        // entry it inserted (`None` prior), or restore the pre-merge
+        // value of an entry it grew. Reverse order so that, when the
+        // same node is recorded twice in one merge (a submission
+        // carrying the same drv twice), the oldest (true pre-merge)
+        // prior is the one that sticks.
         for (hash, prior) in contributions_recorded.iter().rev() {
             if let Some(state) = self.nodes.get_mut(hash) {
                 match prior {

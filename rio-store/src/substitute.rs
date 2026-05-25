@@ -463,7 +463,7 @@ impl Substituter {
     ///
     /// **One path, one answer.** The store does NOT walk
     /// `info.references`; closure completeness is the caller's
-    /// responsibility (`r[sched.substitute.detached+3]` for the
+    /// responsibility (`r[sched.substitute.detached+4]` for the
     /// scheduler; the nix client for the gateway). Matches upstream
     /// Nix's `BinaryCacheStore::queryPathInfo` contract.
     #[instrument(skip(self), fields(tenant = %tenant_id, path = store_path))]

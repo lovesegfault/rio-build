@@ -657,7 +657,7 @@ impl DagActor {
         // queued Tick doesn't reap the fleet on a slow store.
         self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
-        // r[impl sched.substitute.detached+3]
+        // r[impl sched.substitute.detached+4]
         // Partition: locally-present (not in missing_paths) → complete
         // inline; substitutable → spawn detached fetch; truly-missing →
         // leave Ready (dispatches normally). The detached fetch runs
@@ -775,7 +775,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+3]
+    // r[impl sched.substitute.detached+4]
     /// Transition each candidate to `Substituting` and spawn a
     /// background task that triggers store-side `try_substitute` (via
     /// `QueryPathInfo`) for its output paths AND their transitive
@@ -1017,7 +1017,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+3]
+    // r[impl sched.substitute.detached+4]
     /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
     /// detached fetch task. `ok=true` → output now in rio-store with
     /// its full reference closure ([`walk_substitute_closure`] walked
@@ -1478,7 +1478,7 @@ impl DagActor {
                     self.complete_ready_from_store(drv_hash).await;
                     return true;
                 }
-                // r[impl sched.substitute.detached+3] — spawn instead of
+                // r[impl sched.substitute.detached+4] — spawn instead of
                 // awaiting eager_substitute_fetch in the actor loop.
                 // r[impl sched.merge.substitute-probe-indeterminate]
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
@@ -2678,7 +2678,7 @@ impl DagActor {
     }
 }
 
-// r[impl sched.substitute.detached+3]
+// r[impl sched.substitute.detached+4]
 /// Auth source for the detached substitute closure walk.
 ///
 /// `Service` holds `(signer, tenant_id)` and re-mints a fresh

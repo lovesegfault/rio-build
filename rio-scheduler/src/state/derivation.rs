@@ -185,7 +185,7 @@ db_str_enum! {
         /// `QueryPathInfo` (which triggers store-side `try_substitute`)
         /// for this derivation's outputs. Dependents stay gated (NOT
         /// Completed/Skipped); the spawned task posts `SubstituteComplete`
-        /// when done. r[sched.substitute.detached+3]
+        /// when done. r[sched.substitute.detached+4]
         Substituting = "substituting",
         Completed = "completed",
         Failed = "failed",
@@ -392,7 +392,7 @@ impl DerivationStatus {
             // race a prior Queued→Ready promotion — matches
             // DependencyFailed precedent at completion.rs).
             (Self::Queued | Self::Ready, Self::Skipped) => true,
-            // r[impl sched.substitute.detached+3]
+            // r[impl sched.substitute.detached+4]
             // Detached upstream fetch: spawned from any pre-dispatch
             // state (merge-time) or Ready (dispatch-time). Completed →
             // fetch landed; Ready/Queued → fetch failed, fall through
@@ -1274,19 +1274,6 @@ impl DerivationState {
             && self.expected_output_paths.iter().all(|p| !p.is_empty())
     }
 
-    /// The wanted subset of `expected_output_paths`, resolved by zipping
-    /// the (output_names ↔ expected_output_paths) parallel arrays.
-    /// Empty `wanted_output_names` ⇒ all declared outputs (yields every
-    /// expected path). A wanted name with no matching declared output
-    /// is ignored (defensive — the gateway only unions declared names).
-    pub fn wanted_output_paths(&self) -> impl Iterator<Item = &String> {
-        wanted_subset(
-            &self.output_names,
-            &self.expected_output_paths,
-            &self.wanted_output_names,
-        )
-    }
-
     /// Union a newly-merged consumer's wanted set into this node's.
     /// Delegates to [`union_wanted_saturating`] — see it for the
     /// saturation algebra (empty = "all declared outputs wanted",
@@ -1628,12 +1615,12 @@ mod tests {
         assert!(bad_state.input_srcs.is_empty());
     }
 
-    /// `wanted_output_paths()` filters the (output_names ↔ expected_output_paths)
+    /// `wanted_subset` filters the (output_names ↔ expected_output_paths)
     /// parallel arrays down to the wanted subset. Empty wanted = all declared
     /// (pre-migration rows, the BasicDerivation fallback, and `^*` roots must
     /// keep today's conservative all-outputs behaviour).
     #[test]
-    fn wanted_output_paths_filters_and_empty_means_all() {
+    fn wanted_subset_filters_and_empty_means_all() {
         let mut s = DerivationState::try_from_node(&dummy_node()).unwrap();
         s.output_names = vec!["out".into(), "dev".into(), "debug".into()];
         s.expected_output_paths = vec![
@@ -1641,10 +1628,18 @@ mod tests {
             "/nix/store/bbbb-glibc-dev".into(),
             "/nix/store/cccc-glibc-debug".into(),
         ];
+        fn wanted_paths(s: &DerivationState) -> Vec<&String> {
+            wanted_subset(
+                &s.output_names,
+                &s.expected_output_paths,
+                &s.wanted_output_names,
+            )
+            .collect()
+        }
 
         s.wanted_output_names = vec![];
         assert_eq!(
-            s.wanted_output_paths().collect::<Vec<_>>(),
+            wanted_paths(&s),
             vec![
                 "/nix/store/aaaa-glibc",
                 "/nix/store/bbbb-glibc-dev",
@@ -1655,17 +1650,14 @@ mod tests {
 
         s.wanted_output_names = vec!["out".into(), "dev".into()];
         assert_eq!(
-            s.wanted_output_paths().collect::<Vec<_>>(),
+            wanted_paths(&s),
             vec!["/nix/store/aaaa-glibc", "/nix/store/bbbb-glibc-dev"],
             "wanted subset must exclude the unwanted -debug path"
         );
 
         // A wanted name with no matching declared output (defensive) is ignored.
         s.wanted_output_names = vec!["out".into(), "nonexistent".into()];
-        assert_eq!(
-            s.wanted_output_paths().collect::<Vec<_>>(),
-            vec!["/nix/store/aaaa-glibc"]
-        );
+        assert_eq!(wanted_paths(&s), vec!["/nix/store/aaaa-glibc"]);
     }
 
     // r[verify sched.merge.wanted-outputs+2]
@@ -2293,7 +2285,7 @@ mod tests {
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),
-            // Detached upstream fetch (r[sched.substitute.detached+3])
+            // Detached upstream fetch (r[sched.substitute.detached+4])
             (Created, Substituting),
             (Queued, Substituting),
             (Ready, Substituting),

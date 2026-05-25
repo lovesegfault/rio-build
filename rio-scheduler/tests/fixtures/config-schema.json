@@ -130,7 +130,7 @@
         }
       },
       "substitute_max_concurrent": {
-        "description": "In-flight detached substitute-fetch task bound\n(r[sched.substitute.detached+3]) — memory-safety only; per-replica\nthrottling is `r[store.substitute.admission]`. Sizes\n`DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`\n(operator escape hatch — not chart-set). Default 256.",
+        "description": "In-flight detached substitute-fetch task bound\n(r[sched.substitute.detached+4]) — memory-safety only; per-replica\nthrottling is `r[store.substitute.admission]`. Sizes\n`DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`\n(operator escape hatch — not chart-set). Default 256.",
         "type": "integer",
         "format": "uint",
         "minimum": 0,

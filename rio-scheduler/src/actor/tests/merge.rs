@@ -506,7 +506,7 @@ async fn test_fixed_ca_fod_path_based_lane(
 
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    // r[sched.substitute.detached+3]: substitutable lane spawns the fetch;
+    // r[sched.substitute.detached+4]: substitutable lane spawns the fetch;
     // SubstituteComplete arrives via mailbox. barrier() alone races it.
     if substitutable {
         settle_substituting(&handle, &["ca-fod"]).await;
@@ -701,7 +701,7 @@ async fn test_substitutable_probe_matrix(
     node.expected_output_paths = vec![out_path.clone()];
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    // r[sched.substitute.detached+3]: substitutable lane spawns the fetch;
+    // r[sched.substitute.detached+4]: substitutable lane spawns the fetch;
     // settle for the spawned task to post SubstituteComplete. The
     // not-substitutable case never enters Substituting → bare barrier.
     if substitutable {
@@ -855,7 +855,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
 
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, nodes, edges, false).await?;
-    // r[sched.substitute.detached+3]: top-down no longer awaits QPI inline;
+    // r[sched.substitute.detached+4]: top-down no longer awaits QPI inline;
     // the pruned root goes through pending_substitute → spawned fetch
     // → SubstituteComplete via mailbox. settle_substituting waits for
     // that round-trip; the inline-QPI code is deleted so the actor
@@ -1001,7 +1001,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
 ///
 /// Race staged deterministically via `debug_force_status`/
 /// `debug_set_topdown_pruned` + injected `SubstituteComplete{ok=false}`
-/// (see `r[sched.substitute.detached+3]` — the actor only checks `status
+/// (see `r[sched.substitute.detached+4]` — the actor only checks `status
 /// == Substituting`, so an injected message is indistinguishable from
 /// the spawned task's).
 #[tokio::test]
@@ -1124,7 +1124,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     );
 
     // Bottom-up still fires: glibc fetched via check_cached_outputs.
-    // r[sched.substitute.detached+3]: the bottom-up fetch is spawned; let
+    // r[sched.substitute.detached+4]: the bottom-up fetch is spawned; let
     // SubstituteComplete land before checking qpi_calls.
     settle_substituting(&handle, &["glibc-ft"]).await;
     let qpi = store.calls.qpi_calls.read().unwrap();
@@ -1190,7 +1190,7 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// Substitutable nodes go `Substituting` (detached fetch spawned),
 /// not synchronously `Completed` at merge. The closure-invariant
 /// gate (output references ⊆ inputDrv outputs) is enforced by the
@@ -1238,7 +1238,7 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    // r[sched.substitute.detached+3] — substitutable nodes go to
+    // r[sched.substitute.detached+4] — substitutable nodes go to
     // Substituting (detached fetch) instead of cached_hits, so the
     // closure gate is enforced by the detached task's BFS, not by the
     // apply_cached_hits fixed-point. The mock store doesn't
@@ -1510,7 +1510,7 @@ async fn test_preexisting_completed_gc_matrix(
     .await?;
     barrier(&handle).await;
 
-    // r[sched.substitute.detached+3] — the fetch is spawned, not awaited.
+    // r[sched.substitute.detached+4] — the fetch is spawned, not awaited.
     // Let the spawned task post SubstituteComplete before checking.
     if matches!(gc, GcState::Substitutable | GcState::SubFetchFail) {
         let fod_hash = make_node("fod-dep").drv_hash;
@@ -1687,6 +1687,121 @@ async fn test_preexisting_completed_missing_unwanted_output_not_reset(
         "a_terminal={a_terminal} wanted={wanted:?}"
     );
 
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.stale-completed-verify+5]
+/// `verify_preexisting_completed` × an UNAVAILABLE effective wanted set:
+/// when a live interested build's contribution is unknown — the
+/// post-failover shape, where recovery rebuilds DAG interest from
+/// `build_derivations` but per-build contributions are not persisted —
+/// the unwanted complement MUST be taken against the STORED node-level
+/// union, not the partial union of the contributions that happen to be
+/// known (which would silently under-count the recovered build's wants
+/// and forgive an output it may still need).
+///
+/// Build A submits `app-a → dep` wanting ALL outputs (the empty
+/// sentinel) before failover. The recovered leader dispatches dep,
+/// which records {out, debug} but only P_out is ever uploaded. Build B
+/// then re-merges dep wanting only {out}: A is live with an unknown
+/// contribution → stored-union fallback (all outputs) → P_debug is
+/// still wanted → the stale-Completed reset MUST fire (no cache hit
+/// for B). With a partial-union bug, only B's {out} would count and
+/// the missing P_debug would be wrongly forgiven.
+#[tokio::test]
+async fn test_preexisting_completed_unknown_contribution_falls_back_to_stored_union() -> TestResult
+{
+    let out = test_store_path("pf-dep-out");
+    let dbg = test_store_path("pf-dep-debug");
+    fn mk_dep(wanted: &[&str]) -> rio_proto::types::DerivationNode {
+        let mut d = make_node("pf-dep");
+        d.output_names = vec!["out".into(), "debug".into()];
+        d.expected_output_paths = vec![
+            test_store_path("pf-dep-out"),
+            test_store_path("pf-dep-debug"),
+        ];
+        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        d
+    }
+
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // Phase 1 (pre-failover leader): build A merges app-a → dep with
+    // the all-wanted sentinel, then the leader "crashes" (actor drops).
+    let build_a = Uuid::new_v4();
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, _pool| {
+        merge_dag(
+            &handle,
+            build_a,
+            vec![make_node("pf-app-a"), mk_dep(&[])],
+            vec![make_test_edge("pf-app-a", "pf-dep")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Recovered leader: A is Active again with its DAG interest rebuilt
+    // but NO recorded contribution for dep.
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "precondition: the recovered pre-failover build is live"
+    );
+
+    // P_out exists in the store; P_debug never does (and is not
+    // substitutable).
+    store.seed_with_content(&out, b"out");
+
+    // The recovered Ready dep dispatches and completes reporting BOTH
+    // outputs — only P_out was actually uploaded.
+    let mut w1 = connect_executor(&handle, "pf-w1", "x86_64-linux").await?;
+    tick(&handle).await?;
+    let assn = recv_assignment(&mut w1).await;
+    assert!(assn.drv_path.ends_with("pf-dep.drv"));
+    complete_ca(
+        &handle,
+        "pf-w1",
+        &assn.drv_path,
+        &[("out", &out, vec![0u8; 32]), ("debug", &dbg, vec![0u8; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+    // app-a dispatches next; hold it Running so A stays live.
+    let mut w2 = connect_executor(&handle, "pf-w2", "x86_64-linux").await?;
+    let assn_app = recv_assignment(&mut w2).await;
+    assert!(assn_app.drv_path.ends_with("pf-app-a.drv"));
+    let pre = expect_drv(&handle, "pf-dep").await;
+    assert_eq!(pre.status, DerivationStatus::Completed, "precondition");
+
+    // Build B re-merges dep wanting only {out} while P_debug is missing.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("pf-app-b"), mk_dep(&["out"])],
+        vec![make_test_edge("pf-app-b", "pf-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "pf-dep").await.status,
+        DerivationStatus::Ready,
+        "a live recovered build with an unknown contribution must force \
+         the stored-union fallback — P_debug stays wanted → reset"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.cached_derivations,
+        0,
+        "the stale node must not count as a cache hit for build B"
+    );
     Ok(())
 }
 
@@ -2116,7 +2231,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
 }
 
 // r[verify sched.merge.poisoned-resubmit-bounded+2]
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// I-094 substitutable lane: a `Poisoned` node at the resubmit limit
 /// whose output is upstream-substitutable (NOT locally present) on
 /// resubmit must transition `Poisoned → Substituting → Completed` and
@@ -3199,7 +3314,7 @@ async fn test_seed_ignores_reprobe_pending_substitute_dep() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+3]
+// r[verify sched.substitute.detached+4]
 /// Floating-CA reprobe → re-substitute lane: `verify_preexisting_
 /// completed` finds a Completed floating-CA node's REALIZED output
 /// gone-but-substitutable, resets + spawns the detached fetch with the

@@ -803,7 +803,10 @@ narrow re-merge to keep resetting, re-fetching, or rebuilding outputs nothing
 live asks for --- the incident class that motivated live-scoping. Per-build
 contributions are in-memory only on this branch (nothing per-build is
 persisted): after a leader failover the effective set degrades conservatively
-to the stored union until live builds re-merge their contributions.
+to the stored union until the recovered pre-failover builds go terminal ---
+recovery rebuilds their interest but not their contributions, and they never
+re-merge, so only their terminal cleanup ends the degradation (builds
+submitted after the failover record contributions as usual).
 
 #r("sched.merge.substitute-probe")[
   The merge-time cache check (`check_cached_outputs`) MUST forward the
@@ -928,7 +931,7 @@ to the stored union until live builds re-merge their contributions.
   compile-time caught, not silently-zero.
 ]
 
-#r("sched.substitute.detached+3")[
+#r("sched.substitute.detached+4")[
   The upstream-substitute fetch MUST run outside the actor event loop. Awaiting
   it inline blocks `MergeDag`/dispatch for the duration of the slowest closure
   walk --- a single ghc-sized NAR (1.9 GB) exceeds the 30s `grpc_timeout` and
@@ -951,7 +954,10 @@ to the stored union until live builds re-merge their contributions.
   (#rref("sched.merge.wanted-outputs")) is still attempted --- opportunistic
   completeness --- but it is forgiven on its first failure of any kind,
   without consuming the retry budget: logged, not counted as a fetch
-  failure. The store substitutes ONE path per
+  failure. A path recorded in the node's never-forgive set --- one whose
+  forgiveness already triggered a forgiven-now-wanted downgrade of a
+  completed walk --- MUST NOT be forgiven in later walks of that node.
+  The store substitutes ONE path per
   call (no recursion), so this BFS is the only place the runtime closure can be
   completed. `Substituting` is NOT terminal (`all_deps_completed` returns false
   → dependents stay gated); on `ok=true` the handler transitions `Substituting
