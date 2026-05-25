@@ -585,10 +585,6 @@ in
     # load-bearing verification of the binding gate, the span arithmetic
     # over plain and interior-hole payloads, the seal/drain ordering, and
     # the sealed-empty + cleanup reaps.
-    # r[verify sched.log.batch-binding]
-    # r[verify obs.log.gap-span+2]
-    # r[verify obs.log.entry-justified]
-    # r[verify obs.log.line-conservation]
     quint-log-base = mkQuintCheck {
       name = "log-base";
       spec = "logBufferLifecycle";
@@ -608,11 +604,6 @@ in
     # interim row extension and the reconcile fold are only reachable
     # here), the deferred-final tenure pin, the tenure-orphan reap, and
     # the conservation law across failovers.
-    # r[verify obs.log.exec-keyed+2]
-    # r[verify obs.log.gap-span+2]
-    # r[verify obs.log.entry-justified]
-    # r[verify obs.log.line-conservation]
-    # r[verify obs.log.stored-coverage-preserved]
     quint-log-flap = mkQuintCheck {
       name = "log-flap";
       spec = "logBufferLifecycle";
@@ -633,8 +624,6 @@ in
     # Local faults: push-coupled ring evictions and flush-channel-full
     # enqueue failures. The load-bearing verification of the eviction's
     # disclosed head loss and the enqueue-failure reap.
-    # r[verify obs.log.entry-justified]
-    # r[verify obs.log.line-conservation]
     quint-log-fault-local = mkQuintCheck {
       name = "log-fault-local";
       spec = "logBufferLifecycle";
@@ -645,8 +634,6 @@ in
     # Recovery faults: DAG-load failures and TOCTOU-discarded recoveries.
     # The load-bearing verification of the degraded-tenure
     # retain-everything posture.
-    # r[verify obs.log.entry-justified]
-    # r[verify obs.log.line-conservation]
     quint-log-fault-recovery = mkQuintCheck {
       name = "log-fault-recovery";
       spec = "logBufferLifecycle";
@@ -662,10 +649,6 @@ in
     # reachable here), and the frozen-row latch (finalizedRowFrozen's
     # contended state — a finalized row coexisting with a live same-exec
     # entry — is only reachable here).
-    # r[verify obs.log.entry-justified]
-    # r[verify obs.log.line-conservation]
-    # r[verify obs.log.exec-keyed+2]
-    # r[verify obs.log.finalize-immutable]
     quint-log-fault-persist = mkQuintCheck {
       name = "log-fault-persist";
       spec = "logBufferLifecycle";
@@ -676,8 +659,6 @@ in
     # The finalize-guard fault: the deferral path. The load-bearing
     # verification of the deferred-final retention against the tenure
     # pin.
-    # r[verify obs.log.entry-justified]
-    # r[verify obs.log.line-conservation]
     quint-log-fault-guard = mkQuintCheck {
       name = "log-fault-guard";
       spec = "logBufferLifecycle";
@@ -848,19 +829,20 @@ in
     # guard against a plausible model regression are wired here; the
     # full corpus verdict table is log-invariant-map.md's phase-3
     # findings section and the rest of the override modules stay in
-    # calibration/ as re-runnable evidence. Unlike the non-vacuity
-    # witnesses above, these carry r[verify ...] markers: each is the
-    # machine-checked statement that a specific normative behavior is
-    # the load-bearing fix for its rule's invariant, which is a
-    # verification claim about the rule and not just about the regime
-    # checks' non-vacuity.
+    # calibration/ as re-runnable evidence. These checks verify the
+    # model against itself: each is the machine-checked statement that
+    # a specific modeled behavior is the load-bearing fix for its
+    # invariant. They carry no r[verify ...] markers — the spec rules
+    # they originally pinned described the in-scheduler ring-buffer
+    # data plane, which has been replaced by the rio-store LogService
+    # (the model is retained as historical evidence for the design it
+    # verified).
 
     # effefb0a1: a flush payload's span contribution reverts to its
     # physical line count instead of its line-number span. The cheapest
     # falsification in the corpus (base regime, one holey ring, no
     # failover) and the most plausible regression (a refactor
     # "simplifying" ringSpan back to a count).
-    # r[verify obs.log.gap-span+2]
     quint-log-calib-physical-count-span = mkQuintWitnessCheck {
       name = "log-calib-physical-count-span";
       spec = "calibration/lines";
@@ -872,7 +854,6 @@ in
     # 6c26e85f8: a cross-exec restamp reverts to carrying the prior
     # execution's lines into the new execution's entry. The one corpus
     # row that falsifies an original model-A invariant outright.
-    # r[verify obs.log.exec-keyed+2]
     quint-log-calib-cross-exec-carries-lines = mkQuintWitnessCheck {
       name = "log-calib-cross-exec-carries-lines";
       spec = "calibration/restamps";
@@ -886,7 +867,6 @@ in
     # The refused-UPSERT reap is individually load-bearing — deleting it
     # from the model (e.g. during the phase-6 reap unification) must
     # turn this red.
-    # r[verify obs.log.entry-justified]
     quint-log-calib-no-refused-upsert-reap = mkQuintWitnessCheck {
       name = "log-calib-no-refused-upsert-reap";
       spec = "calibration/reaps";
@@ -900,7 +880,6 @@ in
     # consumed. The sealed-empty reap is individually load-bearing. The
     # deepest counterexample in the calibration corpus — random
     # simulation does not find it.
-    # r[verify obs.log.entry-justified]
     quint-log-calib-no-sealed-empty-reap = mkQuintWitnessCheck {
       name = "log-calib-no-sealed-empty-reap";
       spec = "calibration/reaps";
