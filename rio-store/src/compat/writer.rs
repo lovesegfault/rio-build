@@ -84,6 +84,25 @@ pub enum CompatError {
     /// keys) once the column update succeeds on a later pass.
     #[error("compat_file_hash update failed: {0}")]
     Db(#[from] metadata::MetadataError),
+
+    /// The narinfo row vanished (GC won a race) between the upload's
+    /// commit and the `compat_file_hash` update, so the freshly-written
+    /// object pair was rolled back (deleted). Surfaced as an error so
+    /// the caller counts it on `rio_store_compat_write_failures_total`
+    /// and never emits success metrics for objects that are no longer
+    /// supposed to exist. `cleanup_failures > 0` means that many of the
+    /// rollback deletes ALSO failed — those objects are orphaned in the
+    /// compat bucket (warn-logged with their keys) until an operator
+    /// removes them, because without a narinfo row the GC coupling can
+    /// never find them.
+    #[error(
+        "narinfo row for {store_path} vanished before the compat_file_hash update; \
+         publication rolled back ({cleanup_failures} cleanup delete(s) failed)"
+    )]
+    PathVanished {
+        store_path: String,
+        cleanup_failures: usize,
+    },
 }
 
 /// Publishes the stock-Nix compat object pair after a path commit.
@@ -243,14 +262,35 @@ impl CompatWriter {
             // shouldn't happen post-commit) between the commit and this
             // update. Without a row to carry compat_file_hash the GC
             // coupling can never find these objects, so take them back
-            // out best-effort rather than leak them forever.
+            // out — and treat the whole write as FAILED, not published:
+            // returning [`CompatError::PathVanished`] makes
+            // `write_after_commit` count it on
+            // `rio_store_compat_write_failures_total` instead of
+            // reporting success bytes/latency for objects we just
+            // deleted. Each rollback delete that itself fails is
+            // warn-logged with its key (that object is orphaned in the
+            // bucket until an operator removes it) and counted into the
+            // returned error.
             warn!(
                 store_path = %info.store_path,
                 "narinfo row vanished before compat_file_hash update; \
                  removing freshly-written compat objects"
             );
-            let _ = self.blob_target.delete_blob(&narinfo_key).await;
-            let _ = self.blob_target.delete_blob(&nar_key).await;
+            let mut cleanup_failures = 0usize;
+            for key in [narinfo_key.as_str(), nar_key.as_str()] {
+                if let Err(e) = self.blob_target.delete_blob(key).await {
+                    cleanup_failures += 1;
+                    warn!(
+                        key,
+                        error = %e,
+                        "compat rollback delete failed; object is orphaned in the compat bucket"
+                    );
+                }
+            }
+            return Err(CompatError::PathVanished {
+                store_path: info.store_path.to_string(),
+                cleanup_failures,
+            });
         }
 
         Ok(file_size)
@@ -506,5 +546,61 @@ mod tests {
         );
         // Defensive total-ness for non-store-dir input.
         assert_eq!(basename("relative-thing"), "relative-thing");
+    }
+
+    /// GC-race rollback: when the narinfo row is gone by the time the
+    /// `compat_file_hash` UPDATE runs (0 rows), `write()` must delete
+    /// the freshly-published pair and return `PathVanished` — never
+    /// `Ok` — so the caller's success metrics can't describe objects
+    /// that no longer exist. Uses a real (empty) PG so the UPDATE
+    /// genuinely affects 0 rows.
+    #[tokio::test]
+    async fn write_rolls_back_when_narinfo_row_is_gone() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let backend = Arc::new(crate::backend::MemoryChunkBackend::new());
+        let w = CompatWriter::new(
+            db.pool.clone(),
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>,
+            CompatCompression::Zstd,
+        );
+
+        let path = test_store_path("compat-vanished");
+        let (nar, _) = make_nar(b"row vanished before bookkeeping");
+        let info = make_path_info_for_nar(&path, &nar);
+        let nar = Bytes::from(nar);
+
+        let err = w
+            .write(&info, &nar)
+            .await
+            .expect_err("0-row compat_file_hash update must not be a success");
+        assert!(
+            matches!(
+                &err,
+                CompatError::PathVanished {
+                    cleanup_failures: 0,
+                    ..
+                }
+            ),
+            "expected PathVanished with clean rollback, got {err:?}"
+        );
+
+        // Both objects were rolled back; only the nix-cache-info
+        // bootstrap marker remains. The nar key is recomputed via the
+        // same (deterministic) compression pass write() used.
+        let narinfo_key = format!("{}.narinfo", info.store_path.hash_part());
+        assert!(
+            backend.get_blob(&narinfo_key).await.unwrap().is_none(),
+            "rolled-back narinfo object must be deleted"
+        );
+        let (_, file_hash) = w.compress_and_hash(&info, &nar).await.unwrap();
+        let nar_key = format!("nar/{}.nar.zst", nixbase32::encode(&file_hash));
+        assert!(
+            backend.get_blob(&nar_key).await.unwrap().is_none(),
+            "rolled-back NAR object must be deleted"
+        );
+        assert!(
+            backend.get_blob("nix-cache-info").await.unwrap().is_some(),
+            "bootstrap marker is independent of the rolled-back path"
+        );
     }
 }

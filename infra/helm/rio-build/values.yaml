@@ -280,8 +280,9 @@ store:
   # process running (migration on-ramp + PG-outage floor). Disabling
   # ("pure rio mode") stops new compat writes — existing objects stay —
   # and roughly halves S3 storage. Never affects chunked storage.
-  # NOTE: this is the config/env surface only; rio-store accepts and
-  # validates it today, the compat writer itself ships separately.
+  # Gateway-facing buffered uploads publish their pair synchronously at
+  # commit time; builder-chunked and substituted paths are backfilled
+  # by the store's compat reconciler shortly after.
   binaryCacheCompat:
     enabled: true
     # Compat-objects bucket. Empty → the chunk backend's S3-standard

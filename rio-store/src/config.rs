@@ -108,9 +108,12 @@ pub enum CompatWriteMode {
 /// compat writes (existing objects stay); toggling ON resumes for
 /// subsequent puts. Never affects chunked storage either way.
 ///
-/// The compat writer itself is not wired yet (it lands with the
-/// `compat::writer` module); until then these fields are validated and
-/// carried but otherwise inert, so enabling them is a no-op.
+/// How the objects get written (`compat::writer`): paths committed
+/// through the buffered upload RPCs (`PutPath`/`PutPathBatch` — the
+/// gateway surface) are published synchronously after the PG commit;
+/// paths committed via `PutPathChunked` or upstream substitution keep
+/// `narinfo.compat_file_hash IS NULL` and are backfilled by the P0582
+/// compat reconciler off the upload hot path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct BinaryCacheCompat {
@@ -428,8 +431,11 @@ impl rio_common::config::ValidateConfig for Config {
         // value instead of omitting the env var) would point the compat
         // writer at a bucket literally named "" — reject at boot, not
         // at the first compat write. `enabled` itself needs no check:
-        // with no writer wired yet it is inert, and once the writer
-        // lands a non-S3 deployment simply has nothing to write to.
+        // with `bucket` unset the writer publishes into whatever chunk
+        // backend is configured (for filesystem/memory that is its
+        // `blobs/` namespace — dev parity, readable as a `file://`
+        // binary cache), and a dedicated S3 bucket is only built when
+        // `bucket` is set.
         anyhow::ensure!(
             self.binary_cache_compat
                 .bucket
