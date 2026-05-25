@@ -33,6 +33,16 @@ output "chunk_bucket_name" {
   value       = aws_s3_bucket.chunks.bucket
 }
 
+output "express_bucket_by_az_id" {
+  description = "Per-AZ S3 Express directory bucket names keyed by physical AZ-ID (use2-az1 → rio-build-chunk-cache--use2-az1--x-s3). Empty map = cache tier disabled. xtask passes as --set-json store.chunkBackend.expressBucketByAzId; the store-side per-pod selection resolves its own AZ-ID against this map (P0554)."
+  value       = { for az_id, b in aws_s3_directory_bucket.cache : az_id => b.bucket }
+}
+
+output "express_bucket_by_zone" {
+  description = "Same buckets keyed by AZ NAME (us-east-2a → ...--x-s3). The name→ID mapping is account-specific and terraform is the only layer that knows it; this is the map to use if the per-pod selection keys off the node's topology.kubernetes.io/zone label instead of IMDS placement/availability-zone-id."
+  value       = { for az_id, b in aws_s3_directory_bucket.cache : local.zone_name_by_az_id[az_id] => b.bucket }
+}
+
 output "region" {
   description = "AWS region (scripts read this so they don't have to hardcode it)"
   value       = var.region
