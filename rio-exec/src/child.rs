@@ -52,6 +52,11 @@ pub(crate) struct ChildFds {
     /// Write end of the setup-status pipe. `O_CLOEXEC`; survives until
     /// `execve` so the parent can distinguish "exec'd" (EOF with 0
     /// bytes) from "setup failed" (8 bytes then EOF).
+    ///
+    /// EOF only means "exec'd" once every other copy of the write end
+    /// is gone, so the **intermediate must close its copy immediately
+    /// after forking the sandbox child** — holding it open would delay
+    /// the parent's exec notification until the whole build exits.
     pub status_pipe_w: RawFd,
     /// Read end of the go pipe. The intermediate blocks on it until
     /// the parent has attached it to the cgroup, so every descendant
@@ -135,6 +140,11 @@ pub enum SetupPhase {
     Pdeathsig = 25,
     /// `execve(2)` returned.
     Exec = 26,
+    /// The intermediate process could not fork the sandbox child.
+    /// Reported by the executor's supervision code (not by this
+    /// module) so that a fork failure is distinguishable from a build
+    /// that merely exited with an unusual status code.
+    ForkSandboxChild = 27,
 }
 
 impl SetupPhase {
@@ -168,6 +178,7 @@ impl SetupPhase {
         SetupPhase::VerifyIds,
         SetupPhase::Pdeathsig,
         SetupPhase::Exec,
+        SetupPhase::ForkSandboxChild,
     ];
 
     /// Decode a wire discriminant. Exhaustive over every variant so a
@@ -207,6 +218,7 @@ impl SetupPhase {
             SetupPhase::VerifyIds => "verifying the privilege drop",
             SetupPhase::Pdeathsig => "arming the parent-death signal",
             SetupPhase::Exec => "executing the program",
+            SetupPhase::ForkSandboxChild => "forking the sandbox child",
         }
     }
 }
@@ -672,13 +684,17 @@ fn apply_bind(bind: &PlannedBind, idx: u16) -> Result<(), SetupError> {
         }
         if bind.read_only {
             // A bind mount ignores MS_RDONLY on creation; making it
-            // read-only takes a second, remounting call. Non-recursive:
-            // every bind this executor creates is a leaf (the sources
-            // are plain directories/files), so there are no submounts
-            // to cover. This is a deliberate divergence from
-            // implementations that rely on file ownership alone for
-            // read-onlyness — the observable difference is EROFS
-            // instead of EACCES for a write attempt.
+            // read-only takes a second, remounting call. The remount is
+            // non-recursive, so read-onlyness is only guaranteed for
+            // the top mount: a source that itself contained submounts
+            // would carry them over (MS_REC above) still writable. The
+            // caller contract (see `Mount::writable`) is therefore that
+            // read-only mount sources must not contain submounts —
+            // true for every source the intended callers bind. This is
+            // a deliberate divergence from implementations that rely on
+            // file ownership alone for read-onlyness — the observable
+            // difference is EROFS instead of EACCES for a write
+            // attempt.
             if libc::mount(
                 std::ptr::null(),
                 bind.target_in_chroot_c.as_ptr(),

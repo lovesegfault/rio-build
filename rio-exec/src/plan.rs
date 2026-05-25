@@ -1053,7 +1053,9 @@ mod tests {
         let mut req = nested_request();
         req.args.clear();
         let err = SandboxPlan::compile(&req, &layout()).expect_err("invalid request");
-        let ExecError::InvalidRequest(msg) = err;
+        let ExecError::InvalidRequest(msg) = err else {
+            panic!("compile rejections must be InvalidRequest, got {err:?}");
+        };
         assert!(msg.contains("argv[0]"));
     }
 
@@ -1067,7 +1069,9 @@ mod tests {
             },
         )
         .expect_err("relative chroot dir");
-        let ExecError::InvalidRequest(msg) = err;
+        let ExecError::InvalidRequest(msg) = err else {
+            panic!("compile rejections must be InvalidRequest, got {err:?}");
+        };
         assert!(msg.contains("relative/chroot"));
     }
 

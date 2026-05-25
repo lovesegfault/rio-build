@@ -96,6 +96,10 @@ compile_error!(
 /// `(syscall_nr, index_of_the_mode_argument)` pairs for the
 /// chmod family, and the unconditional-`ENOTSUP` xattr-set numbers.
 struct AbiTable {
+    /// Human-readable ABI label. Only read by the test suite's
+    /// assertion messages; the emitted program identifies an ABI by
+    /// its `arch` token alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     name: &'static str,
     arch: u32,
     chmod_like: &'static [(u32, u32)],

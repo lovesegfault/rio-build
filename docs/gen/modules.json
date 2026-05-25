@@ -523,6 +523,11 @@
       "doc": "The post-fork sandbox construction sequence."
     },
     {
+      "path": "execute.rs",
+      "depth": 0,
+      "doc": "The `execute()` entry point: parent-side orchestration of one"
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Build-system-agnostic Linux sandbox executor."

@@ -302,6 +302,27 @@
       "doc": "The request failed [`ExecutionRequest::validate`]. The message names the rule that was violated and the offending path or field."
     },
     {
+      "enum": "ExecError",
+      "name": "Setup",
+      "crate": "rio-exec",
+      "msg": "sandbox setup failed while {}: {} (errno {}, entry {})",
+      "doc": "The forked process reported a sandbox-setup failure before reaching `execve`. Carries the failing phase, the errno, and (for indexed phases such as bind mounts) which entry failed."
+    },
+    {
+      "enum": "ExecError",
+      "name": "Skeleton",
+      "crate": "rio-exec",
+      "msg": "failed to build the sandbox skeleton: {0}",
+      "doc": "Building the host-side chroot skeleton failed (directory creation, the synthesized `/etc` files, inline files, or the per-bind source stat)."
+    },
+    {
+      "enum": "ExecError",
+      "name": "Spawn",
+      "crate": "rio-exec",
+      "msg": "failed to spawn the sandbox: {0}",
+      "doc": "Creating the supervision plumbing failed: pipes, the pty, the fork itself, the cgroup attach, or the go signal."
+    },
+    {
       "enum": "GatewayError",
       "name": "ClientReported",
       "crate": "rio-gateway",
@@ -1370,7 +1391,7 @@
     {
       "name": "ExecError",
       "crate": "rio-exec",
-      "doc": "Errors produced by the executor. Every variant is an *infrastructure* failure from the caller's point of view — a request that could not be validated or a sandbox that could not be constructed. A process that runs and exits non-zero is **not** an error; that is an [`ExitOutcome`] in a successful [`ExecutionOutcome`]. Sandbox-setup failure variants (one per setup phase: namespace creation, mount application, `pivot_root`, privilege drop, …) are added together with the sandbox implementation so each phase failure stays individually attributable."
+      "doc": "Errors produced by the executor. Every variant is an *infrastructure* failure from the caller's point of view — a request that could not be validated or a sandbox that could not be constructed or supervised. A process that runs and exits non-zero (or is killed by a limit) is **not** an error; that is an [`ExitOutcome`] in a successful [`ExecutionOutcome`]."
     },
     {
       "name": "GatewayError",

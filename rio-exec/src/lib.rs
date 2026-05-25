@@ -37,32 +37,26 @@
 //! - `seccomp` (crate-private): the multi-ABI purity filter the child
 //!   installs.
 //!
-//! The `execute()` entry point that forks the process tree and drives
-//! the pieces above is added by the next change; until it lands the
-//! sandbox modules have no production caller, which is why they carry a
-//! temporary `#[allow(dead_code)]`.
+//! [`execute()`] is the entry point that ties the modules together:
+//! compile the plan, build the skeleton, fork the process tree, stream
+//! captured output, enforce limits, and report the outcome.
 
 pub mod outcome;
 pub mod request;
-// The execute() entry point (the next change in this crate) is the
-// production consumer of the plan/skeleton/child/seccomp pipeline;
-// until it lands, the unit tests are the only callers, so the modules'
-// items would otherwise trip dead_code under `--deny warnings`. Remove
-// the allows when execute() wires compile -> build -> fork ->
-// enter_namespaces -> setup_and_exec together.
-#[allow(dead_code)]
-pub(crate) mod child;
-#[allow(dead_code)]
-pub(crate) mod plan;
-#[allow(dead_code)]
-pub(crate) mod seccomp;
-#[allow(dead_code)]
-pub(crate) mod skeleton;
 
+mod child;
+mod execute;
+mod plan;
+mod seccomp;
+mod skeleton;
+
+pub use child::{SetupError, SetupPhase};
+pub use execute::execute;
 pub use outcome::{
     ExecEvent, ExecutionOutcome, ExitOutcome, LogStream, OutputFileType, OutputMetadata,
     OutputReport,
 };
+pub use plan::HostLayout;
 pub use request::{
     ExecutionRequest, InlineFile, Isolation, Limits, Mount, OutputCapture, Personality,
 };
@@ -71,18 +65,33 @@ pub use request::{
 ///
 /// Every variant is an *infrastructure* failure from the caller's point
 /// of view — a request that could not be validated or a sandbox that
-/// could not be constructed. A process that runs and exits non-zero is
-/// **not** an error; that is an [`ExitOutcome`] in a successful
-/// [`ExecutionOutcome`].
-///
-/// Sandbox-setup failure variants (one per setup phase: namespace
-/// creation, mount application, `pivot_root`, privilege drop, …) are
-/// added together with the sandbox implementation so each phase failure
-/// stays individually attributable.
+/// could not be constructed or supervised. A process that runs and
+/// exits non-zero (or is killed by a limit) is **not** an error; that
+/// is an [`ExitOutcome`] in a successful [`ExecutionOutcome`].
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     /// The request failed [`ExecutionRequest::validate`]. The message
     /// names the rule that was violated and the offending path or field.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// Building the host-side chroot skeleton failed (directory
+    /// creation, the synthesized `/etc` files, inline files, or the
+    /// per-bind source stat).
+    #[error("failed to build the sandbox skeleton: {0}")]
+    Skeleton(#[source] std::io::Error),
+    /// Creating the supervision plumbing failed: pipes, the pty, the
+    /// fork itself, the cgroup attach, or the go signal.
+    #[error("failed to spawn the sandbox: {0}")]
+    Spawn(#[source] std::io::Error),
+    /// The forked process reported a sandbox-setup failure before
+    /// reaching `execve`. Carries the failing phase, the errno, and
+    /// (for indexed phases such as bind mounts) which entry failed.
+    #[error(
+        "sandbox setup failed while {}: {} (errno {}, entry {})",
+        .0.phase.describe(),
+        nix::errno::Errno::from_raw(.0.errno).desc(),
+        .0.errno,
+        .0.detail
+    )]
+    Setup(SetupError),
 }

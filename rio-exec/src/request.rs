@@ -73,6 +73,11 @@ pub struct Mount {
     /// Sandbox-absolute path to bind to.
     pub target: PathBuf,
     /// Read-write when true; bind-then-remount-read-only when false.
+    ///
+    /// The read-only remount covers the top of the bind only: a source
+    /// that itself contains other mount points would carry them into
+    /// the sandbox still writable. Callers must therefore not pass
+    /// sources containing submounts as read-only mounts.
     pub writable: bool,
     /// Skip this mount silently if `source` does not exist on the host.
     pub optional: bool,
@@ -469,7 +474,9 @@ mod tests {
     #[track_caller]
     fn assert_rejected(req: &ExecutionRequest, needle: &str) {
         let err = req.validate().expect_err("request should be rejected");
-        let ExecError::InvalidRequest(msg) = err;
+        let ExecError::InvalidRequest(msg) = err else {
+            panic!("validation failures must be InvalidRequest, got {err:?}");
+        };
         assert!(
             msg.contains(needle),
             "error message should name the offending path: expected {needle:?} in {msg:?}"
