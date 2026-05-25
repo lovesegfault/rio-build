@@ -808,7 +808,40 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 **Exit:** `/nixbuild --checks` green; `nix build .#checks.x86_64-linux.vm-put-path-chunked` green; 061's `PINNED` checksum is already pinned (no DDL change here).
 
 ### P0574 — Gateway substituter: Directory-DAG delta-sync client  ★ U5 LANDS
-**Crate:** `rio-gateway` · **Deps:** P0573, P0577 · **Complexity:** MED
+**Crate:** `rio-gateway` · **Deps:** P0573, P0577 · **Complexity:** MED · **Status: DONE 2026-05-25**
+
+> **Reconciliation (post-DONE).** Four deltas from the file table below:
+> **(a) Trigger.** "`nix copy --from rio://store-B` on store-A" landed as the
+> standard Nix destination-substitute flag: `nix copy --to ssh-ng://gateway-A
+> --substitute-on-destination` sends `wopQueryValidPaths(paths, substitute=true)`,
+> and the gateway runs the delta-sync over the missing set before answering.
+> Whatever it cannot sync stays "missing" and the client falls through to the
+> whole-NAR `wopAddToStoreNar`/`wopAddMultipleToStore` push — the fall-through
+> IS the existing protocol behaviour, no new opcode or URL scheme. The peer is
+> named by a new gateway config field `substitute_store_addr` (lazy channel —
+> an unreachable peer never blocks gateway startup).
+> **(b) Capability dispatch is probe-based, not advertised.** No
+> capability-negotiation RPC exists between rio deployments; per the plan's
+> fallback guidance the dispatch is per-path: remote `QueryPathInfo` +
+> `GetNarIndex`. `Unimplemented` (pre-ADR-022 store), `NotFound` (unindexed),
+> or an empty `root_digest` (single-file/symlink NAR) all decline that path.
+> **(c) Reassembly source.** The NAR is rebuilt from the remote's
+> `NarIndex.entries` (the flattened per-path tree, already fetched for
+> `root_digest`) rather than from the Directory bodies — same data, but it
+> avoids needing the *pruned* subtrees' bodies (which would require a local
+> recursive `GetDirectory` plus blake3 re-keying of the streamed bodies). The
+> Directory DAG is used purely for *discovery*: partitioning file digests into
+> already-local vs must-fetch in O(changed-subtrees) round trips. The local
+> `PutPath`'s independent NAR re-hash against the remote's declared `nar_hash`
+> is the end-to-end integrity gate for the reassembly.
+> **(d) `LocalStore` trait.** Landed as the narrower `CastoreView` trait
+> (`has_directories`/`has_blobs`/`get_directory`/`read_blob`) implemented by
+> the gRPC clients and by in-memory test fixtures; the local store's *write*
+> side reuses the existing `grpc_put_path` machinery unchanged. Two extra
+> metrics beyond the planned three: `dirs_fetched_total` (changed directories
+> discovered) and `bytes_fetched_total` (the transfer the delta avoided is
+> only meaningful next to the transfer it didn't).
+
 | File | Change |
 |---|---|
 | `rio-gateway/src/substitute/mod.rs` | new module — `substitute/{mod.rs,dag_sync.rs}`. There is no existing `handler/substitute.rs`; the pre-ADR-022 `nix copy --from rio://` path is the `wopQuerySubstitutablePathInfos`/`wopAddToStoreNar` handlers in `handler/opcodes_read.rs`/`opcodes_write.rs`. This plan does NOT move those; it adds the dag-sync path as a NEW substituter and the gateway dispatches based on advertised capability. |
@@ -868,7 +901,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":572,"title":"Directory merkle layer: dir_digest/root_digest in NarIndex + directories+file_blobs tables + nar_index.root_node column + bottom-up compute in castore.rs","deps":[545,546,551,552],"crate":"rio-proto,rio-store","priority":90,"status":"DONE","complexity":"LOW","note":"LOAD-BEARING for P0559 mount path (ADR §2.2); also U5 foundation; snix castore.proto vendored (MIT); pin canonical encoding (snix #111); pass lives in rio-store not rio-nix (rio-nix can't depend on rio-proto)"}
 {"plan":573,"title":"DirectoryService RPC: GetDirectory(recursive=true server-BFS stream) / HasDirectories / HasBlobs (batch bitmap; I-110 lesson)","deps":[572,589],"crate":"rio-proto,rio-store","priority":90,"status":"DONE","complexity":"MED","note":"snix-wire-compatible; recursive=true is the P0559 mount-time prefetch path; tenant-scoping reads claims.tenant (P0589)"}
 {"plan":577,"title":"BlobService.Read(file_digest) server-stream (snix-compatible; file_blobs→nar_index size→chunk-cumsum slice)","deps":[573],"crate":"rio-proto,rio-store","priority":80,"status":"DONE","complexity":"LOW","note":"completes castore surface; r[store.castore.blob-read]"}
-{"plan":574,"title":"Gateway substituter: Directory-DAG delta-sync client (nix copy walks DAG, prunes present subtrees)","deps":[573,577],"crate":"rio-gateway,nix","priority":75,"status":"UNIMPL","complexity":"MED","note":"U5 LANDS; falls through to chunk-list when remote lacks capability"}
+{"plan":574,"title":"Gateway substituter: Directory-DAG delta-sync client (nix copy walks DAG, prunes present subtrees)","deps":[573,577],"crate":"rio-gateway,nix","priority":75,"status":"DONE","complexity":"MED","note":"U5 LANDS; trigger is wopQueryValidPaths(substitute=true) i.e. nix copy --substitute-on-destination; probe-based capability dispatch (GetNarIndex Unimplemented/NotFound/empty-root_digest -> whole-NAR fallback); vm-dag-delta-sync proves 76/82 subtrees pruned + 1 blob fetched"}
 ```
 
 ---

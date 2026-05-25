@@ -60,6 +60,7 @@ let
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
+  dag-delta-sync = import ./scenarios/dag-delta-sync.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
@@ -506,6 +507,98 @@ in
         extraClientModules = [
           { networking.firewall.allowedTCPPorts = [ 8080 ]; }
         ];
+      };
+    };
+
+  # ── dag-delta-sync (two-store standalone fixture) ────────────────────
+  # Gateway directory-DAG delta-sync substituter (ADR-022 §8, P0574).
+  # Two full control planes: `control` (store-A + the gateway under
+  # test) and `storeb` (store-B, the remote peer). The client builds
+  # closure v1 and v2 locally, pushes v1 → store-A and v2 → store-B,
+  # then `nix copy --substitute-on-destination --to ssh-ng://control`
+  # makes gateway-A delta-sync v2 from store-B instead of accepting the
+  # whole NAR from the client.
+  #
+  # r[verify gw.substitute.dag-delta-sync]
+  #   subtrees_pruned_total == 76 of 82 dirs (> 0.9 × total) AND
+  #   blobs_fetched_total == 1 after syncing a closure that differs in
+  #   one file five directories deep — O(changed-subtrees) discovery.
+  #   The reassembled path round-trips byte-identically out of store-A.
+  vm-dag-delta-sync =
+    let
+      jwtKeys = import ./lib/jwt-keys.nix;
+      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+      jwtSeed = pkgs.writeText "jwt-seed" jwtKeys.seedB64;
+      # Both stores need the JWT pubkey: the castore RPC surface
+      # (HasDirectories/GetDirectory/HasBlobs/ReadBlob) is
+      # tenant-scoped, and the gateway presents its session JWT to
+      # BOTH the local store (the prune oracle) and the remote peer
+      # (the fetch source).
+      storeJwtConfig = {
+        extraConfig = ''
+          [chunk_backend]
+          kind = "filesystem"
+          base_dir = "/var/lib/rio/store/chunks"
+
+          [jwt]
+          key_path = "${jwtPubkey}"
+        '';
+      };
+      twoStoreFixture = standalone {
+        workers = { };
+        extraStoreConfig = storeJwtConfig;
+        # Gateway-A signs session JWTs with the seed and delta-syncs
+        # from storeb's store.
+        extraGatewayEnv = {
+          RIO_JWT__KEY_PATH = "${jwtSeed}";
+          RIO_SUBSTITUTE_STORE_ADDR = "storeb:9002";
+        };
+        extraPackages = [ pkgs.postgresql_18 ];
+        # The client pushes closure v2 to storeb's gateway over ssh-ng;
+        # mkClientNode's ssh_config only covers `control`, so add a
+        # second Host block (lines-typed option — definitions concat).
+        extraClientModules = [
+          {
+            programs.ssh.extraConfig = ''
+              Host storeb
+                HostName storeb
+                User root
+                Port 2222
+                IdentityFile /root/.ssh/id_ed25519
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+            '';
+          }
+        ];
+      };
+    in
+    dag-delta-sync {
+      inherit pkgs common;
+      fixture = twoStoreFixture // {
+        # Second, independent control plane: its own PG, store,
+        # scheduler, and gateway. Only the store (the castore RPC
+        # source) and the gateway (the ssh-ng push target for seeding
+        # closure v2) are exercised; the scheduler just satisfies the
+        # module's service dependencies. Same migration-race guard as
+        # the standalone fixture's control node.
+        nodes = twoStoreFixture.nodes // {
+          storeb = {
+            imports = [
+              (common.mkControlNode {
+                hostName = "storeb";
+                extraStoreConfig = storeJwtConfig;
+              })
+            ];
+            systemd.services.rio-scheduler.preStart = ''
+              for _ in $(seq 1 60); do
+                ${pkgs.netcat}/bin/nc -z localhost 9002 && exit 0
+                sleep 0.5
+              done
+              echo "rio-store port 9002 not open after 30s" >&2
+              exit 1
+            '';
+          };
+        };
       };
     };
 
