@@ -676,6 +676,67 @@ module retryPolicy {
     everFailedBuilders' = everFailedBuilders,
   }
 
+  // --- 7a. dispatch -------------------------------------------------------
+
+  /// Dispatch the Ready derivation to an eligible executor slot.
+  // Mirrors: dispatch.rs::dispatch_ready (the backoff defer) +
+  //          assignment.rs::hard_filter (failed_builders exclusion) +
+  //          dispatch.rs::assign_to_worker (backoff_until = None,
+  //          running_build = Some).
+  action dispatchTo(w: str): bool = all {
+    dStatus == DReady,
+    backoffElapsed,
+    physAttempts < MAX_ATTEMPTS,
+    placeable.contains(w),
+    dStatus' = DRunning,
+    attempt' = Running(w),
+    execs' = execs.put(w, { ...execs.get(w), runningOurs: true }),
+    live' = { ...live, backoffUntil: NoTime },
+    val applied = specApply(spec, FDispatched(now), eligibleFleet)
+    all {
+      spec' = applied.c,
+      specVerdict' = applied.v,
+    },
+    physAttempts' = physAttempts + 1,
+    now' = now, poisonSrc' = poisonSrc, pg' = pg,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    promotionsLeft' = promotionsLeft, failoversLeft' = failoversLeft,
+    pgFaultsLeft' = pgFaultsLeft, last' = noObs,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// E9 -- the dispatch-time fleet-exhaust backstop: no placeable
+  /// executor and every eligible one has already failed this derivation.
+  /// Poisons without a failure event (no fold event -- poisonSrc records
+  /// the scoping). The empty eligible fleet defers instead (the action
+  /// is disabled), per sched.dispatch.fleet-exhaust+3.
+  // Mirrors: dispatch.rs (find_executor == None arm) +
+  //          failed_builders_exhausts_fleet + poison_and_cascade.
+  action dispatchFleetExhaust = all {
+    dStatus == DReady,
+    backoffElapsed,
+    placeable == Set(),
+    exhaustsFleet(live.failedBuilders, eligibleFleet),
+    dStatus' = DPoisoned,
+    poisonSrc' = DispatchPoison,
+    live' = { ...live, poisonedAt: At(now) },
+    lastPoisonReason' = RFleetExhausted,
+    // persist_poisoned (best-effort; not fault-injected here -- the
+    // dispatch-time poison is not a calibration subject)
+    pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+    depStatus' = DepFailed,
+    everFailureTerminal' = true,
+    spec' = spec, specVerdict' = specVerdict,
+    attempt' = attempt, execs' = execs,
+    now' = now, promotionsLeft' = promotionsLeft,
+    physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    pgFaultsLeft' = pgFaultsLeft,
+    last' = { ...noObs, kind: OE9Dispatch, terminal: true },
+    justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
   // --- 7b. physical attempt ends -----------------------------------------
 
   /// The running build ends worker-side with a CompletionReport of the
@@ -744,6 +805,507 @@ module retryPolicy {
     everFailedBuilders' = everFailedBuilders,
   }
 
+  // --- 7c. the worker-report entry points (E1-E4) -------------------------
+
+  /// Process the pending CompletionReport. One action covers the four
+  /// completion-routing entry points; the per-class arms transcribe
+  /// their handlers. The shared prologue is handle_completion's executor
+  /// bookkeeping: running_build cleared, last_completed set, the slot
+  /// marked draining (one-shot), all BEFORE the per-class handler runs --
+  /// which is why the post-report stream close never reassigns and never
+  /// inserts a recently_disconnected entry (I-188 / I-197).
+  // Mirrors: completion.rs::handle_completion (bookkeeping + routing) ->
+  //          handle_transient_failure (E1) / handle_infrastructure_failure
+  //          (E2) / handle_permanent_failure (E3) / handle_timeout_failure
+  //          (E4), with their PG mirror writes (best-effort).
+  action processReport(w: str, class: ReportClass, dual: bool, promoted: bool, atCap: bool, pgLost: bool): bool = all {
+    attempt == Reported({ exec: w, class: class, dual: dual }),
+    // the floor oracle: promoted consumes a ladder rung; at_cap is
+    // always available (the SLA fit may already have dispatched at the
+    // ceiling); both only apply to the cgroup-OOM class here.
+    promoted implies (class == RcInfraOom and promotionsLeft > 0),
+    atCap implies class == RcInfraOom,
+    not(promoted and atCap),
+    (class == RcInfraOom) implies (promoted or atCap),
+    // a lost-PG-write step needs fault budget
+    pgLost implies pgFaultsLeft > 0,
+    // the derivation is Running and assigned to the reporting executor
+    // (handle_completion's status + stale-executor guards) -- structural
+    // here: a pending report only exists for the in-flight attempt.
+    dStatus == DRunning,
+
+    // shared prologue: free the slot, remember the completion, drain.
+    val execAfter = { ...execs.get(w), runningOurs: false, lastCompletedOurs: true, draining: true }
+    val fleetAfter = EXECUTORS.filter(x => and {
+      execs.get(x).registered,
+      not(execs.get(x).draining),
+      x != w,
+    })
+    match class {
+      // ── E1: handle_transient_failure ──────────────────────────────
+      | RcTransient =>
+        val fb1 = live.failedBuilders.union(Set(w))
+        val c1 = { ...live, failedBuilders: fb1, failureCount: live.failureCount + 1 }
+        val reachedPoison = c1.failedBuilders.size() >= THRESHOLD
+        val exhausts = exhaustsFleet(fb1, fleetAfter)
+        val applied = specApply(spec, FTransient({ at: now, exec: w }), fleetAfter)
+        all {
+          execs' = execs.put(w, execAfter),
+          attempt' = NoAttempt,
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          if (reachedPoison or exhausts) all {
+            // poison_and_cascade
+            dStatus' = DPoisoned,
+            poisonSrc' = EventPoison,
+            live' = { ...c1, poisonedAt: At(now) },
+            lastPoisonReason' = if (reachedPoison) RThreshold else RFleetExhausted,
+            pg' = if (pgLost) pg else { ...pg,
+              failedBuilders: pg.failedBuilders.union(Set(w)),
+              status: PgPoisoned, poisonedAt: At(now) },
+            depStatus' = DepFailed,
+            everFailureTerminal' = true,
+            last' = { ...noObs, kind: OE1, chargedAny: true, terminal: true },
+          } else if (live.count < MAX_RETRIES) all {
+            // retry arm: backoff from the pre-increment count
+            dStatus' = DReady,
+            poisonSrc' = poisonSrc,
+            live' = { ...c1,
+              count: live.count + 1,
+              backoffUntil: At(now + backoffSecs(live.count)) },
+            lastPoisonReason' = lastPoisonReason,
+            pg' = if (pgLost) pg else { ...pg,
+              failedBuilders: pg.failedBuilders.union(Set(w)),
+              retryCount: pg.retryCount + 1 },
+            depStatus' = depStatus,
+            everFailureTerminal' = everFailureTerminal,
+            last' = { ...noObs, kind: OE1, chargedAny: true },
+          } else all {
+            // max_retries exhausted -> poison
+            dStatus' = DPoisoned,
+            poisonSrc' = EventPoison,
+            live' = { ...c1, poisonedAt: At(now) },
+            lastPoisonReason' = RTransientBudget,
+            pg' = if (pgLost) pg else { ...pg,
+              failedBuilders: pg.failedBuilders.union(Set(w)),
+              status: PgPoisoned, poisonedAt: At(now) },
+            depStatus' = DepFailed,
+            everFailureTerminal' = true,
+            last' = { ...noObs, kind: OE1, chargedAny: true, terminal: true },
+          },
+          promotionsLeft' = promotionsLeft,
+        }
+
+      // ── E2: handle_infrastructure_failure ─────────────────────────
+      | RcInfraPutPath => infraArm(w, execAfter, fleetAfter, true, false, false, pgLost)
+      | RcInfraOom => infraArm(w, execAfter, fleetAfter, promoted, atCap, promoted, pgLost)
+      | RcInfraOther => infraArm(w, execAfter, fleetAfter, false, false, false, pgLost)
+
+      // ── E3: handle_permanent_failure ──────────────────────────────
+      | RcPermanent =>
+        val applied = specApply(spec, FPermanent({ at: now, exec: w }), fleetAfter)
+        all {
+          execs' = execs.put(w, execAfter),
+          attempt' = NoAttempt,
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          dStatus' = DPoisoned,
+          poisonSrc' = EventPoison,
+          live' = { ...live,
+            poisonedAt: At(now),
+            failedBuilders: live.failedBuilders.union(Set(w)) },
+          lastPoisonReason' = RPermanent,
+          pg' = if (pgLost) pg else { ...pg,
+            status: PgPoisoned, poisonedAt: At(now),
+            failedBuilders: pg.failedBuilders.union(Set(w)) },
+          depStatus' = DepFailed,
+          everFailureTerminal' = true,
+          last' = { ...noObs, kind: OE3, chargedAny: true, terminal: true },
+          promotionsLeft' = promotionsLeft,
+        }
+
+      // ── E4: handle_timeout_failure ────────────────────────────────
+      | RcTimeout =>
+        val applied = specApply(spec, FWorkerTimeout(now), fleetAfter)
+        all {
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          attempt' = NoAttempt,
+          if (live.timeoutCount < MAX_TIMEOUT) all {
+            dStatus' = DReady,
+            poisonSrc' = poisonSrc,
+            live' = { ...live, timeoutCount: live.timeoutCount + 1 },
+            lastPoisonReason' = lastPoisonReason,
+            pg' = pg,
+            depStatus' = depStatus,
+            everFailureTerminal' = everFailureTerminal,
+            execs' = execs.put(w, if (dual) { ...execAfter, deathCharges: execAfter.deathCharges + 1 } else execAfter),
+            last' = { ...noObs, kind: OE4, chargedAny: true },
+          } else all {
+            // terminal Cancelled (NOT Poisoned) + cascade
+            dStatus' = DCancelled,
+            poisonSrc' = poisonSrc,
+            live' = live,
+            lastPoisonReason' = lastPoisonReason,
+            pg' = if (pgLost) pg else { ...pg, status: PgCancelled },
+            depStatus' = DepFailed,
+            everFailureTerminal' = true,
+            execs' = execs.put(w, if (dual) { ...execAfter, deathCharges: execAfter.deathCharges + 1 } else execAfter),
+            last' = { ...noObs, kind: OE4, terminal: true },
+          },
+          promotionsLeft' = promotionsLeft,
+        }
+    },
+
+    pgFaultsLeft' = if (pgLost) pgFaultsLeft - 1 else pgFaultsLeft,
+    everFailedBuilders' = if (class == RcTransient or class == RcPermanent)
+      everFailedBuilders.union(Set(w)) else everFailedBuilders,
+    now' = now, physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    justFailedOver' = false,
+  }
+
+  /// E2's body, shared by the three worker-reported infra classes:
+  /// the exempt block (increment + cap, no early return under cap), the
+  /// I-127 window reset (gated only on the event's own at-cap outcome --
+  /// the exempt fall-through), then the non-exempt cap check and charge.
+  // Mirrors: completion.rs::handle_infrastructure_failure.
+  action infraArm(w: str, execAfter: ExecRec, fleetAfter: Set[str], exempt: bool, atCap: bool, consumesPromotion: bool, pgLost: bool): bool = all {
+    val applied = specApply(spec, FInfra({ at: now, exempt: exempt, atCap: atCap }), fleetAfter)
+    val cExempt = if (exempt) { ...live, exemptInfraCount: live.exemptInfraCount + 1 } else live
+    val exemptCapHit = exempt and cExempt.exemptInfraCount >= MAX_EXEMPT
+    val windowElapsed = and {
+      not(atCap),
+      match cExempt.lastInfraAt { | NoTime => false | At(t) => now - t > INFRA_WINDOW },
+    }
+    val cReset = if (windowElapsed and not(exemptCapHit)) { ...cExempt, infraCount: 0 } else cExempt
+    val infraCapHit = not(exempt) and cReset.infraCount >= MAX_INFRA
+    all {
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      execs' = execs.put(w, execAfter),
+      attempt' = NoAttempt,
+      promotionsLeft' = if (consumesPromotion) promotionsLeft - 1 else promotionsLeft,
+      if (exemptCapHit) all {
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...cExempt, poisonedAt: At(now) },
+        lastPoisonReason' = RExemptInfraBudget,
+        pg' = if (pgLost) pg else { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE2, chargedAny: true, terminal: true,
+          promoted: consumesPromotion, atCap: atCap },
+      } else if (infraCapHit) all {
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...cReset, poisonedAt: At(now) },
+        lastPoisonReason' = RInfraBudget,
+        pg' = if (pgLost) pg else { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE2, terminal: true, windowReset: windowElapsed,
+          promoted: consumesPromotion, atCap: atCap },
+      } else all {
+        dStatus' = DReady,
+        poisonSrc' = poisonSrc,
+        live' = if (exempt) cReset
+          else { ...cReset, infraCount: cReset.infraCount + 1, lastInfraAt: At(now) },
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE2, chargedAny: true, windowReset: windowElapsed,
+          exemptFallthrough: windowElapsed and exempt,
+          promoted: consumesPromotion, atCap: atCap },
+      },
+    },
+  }
+
+  // --- 7d. the disconnect entry point (E5) -------------------------------
+
+  /// Process the dead pod's stream close (or the equivalent heartbeat
+  /// timeout): remove the slot from the executor map, record the
+  /// mid-build death for the controller's follow-up report (unless a
+  /// race-ahead report already handled it -- last_completed), and
+  /// reassign: re-check the existing poison state over failures recorded
+  /// by other paths, else reset to Ready. A bare disconnect charges
+  /// nothing (contradiction C2: the spec says it should count; the code
+  /// does not, and this model encodes the code).
+  // Mirrors: executor.rs::handle_executor_disconnected +
+  //          reassign_derivations (E5).
+  action processDisconnect(w: str): bool = all {
+    match attempt { | PodDead(p) => p.exec == w | _ => false },
+    val e = execs.get(w)
+    val insertRd = not(e.lastCompletedOurs)
+    val stillRunning = dStatus == DRunning
+    val poisonNow = stillRunning and thresholdReached(live)
+    val applied = specApply(spec, FDisconnect(now), eligibleFleet)
+    all {
+      execs' = execs.put(w, { ...e,
+        registered: false, draining: false, runningOurs: false,
+        rd: if (insertRd) At(now) else e.rd,
+        rdForCtrl: if (insertRd) true else e.rdForCtrl }),
+      attempt' = NoAttempt,
+      spec' = if (stillRunning) applied.c else spec,
+      specVerdict' = if (stillRunning) applied.v else specVerdict,
+      if (poisonNow) all {
+        // 3 prior recorded failures + this disconnect: poison instead of
+        // a 4th dispatch (poison_and_cascade from reassign_derivations).
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...live, poisonedAt: At(now) },
+        lastPoisonReason' = RThreshold,
+        pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE5, terminal: true },
+      } else if (stillRunning) all {
+        // reset_to_ready + persist Ready: charge nothing.
+        dStatus' = DReady,
+        poisonSrc' = poisonSrc,
+        live' = live,
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE5 },
+      } else all {
+        // The derivation already left Running (a race-ahead report
+        // poisoned it at the cap): executor bookkeeping only; the
+        // reassign skips the node (reset_to_ready rejects).
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = live,
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE5 },
+      },
+    },
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, pgFaultsLeft' = pgFaultsLeft,
+    justFailedOver' = false, everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// A pending CompletionReport for a derivation that is no longer
+  /// Running (a late controller report from a previous death poisoned it
+  /// while this attempt was in flight): handle_completion's executor
+  /// bookkeeping still runs, the per-class handler is skipped by the
+  /// status guard, nothing is charged and no fold event is observed.
+  // Mirrors: completion.rs::handle_completion (the not-Assigned/Running
+  //          early return after the capacity-free hoist).
+  action processReportStale(w: str): bool = all {
+    match attempt { | Reported(r) => r.exec == w | _ => false },
+    dStatus != DRunning,
+    execs' = execs.put(w, { ...execs.get(w),
+      runningOurs: false, lastCompletedOurs: true, draining: true }),
+    attempt' = NoAttempt,
+    now' = now, dStatus' = dStatus, live' = live, poisonSrc' = poisonSrc,
+    spec' = spec, specVerdict' = specVerdict, pg' = pg,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, pgFaultsLeft' = pgFaultsLeft,
+    last' = noObs, lastPoisonReason' = lastPoisonReason,
+    justFailedOver' = false, everFailedBuilders' = everFailedBuilders,
+  }
+
+  // --- 7e. the controller-report entry points (E6/E7) ---------------------
+
+  /// E6, the normal (post-disconnect) order: the controller's
+  /// OOM/DiskPressure report is correlated back to the derivation
+  /// through the recently_disconnected entry (first-report-wins
+  /// removal). At the floor ceiling this path owns the infra cap check
+  /// and the increment; the increment does NOT stamp the window anchor
+  /// (DIVERGENCE D2). A floor-promoted report charges nothing
+  /// (DIVERGENCE D3 / contradiction C3). The derivation may already be
+  /// running its next attempt (the late installment) -- the status guard
+  /// admits Ready/Assigned/Running, so the charge lands regardless.
+  // Mirrors: executor.rs::handle_executor_termination (the rd-entry arm).
+  action ctrlDeliverOomLate(w: str, promoted: bool, atCap: bool): bool = all {
+    execs.get(w).ctrl == CtrlOom,
+    execs.get(w).rd != NoTime,
+    // the entry and the report name the same pod (a report for a newer
+    // death never matches an older incarnation's entry, and vice versa)
+    execs.get(w).rdForCtrl,
+    promoted implies promotionsLeft > 0,
+    not(promoted and atCap),
+    promoted or atCap,
+    val e = execs.get(w)
+    val statusOk = dStatus == DReady or dStatus == DRunning
+    val charges = statusOk and atCap
+    val capHit = charges and live.infraCount >= MAX_INFRA
+    val applied = specApply(spec,
+      FControllerTermination({ at: now, promoted: promoted, atCap: atCap }), eligibleFleet)
+    all {
+      execs' = execs.put(w, { ...e, rd: NoTime, ctrl: NoCtrl,
+        deathCharges: if (charges) e.deathCharges + 1 else e.deathCharges }),
+      spec' = if (statusOk) applied.c else spec,
+      specVerdict' = if (statusOk) applied.v else specVerdict,
+      promotionsLeft' = if (promoted) promotionsLeft - 1 else promotionsLeft,
+      if (capHit) all {
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...live, poisonedAt: At(now) },
+        lastPoisonReason' = RInfraBudget,
+        pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE6, terminal: true, atCap: atCap,
+          promoted: promoted, lateInstallment: true },
+      } else if (charges) all {
+        // DIVERGENCE D2: infra_count incremented, anchor NOT stamped.
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = { ...live, infraCount: live.infraCount + 1 },
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE6, chargedAny: true, atCap: atCap,
+          promoted: promoted, lateInstallment: true },
+      } else all {
+        // DIVERGENCE D3: the promoted arm charges nothing (or the
+        // status guard dropped the report).
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = live,
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE6, atCap: atCap, promoted: promoted,
+          lateInstallment: true },
+      },
+    },
+    attempt' = attempt,
+    now' = now, physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    pgFaultsLeft' = pgFaultsLeft, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// E6, the race-ahead order: the report lands before the disconnect.
+  /// The drv is resolved through the still-live executor's running_build
+  /// and last_completed is set so the imminent disconnect does not
+  /// insert a recently_disconnected entry (the I-197/ee9302b86 dedup).
+  // Mirrors: executor.rs::handle_executor_termination (the race-ahead arm).
+  action ctrlDeliverOomRaceAhead(w: str, promoted: bool, atCap: bool): bool = all {
+    match attempt { | PodDead(p) => p.exec == w and p.kind == DkOom | _ => false },
+    execs.get(w).ctrl == CtrlOom,
+    not(execs.get(w).ctrlStale),
+    execs.get(w).rd == NoTime,
+    promoted implies promotionsLeft > 0,
+    not(promoted and atCap),
+    promoted or atCap,
+    val e = execs.get(w)
+    val statusOk = dStatus == DReady or dStatus == DRunning
+    val charges = statusOk and atCap
+    val capHit = charges and live.infraCount >= MAX_INFRA
+    val applied = specApply(spec,
+      FControllerTermination({ at: now, promoted: promoted, atCap: atCap }), eligibleFleet)
+    all {
+      execs' = execs.put(w, { ...e, ctrl: NoCtrl, lastCompletedOurs: true,
+        deathCharges: if (charges) e.deathCharges + 1 else e.deathCharges }),
+      spec' = if (statusOk) applied.c else spec,
+      specVerdict' = if (statusOk) applied.v else specVerdict,
+      promotionsLeft' = if (promoted) promotionsLeft - 1 else promotionsLeft,
+      if (capHit) all {
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...live, poisonedAt: At(now) },
+        lastPoisonReason' = RInfraBudget,
+        pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE6, terminal: true, atCap: atCap,
+          promoted: promoted, raceAhead: true },
+      } else if (charges) all {
+        // DIVERGENCE D2 again: no anchor stamp.
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = { ...live, infraCount: live.infraCount + 1 },
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE6, chargedAny: true, atCap: atCap,
+          promoted: promoted, raceAhead: true },
+      } else all {
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = live,
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE6, atCap: atCap, promoted: promoted,
+          raceAhead: true },
+      },
+    },
+    attempt' = attempt,
+    now' = now, physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    pgFaultsLeft' = pgFaultsLeft, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// E7: the controller's DeadlineExceeded report, prefix-matched to a
+  /// recently_disconnected entry (no race-ahead arm exists for this
+  /// path). Charges timeout_count unconditionally under the cap; AT the
+  /// cap it poisons -- DIVERGENCE D1: the worker-reported E4 produces
+  /// terminal Cancelled for the same exhausted budget, so the verdict
+  /// depends on which observer reported first.
+  // Mirrors: executor.rs::handle_deadline_exceeded.
+  action ctrlDeliverDeadline(w: str): bool = all {
+    execs.get(w).ctrl == CtrlDeadline,
+    execs.get(w).rd != NoTime,
+    // the prefix match only ever finds pods of the reporting job: the
+    // entry must be the report's own death's.
+    execs.get(w).rdForCtrl,
+    val e = execs.get(w)
+    val statusOk = dStatus == DReady or dStatus == DRunning
+    val capHit = statusOk and live.timeoutCount >= MAX_TIMEOUT
+    val applied = specApply(spec, FControllerDeadlineExceeded(now), eligibleFleet)
+    all {
+      execs' = execs.put(w, { ...e, rd: NoTime, ctrl: NoCtrl,
+        deathCharges: if (statusOk) e.deathCharges + 1 else e.deathCharges }),
+      spec' = if (statusOk) applied.c else spec,
+      specVerdict' = if (statusOk) applied.v else specVerdict,
+      if (capHit) all {
+        // DIVERGENCE D1: poison_and_cascade where E4 cancels.
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...live, poisonedAt: At(now) },
+        lastPoisonReason' = RTimeoutBudget,
+        pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE7, terminal: true, lateInstallment: true },
+      } else if (statusOk) all {
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = { ...live, timeoutCount: live.timeoutCount + 1 },
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE7, chargedAny: true, lateInstallment: true },
+      } else all {
+        dStatus' = dStatus,
+        poisonSrc' = poisonSrc,
+        live' = live,
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE7, lateInstallment: true },
+      },
+    },
+    attempt' = attempt,
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, pgFaultsLeft' = pgFaultsLeft,
+    justFailedOver' = false, everFailedBuilders' = everFailedBuilders,
+  }
+
   /// The controller's report never lands (controller down, JOB_TTL
   /// expired, or the rd entry was swept first): the death stays
   /// unclassified -- "this one OOM didn't promote".
@@ -758,6 +1320,54 @@ module retryPolicy {
     pgFaultsLeft' = pgFaultsLeft, last' = last,
     lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
     everFailedBuilders' = everFailedBuilders,
+  }
+
+  // --- 7f. the backstop entry point (E8) ----------------------------------
+
+  /// The scheduler-side backstop timer for a wedged attempt: cancel
+  /// signal (best-effort, not modeled), the slot quarantined (draining,
+  /// running_build cleared), the attempt recorded into failed_builders /
+  /// failure_count -- with NO PG mirror (divergence D4) -- and the
+  /// reassign re-check poisons at the threshold or resets to Ready.
+  // Mirrors: housekeeping.rs::tick_scan_dag + tick_process_backstop_timeouts
+  //          -> reassign_derivations.
+  action backstopFires(w: str): bool = all {
+    ENABLE_WEDGE,
+    attempt == Wedged(w),
+    dStatus == DRunning,
+    val fb1 = live.failedBuilders.union(Set(w))
+    val c1 = { ...live, failedBuilders: fb1, failureCount: live.failureCount + 1 }
+    val poisonNow = c1.failedBuilders.size() >= THRESHOLD
+    val applied = specApply(spec, FBackstopTimeout({ at: now, exec: w }), eligibleFleet)
+    all {
+      execs' = execs.put(w, { ...execs.get(w), runningOurs: false, draining: true }),
+      attempt' = NoAttempt,
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      if (poisonNow) all {
+        dStatus' = DPoisoned,
+        poisonSrc' = EventPoison,
+        live' = { ...c1, poisonedAt: At(now) },
+        lastPoisonReason' = RThreshold,
+        pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        last' = { ...noObs, kind: OE8, chargedAny: true, terminal: true },
+      } else all {
+        dStatus' = DReady,
+        poisonSrc' = poisonSrc,
+        live' = c1,
+        lastPoisonReason' = lastPoisonReason,
+        pg' = pg,
+        depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal,
+        last' = { ...noObs, kind: OE8, chargedAny: true },
+      },
+    },
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, pgFaultsLeft' = pgFaultsLeft,
+    justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders.union(Set(w)),
   }
 
   // --- 7g. executor lifecycle ---------------------------------------------
@@ -780,6 +1390,106 @@ module retryPolicy {
     attempt' = attempt, promotionsLeft' = promotionsLeft,
     physAttempts' = physAttempts, failoversLeft' = failoversLeft,
     pgFaultsLeft' = pgFaultsLeft, last' = last,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  // --- 7h. resets ----------------------------------------------------------
+
+  /// The dag::merge resubmit reset: a retriable terminal node
+  /// (Cancelled unconditionally; Poisoned iff resubmit_cycles <
+  /// POISON_RESUBMIT_RETRY_LIMIT) gets a fresh per-cycle state with
+  /// resubmit_cycles incremented; PG is cleared via clear_poison_batch
+  /// (best-effort -- a lost write leaves the stale row for recovery).
+  /// The dependent's DependencyFailed is reset by the same merge.
+  // Mirrors: dag/mod.rs (the resubmit-reset arm) + merge.rs
+  //          clear_poison_batch + derivation.rs::is_retriable_on_resubmit.
+  action resubmitReset(pgLost: bool): bool = all {
+    ENABLE_RESETS,
+    or {
+      dStatus == DCancelled,
+      and { dStatus == DPoisoned, live.resubmitCycles < RESUBMIT_LIMIT },
+    },
+    pgLost implies pgFaultsLeft > 0,
+    val applied = specApply(spec, FResubmitReset(now), eligibleFleet)
+    all {
+      dStatus' = DReady,
+      poisonSrc' = NoPoison,
+      live' = { ...zeroCounters, resubmitCycles: live.resubmitCycles + 1 },
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      pg' = if (pgLost) pg else { ...pg, status: PgNonTerminal, poisonedAt: NoTime,
+        failedBuilders: Set(), retryCount: 0, resubmitCycles: pg.resubmitCycles + 1 },
+      depStatus' = DepReady,
+      last' = { ...noObs, kind: OResubmit },
+    },
+    everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt, execs' = execs,
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft,
+    pgFaultsLeft' = if (pgLost) pgFaultsLeft - 1 else pgFaultsLeft,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// The cache-hit clear: the poisoned derivation's output turned up in
+  /// the store (another tenant built it / a re-probe found it
+  /// substitutable), so the failure history is moot: RetryState::clear()
+  /// (backoff_until survives), transition to Completed, best-effort PG
+  /// poison clear.
+  // Mirrors: merge.rs::apply_cached_hits / dispatch.rs spawn_substitute
+  //          reprobe lane (the Poisoned arm) + db::clear_poison.
+  action cacheHitClear(pgLost: bool): bool = all {
+    ENABLE_RESETS,
+    dStatus == DPoisoned,
+    pgLost implies pgFaultsLeft > 0,
+    val applied = specApply(spec, FCacheHitClear(now), eligibleFleet)
+    all {
+      dStatus' = DCompleted,
+      poisonSrc' = NoPoison,
+      live' = clearForCacheHit(live),
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      pg' = if (pgLost) pg else { status: PgCompleted, retryCount: 0,
+        failedBuilders: Set(), resubmitCycles: 0, poisonedAt: NoTime },
+      last' = { ...noObs, kind: OCacheHit },
+    },
+    depStatus' = depStatus,
+    everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt, execs' = execs,
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft,
+    pgFaultsLeft' = if (pgLost) pgFaultsLeft - 1 else pgFaultsLeft,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// The poison TTL expiry (the admin ClearPoison path is identical
+  /// minus the time gate and is not modeled separately): PG is cleared
+  /// FIRST (a failed clear aborts -- equivalently, the action does not
+  /// fire), then the node is removed from the DAG; the next merge would
+  /// re-insert it fresh (not modeled -- DAbsent is a sink).
+  // Mirrors: housekeeping.rs::tick_process_expired_poisons +
+  //          db::clear_poison (the full reset).
+  action poisonTtlExpires = all {
+    ENABLE_RESETS,
+    dStatus == DPoisoned,
+    poisonTtlElapsed,
+    val applied = specApply(spec, FPoisonCleared(now), eligibleFleet)
+    all {
+      dStatus' = DAbsent,
+      poisonSrc' = NoPoison,
+      live' = zeroCounters,
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      pg' = freshPg,
+      last' = { ...noObs, kind: OTtlExpire },
+    },
+    depStatus' = depStatus,
+    everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt, execs' = execs,
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, pgFaultsLeft' = pgFaultsLeft,
     lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
     everFailedBuilders' = everFailedBuilders,
   }
@@ -898,14 +1608,13 @@ module retryPolicy {
 
   // --- 9. step --------------------------------------------------------------
   // Every disjunct is a named action with its nondet choices bound
-  // directly inside it. The decision-bearing entry points (dispatch,
-  // E1-E9, the resets) join in the next stage; this stage wires the
-  // attempt-end / channel / failover machinery only.
+  // directly inside it.
 
   pure val REPORT_CLASSES = Set(RcTransient, RcInfraPutPath, RcInfraOom, RcInfraOther, RcPermanent, RcTimeout)
   pure val DEATH_KINDS = Set(DkOom, DkDeadline, DkCrash)
   pure val BOOLS = Set(true, false)
 
+  action dispatchToAny = { nondet w = EXECUTORS.oneOf() dispatchTo(w) }
   action buildEndsReportedAny = {
     nondet w = EXECUTORS.oneOf()
     nondet class = REPORT_CLASSES.oneOf()
@@ -918,16 +1627,55 @@ module retryPolicy {
     buildEndsPodDeath(w, kind)
   }
   action buildWedgesAny = { nondet w = EXECUTORS.oneOf() buildWedges(w) }
+  action processReportAny = {
+    nondet w = EXECUTORS.oneOf()
+    nondet class = REPORT_CLASSES.oneOf()
+    nondet dual = BOOLS.oneOf()
+    nondet promoted = BOOLS.oneOf()
+    nondet atCap = BOOLS.oneOf()
+    nondet pgLost = BOOLS.oneOf()
+    processReport(w, class, dual, promoted, atCap, pgLost)
+  }
+  action processReportStaleAny = { nondet w = EXECUTORS.oneOf() processReportStale(w) }
+  action processDisconnectAny = { nondet w = EXECUTORS.oneOf() processDisconnect(w) }
+  action ctrlDeliverOomLateAny = {
+    nondet w = EXECUTORS.oneOf()
+    nondet promoted = BOOLS.oneOf()
+    nondet atCap = BOOLS.oneOf()
+    ctrlDeliverOomLate(w, promoted, atCap)
+  }
+  action ctrlDeliverOomRaceAheadAny = {
+    nondet w = EXECUTORS.oneOf()
+    nondet promoted = BOOLS.oneOf()
+    nondet atCap = BOOLS.oneOf()
+    ctrlDeliverOomRaceAhead(w, promoted, atCap)
+  }
+  action ctrlDeliverDeadlineAny = { nondet w = EXECUTORS.oneOf() ctrlDeliverDeadline(w) }
   action ctrlReportLostAny = { nondet w = EXECUTORS.oneOf() ctrlReportLost(w) }
+  action backstopFiresAny = { nondet w = EXECUTORS.oneOf() backstopFires(w) }
   action respawnExecutorAny = { nondet w = EXECUTORS.oneOf() respawnExecutor(w) }
+  action resubmitResetAny = { nondet pgLost = BOOLS.oneOf() resubmitReset(pgLost) }
+  action cacheHitClearAny = { nondet pgLost = BOOLS.oneOf() cacheHitClear(pgLost) }
 
   action step = any {
     tick,
+    dispatchToAny,
+    dispatchFleetExhaust,
     buildEndsReportedAny,
     buildEndsPodDeathAny,
     buildWedgesAny,
+    processReportAny,
+    processReportStaleAny,
+    processDisconnectAny,
+    ctrlDeliverOomLateAny,
+    ctrlDeliverOomRaceAheadAny,
+    ctrlDeliverDeadlineAny,
     ctrlReportLostAny,
+    backstopFiresAny,
     respawnExecutorAny,
+    resubmitResetAny,
+    cacheHitClearAny,
+    poisonTtlExpires,
     leaderFailover,
   }
 }
