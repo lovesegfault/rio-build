@@ -87,16 +87,60 @@ struct Inner {
     next_seq: AtomicU32,
 }
 
+/// The "is any client handle still alive?" sentinel.
+///
+/// Client handles share an `Arc<Conn>`; the reader thread holds an
+/// `Arc<Inner>` directly. The two refcounts are deliberately separate:
+/// the reader must keep the socket and the pending map alive while it
+/// drains, but its own liveness must not keep the *connection* alive —
+/// otherwise dropping every client handle would leave the reader
+/// parked in `recvmsg` holding the last strong reference forever, the
+/// socket would never shut down, and the daemon would never see the
+/// EOF that triggers its conn-drop teardown (umount the castore mount,
+/// reap the staging dir).
+struct Conn {
+    shared: Arc<Inner>,
+    /// Joined on drop, after the shutdown that guarantees it exits.
+    /// `Option` so `Drop` can `take()` it.
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Conn {
+    /// Runs when the last client handle drops. Shuts the socket down —
+    /// the daemon's `recvmsg` returns EOF (its cue to tear the build
+    /// down) and the reader thread's blocked `recvmsg` returns EOF
+    /// (closing the fd alone does NOT reliably interrupt a thread
+    /// already parked in `recvmsg(2)`; `shutdown(2)` does) — then joins
+    /// the reader so no thread outlives the connection. The join is
+    /// bounded: post-shutdown the reader's next `recvmsg` returns
+    /// immediately and its drain path only sends on never-blocking
+    /// capacity-1 channels.
+    fn drop(&mut self) {
+        let _ = nix::sys::socket::shutdown(
+            self.shared.sock.as_raw_fd(),
+            nix::sys::socket::Shutdown::Both,
+        );
+        if let Some(reader) = self.reader.take()
+            && let Err(e) = reader.join()
+        {
+            tracing::error!(?e, "mountd-reader thread panicked");
+        }
+    }
+}
+
 /// Handle to one mountd connection. Cheap to clone; the underlying
 /// socket and reader thread are shared.
 ///
-/// Dropping the last handle shuts the socket down, which (a) wakes the
-/// reader thread so it exits and (b) signals teardown to the daemon
-/// (mountd unmounts the build's castore mount and reaps its staging
-/// dir on connection close).
+/// Dropping the last handle disconnects: the socket is shut down, the
+/// reader thread is joined, and the daemon observes EOF — which is its
+/// signal to umount the build's castore mount and reap its staging
+/// dir. There is deliberately no force-close that yanks the socket out
+/// from under live clones: the FUSE callbacks hold a clone for
+/// `BackingOpen`/`BackingClose`/`Promote`, and the connection must
+/// outlive the last of them.
 #[derive(Clone)]
 pub struct MountdClient {
-    inner: Arc<Inner>,
+    conn: Arc<Conn>,
 }
 
 impl MountdClient {
@@ -117,22 +161,34 @@ impl MountdClient {
     /// Wrap an already-connected `SOCK_SEQPACKET` fd (tests use a
     /// `socketpair` half).
     pub fn from_fd(sock: OwnedFd) -> Self {
-        let inner = Arc::new(Inner {
+        let shared = Arc::new(Inner {
             sock,
             send: Mutex::new(()),
             pending: Mutex::new(Some(HashMap::new())),
             next_seq: AtomicU32::new(1),
         });
-        let reader = Arc::clone(&inner);
-        // The reader thread holds an Arc, so the socket outlives it.
-        // It exits when recv_frame returns Eof/Err — which happens when
-        // the daemon closes the connection or when the last client
-        // handle drops and `Drop` calls shutdown(2).
-        std::thread::Builder::new()
+        let reader_shared = Arc::clone(&shared);
+        // The reader holds its own strong Arc<Inner> (NOT an Arc<Conn>)
+        // so the socket and pending map outlive its drain path without
+        // its liveness keeping the connection open. It exits when
+        // recv_frame returns Eof/Err — on daemon-side close, or on the
+        // shutdown(2) issued by Conn::drop when the last client handle
+        // goes away.
+        let reader = std::thread::Builder::new()
             .name("mountd-reader".into())
-            .spawn(move || reader_loop(&reader))
+            .spawn(move || reader_loop(&reader_shared))
             .expect("spawn mountd-reader thread");
-        Self { inner }
+        Self {
+            conn: Arc::new(Conn {
+                shared,
+                reader: Some(reader),
+            }),
+        }
+    }
+
+    /// The connection state shared with the reader thread.
+    fn shared(&self) -> &Inner {
+        &self.conn.shared
     }
 
     /// Allocate a seq, register the reply slot, and send one frame.
@@ -141,7 +197,7 @@ impl MountdClient {
         req: Req,
         fds: &[RawFd],
     ) -> Result<(u32, Receiver<Delivery>), MountdError> {
-        let bytes_seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        let bytes_seq = self.shared().next_seq.fetch_add(1, Ordering::Relaxed);
         let frame = proto::encode(&Request {
             seq: bytes_seq,
             req,
@@ -151,7 +207,7 @@ impl MountdClient {
         // slot absorbs the late reply, then the whole channel drops).
         let (tx, rx) = std::sync::mpsc::sync_channel::<Delivery>(1);
         {
-            let mut pending = self.inner.pending.lock().ignore_poison();
+            let mut pending = self.shared().pending.lock().ignore_poison();
             let Some(map) = pending.as_mut() else {
                 return Err(MountdError::Disconnected(
                     "connection already closed".into(),
@@ -159,10 +215,10 @@ impl MountdClient {
             };
             map.insert(bytes_seq, tx);
         }
-        let _send_guard = self.inner.send.lock().ignore_poison();
-        if let Err(e) = proto::send_frame(self.inner.sock.as_raw_fd(), &frame, fds) {
+        let _send_guard = self.shared().send.lock().ignore_poison();
+        if let Err(e) = proto::send_frame(self.shared().sock.as_raw_fd(), &frame, fds) {
             // Send failed — deregister so the slot doesn't leak.
-            if let Some(map) = self.inner.pending.lock().ignore_poison().as_mut() {
+            if let Some(map) = self.shared().pending.lock().ignore_poison().as_mut() {
                 map.remove(&bytes_seq);
             }
             return Err(e.into());
@@ -185,7 +241,7 @@ impl MountdClient {
                 // Timed out (or the reader dropped the sender without a
                 // drain message, which cannot happen — the drain always
                 // sends). Deregister so a late reply is dropped.
-                if let Some(map) = self.inner.pending.lock().ignore_poison().as_mut() {
+                if let Some(map) = self.shared().pending.lock().ignore_poison().as_mut() {
                     map.remove(&seq);
                 }
                 Err(MountdError::Timeout(timeout))
@@ -309,16 +365,9 @@ fn reader_loop(inner: &Inner) {
     tracing::info!(reason, "rio-mountd connection reader exiting");
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
-        // Wake the reader thread out of its blocking recvmsg. Closing
-        // the fd alone does NOT reliably interrupt a thread already
-        // parked in recvmsg(2); shutdown(2) does (the recv returns 0 →
-        // Eof). Best-effort: if the socket is already dead this is
-        // ENOTCONN, which is fine.
-        let _ = nix::sys::socket::shutdown(self.sock.as_raw_fd(), nix::sys::socket::Shutdown::Both);
-    }
-}
+// No `Drop for Inner`: by the time the last `Arc<Inner>` drops, the
+// socket has already been shut down (by `Conn::drop`) or closed by the
+// daemon, and the reader has exited. `OwnedFd`'s own drop closes the fd.
 
 #[cfg(test)]
 mod tests {
@@ -349,6 +398,59 @@ mod tests {
     }
 
     const T: Duration = Duration::from_secs(5);
+
+    /// Dropping the last client handle disconnects: the daemon observes
+    /// EOF (its cue to umount the build's castore mount and reap its
+    /// staging dir) and the reader thread exits and releases its
+    /// resources. A surviving clone keeps the connection open — only
+    /// the LAST drop disconnects. This is the contract P0560's whole
+    /// teardown path hangs off; a reader thread holding a strong
+    /// reference to the connection would break it (the socket would
+    /// never shut down and every build would leak its mount until the
+    /// builder process exited).
+    #[test]
+    fn dropping_the_last_handle_disconnects_the_daemon() {
+        let (client, daemon) = pair();
+        // Observes the reader thread's exit: the reader holds the only
+        // other strong `Arc<Inner>`, so a strong count of zero proves
+        // it returned (and that the socket fd was released).
+        let inner = Arc::downgrade(&client.conn.shared);
+
+        // A live clone keeps the connection open after the original
+        // handle drops.
+        let survivor = client.clone();
+        drop(client);
+        let c = survivor.clone();
+        let call = std::thread::spawn(move || c.backing_close(1, T));
+        let req = recv_request(&daemon);
+        send_reply(
+            &daemon,
+            &Reply {
+                seq: req.seq,
+                resp: Resp::Ok,
+            },
+        );
+        call.join()
+            .unwrap()
+            .expect("connection still live while any handle survives");
+
+        // Dropping the last handle shuts the socket down and joins the
+        // reader before returning, so both effects are observable
+        // immediately — no polling, no sleeps.
+        drop(survivor);
+        assert_eq!(
+            inner.strong_count(),
+            0,
+            "the reader thread must exit and release the connection state"
+        );
+        assert!(
+            matches!(
+                proto::recv_frame(daemon.as_raw_fd()),
+                Err(proto::FrameError::Eof)
+            ),
+            "the daemon must observe EOF when the last client handle drops"
+        );
+    }
 
     #[test]
     fn backing_open_roundtrip() {

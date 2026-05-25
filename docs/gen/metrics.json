@@ -9,11 +9,9 @@
     "rio_builder_castore_fuse_eio_total",
     "rio_builder_castore_fuse_fetch_bytes_total",
     "rio_builder_castore_fuse_integrity_fail_total",
-    "rio_builder_castore_fuse_lookup_total",
     "rio_builder_castore_fuse_open_case_total",
     "rio_builder_castore_fuse_open_mode_total",
     "rio_builder_castore_fuse_open_seconds",
-    "rio_builder_castore_fuse_readdir_total",
     "rio_builder_castore_fuse_upcalls_total",
     "rio_builder_cgroup_leak_total",
     "rio_builder_cgroup_oom_total",
@@ -291,11 +289,6 @@
         "help": "Castore-FUSE fetches whose bytes did not blake3-hash to the requested file_digest. The bytes are discarded and the open fails with EIO. Nonzero = corrupt store content or a transport integrity failure — investigate immediately."
       },
       {
-        "name": "rio_builder_castore_fuse_lookup_total",
-        "kind": "counter",
-        "help": "Castore-FUSE cold lookup() upcalls (first touch of each (parent, name) pair — the dcache absorbs repeats at Duration::MAX ttl)."
-      },
-      {
         "name": "rio_builder_castore_fuse_open_case_total",
         "kind": "counter",
         "help": "Castore-FUSE open() dispatch decisions: hit (backing cache), miss_small (whole-file JIT fetch), miss_stream (above stream_threshold; streaming in P0575), wait_fetching (another open of the same digest was already filling)."
@@ -311,14 +304,9 @@
         "help": "Castore-FUSE open() upcall-to-reply latency, labeled by hit (node_ssd = backing-cache hit, remote = JIT fetch)."
       },
       {
-        "name": "rio_builder_castore_fuse_readdir_total",
-        "kind": "counter",
-        "help": "Castore-FUSE cold readdir()/readdirplus() upcalls (first enumeration of each directory — FOPEN_CACHE_DIR absorbs repeats)."
-      },
-      {
         "name": "rio_builder_castore_fuse_upcalls_total",
         "kind": "counter",
-        "help": "Castore-FUSE kernel upcalls by op (lookup/getattr/readdir/readlink/open/read). With every cache TTL infinite the steady-state rate is ~one per distinct dentry per build; read>0 means passthrough is not engaging."
+        "help": "Castore-FUSE kernel upcalls by op (lookup/getattr/readdir/readlink/open/read). The single cold-metadata counter: with every cache TTL infinite, lookup/readdir fire ~once per distinct dentry per build (the dcache and FOPEN_CACHE_DIR absorb repeats); op=\"read\">0 means passthrough is not engaging."
       },
       {
         "name": "rio_builder_cgroup_leak_total",

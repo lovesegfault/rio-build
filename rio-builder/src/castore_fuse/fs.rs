@@ -240,7 +240,6 @@ impl Filesystem for CastoreFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         Self::count_upcall("lookup");
-        metrics::counter!("rio_builder_castore_fuse_lookup_total").increment(1);
         match self.tree.lookup(parent.0, name.as_bytes()) {
             Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
             // Outside the prefetched DAG → negative dentry with
@@ -292,7 +291,6 @@ impl Filesystem for CastoreFs {
         mut reply: ReplyDirectory,
     ) {
         Self::count_upcall("readdir");
-        metrics::counter!("rio_builder_castore_fuse_readdir_total").increment(1);
         let Some(children) = self.tree.children(ino.0) else {
             reply.error(Errno::ENOTDIR);
             return;
@@ -334,7 +332,6 @@ impl Filesystem for CastoreFs {
         mut reply: ReplyDirectoryPlus,
     ) {
         Self::count_upcall("readdir");
-        metrics::counter!("rio_builder_castore_fuse_readdir_total").increment(1);
         let Some(children) = self.tree.children(ino.0) else {
             reply.error(Errno::ENOTDIR);
             return;

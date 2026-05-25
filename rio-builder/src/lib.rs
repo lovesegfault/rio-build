@@ -147,18 +147,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_castore_fuse_upcalls_total",
         "Castore-FUSE kernel upcalls by op (lookup/getattr/readdir/readlink/open/read). \
-         With every cache TTL infinite the steady-state rate is ~one per distinct dentry \
-         per build; read>0 means passthrough is not engaging."
-    );
-    describe_counter!(
-        "rio_builder_castore_fuse_lookup_total",
-        "Castore-FUSE cold lookup() upcalls (first touch of each (parent, name) pair — \
-         the dcache absorbs repeats at Duration::MAX ttl)."
-    );
-    describe_counter!(
-        "rio_builder_castore_fuse_readdir_total",
-        "Castore-FUSE cold readdir()/readdirplus() upcalls (first enumeration of each \
-         directory — FOPEN_CACHE_DIR absorbs repeats)."
+         The single cold-metadata counter: with every cache TTL infinite, lookup/readdir \
+         fire ~once per distinct dentry per build (the dcache and FOPEN_CACHE_DIR absorb \
+         repeats); op=\"read\">0 means passthrough is not engaging."
     );
     describe_counter!(
         "rio_builder_castore_fuse_open_mode_total",
