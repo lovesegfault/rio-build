@@ -2572,25 +2572,26 @@ impl SubstituteAuth {
 }
 
 /// `reason` label values for `rio_scheduler_substitute_demotions_total`,
-/// derived from the FINAL error that demoted a non-forgivable path. A
-/// small fixed set — never the raw store message or the path.
+/// derived from the FINAL error that demoted a non-forgivable path
+/// (attempts within one path's retry ladder can fail with different
+/// codes; the last one is what the walk gave up on). A small fixed set
+/// — never the raw store message or the path.
 ///
-/// - `not_found`: a plain path-not-found after the retry ladder — every
-///   configured upstream definitively missed on every attempt (the HEAD
-///   probe and the GET really did disagree, persistently).
-/// - `not_found_infra`: the NotFound message indicates the request
-///   never reached the upstream (auth chain / substituter config) — fix
-///   the infrastructure, the path is probably fine.
+/// - `not_found`: the final attempt was a plain path-not-found — every
+///   configured upstream definitively missed (the HEAD probe and the
+///   GET really did disagree).
+/// - `not_found_infra`: the final attempt's NotFound message indicates
+///   the request never reached an upstream (auth chain / substituter
+///   config) — fix the infrastructure, the path is probably fine. The
+///   substrings are pinned against rio-store's `substitute_path_impl`
+///   refusal messages by `demotion_reason_classifies_store_messages`.
 /// - `error`: a non-transient, non-NotFound gRPC error (no retry).
-/// - `exhausted`: transient errors on every attempt of the ladder.
+/// - `exhausted`: the retry budget ran out on a transient error.
 fn demotion_reason(e: &tonic::Status) -> &'static str {
     match e.code() {
         tonic::Code::NotFound => {
             let m = e.message();
-            if m.contains("no tenant context")
-                || m.contains("substituter not configured")
-                || m.contains("substitution disabled")
-            {
+            if m.contains("no tenant context") || m.contains("substituter not configured") {
                 "not_found_infra"
             } else {
                 "not_found"
@@ -2963,12 +2964,13 @@ pub(super) async fn walk_substitute_closure(
             // final attempt's error here. The consequence is "compile
             // the derivation (and its build closure) from source", so
             // the WHY must survive into the log: `store_msg` is
-            // rio-store's own reason — "no tenant context on request"
-            // / "substituter not configured" mean the request never
-            // reached cache.nixos.org (fix the auth chain / config); a
-            // bare "path not found" means every configured upstream
-            // definitively missed on every attempt (the HEAD probe and
-            // the GET really did disagree). Indistinguishable before
+            // rio-store's own reason for the FINAL attempt — "no
+            // tenant context on request" / "substituter not
+            // configured" mean that request never reached
+            // cache.nixos.org (fix the auth chain / config); a bare
+            // "path not found" means every configured upstream
+            // definitively missed it (the HEAD probe and the GET
+            // really did disagree). Indistinguishable before
             // 2026-05-23.
             let store_msg = last_err
                 .as_ref()
@@ -3000,6 +3002,57 @@ pub(super) async fn walk_substitute_closure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin `demotion_reason`'s message-substring classifier against the
+    /// THREE NotFound shapes rio-store's `substitute_path_impl`
+    /// actually produces (rio-store/src/grpc/queries.rs). The reason
+    /// label is the only alertable signal that distinguishes "the
+    /// upstream really missed" from "the request never reached the
+    /// upstream"; if the store re-words a refusal message and the
+    /// substring no longer matches, the infra case silently collapses
+    /// into `not_found` — this test breaks instead.
+    #[test]
+    fn demotion_reason_classifies_store_messages() {
+        let p = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x";
+        for (status, want) in [
+            // queries.rs: the no-substituter refusal.
+            (
+                tonic::Status::not_found(format!(
+                    "path not found (substituter not configured on this store replica): {p}"
+                )),
+                "not_found_infra",
+            ),
+            // queries.rs: the no-tenant refusal.
+            (
+                tonic::Status::not_found(format!(
+                    "path not found (no tenant context on request — substitution \
+                     requires x-rio-tenant-token or x-rio-probe-tenant-id + \
+                     x-rio-service-token): {p}"
+                )),
+                "not_found_infra",
+            ),
+            // queries.rs: the genuine all-upstreams-missed terminal.
+            (
+                tonic::Status::not_found(format!("path not found: {p}")),
+                "not_found",
+            ),
+            // Transient code → the ladder ran out of budget.
+            (
+                tonic::Status::unavailable("connection refused"),
+                "exhausted",
+            ),
+            // Non-transient, non-NotFound → no retry.
+            (tonic::Status::internal("boom"), "error"),
+        ] {
+            assert_eq!(
+                demotion_reason(&status),
+                want,
+                "code={:?} msg={:?}",
+                status.code(),
+                status.message()
+            );
+        }
+    }
 
     // check_freeze state machine. `backdate` (from actor/mod.rs) lets us
     // construct Instants in the past without waiting or mocking the clock.

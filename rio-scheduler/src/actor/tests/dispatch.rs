@@ -3960,19 +3960,20 @@ async fn walk_forgives_unwanted_seed_without_retrying() -> TestResult {
     Ok(())
 }
 
-/// The NON-TRANSIENT-ERROR arm (generic `Err(e)`, here `Internal`) has
-/// its own forgiveness gate: a forgivable seed that fails with a
-/// non-transient error must not fail the walk; the same failure on a
-/// non-forgivable seed must. Single-seed A/B because the mock's fault
-/// knob is global (every QPI fails) — the wanted-seed-succeeds-while-
-/// unwanted-fails composition is covered by the NotFound pair above
-/// and the end-to-end test below.
+/// A NON-TRANSIENT error (generic `Err(e)`, here `Internal`) is
+/// forgiven iff the seed is forgivable: the dedicated first-failure
+/// forgiveness arm catches it for a forgivable seed; a non-forgivable
+/// seed falls through to the generic `Err(e)` arm and demotes
+/// immediately (no retry ladder). Single-seed A/B because the mock's
+/// fault knob is global (every QPI fails) — the wanted-seed-succeeds-
+/// while-unwanted-fails composition is covered by the NotFound pair
+/// above and the end-to-end test below.
 #[tokio::test]
 async fn walk_forgives_unwanted_seed_non_transient_error() -> TestResult {
     use std::sync::atomic::Ordering;
     let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    // Internal — non-transient, not NotFound → the generic `Err(e)`
-    // arm on the FIRST attempt (no retry ladder).
+    // Internal — non-transient, not NotFound → decided on the FIRST
+    // attempt either way (no retry ladder).
     store
         .faults
         .fail_query_path_info_permanent
@@ -4001,8 +4002,10 @@ async fn walk_forgives_unwanted_seed_non_transient_error() -> TestResult {
             "{tag}: a non-transient error on a seed must be forgiven \
              iff the seed is forgivable"
         );
-        // Structural: exactly one attempt — the error arm fired, not
-        // the retry ladder / exhaust fallthrough.
+        // Structural: exactly one attempt — the first-failure
+        // forgiveness arm (forgivable) or the generic error arm
+        // (non-forgivable) fired, not the retry ladder / exhaust
+        // fallthrough.
         assert_eq!(
             store
                 .calls
@@ -4012,8 +4015,8 @@ async fn walk_forgives_unwanted_seed_non_transient_error() -> TestResult {
                 .get(&dbg)
                 .copied(),
             Some(1),
-            "{tag}: Internal is non-transient → no retries → the \
-             generic Err(e) arm made the decision"
+            "{tag}: Internal is non-transient → no retries → decided \
+             on the first attempt"
         );
     }
     Ok(())
