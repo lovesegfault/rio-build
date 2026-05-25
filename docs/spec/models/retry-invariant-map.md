@@ -510,3 +510,111 @@ referenceFold unit-test markers), `sched.retry.no-double-count` and
 `quint-retry-policy-divergence-verdict` (an expect-violation check while
 the as-built code still carries D1; it flips to a HOLD check with the
 Phase-1 fix).
+
+## Post-integration re-validation: harden-subst's substitution-walk changes
+
+Stage A and Stage B were derived from the pre-`harden-subst` tree. This
+section records the re-validation of the Stage-A artifacts (the protocol
+inventory, this map, the `referenceFold`) and the Stage-B model against the
+integrated tree, after `formal-sprint` was rebased onto `harden-subst`
+(`ebb0270eb`). Substitution-walk commits checked: `01344dacd` (walk failure
+gated on wanted seeds only), `a62fcf7e6` (error / retry-exhaust forgiveness
+gates), `317b9cdd3` (forgiven-seed re-check against the post-walk wanted
+set), `7489817da` (contradicted-NotFound retry + demotion-reason taxonomy),
+`aae914cae` (downgraded-walk re-spawn for terminal / topdown-pruned revert
+targets), `d8c82ae7c` (stale-Completed re-substitution routed on the wanted
+subset), `a50f1f590` (not_found demotion-label honesty), plus the base
+wanted-outputs plumbing they build on (`91e8daae4`, `18d6c257d`,
+`01fbc008c`, `99949da37`, `024172387`, `843dac621`).
+
+### Verdict: the fold, the model, and the E1–E9 alphabet are unaffected
+
+- **Which events reach E5.** E5 (`reassign_derivations`,
+  `actor/executor.rs`) is byte-identical to the pre-integration code:
+  harden-subst touches neither `actor/executor.rs` nor `actor/completion.rs`,
+  `actor/housekeeping.rs`, `actor/floor.rs`, `actor/event.rs`,
+  `state/executor.rs`, nor `retry_policy.rs`. No substitution event reached
+  E5 before the integration and none does after; the substitution-failure
+  path remains the *adjacent decider* (`handle_substitute_complete`) this
+  map already excludes from the fold ("Out of scope" above).
+- **Charging semantics encoded by the fold.** Unchanged and still accurate.
+  Inside `actor/dispatch.rs` and `actor/merge.rs` the harden-subst diff
+  contains no edits to the fold-relevant sites: no `RetryState` counter
+  increments, no `retry.clear()` cache-hit clear sites, no
+  `backoff_until` writes, no `insert_drv_execution` / exec_id minting, no
+  `poison_and_cascade` callers, no `failed_builders_exhausts_fleet`
+  changes. A substitution failure still charges no `RetryState` counter —
+  it consumes only the `substitute_tried` one-shot, which the fold's event
+  alphabet deliberately excludes. The fold and `retryPolicy.qnt` therefore
+  need no re-derivation; the Stage-B verdict table stands.
+- **Spec-rule ids.** The rule sets are disjoint: harden-subst
+  adds/bumps `gw.conn.*`, `gw.dag.reconstruct+3`, `sched.merge.wanted-outputs`,
+  `sched.merge.stale-completed-verify+4`, `sched.substitute.detached+3`,
+  `builder.seccomp.localhost-profile+3`; none collides with the
+  `sched.retry.*` / `sched.lease.*` / `store.log.*` / `obs.log.*` ids this
+  campaign added (base-id intersection is empty; `tracey-validate` is the
+  mechanical check).
+- **Migration number.** The integrated tree's migration sequence is
+  `062_derivation_wanted_outputs` (harden-subst), `063_leader_generation_claims`,
+  `064_log_chunks`, `065_drop_drv_logs`. The retry-formal attempt-ledger
+  migration (Phase 1a) takes **066**.
+
+### What did change: the substitution-failure adjacent decider
+
+The changes alter *when and how often* `handle_substitute_complete`'s
+failure arm fires and *what it observes* — not what it charges. For the
+Stage-C executor re-deriving the inventory's substitution rows
+(§1.3 `substitute_tried` / `topdown_pruned` / the SUBSTITUTE_FETCH loop,
+and the §2.1 adjacent-decider row), the corrections are:
+
+1. **Signature and command shape.** `SubstituteComplete` now carries
+   `forgiven: Vec<String>` (the forgivable seeds that actually failed and
+   were forgiven), and the handler is
+   `handle_substitute_complete(drv_hash, ok, forgiven)`. The handler
+   re-checks `forgiven` against the node's *current* wanted paths: if any
+   forgiven seed has become wanted since the walk was spawned, an `ok=true`
+   completion is downgraded to the failure arm (`forgiven_now_wanted`).
+2. **The failure arm fires less often for genuine misses.** A failed seed
+   that is *unwanted* (outside the post-merge wanted union) is forgiven on
+   its first failure of any kind and no longer fails the walk; NotFound
+   responses now consume the same 8-attempt backoff ladder
+   (`SUBSTITUTE_FETCH_MAX_ATTEMPTS`) as transient errors before the walk
+   gives up. Only wanted-seed failures (after retry exhaustion) and
+   reference-BFS holes still produce `ok=false`.
+3. **The failure arm fires *more* often for stale-Completed nodes.**
+   `verify_preexisting_completed`'s routing now forgives unwanted recorded
+   outputs the same way its reset decision does, so a stale Completed node
+   whose *wanted* outputs are substitutable is routed to the detached
+   re-substitution walk (and therefore to this handler) instead of being
+   pushed straight to Ready/from-source dispatch.
+4. **The `substitute_tried` one-shot is no longer charged on every
+   failure-arm entry.** The `forgiven_now_wanted` downgrade reverts
+   *without* setting `substitute_tried` (the next dispatch pass
+   re-substitutes with the corrected forgivable set), and when the
+   downgrade's revert target is terminal (DependencyFailed) or
+   topdown-pruned, the handler re-spawns the walk immediately instead of
+   reverting to a terminal state. The inventory's "the substitution-failure
+   retry budget is exactly 1" claim needs that qualification: one charged
+   failure still flips the one-shot, but downgrade/re-spawn passes do not
+   consume it.
+5. **The topdown-pruned arm has an exception.** "On substitute failure a
+   topdown-pruned root fails the whole build" now holds only for
+   non-downgrade failures (`!forgiven_now_wanted`); the downgrade case
+   re-spawns instead, precisely to avoid dispatching a root from source
+   with an unscheduled dependency closure.
+6. **What the failure arm observes.** Demotions now carry a reason
+   taxonomy (`rio_scheduler_substitute_demotions_total{reason}` with
+   `not_found` / `not_found_infra` / `error` / `exhausted`, classified by
+   `demotion_reason()`), and a bare `not_found` no longer implies every
+   upstream missed (the store reports the same message for
+   skipped-substitution cases counted in
+   `rio_store_substitute_skipped_total`).
+7. **Line-number citations drift.** The inventory's `dispatch.rs` /
+   `state/derivation.rs` line references predate the +541/+122-line
+   substitution rewrite and the LogService/lease deltas; re-derive them
+   against the integrated tree rather than patching individual numbers.
+
+None of these corrections touches the fold's input alphabet, the ten
+`RetryState` counters, the poison/cascade tails, or `drv_executions`
+stamping, so they are inventory-row corrections for Stage C, not model or
+fold changes.
