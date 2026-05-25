@@ -1,0 +1,15 @@
+FileEntry file = 2;
+SymlinkEntry symlink = 3;
+bool executable = 4;
+bytes digest = 2;
+bytes digest = 2;
+bytes dir_digest = 1;
+bytes name = 1;
+bytes name = 1;
+bytes name = 1;
+bytes target = 2;
+repeated DirectoryEntry directories = 1;
+repeated FileEntry files = 2;
+repeated SymlinkEntry symlinks = 3;
+uint64 size = 3;
+uint64 size = 3;

@@ -857,6 +857,27 @@
         "Markus Klein"
       ]
     },
+    "atomic-polyfill": {
+      "crateName": "atomic-polyfill",
+      "version": "1.0.3",
+      "edition": "2021",
+      "sha256": "1x00ndablb89zvbr8m03cgjzgajg86fqn8pgz85yy2gy1pivrwlc",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "critical-section",
+          "packageId": "critical-section"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Dario Nieuwenhuis <dirbaio@dirbaio.net>"
+      ]
+    },
     "atomic-waker": {
       "crateName": "atomic-waker",
       "version": "1.1.2",
@@ -4409,6 +4430,28 @@
         "RustCrypto Developers"
       ]
     },
+    "cobs": {
+      "crateName": "cobs",
+      "version": "0.3.0",
+      "edition": "2021",
+      "sha256": "18f0kxxa1fqb8pz2dxwssnhsrvhrs5j4p8xllgin5d7h36sn3a8g",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Allen Welkie <>",
+        "James Munns <james@onevariable.com>"
+      ]
+    },
     "colorchoice": {
       "crateName": "colorchoice",
       "version": "1.0.5",
@@ -4928,6 +4971,18 @@
       "authors": [
         "Sam Rijs <srijs@airpost.net>",
         "Alex Crichton <alex@alexcrichton.com>"
+      ]
+    },
+    "critical-section": {
+      "crateName": "critical-section",
+      "version": "1.2.0",
+      "edition": "2018",
+      "sha256": "02ylhcykxjc40xrfhk1lwc21jqgz4dbwv3jr49ymw733c51yl3kr",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "crossbeam-channel": {
@@ -6347,6 +6402,36 @@
         "RustCrypto Developers"
       ]
     },
+    "embedded-io 0.4.0": {
+      "crateName": "embedded-io",
+      "version": "0.4.0",
+      "edition": "2021",
+      "sha256": "1v9wrc5nsgaaady7i3ya394sik5251j0iq5rls7mrx7fv696h6pg",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "embedded-io 0.6.1": {
+      "crateName": "embedded-io",
+      "version": "0.6.1",
+      "edition": "2021",
+      "sha256": "0v901xykajh3zffn6x4cnn4fhgfw3c8qpjwbsk6gai3gaccg3l7d",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "alloc"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "encode_unicode": {
       "crateName": "encode_unicode",
       "version": "1.0.0",
@@ -6706,7 +6791,7 @@
       "dependencies": [
         {
           "name": "heapless",
-          "packageId": "heapless",
+          "packageId": "heapless 0.8.0",
           "target": "cfg(not(feature = \"alloc\"))"
         }
       ],
@@ -7005,9 +7090,11 @@
       "crateName": "fuser",
       "version": "0.17.0",
       "edition": "2024",
-      "sha256": "1kwgd5mfmgqlf4jmi1gwxsgc6zsbjnbxfbz5x4wjw34hg2lfr9c0",
+      "sha256": "0pin1m7spim8c48wzckpwhsr1h95x7v04bf5m2ls47y7pm7qf548",
       "source": {
-        "type": "crates-io"
+        "type": "git",
+        "url": "https://github.com/cberner/fuser",
+        "rev": "2bdfbc53a116b9b4af5c91d20ab6a4f9b9004645"
       },
       "dependencies": [
         {
@@ -11255,7 +11342,28 @@
         "Kathryn Long <squeeself@gmail.com>"
       ]
     },
-    "hash32": {
+    "hash32 0.2.1": {
+      "crateName": "hash32",
+      "version": "0.2.1",
+      "edition": "2015",
+      "sha256": "0rrbv5pc5b1vax6j6hk7zvlrpw0h6aybshxy9vbpgsrgfrc5zhxh",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <jorge@japaric.io>"
+      ]
+    },
+    "hash32 0.3.1": {
       "crateName": "hash32",
       "version": "0.3.1",
       "edition": "2015",
@@ -11467,7 +11575,79 @@
         "Marshall Pierce <marshall@mpierce.org>"
       ]
     },
-    "heapless": {
+    "heapless 0.7.17": {
+      "crateName": "heapless",
+      "version": "0.7.17",
+      "edition": "2018",
+      "sha256": "0kwn2wzk9fnsqnwp6rqjqhvh6hfq4rh225xwqjm72b5n1ry4bind",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "atomic-polyfill",
+          "packageId": "atomic-polyfill",
+          "target": "cfg(target_arch = \"avr\")"
+        },
+        {
+          "name": "atomic-polyfill",
+          "packageId": "atomic-polyfill",
+          "target": "riscv32i-unknown-none-elf"
+        },
+        {
+          "name": "atomic-polyfill",
+          "packageId": "atomic-polyfill",
+          "target": "riscv32imc-unknown-none-elf"
+        },
+        {
+          "name": "atomic-polyfill",
+          "packageId": "atomic-polyfill",
+          "target": "thumbv6m-none-eabi"
+        },
+        {
+          "name": "atomic-polyfill",
+          "packageId": "atomic-polyfill",
+          "target": "xtensa-esp32s2-none-elf"
+        },
+        {
+          "name": "hash32",
+          "packageId": "hash32 0.2.1"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "spin",
+          "packageId": "spin 0.9.8",
+          "target": "cfg(target_arch = \"x86_64\")"
+        },
+        {
+          "name": "stable_deref_trait",
+          "packageId": "stable_deref_trait"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rustc_version",
+          "packageId": "rustc_version"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "atomic-polyfill",
+        "cas",
+        "serde"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <jorge@japaric.io>",
+        "Per Lindgren <per.lindgren@ltu.se>",
+        "Emil Fresk <emil.fresk@gmail.com>"
+      ]
+    },
+    "heapless 0.8.0": {
       "crateName": "heapless",
       "version": "0.8.0",
       "edition": "2021",
@@ -11478,7 +11658,7 @@
       "dependencies": [
         {
           "name": "hash32",
-          "packageId": "hash32"
+          "packageId": "hash32 0.3.1"
         },
         {
           "name": "stable_deref_trait",
@@ -15231,6 +15411,10 @@
         {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "memoffset",
+          "packageId": "memoffset"
         }
       ],
       "buildDependencies": [
@@ -15244,11 +15428,13 @@
         "feature",
         "fs",
         "hostname",
+        "memoffset",
         "mman",
         "mount",
         "process",
         "sched",
         "signal",
+        "socket",
         "uio",
         "user"
       ],
@@ -17213,6 +17399,42 @@
         "lib"
       ]
     },
+    "postcard": {
+      "crateName": "postcard",
+      "version": "1.1.3",
+      "edition": "2021",
+      "sha256": "094srff139n7m8g5ssq36ag6s29ikf7fgpz660x2hkj5vnsw6r37",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cobs",
+          "packageId": "cobs"
+        },
+        {
+          "name": "heapless",
+          "packageId": "heapless 0.7.17"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default",
+        "heapless",
+        "heapless-cas",
+        "use-std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "James Munns <james@onevariable.com>"
+      ]
+    },
     "potential_utf": {
       "crateName": "potential_utf",
       "version": "0.1.5",
@@ -18965,6 +19187,10 @@
           "packageId": "base64 0.22.1"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
         },
@@ -19056,6 +19282,10 @@
           "packageId": "axum"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -19078,6 +19308,14 @@
         {
           "name": "nix",
           "packageId": "nix 0.31.3"
+        },
+        {
+          "name": "postcard",
+          "packageId": "postcard"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
         },
         {
           "name": "prost-types",
@@ -19190,6 +19428,14 @@
         {
           "name": "rio-builder",
           "path": "src/main.rs"
+        },
+        {
+          "name": "rio-mountd",
+          "path": "src/bin/rio-mountd.rs"
+        },
+        {
+          "name": "spike_mountd_client",
+          "path": "src/bin/spike_mountd_client.rs"
         }
       ],
       "libCrateTypes": [
@@ -19920,6 +20166,10 @@
           "packageId": "base64 0.22.1"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
         },
@@ -20004,6 +20254,10 @@
         {
           "name": "anyhow",
           "packageId": "anyhow"
+        },
+        {
+          "name": "blake3",
+          "packageId": "blake3"
         },
         {
           "name": "futures-util",
@@ -20446,6 +20700,10 @@
         {
           "name": "moka",
           "packageId": "moka"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
         },
         {
           "name": "reqwest",
@@ -29224,6 +29482,10 @@
         {
           "name": "bytes",
           "packageId": "bytes"
+        },
+        {
+          "name": "cc",
+          "packageId": "cc"
         },
         {
           "name": "chacha20",
