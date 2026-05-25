@@ -266,7 +266,7 @@ impl ExecutorState {
 /// fields mean this is a BITWISE compare — acceptable for config
 /// (the test just asserts default-constructed identity, not
 /// computed-value equality).
-// r[impl sched.retry.attempts-bounded]
+// r[impl sched.retry.attempts-bounded+2]
 // The budget caps. Every failure-driven retry loop is bounded by one
 // of these (or by `PoisonConfig.threshold` / POISON_RESUBMIT_RETRY_
 // LIMIT); the per-site charge/check discipline is the reference fold

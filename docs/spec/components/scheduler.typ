@@ -423,11 +423,16 @@ epilogue in the success path).
   only.
 ]
 
-#r("sched.dispatch.fleet-exhaust+2")[
+#r("sched.dispatch.fleet-exhaust+3")[
   When `find_executor` returns `None` and every _statically-eligible_
   *non-draining* registered worker (matching kind, `system`, and
   `required_features`) is already in `failed_builders`, the derivation is
-  poisoned immediately rather than deferring. Draining workers MUST be
+  poisoned immediately rather than deferring. When zero statically-eligible
+  non-draining workers are registered (the eligible fleet is empty), the
+  check MUST NOT poison --- the derivation defers: an empty pool is a
+  provisioning transient (autoscaler lag, a deployment rollout in
+  progress), and poisoning on it would brick every build submitted during
+  the rollout. Draining workers MUST be
   excluded: under one-shot semantics
   (#rref("sched.ephemeral.no-redispatch-after-completion")), a just-failed
   worker is draining but still in the executor map at completion-time; counting
@@ -508,42 +513,60 @@ the only one among the failure classes (infra, timeout, disconnect, and
 backstop requeues are immediate) --- the asymmetry is recorded in the
 invariant map as a Phase-1 policy decision, not specified away here.
 
-#r("sched.retry.attempts-bounded")[
-  Every failure-driven retry loop MUST be bounded: each counted attempt
-  charges exactly one of the named budgets --- the per-cycle transient
+#r("sched.retry.attempts-bounded+2")[
+  Every failure-driven retry loop MUST be bounded: every counted attempt
+  charges at least one of the named budgets --- the per-cycle transient
   count (`max_retries`), the non-exempt infrastructure count
   (`max_infra_retries`), the exempt-infrastructure count
   (`max_exempt_infra_retries`), the timeout count (`max_timeout_retries`),
   the poison threshold (`PoisonConfig.threshold`), or the cross-cycle
-  resubmit count (`POISON_RESUBMIT_RETRY_LIMIT`) --- and every budget has a
+  resubmit count (`POISON_RESUBMIT_RETRY_LIMIT`) --- every budget has a
   finite cap whose exhaustion produces a terminal state (`Poisoned` or
-  `Cancelled`); an attempt exempted from one budget MUST be charged to
-  another.
+  `Cancelled`), no single attempt charges the same budget more than once,
+  and an attempt exempted from one budget MUST be charged to another.
 ]
 The budget values are configuration (`[retry]` / `[poison]` tables above),
-not normative numbers. The clause that bites is the partition: an attempt
-charged to no budget is an unbounded retry loop (the 9,748-redispatch
-incident, the pre-I-200 cold-start timeout loop, the pre-cap exempt-infra
-livelock), and an attempt charged to two budgets poisons early (the at-cap
-OOM double-count). The per-counter fencepost conventions (whether the cap
-fires on the Nth or the N+1th attempt) currently differ between counters;
-the reference fold reproduces each counter's own convention and the
-invariant map flags the inconsistency for Phase-1 unification.
+not normative numbers. The two clauses that bite: an attempt charged to no
+budget is an unbounded retry loop (the 9,748-redispatch incident, the
+pre-I-200 cold-start timeout loop, the pre-cap exempt-infra livelock), and
+one attempt charged twice to the *same* budget poisons early (the at-cap
+OOM double-count was `infra_count` charged twice for one pod death). The
+partition is per budget, not across budgets: a single worker-reported
+transient failure legitimately charges both the poison threshold
+(`failed_builders` / `failure_count`) and the per-cycle transient count ---
+#rref("sched.retry.transient-budget") mandates exactly that --- because the
+two budgets bound different things (distinct wedged workers vs attempts
+this cycle), so a model invariant encoded as "exactly one budget total"
+would falsify on the first transient failure. The as-built code violates
+the boundedness clause on one reachable history: a worker that hard-crashes
+without ever sending a `CompletionReport` produces a disconnect-requeue
+loop that charges no budget and never reaches the backstop timer (each
+disconnect resets the derivation to `Ready`, so the Running-too-long clock
+restarts on every attempt) --- contradiction C2 in the invariant map,
+bounded only by an optional per-build `build_timeout`, and a pre-registered
+expected Stage-B falsification. The per-counter fencepost conventions
+(whether the cap fires on the Nth or the N+1th attempt) currently differ
+between counters; the reference fold reproduces each counter's own
+convention and the invariant map flags the inconsistency for Phase-1
+unification.
 
-#r("sched.retry.counters-refine-history")[
+#r("sched.retry.counters-refine-history+2")[
   The per-derivation retry counters (`count`, `resubmit_cycles`,
   `infra_count`, `timeout_count`, `last_infra_failure_at`,
   `exempt_infra_count`, `failed_builders`, `failure_count`, `poisoned_at`,
   `backoff_until`) MUST at every point equal the reference fold of the
   derivation's observed failure-event history: each observed event charges
-  the counters its class charges and no others; a non-exempt infrastructure
-  failure observed more than `infra_retry_window_secs` (default 300 s)
-  after the previous counted one resets `infra_count` before charging it,
-  unless the resource floor is at its ceiling; a floor-promoted or
-  CONCURRENT_PUTPATH infrastructure failure charges `exempt_infra_count`
-  instead of `infra_count`; the cache-hit and resubmit resets are
-  themselves history events that zero the per-cycle counters; and no code
-  path mutates a counter outside the fold's event alphabet.
+  the counters its class charges and no others; an infrastructure failure
+  whose own resource-floor outcome is not at the ceiling, observed more
+  than `infra_retry_window_secs` (default 300 s) after the most recent
+  counted infrastructure failure, resets `infra_count` before any charge
+  --- whether or not the failure itself is cap-exempt; a non-exempt
+  infrastructure failure then charges `infra_count` and re-anchors the
+  window; a floor-promoted or CONCURRENT_PUTPATH infrastructure failure
+  charges `exempt_infra_count` instead of `infra_count` and does not move
+  the window anchor; the cache-hit and resubmit resets are themselves
+  history events that zero the per-cycle counters; and no code path
+  mutates a counter outside the fold's event alphabet.
 ]
 The fold is `rio-scheduler/src/retry_policy.rs` (a pure function with unit
 tests against hand-computed histories); the model-checked form quantifies
@@ -551,7 +574,11 @@ over observation orderings and is deferred to the `retryPolicy.qnt` model.
 The 300 s window appears here because no other rule states it --- it is the
 I-127 forgiveness that distinguishes a burst of misclassified permanent
 failures from sparse independent incidents, and a fold that omits it
-poisons healthy derivations on long builds.
+poisons healthy derivations on long builds. The window reset firing on
+cap-exempt observations too is the as-built `handle_infrastructure_failure`
+fall-through (the exempt arm does not return before the reset block); the
+fold reproduces it, so a counter mismatch on that history class reads as a
+code defect rather than a fold gap.
 
 #r("sched.retry.verdict-channel-invariant")[
   For a fixed physical failure history, the budget verdict (requeue,
@@ -568,7 +595,19 @@ budget lands as `Cancelled` (worker-reported `TimedOut`) or `Poisoned`
 reports the deadline overrun first --- the two reports describe one
 physical fact and which arrives first is a race. The rule is added
 marker-first so the model run that falsifies it is confirming a documented
-defect; the code fix is a Phase-1 disposition. The related
+defect; the code fix is a Phase-1 disposition. Adding it marker-first also
+creates a rule-vs-rule tension:
+#rref("sched.termination.deadline-exceeded") as written assigns terminal
+ownership at the timeout cap exclusively to the worker-side `TimedOut`
+path (the controller path "only promotes and counts"), so on the reachable
+wedged-worker history where only the controller ever observes the deadline
+overrun, no implementation can satisfy both rules --- honoring the
+deadline-exceeded clause makes the verdict channel-dependent (no terminal
+on the controller-observed run, `Cancelled` on the worker-observed run of
+the same physical history). The design pre-commits the resolution: Phase 1
+amends the deadline-exceeded rule (with the corresponding version bump) to
+permit terminal `Cancelled` at the cap on the controller path; the
+invariant map records this as rule-vs-rule contradiction C4. The related
 which-counter-does-a-promoted-OOM-charge inconsistency (divergence D3) is
 *not* a channel race --- a cgroup-level OOM and a pod-level OOM are
 physically distinct events --- and is recorded as a contradiction of

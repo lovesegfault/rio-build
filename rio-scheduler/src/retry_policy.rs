@@ -35,8 +35,8 @@
 //! `last_completed` dedup deciding which of them count) is the
 //! environment's nondeterminism; the Stage-B model quantifies over it and
 //! checks that the code's counters equal `reference_fold(observed)`
-//! (`r[sched.retry.counters-refine-history]`) and that the verdict is the
-//! same for every observation of one physical history
+//! (`r[sched.retry.counters-refine-history+2]`) and that the verdict is
+//! the same for every observation of one physical history
 //! (`r[sched.retry.verdict-channel-invariant]`).
 //!
 //! ## Where the fold deliberately deviates from the code
@@ -402,7 +402,7 @@ pub(crate) enum Verdict {
     TtlExpire,
 }
 
-// r[impl sched.dispatch.fleet-exhaust+2]
+// r[impl sched.dispatch.fleet-exhaust+3]
 /// The fleet-exhaust predicate shared by E1's poison check and E9's
 /// dispatch-time backstop: every statically-eligible non-draining
 /// registered worker has already failed this derivation. Returns `false`
@@ -417,9 +417,9 @@ pub(crate) fn exhausts_fleet(failed_builders: &HashSet<String>, fleet: &FleetVie
     fleet.eligible.iter().all(|w| failed_builders.contains(w))
 }
 
-// r[impl sched.retry.counters-refine-history]
+// r[impl sched.retry.counters-refine-history+2]
 // r[impl sched.retry.transient-budget]
-// r[impl sched.retry.attempts-bounded]
+// r[impl sched.retry.attempts-bounded+2]
 // r[impl sched.retry.verdict-channel-invariant]
 /// Fold an observed failure-event history into the ten retry counters and
 /// the budget verdict.
@@ -495,6 +495,10 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
         }
 
         // ── E2: handle_infrastructure_failure ───────────────────────
+        // The arm mirrors the handler's own statement order: the exempt
+        // block first (increment + its own cap check, with NO early
+        // return on the under-cap path), then the I-127 window reset,
+        // then the non-exempt cap check and charge.
         AttemptEvent::Infra {
             at,
             executor: _,
@@ -505,24 +509,35 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
                 // r[impl sched.retry.exempt-infra-cap]
                 // Increment-then-check: the cap fires ON the Nth exempt
                 // attempt (a different fencepost from the non-exempt arm
-                // below — divergence A10).
+                // below — divergence A10). The under-cap exempt path
+                // does not return here: the as-built handler falls
+                // through to the window reset below.
                 c.exempt_infra_count += 1;
                 if c.exempt_infra_count >= budget.max_exempt_infra_retries {
                     c.poisoned_at = Some(*at);
                     return Verdict::Poison(PoisonReason::ExemptInfraBudget);
                 }
-                return Verdict::Requeue;
             }
-            // The I-127 sliding window: a non-exempt infra failure more
-            // than `infra_retry_window_secs` after the previous counted
-            // one is a fresh incident — reset the counter before the cap
-            // check. At-cap resource exhaustion is deterministic, so the
-            // sparse-vs-burst forgiveness does not apply to it.
+            // The I-127 sliding window: an infra failure more than
+            // `infra_retry_window_secs` after the previous counted one
+            // is a fresh incident — reset the counter before the cap
+            // check. The guard is the event's own floor outcome only:
+            // at-cap resource exhaustion is deterministic, so the
+            // sparse-vs-burst forgiveness does not apply to it. It is
+            // NOT gated on the exemption — an under-cap exempt failure
+            // (CONCURRENT_PUTPATH or floor-promoted) arriving past the
+            // window also zeroes `infra_count`, exactly as the as-built
+            // handler does (its exempt block falls through to the
+            // reset). The exempt event itself still charges only
+            // `exempt_infra_count` and does not move the window anchor.
             if !*at_cap
                 && let Some(last) = c.last_infra_failure_at
                 && at.saturating_sub(last) > budget.infra_retry_window_secs
             {
                 c.infra_count = 0;
+            }
+            if *exempt {
+                return Verdict::Requeue;
             }
             // Check-then-increment: the cap fires on failure N+1.
             if c.infra_count >= budget.max_infra_retries {
@@ -708,8 +723,8 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
 }
 
 // r[verify sched.retry.transient-budget]
-// r[verify sched.retry.attempts-bounded]
-// r[verify sched.retry.counters-refine-history]
+// r[verify sched.retry.attempts-bounded+2]
+// r[verify sched.retry.counters-refine-history+2]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +901,46 @@ mod tests {
         ];
         let (c, _) = fold(&h_cap, 900);
         assert_eq!(c.infra_count, 3, "at-cap failures never reset");
+    }
+
+    /// The as-built E2 fall-through: the I-127 stale-window reset is
+    /// gated only on the event's own at-cap outcome, not on the
+    /// exemption, so an under-cap exempt infra failure
+    /// (CONCURRENT_PUTPATH or floor-promoted) arriving more than the
+    /// window after the last counted infra failure also resets
+    /// `infra_count` — while itself charging only `exempt_infra_count`
+    /// and leaving the window anchor where the last counted failure put
+    /// it.
+    #[test]
+    fn exempt_infra_failure_past_the_window_resets_the_counted_budget() {
+        // Counted infra failure (anchor stamped), then an exempt one
+        // 350 s later — strictly past the 300 s window.
+        let h = [
+            infra(100, "w1", false, false),
+            infra(450, "w1", true, false),
+        ];
+        let (c, v) = fold(&h, 450);
+        assert_eq!(
+            c.infra_count, 0,
+            "stale-window reset fires on the exempt event"
+        );
+        assert_eq!(c.exempt_infra_count, 1);
+        assert_eq!(
+            c.last_infra_failure_at,
+            Some(100),
+            "the exempt event does not move the anchor"
+        );
+        assert_eq!(v, Verdict::Requeue);
+
+        // Within the window the exempt event leaves the counted budget
+        // untouched.
+        let h = [
+            infra(100, "w1", false, false),
+            infra(200, "w1", true, false),
+        ];
+        let (c, _) = fold(&h, 200);
+        assert_eq!(c.infra_count, 1, "within the window: no reset");
+        assert_eq!(c.exempt_infra_count, 1);
     }
 
     /// The exempt arm: a CONCURRENT_PUTPATH or floor-promoted infra

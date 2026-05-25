@@ -2717,7 +2717,7 @@ async fn connect_executor_with_intent(
 // I-065 fleet-exhaustion: system/feature awareness
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fleet-exhaust+2]
+// r[verify sched.dispatch.fleet-exhaust+3]
 /// `failed_builders_exhausts_fleet` under one-shot (I-188) semantics:
 /// failed workers are draining and excluded from the fleet count, so
 /// the drv DEFERS (Ready) for the controller to spawn fresh workers,
@@ -2804,7 +2804,7 @@ async fn test_fleet_exhaustion_defers_under_one_shot() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.fleet-exhaust+2]
+// r[verify sched.dispatch.fleet-exhaust+3]
 /// Negative: a statically-eligible worker NOT in `failed_builders` keeps
 /// the fleet non-exhausted (defer, don't poison). Guards against the
 /// fix over-filtering.

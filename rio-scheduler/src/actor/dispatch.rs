@@ -1953,7 +1953,7 @@ impl DagActor {
     /// for this system/features", a transient that the freeze
     /// detector, unroutable-system gauge, and autoscaler handle.
     /// Poisoning then would brick builds during a deployment rollout.
-    // r[impl sched.dispatch.fleet-exhaust+2]
+    // r[impl sched.dispatch.fleet-exhaust+3]
     pub(super) fn failed_builders_exhausts_fleet(&self, drv_hash: &DrvHash) -> bool {
         let Some(state) = self.dag.node(drv_hash) else {
             return false;

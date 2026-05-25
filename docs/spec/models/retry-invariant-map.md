@@ -21,6 +21,16 @@ of this map is `rio-scheduler/src/retry_policy.rs` (the `referenceFold` —
 the Phase-0 specification oracle the model's `CountersRefineHistory`
 invariant compares the live counters against).
 
+This revision incorporates the Stage-A self-review (the audit of this map
+and the fold before the Stage-B model is written): three rule bodies were
+amended and version-bumped (`sched.retry.attempts-bounded+2`,
+`sched.retry.counters-refine-history+2`, `sched.dispatch.fleet-exhaust+3`),
+the fold's E2 exempt arm was corrected to reproduce the as-built
+window-reset fall-through, the D2 and C2 consequence narratives were
+corrected, the rule-vs-rule contradiction C4 was recorded, and the D1/D3/D4
+phase-1 dispositions plus the pre-registered Stage-B falsification list
+were added.
+
 ## The decision sites (the columns of every row below)
 
 | # | Entry point | Trigger |
@@ -54,19 +64,19 @@ what the rule says it MUST; recorded in the contradiction table below and
 not fixed here.
 
 ### `AttemptsBounded`
-*No derivation is dispatched more than its budget, counting every attempt
-kind exactly once.*
+*Every failure-driven retry loop is bounded: every counted attempt charges
+at least one finite budget, and no attempt charges the same budget twice.*
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `sched.retry.attempts-bounded` *(new)* | **COVERS** (the conjunction) | Was a GAP. The per-counter cap rules below each bound one budget; no rule stated that the budgets partition the attempt kinds (every counted attempt charges exactly one budget) or that every retry loop is bounded. The new rule states the conjunction and names the two budgets that had no rule at all: the transient cap (`max_retries`, E1) and the non-exempt infra cap (`max_infra_retries`, E2/E6 — previously mentioned only in `sched.retry.promotion-exempt+3`'s prose, and only for the at-ceiling case). |
+| `sched.retry.attempts-bounded+2` *(new; amended in the Stage-A review)* | **COVERS** (the conjunction) | Was a GAP. The per-counter cap rules below each bound one budget; no rule stated the conjunction (every retry loop bounded; every counted attempt charges at least one budget; no attempt charges the same budget twice). The new rule states it and names the two budgets that had no rule at all: the transient cap (`max_retries`, E1) and the non-exempt infra cap (`max_infra_retries`, E2/E6 — previously mentioned only in `sched.retry.promotion-exempt+3`'s prose, and only for the at-ceiling case). The partition is per budget, not across budgets: a single worker-reported transient failure charges both the poison threshold and the per-cycle transient count (`sched.retry.transient-budget` mandates exactly that); the bug class the rule excludes is one attempt charged twice to the *same* budget (the 8a016a393 at-cap OOM double-count). The rule's original wording ("each counted attempt charges exactly one of the named budgets") would have made a Stage-B `AttemptsBounded` encoding falsify on the first transient failure and the falsification be mis-triaged as a code defect — amended (`+2`) in this review. The as-built code falsifies the boundedness clause on the C2 no-report hard-crash loop (see the contradiction table and the expected-falsifications list). |
 | `sched.retry.transient-budget` *(new)* | **COVERS** (E1) | Was a GAP (the inventory's named spec hole): no rule covered E1's decision — transient failures charge `count` + `failed_builders` + `failure_count`, requeue with exponential backoff while under both `max_retries` and the poison threshold, poison at either. `sched.retry.per-executor-budget` describes what *infra* failures don't do, not what transient failures do. |
 | `sched.retry.per-executor-budget` | **PARTIAL** + **CONTRADICTION C2** | Covers the poison threshold (3 distinct workers / N flat failures) and the transient-vs-infra budget split. Does not state the caps as numbers (config defaults; the TOML example omits `max_infra_retries` and `max_timeout_retries`). The "Executor disconnect DOES count" sentence contradicts E5 (see C2). |
 | `sched.retry.exempt-infra-cap` | **COVERS** (the exempt arm) | The exemption's own terminal (`exempt_infra_count` / `max_exempt_infra_retries`). Note the off-by-one convention: the exempt arm increments *before* its cap check (the cap fires *on* the Nth exempt attempt) while the non-exempt infra arm checks *before* incrementing (the cap fires on the N+1th failure). Both are reproducible by the fold; the asymmetry in what `max_X_retries = N` means is a Phase-1 unification candidate, not a divergence. |
 | `sched.timeout.promote-on-exceed+2` | **COVERS** (the timeout budget) | `timeout_count` vs `max_timeout_retries`, terminal `Cancelled`. The controller-path divergence is D1. |
 | `sched.merge.poisoned-resubmit-bounded+2` | **COVERS** (the cross-cycle budget) | `resubmit_cycles` vs `POISON_RESUBMIT_RETRY_LIMIT`; the per-cycle `count = 0` reset. |
 | `sched.retry.promotion-exempt+3` | **COVERS** (the exemption gating) | A promoted attempt consumes no failure budget; an at-ceiling attempt always consumes budget; timeouts consume budget regardless of promotion. The controller-path deviation from "every exempt attempt charges `exempt_infra_count`" is D3. |
-| `sched.backstop.timeout+3` | **COVERS** (E8's accounting) | The backstop charges `failed_builders` + `failure_count` so the no-report loop is bounded by the poison threshold. The missing PG mirror of that charge is D4. |
+| `sched.backstop.timeout+3` | **COVERS** (E8's accounting) | The backstop charges `failed_builders` + `failure_count` so the no-report *wedge* loop (worker still heartbeating, derivation stays Running long enough for the scan to see it) is bounded by the poison threshold; the no-report *hard-crash* loop never stays Running long enough to reach the backstop at all (see C2). The missing PG mirror of the backstop's charge is D4. |
 
 ### `PoisonIsTerminalUntilCleared`
 *A poisoned derivation stays poisoned until the TTL expires, an admin
@@ -102,7 +112,7 @@ terminal build state.*
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `sched.retry.counters-refine-history` *(new)* | **COVERS** | Was a GAP — necessarily: the spec had no concept of an attempt history, so no rule could state that the counters are a pure function of one. The new rule's normative body is the invariant; the executable definition of the fold is `rio-scheduler/src/retry_policy.rs`. The 300 s sliding-window reset, previously stated nowhere in the spec (not even in the TOML example), is normative here as a clause of the fold. Verification is deferred to the Stage-B model (`retryPolicy.qnt`); the fold's own unit tests pin the fold against hand-computed histories. |
+| `sched.retry.counters-refine-history+2` *(new; amended in the Stage-A review)* | **COVERS** | Was a GAP — necessarily: the spec had no concept of an attempt history, so no rule could state that the counters are a pure function of one. The new rule's normative body is the invariant; the executable definition of the fold is `rio-scheduler/src/retry_policy.rs`. The 300 s sliding-window reset, previously stated nowhere in the spec (not even in the TOML example), is normative here as a clause of the fold — including its as-built fall-through: an under-cap *exempt* infra observation past the window also resets `infra_count` (E2's exempt arm does not return before the reset block, and the reset is gated only on the event's own at-cap outcome). The rule's first wording said only non-exempt failures reset, and the fold's first transcription returned early on the exempt arm; both were corrected in the Stage-A review (`+2`, plus a fold unit test pinning the counted-then-stale-exempt history) so the fold reproduces the code and a counter mismatch on that history class reads as a code defect, not a fold gap. Verification is deferred to the Stage-B model (`retryPolicy.qnt`); the fold's own unit tests pin the fold against hand-computed histories. |
 
 ### `VerdictIsChannelInvariant`
 *For a fixed physical failure history, every observation subset/order the
@@ -111,7 +121,7 @@ poison-on-budget / cancel / TTL-expire) and the same counter deltas.*
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `sched.retry.verdict-channel-invariant` *(new)* | **COVERS** (the statement) — **falsified by the as-built code** | Was a GAP. The rule states the invariant the design mandates; the as-built code violates it on at least one reachable history: D1 (the same exhausted timeout budget lands as `Cancelled` via E4 or `Poisoned` via E7 depending on whether the worker's `daemon_timeout` or the Job controller's `activeDeadlineSeconds` observer reports the same deadline overrun first). This is the expected Stage-B falsification, recorded here so the model run that finds it is confirming a documented defect rather than discovering a new one. The rule is added marker-first; the code is not changed in Phase 0. The G5 double-counts falsify the counter-delta half of this invariant whenever the dedup fails (the `NoDoubleCount` rows). |
+| `sched.retry.verdict-channel-invariant` *(new)* | **COVERS** (the statement) — **falsified by the as-built code** | Was a GAP. The rule states the invariant the design mandates; the as-built code violates it on at least one reachable history: D1 (the same exhausted timeout budget lands as `Cancelled` via E4 or `Poisoned` via E7 depending on whether the worker's `daemon_timeout` or the Job controller's `activeDeadlineSeconds` observer reports the same deadline overrun first). This is the expected Stage-B falsification, recorded here so the model run that finds it is confirming a documented defect rather than discovering a new one. The rule is added marker-first; the code is not changed in Phase 0. Adding it marker-first also puts the rule in direct conflict with `sched.termination.deadline-exceeded+2` on the wedged-worker history — recorded as rule-vs-rule contradiction C4 below, with the design-pre-committed deadline-exceeded amendment as the resolution. The G5 double-counts falsify the counter-delta half of this invariant whenever the dedup fails (the `NoDoubleCount` rows). |
 
 ### `PlacementIsAFunctionOfExclusionAndFleet`
 *Whether a derivation can still be placed — and the fleet-exhaust poison —
@@ -120,7 +130,7 @@ fleet) only.*
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `sched.dispatch.fleet-exhaust+2` | **COVERS** (the exhaust-poison half) | The predicate (every statically-eligible non-draining registered worker ∈ `failed_builders` → poison; empty fleet → defer, not poison) is stated exactly, including the kind/system/features-awareness and the draining exclusion. |
+| `sched.dispatch.fleet-exhaust+3` | **PARTIAL → COVERS** (the exhaust-poison half; `+3` adds the empty-fleet clause) | The original audit over-claimed COVERS: the `+2` text stated the exhaustion predicate (every statically-eligible non-draining registered worker ∈ `failed_builders` → poison, kind/system/features-aware, draining excluded) but never adjudicated the empty fleet, and under a vacuous-truth reading mandated poison there — the opposite of the code, which deliberately peeks the eligible-worker iterator and returns "not exhausted" when zero statically-eligible non-draining workers are registered (`failed_builders_exhausts_fleet`: an empty pool is a provisioning transient; poisoning would brick builds during a deployment rollout). A Stage-B `Placement` invariant encoded from the `+2` text and quantified over fleet states — the design quantifies over the empty fleet explicitly — would have diverged from the code on that basic case while this map claimed the spec covers it. Amended in the Stage-A review: `+3` states the empty-fleet defer as a MUST NOT poison; `test_fleet_exhaustion_defers_under_one_shot` already exercises the empty-non-draining-fleet defer and now carries the `+3` verify marker. |
 | `sched.retry.per-executor-budget` | **PARTIAL** (the exclusion half) | `failed_builders` drives `best_executor` exclusion (`assignment.rs::hard_filter` rejects workers in the set) — the rule names the set and its persistence but never states the placement-exclusion obligation as a MUST. The missing piece is rationale-grade (the exclusion is the mechanism behind the distinct-workers threshold and the fleet-exhaust predicate, both of which are normative elsewhere); recorded here, not bumped. Phase 1's `placeable(&ExclusionSet, &EligibleFleet)` extraction is the natural point to make it normative. |
 
 ### `NoDoubleCount`
@@ -160,8 +170,16 @@ the rule is not weakened — each row is a Phase-1 disposition input
 | # | Rule | What the rule says | What the code does | Evidence |
 |---|---|---|---|---|
 | C1 | `sched.termination.deadline-exceeded+2` | The controller-reported `DeadlineExceeded` path "does NOT `reset_to_ready` --- it only promotes (so the next dispatch goes larger) and counts (so the ladder is bounded). At `max_timeout_retries` the floor is at ceiling; terminal `Cancelled` is owned by the worker-side `TimedOut` path." — i.e. the controller path performs no terminal transition. | `handle_deadline_exceeded` calls `poison_and_cascade` when `timeout_count >= max_timeout_retries` — a terminal transition, and to `Poisoned` (24 h TTL, bounded resubmit) rather than the `Cancelled` the worker-side path and `sched.timeout.promote-on-exceed+2` produce for the same exhausted budget. The off-spec poison was added by `172776b1b` to break the loop-at-cap (the rule as written loops forever when the worker is too wedged to ever send the `TimedOut` report that would own the terminal transition). The rule needs a terminal clause; the design pre-adjudicates it as `Cancelled` (design §6); neither the code nor the rule changes in Phase 0. | `rio-scheduler/src/actor/executor.rs` (`handle_deadline_exceeded`, the `>= max` arm) vs `scheduler.typ` `sched.termination.deadline-exceeded+2` |
-| C2 | `sched.retry.per-executor-budget` | "Executor disconnect DOES count --- a build that crashes the daemon 3× is poisoned." | A bare disconnect (E5, `reassign_derivations`) records nothing: no `failed_builders` insert, no `failure_count` increment. It only re-reads `is_poisoned()` over failures recorded by *other* paths. A build that hard-crashes the worker process 3× without a `CompletionReport` is requeued 3× with no accounting; the loop is bounded only by the backstop timer (E8, ≥ 7800 s per attempt) — not by the poison threshold the rule promises. The "crashes the daemon 3×" property holds only when the worker survives long enough to report the failure before disconnecting. | `rio-scheduler/src/actor/executor.rs` (`reassign_derivations`: "Disconnect ... does NOT record into `failed_builders`/`failure_count`/`retry_count`") vs `scheduler.typ` `sched.retry.per-executor-budget` |
+| C2 | `sched.retry.per-executor-budget` | "Executor disconnect DOES count --- a build that crashes the daemon 3× is poisoned." | A bare disconnect (E5, `reassign_derivations`) records nothing: no `failed_builders` insert, no `failure_count` increment — it only re-reads `is_poisoned()` over failures recorded by *other* paths, so the "crashes the daemon 3×" property holds only when the worker survives long enough to report the failure before disconnecting. The compensating bound is narrower than this row first recorded (corrected in the Stage-A review): the E8 backstop scans only derivations still `Running` past max(est×3, 7800 s), so it bounds the *wedged-worker* sub-case (worker keeps heartbeating, derivation stays Running) at ≥ 7800 s per counted attempt. A hard crash closes the stream within seconds; E5 resets the node to `Ready`, the next dispatch restarts `running_since`, and the backstop clock never accumulates — and the controller's follow-up termination report for a non-resource crash reason hits the non-promoting early return and charges nothing. A derivation that deterministically kills the worker daemon with no report and no OOM/DiskPressure/DeadlineExceeded reason is therefore bounded by nothing in the retry machinery (only by an optional per-build `build_timeout`), and the as-built code falsifies `sched.retry.attempts-bounded+2`'s boundedness clause on exactly this history (pre-registered Stage-B falsification). | `rio-scheduler/src/actor/executor.rs` (`reassign_derivations`: "Disconnect ... does NOT record into `failed_builders`/`failure_count`/`retry_count`"; `handle_executor_termination`'s non-promoting-reason early return) and `rio-scheduler/src/actor/housekeeping.rs` (`tick_scan_dag` scans Running-with-`running_since` only) vs `scheduler.typ` `sched.retry.per-executor-budget` |
 | C3 | `sched.retry.exempt-infra-cap` | "The `exempt_from_cap` infra-retry path (CONCURRENT_PUTPATH, `floor_outcome.promoted`) skips `infra_count++` ... A separate `exempt_infra_count` increments on every exempt attempt and poisons at `max_exempt_infra_retries`." The rule's own definition of an exempt attempt is "CONCURRENT_PUTPATH or `floor_outcome.promoted`". | A floor-promoted *controller-reported* OOM/DiskPressure (E6, `floor_outcome.promoted = true`) increments nothing — the increment block is gated on `at_cap`, and `promoted` and `at_cap` are mutually exclusive. Only the worker-reported exempt path (E2) charges `exempt_infra_count`. The promoted controller path is still bounded — by the floor ladder's own monotone doubling up to the ceiling, past which `at_cap` engages `infra_count` — but it is a different and unstated bound, and the rule's defense-in-depth purpose ("a `bump_resource_floor` bug that always returns `promoted=true`" livelocks) is unenforced on the controller channel. | `rio-scheduler/src/actor/executor.rs` (`handle_executor_termination`, the `if outcome.at_cap` gate) vs `scheduler.typ` `sched.retry.exempt-infra-cap`. Same defect seen from the fold's side: divergence D3. |
+
+The rows above are code-vs-rule contradictions. One **rule-vs-rule**
+contradiction is also on record — two normative bodies the spec now
+carries that no implementation can satisfy together:
+
+| # | Rules | The conflict | Resolution |
+|---|---|---|---|
+| C4 | `sched.termination.deadline-exceeded+2` vs `sched.retry.verdict-channel-invariant` | The deadline-exceeded rule assigns terminal ownership at the timeout cap exclusively to the worker-side `TimedOut` path — the controller path "only promotes and counts" — while the channel-invariance rule requires the budget verdict for a fixed physical history not to depend on which channel observed it. On the reachable wedged-worker history where the worker never sends `TimedOut` and only the controller observes the deadline overrun, the two MUSTs are jointly unsatisfiable: obeying deadline-exceeded means the controller-observed run never goes terminal while the worker-observed run of the same physical history goes `Cancelled` (a channel-dependent verdict); obeying channel-invariance means the controller path takes a terminal transition deadline-exceeded forbids. `172776b1b` went off-spec to `Poisoned` at the cap for exactly this reason (C1/D1 are the code-side view of the same knot). | The design (§6, adjudication (a)) pre-commits the resolution: Phase 1 amends `sched.termination.deadline-exceeded+2` (with the corresponding version bump) to permit terminal `Cancelled` at the cap on the controller path, dissolving the conflict in the same red-first change that fixes D1/C1. Until that lands the spec deliberately carries both bodies; Stage B encodes the as-built code (which satisfies neither exactly) and treats the D1 falsification as the documented expected outcome. |
 
 Near-misses recorded for Phase 1 but not classified as contradictions of a
 MUST: the `sched.admin.clear-poison` ordering prose (above);
@@ -190,9 +208,9 @@ asymmetry or (c) policy choice) but it is not a defect in the fold's sense.
 | # | Kind | Site A | Site B | The fold does | The deviation |
 |---|---|---|---|---|---|
 | D1 | **DIVERGENCE** | E4 at `timeout_count >= max_timeout_retries` → terminal `Cancelled` (resubmit-retriable immediately, no cascade lockout beyond this build) | E7 at the same cap → `poison_and_cascade` → `Poisoned` (24 h TTL, `resubmit_cycles`-bounded resubmit) | `Cancel` for both `WorkerTimeout` and `ControllerDeadlineExceeded` cap-exhaustion — `sched.timeout.promote-on-exceed+2` already names `Cancelled` as the timeout-cap terminal state and `sched.termination.deadline-exceeded+2` assigns terminal ownership to the timeout path; the design (§6) pre-adjudicates E7's `Poisoned` as the non-conforming side | E7 produces `Poisoned`. User-visible consequence of the Phase-1 fix: a wedged-worker derivation that exhausts its timeout budget via the controller backstop becomes immediately resubmit-retriable instead of locked out for 24 h. Contradiction C1 is the same defect seen from the rule's side. |
-| D2 | **DIVERGENCE** | E2's non-exempt `infra_count += 1` also stamps `last_infra_failure_at = now` (the 300 s window's anchor) | E6's at-cap `infra_count += 1` does not stamp `last_infra_failure_at` | Stamps `last_infra_failure_at` on every `infra_count` increment — the field's own documented meaning ("timestamp of the most recent InfrastructureFailure that incremented `infra_count`") and the window's purpose (measure the gap since the last *counted* failure) | E6's increment leaves the window anchored at the last E2 increment (or unset). Observable: a run of controller-reported at-cap OOMs followed by a worker-reported non-at-cap infra failure > 300 s later is *not* forgiven by the window (the anchor is stale or None) where a run of worker-reported at-cap OOMs would leave the anchor fresh and likewise not be forgiven (`!at_cap` guard) — the two runs agree by accident of the `at_cap` guard; the anchor divergence becomes observable the moment any non-at-cap E6 increment is introduced. Low severity today; a latent trap for any change to E6's `at_cap` gate. |
-| D3 | **DIVERGENCE** | E2: a floor-promoted infra failure (worker-reported `CgroupOom` that successfully doubled the floor) is exempt from `infra_count` but charges `exempt_infra_count` (the budget for the budget exemption, `sched.retry.exempt-infra-cap`: "increments on every exempt attempt", where the rule defines an exempt attempt as CONCURRENT_PUTPATH or `floor_outcome.promoted`) | E6: a floor-promoted controller-reported OOM (`promoted=true` ⟹ `at_cap=false` ⟹ the increment block is skipped) charges *nothing* | Charges `exempt_infra_count` for every `floor_outcome.promoted` infra-class attempt regardless of the reporting channel — `sched.retry.exempt-infra-cap`'s "every exempt attempt" is the spec mandate, and `sched.retry.attempts-bounded`'s exempted-attempts-charge-the-exemption-budget clause depends on it | E6's promoted arm charges no budget (contradiction C3). Not a channel race — a cgroup-level OOM and a pod-level OOM are physically distinct events — but the two sites disagree about what a `floor_outcome.promoted` infra-class attempt charges, the existing rule mandates the E2 side, and a fold that reproduces the E6 side leaves the exemption bounded on the controller path only by the floor ladder's own length (log₂(ceiling/start) promotions before `at_cap` engages `infra_count`) — a real bound, but a different and unstated one. A `bump_resource_floor` bug that always returns `promoted=true` would livelock the controller path where the worker path poisons at `max_exempt_infra_retries`. `CountersRefineHistory` is expected to falsify on any history containing a promoted controller-reported termination. |
-| D4 | **DIVERGENCE** (durable mirror) | E1's and E3's `failed_builders.insert` are mirrored to PG via `db.append_failed_worker` | E8's `failed_builders.insert` (the backstop's accounting) is in-memory only — no `append_failed_worker` call | The fold computes the in-memory set (insert on `TransientFailure`, `PermanentFailure`, `BackstopTimeout`); the durable view is the Stage-B model's PG-mirror ghost, where E8's write is a permanently-lost mirror write rather than a maybe-lost one | A backstop-recorded failure survives neither failover nor the recovery-time poison re-check: the post-failover `failed_builders` (and the derived `failure_count`) under-count by every backstop event since the last E1/E3 failure, so a derivation that wedged 2 of 3 workers pre-failover restarts its poison-threshold progress. Compounds C2 (the backstop is the only thing bounding the no-report crash loop, and its accounting does not survive the leader change that a crashing worker can itself cause). |
+| D2 | **DIVERGENCE** | E2's non-exempt `infra_count += 1` also stamps `last_infra_failure_at = now` (the 300 s window's anchor) | E6's at-cap `infra_count += 1` does not stamp `last_infra_failure_at` | Stamps `last_infra_failure_at` on every `infra_count` increment — the field's own documented meaning ("timestamp of the most recent InfrastructureFailure that incremented `infra_count`") and the window's purpose (measure the gap since the last *counted* failure) | E6's increment leaves the window anchored at the last E2-counted failure (or `None` if there has never been one). Observability corrected in the Stage-A review: the `!at_cap` guard tests the *current* event's floor outcome, and E2's at-cap increments do stamp the anchor — so a run of worker-reported at-cap OOMs followed by a non-at-cap infra failure > 300 s later IS forgiven (stale-but-set anchor → the reset fires and the accumulated at-cap count is wiped), as is a controller-counted run that has any earlier E2-counted failure to anchor on; only the anchor-`None` case (an exclusively controller-counted run) is not forgiven. The divergence is therefore observable today, with no change to E6's gate: the same physical at-cap OOM run followed by a sparse non-at-cap infra failure produces different `infra_count` trajectories — and a different time-to-poison — depending on which channel counted the OOMs. The adjudication is unchanged: the fold stamps the anchor on every increment. |
+| D3 | **DIVERGENCE** | E2: a floor-promoted infra failure (worker-reported `CgroupOom` that successfully doubled the floor) is exempt from `infra_count` but charges `exempt_infra_count` (the budget for the budget exemption, `sched.retry.exempt-infra-cap`: "increments on every exempt attempt", where the rule defines an exempt attempt as CONCURRENT_PUTPATH or `floor_outcome.promoted`) | E6: a floor-promoted controller-reported OOM (`promoted=true` ⟹ `at_cap=false` ⟹ the increment block is skipped) charges *nothing* | Charges `exempt_infra_count` for every `floor_outcome.promoted` infra-class attempt regardless of the reporting channel — `sched.retry.exempt-infra-cap`'s "every exempt attempt" is the spec mandate, and `sched.retry.attempts-bounded+2`'s exempted-attempts-charge-the-exemption-budget clause depends on it | E6's promoted arm charges no budget (contradiction C3). Not a channel race — a cgroup-level OOM and a pod-level OOM are physically distinct events — but the two sites disagree about what a `floor_outcome.promoted` infra-class attempt charges, the existing rule mandates the E2 side, and a fold that reproduces the E6 side leaves the exemption bounded on the controller path only by the floor ladder's own length (log₂(ceiling/start) promotions before `at_cap` engages `infra_count`) — a real bound, but a different and unstated one. A `bump_resource_floor` bug that always returns `promoted=true` would livelock the controller path where the worker path poisons at `max_exempt_infra_retries`. `CountersRefineHistory` is expected to falsify on any history containing a promoted controller-reported termination. |
+| D4 | **DIVERGENCE** (durable mirror) | E1's and E3's `failed_builders.insert` are mirrored to PG via `db.append_failed_worker` | E8's `failed_builders.insert` (the backstop's accounting) is in-memory only — no `append_failed_worker` call | The fold computes the in-memory set (insert on `TransientFailure`, `PermanentFailure`, `BackstopTimeout`); the durable view is the Stage-B model's PG-mirror ghost, where E8's write is a permanently-lost mirror write rather than a maybe-lost one | A backstop-recorded failure survives neither failover nor the recovery-time poison re-check: the post-failover `failed_builders` (and the derived `failure_count`) under-count by every backstop event since the last E1/E3 failure, so a derivation that wedged 2 of 3 workers pre-failover restarts its poison-threshold progress. Compounds C2's wedged-worker sub-case: the backstop is the only counted bound on the no-report *wedge* loop, and that accounting does not survive the leader change a wedging derivation can outlast; the no-report *hard-crash* loop never reaches the backstop at all (see C2), so D4 neither helps nor hurts it. |
 | A5 | ASYMMETRY (inventory §2.3.5) | E1, E8 insert into `failed_builders` and increment `failure_count`; E3 inserts into `failed_builders` only (diagnostics; it poisons unconditionally anyway) | E2, E4, E5, E6, E7 deliberately do not insert | The fold inserts on `TransientFailure` / `BackstopTimeout` / `PermanentFailure` and not on the others — each event class has one consistent behavior | None for the fold. Phase-1 disposition (b)/(c): which failure classes join the placement-exclusion set is a policy choice the `Attempt` record's `outcome_class` carries. |
 | A6 | ASYMMETRY (recovery) | Live `failure_count` is incremented by E1 and E8 only (same-worker repeats counted, permanent failures not counted) | Recovered `failure_count := failed_builders.len()` (same-worker repeats forgotten, the permanent path's diagnostics-only insert counted) | The fold computes the live value; `Counters::recovery_projection` computes the recovered value; the two are documented as different functions of the history | The recovered value can be both above and below the live value for the same history. Documented lossy reconstruction (`sched.retry.recovery-projection`); becomes moot when the ledger fold replaces the projection in Phase 1b. |
 | A7 | ASYMMETRY (inventory §2.3.6) | Only E1 sets `backoff_until` (exponential, jittered, 5 s → 300 s) | E2/E4/E5/E6/E7/E8 requeue with no backoff (E4's longer deadline and E2's immediate-retry rationale are documented; E5/E8's are not) | The fold sets `backoff_until` on `TransientFailure` only, deterministically (no jitter — the jitter is an implementation freedom the spec permits, and the model compares modulo it) | None for the fold. Phase-1 disposition (c): uniform backoff vs uniform no-backoff is the policy choice the design flags (the 9,748-redispatch incident is the no-backoff hot-loop; the documented mitigation is the cap, not a backoff). |
@@ -201,10 +219,71 @@ asymmetry or (c) policy choice) but it is not a defect in the fold's sense.
 | A10 | ASYMMETRY (inventory §2.3.2) | `infra_count`: cap-checked before the increment at both E2 and E6 (the cap fires on failure N+1); `count`: checked-then-incremented on the retry arm at E1 (poison on failure N+1); `timeout_count`: checked-then-incremented at both E4 and E7 (terminal on timeout N+1) | `exempt_infra_count`: incremented before the cap check at E2 (poison *on* exempt attempt N) | The fold reproduces each counter's own convention exactly — no two sites disagree about the *same* counter, so this is reproducible | None for the fold. The off-by-one inconsistency in what `max_X_retries = N` means across counters is a Phase-1 unification candidate (the single `decide()` should give every budget the same fencepost). |
 
 The three most consequential divergences are D1 (a 24 h lockout vs an
-immediate retry, decided by message arrival order), D4 (the only bound on
-the no-report crash loop does not survive failover), and D3 (the exemption
-budget that exists to bound the cap-exemption is never charged on the
-controller channel).
+immediate retry, decided by message arrival order), D4 (the only counted
+bound on the no-report wedge loop does not survive failover — and the
+no-report hard-crash loop has no bound at all, see C2), and D3 (the
+exemption budget that exists to bound the cap-exemption is never charged
+on the controller channel).
+
+### Stage-A dispositions for D1 / D3 / D4
+
+The Stage-A self-review confirmed all three headline divergences against
+the code and dispositioned each as **phase-1** — no immediate fix; Phase 0
+leaves the production code unchanged and Stage B models it as-is.
+
+- **D1 — phase-1.** Pre-adjudicated by the design (§6, adjudication (a)):
+  the fix is a behavior change on the losing path that ships red-first
+  together with the `sched.termination.deadline-exceeded+2` amendment and
+  its version bump (see C4). The as-built consequence is bounded
+  (`Poisoned` with a 24 h TTL, bounded resubmit, admin clear-poison), and
+  D1 is the designated expected falsification of
+  `VerdictIsChannelInvariant` — fixing it now would remove the
+  falsification the Stage-B calibration is designed to confirm.
+- **D3 — phase-1.** The same defect as contradiction C3. Today's
+  controller path is still bounded (the floor ladder's monotone doubling
+  until `at_cap` engages `infra_count`); the livelock requires a
+  hypothetical second bug in `bump_resource_floor`; and the proper fix
+  lands with the E6 rework that the two-installment attempt-correlation
+  mechanism forces in Phase 1 anyway. Charging `exempt_infra_count` now
+  would be a Phase-0 behavior change with no urgent production exposure.
+- **D4 — phase-1.** Confirmed real: the backstop's accounting is
+  in-memory only (the only `db.append_failed_worker` call sites are E1's
+  `record_failure_and_check_poison` and E3's `handle_permanent_failure`),
+  so backstop-recorded poison-threshold progress does not survive
+  failover. The practical exposure is a slow-cadence loss of that
+  progress — it requires a no-report *wedge* loop (≥ 7800 s per counted
+  attempt) plus a leader failover mid-loop, and it costs wasted
+  dispatches, not data loss or wrong build outputs. Fixing it now would
+  change post-failover accounting mid-campaign (invalidating this row,
+  the as-built model the design requires, and the G8 calibration
+  premises), it intersects the pending `sched.retry.failover-budget`
+  decision the design's Phase-0 gate requires, and Phase 1a's
+  `drv_attempts` ledger makes every attempt durable at the append site,
+  structurally subsuming a tactical mirror write that Phase 1b would then
+  delete. Stage B encodes E8's mirror write as permanently lost in the
+  durable view.
+
+### Expected Stage-B falsifications (pre-registered)
+
+A model run that falsifies one of these is confirming a documented
+as-built defect; a falsification *not* on this list is a stop-and-report
+(a model-encoding bug or a new defect — triage before continuing).
+
+- `VerdictIsChannelInvariant` — the D1 history: the timeout budget
+  exhausted via E7 (controller-reported) instead of E4 (worker-reported).
+- `CountersRefineHistory` — histories reaching D2 (controller-counted
+  at-cap OOMs: the missing anchor stamp) or D3 (a promoted
+  controller-reported termination: the missing `exempt_infra_count`
+  charge); and, in the durable view only, D4 (E8's unmirrored
+  `failed_builders`/`failure_count` charge — encoded as a permanently
+  lost write, not a fault-injectable one).
+- `AttemptsBounded` — the C2 no-report hard-crash loop: an uncounted
+  disconnect-requeue cycle that never reaches the backstop, bounded only
+  by an optional per-build `build_timeout`.
+- The G5 double-count interleavings falsify the counter-delta half of
+  `VerdictIsChannelInvariant` (and `NoDoubleCount`) only if the dedup
+  encoding admits them — that is a Stage-B question to answer, not a
+  pre-registered defect.
 
 ## Rules in the failure-handling inventory not load-bearing for any invariant above
 
@@ -260,11 +339,12 @@ or hold depending on the dedup encoding — the G5 family),
 keep-going and recovery-cascade tests verify the build-level consequences
 but not the reaches-exactly-the-dependents set property).
 
-`sched.retry.transient-budget`, `sched.retry.attempts-bounded`, and
-`sched.retry.counters-refine-history` carry `r[verify]` markers on the
+`sched.retry.transient-budget`, `sched.retry.attempts-bounded+2`, and
+`sched.retry.counters-refine-history+2` carry `r[verify]` markers on the
 referenceFold's unit tests (`rio-scheduler/src/retry_policy.rs`), which pin
 the fold against hand-computed histories covering every counter, the window
-reset, the exemption, a poison, a TTL expiry, and a per-executor exclusion.
+reset (including the exempt-event fall-through), the exemption, a poison, a
+TTL expiry, and a per-executor exclusion.
 The model's exhaustive form of `counters-refine-history` — the *live*
 counters compared against the fold over every observation ordering — is
 still Stage-B work; the unit tests verify the fold, the model verifies the
