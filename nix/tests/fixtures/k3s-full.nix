@@ -459,7 +459,7 @@ let
       pkgs.wireguard-tools # `wg show cilium_wg0` (cilium-encrypt.nix)
     ];
 
-    # r[impl builder.seccomp.localhost-profile+2]
+    # r[impl builder.seccomp.localhost-profile+3]
     # Same tmpfiles delivery as the NixOS AMI (nix/nixos-node/hardening.nix):
     # profiles are store paths, copied into kubelet's seccomp dir before k3s
     # (and its embedded kubelet) starts. k3s passes `--root-dir

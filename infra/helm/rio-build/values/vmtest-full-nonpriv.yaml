@@ -44,7 +44,8 @@ poolDefaults:
   # k3s's containerd RuntimeDefault does NOT allowlist pivot_root even
   # with CAP_SYS_ADMIN — nix-daemon's sandbox does pivot_root → EPERM
   # under RuntimeDefault. The Localhost profile (RuntimeDefault +
-  # pivot_root − ptrace/bpf/setns) is delivered via systemd-tmpfiles by
+  # pivot_root + ptrace/process_vm_readv − bpf/setns/
+  # process_vm_writev) is delivered via systemd-tmpfiles by
   # k3sBase before k3s starts (fixtures/k3s-full.nix — same path as the
   # NixOS AMI), so the file is guaranteed present before any pod
   # schedules.

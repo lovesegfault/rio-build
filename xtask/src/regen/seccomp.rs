@@ -2,7 +2,7 @@
 //!
 //! Moby's default.json has conditional blocks keyed on capabilities.
 //! Flatten for the caps the worker HAS, remove the syscalls we deny
-//! (per security.typ r[builder.seccomp.localhost-profile+2]), then diff.
+//! (per security.typ r[builder.seccomp.localhost-profile+3]), then diff.
 //!
 //! The flattening is approximate — moby's format has arch-specific
 //! blocks, minKernel conditionals. Produces a diff for HUMAN REVIEW.
@@ -20,17 +20,30 @@ const PROFILE_PATH: &str = "nix/nixos-node/seccomp/rio-builder.json";
 const WORKER_CAPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_CHROOT"];
 
 /// Syscalls the builder profile MUST NOT allow (per security.typ
-/// r[builder.seccomp.localhost-profile+2]). Single source of truth —
+/// r[builder.seccomp.localhost-profile+3]). Single source of truth —
 /// `regen seccomp` strips these from the moby diff baseline, and
 /// `lint seccomp-allowlist` asserts they're absent from the checked-in
 /// profile's ALLOW blocks.
-pub(crate) const DENIED: &[&str] = &[
-    "ptrace",
-    "bpf",
-    "setns",
-    "process_vm_readv",
-    "process_vm_writev",
-];
+///
+/// `ptrace` and `process_vm_readv` are deliberately NOT in this set —
+/// they are allowed (and `lint seccomp-allowlist` asserts they STAY in
+/// an ALLOW block). Denying them breaks every build whose check phase
+/// traces its own processes: LeakSanitizer's at-exit stop-the-world
+/// attaches a tracer to the leaking process (all rio-fuzz-* checks died
+/// with "LeakSanitizer has encountered a fatal error"), and strace-/
+/// gdb-driven test suites fork-and-trace. The mitigating control is the
+/// Yama LSM (active on the builder nodes, `kernel.yama.ptrace_scope=1`
+/// pinned in nix/nixos-node/hardening.nix): a process may only trace
+/// its own descendants, which is exactly what a check phase needs and
+/// close to nothing for lateral movement. The write side
+/// (`process_vm_writev`) stays denied — no test harness needs to write
+/// another process's memory. Residual risk accepted: the kernel's
+/// ptrace code paths become reachable from untrusted build code; the
+/// cluster is single-tenant today — revisit before onboarding untrusted
+/// tenants. The fetcher profile keeps both denied
+/// (`FETCHER_EXTRA_DENIED` in lint.rs): FOD fetch scripts have no check
+/// phase and fetchers face the open internet.
+pub(crate) const DENIED: &[&str] = &["bpf", "setns", "process_vm_writev"];
 
 pub async fn run(tag: &str) -> Result<()> {
     let ours = repo_root().join(PROFILE_PATH);

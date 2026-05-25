@@ -233,6 +233,52 @@ pkgs.testers.runNixOSTest {
             f"hostUsers={host_users!r} (k3s opt-out)"
         )
 
+    # ── seccomp profile content: read-side tracing allowed ──────────
+    # The subtest above proves the pod REFERENCES the Localhost
+    # profile; this one proves the INSTALLED profile (the tmpfiles
+    # copy runc actually loads) carries the intended allow/deny split.
+    # ptrace + process_vm_readv must be in an ALLOW block — denying
+    # them fails every build whose check phase traces its own
+    # processes (LeakSanitizer's at-exit stop-the-world, strace/gdb
+    # test suites). Yama ptrace_scope=1 (descendants-only) is the
+    # confinement that makes the allow acceptable. process_vm_writev
+    # (the cross-process WRITE) must stay out of every ALLOW block so
+    # defaultAction=ERRNO keeps denying it. `xtask lint
+    # seccomp-allowlist` asserts the same against the checked-in JSON;
+    # this asserts the delivery path ships that JSON unmodified.
+    with subtest("seccomp-profile-content: read-side trace syscalls allowed, write-side denied"):
+        prof = json.loads(k3s_server.succeed(
+            "cat /var/lib/kubelet/seccomp/operator/rio-builder.json"
+        ))
+        assert prof["defaultAction"] == "SCMP_ACT_ERRNO", (
+            f"profile must stay a default-deny allowlist; got "
+            f"defaultAction={prof['defaultAction']!r}"
+        )
+        allowed = {
+            n
+            for b in prof["syscalls"]
+            if b["action"] == "SCMP_ACT_ALLOW"
+            for n in b.get("names", [])
+        }
+        for sc in ("ptrace", "process_vm_readv"):
+            assert sc in allowed, (
+                f"`{sc}` not in any ALLOW block of the installed "
+                f"rio-builder.json — sanitizer/debugger check phases "
+                f"(LSan stop-the-world, strace/gdb test suites) need "
+                f"to trace their own descendants; Yama ptrace_scope=1 "
+                f"is the confinement that makes this acceptable"
+            )
+        assert "process_vm_writev" not in allowed, (
+            "`process_vm_writev` appears in an ALLOW block — the "
+            "cross-process WRITE syscall must stay denied; only the "
+            "read side is needed by tracers"
+        )
+        print(
+            f"seccomp-profile-content PASS: ptrace+process_vm_readv "
+            f"allowed, process_vm_writev denied, "
+            f"{len(allowed)} syscalls in ALLOW blocks"
+        )
+
     # ── cgroup rw-remount succeeded ─────────────────────────────────
     # containerd mounts /sys/fs/cgroup RO for non-privileged pods
     # even with CAP_SYS_ADMIN. delegated_root() does

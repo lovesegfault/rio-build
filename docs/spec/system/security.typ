@@ -276,15 +276,17 @@
   to all containers + init containers) when `privileged != true`. RuntimeDefault
   blocks \~40 syscalls including `kexec_load`, `open_by_handle_at`,
   `userfaultfd` that builds don't need. A Localhost profile additionally
-  blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is
+  blocking `bpf`/`setns`/`process_vm_writev` under `CAP_SYS_ADMIN` is
   available --- see `r[builder.seccomp.localhost-profile]` below.
 ]
 
-#r("builder.seccomp.localhost-profile+2")[
+#r("builder.seccomp.localhost-profile+3")[
   Executor pods MAY be configured with a Localhost seccomp profile
-  (`PoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`,
-  `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's
-  \~40-syscall denylist. The profile JSON lives at
+  (`PoolSpec.seccompProfile: Localhost`) that denies `bpf`, `setns`, and the
+  cross-process *write* syscall `process_vm_writev` on top of RuntimeDefault's
+  \~40-syscall denylist, while keeping the read-side trace syscalls `ptrace`
+  and `process_vm_readv` permitted (the builder profile only; the fetcher
+  profile denies all five). The profile JSON lives at
   `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default
   `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode
   `operator/rio-fetcher.json`) --- that path is relative to
@@ -297,6 +299,21 @@
   missing profile surfaces as the executor container's `CreateContainerError`
   with the profile path in the message.
 ]
+
+The read-side trace syscalls are permitted because denying them breaks every
+build whose check phase traces its own processes: LeakSanitizer's at-exit
+stop-the-world attaches a tracer to the leaking process (every sanitized test
+suite dies with "LeakSanitizer has encountered a fatal error"), and strace- and
+gdb-driven test suites fork-and-trace. The mitigating control is the Yama LSM,
+active on the builder nodes via the default `lsm=landlock,yama,bpf` kernel
+command line with `kernel.yama.ptrace_scope = 1` pinned in
+`nix/nixos-node/hardening.nix`: a process may only trace its own descendants,
+which is exactly the capability a check phase needs and close to nothing for
+lateral movement. The cross-process write syscall stays denied because no test
+harness needs to write another process's memory. The residual risk accepted is
+kernel attack surface --- the ptrace code paths become reachable from untrusted
+build code. The cluster is single-tenant today; the intent is to revisit this
+allowance before onboarding untrusted tenants.
 
 == Key Security Properties
 
@@ -608,7 +625,8 @@ cached inputs from other tenants to exfiltrate.
 
     [Seccomp],
     [`PoolSpec.seccompProfile: Localhost`],
-    [`ptrace`/`bpf`/`setns`/`process_vm_*` denied (see
+    [`bpf`/`setns`/`process_vm_writev` denied; read-side tracing
+      (`ptrace`/`process_vm_readv`) Yama-confined to descendants (see
       `r[builder.seccomp.localhost-profile]`)],
 
     [Node isolation],
@@ -636,8 +654,9 @@ heartbeat) plus one reconciler tick (\~10s).
   syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still
   grants significant host access. The Localhost @seccomp profile
   (`r[builder.seccomp.localhost-profile]`) additionally blocks
-  `ptrace`/`bpf`/`setns`/`process_vm_*` --- production deployments should set
-  `PoolSpec.seccompProfile: {type: Localhost, localhostProfile:
+  `bpf`/`setns`/`process_vm_writev` (read-side tracing stays available to
+  check phases, confined to descendants by Yama) --- production deployments
+  should set `PoolSpec.seccompProfile: {type: Localhost, localhostProfile:
   operator/rio-builder.json}` (the chart default). Dedicated node pools with
   taints are essential. *Mitigation (K8s 1.33+):* Executor pods must set
   `hostUsers: false` to enable user namespace isolation. With user namespaces,

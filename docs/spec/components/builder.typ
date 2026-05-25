@@ -1053,10 +1053,12 @@ Nix sandbox (user/mount/PID/network namespaces).
 `seccomp-rio-builder.json` when `privileged != true`. The profile is a
 default-deny allowlist derived from moby `default.json` v27.5.1 (see
 #rref("builder.seccomp.localhost-profile")), permitting the namespace/mount
-syscalls the FUSE mount + overlayfs + nix-daemon sandbox need while blocking
-`ptrace`, `bpf`, `keyctl`, `kexec_load`, `open_by_handle_at`, `userfaultfd`.
-When the profile is unset (or `privileged=true`), pods fall back to
-`RuntimeDefault`.
+syscalls the FUSE mount + overlayfs + nix-daemon sandbox need --- plus the
+read-side trace syscalls (`ptrace`, `process_vm_readv`) that
+sanitizer/debugger-based check phases require, Yama-confined to descendants ---
+while blocking `bpf`, `setns`, `process_vm_writev`, `kexec_load`,
+`open_by_handle_at`, `userfaultfd`. When the profile is unset (or
+`privileged=true`), pods fall back to `RuntimeDefault`.
 
 *Recommended cluster configuration:*
 - Dedicated node pool with taint `rio.build/builder=true:NoSchedule` to

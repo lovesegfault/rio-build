@@ -179,8 +179,14 @@ let
       # the checks gate (one fork pool per fuzz target, all running
       # concurrently — uncapped that's targets × cores procs on the
       # big box).
-      # Workers write to fuzz-*.log; dump those on failure so crash
-      # stacks land in the Nix build log.
+      # In -fork mode each worker's stdout/stderr goes to
+      # $TMPDIR/libFuzzerTemp.FuzzWithFork<pid>.dir/<job>.log — NOT to
+      # ./fuzz-*.log (that's -jobs mode). The parent only echoes the
+      # log of the job it decides crashed; a worker that dies before
+      # producing an artifact (sanitizer init failure, LSan fatal
+      # error under a restrictive seccomp profile, OOM) leaves its
+      # diagnostics only in those files. Dump every worker log on
+      # failure so the crash stacks land in the Nix build log.
       cores=''${NIX_BUILD_CORES:-1}
       ${fuzzBins}/bin/${target} "$workCorpus" \
         -max_total_time=120 \
@@ -188,8 +194,15 @@ let
         -print_final_stats=1 \
         -artifact_prefix=artifacts/ \
         -fork=$(( cores <= 16 ? cores : 16 )) || {
-          echo "--- worker logs ---"
-          cat fuzz-*.log 2>/dev/null || true
+          echo "--- fork-mode worker logs ---"
+          found=
+          for log in "''${TMPDIR:-/tmp}"/libFuzzerTemp.*/*.log; do
+            [ -e "$log" ] || continue
+            found=1
+            echo "=== $log ==="
+            cat "$log"
+          done
+          [ -n "$found" ] || echo "(no libFuzzerTemp.*/*.log found under ''${TMPDIR:-/tmp})"
           exit 1
         }
 

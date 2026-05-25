@@ -57,7 +57,7 @@ fn job_pod_security_context() {
     );
 }
 
-// r[verify builder.seccomp.localhost-profile+2]
+// r[verify builder.seccomp.localhost-profile+3]
 #[test]
 fn seccomp_default_is_runtime_default() {
     // spec.seccompProfile=None → builder emits RuntimeDefault at
@@ -74,7 +74,7 @@ fn seccomp_default_is_runtime_default() {
     assert_eq!(prof.localhost_profile, None);
 }
 
-// r[verify builder.seccomp.localhost-profile+2]
+// r[verify builder.seccomp.localhost-profile+3]
 #[test]
 fn seccomp_localhost_emits_correct_security_context() {
     // spec.seccompProfile={type: Localhost, localhostProfile: ...}
@@ -163,7 +163,7 @@ fn seccomp_non_localhost_pod_level_only() {
     }
 }
 
-// r[verify builder.seccomp.localhost-profile+2]
+// r[verify builder.seccomp.localhost-profile+3]
 #[test]
 fn seccomp_privileged_drops_profile() {
     // privileged=true disables seccomp at the runtime level. The

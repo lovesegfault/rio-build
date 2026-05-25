@@ -29,9 +29,11 @@ pub enum Lint {
     /// allowlists (`defaultAction: SCMP_ACT_ERRNO`), the denied
     /// syscalls are absent from every ALLOW block, the
     /// worker-critical syscalls (mount/unshare/chroot/clone/umount2)
-    /// are present, and the fetcher profile keeps its explicit
-    /// SCMP_ACT_ERRNO block (ADR-019). Catches a profile edit that
-    /// flips to a denylist or strands the Nix sandbox.
+    /// are present (plus, builder-only, the read-side trace syscalls
+    /// sanitizer/debugger check phases need), and the fetcher profile
+    /// keeps its explicit SCMP_ACT_ERRNO block (ADR-019). Catches a
+    /// profile edit that flips to a denylist or strands the Nix
+    /// sandbox.
     SeccompAllowlist,
 }
 
@@ -398,7 +400,7 @@ fn helm_sla() -> Result<()> {
 /// profile *files* stay at `nix/nixos-node/seccomp/`; they're
 /// deployment config consumed by `hardening.nix`, `k3s-full.nix`, and
 /// `xtask regen seccomp`.
-// r[verify builder.seccomp.localhost-profile+2]
+// r[verify builder.seccomp.localhost-profile+3]
 // r[verify fetcher.sandbox.strict-seccomp]
 fn seccomp_allowlist() -> Result<()> {
     // Worker-critical syscalls — must be present in an ALLOW block. If
@@ -407,8 +409,21 @@ fn seccomp_allowlist() -> Result<()> {
     // the FOD build script inside the same sandbox.
     const NEEDED: &[&str] = &["mount", "unshare", "chroot", "clone", "umount2"];
 
+    // Builder-only: the read-side trace syscalls must STAY in an ALLOW
+    // block. Sanitizer/debugger check phases (LeakSanitizer's at-exit
+    // stop-the-world, strace/gdb test suites) trace their own
+    // descendants; Yama ptrace_scope=1 confines the capability to
+    // exactly that. A profile edit that drops these re-breaks every
+    // such build. NOT folded into NEEDED: the fetcher profile denies
+    // them (see FETCHER_EXTRA_DENIED).
+    const BUILDER_NEEDED_TRACE: &[&str] = &["ptrace", "process_vm_readv"];
+
     // Fetcher-only ADR-019 denies, on top of the builder DENIED set.
-    const FETCHER_EXTRA_DENIED: &[&str] = &["keyctl", "add_key"];
+    // `ptrace`/`process_vm_readv` are allowed in the BUILDER profile
+    // (read-side tracing for check phases — see regen::seccomp::DENIED)
+    // but stay denied here: FOD fetch scripts have no check phase, and
+    // the fetcher faces the open internet.
+    const FETCHER_EXTRA_DENIED: &[&str] = &["keyctl", "add_key", "ptrace", "process_vm_readv"];
 
     let fetcher_denied: Vec<&str> = crate::regen::seccomp::DENIED
         .iter()
@@ -416,10 +431,12 @@ fn seccomp_allowlist() -> Result<()> {
         .copied()
         .collect();
 
+    let builder_needed: Vec<&str> = NEEDED.iter().chain(BUILDER_NEEDED_TRACE).copied().collect();
+
     check_seccomp_profile(
         "nix/nixos-node/seccomp/rio-builder.json",
         crate::regen::seccomp::DENIED,
-        NEEDED,
+        &builder_needed,
         // Builder profile relies on defaultAction ERRNO alone; no
         // explicit ERRNO block required.
         &[],
@@ -514,8 +531,10 @@ fn check_seccomp_profile(
     for n in needed {
         ensure!(
             allowed.contains(n),
-            "{}: `{n}` missing from ALLOW blocks — worker overlayfs/\
-             Nix-sandbox setup needs it",
+            "{}: `{n}` missing from ALLOW blocks — the executor needs it \
+             (overlayfs/Nix-sandbox setup, or descendant tracing for \
+             sanitizer/debugger check phases — see NEEDED / \
+             BUILDER_NEEDED_TRACE in xtask/src/lint.rs)",
             path.display(),
         );
     }

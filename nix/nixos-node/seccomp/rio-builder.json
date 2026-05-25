@@ -1,13 +1,11 @@
 {
   "//": "rio-builder seccomp profile (Localhost). See docs/spec/system/security.typ r[builder.seccomp.localhost-profile].",
   "//provenance": "Derived from Docker/moby default.json v27.5.1 (RuntimeDefault equivalent), flattened to OCI runtime spec format for the worker cap set (CAP_SYS_ADMIN + CAP_SYS_CHROOT). The Docker profile uses includes/excludes preprocessing which is Docker-specific; kubelet Localhost profiles are consumed by runc/crun which expect the OCI LinuxSeccomp format. Flattening: resolve the conditional blocks for the capabilities the worker actually has, drop the rest.",
-  "//denied": "ptrace, bpf, setns, process_vm_readv, process_vm_writev — absent from ALL allow blocks, so defaultAction=ERRNO(EPERM) applies. Under RuntimeDefault these ARE allowed: ptrace/process_vm_* via the minKernel:4.8 block (always active on modern kernels), bpf/setns via the CAP_SYS_ADMIN block (worker has that cap). A sandbox escape inside the worker would have these tools; this profile takes them away.",
+  "//denied": "bpf, setns, process_vm_writev — absent from ALL allow blocks, so defaultAction=ERRNO(EPERM) applies. Under RuntimeDefault these ARE allowed: process_vm_writev via the minKernel:4.8 block (always active on modern kernels), bpf/setns via the CAP_SYS_ADMIN block (worker has that cap). A sandbox escape inside the worker would have these tools; this profile takes them away. ptrace and process_vm_readv used to be in this set; they are now ALLOWED (see the read-side-tracing block below) because denying them broke every sanitizer/debugger-based check phase.",
   "//why-each": {
-    "ptrace": "debugger attach — lets an escapee inspect/modify other worker processes sharing the PID namespace",
     "bpf": "load eBPF programs — kernel-side code execution surface",
     "setns": "join another namespace — defeats namespace isolation (worker CREATES namespaces via unshare/clone, never JOINS existing ones)",
-    "process_vm_readv": "cross-process memory read without ptrace — same attack class as ptrace",
-    "process_vm_writev": "cross-process memory write without ptrace"
+    "process_vm_writev": "cross-process memory write — no test harness needs to WRITE another process's memory; the read side is what tracers use"
   },
   "//kept-from-cap-sys-admin": "mount/umount/umount2/unshare/clone/clone3/fsconfig/fsmount/fsopen/fspick/mount_setattr/move_mount/open_tree/pivot_root — worker needs these for overlayfs per-build isolation + Nix sandbox namespace setup. pivot_root is NOT in containerd's RuntimeDefault CAP_SYS_ADMIN block (upstream gap) but nix-daemon's build sandbox requires it; added here so the Localhost profile works where RuntimeDefault doesn't. fanotify_init/lookup_dcookie/perf_event_open/quotactl/quotactl_fd/setdomainname/sethostname/syslog kept for RuntimeDefault parity (low risk, removing them is a behavior change vs RuntimeDefault beyond the plan scope).",
   "defaultAction": "SCMP_ACT_ERRNO",
@@ -454,6 +452,14 @@
           "op": "SCMP_CMP_EQ"
         }
       ]
+    },
+    {
+      "//": "Read-side tracing: the minKernel:4.8 block from RuntimeDefault, MINUS process_vm_writev. LeakSanitizer's at-exit stop-the-world, strace- and gdb-driven test suites all need a build's check phase to trace its own descendants; with these denied every such build fails ('LeakSanitizer has encountered a fatal error'). The Yama LSM (kernel.yama.ptrace_scope=1, pinned in nix/nixos-node/hardening.nix) confines ptrace to descendants — exactly the capability a check phase needs, close to nothing for lateral movement. The cross-process WRITE stays denied. Residual risk: kernel ptrace code paths reachable from untrusted build code; single-tenant today, revisit before onboarding untrusted tenants.",
+      "names": [
+        "process_vm_readv",
+        "ptrace"
+      ],
+      "action": "SCMP_ACT_ALLOW"
     },
     {
       "//": "CAP_SYS_ADMIN block from RuntimeDefault, MINUS bpf + setns, PLUS pivot_root (containerd omits it from the CAP_SYS_ADMIN allowlist but nix-daemon's sandbox requires it). Worker has CAP_SYS_ADMIN so under RuntimeDefault these are all allowed except pivot_root; here we drop the two that grant lateral movement and add the one RuntimeDefault forgot.",

@@ -19,6 +19,23 @@
     kernel.sysctl = {
       "user.max_user_namespaces" = 65536;
 
+      # Load-bearing for the seccomp ptrace allow (the builder.seccomp.
+      # localhost-profile rule, nix/nixos-node/seccomp/rio-builder.json):
+      # the builder profile permits `ptrace`/`process_vm_readv` so that
+      # sanitizer/debugger-based check phases (LeakSanitizer's at-exit
+      # stop-the-world, strace/gdb test suites) can trace their own
+      # descendants. Yama scope 1 ("a process may only trace its own
+      # descendants") is the invariant that makes granting the syscall
+      # acceptable — it reduces the capability to exactly what a check
+      # phase needs and close to nothing for lateral movement. Yama is
+      # already active via the default `lsm=landlock,yama,bpf` cmdline
+      # and the kernel's built-in default for the scope is already 1
+      # (YAMA_SCOPE_RELATIONAL), but nothing pinned it: a future
+      # nixpkgs/systemd sysctl.d default or hardening preset moving it
+      # to 0 (no confinement) or 2/3 (breaks the tracers again) would
+      # silently invalidate the seccomp decision. Pin it.
+      "kernel.yama.ptrace_scope" = 1;
+
       # nodeadm sets KubeletConfiguration.protectKernelDefaults=true,
       # which makes kubelet REFUSE to start unless these match exactly
       # (kubelet validates instead of writing them — that's the "protect"
@@ -90,7 +107,7 @@
   systemd.services.growpart.environment.TMPDIR = "/run";
 
   # ── seccomp profiles ────────────────────────────────────────────────
-  # r[impl builder.seccomp.localhost-profile+2]
+  # r[impl builder.seccomp.localhost-profile+3]
   # Profiles are store paths in the AMI, copied into kubelet's seccomp
   # dir before kubelet starts. By the time any pod schedules the file is
   # guaranteed present — rio-controller emits seccompProfile: Localhost

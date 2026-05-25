@@ -283,7 +283,7 @@
   (
     key: "seccomp",
     short: [seccomp],
-    description: [Secure Computing Mode. A Linux kernel feature that restricts which system calls a process can make. The controller sets `PoolSpec.seccompProfile` (default `Localhost` profile denying `ptrace`/`bpf`/`setns`/`process_vm_*`) plus granular capabilities (`SYS_ADMIN`, `SYS_CHROOT`) instead of `privileged: true`.],
+    description: [Secure Computing Mode. A Linux kernel feature that restricts which system calls a process can make. The controller sets `PoolSpec.seccompProfile` (default `Localhost` profile denying `bpf`/`setns`/`process_vm_writev`; the read-side trace syscalls stay allowed for sanitizer/debugger check phases, Yama-confined to descendants) plus granular capabilities (`SYS_ADMIN`, `SYS_CHROOT`) instead of `privileged: true`.],
   ),
   (
     key: "networkpolicy",

@@ -591,6 +591,13 @@ in
   # r[verify sec.pod.fuse-device-plugin]
   # r[verify builder.cgroup.ns-root-remount]
   # r[verify sec.psa.control-plane-restricted]
+  # r[verify builder.seccomp.localhost-profile+3]
+  #   seccomp: nonpriv-admitted asserts the worker container references
+  #   the Localhost profile (pod-level RuntimeDefault + container-level
+  #   Localhost, operator/rio-builder.json); seccomp-profile-content
+  #   asserts the INSTALLED profile keeps the read-side trace syscalls
+  #   (ptrace/process_vm_readv) in an ALLOW block and process_vm_writev
+  #   out of every ALLOW block.
   #   Non-privileged VM e2e. hostUsers:false NOT exercised here —
   #   k3s's containerd (systemd cgroup driver) doesn't chown the pod
   #   cgroup to the userns root; worker mkdir /sys/fs/cgroup/leaf

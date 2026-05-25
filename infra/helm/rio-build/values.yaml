@@ -1184,7 +1184,10 @@ poolDefaults:
   # RuntimeDefault seccomp profile omits pivot_root from the
   # CAP_SYS_ADMIN allowlist. The Localhost profile (nix/nixos-node/
   # seccomp/rio-builder.json, baked into the AMI) is RuntimeDefault +
-  # pivot_root − {ptrace, bpf, setns, process_vm_*}.
+  # pivot_root + {ptrace, process_vm_readv} − {bpf, setns,
+  # process_vm_writev} — read-side tracing is allowed so sanitizer/
+  # debugger check phases work (Yama-confined to descendants); the
+  # fetcher profile keeps all five denied.
   #
   # hostUsers default = true here so k3s VM tests work without
   # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd

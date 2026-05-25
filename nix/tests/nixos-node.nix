@@ -133,6 +133,13 @@ pkgs.testers.runNixOSTest {
 
     with subtest("hardening sysctl applied"):
         node.succeed("sysctl -n user.max_user_namespaces | grep -qx 65536")
+        # Yama descendants-only tracing is load-bearing for the seccomp
+        # profile's ptrace/process_vm_readv allow (hardening.nix pins
+        # the sysctl; the kernel default happens to match but is not a
+        # contract). 0 would drop the confinement that makes the allow
+        # acceptable; 2/3 would re-break sanitizer/debugger check
+        # phases.
+        node.succeed("sysctl -n kernel.yama.ptrace_scope | grep -qx 1")
         node.succeed("test -f /var/lib/kubelet/seccomp/operator/rio-builder.json")
 
     # kubelet loads NODEADM_KUBELET_ARGS from /etc/eks/kubelet/
