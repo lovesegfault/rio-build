@@ -339,6 +339,20 @@ pub struct NodeClaimPoolConfig {
     /// controller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`
     /// (8Gi).
     pub fuse_cache_bytes: u64,
+    /// FUSE-cache budget for FETCHER pods (the `fuse-cache` emptyDir
+    /// sizeLimit and the matching `ephemeral-storage` addend). A FOD's
+    /// FUSE cache only ever holds the fetch script's input closure
+    /// (curl/git/JDK-class toolchains), not the downloaded artifact
+    /// (that lands in the overlay emptyDir, sized from `disk_bytes`,
+    /// which grows via the reactive disk floor on eviction) — so this
+    /// is a small static bound, not the builder budget. Single source
+    /// for all Fetcher callers via [`pool::pod::FETCHER_FUSE_CACHE`]
+    /// (§Simulator-shares-accounting). This dimension has NO eviction
+    /// escalation path: a FOD whose input closure exceeds it retries to
+    /// exhaustion, so raise it here rather than relying on retry. Helm:
+    /// `poolDefaults.fetcherFuseCacheBytes`. Default is
+    /// `pool::pod::FETCHER_FUSE_CACHE_BYTES` (4Gi).
+    pub fetcher_fuse_cache_bytes: u64,
     /// `true` ⟺ the `kube-build-scheduler` Deployment is rendered
     /// (`buildScheduler.enabled`). r40 bug_018: builder pods get
     /// `schedulerName=kube-build-scheduler` only when BOTH the
@@ -577,6 +591,7 @@ impl Default for NodeClaimPoolConfig {
             max_node_disk: 450 * (1 << 30),
             metal_sizes: Vec::new(),
             fuse_cache_bytes: pool::pod::BUILDER_FUSE_CACHE_BYTES,
+            fetcher_fuse_cache_bytes: pool::pod::FETCHER_FUSE_CACHE_BYTES,
             // r40 bug_018: matches the chart's `buildScheduler.enabled`
             // default. When `false`, `pool/jobs::build_job` does NOT
             // stamp `schedulerName=kube-build-scheduler` even with the
