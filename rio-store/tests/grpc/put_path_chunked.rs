@@ -677,6 +677,13 @@ async fn has_chunks_reports_durable_presence_only() -> TestResult {
 /// HMAC enforcement: no token → PERMISSION_DENIED before anything is
 /// read; a valid token whose `expected_outputs` covers the path →
 /// committed.
+///
+/// The accept half is also the builder side of
+/// `store.put.builder-chunked-only`: the same builder-role token that
+/// legacy `PutPath`/`PutPathBatch` reject (see
+/// `tests/grpc/hmac.rs::hmac_builder_token_putpath_rejected`) commits
+/// here — `PutPathChunked` is the builder upload path.
+// r[verify store.put.builder-chunked-only]
 #[tokio::test]
 async fn hmac_token_gates_the_upload() -> TestResult {
     let key = b"chunked-hmac-test-key".to_vec();

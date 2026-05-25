@@ -96,6 +96,9 @@ impl StoreServiceImpl {
         });
 
         let auth = self.authorize(&request)?;
+        // r[impl store.put.builder-chunked-only]
+        // Same gate as PutPath: builders must use PutPathChunked.
+        auth.deny_builder_role("PutPathBatch")?;
         let mut stream = request.into_inner();
 
         // --- Phase 1: drain the stream, route by output_index ---

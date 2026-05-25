@@ -4,6 +4,16 @@
 //! signed token proving the upload is for an assigned build. Without
 //! this, a compromised worker could upload arbitrary paths.
 //!
+//! Spec `store.put.builder-chunked-only`: a token that DOES verify is
+//! a builder token (the scheduler only mints assignment tokens for
+//! dispatched builds), and builders may not use the legacy buffered
+//! RPCs at all — `PutPath`/`PutPathBatch` reject `role = Builder`
+//! before reading the stream. Builder uploads (including the
+//! floating-CA path-derivation and `expected_outputs` membership
+//! checks) are exercised against `PutPathChunked` in
+//! `tests/grpc/put_path_chunked.rs`; the legacy RPCs stay reachable
+//! only for the gateway's service-token bypass and for dev mode.
+//!
 //! All tests use `StoreSession::new_with_hmac` so `hmac_verifier` is
 //! Some — in dev mode (None) the check is bypassed entirely.
 
@@ -72,6 +82,7 @@ fn sign_service(caller: &str, expiry_offset_secs: i64) -> String {
 // ---------------------------------------------------------------------------
 
 // r[verify sec.authz.service-token]
+// r[verify store.put.builder-chunked-only]
 #[tokio::test]
 async fn service_token_bypasses_hmac() -> TestResult {
     let mut s =
@@ -81,6 +92,10 @@ async fn service_token_bypasses_hmac() -> TestResult {
     let info = make_path_info_for_nar(&path, &nar);
 
     // Valid service token, NO assignment token → accepted (bypass).
+    // This is also the gateway/admin half of builder-chunked-only:
+    // the service-token path carries no role claim, so legacy PutPath
+    // keeps working for `nix copy --to` while builders are rejected
+    // (see hmac_builder_token_putpath_rejected).
     let created = put_path_with_header(
         &mut s.client,
         info,
@@ -193,24 +208,110 @@ async fn hmac_no_token_rejected() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Valid token with path in expected_outputs → accept
+// Builder-chunked-only gate: a VALID assignment token (role=Builder) is
+// rejected on the legacy buffered RPCs — builders must use PutPathChunked.
 // ---------------------------------------------------------------------------
 
+/// A builder-role token — even one that is in-date and whose
+/// `expected_outputs` lists exactly the uploaded path — may not use
+/// legacy `PutPath`. The gate fires at the token-verify step, before
+/// the stream is read, so no NAR bytes are buffered and no
+/// `'uploading'` placeholder is ever claimed (the squat resistance
+/// that bug_094 previously needed the CA-ordering fix for).
+// r[verify store.put.builder-chunked-only]
 #[tokio::test]
-async fn hmac_valid_token_accepted() -> TestResult {
-    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+async fn hmac_builder_token_putpath_rejected() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
 
-    let path = test_store_path("hmac-valid");
-    let (nar, _) = make_nar(b"authorized upload");
+    let path = test_store_path("hmac-builder-legacy");
+    let (nar, _) = make_nar(b"builder upload");
     let info = make_path_info_for_nar(&path, &nar);
 
-    // Token lists the exact path we're uploading.
+    // Token lists the exact path we're uploading — rejection is about
+    // the role, not token validity or path membership.
     let token = sign_claims(vec![path.clone()], 60);
 
-    let created = put_path_with_token(&mut s.client, info, nar, &token)
+    let err = put_path_with_token(&mut client, info, nar, &token)
         .await
-        .context("put with valid token")?;
-    assert!(created, "valid token → accepted + created");
+        .expect_err("builder-role token on PutPath → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("PutPathChunked"),
+        "rejection should redirect builders to PutPathChunked: {}",
+        err.message()
+    );
+
+    // Gate fires before any buffering or placeholder claim.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM manifests")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(
+        n, 0,
+        "rejected builder PutPath must not claim a placeholder"
+    );
+
+    Ok(())
+}
+
+/// Same gate on the batch RPC.
+// r[verify store.put.builder-chunked-only]
+#[tokio::test]
+async fn hmac_builder_token_putpathbatch_rejected() -> TestResult {
+    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+
+    let path = test_store_path("hmac-builder-legacy-batch");
+    let (nar, _) = make_nar(b"builder batch upload");
+    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    let wrap = |m| PutPathBatchRequest {
+        output_index: 0,
+        inner: Some(PutPathRequest { msg: Some(m) }),
+    };
+    tx.send(wrap(put_path_request::Msg::Metadata(PutPathMetadata {
+        info: Some(info),
+    })))
+    .await
+    .unwrap();
+    tx.send(wrap(put_path_request::Msg::NarChunk(nar)))
+        .await
+        .unwrap();
+    tx.send(wrap(put_path_request::Msg::Trailer(trailer)))
+        .await
+        .unwrap();
+    drop(tx);
+
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    let token = sign_claims(vec![path.clone()], 60);
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+
+    let err = client
+        .put_path_batch(req)
+        .await
+        .expect_err("builder-role token on PutPathBatch → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("PutPathChunked"),
+        "rejection should redirect builders to PutPathChunked: {}",
+        err.message()
+    );
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM manifests")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(
+        n, 0,
+        "rejected builder PutPathBatch must not claim a placeholder"
+    );
 
     Ok(())
 }
@@ -295,35 +396,6 @@ async fn hmac_expired_token_rejected() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Valid token but uploaded path NOT in expected_outputs → reject
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn hmac_path_not_in_claims_rejected() -> TestResult {
-    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
-
-    let path = test_store_path("hmac-unauthorized-path");
-    let (nar, _) = make_nar(b"content");
-    let info = make_path_info_for_nar(&path, &nar);
-
-    // Token authorizes a DIFFERENT path.
-    let authorized = test_store_path("hmac-some-other-path");
-    let token = sign_claims(vec![authorized], 60);
-
-    let err = put_path_with_token(&mut s.client, info, nar, &token)
-        .await
-        .expect_err("path not in claims → reject");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    assert!(
-        err.message().contains("not authorized") || err.message().contains("not in"),
-        "msg: {}",
-        err.message()
-    );
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Sanity: verifier OFF (dev mode) → no enforcement
 // ---------------------------------------------------------------------------
 
@@ -342,219 +414,6 @@ async fn hmac_disabled_no_token_accepted() -> TestResult {
         .context("dev-mode put")?;
     assert!(created);
 
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Floating-CA: store_path derived server-side from verified nar_hash
-// ---------------------------------------------------------------------------
-
-/// Compute the floating-CA store path for `nar` the way the server
-/// does (`make_fixed_output(name, sha256(nar), recursive, [])`).
-fn ca_path_for(name: &str, nar: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let h = rio_nix::hash::NixHash::new(
-        rio_nix::hash::HashAlgo::SHA256,
-        Sha256::digest(nar).to_vec(),
-    )
-    .unwrap();
-    rio_nix::store_path::StorePath::make_fixed_output(name, &h, true, &[])
-        .unwrap()
-        .to_string()
-}
-
-// r[verify sec.authz.ca-path-derived+2]
-#[tokio::test]
-async fn hmac_is_ca_correct_path_accepted() -> TestResult {
-    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
-    let (nar, _) = make_nar(b"ca content");
-    let path = ca_path_for("ca-ok", &nar);
-    let info = make_path_info_for_nar(&path, &nar);
-
-    // is_ca=true, expected_outputs empty (as at dispatch time). Upload
-    // to the content-derived path → accepted.
-    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
-    let created = put_path_with_token(&mut s.client, info, nar, &token)
-        .await
-        .context("put to derived CA path")?;
-    assert!(created);
-    Ok(())
-}
-
-// r[verify sec.authz.ca-path-derived+2]
-#[tokio::test]
-async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
-    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
-    let (nar, _) = make_nar(b"evil content");
-    // Upload to an ARBITRARY (IA-shaped) path that is NOT the
-    // content-derived CA path. Pre-fix this was accepted — the
-    // "backdoored libc" scenario.
-    let path = test_store_path("evil-glibc-2.38");
-    let info = make_path_info_for_nar(&path, &nar);
-
-    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
-    let err = put_path_with_token(&mut s.client, info, nar, &token)
-        .await
-        .expect_err("is_ca token to non-derived path → reject");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    assert!(
-        err.message().contains("content-derived CA path"),
-        "msg: {}",
-        err.message()
-    );
-    Ok(())
-}
-
-// r[verify sec.authz.ca-path-derived+2]
-/// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
-/// for is_ca tokens, so a compromised worker could open a PutPath stream
-/// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
-/// placeholder fresh — forcing legitimate uploaders into `Aborted` until
-/// token expiry. Post-fix, the placeholder is not claimed until the
-/// server-derived CA path is verified, so a held-open mismatched-path
-/// stream never inserts a placeholder and a concurrent legitimate
-/// uploader for that path is unaffected.
-#[tokio::test]
-async fn hmac_is_ca_wrong_path_leaves_no_placeholder() -> TestResult {
-    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
-    let mut attacker = s.client.clone();
-    let mut victim = s.client.clone();
-
-    // Victim's IA path the attacker wants to squat.
-    let victim_path = test_store_path("victim-glibc-2.40");
-    let (victim_nar, _) = make_nar(b"legitimate glibc");
-    let victim_info = make_path_info_for_nar(&victim_path, &victim_nar);
-
-    // Attacker: is_ca token, opens a PutPath stream targeting
-    // victim_path with metadata + ONE chunk, NO trailer — held open.
-    let (atx, arx) = mpsc::channel(8);
-    let mut bogus_info: PathInfo =
-        make_path_info_for_nar(&victim_path, &make_nar(b"evil").0).into();
-    bogus_info.nar_hash = vec![];
-    bogus_info.nar_size = 0;
-    atx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(bogus_info),
-        })),
-    })
-    .await
-    .unwrap();
-    atx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::NarChunk(vec![0u8])),
-    })
-    .await
-    .unwrap();
-    // atx kept alive — stream held open. Spawn the call so it parks
-    // on `stream.message().await` server-side.
-    let mut areq = tonic::Request::new(ReceiverStream::new(arx));
-    let atoken = sign_claims_full("evil-worker", vec![String::new()], true, 60);
-    areq.metadata_mut()
-        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, atoken.parse().unwrap());
-    let attacker_call = tokio::spawn(async move { attacker.put_path(areq).await });
-
-    // Give the server a beat to read metadata + chunk and (pre-fix)
-    // insert the placeholder. Post-fix it's parked at
-    // `stream.message().await` with NO PG row.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM manifests WHERE store_path_hash = sha256($1::text::bytea)",
-    )
-    .bind(&victim_path)
-    .fetch_one(&s.db.pool)
-    .await?;
-    assert_eq!(
-        n, 0,
-        "is_ca held-open stream to non-derived path must NOT insert placeholder"
-    );
-
-    // Victim's legitimate IA upload (token lists victim_path) MUST
-    // succeed — pre-fix it got `Aborted: concurrent PutPath`.
-    let vtoken = sign_claims(vec![victim_path.clone()], 60);
-    let created = put_path_with_token(&mut victim, victim_info, victim_nar, &vtoken)
-        .await
-        .context("victim upload while attacker stream held open")?;
-    assert!(created, "victim's legitimate PutPath must not be blocked");
-
-    // Close attacker stream → server reads EOF without trailer →
-    // InvalidArgument (no trailer) — NOT Aborted/PermissionDenied
-    // before that since no placeholder was ever claimed. The exact
-    // status doesn't matter for the squat; just clean up.
-    drop(atx);
-    let _ = attacker_call.await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
-    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
-    let (nar, _) = make_nar(b"ca content 2");
-    // Correct name, WRONG hash-part (test_store_path uses a fixed
-    // TEST_HASH). Proves the check compares the full path, not just
-    // the name.
-    let derived = ca_path_for("ca-hashpart", &nar);
-    let wrong = test_store_path("ca-hashpart");
-    assert_ne!(derived, wrong, "test precondition: paths differ");
-    let info = make_path_info_for_nar(&wrong, &nar);
-
-    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
-    let err = put_path_with_token(&mut s.client, info, nar, &token)
-        .await
-        .expect_err("wrong hash-part → reject");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    Ok(())
-}
-
-// r[verify sec.authz.ca-path-derived+2]
-/// `PutPathBatch` is the multi-output endpoint builders use; the CA
-/// path-derivation gate must apply there too. Same attack as
-/// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
-#[tokio::test]
-async fn hmac_is_ca_batch_wrong_path_rejected() -> TestResult {
-    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
-
-    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
-    let mut client = s.client.clone();
-    let (nar, _) = make_nar(b"evil batch content");
-    let path = test_store_path("evil-batch-target");
-    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
-    let trailer = PutPathTrailer {
-        nar_hash: std::mem::take(&mut info.nar_hash),
-        nar_size: std::mem::take(&mut info.nar_size),
-    };
-
-    let (tx, rx) = mpsc::channel(8);
-    let wrap = |m| PutPathBatchRequest {
-        output_index: 0,
-        inner: Some(PutPathRequest { msg: Some(m) }),
-    };
-    tx.send(wrap(put_path_request::Msg::Metadata(PutPathMetadata {
-        info: Some(info),
-    })))
-    .await
-    .unwrap();
-    tx.send(wrap(put_path_request::Msg::NarChunk(nar)))
-        .await
-        .unwrap();
-    tx.send(wrap(put_path_request::Msg::Trailer(trailer)))
-        .await
-        .unwrap();
-    drop(tx);
-
-    let mut req = tonic::Request::new(ReceiverStream::new(rx));
-    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
-    req.metadata_mut()
-        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
-
-    let err = client
-        .put_path_batch(req)
-        .await
-        .expect_err("is_ca batch to non-derived path → reject");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    assert!(
-        err.message().contains("content-derived CA path"),
-        "msg: {}",
-        err.message()
-    );
     Ok(())
 }
 
@@ -791,28 +650,32 @@ async fn append_hw_perf_sample_service_token_rejected() -> TestResult {
 // ---------------------------------------------------------------------------
 
 /// bug_068: HMAC binds `store_path` (string), not `store_path_hash`.
-/// A worker holding a token for path A sends `{store_path: A,
-/// store_path_hash: sha256(B)}`. The HMAC gate passes (store_path is
-/// in claims); pre-fix, the server keyed A's narinfo under B's slot —
+/// A caller uploading path A sends `{store_path: A, store_path_hash:
+/// sha256(B)}`; pre-fix, the server keyed A's narinfo under B's slot —
 /// poisoning B's hash lookups. Post-fix, `validate_put_metadata`
 /// recomputes `store_path_hash` from the gated `store_path`
 /// unconditionally; the wire value is ignored.
+///
+/// Exercised via the gateway's service-token bypass: since
+/// `store.put.builder-chunked-only` an assignment (builder) token can
+/// no longer reach legacy `PutPath` at all, so the gateway is the
+/// caller that still hits this recompute (PutPathChunked never reads a
+/// wire `store_path_hash` — the chunked handler derives it
+/// server-side).
 // r[verify sec.boundary.grpc-hmac]
 #[tokio::test]
 async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
     use sha2::{Digest, Sha256};
 
-    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
 
     let path_a = test_store_path("hmac-hashforge-a");
     let path_b = test_store_path("hmac-hashforge-b");
     let (nar, _) = make_nar(b"authorized payload for A");
     let info = make_path_info_for_nar(&path_a, &nar);
 
-    // Token authorizes path A only.
-    let token = sign_claims(vec![path_a.clone()], 60);
-
-    // Forge: store_path=A (passes HMAC) but store_path_hash=sha256(B).
+    // Forge: store_path=A but store_path_hash=sha256(B).
     let mut raw: PathInfo = info.into();
     raw.store_path_hash = Sha256::digest(path_b.as_bytes()).to_vec();
     let trailer = PutPathTrailer {
@@ -842,8 +705,10 @@ async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
 
     let mut req = tonic::Request::new(ReceiverStream::new(rx));
     req.metadata_mut().insert(
-        rio_proto::ASSIGNMENT_TOKEN_HEADER,
-        token.parse().expect("ascii token"),
+        rio_proto::SERVICE_TOKEN_HEADER,
+        sign_service("rio-gateway", 60)
+            .parse()
+            .expect("ascii token"),
     );
     let created = s.client.put_path(req).await?.into_inner().created;
     assert!(created, "upload of A with forged hash succeeds");

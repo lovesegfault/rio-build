@@ -149,6 +149,13 @@ impl StoreServiceImpl {
         });
 
         let auth = self.authorize(&request)?;
+        // r[impl store.put.builder-chunked-only]
+        // Builder-role assignment tokens may not use the legacy
+        // buffered RPC — reject before the stream is read so nothing
+        // is buffered and no placeholder is claimed. Gateway/admin
+        // callers (service token / dev mode) have no assignment
+        // claims and pass through.
+        auth.deny_builder_role("PutPath")?;
         let mut stream = request.into_inner();
 
         let raw_info = common::read_first_metadata(&mut stream).await?;

@@ -314,6 +314,25 @@ the `pending_s3_deletes` table.
   with no TLS dependency.
 ]
 
+#r("store.put.builder-chunked-only")[
+  Builders MUST NOT upload through the buffered legacy RPCs: when the verified
+  assignment token carries `role = Builder`, `PutPath` and `PutPathBatch`
+  reject with `PERMISSION_DENIED` ("builders must use PutPathChunked") before
+  any stream buffering or placeholder claim. The legacy RPCs remain available
+  to the gateway and admin tooling --- which authenticate via
+  #rref("sec.authz.service-token"), not an assignment token --- and to
+  dev-mode deployments with no HMAC verifier configured. Builder uploads go
+  exclusively through `PutPathChunked` (ADR-022 §6,
+  #rref("store.put.chunked-wire")).
+]
+
+Rationale: assignment tokens are minted by the scheduler only for dispatched
+builds, so any caller presenting one is a builder; routing builders onto
+`PutPathChunked` keeps FastCDC CPU on the (ephemeral, per-build) builder pod
+and eliminates the store-side whole-NAR buffer for build outputs. Token
+*validity* failures (missing/garbage/expired/wrong-key tokens) are rejected by
+the verification step itself and never reach this gate.
+
 + *Idempotency check + `'uploading'` placeholder:* If a `'complete'` manifest
   already exists for this path, return success immediately (fast-path no-op).
   Otherwise, insert an `'uploading'` placeholder row in `manifests` as an

@@ -68,6 +68,45 @@ pub(in crate::grpc) struct PutAuth {
     pub tenant_id: Option<uuid::Uuid>,
 }
 
+impl PutAuth {
+    /// Builder-chunked-only gate for the legacy buffered upload RPCs.
+    ///
+    /// Assignment tokens are minted by the scheduler exclusively for
+    /// dispatched builds, so any caller presenting one is a builder —
+    /// the gateway/admin path authenticates with a `ServiceClaims`
+    /// service token instead, which leaves `hmac_claims = None` here
+    /// (see `StoreServiceImpl::verify_assignment_token`). Builders
+    /// upload via `PutPathChunked`; rejecting them here — before the
+    /// request stream is read — keeps the whole-NAR buffer and the
+    /// placeholder claim from ever happening for a request that can
+    /// never commit.
+    ///
+    /// The exhaustive `match` (not `if`) mirrors `validate_begin`'s
+    /// role gate in `put_path_chunked`: adding a second `TokenRole`
+    /// variant forces a decision at this gate.
+    ///
+    /// `rpc` names the RPC in the error message ("PutPath" /
+    /// "PutPathBatch").
+    // r[impl store.put.builder-chunked-only]
+    pub(in crate::grpc) fn deny_builder_role(&self, rpc: &str) -> Result<(), Status> {
+        if let Some(claims) = &self.hmac_claims {
+            match claims.role {
+                rio_auth::hmac::TokenRole::Builder => {
+                    metrics::counter!(
+                        "rio_store_hmac_rejected_total",
+                        "reason" => "builder_legacy_put"
+                    )
+                    .increment(1);
+                    return Err(Status::permission_denied(format!(
+                        "builders must use PutPathChunked; {rpc} is gateway/admin-only"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Validate a raw PathInfo message for PutPath/PutPathBatch.
 ///
 /// Shared validation shared by both upload RPCs: (1) nar_hash-empty
