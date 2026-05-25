@@ -503,4 +503,807 @@ module logService {
           else Accept(minInt(hi, c.value))
       }
 
+  // --- 6. actions -------------------------------------------------------
+  //
+  // Each action's precondition is the corresponding code path's guard
+  // and its effect is that path's state mutation; the function it
+  // mirrors is named in its doc comment. Actions are GUARDED (disabled
+  // when their preconditions fail), not thin always-enabled no-ops.
+  // Ceilings (MAX_EXECS, MAX_SESSIONS, MAX_LINE) are action
+  // preconditions so the TLC backend's state space is finite.
+
+  /// Frame helper: the variables almost every action leaves unchanged.
+  /// Quint has no frame conditions; each action lists its unchanged
+  /// variables explicitly. (Kept as individual assignments at each
+  /// action rather than a helper action — a helper that assigns a
+  /// variable the action also assigns would be a double-assignment
+  /// error.)
+
+  // --- 6a. dispatch and the build --------------------------------------
+
+  /// The scheduler dispatches the derivation: a new assignment attempt
+  /// with a fresh exec_id becomes the LATEST assignment, and its
+  /// `drv_executions` lifecycle row is INSERTed.
+  // Mirrors: rio-scheduler assign_to_worker -> assignments INSERT +
+  //          rio-scheduler/src/db/executions.rs (the dispatch INSERT).
+  action dispatch = all {
+    dispatched < MAX_EXECS,
+    dispatched' = dispatched + 1,
+    execRowExists' = execRowExists.put(dispatched + 1, true),
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The build emits one more stderr line into its uploader's input
+  /// channel (and so into the retransmit buffer).
+  // Mirrors: rio-builder/src/log_stream.rs (the per-line counter) +
+  //          log_upload.rs::UploadTask::accept (the buffer push).
+  action produceLine(e: int): bool = all {
+    e <= dispatched,
+    not(buildFinished.get(e)),
+    producedEnd.get(e) < MAX_LINE,
+    producedEnd' = producedEnd.put(e, producedEnd.get(e) + 1),
+    dispatched' = dispatched,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The build exits: no more lines, the completion report (carrying
+  /// the build's own line total) is ready for the scheduler, and the
+  /// uploader's input channel closes (arming the drain deadline).
+  // Mirrors: rio-builder/src/runtime/mod.rs (the post-footer
+  //          completion report) + log_upload.rs::accept(None).
+  action buildFinishes(e: int): bool = all {
+    e <= dispatched,
+    not(buildFinished.get(e)),
+    buildFinished' = buildFinished.put(e, true),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The scheduler stamps the execution's lifecycle row terminal with
+  /// the builder-reported line count. A zero-line build maps to NULL
+  /// (the proto's not-reported sentinel), so its log can never read
+  /// complete — disclosed, permanent, and harmless (the banner header
+  /// guarantees real builds are never zero-line). The stamp is honest
+  /// (the count is the build's own total): a scheduler that stamps a
+  /// count below the true total would seal real lines out of the log —
+  /// that is a trusted-component failure outside this model.
+  /// Precondition `not(expired)`: the terminal stamp follows the
+  /// completion report by seconds, the TTL by days.
+  // Mirrors: rio-scheduler/src/actor/completion.rs
+  //          (terminal_log_epilogue's `try_from(...).filter(> 0)`).
+  action recordFinalLineCount(e: int): bool = all {
+    e <= dispatched,
+    buildFinished.get(e),
+    execRowExists.get(e),
+    not(expired.get(e)),
+    dbFinalCount.get(e) == NoCount,
+    dbFinalCount' = dbFinalCount.put(e,
+      if (producedEnd.get(e) > 0) Count(producedEnd.get(e)) else NoCount),
+    // Avoid a self-loop when the count maps to NULL: the row is
+    // terminal either way, and a terminal row with an unknown count is
+    // observationally identical to a non-terminal one (see the
+    // dbFinalCount doc), so re-enabling the action would only add a
+    // stuttering step.
+    producedEnd.get(e) > 0,
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  // --- 6b. the open gate -----------------------------------------------
+
+  /// `gate.rs::check_append_open`'s admission predicate, restricted to
+  /// the checks with model content: the claimed execution is the
+  /// derivation's latest assignment (check 3) and its log is not
+  /// already complete (check 4). Checks 1-2 (HMAC, the token-vs-header
+  /// derivation match) are pure equality on signed fields; check 5 (the
+  /// single-live-session lease) is the `openSessionOf(e) == 0`
+  /// admission conjunct on the action itself.
+  def openAdmitted(e: int): bool = and {
+    e <= dispatched,
+    e == dispatched,
+    not(logIsComplete(e)),
+  }
+
+  /// The builder opens (or re-opens) an `AppendLog` stream for its
+  /// execution and the gate admits it. The new session is born with the
+  /// completeness ceiling iff the execution is already terminal with a
+  /// known count (the late-replay case); the uploader's transmit cursor
+  /// rewinds to its acked watermark so everything un-acked is
+  /// retransmitted (the at-least-once replay).
+  // Mirrors: service.rs::append_log (steps 3-6) + gate.rs::
+  //          check_append_open + sessions::acquire +
+  //          log_upload.rs::UploadTask::open / drive's `sent = 0`.
+  action openSession(e: int): bool = all {
+    openAdmitted(e),
+    uploader.get(e) == Uploading,
+    // One AppendLog stream per uploader: the previous session must have
+    // been detached (the builder cannot hold two streams). The lease's
+    // Busy rejection against a still-fresh foreign-replica session is a
+    // bounded retry delay, not a distinct safety state.
+    openSessionOf(e) == 0,
+    sessionsOpened.get(e) < MAX_SESSIONS,
+    // A second open is the uploader's reconnect-and-replay; the regimes
+    // that do not explore the at-least-once shape disable it (the first
+    // open is always allowed).
+    sessionsOpened.get(e) == 0 or ENABLE_RECONNECT,
+    // Token expiry << the 30-day TTL (see the header's scope notes).
+    not(expired.get(e)),
+    sessions' = sessions.put(e, sessions.get(e).put(sessionsOpened.get(e) + 1, Session({
+      phase: SessOpen,
+      highWater: 0,
+      ceiling: match dbFinalCount.get(e) {
+        | NoCount => NoCeiling
+        | Count(n) => Ceiling({ value: n, hwAtLearn: 0 })
+      },
+      buf: Set(),
+    }))),
+    sessionsOpened' = sessionsOpened.put(e, sessionsOpened.get(e) + 1),
+    sentBelow' = sentBelow.put(e, ackedBelow.get(e)),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The gate rejects a stream open whose claimed execution has been
+  /// superseded by a re-dispatch (PERMISSION_DENIED). The uploader
+  /// treats it as a permanent rejection: the retransmit buffer is
+  /// discarded and the remaining input is drained to nowhere — the
+  /// superseded execution's un-stored tail is gone, disclosed by the
+  /// rejection warn and by its log never reading complete.
+  // Mirrors: gate.rs::check_append_open (the latest-assignment
+  //          mismatch arm) + log_upload.rs::reject_permanently.
+  action openRejectedSuperseded(e: int): bool = all {
+    e <= dispatched,
+    e != dispatched,
+    uploader.get(e) == Uploading,
+    openSessionOf(e) == 0,
+    uploader' = uploader.put(e, Abandoned),
+    wit' = { ...wit, supersededOpenRejected: true },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+  }
+
+  /// The gate rejects a stream open because the execution's log is
+  /// already complete (FAILED_PRECONDITION). Same uploader reaction as
+  /// the superseded rejection, but nothing of value is lost: every line
+  /// the buffer still holds is already covered by the (complete)
+  /// manifest.
+  // Mirrors: gate.rs::check_append_open (check 4) +
+  //          log_upload.rs::reject_permanently.
+  action openRejectedComplete(e: int): bool = all {
+    e <= dispatched,
+    e == dispatched,
+    logIsComplete(e),
+    uploader.get(e) == Uploading,
+    openSessionOf(e) == 0,
+    uploader' = uploader.put(e, Abandoned),
+    wit' = { ...wit, completeOpenRejected: true },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+  }
+
+  // --- 6c. batch ingestion ---------------------------------------------
+
+  /// Rebuild session `s` of `e` after accepting the (post-truncation)
+  /// batch `[lo, keptHi)`: the lines join the buffer, the high water
+  /// rises to the kept end. Only meaningful under a `hasSession` guard.
+  pure def sessAfterAccept(slot: SessionSlot, lo: int, keptHi: int): SessionSlot =
+    match slot {
+      | NoSession => NoSession
+      | Session(x) => Session({
+          phase: x.phase,
+          highWater: maxInt(x.highWater, keptHi),
+          ceiling: x.ceiling,
+          buf: x.buf.union(interval(lo, keptHi)),
+        })
+    }
+
+  /// The uploader transmits the next un-sent run of its retransmit
+  /// buffer — `[sentBelow, producedEnd)`, the whole remainder — to the
+  /// execution's Open session. The accept verdict is a pure function of
+  /// the session's state: the batch is accepted (possibly truncated at
+  /// the completeness ceiling), rejected as non-monotone (only
+  /// reachable after a fabricated batch raised the high water past the
+  /// honest cursor), or rejected as past-final (only reachable after a
+  /// truncation left the cursor at the ceiling). The transmit cursor
+  /// advances regardless — the uploader gets no per-batch verdict, only
+  /// acks — and a rejected batch's lines stay in the retransmit buffer
+  /// until an ack covers them or the drain is abandoned.
+  // Mirrors: log_upload.rs::drive (the send arm) ->
+  //          service.rs::drive (the Batch arm) ->
+  //          ingest.rs::IngestSession::accept.
+  action appendHonest(e: int): bool = all {
+    e <= dispatched,
+    uploader.get(e) == Uploading,
+    val s = openSessionOf(e)
+    val lo = sentBelow.get(e)
+    val hi = producedEnd.get(e)
+    all {
+      s != 0,
+      lo < hi,
+      sentBelow' = sentBelow.put(e, hi),
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
+        | Accept(keptHi) => all {
+            sessions' = sessions.put(e,
+              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
+            wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
+          }
+        | RejectNonMonotone => all {
+            sessions' = sessions,
+            wit' = { ...wit, nonMonotoneRejected: true },
+          }
+        | RejectPastFinal => all {
+            sessions' = sessions,
+            wit' = { ...wit, pastFinalRejected: true },
+          }
+      },
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+  }
+
+  /// The bound builder sends a batch that is NOT its uploader's honest
+  /// in-order replay: an arbitrary `[lo, hi)` at or above the session's
+  /// high water. Accepted lines (post-truncation at the completeness
+  /// ceiling) enter the buffer and the `fabricated` ghost; lines at or
+  /// past the ceiling are dropped. This is the adversary the per-append
+  /// completeness gate exists for ("a builder holding a still-current
+  /// token for a terminal-but-incomplete execution can append arbitrary
+  /// lines past the build's true end") and the source of forward-gapped
+  /// manifests. The uploader's cursors are untouched — the fabrication
+  /// is the builder process misbehaving alongside its own uploader, and
+  /// its high-water side effect can permanently strand the honest
+  /// replay behind the monotone floor (the builder shooting its own
+  /// log; the strand is disclosed by the log never completing).
+  // Mirrors: ingest.rs::IngestSession::accept (the accept and
+  //          truncate-at-ceiling arms) driven by an untrusted
+  //          LogBatcher.
+  action appendFabricated(e: int, lo: int, hi: int): bool = all {
+    ENABLE_FABRICATION,
+    e <= dispatched,
+    lo < hi,
+    hi <= MAX_LINE,
+    val s = openSessionOf(e)
+    all {
+      s != 0,
+      lo >= sessHw(e, s),
+      match acceptVerdict(sessHw(e, s), sessCeiling(e, s), lo, hi) {
+        | Accept(keptHi) => all {
+            sessions' = sessions.put(e,
+              sessions.get(e).put(s, sessAfterAccept(sessions.get(e).get(s), lo, keptHi))),
+            fabricated' = fabricated.put(e, fabricated.get(e).union(interval(lo, keptHi))),
+            wit' = if (keptHi < hi) { ...wit, pastFinalRejected: true } else wit,
+          }
+        | RejectNonMonotone => all {
+            // Unreachable under the `lo >= hw` precondition; the arm
+            // must still assign every variable.
+            sessions' = sessions,
+            fabricated' = fabricated,
+            wit' = wit,
+          }
+        | RejectPastFinal => all {
+            sessions' = sessions,
+            fabricated' = fabricated,
+            wit' = { ...wit, pastFinalRejected: true },
+          }
+      },
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+  }
+
+  /// A session learns the execution's recorded `final_line_count`
+  /// mid-stream: the scheduler stamped the lifecycle row terminal while
+  /// the builder was still streaming, and the handler's heartbeat-tick
+  /// refresh observed it. The learn-time high-water mark is recorded so
+  /// `completenessGate` can separate the pre-refresh residual from the
+  /// post-refresh obligation. Only an Open session refreshes (the
+  /// heartbeat loop exits with the driver's select loop); the first
+  /// observed value wins (the count is stamped once and never changes).
+  // Mirrors: service.rs::drive (the heartbeat arm's
+  //          sealed_final_line_count refresh) +
+  //          ingest.rs::set_final_line_count.
+  action refreshCeiling(e: int, s: int): bool = all {
+    e <= dispatched,
+    sessIsOpen(e, s),
+    sessCeiling(e, s) == NoCeiling,
+    execRowExists.get(e),
+    val n = dbFinalCount.get(e)
+    all {
+      n != NoCount,
+      sessions' = sessions.put(e, sessions.get(e).put(s,
+        match sessions.get(e).get(s) {
+          | NoSession => NoSession
+          | Session(x) => Session({
+              phase: x.phase,
+              highWater: x.highWater,
+              ceiling: match n { | NoCount => NoCeiling | Count(v) => Ceiling({ value: v, hwAtLearn: x.highWater }) },
+              buf: x.buf,
+            })
+        })),
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  // --- 6d. the chunk cut and the ack -----------------------------------
+
+  /// Cut the longest contiguous prefix of session `s`'s buffer into one
+  /// immutable chunk: the run leaves the buffer and a manifest row
+  /// describing exactly that run is committed under the cutting
+  /// session's `(exec, session)` key. The commit and the manifest
+  /// INSERT are one atomic step here — the failure path restores the
+  /// staged run exactly (a no-op at this granularity) and burns a
+  /// sequence number the model does not track; the abort that three
+  /// consecutive failures trigger is `sessionAborts`. Both Open and
+  /// Detached sessions cut (the periodic/size-triggered cut and the
+  /// final drain respectively) — a detached predecessor session
+  /// committing its drain concurrently with its successor's cuts is
+  /// the manifest-overlap source.
+  // Mirrors: ingest.rs::IngestSession::cut + commit_chunk;
+  //          service.rs::do_cut / drain.
+  action cutChunk(e: int, s: int): bool = all {
+    e <= dispatched,
+    hasSession(e, s),
+    sessBuf(e, s) != Set(),
+    val cutRun = runFrom(sessBuf(e, s), setMin(sessBuf(e, s)))
+    all {
+      chunks' = chunks.put(e, chunks.get(e).union(Set({
+        sess: s,
+        first: setMin(cutRun),
+        count: cutRun.size(),
+      }))),
+      sessions' = sessions.put(e, sessions.get(e).put(s,
+        match sessions.get(e).get(s) {
+          | NoSession => NoSession
+          | Session(x) => Session({ ...x, buf: x.buf.exclude(cutRun) })
+        })),
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessionsOpened' = sessionsOpened,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The builder receives the ack for one committed chunk of its
+  /// CURRENT Open session and trims every retransmit-buffer frame whose
+  /// last line the ack covers. The ack exists only because the chunk's
+  /// manifest INSERT committed (`do_cut` sends it after `cut` returns
+  /// the durable-through line), and it is deliverable only while the
+  /// builder still holds the stream that cut the chunk — a detached
+  /// session's drain acks go to a closed response stream. Acks arrive
+  /// in cut order on the wire; the trim is a max, so delivering any
+  /// single chunk's ack reaches the same watermark set as delivering
+  /// the ordered prefix up to it.
+  // Mirrors: service.rs::do_cut (the AppendLogAck send) +
+  //          log_upload.rs::trim.
+  action deliverAck(e: int): bool = all {
+    e <= dispatched,
+    uploader.get(e) == Uploading,
+    val s = openSessionOf(e)
+    all {
+      s != 0,
+      nondet c = chunks.get(e).filter(c => c.sess == s).oneOf()
+      all {
+        c.first + c.count > ackedBelow.get(e),
+        ackedBelow' = ackedBelow.put(e, c.first + c.count),
+      },
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  // --- 6e. disconnects, aborts, abandonment ----------------------------
+
+  /// The builder's stream to its Open session ends without a
+  /// server-side abort: the clean half-close at the end of every build,
+  /// a transport error, or the builder reconnecting elsewhere. The
+  /// driver runs its final drain — the session keeps its buffer and
+  /// keeps cutting (as a Detached session) until the buffer is empty.
+  /// Un-acked lines stay in the builder's retransmit buffer for the
+  /// next session; the drain's chunks for those same lines are the
+  /// manifest overlap the read path dedups. Enabled in every regime
+  /// (every build's stream ends); whether a SECOND session can then
+  /// open is `openSession`'s ENABLE_RECONNECT gate.
+  // Mirrors: service.rs::drive (Ok(None) / Err -> ClientFinished) +
+  //          AppendDriver::run (the drain arm).
+  action builderDisconnects(e: int): bool = all {
+    e <= dispatched,
+    val s = openSessionOf(e)
+    all {
+      s != 0,
+      sessions' = sessions.put(e, sessions.get(e).put(s,
+        match sessions.get(e).get(s) {
+          | NoSession => NoSession
+          | Session(x) => Session({ ...x, phase: SessDetached })
+        })),
+    },
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The server tears the stream down and DROPS the in-memory buffer
+  /// without draining it: the gray-failure abort (three consecutive
+  /// failed cuts, a stale buffer), the per-execution byte/chunk caps,
+  /// or the ingest lease observed as lost. Safe by design: every
+  /// dropped line is still in the builder's retransmit buffer (it was
+  /// never acked) and will be replayed to the next session.
+  // Mirrors: service.rs::AppendDriver::run (the LoopExit::Abort /
+  //          LeaseLost arms — the drain is skipped and the
+  //          deregistration scopeguard drops IngestShared).
+  action sessionAborts(e: int, s: int): bool = all {
+    e <= dispatched,
+    hasSession(e, s),
+    // An inert detached session (empty buffer) aborting is a no-op
+    // self-loop; require something observable to change.
+    sessIsOpen(e, s) or sessBuf(e, s) != Set(),
+    sessions' = sessions.put(e, sessions.get(e).put(s,
+      match sessions.get(e).get(s) {
+        | NoSession => NoSession
+        | Session(x) => Session({ ...x, phase: SessDetached, buf: Set() })
+      })),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The uploader gives up with lines still un-acked: the post-build
+  /// drain deadline expires while the store is unreachable (or keeps
+  /// rejecting the stream). The retransmit buffer is dropped; the loss
+  /// is disclosed by `rio_builder_log_drain_abandoned_total` and the
+  /// error log, and the execution's log never reads complete (the
+  /// manifest cannot cover the abandoned tail).
+  // Mirrors: log_upload.rs::run_inner (DeadlineExpired -> abandoned()).
+  action uploaderAbandons(e: int): bool = all {
+    e <= dispatched,
+    uploader.get(e) == Uploading,
+    buildFinished.get(e),
+    ackedBelow.get(e) < producedEnd.get(e),
+    uploader' = uploader.put(e, Abandoned),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  // --- 6f. expiry and the TTL sweep ------------------------------------
+
+  /// The retention clock passes the execution's `started_at +
+  /// log_retention_days`. Environment action; monotone.
+  action executionExpires(e: int): bool = all {
+    ENABLE_SWEEP,
+    e <= dispatched,
+    not(expired.get(e)),
+    expired' = expired.put(e, true),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// The TTL sweep's first DELETE for one expired execution: every
+  /// `drv_log_chunks` manifest row (and, transitively, the objects they
+  /// reference). The guard is the sweep's SELECT: the execution's
+  /// lifecycle row is older than the retention window AND still exists
+  /// (the SELECT is over `drv_executions`).
+  // Mirrors: sweep.rs::sweep_expired_logs (the drv_log_chunks DELETE +
+  //          the object delete_batch).
+  action sweepChunks(e: int): bool = all {
+    ENABLE_SWEEP,
+    e <= dispatched,
+    expired.get(e),
+    execRowExists.get(e),
+    not(sweepChunksDone.get(e)),
+    chunks' = chunks.put(e, Set()),
+    sweepChunksDone' = sweepChunksDone.put(e, true),
+    wit' = if (chunks.get(e) != Set()) { ...wit, sweptChunks: true } else wit,
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    fabricated' = fabricated,
+  }
+
+  /// The same sweep pass's last DELETE: the `drv_executions` row
+  /// itself. Ordered after the manifest DELETE so a crash mid-pass
+  /// leaves an expired execution with no chunks (re-found and finished
+  /// next hour) rather than chunks with no execution (never re-found).
+  /// A live session's cut CAN interleave between the two DELETEs and
+  /// commit a manifest row that survives the pass — that row references
+  /// a deleted execution and is never re-swept (the SELECT is over
+  /// `drv_executions`), a bounded leak priced in the header's scope
+  /// notes, not a safety violation.
+  // Mirrors: sweep.rs::sweep_expired_logs (the drv_executions DELETE).
+  action sweepExecRow(e: int): bool = all {
+    ENABLE_SWEEP,
+    e <= dispatched,
+    expired.get(e),
+    execRowExists.get(e),
+    sweepChunksDone.get(e),
+    execRowExists' = execRowExists.put(e, false),
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    expired' = expired,
+    sweepChunksDone' = sweepChunksDone,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  // --- 8. init ----------------------------------------------------------
+
+  action init = all {
+    dispatched' = 0,
+    producedEnd' = EXECS.mapBy(e => 0),
+    buildFinished' = EXECS.mapBy(e => false),
+    dbFinalCount' = EXECS.mapBy(e => NoCount),
+    execRowExists' = EXECS.mapBy(e => false),
+    expired' = EXECS.mapBy(e => false),
+    sweepChunksDone' = EXECS.mapBy(e => false),
+    uploader' = EXECS.mapBy(e => Uploading),
+    ackedBelow' = EXECS.mapBy(e => 0),
+    sentBelow' = EXECS.mapBy(e => 0),
+    sessions' = EXECS.mapBy(e => SESSION_IDS.mapBy(s => NoSession)),
+    sessionsOpened' = EXECS.mapBy(e => 0),
+    chunks' = EXECS.mapBy(e => Set()),
+    fabricated' = EXECS.mapBy(e => Set()),
+    wit' = {
+      supersededOpenRejected: false,
+      completeOpenRejected: false,
+      pastFinalRejected: false,
+      nonMonotoneRejected: false,
+      sweptChunks: false,
+    },
+  }
+
+  // --- 9. step ----------------------------------------------------------
+  // Every disjunct of `step` is a NAMED action with its nondet choices
+  // bound directly inside it (the MBT tracker records the innermost
+  // disjunct's name; an anonymous block makes the whole step anonymous
+  // and undrivable).
+
+  action produceLineAny = { nondet e = EXECS.oneOf() produceLine(e) }
+  action buildFinishesAny = { nondet e = EXECS.oneOf() buildFinishes(e) }
+  action recordFinalLineCountAny = { nondet e = EXECS.oneOf() recordFinalLineCount(e) }
+  action openSessionAny = { nondet e = EXECS.oneOf() openSession(e) }
+  action openRejectedSupersededAny = { nondet e = EXECS.oneOf() openRejectedSuperseded(e) }
+  action openRejectedCompleteAny = { nondet e = EXECS.oneOf() openRejectedComplete(e) }
+  action appendHonestAny = { nondet e = EXECS.oneOf() appendHonest(e) }
+  action appendFabricatedAny = {
+    nondet e = EXECS.oneOf()
+    nondet lo = 0.to(MAX_LINE - 1).oneOf()
+    nondet hi = 1.to(MAX_LINE).oneOf()
+    appendFabricated(e, lo, hi)
+  }
+  action refreshCeilingAny = {
+    nondet e = EXECS.oneOf()
+    nondet s = SESSION_IDS.oneOf()
+    refreshCeiling(e, s)
+  }
+  action cutChunkAny = {
+    nondet e = EXECS.oneOf()
+    nondet s = SESSION_IDS.oneOf()
+    cutChunk(e, s)
+  }
+  action deliverAckAny = { nondet e = EXECS.oneOf() deliverAck(e) }
+  action builderDisconnectsAny = { nondet e = EXECS.oneOf() builderDisconnects(e) }
+  action sessionAbortsAny = {
+    nondet e = EXECS.oneOf()
+    nondet s = SESSION_IDS.oneOf()
+    sessionAborts(e, s)
+  }
+  action uploaderAbandonsAny = { nondet e = EXECS.oneOf() uploaderAbandons(e) }
+  action executionExpiresAny = { nondet e = EXECS.oneOf() executionExpires(e) }
+  action sweepChunksAny = { nondet e = EXECS.oneOf() sweepChunks(e) }
+  action sweepExecRowAny = { nondet e = EXECS.oneOf() sweepExecRow(e) }
+
+  action step = any {
+    dispatch,
+    produceLineAny,
+    buildFinishesAny,
+    recordFinalLineCountAny,
+    openSessionAny,
+    openRejectedSupersededAny,
+    openRejectedCompleteAny,
+    appendHonestAny,
+    appendFabricatedAny,
+    refreshCeilingAny,
+    cutChunkAny,
+    deliverAckAny,
+    builderDisconnectsAny,
+    sessionAbortsAny,
+    uploaderAbandonsAny,
+    executionExpiresAny,
+    sweepChunksAny,
+    sweepExecRowAny,
+  }
 }
