@@ -342,6 +342,8 @@ r[obs.metric.compat]
 | `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"error"}` |
 | `rio_store_compat_write_failures_total` | compat writes that failed post-commit (reconciler backlog) |
 | `rio_store_compat_write_bytes_total` | compressed bytes published as compat `nar/` objects (the S3 cost of compat-ON) |
+| `rio_store_compat_reconcile_total` | reconciler backfill attempts, labeled `{result="ok"\|"error"}` |
+| `rio_store_compat_backlog` (gauge) | committed paths whose compat pair is not yet published (`compat_file_hash IS NULL`) |
 | `rio_store_nar_index_compute_seconds` | `nar_ls` + blake3 pass duration at PutPath |
 | `rio_builder_castore_fuse_open_mode_total` | per-`open()` reply, labeled `{mode="passthrough"\|"keep_cache"}` — passthrough-not-negotiated visible as `passthrough`=0 |
 | `rio_builder_castore_fuse_open_case_total` | per-`open()` decision, labeled `{case="hit"\|"miss_small"\|"miss_stream"\|"wait_fetching"}` |

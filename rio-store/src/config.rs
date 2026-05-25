@@ -139,6 +139,19 @@ pub struct BinaryCacheCompat {
     /// commit. Only `sync_after_commit` exists today (see
     /// [`CompatWriteMode`]).
     pub write_mode: CompatWriteMode,
+    /// Poll cadence (seconds) of the compat reconciler — the
+    /// background loop that finds committed paths whose
+    /// `narinfo.compat_file_hash` is NULL (paths committed via
+    /// `PutPathChunked` or upstream substitution, paths ingested while
+    /// compat was OFF, and inline writes that failed), reassembles
+    /// their NARs from the chunk store, and publishes the compat
+    /// object pair off the upload hot path. Within one tick the
+    /// backlog drains continuously (batch after batch); the interval
+    /// is the idle re-poll cadence. `0` disables the reconciler
+    /// (inline writes still happen); ignored entirely when `enabled`
+    /// is false. Default 30. Set via
+    /// `RIO_BINARY_CACHE_COMPAT__RECONCILE_INTERVAL_SECS`.
+    pub reconcile_interval_secs: u64,
 }
 
 impl Default for BinaryCacheCompat {
@@ -151,6 +164,10 @@ impl Default for BinaryCacheCompat {
             bucket: None,
             compression: CompatCompression::Zstd,
             write_mode: CompatWriteMode::SyncAfterCommit,
+            // 30s idle re-poll matches the plan's "sleep 30s if empty"
+            // and the GC-drain cadence; the steady-state poll is an
+            // index-only probe of narinfo_compat_pending_idx (M_066).
+            reconcile_interval_secs: 30,
         }
     }
 }
@@ -577,9 +594,9 @@ mod tests {
         // r[verify store.compat.runtime-toggle]
         // Binary-cache compat defaults ON (ADR-022 §10 migration
         // posture), no dedicated bucket (→ chunk backend's bucket),
-        // zstd, synchronous post-commit write. Changing any of these
-        // changes what a bare deployment publishes to S3 — deliberate
-        // only.
+        // zstd, synchronous post-commit write, 30s reconciler idle
+        // poll. Changing any of these changes what a bare deployment
+        // publishes to S3 — deliberate only.
         assert!(d.binary_cache_compat.enabled);
         assert!(d.binary_cache_compat.bucket.is_none());
         assert_eq!(d.binary_cache_compat.compression, CompatCompression::Zstd);
@@ -587,6 +604,7 @@ mod tests {
             d.binary_cache_compat.write_mode,
             CompatWriteMode::SyncAfterCommit
         );
+        assert_eq!(d.binary_cache_compat.reconcile_interval_secs, 30);
     }
 
     #[test]
@@ -1025,6 +1043,7 @@ mod tests {
             bucket = "nix-cache"
             compression = "xz"
             write_mode = "sync_after_commit"
+            reconcile_interval_secs = 0
             "#,
         );
         assert!(!cfg.binary_cache_compat.enabled);
@@ -1034,6 +1053,9 @@ mod tests {
             cfg.binary_cache_compat.write_mode,
             CompatWriteMode::SyncAfterCommit
         );
+        // 0 = reconciler disabled (the "I only ever want inline writes"
+        // escape hatch).
+        assert_eq!(cfg.binary_cache_compat.reconcile_interval_secs, 0);
     }
 
     /// Partial `[binary_cache_compat]` table: unspecified fields fall

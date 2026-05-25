@@ -718,6 +718,43 @@ pub(crate) async fn set_compat_file_hash(
     Ok(res.rows_affected())
 }
 
+/// Compat-reconciler work queue: committed paths whose compat object
+/// pair has not been published (`compat_file_hash IS NULL`), oldest
+/// first. Bounded by `limit` so one batch is a bounded amount of
+/// reassembly work; the partial index `narinfo_compat_pending_idx`
+/// (M_066) makes the empty-backlog steady state an index-only no-op.
+///
+/// Only `'complete'` manifests qualify — placeholders are still being
+/// uploaded (the inline writer or a later reconciler pass picks them
+/// up once they commit).
+pub(crate) async fn list_compat_pending(pool: &PgPool, limit: i64) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT n.store_path FROM narinfo n \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         WHERE n.compat_file_hash IS NULL AND m.status = 'complete' \
+         ORDER BY n.registration_time ASC \
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Size of the compat-reconciler backlog (committed paths with
+/// `compat_file_hash IS NULL`). Drives the `rio_store_compat_backlog`
+/// gauge; same partial-index plan as [`list_compat_pending`].
+pub(crate) async fn count_compat_pending(pool: &PgPool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM narinfo n \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         WHERE n.compat_file_hash IS NULL AND m.status = 'complete'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

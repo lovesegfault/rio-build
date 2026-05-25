@@ -197,7 +197,11 @@ pub fn maybe_spawn_eager(
 
 /// Reassemble a NAR from its manifest. Chunks fetch through the
 /// shared moka cache (BLAKE3 verify per-chunk; cross-warm with GetPath).
-async fn reassemble(
+///
+/// `pub(crate)`: the binary-cache compat reconciler reuses this exact
+/// reassembly (same cache, same per-chunk verification) to rebuild the
+/// NARs it publishes as compat objects.
+pub(crate) async fn reassemble(
     cache: &Arc<ChunkCache>,
     manifest: ChunkManifest,
     total: u64,

@@ -46,7 +46,8 @@
           "enabled": true,
           "bucket": null,
           "compression": "zstd",
-          "write_mode": "sync_after_commit"
+          "write_mode": "sync_after_commit",
+          "reconcile_interval_secs": 30
         }
       },
       "chunk_cache_capacity_bytes": {
@@ -258,7 +259,7 @@
         ]
       },
       "BinaryCacheCompat": {
-        "description": "Stock-Nix binary-cache compatibility layer (ADR-022 Design Overview\n§10). When `enabled`, every committed path is *additionally*\nwritten to S3-standard as a stock-Nix object pair\n(`{store-path-hash}.narinfo` + `nar/{file-hash}.nar.<ext>`), so\n`nix copy --from s3://bucket` substitutes with no rio process\nrunning. Runtime config, not a build flag: toggling OFF stops new\ncompat writes (existing objects stay); toggling ON resumes for\nsubsequent puts. Never affects chunked storage either way.\n\nThe compat writer itself is not wired yet (it lands with the\n`compat::writer` module); until then these fields are validated and\ncarried but otherwise inert, so enabling them is a no-op.",
+        "description": "Stock-Nix binary-cache compatibility layer (ADR-022 Design Overview\n§10). When `enabled`, every committed path is *additionally*\nwritten to S3-standard as a stock-Nix object pair\n(`{store-path-hash}.narinfo` + `nar/{file-hash}.nar.<ext>`), so\n`nix copy --from s3://bucket` substitutes with no rio process\nrunning. Runtime config, not a build flag: toggling OFF stops new\ncompat writes (existing objects stay); toggling ON resumes for\nsubsequent puts. Never affects chunked storage either way.\n\nHow the objects get written (`compat::writer`): paths committed\nthrough the buffered upload RPCs (`PutPath`/`PutPathBatch` — the\ngateway surface) are published synchronously after the PG commit;\npaths committed via `PutPathChunked` or upstream substitution keep\n`narinfo.compat_file_hash IS NULL` and are backfilled by the P0582\ncompat reconciler off the upload hot path.",
         "type": "object",
         "properties": {
           "enabled": {
@@ -283,6 +284,13 @@
             "description": "When the compat write happens relative to the PutPath PG\ncommit. Only `sync_after_commit` exists today (see\n[`CompatWriteMode`]).",
             "$ref": "#/$defs/CompatWriteMode",
             "default": "sync_after_commit"
+          },
+          "reconcile_interval_secs": {
+            "description": "Poll cadence (seconds) of the compat reconciler — the\nbackground loop that finds committed paths whose\n`narinfo.compat_file_hash` is NULL (paths committed via\n`PutPathChunked` or upstream substitution, paths ingested while\ncompat was OFF, and inline writes that failed), reassembles\ntheir NARs from the chunk store, and publishes the compat\nobject pair off the upload hot path. Within one tick the\nbacklog drains continuously (batch after batch); the interval\nis the idle re-poll cadence. `0` disables the reconciler\n(inline writes still happen); ignored entirely when `enabled`\nis false. Default 30. Set via\n`RIO_BINARY_CACHE_COMPAT__RECONCILE_INTERVAL_SECS`.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 30
           }
         }
       },
@@ -347,7 +355,8 @@
       "enabled": true,
       "bucket": null,
       "compression": "zstd",
-      "write_mode": "sync_after_commit"
+      "write_mode": "sync_after_commit",
+      "reconcile_interval_secs": 30
     },
     "chunk_cache_capacity_bytes": 2147483648,
     "nar_buffer_budget_bytes": null,

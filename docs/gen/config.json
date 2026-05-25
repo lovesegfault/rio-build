@@ -372,6 +372,12 @@
         "description": "When the compat write happens relative to the PutPath PG commit."
       },
       {
+        "key": "binary_cache_compat.reconcile_interval_secs",
+        "type": "uint64",
+        "default": "30",
+        "description": "Poll cadence (seconds) of the compat reconciler — the background loop that finds committed paths whose `narinfo.compat_file_hash` is NULL (paths committed via `PutPathChunked` or upstream substitution, paths ingested while compat was OFF, and inline writes that failed), reassembles their NARs from the chunk store, and publishes the compat object pair off the upload hot path."
+      },
+      {
         "key": "chunk_cache_capacity_bytes",
         "type": "uint64",
         "default": "2147483648",

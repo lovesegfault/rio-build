@@ -1107,6 +1107,29 @@ pub const M_064: () = ();
 /// closed only once no store is inline-only.
 pub const M_065: () = ();
 
+/// 066 — partial index for the binary-cache compat reconciler queue
+/// (P0582).
+///
+/// `narinfo.compat_file_hash IS NULL` means "compat objects not yet
+/// published" (M_062 added the column; the P0566 writer populates it
+/// on the buffered upload paths). The reconciler polls for pending
+/// rows every `binary_cache_compat.reconcile_interval_secs` per
+/// replica; without an index that poll is a full `narinfo` heap scan
+/// even in the steady state where the backlog is empty — the most
+/// common case, repeated forever. The partial index contains ONLY
+/// pending rows, so the steady-state poll and the
+/// `rio_store_compat_backlog` count are index-only and effectively
+/// free, and it shrinks back to nothing as the backlog drains.
+///
+/// `registration_time` as the key gives oldest-first draining (the
+/// order the reconciler processes in) without a separate sort.
+/// Mirrors `manifests_nar_index_pending_idx` (M_062), the same
+/// pattern for the NAR-indexer work queue. Plain CREATE INDEX (not
+/// CONCURRENTLY): the index covers only NULL rows, which on an
+/// existing pre-compat deployment is every row — the same one-time
+/// build cost 062's indexes already accepted at migration time.
+pub const M_066: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

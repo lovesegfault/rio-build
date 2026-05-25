@@ -1227,6 +1227,13 @@
     },
     {
       "enum": "CompatError",
+      "name": "PathVanished",
+      "crate": "rio-store",
+      "msg": "narinfo row for {store_path} vanished before the compat_file_hash update; publication rolled back ({cleanup_failures} cleanup delete(s) failed)",
+      "doc": "The narinfo row vanished (GC won a race) between the upload's commit and the `compat_file_hash` update, so the freshly-written object pair was rolled back (deleted). Surfaced as an error so the caller counts it on `rio_store_compat_write_failures_total` and never emits success metrics for objects that are no longer supposed to exist. `cleanup_failures > 0` means that many of the rollback deletes ALSO failed — those objects are orphaned in the compat bucket (warn-logged with their keys) until an operator removes them, because without a narinfo row the GC coupling can never find them."
+    },
+    {
+      "enum": "CompatError",
       "name": "Upload",
       "crate": "rio-store",
       "msg": "compat object upload failed for {key}: {source}",

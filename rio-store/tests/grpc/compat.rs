@@ -246,6 +246,158 @@ async fn compat_failure_does_not_fail_put_path() -> TestResult {
     Ok(())
 }
 
+// r[verify store.compat.reconcile]
+/// The reconciler backfills exactly the pending set: a path whose NAR
+/// exists only as chunks (uploaded with compat OFF) gets its object
+/// pair published from a chunk-store reassembly and its
+/// `compat_file_hash` recorded; a path already marked written is left
+/// alone; a second pass is idle.
+#[tokio::test]
+async fn reconciler_backfills_pending_paths() -> TestResult {
+    use rio_store::compat::{CompatWriter, reconciler};
+
+    // Compat OFF at upload time: chunks + narinfo land, no compat
+    // objects, compat_file_hash stays NULL.
+    let (mut s, backend) = StoreSession::new_chunked().await?;
+
+    let path_a = format!("/nix/store/{}-reconcile-pending", "d".repeat(32));
+    let path_b = format!("/nix/store/{}-reconcile-done", "g".repeat(32));
+    let (nar_a, _) = make_nar(b"backfill me from chunks");
+    let (nar_b, _) = make_nar(b"already published elsewhere");
+    let info_a = make_path_info(&path_a, &nar_a, Sha256::digest(&nar_a).into());
+    let info_b = make_path_info(&path_b, &nar_b, Sha256::digest(&nar_b).into());
+    assert!(put_path(&mut s.client, info_a, nar_a.clone()).await?);
+    assert!(put_path(&mut s.client, info_b, nar_b).await?);
+
+    // Mark B as already written (as if the inline writer had covered
+    // it) so the reconciler must skip it.
+    sqlx::query("UPDATE narinfo SET compat_file_hash = $2 WHERE store_path = $1")
+        .bind(&path_b)
+        .bind([0xEEu8; 32].as_slice())
+        .execute(&s.db.pool)
+        .await?;
+
+    // Reconciler components share the session's backend: the cache
+    // reads the chunks PutPath stored, the writer publishes into the
+    // same blob namespace the assertions read.
+    let cache = Arc::new(rio_store::cas::ChunkCache::new(
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>
+    ));
+    let writer = CompatWriter::new(
+        s.db.pool.clone(),
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>,
+        rio_store::config::CompatCompression::Zstd,
+    );
+
+    let stats = reconciler::run_once(&s.db.pool, &cache, &writer).await?;
+    assert_eq!(stats.backlog, 1, "only A is pending (B was marked written)");
+    assert_eq!(stats.published, 1);
+    assert_eq!(stats.failed, 0);
+
+    // A's pair is now in the bucket and round-trips.
+    let hash_part_a = StorePath::parse(&path_a)?.hash_part();
+    let narinfo_blob = backend
+        .get_blob(&format!("{hash_part_a}.narinfo"))
+        .await?
+        .expect("reconciler must publish A's narinfo");
+    let parsed = NarInfo::parse(std::str::from_utf8(&narinfo_blob)?)?;
+    assert_eq!(parsed.store_path, path_a);
+    let nar_blob = backend
+        .get_blob(&parsed.url)
+        .await?
+        .expect("A's narinfo URL must resolve");
+    assert_eq!(zstd_decode(&nar_blob).await, nar_a);
+    let recorded: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT compat_file_hash FROM narinfo WHERE store_path = $1")
+            .bind(&path_a)
+            .fetch_one(&s.db.pool)
+            .await?;
+    let file_hash: [u8; 32] = Sha256::digest(&nar_blob).into();
+    assert_eq!(recorded.as_deref(), Some(file_hash.as_slice()));
+
+    // B was skipped: no narinfo object was created for it.
+    let hash_part_b = StorePath::parse(&path_b)?.hash_part();
+    assert!(
+        backend
+            .get_blob(&format!("{hash_part_b}.narinfo"))
+            .await?
+            .is_none(),
+        "already-written path must not be re-published"
+    );
+
+    // Steady state: nothing pending, second pass is idle.
+    let stats = reconciler::run_once(&s.db.pool, &cache, &writer).await?;
+    assert!(stats.idle(), "second pass must find nothing: {stats:?}");
+    assert_eq!(stats.backlog, 0);
+
+    Ok(())
+}
+
+// r[verify store.compat.reconcile]
+/// Per-path failures don't poison the batch: a pending row whose
+/// chunks are missing from the backend fails (and stays pending),
+/// while a healthy pending path in the same batch is still published.
+#[tokio::test]
+async fn reconciler_failure_keeps_path_pending_and_loop_alive() -> TestResult {
+    use rio_store::compat::{CompatWriter, reconciler};
+    use rio_store::test_helpers::StoreSeed;
+
+    let (mut s, backend) = StoreSession::new_chunked().await?;
+
+    // Healthy pending path (real upload, chunks present).
+    let good_path = format!("/nix/store/{}-reconcile-good", "h".repeat(32));
+    let (good_nar, _) = make_nar(b"healthy backfill");
+    let good_info = make_path_info(&good_path, &good_nar, Sha256::digest(&good_nar).into());
+    assert!(put_path(&mut s.client, good_info, good_nar).await?);
+
+    // Broken pending path: complete metadata pointing at chunks that
+    // were never written to the backend → reassembly fails.
+    let broken_path = format!("/nix/store/{}-reconcile-broken", "i".repeat(32));
+    StoreSeed::raw_path(&broken_path)
+        .with_chunk_manifest(&[([0xAB; 32], 64)])
+        .with_nar_size(64)
+        .seed(&s.db.pool)
+        .await;
+
+    let cache = Arc::new(rio_store::cas::ChunkCache::new(
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>
+    ));
+    let writer = CompatWriter::new(
+        s.db.pool.clone(),
+        Arc::clone(&backend) as Arc<dyn ChunkBackend>,
+        rio_store::config::CompatCompression::Zstd,
+    );
+
+    let stats = reconciler::run_once(&s.db.pool, &cache, &writer).await?;
+    assert_eq!(stats.backlog, 2);
+    assert_eq!(stats.published, 1, "healthy path must still publish");
+    assert_eq!(stats.failed, 1, "broken path must be counted, not fatal");
+
+    // The healthy path is done; the broken one stays pending for a
+    // later pass (NULL column, no objects).
+    let good_hash: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT compat_file_hash FROM narinfo WHERE store_path = $1")
+            .bind(&good_path)
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert!(good_hash.is_some());
+    let broken_hash: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT compat_file_hash FROM narinfo WHERE store_path = $1")
+            .bind(&broken_path)
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert!(broken_hash.is_none(), "failed path must stay pending");
+    let broken_part = StorePath::parse(&broken_path)?.hash_part();
+    assert!(
+        backend
+            .get_blob(&format!("{broken_part}.narinfo"))
+            .await?
+            .is_none()
+    );
+
+    Ok(())
+}
+
 // r[verify store.compat.narinfo-on-put]
 /// PutPathBatch: every committed output gets its own compat pair, and
 /// the published narinfo carries the batch-resolved signature.

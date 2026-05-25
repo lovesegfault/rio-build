@@ -938,12 +938,13 @@ impl Substituter {
 
             // — Step 5-6: persist via the shared write-ahead core —
             //
-            // TODO: no inline binary-cache compat write here (unlike the
+            // No inline binary-cache compat write here (unlike the
             // buffered PutPath/PutPathBatch handlers): a substituted path
             // is on the upstream-miss latency path and usually already
             // lives in some public binary cache. The row keeps
-            // `narinfo.compat_file_hash IS NULL`, so the P0582 compat
-            // reconciler republishes it to our bucket off the hot path.
+            // `narinfo.compat_file_hash IS NULL`, so `compat::reconciler`
+            // republishes it to our bucket off the hot path
+            // (r[store.compat.reconcile]).
             ingest::persist_nar(
                 &self.pool,
                 &self.chunk_backend,

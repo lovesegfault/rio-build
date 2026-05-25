@@ -200,6 +200,8 @@
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
+    "rio_store_compat_backlog",
+    "rio_store_compat_reconcile_total",
     "rio_store_compat_write_bytes_total",
     "rio_store_compat_write_failures_total",
     "rio_store_compat_write_seconds",
@@ -1270,9 +1272,19 @@
         "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)"
       },
       {
+        "name": "rio_store_compat_backlog",
+        "kind": "gauge",
+        "help": "Committed paths whose compat objects are not yet published (narinfo.compat_file_hash IS NULL). Refreshed at the start of each reconciler batch; absent when the reconciler is disabled. Should trend to 0 — a plateau means the reconciler cannot keep up or is failing (see rio_store_compat_reconcile_total{result=\"error\"})."
+      },
+      {
+        "name": "rio_store_compat_reconcile_total",
+        "kind": "counter",
+        "help": "Compat-reconciler backfill attempts, labeled by result (ok|error). ok = a pending path's narinfo + NAR pair was published from chunks and compat_file_hash recorded; error = the path stays pending and retries on a later pass. Sustained errors = chunk-store or compat-bucket trouble on paths the upload hot path never touches."
+      },
+      {
         "name": "rio_store_compat_write_bytes_total",
         "kind": "counter",
-        "help": "Compressed bytes published as nar/*.nar.<ext> compat objects (the S3-storage cost of binary_cache_compat.enabled)."
+        "help": "Compressed bytes published as nar/*.nar.<ext> compat objects (the S3-storage cost of binary_cache_compat.enabled), counting both the inline post-commit writes and the reconciler's backfills."
       },
       {
         "name": "rio_store_compat_write_failures_total",

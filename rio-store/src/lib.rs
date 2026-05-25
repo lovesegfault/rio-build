@@ -415,7 +415,24 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_compat_write_bytes_total",
         "Compressed bytes published as nar/*.nar.<ext> compat objects \
-         (the S3-storage cost of binary_cache_compat.enabled)."
+         (the S3-storage cost of binary_cache_compat.enabled), counting both \
+         the inline post-commit writes and the reconciler's backfills."
+    );
+    describe_counter!(
+        "rio_store_compat_reconcile_total",
+        "Compat-reconciler backfill attempts, labeled by result (ok|error). \
+         ok = a pending path's narinfo + NAR pair was published from chunks \
+         and compat_file_hash recorded; error = the path stays pending and \
+         retries on a later pass. Sustained errors = chunk-store or \
+         compat-bucket trouble on paths the upload hot path never touches."
+    );
+    describe_gauge!(
+        "rio_store_compat_backlog",
+        "Committed paths whose compat objects are not yet published \
+         (narinfo.compat_file_hash IS NULL). Refreshed at the start of each \
+         reconciler batch; absent when the reconciler is disabled. Should \
+         trend to 0 — a plateau means the reconciler cannot keep up or is \
+         failing (see rio_store_compat_reconcile_total{result=\"error\"})."
     );
 
     describe_counter!(

@@ -182,14 +182,30 @@ async fn main() -> anyhow::Result<()> {
             bucket = cfg.binary_cache_compat.bucket.as_deref().unwrap_or("<chunk backend>"),
             compression = ?cfg.binary_cache_compat.compression,
             write_mode = ?cfg.binary_cache_compat.write_mode,
+            reconcile_interval_secs = cfg.binary_cache_compat.reconcile_interval_secs,
             "binary-cache compat writer enabled"
         );
-        store_service =
-            store_service.with_compat_writer(Arc::new(rio_store::compat::CompatWriter::new(
+        let compat_writer = Arc::new(rio_store::compat::CompatWriter::new(
+            pool.clone(),
+            blob_target,
+            cfg.binary_cache_compat.compression,
+        ));
+        store_service = store_service.with_compat_writer(Arc::clone(&compat_writer));
+        // Reconciler: backfills compat objects for paths the inline
+        // writer never covers (PutPathChunked, substitution, failed or
+        // pre-toggle writes). Same shared writer + chunk cache; same
+        // panic/shutdown disposition as the GC/indexer loops.
+        if cfg.binary_cache_compat.reconcile_interval_secs > 0 {
+            rio_store::compat::spawn_reconciler_loop(
                 pool.clone(),
-                blob_target,
-                cfg.binary_cache_compat.compression,
-            )));
+                Arc::clone(&chunk_cache),
+                compat_writer,
+                std::time::Duration::from_secs(cfg.binary_cache_compat.reconcile_interval_secs),
+                shutdown.clone(),
+            );
+        } else {
+            info!("compat reconciler disabled (reconcile_interval_secs = 0)");
+        }
     } else {
         info!("binary-cache compat writer disabled (binary_cache_compat.enabled = false)");
     }

@@ -9,12 +9,16 @@
 //! on-ramp + PG-outage floor). The chunked store remains authoritative;
 //! compat objects are a derived, regenerable projection.
 //!
-//! [`writer::CompatWriter`] is the only producer. The deferred
-//! reconciler (P0582) backfills paths whose `narinfo.compat_file_hash`
-//! is NULL — crash windows, paths ingested while compat was OFF, and
-//! paths committed via ingest paths that don't carry the whole NAR in
-//! RAM (`PutPathChunked`, upstream substitution).
+//! [`writer::CompatWriter`] is the only producer; it runs from two
+//! places. The upload handlers call it inline (sync after commit) for
+//! the buffered RPCs, and the [`reconciler`] loop backfills every path
+//! whose `narinfo.compat_file_hash` is NULL — crash windows, paths
+//! ingested while compat was OFF, and paths committed via ingest paths
+//! that don't carry the whole NAR in RAM (`PutPathChunked`, upstream
+//! substitution).
 
+pub mod reconciler;
 pub mod writer;
 
+pub use reconciler::spawn_reconciler_loop;
 pub use writer::{CompatError, CompatWriter};

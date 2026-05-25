@@ -421,9 +421,19 @@ Until then a multi-AZ `kind=tiered` deployment runs every replica with `local=No
 
 **Exit:** `/nixbuild --checks` green.
 
-### P0582 — compat reconciler (deferred-priority)
-**Crate:** `rio-store` · **Deps:** P0566, P0581 · **Complexity:** LOW
-`rio-store/src/compat/reconciler.rs`: background loop, `SELECT n.store_path_hash FROM narinfo n JOIN manifests m USING (store_path_hash) WHERE n.compat_file_hash IS NULL AND m.status='complete' LIMIT 64` → `compat_writer.write(...)` for each → sleep 30s if empty. Handles the crash-between-PG-commit-and-S3-write window and backfills paths ingested while compat was OFF. Spawned in `main.rs` only when `enabled`. **Exit:** `/nixbuild --checks` green; unit: insert a `compat_file_hash IS NULL` row → one tick → row populated + S3 objects present.
+### P0582 — compat reconciler
+**Crate:** `rio-store` · **Deps:** P0566, P0581 · **Complexity:** LOW · **Status: DONE 2026-05-25**
+
+> **Pulled forward** (originally framed deferred-priority): the P0566 review settled hook coverage as buffered-RPCs-only, which makes the reconciler the *only* compat producer for builder uploads (`PutPathChunked`) and substituted paths — load-bearing for U6, not a nice-to-have — so it shipped immediately after P0566 and **before P0581** (the GC-coupling dep is about cleanup, not about producing objects; nothing here reads `pending_s3_deletes`). Landed shape vs. the sketch: `compat/reconciler.rs` `run_once` (one bounded batch: backlog gauge → `LIMIT 64` oldest-first by `registration_time` → per-path reassemble-from-chunks via the shared `ChunkCache` → whole-NAR SHA-256 re-verify → `CompatWriter::write`) + `spawn_reconciler_loop` (drains batch-after-batch within a tick, idles `reconcile_interval_secs` when empty, shutdown-checked between batches; per-path failures logged + counted, never fatal). New config `binary_cache_compat.reconcile_interval_secs` (default 30, `0` = disabled; not exposed as a helm value), spawned from `main.rs` only when `enabled`. Migration `066_compat_pending_index` adds the partial index `narinfo_compat_pending_idx` (`WHERE compat_file_hash IS NULL`) so the steady-state empty poll and the backlog count are index-only instead of a per-tick `narinfo` heap scan. Metrics `rio_store_compat_reconcile_total{result}` + `rio_store_compat_backlog` (the dashboards item's wished-for backlog observable); spec rule `store.compat.reconcile` in `components/store.typ`; not leader-gated (duplicate publication is idempotent). Tests: gRPC integration — pending chunked-style path backfilled + already-written path skipped + second pass idle; missing-chunk failure counted while the rest of the batch still publishes.
+
+| File | Change |
+|---|---|
+| `rio-store/src/compat/reconciler.rs` | new — `run_once` + `spawn_reconciler_loop` as described above. `// r[impl store.compat.reconcile]` |
+| `rio-store/src/config.rs` | `binary_cache_compat.reconcile_interval_secs` (default 30, 0 = off) |
+| `rio-migrations/migrations/066_compat_pending_index.sql` | partial index `narinfo_compat_pending_idx ON narinfo (registration_time) WHERE compat_file_hash IS NULL` |
+| `rio-store/src/main.rs` | spawn when `enabled && reconcile_interval_secs > 0` |
+
+**Exit:** `/nixbuild --checks` green; integration: a `compat_file_hash IS NULL` path → one `run_once` → row populated + S3 objects present (met).
 
 ### P0583 — drop `inline_blob` storage; all NARs chunked
 **Crate:** `rio-store, rio-proto` · **Deps:** P0544, P0551 · **Complexity:** MED · **Status: DONE 2026-05-25**
@@ -912,7 +922,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 {"plan":566,"title":"binary-cache compat writer: stock-Nix .narinfo + nar/*.nar.zst to S3-standard post-commit","deps":[549,579],"crate":"rio-store","priority":80,"status":"DONE","complexity":"MED","note":"sync-after-commit on PutPath/PutPathBatch from the in-RAM NAR; FileHash/FileSize + compat_file_hash populated; failure non-fatal; chunked/substituter paths left to the P0582 reconciler"}
 {"plan":580,"title":"VM test: stock-Nix substitutes from S3 with rio-store stopped","deps":[566],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"MED","note":"U6 LANDS"}
 {"plan":581,"title":"compat GC: enqueue narinfo+nar.zst to pending_s3_deletes on sweep; narinfo.compat_file_hash column","deps":[551,566],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":"runs regardless of current enabled value"}
-{"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"UNIMPL","complexity":"LOW","note":"crash-window + toggle-ON backfill; deferrable"}
+{"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"DONE","complexity":"LOW","note":"pulled forward after the P0566 review: sole compat producer for chunked/substituted paths; landed before P0581 (GC dep is cleanup-only); reconcile_interval_secs + narinfo_compat_pending_idx (066) + rio_store_compat_backlog"}
 {"plan":583,"title":"drop inline_blob: all NARs chunked; ChunkBackendKind::Inline removed; chunk_backend required","deps":[544,551],"crate":"rio-store,rio-proto","priority":80,"status":"DONE","complexity":"MED","note":"greenfield: ALTER TABLE manifests DROP COLUMN inline_blob in mig 065; ManifestKind -> ChunkManifest; chunk_cache no longer Option; ChunkBackendKind::Memory added for tests"}
 {"plan":589,"title":"AssignmentClaims.{role,input_closure_digest} + dispatch populate","deps":[544,588],"crate":"rio-auth,rio-scheduler","priority":92,"status":"DONE","complexity":"LOW","note":"sequenced before P0573/P0586/P0584 — all three read these fields; closure already in hand at dispatch via P0588"}
 {"plan":584,"title":"builder-chunked-only auth gate: PutPath/PutPathBatch reject role=Builder","deps":[586,589],"crate":"rio-store","priority":80,"status":"DONE","complexity":"LOW","note":"PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders; spec rule store.put.builder-chunked-only added to components/store.typ; legacy assignment-token PutPath tests retired in favor of chunked-path equivalents"}

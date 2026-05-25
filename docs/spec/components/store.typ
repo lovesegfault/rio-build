@@ -974,9 +974,36 @@ buffered upload RPCs (`PutPath`, `PutPathBatch`) where the verified NAR is
 already in RAM; the response returns after the compat write, so its cost is
 one compression pass plus two S3 PUTs, bounded by the NAR size. Paths
 committed through `PutPathChunked` or upstream substitution are not written
-inline --- they are exactly the rows the compat reconciler (P0582) finds via
-`compat_file_hash IS NULL` and backfills off the hot path, which keeps
-builder-upload latency unaffected by the compat layer.
+inline --- they are exactly the rows the compat reconciler
+(#rref("store.compat.reconcile")) finds via `compat_file_hash IS NULL` and
+backfills off the hot path, which keeps builder-upload latency unaffected by
+the compat layer.
+
+#r("store.compat.reconcile")[
+  When the compat layer is enabled, the store MUST run a background
+  reconciler that repeatedly selects committed paths whose
+  `narinfo.compat_file_hash` is NULL (bounded batches, oldest first by
+  registration time), reassembles each path's NAR from the chunk store with
+  the same per-chunk verification the read path uses, re-verifies the
+  whole-NAR SHA-256 against the narinfo row, publishes the compat object
+  pair through the same writer as the inline path, and records
+  `compat_file_hash`. Per-path failures MUST be logged and counted
+  (#(refs.metric)("rio_store_compat_reconcile_total")`{result="error"}`) and
+  MUST NOT stop the loop or affect any RPC; the backlog MUST be observable
+  via #(refs.metric)("rio_store_compat_backlog"). The reconciler's poll
+  cadence is `binary_cache_compat.reconcile_interval_secs` (`0` disables
+  it); within one tick it drains the backlog continuously rather than one
+  batch per interval.
+]
+
+The reconciler is what closes the gap between "compat is enabled" and "every
+committed path is substitutable by stock Nix": builder uploads
+(`PutPathChunked`), upstream-substituted paths, paths ingested while compat
+was OFF, and inline writes that failed or crashed mid-way all converge
+through it. Duplicate publication by concurrent replicas is harmless --- the
+NAR object is keyed by the compressed digest and the narinfo content is
+identical --- so the loop is not leader-gated; duplicate work during a
+backlog drain is the only cost.
 
 = Two-Phase Garbage Collection
 
