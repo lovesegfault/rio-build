@@ -58,7 +58,11 @@ test "$(yq "$ds | .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedu
 # nix/nixos-node/eks-node.nix (990). The two sides of the SO_PEERCRED
 # gate are declared in different languages in different trees — this is
 # the only place they meet.
-yq "$ds | .spec.template.spec.containers[0].args[]" "$out" | grep -qx -- "--allowed-gid=990" || {
+# Capture-then-grep (not `yq | grep -q`): under the driver's pipefail,
+# grep -q exiting at first match can SIGPIPE yq and turn a MATCH into a
+# 141 pipeline failure — the inverse of the r39 pass-gap, a false FAIL.
+args=$(yq "$ds | .spec.template.spec.containers[0].args[]" "$out")
+grep -qx -- "--allowed-gid=990" <<<"$args" || {
   echo "FAIL: rio-mountd --allowed-gid != 990 (must match users.groups.rio-builder.gid in nix/nixos-node/eks-node.nix)" >&2
   exit 1
 }
