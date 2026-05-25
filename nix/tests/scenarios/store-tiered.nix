@@ -215,7 +215,7 @@ let
       enable = true;
       # Explicit major pin (the module requires choosing one): the
       # layout/key/bucket CLI calls in the prelude are the 1.x syntax.
-      package = pkgs.garage_1_x;
+      package = pkgs.garage_1;
       settings = {
         replication_factor = 1;
         rpc_bind_addr = "127.0.0.1:3901";

@@ -1031,7 +1031,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `rio-proto/build.rs` | P0568 only | — |
 | `rio-builder/src/overlay.rs` | P0560 only | — |
 | `nix/tests/default.nix` | P0555, P0560§B, P0562 | append-only scenario entries |
-| `nix/tests/fixtures/k3s-prod-parity.nix` | P0555, P0560§B | P0555 adds args; P0560§B adds unconditional kernel.nix import |
+| `nix/tests/fixtures/k3s-prod-parity.nix` | P0560§B | P0560§B adds unconditional kernel.nix import (P0555 landed on the standalone fixture — no change here) |
 | `infra/helm/rio-build/values.yaml` | P0554, P0564 | distinct top-level keys |
 | `rio-controller/src/reconcilers/common/sts.rs` | P0564 only | — |
 | `nix/nixos-node/eks-node.nix` | P0564, P0571 | distinct hunks (drop smarter-device-manager static-pod vs tmpfiles) |
