@@ -300,6 +300,17 @@ pkgs.testers.runNixOSTest {
     def check_entry(name, meta):
         with subtest(f"corpus entry: {name}"):
             drv = instantiate(name)
+            # Later corpus entries depend on earlier entries' outputs
+            # (e.g. erg-with-drv exports the trivial entry's graph), and
+            # the native driver computes its input closure with
+            # `nix-store -qR`, which requires every input to be a valid
+            # store path. Realise the entry's input derivations first so
+            # the native side sees the same materialized inputs the
+            # oracle build would create on demand.
+            refs = machine.succeed(f"nix-store -q --references {drv}")
+            input_drvs = " ".join(r for r in refs.split() if r.endswith(".drv"))
+            if input_drvs:
+                machine.succeed(f"nix-store --realise {input_drvs} >/dev/null")
             report = native_build(name, drv)
             try:
                 run_entry_assertions(name, meta, drv, report)
