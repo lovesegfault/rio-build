@@ -26,19 +26,38 @@
 //!   [`validate`](ExecutionRequest::validate) boundary.
 //! - [`outcome`]: the [`ExecutionOutcome`] type tree and the
 //!   [`ExecEvent`] stream items.
+//! - `plan` (crate-private): `SandboxPlan::compile`, the pure
+//!   request → ordered-operations resolution step where every mount
+//!   ordering and file content decision lives.
+//! - `skeleton` (crate-private): the host-side, pre-fork
+//!   materialization of a plan's directory tree, files, and symlinks.
+//! - `child` (crate-private): the async-signal-safe post-fork sequence
+//!   (namespaces, mounts, `pivot_root`, hardening, privilege drop,
+//!   `execve`).
+//! - `seccomp` (crate-private): the multi-ABI purity filter the child
+//!   installs.
 //!
-//! The sandbox construction and the `execute()` entry point are added by
-//! follow-up changes; this crate currently defines only the API surface.
+//! The `execute()` entry point that forks the process tree and drives
+//! the pieces above is added by the next change; until it lands the
+//! sandbox modules have no production caller, which is why they carry a
+//! temporary `#[allow(dead_code)]`.
 
 pub mod outcome;
 pub mod request;
-// The sandbox child sequence (the next change in this crate) is the
-// production consumer of the seccomp filter; until it lands, the unit
-// tests are its only callers, so the module's items would otherwise trip
-// dead_code under `--deny warnings`. Remove the allow when the sandbox
-// sequence wires `build_filter` + `install` into the pre-exec path.
+// The execute() entry point (the next change in this crate) is the
+// production consumer of the plan/skeleton/child/seccomp pipeline;
+// until it lands, the unit tests are the only callers, so the modules'
+// items would otherwise trip dead_code under `--deny warnings`. Remove
+// the allows when execute() wires compile -> build -> fork ->
+// enter_namespaces -> setup_and_exec together.
+#[allow(dead_code)]
+pub(crate) mod child;
+#[allow(dead_code)]
+pub(crate) mod plan;
 #[allow(dead_code)]
 pub(crate) mod seccomp;
+#[allow(dead_code)]
+pub(crate) mod skeleton;
 
 pub use outcome::{
     ExecEvent, ExecutionOutcome, ExitOutcome, LogStream, OutputFileType, OutputMetadata,

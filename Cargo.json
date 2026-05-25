@@ -19680,6 +19680,12 @@
           "packageId": "workspace-hack"
         }
       ],
+      "devDependencies": [
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
       "libCrateTypes": [
         "lib"
       ],

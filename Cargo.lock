@@ -6217,6 +6217,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "nix 0.31.3",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

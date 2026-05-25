@@ -518,6 +518,11 @@
   ],
   "rio-exec": [
     {
+      "path": "child.rs",
+      "depth": 0,
+      "doc": "The post-fork sandbox construction sequence."
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Build-system-agnostic Linux sandbox executor."
@@ -528,9 +533,24 @@
       "doc": "The execution outcome: what happened when the request was run."
     },
     {
+      "path": "plan.rs",
+      "depth": 0,
+      "doc": "The sandbox plan: a fully-resolved, ordered description of every"
+    },
+    {
       "path": "request.rs",
       "depth": 0,
       "doc": "The execution request: a complete, concrete description of a process"
+    },
+    {
+      "path": "seccomp.rs",
+      "depth": 0,
+      "doc": "The multi-ABI seccomp purity filter."
+    },
+    {
+      "path": "skeleton.rs",
+      "depth": 0,
+      "doc": "Host-side sandbox preparation: materialize a [`SandboxPlan`]'s"
     }
   ],
   "rio-gateway": [

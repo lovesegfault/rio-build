@@ -51,7 +51,9 @@ use nix::errno::Errno;
 /// machine number OR'd with `__AUDIT_ARCH_64BIT` (`0x8000_0000`) and
 /// `__AUDIT_ARCH_LE` (`0x4000_0000`) as appropriate. Stable kernel UAPI
 /// values.
+#[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000; // EM_X86_64
+#[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_I386: u32 = 3 | 0x4000_0000; // EM_386
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH_AARCH64: u32 = 183 | 0x8000_0000 | 0x4000_0000; // EM_AARCH64
@@ -263,7 +265,11 @@ impl Asm {
 
     /// Bind `l` to the next instruction to be emitted.
     fn bind(&mut self, l: Label) {
-        debug_assert!(self.bound[l.0].is_none(), "label bound twice");
+        // A hard assert, not a debug_assert: a double-bound label is a
+        // silently mis-targeted jump in the finished program. This runs
+        // once, in the parent, at filter-build time, where panicking is
+        // allowed (and the unit tests build the filter on every run).
+        assert!(self.bound[l.0].is_none(), "label bound twice");
         self.bound[l.0] = Some(self.insns.len());
     }
 
@@ -667,8 +673,8 @@ mod tests {
 
     /// Syscall numbers must be scoped to their arch block: i386's
     /// `chmod` is nr 15, which under `AUDIT_ARCH_X86_64` is
-    /// `rt_sigprocmask`-adjacent and must NOT be filtered; x86_64's
-    /// `chmod` (nr 90) under `AUDIT_ARCH_I386` is `dup` and must not be
+    /// `rt_sigreturn` and must NOT be filtered; x86_64's `chmod`
+    /// (nr 90) under `AUDIT_ARCH_I386` is `old_mmap` and must not be
     /// filtered there.
     #[cfg(target_arch = "x86_64")]
     #[test]
