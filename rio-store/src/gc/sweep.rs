@@ -214,6 +214,79 @@ struct SweptCastoreRefs {
     dirs: Vec<[u8; 32]>,
 }
 
+// r[impl store.compat.gc-coupled]
+/// Enqueue a swept path's binary-cache compat objects onto the
+/// `pending_s3_deletes` outbox (kind = 'blob'), in the same
+/// transaction that is about to delete its narinfo row.
+///
+/// Reads `compat_file_hash` BEFORE the CASCADE removes it: NULL means
+/// no compat objects were ever published (nothing to enqueue); a
+/// digest means a `{hash-part}.narinfo` and one `nar/…` object exist.
+/// The column records only the SHA-256 of the compressed object, not
+/// the codec it was compressed with at write time — and the codec
+/// config may have changed since — so all three candidate NAR keys
+/// (`.nar.zst`, `.nar.xz`, bare `.nar`) are enqueued; deleting an
+/// absent key is an idempotent no-op for every backend, so the two
+/// extra DeleteObject calls per GC'd compat path are the whole cost.
+///
+/// Runs unconditionally — compat may be disabled NOW, but objects
+/// written while it was enabled must still be reclaimed with their
+/// path. Returns the number of keys enqueued (0 when the path has no
+/// compat objects or the narinfo row is malformed — logged, the
+/// objects leak rather than wedging GC).
+async fn enqueue_compat_objects(
+    tx: &mut Transaction<'_, Postgres>,
+    store_path_hash: &[u8],
+) -> Result<u64, sqlx::Error> {
+    let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT store_path, compat_file_hash FROM narinfo WHERE store_path_hash = $1",
+    )
+    .bind(store_path_hash)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((store_path, Some(file_hash))) = row else {
+        return Ok(0);
+    };
+
+    let hash_part = match rio_nix::store_path::StorePath::parse(&store_path) {
+        Ok(sp) => sp.hash_part(),
+        Err(e) => {
+            warn!(
+                %store_path, error = %e,
+                "GC sweep: unparseable store_path on a compat-written row; \
+                 compat objects leak for this path"
+            );
+            return Ok(0);
+        }
+    };
+    let digest: [u8; 32] = match file_hash.as_slice().try_into() {
+        Ok(d) => d,
+        Err(_) => {
+            warn!(
+                %store_path,
+                len = file_hash.len(),
+                "GC sweep: compat_file_hash is not 32 bytes; compat objects leak for this path"
+            );
+            return Ok(0);
+        }
+    };
+    let file_b32 = rio_nix::store_path::nixbase32::encode(&digest);
+
+    let keys = [
+        format!("{hash_part}.narinfo"),
+        format!("nar/{file_b32}.nar.zst"),
+        format!("nar/{file_b32}.nar.xz"),
+        format!("nar/{file_b32}.nar"),
+    ];
+    for key in &keys {
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key, kind) VALUES ($1, 'blob')")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(keys.len() as u64)
+}
+
 /// Delete one swept path's metadata (realisations + path_tenants +
 /// narinfo CASCADE). `None` if narinfo was already gone, else the
 /// castore digests its `nar_index` referenced. Chunk and directory
@@ -730,12 +803,18 @@ async fn sweep_one_batch(
             continue;
         }
 
+        // Compat objects ride the same outbox as the chunk keys, and
+        // must be read out of the narinfo row BEFORE the CASCADE
+        // below removes it. r[store.compat.gc-coupled]
+        let compat_keys = enqueue_compat_objects(&mut tx, store_path_hash).await?;
+
         let Some(refs) = delete_swept_path(&mut tx, store_path_hash).await? else {
             // narinfo already gone (concurrent sweep? shouldn't
             // happen under FOR UPDATE). Skip chunk handling.
             continue;
         };
         delta.paths_deleted += 1;
+        delta.s3_keys_enqueued += compat_keys;
         for d in refs.dirs {
             *dir_counts.entry(d).or_default() += 1;
         }
@@ -996,6 +1075,80 @@ mod tests {
     /// the shutdown path.
     fn no_shutdown() -> rio_common::signal::Token {
         rio_common::signal::Token::new()
+    }
+
+    // r[verify store.compat.gc-coupled]
+    /// Sweeping a path whose compat objects were published
+    /// (`compat_file_hash` set) enqueues the `.narinfo` key plus all
+    /// three candidate `nar/…` keys (the column doesn't record the
+    /// codec) onto `pending_s3_deletes` as `kind='blob'` rows, in the
+    /// same sweep that deletes the path — and counts them in
+    /// `s3_keys_enqueued`.
+    #[tokio::test]
+    async fn sweep_enqueues_compat_objects_for_compat_written_path() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let path = test_store_path("sweep-compat-written");
+        let hash = StoreSeed::raw_path(&path).seed(&db.pool).await;
+        // Mark the path as compat-published with a known digest.
+        let file_hash = [0x5Au8; 32];
+        sqlx::query("UPDATE narinfo SET compat_file_hash = $2 WHERE store_path_hash = $1")
+            .bind(&hash)
+            .bind(file_hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+        assert_eq!(
+            stats.s3_keys_enqueued, 4,
+            "narinfo + three candidate NAR keys"
+        );
+
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT s3_key FROM pending_s3_deletes WHERE kind = 'blob' ORDER BY s3_key",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        let hash_part = rio_nix::store_path::StorePath::parse(&path)
+            .unwrap()
+            .hash_part();
+        let b32 = rio_nix::store_path::nixbase32::encode(&file_hash);
+        let mut expected = vec![
+            format!("{hash_part}.narinfo"),
+            format!("nar/{b32}.nar.zst"),
+            format!("nar/{b32}.nar.xz"),
+            format!("nar/{b32}.nar"),
+        ];
+        expected.sort();
+        assert_eq!(keys, expected);
+    }
+
+    // r[verify store.compat.gc-coupled]
+    /// A path that never got compat objects (`compat_file_hash` NULL)
+    /// enqueues no blob rows — the compat coupling never invents keys.
+    #[tokio::test]
+    async fn sweep_skips_compat_enqueue_when_never_written() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let path = test_store_path("sweep-compat-null");
+        let hash = StoreSeed::raw_path(&path).seed(&db.pool).await;
+
+        let stats = sweep(&db.pool, None, vec![hash], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+
+        let blob_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes WHERE kind = 'blob'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(blob_rows, 0, "no compat objects → nothing extra enqueued");
     }
 
     /// Sweep must DELETE realisations rows pointing to swept paths.

@@ -930,10 +930,9 @@ the bucket as a plain binary cache while rio rolls out) and the
 disaster-recovery floor (PG outage degrades to the slower stock-Nix path
 instead of a total substitution outage); operators flip it OFF ("pure rio
 mode") once every consumer is rio-aware to reclaim roughly half the S3
-storage. The remaining companion requirements
-(`store.compat.stock-nix-substitute` for the end-to-end stock-`nix` VM proof,
-`store.compat.gc-coupled` for GC of compat objects) land with their own plan
-items.
+storage. The remaining companion requirement
+(`store.compat.stock-nix-substitute`, the end-to-end stock-`nix` VM proof)
+lands with its own plan item.
 
 #r("store.compat.nar-on-put")[
   For each path it publishes, the compat writer MUST upload the path's
@@ -1009,6 +1008,27 @@ through it. Duplicate publication by concurrent replicas is harmless --- the
 NAR object is keyed by the compressed digest and the narinfo content is
 identical --- so the loop is not leader-gated; duplicate work during a
 backlog drain is the only cost.
+
+#r("store.compat.gc-coupled")[
+  When the GC sweep deletes a path whose `narinfo.compat_file_hash` is set,
+  the same sweep transaction MUST enqueue that path's compat objects --- its
+  `<hash-part>.narinfo` and the `nar/…` object named by `compat_file_hash`
+  --- onto the `pending_s3_deletes` outbox, and the drain task MUST delete
+  them through the blob namespace. This applies regardless of whether the
+  compat layer is currently enabled: objects written while it was on are
+  reclaimed with their path either way, so compat objects never outlive the
+  path they describe. Because the column records only the compressed
+  object's digest (not the codec it was written with, which may have changed
+  since), the sweep enqueues every candidate NAR key (`.nar.zst`, `.nar.xz`,
+  `.nar`); deleting an absent key is an idempotent no-op.
+]
+
+A compat object enqueued here and a chunk key enqueued by the same sweep ride
+the same outbox and the same drain/backoff machinery
+(#rref("store.gc.pending-deletes")); the `kind` column tells the drain which
+delete API the key belongs to. Failed deletes surface in the existing
+#(refs.metric)("rio_store_s3_deletes_stuck") gauge --- there is no separate
+compat-delete metric.
 
 = Two-Phase Garbage Collection
 

@@ -1151,6 +1151,23 @@ pub const M_066: () = ();
 /// pending rows only.
 pub const M_067: () = ();
 
+/// 068 — `pending_s3_deletes.kind`: compat objects ride the GC delete
+/// outbox (P0581).
+///
+/// The GC sweep enqueues a swept path's binary-cache compat objects
+/// (`{hash-part}.narinfo` + the `nar/…` candidates derived from
+/// `compat_file_hash`) into the same `pending_s3_deletes` outbox the
+/// chunk keys use, so compat objects never outlive their path. Those
+/// keys are string-keyed *blobs*, not `[u8;32]`-addressed chunks —
+/// the drain must call `delete_blob` (prefix-relative blob namespace)
+/// instead of `delete_by_key` (chunk namespace, which validates and
+/// would reject blob-shaped keys). `kind` is that dispatch:
+/// `'chunk'` (default, every pre-existing row) vs `'blob'`. A column
+/// rather than a key-shape heuristic so the outbox stays legible to
+/// operators and the dispatch can't silently misclassify if a future
+/// backend changes its chunk-key format.
+pub const M_068: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

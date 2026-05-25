@@ -156,20 +156,27 @@ async fn drain_one_row(
     // blake3_hash is nullable: pre-migration-006 rows have NULL
     // → drain proceeds unconditionally (old behavior). New rows
     // have the hash → re-check `chunks` before S3 delete.
-    let Some((id, key, blake3_hash)): Option<(i64, String, Option<Vec<u8>>)> = sqlx::query_as(
-        r#"
-        SELECT id, s3_key, blake3_hash FROM pending_s3_deletes
+    //
+    // kind: 'chunk' rows hold a chunk-namespace key (delete_by_key);
+    // 'blob' rows hold a binary-cache compat object key enqueued by
+    // the GC sweep (delete_blob — different key namespace, no chunks
+    // resurrection re-check because blobs aren't refcounted).
+    // r[impl store.compat.gc-coupled]
+    let Some((id, key, blake3_hash, kind)): Option<(i64, String, Option<Vec<u8>>, String)> =
+        sqlx::query_as(
+            r#"
+        SELECT id, s3_key, blake3_hash, kind FROM pending_s3_deletes
          WHERE attempts < $1
            AND id <> ALL($2::bigint[])
          ORDER BY enqueued_at
          LIMIT 1
            FOR UPDATE SKIP LOCKED
         "#,
-    )
-    .bind(MAX_ATTEMPTS)
-    .bind(skip_ids)
-    .fetch_optional(&mut *tx)
-    .await?
+        )
+        .bind(MAX_ATTEMPTS)
+        .bind(skip_ids)
+        .fetch_optional(&mut *tx)
+        .await?
     else {
         tx.rollback().await?;
         return Ok(None);
@@ -214,7 +221,12 @@ async fn drain_one_row(
         }
     }
 
-    let outcome = match backend.delete_by_key(&key).await {
+    let delete_result = if kind == "blob" {
+        backend.delete_blob(&key).await
+    } else {
+        backend.delete_by_key(&key).await
+    };
+    let outcome = match delete_result {
         Ok(()) => {
             // DELETE the pending row (same tx). If tx commit
             // later fails, the S3 delete already happened —
@@ -324,6 +336,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "pending row deleted");
+    }
+
+    // r[verify store.compat.gc-coupled]
+    /// `kind='blob'` rows (the GC sweep's compat-object enqueues) are
+    /// deleted through `delete_blob` — the blob namespace, not the
+    /// chunk namespace whose key validation would reject them — and a
+    /// candidate key that was never written (the wrong-codec
+    /// extensions) drains as a successful no-op.
+    #[tokio::test]
+    async fn drain_deletes_blob_rows_via_delete_blob() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+
+        // One real compat object + one absent candidate key.
+        backend
+            .put_blob("abc123.narinfo", bytes::Bytes::from_static(b"StorePath: x"))
+            .await
+            .unwrap();
+        for key in ["abc123.narinfo", "nar/never-written.nar.xz"] {
+            sqlx::query("INSERT INTO pending_s3_deletes (s3_key, kind) VALUES ($1, 'blob')")
+                .bind(key)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        assert_eq!(deleted, 2, "present object + absent candidate both drain");
+        assert_eq!(failed, 0);
+
+        assert!(
+            backend.get_blob("abc123.narinfo").await.unwrap().is_none(),
+            "compat object removed from the blob namespace"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "both outbox rows consumed");
     }
 
     #[tokio::test]
