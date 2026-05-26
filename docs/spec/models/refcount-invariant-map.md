@@ -231,3 +231,87 @@ is about to replace. The existing markers on
 `store.cas.upsert-inserted+2`, `store.cas.chunk-upload-committed`,
 `store.gc.pending-deletes` (inventory Appendix B) are unaffected: no existing
 rule text was changed, so nothing went stale.
+
+## Consumer audit (design §5a): every reader/writer of `chunks.refcount` outside `rio-store/src`
+
+Stage-A companion deliverable. Method: repo-wide greps over the worktree at
+this branch point for `refcount` (case-insensitive), `chunks.refcount`, SQL
+against the `chunks` table (`FROM chunks` / `UPDATE chunks` / `INSERT INTO
+chunks` / `JOIN chunks`), `idx_chunks_gc`, `chunks_refcount_nonneg`, and
+`chunk_tenants`, across every crate, `xtask`, `nix/`, `infra/`, `fuzz/`,
+`.sqlx/`, `docs/`, and the repo-root files. No code is changed by this audit.
+
+Two-class disposition per design §5a: **(a)** a production decision-path
+consumer of the counter outside the inventory §1.2 reader list — anything
+gating behavior other than GC deletion-eligibility on the counter — is a
+go/no-go finding that redraws the subject; **(b)** tooling, test seeds, or
+prose that query or describe the column are not no-gos; each gets a fate
+entry with a named deadline (no later than Release B for anything that
+issues SQL against the column).
+
+**Class (a) verdict: none found.** The only SQL that reads `chunks.refcount`
+outside `rio-store/src` is in the two xtask k8s QA probes (operator tooling,
+rows 1–2). Inside `rio-store/src` the production readers are exactly the
+inventory §1.2 decision-site list reproduced in this map's site table (ZERO's
+predicate, ZERO-2's candidate SELECT and UPDATE re-check, the drain re-check,
+and the `idx_chunks_gc` partial index); the serving-path dedup decision reads
+`uploaded_at`, and the admin `VerifyChunks` scan filters on
+`deleted = FALSE AND uploaded_at IS NOT NULL`, not the counter. The design's
+blast-radius claim — the counter gates GC deletion-eligibility only — holds.
+
+### Class (b) rows
+
+| # | Site | What it does with the counter | Fate / deadline |
+|---|---|---|---|
+| 1 | `xtask/src/k8s/qa/scenarios/i201_stranded_chunks.rs` (module doc; the sample query at the top of `run`; the fail message) | SQL reader: `SELECT … FROM chunks WHERE refcount > 0 AND NOT deleted ORDER BY created_at DESC LIMIT 1000`, then per-hash S3 HeadObject; "PG refcount>0 but S3 404" is the failure verdict. Counter-as-presence inference in tooling — contradiction T1 against the new `store.chunk.liveness-not-presence`; also false-positive-prone against in-flight uploads (`refcount ≥ 1`, `uploaded_at IS NULL`). | Design §4.3: predicate moves to `uploaded_at IS NOT NULL AND NOT deleted` (matching the server-side VerifyChunks scan and CR-4); fail-message text updated. **No later than Release B**; may land earlier — the new predicate is column-independent and removes the in-flight false-positive window. |
+| 2 | `xtask/src/k8s/qa/scenarios/i040_chunk_verify.rs` (seed-chunk pick CTE; `diagnose_missing_chunk`; surrounding doc comments) | SQL reader: seed-chunk pick joins the seed manifest's parsed `chunk_list` to `chunks` and filters `c.refcount = 1 AND NOT c.deleted` ("unshared" selector); diagnostics and comments are refcount-phrased. (Its cleanup `DELETE FROM chunks WHERE blake3_hash = …` does not read the counter.) Not a presence inference — but the query errors once the column drops. | Design §4.3: selector re-pointed at a manifest-reference-based predicate (the hash appears in exactly one existing manifest's `chunk_list`); diagnostics reworded. **No later than Release B.** |
+| 3 | `rio-cli/src/verify_chunks.rs` (module doc) | Comment only: describes the VerifyChunks audit as "PG says exists (refcount>0, deleted=false)". Doubly stale — no SQL issued, and the server-side scan has keyed on `uploaded_at` since the VerifyChunks predicate changed. | Phase-1c prose sweep (design §4.3 comment-only row). |
+| 4 | `rio-proto/src/lib.rs` (store-module doc) | Comment only: "dedupes chunks via the `chunks` table refcount" — pre-M_033 phrasing. | Phase-1c prose sweep. |
+| 5 | `rio-store/src/grpc/chunk.rs` (module doc; in-crate but prose-only) | Comment only: "dedup via the `refcount==1` RETURNING clause" — pre-M_033 phrasing for a module that no longer hosts the deleted RPC. | Phase-1c prose sweep (named in design §4.3). |
+| 6 | `rio-store/tests/grpc/chunked.rs` (3 assertions) plus the in-module `#[cfg(test)]` suites of `metadata/chunked.rs`, `gc/{mod,sweep,orphan,drain}.rs`, `metadata/mod.rs`, `test_helpers.rs` | Test fixtures and assertions on counter values (the ~86-test corpus the inventory sizes). Outside `rio-store/src` only in the `tests/` tree; listed for completeness. | Phase-1c test disposition: each re-pointed at the collector's observable effects or retired with the falsifying-run-or-redundancy justification (design §4.6). No Release-A/B code change required. |
+| 7 | `rio-migrations/migrations/` 002 (table, `idx_chunks_gc`, comments), 005/006 (comments), 023 (`chunks_refcount_nonneg` CHECK), 018 (`chunk_tenants`), 035 (drops `chunk_tenants`) | Shipped schema history; the live schema still carries the column, CHECK, and index. | Frozen — never edited (house rule). The CHECK + index drop is Release B's new migration; the column drop is the post-rollout follow-up migration; commentary lands in `migrations.rs` (design §4.5). |
+| 8 | `rio-migrations/src/migrations.rs` (M_018, M_023, M_033, M_035, M_052 … doc-consts) | Historical commentary explaining why those migrations exist; mentions the counter and `chunk_tenants` throughout. | Stays as history; new M_0NN entries are added for the Release-B and follow-up migrations. No sweep. |
+| 9 | `docs/gen/errors.json`, `docs/gen/metrics.json`, `docs/gen/modules.json` | Generated artifacts (`cargo xtask regen docs-data`) carrying refcount wording from code doc comments and metric help strings (orphan-chunk metrics, the i201 module doc). | Regenerate whenever the source comments change (Phase 1c); never hand-edited; `docs-data-fresh` enforces. |
+| 10 | `docs/spec/components/store.typ` | The audited spec itself: the counter rules, the new invariant rules, and the flagged stale prose (P1/P2/P3). | Handled by this campaign's spec passes (this audit now; the counter-prose rewrite in the Release-B spec commit). |
+| 11 | `docs/spec/components/lazy-store.typ` (write-path sketch; EROFS bootstrap note) | Describes the current chunked write path ("upsert chunk refcounts (PG)") and contrasts the EROFS bootstrap blob lifecycle ("1:1, no refcount"). Accurate as-built. | Touched by the Phase-1c prose pass only if the write-path description it quotes changes; no SQL, no deadline. |
+| 12 | Checked, zero references | `.sqlx/` query cache (no prepared statement names the column — the eventual drop creates no sqlx-prepare drift), `infra/` (helm + grafana dashboards consume Prometheus metrics only), `nix/tests/` VM scenarios (no SQL against `chunks`), `rio-dashboard`, `rio-gateway`, `rio-builder`, `rio-controller`, `rio-scheduler`, `rio-common`, `rio-auth`, `rio-test-support`, `fuzz/`, shell/python scripts, README, process-compose. | Nothing to do; recorded so the negative result is reproducible. |
+| 13 | Same word, different concept (excluded from the audit) | `nix/tests/fixtures/k3s-full.nix` and `nix/tests/scenarios/lifecycle/gc-sweep.nix` comments (kubernetes SecretManager reflector refcount), `rio-builder` FUSE `nlookup` refcounting, `rio-scheduler/src/state/newtypes.rs` Arc refcount comments. | Not consumers of `chunks.refcount`; listed so the grep tally reconciles. |
+
+### `chunk_tenants` confirmation (dead table)
+
+Confirmed dropped: `rio-migrations/migrations/035_drop_dead_rpc_tables.sql`
+contains `DROP TABLE IF EXISTS chunk_tenants;` (alongside `content_index` and
+`narinfo.refs_backfilled`), and the M_035 doc-const in
+`rio-migrations/src/migrations.rs` records the rationale (the backing RPCs —
+PutChunk/FindMissingChunks — were never wired to a production caller). The
+table the design's earlier draft proposed dropping is therefore already gone;
+nothing in this campaign claims that deletion.
+
+Remaining references are stale prose only — none issues SQL, so none carries
+a Release-B deadline; all are routine cleanup, not campaign deliverables:
+
+- `rio-scheduler/src/db/tenants.rs` — `delete_tenant`'s doc comment lists
+  `chunk_tenants` among the FK-CASCADE targets and cites migration 018.
+- `docs/spec/components/scheduler.typ` — `sched.admin.delete-tenant`'s body
+  lists `chunk_tenants` in the same CASCADE enumeration. (Inside a rule body;
+  removing a dead table name does not change the rule's normative meaning, so
+  the eventual cleanup is not expected to need a `tracey bump` — note left
+  here so whoever sweeps it makes that call consciously.)
+- `docs/spec/system/tenancy.typ` — the tenant-isolation table row, the
+  "FindMissingChunks Scoping" current-state box (still presents the junction
+  and the deleted RPC as the shipped, mandatory scoping mechanism), and the
+  Implementation Status row. No `#r()` rules exist in that file, so these are
+  prose-only.
+- `docs/spec/system/security.typ` — two threat-model entries naming
+  `FindMissingChunks` as a live cross-tenant probing surface.
+- Historical, stays: migration 018 itself (frozen) and the M_018 commentary.
+
+### Tally
+
+13 class-(b) rows above (2 SQL readers, 3 comment-only code mentions, 1 test
+corpus row, 2 schema/commentary rows, 1 generated-docs row, 2 spec-doc rows,
+1 checked-clean row, 1 same-word-exclusion row), plus the `chunk_tenants`
+stale-reference list (5 sites). 0 class-(a) findings: the §5a no-go trigger
+"a production decision-path consumer outside the §1.2 reader list" is not
+met, and the audit found nothing that gates anything other than GC
+deletion-eligibility on the counter.
