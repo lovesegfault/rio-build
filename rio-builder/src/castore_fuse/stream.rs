@@ -578,21 +578,29 @@ enum StatOutcome {
 }
 
 /// `StatBlob(file_digest, send_chunks=true)` bounded by the fill
-/// deadline.
+/// deadline. Transport-level failures get the short in-budget transient
+/// retry (`store_fetch::retry_transient`) — the loop runs inside `left`,
+/// so the fill's overall deadline and its single breaker record are
+/// unchanged.
 fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatOutcome, FillError> {
     let left = remaining(deadline)?;
-    let mut directory = ctx.clients.directory.clone();
-    let req = crate::store_fetch::authed_request(
-        StatBlobRequest {
-            file_digest: ctx.file_digest.to_vec(),
-            send_chunks: true,
-        },
-        &ctx.assignment_token,
-    )
-    .map_err(|s| FillError::Store(format!("StatBlob: {s}")))?;
-    let resp = ctx
-        .runtime
-        .block_on(async move { tokio::time::timeout(left, directory.stat_blob(req)).await });
+    let resp = ctx.runtime.block_on(async {
+        tokio::time::timeout(
+            left,
+            crate::store_fetch::retry_transient("stat_blob", async || {
+                let req = crate::store_fetch::authed_request(
+                    StatBlobRequest {
+                        file_digest: ctx.file_digest.to_vec(),
+                        send_chunks: true,
+                    },
+                    &ctx.assignment_token,
+                )?;
+                let mut directory = ctx.clients.directory.clone();
+                directory.stat_blob(req).await
+            }),
+        )
+        .await
+    });
     match resp {
         Err(_elapsed) => Err(FillError::Timeout),
         // The documented "no chunk list — use ReadBlob" signal
@@ -608,6 +616,12 @@ fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatOutcome, FillEr
 /// Whole-file fallback for inline manifests: stream `ReadBlob` into the
 /// `.partial`, advancing the high-water mark per frame so readers
 /// unblock progressively, then verify/rename as usual.
+///
+/// Only the stream OPEN gets the in-budget transient retry: once frames
+/// have been written the high-water mark has been published to readers,
+/// so a mid-stream failure stays a fill failure (the next open of this
+/// digest starts a fresh fill) rather than risking a partially-rewound
+/// file under live readers.
 fn fill_from_read_blob(
     ctx: &FillContext,
     fill: &StreamFill,
@@ -616,18 +630,22 @@ fn fill_from_read_blob(
     use std::os::unix::fs::FileExt;
 
     let left = remaining(deadline)?;
-    let mut directory = ctx.clients.directory.clone();
-    let req = crate::store_fetch::authed_request(
-        rio_proto::types::ReadBlobRequest {
-            file_digest: ctx.file_digest.to_vec(),
-        },
-        &ctx.assignment_token,
-    )
-    .map_err(|s| FillError::Store(format!("ReadBlob: {s}")))?;
-    let mut stream = match ctx
-        .runtime
-        .block_on(async move { tokio::time::timeout(left, directory.read_blob(req)).await })
-    {
+    let mut stream = match ctx.runtime.block_on(async {
+        tokio::time::timeout(
+            left,
+            crate::store_fetch::retry_transient("read_blob_connect", async || {
+                let req = crate::store_fetch::authed_request(
+                    rio_proto::types::ReadBlobRequest {
+                        file_digest: ctx.file_digest.to_vec(),
+                    },
+                    &ctx.assignment_token,
+                )?;
+                let mut directory = ctx.clients.directory.clone();
+                directory.read_blob(req).await
+            }),
+        )
+        .await
+    }) {
         Err(_elapsed) => return Err(FillError::Timeout),
         Ok(Err(status)) => return Err(FillError::Store(format!("ReadBlob: {status}"))),
         Ok(Ok(resp)) => resp.into_inner(),
@@ -945,20 +963,32 @@ impl RemoteChunks {
     /// first use.
     fn request(&mut self, digests: Vec<Vec<u8>>, timeout: Duration) -> Result<(), FillError> {
         if self.live.is_none() {
-            // Capacity covers the frames a full lookahead window can
-            // produce before the server starts draining.
-            let (tx, rx) = tokio::sync::mpsc::channel::<GetChunksRequest>(8);
-            let mut chunk_client = self.clients.chunk.clone();
-            let req =
-                crate::store_fetch::authed_request(ReceiverStream::new(rx), &self.assignment_token)
-                    .map_err(|s| FillError::Store(format!("GetChunks: {s}")))?;
+            // Stream open gets the in-budget transient retry. Each
+            // attempt mints its own request channel (a failed attempt
+            // consumed the previous receiver); the winning attempt's
+            // sender is what gets kept. Channel capacity 8 covers the
+            // frames a full lookahead window can produce before the
+            // server starts draining.
+            let clients = self.clients.clone();
+            let token = self.assignment_token.clone();
             let connect = self.runtime.block_on(async {
-                tokio::time::timeout(timeout, chunk_client.get_chunks(req)).await
+                tokio::time::timeout(
+                    timeout,
+                    crate::store_fetch::retry_transient("get_chunks_connect", async || {
+                        let (tx, rx) = tokio::sync::mpsc::channel::<GetChunksRequest>(8);
+                        let req =
+                            crate::store_fetch::authed_request(ReceiverStream::new(rx), &token)?;
+                        let mut chunk_client = clients.chunk.clone();
+                        let streaming = chunk_client.get_chunks(req).await?.into_inner();
+                        Ok((tx, streaming))
+                    }),
+                )
+                .await
             });
-            let streaming = match connect {
+            let (tx, streaming) = match connect {
                 Err(_elapsed) => return Err(FillError::Timeout),
                 Ok(Err(status)) => return Err(FillError::Store(format!("GetChunks: {status}"))),
-                Ok(Ok(resp)) => resp.into_inner(),
+                Ok(Ok(pair)) => pair,
             };
             self.live = Some((tx, streaming));
         }

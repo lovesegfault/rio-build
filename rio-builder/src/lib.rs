@@ -188,6 +188,14 @@ pub fn describe_metrics() {
          investigate immediately."
     );
     describe_counter!(
+        "rio_builder_castore_fuse_fetch_retries_total",
+        "Transient (Unavailable/Unknown) castore fetch failures that were retried \
+         in-budget, labeled by op (read_blob/stat_blob/read_blob_connect/\
+         get_chunks_connect). A low background rate is normal during store rolling \
+         restarts; a sustained rate means the store is flapping — the fetch circuit \
+         breaker still owns the fail-fast decision."
+    );
+    describe_counter!(
         "rio_builder_castore_fuse_eio_total",
         "EIO replies returned to the kernel from the castore-FUSE open()/read() path \
          (fetch timeout, integrity failure, mountd error, open ceiling). Every one \

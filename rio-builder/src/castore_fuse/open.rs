@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -739,11 +739,60 @@ enum FetchError {
 /// verify the whole-file blake3 before returning. Returns the byte
 /// count on success.
 ///
+/// Transport-level failures (connection reset, store rolling restart)
+/// get the short in-budget transient retry
+/// ([`crate::store_fetch::TRANSIENT_FETCH_ATTEMPTS`]): the staging file
+/// is truncated and the whole stream re-attempted, all inside the
+/// caller's `jit_fetch_timeout` and under the caller's single circuit-
+/// breaker record. Application-level statuses, local I/O errors, and
+/// integrity mismatches are never retried.
+///
 /// `dst` writes are synchronous `std::io` calls from inside an async
 /// fn — this future is only ever polled via `Handle::block_on` from a
 /// fuser (blocking) thread, so a blocking write blocks a thread that is
 /// already allowed to block (the `fuse::fetch::SyncSpool` precedent).
 async fn read_blob_into(
+    clients: StoreClients,
+    file_digest: [u8; 32],
+    dst: &mut File,
+    assignment_token: &str,
+) -> Result<u64, FetchError> {
+    let mut attempt = 0u32;
+    loop {
+        match read_blob_attempt(clients.clone(), file_digest, dst, assignment_token).await {
+            Err(FetchError::Rpc(status))
+                if attempt + 1 < crate::store_fetch::TRANSIENT_FETCH_ATTEMPTS
+                    && crate::store_fetch::is_transient_fetch_status(&status) =>
+            {
+                metrics::counter!(
+                    "rio_builder_castore_fuse_fetch_retries_total",
+                    "op" => "read_blob"
+                )
+                .increment(1);
+                tracing::debug!(
+                    digest = %hex::encode(file_digest),
+                    attempt,
+                    error = %status,
+                    "castore-fuse: transient ReadBlob failure; retrying within the JIT budget"
+                );
+                // Drop whatever the failed attempt already wrote so the
+                // next attempt (and its hash) starts from byte 0.
+                dst.set_len(0).map_err(FetchError::Io)?;
+                dst.seek(std::io::SeekFrom::Start(0))
+                    .map_err(FetchError::Io)?;
+                tokio::time::sleep(crate::store_fetch::TRANSIENT_FETCH_BACKOFF.duration(attempt))
+                    .await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One `ReadBlob` attempt: open the stream, write + hash every frame,
+/// verify the whole-file digest. [`read_blob_into`] owns the retry
+/// policy around this.
+async fn read_blob_attempt(
     mut clients: StoreClients,
     file_digest: [u8; 32],
     dst: &mut File,

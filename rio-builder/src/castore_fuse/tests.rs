@@ -52,6 +52,10 @@ struct MockState {
     blobs: std::sync::Mutex<HashMap<[u8; 32], Vec<u8>>>,
     get_directory_calls: AtomicUsize,
     read_blob_calls: AtomicUsize,
+    /// When > 0, the next `ReadBlob` calls fail with `Unavailable`
+    /// (decrementing per call) — the transient-retry tests' injected
+    /// store blip.
+    read_blob_fail_next: AtomicUsize,
     /// The digests field-3 multi-root extension of the last
     /// `GetDirectory` request (first digest + `digests`), for the
     /// one-RPC-for-the-whole-closure assertion.
@@ -136,6 +140,12 @@ impl MockCastore {
 
     fn read_blob_calls(&self) -> usize {
         self.state.read_blob_calls.load(Ordering::SeqCst)
+    }
+
+    /// Make the next `n` ReadBlob calls fail with `Unavailable` (the
+    /// transient transport blip the in-budget retry exists for).
+    fn fail_next_read_blobs(&self, n: usize) {
+        self.state.read_blob_fail_next.store(n, Ordering::SeqCst);
     }
 
     fn stat_blob_calls(&self) -> usize {
@@ -285,6 +295,16 @@ impl DirectoryService for MockCastore {
     ) -> Result<Response<Self::ReadBlobStream>, Status> {
         self.observe_token("read_blob", &request)?;
         self.state.read_blob_calls.fetch_add(1, Ordering::SeqCst);
+        // Scripted transient failure (counted above so tests can assert
+        // "the retry really re-called us").
+        if self
+            .state
+            .read_blob_fail_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Status::unavailable("injected transient store blip"));
+        }
         let digest: [u8; 32] = request
             .into_inner()
             .file_digest
@@ -899,6 +919,52 @@ async fn open_miss_fetches_verifies_and_promotes() {
         1,
         "no re-fetch on the second open"
     );
+}
+
+/// A single transient (`Unavailable`) ReadBlob failure must NOT surface
+/// as EIO to the build: the whole-file fetch retries in-budget
+/// (store_fetch::retry policy, I-039 class) and the open still completes
+/// with verified, promoted bytes. A sustained outage still fails after
+/// the bounded attempts — the circuit breaker above owns fail-fast from
+/// there.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_miss_retries_transient_read_blob_failure() {
+    let h = harness().await;
+    let content = b"retry me once".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+
+    // One injected blip → retried → success, exactly two ReadBlob calls.
+    h.mock.fail_next_read_blobs(1);
+    let case = ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("transient blip must be absorbed by the in-budget retry");
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(
+        h.mock.read_blob_calls(),
+        2,
+        "the failed attempt plus the successful retry"
+    );
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).expect("promoted into the cache"),
+        content,
+        "the retried fetch still verifies and promotes the right bytes"
+    );
+
+    // Sustained outage: every attempt fails → the open fails (EIO) after
+    // exactly the bounded number of attempts, not an unbounded loop.
+    let content2 = b"still down".to_vec();
+    let digest2 = seeded_blob(&h.mock, &content2);
+    let calls_before = h.mock.read_blob_calls();
+    h.mock.fail_next_read_blobs(usize::MAX);
+    ensure_blocking(&h.open_path, digest2, content2.len() as u64)
+        .await
+        .expect_err("sustained unavailability still fails the open");
+    assert_eq!(
+        h.mock.read_blob_calls() - calls_before,
+        crate::store_fetch::TRANSIENT_FETCH_ATTEMPTS as usize,
+        "attempts are bounded by TRANSIENT_FETCH_ATTEMPTS"
+    );
+    h.mock.fail_next_read_blobs(0);
 }
 
 /// The production caller of the open path is a fuser serve thread: a
