@@ -100,3 +100,10 @@ test -z "$mount_off" || {
   echo "FAIL: empty gateway.buildPolicy must not render the gateway.toml mount" >&2
   exit 1
 }
+volume_off=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-gateway")
+                    | .spec.template.spec.volumes[]
+                    | select(.name=="gateway-config")' "$off")
+test -z "$volume_off" || {
+  echo "FAIL: empty gateway.buildPolicy must not render the gateway-config volume" >&2
+  exit 1
+}

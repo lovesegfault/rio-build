@@ -7,8 +7,8 @@
 {{- define "rio.gatewayToml" -}}
 {{- range $tenant, $pol := .Values.gateway.buildPolicy }}
 [build_policy.{{ $tenant | quote }}]
-keep_going = {{ $pol.keepGoing | default false }}
-force_build_roots = {{ $pol.forceBuildRoots | default false }}
+keep_going = {{ (default dict $pol).keepGoing | default false }}
+force_build_roots = {{ (default dict $pol).forceBuildRoots | default false }}
 {{ end -}}
 {{- end }}
 {{- if .Values.gateway.enabled }}
