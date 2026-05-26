@@ -499,7 +499,7 @@
       {
         "name": "rio_gateway_channels_active",
         "kind": "gauge",
-        "help": "Currently active SSH channels"
+        "help": "Currently active protocol sessions (one per accepted nix-daemon exec, not SSH-level open channels); the gateway autoscaling signal"
       },
       {
         "name": "rio_gateway_connections_active",

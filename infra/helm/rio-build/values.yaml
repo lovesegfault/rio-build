@@ -821,7 +821,10 @@ gateway:
   # rio_gateway_channels_active — the k3s VM-test and local-dev
   # profiles run neither, set enabled=false, and fall back to the
   # static `replicas` above. With autoscaling enabled, gateway.yaml
-  # omits .spec.replicas so helm upgrade doesn't fight the autoscaler.
+  # renders .spec.replicas as the LIVE Deployment's current value
+  # (lookup; omitted on fresh install and under `helm template`), so
+  # helm upgrade neither fights the autoscaler nor null-patches the
+  # field back to 1 on an existing release.
   #
   # Sizing rationale + the ControlMaster single-connection caveat live
   # in templates/gateway-scaledobject.yaml.

@@ -26,7 +26,14 @@ spec:
       {{- include "rio.selectorLabels" "rio-scheduler" | nindent 6 }}
 {{- end }}
 
-{{- if and .Values.gateway.enabled (gt (int .Values.gateway.replicas) 1) }}
+{{- $g := .Values.gateway }}
+{{- /* Gate on the effective floor — minReplicas under autoscaling, the
+       static replicas otherwise — the same expression as gateway.yaml's
+       anti-affinity gate. Keying on the static `replicas` would skip
+       the PDB for replicas=1 + autoscaling-on (≥2 KEDA-managed pods
+       left unprotected) and render a drain-blocking PDB for replicas=2
+       + minReplicas=1 (minAvailable=1 against a single pod). */}}
+{{- if and $g.enabled (gt (int (ternary $g.autoscaling.minReplicas $g.replicas $g.autoscaling.enabled)) 1) }}
 ---
 # minAvailable (not maxUnavailable): SSH ingress must stay up. Killing both
 # gateways = no way to submit builds (SSH is the only submission path).

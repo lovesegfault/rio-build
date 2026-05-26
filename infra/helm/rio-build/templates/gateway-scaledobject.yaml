@@ -59,8 +59,10 @@ spec:
           stabilizationWindowSeconds: 0
   triggers:
     # AverageValue: KEDA divides the query result (total active
-    # channels across the fleet) by the current replica count, so
-    # desiredReplicas = ceil(sum(channels) / targetSessionsPerPod).
+    # protocol sessions across the fleet — rio_gateway_channels_active
+    # counts exec'd sessions, not SSH-level channels) by the current
+    # replica count, so desiredReplicas =
+    # ceil(sum(sessions) / targetSessionsPerPod).
     - type: prometheus
       metricType: AverageValue
       metadata:

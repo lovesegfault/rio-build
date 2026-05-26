@@ -56,7 +56,8 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_gateway_channels_active",
-        "Currently active SSH channels"
+        "Currently active protocol sessions (one per accepted nix-daemon exec, \
+         not SSH-level open channels); the gateway autoscaling signal"
     );
     describe_counter!(
         "rio_gateway_errors_total",

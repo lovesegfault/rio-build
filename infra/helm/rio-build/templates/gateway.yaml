@@ -9,13 +9,39 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
 spec:
   {{- if not $g.autoscaling.enabled }}
-  # OMITTED when gateway.autoscaling.enabled=true: the KEDA-managed HPA
-  # owns the replica count; if helm also rendered .spec.replicas here,
-  # every `helm upgrade` would reset it and fight the autoscaler. Same
-  # shape as store.yaml + componentScaler. K8s defaults an absent
-  # .spec.replicas to 1 on first apply; KEDA's first reconcile raises
-  # it to minReplicaCount.
+  # Static replica count — autoscaling disabled (environments without
+  # the KEDA operator: k3s VM tests, local dev). With autoscaling
+  # enabled the KEDA-managed HPA owns the count and helm echoes the
+  # live value instead (see the lookup branch in the template).
   replicas: {{ $g.replicas }}
+  {{- else }}
+  {{- /* The KEDA-managed HPA owns the replica count: rendering the
+         static value here would reset it on every `helm upgrade` and
+         fight the autoscaler (same reasoning as store.yaml +
+         componentScaler). But on an EXISTING release whose previous
+         manifest carried `replicas: 2`, simply omitting the field is
+         not neutral either: helm's three-way merge turns
+         present→absent into a patch to null, the API server
+         re-defaults the field to 1, and the Deployment controller
+         deletes a gateway pod on the spot — outside the surge-first
+         strategy and the PDB (both only cover rollouts/evictions),
+         while the replacement pod usually waits on a fresh node
+         because the required podAntiAffinity still counts the
+         hour-draining victim. The only build-submission ingress would
+         run single-pod for minutes.
+
+         So when a live Deployment exists, echo ITS current replica
+         count: the field stays present at exactly the value KEDA last
+         set, the upgrade is a no-op for scale, and helm never fights
+         the HPA. `lookup` returns an empty map under `helm template` /
+         `--dry-run` and on a fresh install (no live Deployment yet) —
+         the field is then omitted, K8s defaults it to 1 on first
+         apply, and KEDA's first reconcile raises it to
+         minReplicaCount. That ramp happens before the gateway has any
+         traffic or NLB targets, so no install-time seed is needed. */}}
+  {{- with lookup "apps/v1" "Deployment" .Values.namespaces.system.name "rio-gateway" }}
+  replicas: {{ .spec.replicas }}
+  {{- end }}
   {{- end }}
   # I-064: surge first so the NLB has a healthy target throughout the
   # rollout. With maxUnavailable: 0 the old pod stays Serving until the
