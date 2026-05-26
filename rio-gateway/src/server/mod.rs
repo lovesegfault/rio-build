@@ -164,6 +164,12 @@ pub struct GatewayServer {
     /// See [`EMPTY_CONNECTION_GRACE`]. Overridable for tests via
     /// `with_empty_connection_grace()`.
     empty_connection_grace: std::time::Duration,
+    /// Max wait for `WORKER_MAGIC_1` on an exec'd channel before the
+    /// protocol session ends server-side. Default
+    /// [`crate::session::HANDSHAKE_TIMEOUT`]; overridable for tests via
+    /// `with_handshake_timeout()` so the exec'd-but-silent scenario
+    /// resolves in milliseconds instead of 30 s.
+    handshake_timeout: std::time::Duration,
     /// Count of REAL (post-auth-handshake) connections currently open.
     /// Same lifecycle as the `rio_gateway_connections_active` gauge —
     /// incremented in [`ConnectionHandler::mark_real_connection`],
@@ -207,6 +213,7 @@ impl GatewayServer {
             session_sem: Arc::new(Semaphore::new(DEFAULT_MAX_SESSIONS)),
             max_channels_per_connection: DEFAULT_MAX_CHANNELS_PER_CONNECTION,
             empty_connection_grace: EMPTY_CONNECTION_GRACE,
+            handshake_timeout: crate::session::HANDSHAKE_TIMEOUT,
             active_conns: Arc::new(AtomicUsize::new(0)),
             sessions_shutdown: CancellationToken::new(),
         }
@@ -276,6 +283,16 @@ impl GatewayServer {
     /// grace without waiting 60 s for the disconnect to fire.
     pub fn with_empty_connection_grace(mut self, grace: std::time::Duration) -> Self {
         self.empty_connection_grace = grace;
+        self
+    }
+
+    /// Override the protocol handshake timeout (max wait for
+    /// `WORKER_MAGIC_1` on an exec'd channel). Default
+    /// [`crate::session::HANDSHAKE_TIMEOUT`]. Exposed so tests can make
+    /// an exec'd-but-never-speaking channel end its protocol session
+    /// server-side in milliseconds instead of 30 s.
+    pub fn with_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 
@@ -677,7 +694,8 @@ impl russh::server::Server for GatewayServer {
             max_channels_per_connection: self.max_channels_per_connection,
             open_channels: 0,
             empty_connection_grace: self.empty_connection_grace,
-            pending_idle_disconnect: None,
+            handshake_timeout: self.handshake_timeout,
+            idle: Arc::new(connection::EmptyConnectionTimer::new()),
         }
     }
 }

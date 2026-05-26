@@ -43,6 +43,7 @@ pub fn spawn_session_task(
             None,
             rio_gateway::TenantLimiter::disabled(),
             rio_gateway::QuotaCache::new(),
+            session::HANDSHAKE_TIMEOUT,
             shutdown,
         )
         .await

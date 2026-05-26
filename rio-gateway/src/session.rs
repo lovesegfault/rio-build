@@ -123,7 +123,12 @@ const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// alive). Real Nix clients complete the handshake in <100ms; 30s is
 /// generous but far below the 600s opcode-idle bound — no legitimate
 /// client idles before handshake.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// This is the default for `SessionContext::handshake_timeout`; the SSH
+/// layer can override it per server via
+/// `GatewayServer::with_handshake_timeout` (tests shrink it so the
+/// exec'd-but-never-speaks scenario resolves in milliseconds).
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // r[impl gw.conn.per-channel-state]
 // r[impl gw.conn.sequential]
@@ -133,9 +138,9 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
-// 8 args is one over clippy's default of 7. The alternatives
+// 9 args is over clippy's default of 7. The alternatives
 // (grouping into a struct, or building SessionContext at the call
-// site) both add more noise than the extra arg costs. The session
+// site) both add more noise than the extra args cost. The session
 // entry point is the natural narrowing-point: everything before is
 // SSH plumbing, everything after is protocol handling.
 #[allow(clippy::too_many_arguments)]
@@ -161,6 +166,10 @@ pub async fn run_protocol<R, W>(
     // Per-tenant store-quota cache (30s TTL). Checked alongside
     // `limiter` before `SubmitBuild`. Shared via inner `Arc`.
     quota_cache: QuotaCache,
+    // Max wait for `WORKER_MAGIC_1` through handshake completion.
+    // Production passes `GatewayServer`'s setting (default
+    // [`HANDSHAKE_TIMEOUT`]); tests shrink it.
+    handshake_timeout: std::time::Duration,
     // Fired by `ChannelSession::Drop` (server.rs) when russh signals
     // `channel_close`. The opcode-read select picks this up and runs
     // the cancel loop — same outcome as the UnexpectedEof arm, but
@@ -182,6 +191,7 @@ where
         limiter,
         quota_cache,
     );
+    ctx.handshake_timeout = handshake_timeout;
     run_protocol_loop(reader, writer, &mut ctx, shutdown).await
 }
 
@@ -208,6 +218,7 @@ where
     // pre-handshake stall must not outlive the channel. No
     // cancel_active_builds here — the map is empty by construction
     // until the first build opcode runs.
+    let handshake_timeout = ctx.handshake_timeout;
     let handshake_result = tokio::select! {
         biased;
         () = shutdown.cancelled() => {
@@ -215,7 +226,7 @@ where
             return Ok(());
         }
         r = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
+            handshake_timeout,
             handshake::server_handshake_split(reader, writer, &version_string),
         ) => r,
     };
@@ -223,7 +234,7 @@ where
         Ok(r) => r,
         Err(_elapsed) => {
             metrics::counter!("rio_gateway_handshakes_total", "result" => "timeout").increment(1);
-            warn!(timeout = ?HANDSHAKE_TIMEOUT, "handshake timeout: no WORKER_MAGIC_1 received");
+            warn!(timeout = ?handshake_timeout, "handshake timeout: no WORKER_MAGIC_1 received");
             return Ok(());
         }
     };

@@ -715,6 +715,185 @@ async fn test_open_channel_without_exec_is_reaped() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Forwarding TCP proxy for one connection that can stop relaying
+/// client→server bytes on command (server→client always flows). Lets a
+/// test stage a misbehaving SSH client out of a well-behaved russh one:
+/// once `block` is set, the russh client's automatic protocol responses
+/// (most importantly the `CHANNEL_CLOSE` acknowledgment it sends when the
+/// server closes a channel) silently never reach the gateway, while the
+/// client itself still sees all server traffic and stays connected.
+async fn spawn_blockable_proxy(
+    upstream: SocketAddr,
+) -> anyhow::Result<(
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+)> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let block = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let block_pump = Arc::clone(&block);
+    let task = tokio::spawn(async move {
+        let Ok((mut client_sock, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut server_sock) = tokio::net::TcpStream::connect(upstream).await else {
+            return;
+        };
+        let mut cbuf = [0u8; 16 * 1024];
+        let mut sbuf = [0u8; 16 * 1024];
+        loop {
+            tokio::select! {
+                r = client_sock.read(&mut cbuf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // Blocked: keep reading (so the client never blocks
+                        // on a full send buffer) but discard the bytes.
+                        if !block_pump.load(Ordering::SeqCst)
+                            && server_sock.write_all(&cbuf[..n]).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                r = server_sock.read(&mut sbuf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if client_sock.write_all(&sbuf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+            }
+        }
+    });
+    Ok((addr, block, task))
+}
+
+// r[verify gw.conn.session-cap]
+// r[verify gw.conn.exit-status+3]
+/// bug_001: a protocol session that ends SERVER-side (handshake timeout
+/// here; opcode-idle timeout and protocol errors exit through the same
+/// `run_protocol` return) must release the global session permit and the
+/// `rio_gateway_channels_active` gauge immediately, and the connection —
+/// now holding only a dead session — must be reaped by the
+/// empty-connection grace, all WITHOUT any cooperation from the client.
+///
+/// Staging: client A execs `nix-daemon --stdio` (admitted, takes the only
+/// `max_sessions = 1` permit) and then never sends a protocol byte; the
+/// shrunken handshake timeout ends the session server-side. A connects
+/// through a proxy whose client→server direction is blocked right after
+/// the exec is admitted, so the `CHANNEL_CLOSE` acknowledgment the russh
+/// client automatically sends in response to the server's channel close
+/// never reaches the gateway — the same observable behavior as a client
+/// that ignores the server's close and just keeps answering keepalives.
+///
+/// Regression: the permit, the gauge decrement, and the
+/// empty-connection-grace arming all lived on the `sessions` map entry,
+/// which only CLIENT action removed — such a client pinned one global
+/// session slot per channel forever and the connection was never reaped.
+#[tokio::test]
+async fn test_server_side_ended_session_releases_capacity() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    const HANDSHAKE: std::time::Duration = std::time::Duration::from_millis(300);
+    const GAUGE: &str = "rio_gateway_channels_active{}";
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (addr, client_key, srv) = spawn_ssh_server_with(|s| {
+        s.with_max_sessions(1)
+            .with_empty_connection_grace(GRACE)
+            .with_handshake_timeout(HANDSHAKE)
+    })
+    .await?;
+
+    // Client A connects through the blockable proxy so the test can cut
+    // its outbound traffic the moment the exec has been admitted.
+    let (proxy_addr, block_a_outbound, proxy_task) = spawn_blockable_proxy(addr).await?;
+    let conn_a = connect_and_auth(proxy_addr, client_key.clone()).await?;
+    let mut ch_a = conn_a.channel_open_session().await?;
+    ch_a.exec(true, "nix-daemon --stdio").await?;
+    let msg = ch_a.wait().await.expect("server reply");
+    assert!(
+        matches!(msg, russh::ChannelMsg::Success),
+        "exec on A must be admitted: {msg:?}"
+    );
+    assert_eq!(
+        recorder.gauge_value(GAUGE),
+        Some(1.0),
+        "admitted exec must count as an active session; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    // From here on nothing A sends reaches the gateway. A never speaks the
+    // nix protocol, so the (shrunken) handshake timeout ends the protocol
+    // session server-side ~300ms from the exec; the close the server then
+    // sends is acknowledged by the russh client, but that ack is dropped
+    // here — exactly the client that never closes its dead channel.
+    block_a_outbound.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // The dead session must release the gauge (and its permit) without any
+    // client cooperation. Poll past the handshake timeout with margin.
+    let mut active = recorder.gauge_value(GAUGE);
+    for _ in 0..80 {
+        if active == Some(0.0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        active = recorder.gauge_value(GAUGE);
+    }
+
+    // With max_sessions = 1, a second client's exec only succeeds if the
+    // dead session's permit was actually released.
+    let conn_b = connect_and_auth(addr, client_key).await?;
+    let mut ch_b = conn_b.channel_open_session().await?;
+    ch_b.exec(true, "nix-daemon --stdio").await?;
+    let msg = ch_b.wait().await.expect("server reply");
+    assert!(
+        matches!(msg, russh::ChannelMsg::Success),
+        "a server-side-ended session must release its global session permit \
+         (max_sessions = 1, so a still-held permit rejects this exec): {msg:?}"
+    );
+    assert_eq!(
+        active,
+        Some(0.0),
+        "rio_gateway_channels_active must return to baseline once the protocol \
+         session ends server-side, without waiting for the client to close the \
+         channel; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    // The connection whose only session died must be reaped by the
+    // empty-connection grace: a dead session is not activity, even though
+    // its channel is still open from the client's point of view.
+    let mut reaped = false;
+    for _ in 0..80 {
+        if conn_a.is_closed() {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        reaped,
+        "a connection whose only protocol session ended server-side must be \
+         reaped by the empty-connection grace despite the client never closing \
+         its channel"
+    );
+
+    drop(ch_a);
+    drop(conn_a);
+    drop(ch_b);
+    drop(conn_b);
+    proxy_task.abort();
+    srv.abort();
+    Ok(())
+}
+
 // r[verify gw.conn.exit-status+3]
 /// A client that opens TCP but never sends its SSH identification string
 /// parks the connection inside russh's `run_stream` (`read_ssh_id` is

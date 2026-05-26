@@ -69,12 +69,6 @@ impl ConnStage {
 pub(super) struct ChannelSession {
     /// Send client data to the protocol handler.
     client_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    /// Global session-cap permit (`r[gw.conn.session-cap]`). Acquired
-    /// in `exec_request` BEFORE the duplex buffers are allocated; held
-    /// for the session's lifetime so every removal path (channel close,
-    /// dead protocol task, connection drop clearing the map) releases
-    /// the slot. Underscore-prefixed: never read, only dropped.
-    _session_permit: tokio::sync::OwnedSemaphorePermit,
     /// Protocol handler task. NOT aborted in Drop — dropping a
     /// `JoinHandle` detaches the task, it keeps running. `shutdown`
     /// below is the graceful stop signal. Held (not immediately
@@ -82,7 +76,9 @@ pub(super) struct ChannelSession {
     /// lifetime end, preserving the option to `await` it later.
     /// Underscore-prefixed: never read, intentionally so.
     _proto_task: tokio::task::JoinHandle<()>,
-    /// Response pump task.
+    /// Response pump task. Owns the [`SessionGuard`] (session permit,
+    /// gauge, live-session count) — see the guard's doc for why the
+    /// resources live with the task rather than this map entry.
     response_task: tokio::task::JoinHandle<()>,
     /// Fired in Drop to let `proto_task` run its cancel-on-disconnect
     /// loop before exiting. Replaces the hard `abort()` that raced the
@@ -113,12 +109,206 @@ impl Drop for ChannelSession {
         self.shutdown.cancel();
         // response_task is a dumb pump — no state to clean up. Abort
         // is still correct, and it's load-bearing for the mid-opcode
-        // case above (breaks the outbound pipe).
+        // case above (breaks the outbound pipe). Aborting also drops the
+        // task's SessionGuard (permit, gauge, live-session count) if the
+        // session was still live — the abnormal-path release.
         self.response_task.abort();
-        // Gauge decrement lives here so it fires on ALL drop paths: normal
-        // channel_close, connection drop (HashMap clears), and session removal
-        // after a dead protocol task. Avoids gauge leak on abnormal paths.
+    }
+}
+
+/// Per-connection bookkeeping of LIVE protocol sessions and the
+/// empty-connection grace timer (`r[gw.conn.exit-status+3]`).
+///
+/// Shared (`Arc`) between the [`ConnectionHandler`] (auth-time arming,
+/// exec-time disarm, connection drop) and every session's
+/// [`SessionGuard`] (released when the protocol session ACTUALLY ends).
+/// The session count and the timer live under one mutex so
+/// "last live session ended → arm" and "exec admitted → disarm" are
+/// atomic transitions — without that, a guard dropping concurrently with
+/// an exec admission could arm a timer while a live session exists.
+///
+/// Why not key emptiness on the `sessions` map: the map entry is only
+/// removed by CLIENT action (channel close, data on a dead channel) or
+/// connection end. A session that ends SERVER-side (handshake/idle
+/// timeout, protocol error) with a client that ignores the server's
+/// channel close has no further handler callback to run the bookkeeping
+/// in — the release has to ride on the session's own task ending.
+pub(super) struct EmptyConnectionTimer {
+    inner: std::sync::Mutex<EmptyConnectionTimerInner>,
+}
+
+struct EmptyConnectionTimerInner {
+    /// Number of protocol sessions currently live on this connection:
+    /// incremented when an exec is admitted, decremented when the
+    /// session's [`SessionGuard`] drops.
+    live_sessions: usize,
+    /// The armed idle-disconnect task, if the connection currently has
+    /// zero live sessions. Aborted on exec admission and connection drop.
+    pending_disconnect: Option<tokio::task::JoinHandle<()>>,
+    /// Set when the `ConnectionHandler` drops: the connection is gone,
+    /// so guards that drop afterwards must not arm fresh timers against
+    /// a dead `Handle` (they'd just leave a useless sleeper behind).
+    connection_closed: bool,
+}
+
+impl EmptyConnectionTimer {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(EmptyConnectionTimerInner {
+                live_sessions: 0,
+                pending_disconnect: None,
+                connection_closed: false,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, EmptyConnectionTimerInner> {
+        self.inner
+            .lock()
+            .expect("empty-connection timer mutex poisoned")
+    }
+
+    // r[impl gw.conn.exit-status+3]
+    /// Arm the empty-connection grace timer: after `grace` with zero live
+    /// protocol sessions, disconnect the connection. No-op if a timer is
+    /// already running (the grace measures how long the connection has
+    /// *continuously* had zero live sessions, so re-arming must not reset
+    /// the clock), if a session is currently live, or if the connection
+    /// has already ended.
+    ///
+    /// Race at the boundary: an exec admitted in the same instant the
+    /// timer fires may lose (the abort lands after the disconnect was
+    /// already queued). The timer re-checks the live count when it wakes
+    /// to shrink that window, but it cannot be eliminated — the inherent
+    /// boundary condition of any idle timeout; the client retries on a
+    /// fresh connection.
+    fn arm_if_idle(
+        self: Arc<Self>,
+        handle: russh::server::Handle,
+        peer: Option<SocketAddr>,
+        grace: std::time::Duration,
+    ) {
+        let mut inner = self.lock();
+        if inner.pending_disconnect.is_some() || inner.live_sessions > 0 || inner.connection_closed
+        {
+            return;
+        }
+        let timer = Arc::clone(&self);
+        inner.pending_disconnect = Some(rio_common::task::spawn_monitored(
+            "idle-disconnect",
+            async move {
+                tokio::time::sleep(grace).await;
+                {
+                    let mut inner = timer.lock();
+                    if inner.live_sessions > 0 || inner.connection_closed {
+                        // An exec was admitted (or the connection already
+                        // ended) while we slept and the abort lost the
+                        // race. Clear the slot so a later last-session-end
+                        // can arm a fresh timer, and stand down.
+                        inner.pending_disconnect = None;
+                        return;
+                    }
+                }
+                debug!(
+                    peer = ?peer,
+                    grace_secs = grace.as_secs(),
+                    "no active sessions for the grace period; disconnecting"
+                );
+                // Err = the connection already ended for another
+                // reason — nothing left to disconnect.
+                let _ = handle
+                    .disconnect(
+                        Disconnect::ByApplication,
+                        "no active sessions".to_owned(),
+                        String::new(),
+                    )
+                    .await;
+            },
+        ));
+    }
+
+    /// An exec was admitted: the connection is no longer empty. Bumps the
+    /// live count and disarms any pending idle-disconnect.
+    fn session_admitted(&self) {
+        let mut inner = self.lock();
+        inner.live_sessions += 1;
+        if let Some(timer) = inner.pending_disconnect.take() {
+            timer.abort();
+        }
+    }
+
+    /// A protocol session ended (its [`SessionGuard`] dropped). Decrements
+    /// the live count and, if that was the last live session, starts the
+    /// empty-connection grace clock.
+    fn session_ended(
+        self: Arc<Self>,
+        handle: russh::server::Handle,
+        peer: Option<SocketAddr>,
+        grace: std::time::Duration,
+    ) {
+        {
+            let mut inner = self.lock();
+            inner.live_sessions = inner.live_sessions.saturating_sub(1);
+        }
+        // Re-checks live count / closed flag under its own lock; the gap
+        // between the two locks only matters if an exec lands exactly in
+        // between, in which case arming correctly does nothing.
+        self.arm_if_idle(handle, peer, grace);
+    }
+
+    /// The connection ended: abort any pending timer (no reason to keep a
+    /// 60 s sleeper alive per churned connection) and stop future arming.
+    fn connection_dropped(&self) {
+        let mut inner = self.lock();
+        inner.connection_closed = true;
+        if let Some(timer) = inner.pending_disconnect.take() {
+            timer.abort();
+        }
+    }
+}
+
+// r[impl gw.conn.session-cap]
+/// Owns one protocol session's capacity accounting: the global
+/// session-cap permit, the `rio_gateway_channels_active` increment, and
+/// the connection's live-session count. Held by the session's response
+/// task and dropped when the session ACTUALLY ends — the protocol task
+/// has returned (client EOF, handshake/idle timeout, protocol error, or
+/// graceful shutdown) and the server-side `exit-status`/`eof`/`close`
+/// have been sent — or when the `ChannelSession` is dropped early
+/// (client channel close, connection end) and the response task is
+/// aborted with it.
+///
+/// This is what makes a SERVER-side session ending release capacity: a
+/// client that ignores the server's channel close and keeps answering
+/// keepalives never triggers another handler callback, so the release
+/// cannot live on the `sessions` map entry (which only client action
+/// removes). Tying it to the task means every ending — client- or
+/// server-initiated — releases the permit, the gauge, and (via
+/// [`EmptyConnectionTimer::session_ended`]) starts the empty-connection
+/// grace when the last live session is gone.
+struct SessionGuard {
+    /// Global session-cap permit (`r[gw.conn.session-cap]`), acquired in
+    /// `exec_request` before the duplex buffers are allocated.
+    /// Underscore-prefixed: never read, only dropped.
+    _permit: OwnedSemaphorePermit,
+    /// Shared live-session/grace-timer bookkeeping for the owning
+    /// connection.
+    timer: Arc<EmptyConnectionTimer>,
+    /// Handle to the SSH connection, for arming the grace timer when the
+    /// last live session ends.
+    handle: russh::server::Handle,
+    peer: Option<SocketAddr>,
+    grace: std::time::Duration,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        // Mirrors the increment in `exec_request` — exactly one guard is
+        // created per increment, so the gauge tracks live protocol
+        // sessions on every exit path (normal end, abort via
+        // ChannelSession::Drop, connection teardown).
         metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
+        Arc::clone(&self.timer).session_ended(self.handle.clone(), self.peer, self.grace);
     }
 }
 
@@ -241,11 +431,16 @@ pub struct ConnectionHandler {
     /// last session ending — before it is disconnected. See
     /// [`super::EMPTY_CONNECTION_GRACE`].
     pub(super) empty_connection_grace: std::time::Duration,
-    /// The armed idle-disconnect timer, if the connection currently has
-    /// zero active protocol sessions. Aborted when an exec is admitted
-    /// (a session is created) and in `Drop` (the timer must not outlive
-    /// the connection it would disconnect).
-    pub(super) pending_idle_disconnect: Option<tokio::task::JoinHandle<()>>,
+    /// Max wait for `WORKER_MAGIC_1` on an exec'd channel, passed to
+    /// [`run_protocol`]. Default [`crate::session::HANDSHAKE_TIMEOUT`];
+    /// shrunk by tests via `GatewayServer::with_handshake_timeout`.
+    pub(super) handshake_timeout: std::time::Duration,
+    /// Live-session count + empty-connection grace timer, shared with
+    /// every session's [`SessionGuard`] so the grace can be armed when
+    /// the last LIVE session ends — even when that ending is server-side
+    /// and the client never sends another SSH message. See
+    /// [`EmptyConnectionTimer`].
+    pub(super) idle: Arc<EmptyConnectionTimer>,
 }
 
 impl ConnectionHandler {
@@ -369,52 +564,20 @@ impl ConnectionHandler {
     }
 
     // r[impl gw.conn.exit-status+3]
-    /// Arm the empty-connection grace timer: after
-    /// `empty_connection_grace` with zero active protocol sessions,
-    /// disconnect the connection. Called from the places a connection
-    /// enters (or is found in) the zero-active-sessions state —
-    /// `auth_succeeded` (established, nothing exec'd yet),
-    /// `channel_close` (last session gone), and `data` (last session
-    /// found dead). `exec_request` disarms it when a session is
-    /// admitted; `Drop` aborts it.
-    ///
-    /// Idempotent: if a timer is already running, its clock is kept.
-    /// The grace measures how long the connection has *continuously*
-    /// had zero active sessions, so a channel open/close that never
-    /// produced a session must not reset it.
-    ///
-    /// Race at the boundary: an exec that arrives in the same instant
-    /// the timer fires may lose (the abort in `exec_request` lands
-    /// after `disconnect` was already queued). That is the inherent
-    /// boundary condition of any idle timeout; the client retries on a
-    /// fresh connection.
+    /// Arm the empty-connection grace timer (delegates to
+    /// [`EmptyConnectionTimer::arm_if_idle`]). Called from
+    /// `auth_succeeded` — the connection is established with nothing
+    /// exec'd yet. The other entry into the zero-live-sessions state is a
+    /// session ending, which arms via [`SessionGuard`]'s drop (the
+    /// session's own task), because a server-side ending may come with no
+    /// further SSH callback to do it in. `exec_request` disarms it when a
+    /// session is admitted; `Drop` aborts it.
     fn arm_empty_connection_timer(&mut self, session: &Session) {
-        if self.pending_idle_disconnect.is_some() {
-            return;
-        }
-        let handle = session.handle();
-        let grace = self.empty_connection_grace;
-        let peer = self.peer_addr;
-        self.pending_idle_disconnect = Some(rio_common::task::spawn_monitored(
-            "idle-disconnect",
-            async move {
-                tokio::time::sleep(grace).await;
-                debug!(
-                    peer = ?peer,
-                    grace_secs = grace.as_secs(),
-                    "no active sessions for the grace period; disconnecting"
-                );
-                // Err = the connection already ended for another
-                // reason — nothing left to disconnect.
-                let _ = handle
-                    .disconnect(
-                        Disconnect::ByApplication,
-                        "no active sessions".to_owned(),
-                        String::new(),
-                    )
-                    .await;
-            },
-        ));
+        Arc::clone(&self.idle).arm_if_idle(
+            session.handle(),
+            self.peer_addr,
+            self.empty_connection_grace,
+        );
     }
 }
 
@@ -423,10 +586,11 @@ impl Drop for ConnectionHandler {
         // The idle-disconnect timer holds a russh `Handle` to this
         // connection; if the connection is already gone the disconnect
         // would be a harmless no-op, but there's no reason to keep a
-        // 60s sleeper alive per churned connection.
-        if let Some(timer) = self.pending_idle_disconnect.take() {
-            timer.abort();
-        }
+        // 60s sleeper alive per churned connection. Marking the
+        // connection closed also stops SessionGuards that drop after us
+        // (the map below clears, aborting their response tasks) from
+        // arming fresh timers against a dead connection.
+        self.idle.connection_dropped();
         if self.auth_attempted {
             self.active_conns.fetch_sub(1, Ordering::Relaxed);
             metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
@@ -838,14 +1002,23 @@ impl Handler for ConnectionHandler {
 
         // r[impl gw.conn.exit-status+3]
         // An admitted exec creates a protocol session — the connection
-        // is no longer empty, so disarm any pending idle-disconnect
-        // (armed at auth time or when the previous last session ended).
-        if let Some(timer) = self.pending_idle_disconnect.take() {
-            timer.abort();
-        }
+        // is no longer empty, so bump the live-session count and disarm
+        // any pending idle-disconnect (armed at auth time or when the
+        // previous last session ended).
+        self.idle.session_admitted();
 
         session.channel_success(channel_id)?;
         metrics::gauge!("rio_gateway_channels_active").increment(1.0);
+        // Owns the permit, the gauge decrement, and the live-session
+        // count for this session; moved into the response task below and
+        // dropped when the session actually ends. See [`SessionGuard`].
+        let session_guard = SessionGuard {
+            _permit: session_permit,
+            timer: Arc::clone(&self.idle),
+            handle: session.handle(),
+            peer: self.peer_addr,
+            grace: self.empty_connection_grace,
+        };
 
         let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
@@ -889,6 +1062,7 @@ impl Handler for ConnectionHandler {
         // affects only that channel (children don't cascade upward).
         let shutdown = self.sessions_shutdown.child_token();
         let shutdown_child = shutdown.child_token();
+        let handshake_timeout = self.handshake_timeout;
         let proto_task = rio_common::task::spawn_monitored(
             "proto-task",
             async move {
@@ -904,6 +1078,7 @@ impl Handler for ConnectionHandler {
                     service_signer,
                     limiter,
                     quota_cache,
+                    handshake_timeout,
                     shutdown_child,
                 )
                 .await
@@ -957,6 +1132,14 @@ impl Handler for ConnectionHandler {
             if let Err(e) = handle.close(channel_id).await {
                 warn!(channel = ?channel_id, error = ?e, "failed to close SSH channel");
             }
+            // The protocol session is over and the server-side channel
+            // close has been sent: release the session permit, the gauge,
+            // and the live-session count NOW. Waiting for the client to
+            // acknowledge (or for the connection to end) would let a
+            // client that ignores the close pin a global session slot
+            // indefinitely — the dead session must stop counting the
+            // moment the server is done with it.
+            drop(session_guard);
             if let Err(e) = client_pump.await
                 && e.is_panic()
             {
@@ -971,7 +1154,6 @@ impl Handler for ConnectionHandler {
                 _proto_task: proto_task,
                 response_task,
                 shutdown,
-                _session_permit: session_permit,
             },
         );
 
@@ -982,7 +1164,7 @@ impl Handler for ConnectionHandler {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
         metrics::counter!("rio_gateway_bytes_total", "direction" => "rx")
             .increment(data.len() as u64);
@@ -991,16 +1173,13 @@ impl Handler for ConnectionHandler {
                 debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
                 if tx.send(data.to_vec()).await.is_err() {
                     warn!(channel = ?channel, "protocol session dead, closing channel");
-                    // Gauge decrement handled by ChannelSession::Drop.
+                    // Bookkeeping cleanup only: the dead session's permit,
+                    // gauge slot, and live-session count were already
+                    // released when its tasks ended (SessionGuard), and the
+                    // empty-connection grace clock started then if this was
+                    // the last live session — client data on the dead
+                    // channel must not extend anything.
                     self.sessions.remove(&channel);
-                    // r[impl gw.conn.exit-status+3]
-                    // That removal may have ended the connection's last
-                    // active session — start the empty-connection grace
-                    // clock if so (the SSH channel itself may stay open
-                    // if the client ignores the close we already sent).
-                    if self.sessions.is_empty() {
-                        self.arm_empty_connection_timer(session);
-                    }
                     return Ok(());
                 }
             }
@@ -1025,41 +1204,23 @@ impl Handler for ConnectionHandler {
     async fn channel_close(
         &mut self,
         channel: ChannelId,
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
-        // Gauge decrement handled by ChannelSession::Drop.
+        // Removing the entry aborts the response task (ChannelSession::
+        // Drop), whose SessionGuard then releases the permit/gauge/live
+        // count if the session was still live. r[gw.conn.exit-status+3]:
+        // if that was the connection's last LIVE session, the guard's
+        // drop arms the empty-connection grace — NOT an immediate
+        // disconnect, because a ControlMaster's in-flight session count
+        // legitimately transits through zero between builds, and killing
+        // the transport there poisons the rest of the batch (the master
+        // exits, OpenSSH unlinks the "stale" control socket, every
+        // remaining nix process falls back to a corrupted direct
+        // connection). A session that already ended server-side released
+        // its slot back then; this close is pure bookkeeping.
         self.sessions.remove(&channel);
         self.open_channels = self.open_channels.saturating_sub(1);
-        // r[impl gw.conn.exit-status+3]
-        // Last active session gone → arm a grace timer, THEN disconnect.
-        //
-        // Disconnecting immediately here (the previous behavior) tears
-        // down a ControlMaster's transport the instant its in-flight
-        // session count transits through zero between builds. The
-        // master then exits, OpenSSH unlinks the "stale" control
-        // socket, and every remaining nix process in the batch silently
-        // falls back to a direct connection whose handshake is
-        // corrupted by `LocalCommand` — one touch-zero event poisons
-        // the rest of a 64-worker run.
-        //
-        // The grace period keeps the mux alive across inter-build gaps
-        // while still reaping a genuinely abandoned connection 60×
-        // sooner than `inactivity_timeout` (which an idle-but-
-        // keepalive-answering client never trips). A non-mux client
-        // (`ssh gw nix-daemon --stdio`, one channel) closes its own TCP
-        // connection as soon as it receives `exit-status` — the timer
-        // never fires for it.
-        //
-        // Keyed on the session map, NOT `open_channels`: emptiness means
-        // "zero active protocol sessions". Channels that were opened but
-        // never exec'd don't count as activity, so their continued
-        // existence must not keep the connection alive (and the arm is
-        // idempotent, so a no-session open/close cycle doesn't reset an
-        // already-running clock).
-        if self.sessions.is_empty() {
-            self.arm_empty_connection_timer(session);
-        }
         Ok(())
     }
 }

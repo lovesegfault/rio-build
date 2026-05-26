@@ -359,6 +359,12 @@ pub struct SessionContext {
     /// Handlers that emit version-gated wire fields (e.g.
     /// `BuildResult.cpu_user` at ≥1.37) read this.
     pub negotiated_version: u64,
+    /// Max time [`crate::session::run_protocol_loop`] waits for
+    /// `WORKER_MAGIC_1` through the handshake completing. Defaults to
+    /// [`crate::session::HANDSHAKE_TIMEOUT`]; the SSH layer overrides it
+    /// from `GatewayServer::with_handshake_timeout` (tests shrink it so
+    /// an exec'd-but-silent channel ends in milliseconds, not 30 s).
+    pub handshake_timeout: std::time::Duration,
 }
 
 impl SessionContext {
@@ -383,6 +389,7 @@ impl SessionContext {
             limiter,
             quota_cache,
             negotiated_version: rio_nix::protocol::handshake::PROTOCOL_VERSION,
+            handshake_timeout: crate::session::HANDSHAKE_TIMEOUT,
         }
     }
 }
