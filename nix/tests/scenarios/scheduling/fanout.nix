@@ -54,4 +54,34 @@ scope: with scope; ''
       # 0 paths) would pass hints≥1 but fail paths≥1. (phase3a:485)
       assert_metric_ge(${gatewayHost}, 9091,
           "rio_scheduler_prefetch_paths_sent_total", 1.0)
+
+  # ══════════════════════════════════════════════════════════════════
+  # fanout epilogue — per-build castore stack fully torn down
+  # ══════════════════════════════════════════════════════════════════
+  with subtest("fanout: per-build castore cleanup after builds complete"):
+      # Every build above mounted its own castore-FUSE lower + overlay
+      # and tears both down at completion: no fuse.rio-castore mounts
+      # survive, the builder-owned <build_id>.castore mountpoints under
+      # the overlay base dir are removed, and rio-mountd reaps
+      # /var/rio/staging/<build_id> when the build's UDS connection
+      # closes. The reap and the serve-thread exit are prompt but not
+      # synchronous with the client seeing the build result (the FUSE
+      # session winds down just after the completion report), so poll
+      # briefly instead of asserting instantly.
+      for w in all_workers:
+          w.wait_until_succeeds(
+              "[ -z \"$(findmnt -rn -t fuse.rio-castore)\" ]", timeout=30
+          )
+          # overlayBaseDir default (/var/rio/overlays): no leftover
+          # per-build castore mountpoint dirs.
+          w.wait_until_succeeds(
+              "[ -z \"$(ls -d /var/rio/overlays/*.castore 2>/dev/null)\" ]",
+              timeout=30,
+          )
+          # mountd's conn-drop teardown reaped every per-build staging
+          # dir (the shared staging root itself stays).
+          w.wait_until_succeeds(
+              "[ -z \"$(ls -A /var/rio/staging 2>/dev/null)\" ]", timeout=30
+          )
+      print("fanout cleanup PASS: no castore mounts, mountpoints, or staging leftovers")
 ''

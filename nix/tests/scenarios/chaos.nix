@@ -188,16 +188,22 @@ pkgs.testers.runNixOSTest {
 
         # Wait for the toxic to bite. The 500ms reset_peer fires during
         # the worker's FIRST worker_store use — under the castore stack
-        # that is the per-build mount's DAG prefetch / input resolve
-        # (surfaced as "build execution failed" with the castore mount
-        # error in the chain), not the upload. The scheduler
-        # re-dispatches (infra-classified, same drv re-assigned) so the
-        # overall retry path is scheduler→worker redispatch, not the
-        # upload.rs internal loop. Grep both: if timing jitter lets the
-        # mount through, the upload-retry path fires instead.
+        # that is the per-build mount's DAG prefetch / input resolve,
+        # whose failure carries the castore-specific signatures
+        # ("castore mount failed: castore DAG prefetch failed: ...") in
+        # the error chain, not the upload. The scheduler re-dispatches
+        # (infra-classified, same drv re-assigned) so the overall retry
+        # path is scheduler→worker redispatch, not the upload.rs
+        # internal loop. Grep the castore signatures plus the
+        # upload-retry line: if timing jitter lets the mount through,
+        # the upload-retry path fires instead. NOT the generic "build
+        # execution failed" — that line fires for any failure mode and
+        # would let this wait pass without the fault ever biting the
+        # store path.
         worker.wait_until_succeeds(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
-            "grep -E 'upload attempt failed|build execution failed' >/dev/null",
+            "grep -E 'upload attempt failed|castore mount failed|"
+            "castore DAG prefetch failed' >/dev/null",
             timeout=30,
         )
 
