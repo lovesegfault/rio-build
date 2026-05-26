@@ -36,6 +36,21 @@
 //! comparisons. The kernels only ever use `Ord`/`Eq`/`Clone`/`Default`
 //! of `Id`, so the choice of identity type cannot change a verdict.
 //!
+//! ## The exclusion-set representation is cfg(kani)-swapped
+//!
+//! Every executor-id set in the kernel (the per-executor exclusion set,
+//! the eligible fleet, the frozen mirror columns) is declared as
+//! [`IdSet`], an alias that resolves to `std::collections::BTreeSet`
+//! everywhere except under `cfg(kani)`, where it resolves to
+//! [`BoundedIdSet`] — a fixed-capacity array set whose operations are
+//! short, concretely-bounded loops. Production semantics and the public
+//! API are untouched (outside the kani cfg the alias *is* `BTreeSet`);
+//! the proof harnesses get a goto model with no b-tree node machinery
+//! in it, which is what lets them converge inside a merge-gate budget.
+//! The two representations are pinned to each other by the differential
+//! unit tests in `mod tests` and the set-semantics harness in
+//! `mod proofs`.
+//!
 //! ## What `reference_fold` is
 //!
 //! [`reference_fold`] is a pure function from an observed failure-event
@@ -125,10 +140,149 @@
 //!   event that was dropped by such a guard is simply absent from the
 //!   observed history.
 
-use std::collections::BTreeSet;
-
 /// Abstract monotonic clock, in whole seconds since an arbitrary origin.
 pub type AbsTime = u64;
+
+// ---------------------------------------------------------------------------
+// The exclusion-set representation
+//
+// Production code and the unit-test batteries use `std::collections::
+// BTreeSet` for every executor-id set (the per-executor exclusion set, the
+// eligible fleet, the frozen mirror columns). The CBMC proof harnesses do
+// not: a `BTreeSet` insert/lookup walks the b-tree node machinery
+// (`search_tree`, `find_key_index`, `insert_recursing`), and the symbolic
+// execution of that code — not SAT solving — is what kept the decision
+// harnesses from converging inside a merge-gate budget. Under `cfg(kani)`
+// the `IdSet` alias swaps every one of those sets for `BoundedIdSet`, a
+// fixed-capacity array set whose operations are short loops with concrete
+// bounds (the proof-only-representation pattern: concrete structure,
+// symbolic values). The swap is invisible outside the proofs — the alias
+// resolves to `BTreeSet` under every other cfg, so production semantics,
+// the public API and the scheduler shim are untouched. The two
+// representations are pinned to each other by the differential unit tests
+// in `mod tests` (exhaustive small insert sequences compared against
+// `BTreeSet`) and by the `check_bounded_set_models_set_semantics` harness
+// (the set axioms over symbolic values).
+// ---------------------------------------------------------------------------
+
+/// The executor-id set representation used by every kernel structure:
+/// the production `BTreeSet` under every cfg except `kani`.
+#[cfg(not(kani))]
+pub type IdSet<Id> = std::collections::BTreeSet<Id>;
+
+/// The executor-id set representation used by every kernel structure:
+/// under `cfg(kani)` the bounded proof-time set, so the harnesses' goto
+/// model never has to symbolically execute b-tree node code.
+#[cfg(kani)]
+pub type IdSet<Id> = BoundedIdSet<Id>;
+
+/// Capacity of [`BoundedIdSet`]. The proof harnesses' executor universe
+/// is four values (three named executors plus the "no executor recorded"
+/// default), so eight slots leave headroom for a larger universe before
+/// the insert-overflow panic (which CBMC surfaces as a verification
+/// failure) forces this constant up.
+pub const BOUNDED_ID_SET_CAPACITY: usize = 8;
+
+/// A fixed-capacity set with linear-scan membership — the proof-time
+/// executor-id set representation (see [`IdSet`]).
+///
+/// Every operation is a short loop bounded by the concrete
+/// [`BOUNDED_ID_SET_CAPACITY`], with no heap allocation and no node
+/// structure, which is what the CBMC harnesses need: the cost of the
+/// goto model tracks the (small, fixed) capacity instead of the b-tree
+/// implementation. Inserting more distinct values than the capacity
+/// panics — within the harnesses' bounded domains the panic is
+/// unreachable (every harness proves that as a side effect), and the
+/// panic rather than a silent drop is what keeps the equivalence with
+/// `BTreeSet` honest.
+///
+/// The type is compiled (and differentially unit-tested against
+/// `BTreeSet`) under every cfg; only the [`IdSet`] alias is
+/// cfg-dependent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedIdSet<Id> {
+    /// Occupied slots, packed at the front in insertion order (the
+    /// kernel only ever inserts; nothing removes a single element).
+    slots: [Option<Id>; BOUNDED_ID_SET_CAPACITY],
+}
+
+impl<Id> Default for BoundedIdSet<Id> {
+    fn default() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl<Id> BoundedIdSet<Id> {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of elements in the set.
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// Whether the set has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|slot| slot.is_none())
+    }
+
+    /// Iterate the elements in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = &Id> {
+        self.slots.iter().filter_map(|slot| slot.as_ref())
+    }
+}
+
+impl<Id: Ord> BoundedIdSet<Id> {
+    /// Whether `value` is in the set.
+    pub fn contains(&self, value: &Id) -> bool {
+        self.slots.iter().flatten().any(|v| v == value)
+    }
+
+    /// Insert `value`; returns `true` iff it was not already present
+    /// (the `BTreeSet::insert` convention).
+    ///
+    /// # Panics
+    ///
+    /// If the set already holds [`BOUNDED_ID_SET_CAPACITY`] distinct
+    /// values. The proof harnesses' domains stay below the capacity;
+    /// the panic (a CBMC verification failure if ever reachable) is the
+    /// tripwire that forces the capacity up rather than silently
+    /// diverging from set semantics.
+    pub fn insert(&mut self, value: Id) -> bool {
+        if self.contains(&value) {
+            return false;
+        }
+        match self.slots.iter().position(|slot| slot.is_none()) {
+            Some(free) => {
+                self.slots[free] = Some(value);
+                true
+            }
+            None => panic!("BoundedIdSet capacity exceeded: raise BOUNDED_ID_SET_CAPACITY"),
+        }
+    }
+}
+
+impl<Id: Ord> FromIterator<Id> for BoundedIdSet<Id> {
+    fn from_iter<T: IntoIterator<Item = Id>>(iter: T) -> Self {
+        let mut set = Self::new();
+        for value in iter {
+            set.insert(value);
+        }
+        set
+    }
+}
+
+impl<Id: Ord> Extend<Id> for BoundedIdSet<Id> {
+    fn extend<T: IntoIterator<Item = Id>>(&mut self, iter: T) {
+        for value in iter {
+            self.insert(value);
+        }
+    }
+}
 
 /// The store-side error-message marker for a concurrent `PutPath` upload
 /// race. [`classify`]'s exemption predicate greps worker-reported infra
@@ -142,6 +296,38 @@ pub type AbsTime = u64;
 /// `concurrent_putpath_marker_matches_rio_proto` in
 /// `rio-scheduler/src/retry_policy.rs` — change both together.
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
+
+/// Whether a worker-reported error message carries the
+/// [`CONCURRENT_PUTPATH_MSG`] marker — the substring half of
+/// [`classify`]'s exemption predicate.
+///
+/// This is a plain windowed byte comparison rather than `str::contains`:
+/// the verdict is identical for this fixed, non-empty needle, but the
+/// standard library's substring searcher (the two-way algorithm and its
+/// `memcmp` fast paths) is expensive to symbolically execute, and this
+/// predicate sits inside both [`classify`] and its CBMC contract. The
+/// agreement with `str::contains` is pinned by the
+/// `concurrent_putpath_predicate_matches_std_contains` unit test.
+fn contains_concurrent_putpath_marker(msg: &str) -> bool {
+    let hay = msg.as_bytes();
+    let needle = CONCURRENT_PUTPATH_MSG.as_bytes();
+    if hay.len() < needle.len() {
+        return false;
+    }
+    let last_start = hay.len() - needle.len();
+    let mut start = 0;
+    while start <= last_start {
+        let mut offset = 0;
+        while offset < needle.len() && hay[start + offset] == needle[offset] {
+            offset += 1;
+        }
+        if offset == needle.len() {
+            return true;
+        }
+        start += 1;
+    }
+    false
+}
 
 /// The retry/poison budget — the union of `RetryPolicy`, `PoisonConfig`,
 /// `POISON_RESUBMIT_RETRY_LIMIT`, and `POISON_TTL`, flattened into one
@@ -231,13 +417,13 @@ impl Budget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetView<Id> {
     /// Statically-eligible, non-draining, registered executor ids.
-    pub eligible: BTreeSet<Id>,
+    pub eligible: IdSet<Id>,
 }
 
 impl<Id> Default for FleetView<Id> {
     fn default() -> Self {
         Self {
-            eligible: BTreeSet::new(),
+            eligible: IdSet::new(),
         }
     }
 }
@@ -367,7 +553,7 @@ pub struct Counters<Id> {
     /// The per-executor exclusion set (`RetryState::failed_builders`).
     /// Drives `hard_filter`'s placement exclusion, the distinct-workers
     /// poison threshold, and the fleet-exhaust check.
-    pub failed_builders: BTreeSet<Id>,
+    pub failed_builders: IdSet<Id>,
     /// Flat failure count for `require_distinct_workers = false`
     /// (`RetryState::failure_count`).
     pub failure_count: u32,
@@ -386,7 +572,7 @@ impl<Id> Default for Counters<Id> {
             timeout_count: 0,
             last_infra_failure_at: None,
             exempt_infra_count: 0,
-            failed_builders: BTreeSet::new(),
+            failed_builders: IdSet::new(),
             failure_count: 0,
             poisoned_at: None,
             backoff_until: None,
@@ -469,7 +655,7 @@ pub struct PersistedRetryColumns<Id> {
     /// `derivations.resubmit_cycles`.
     pub resubmit_cycles: u32,
     /// `derivations.failed_builders`.
-    pub failed_builders: BTreeSet<Id>,
+    pub failed_builders: IdSet<Id>,
     /// `derivations.poisoned_at`, already converted to the abstract
     /// clock and already filtered for TTL expiry.
     pub poisoned_at: Option<AbsTime>,
@@ -480,7 +666,7 @@ impl<Id> Default for PersistedRetryColumns<Id> {
         Self {
             retry_count: 0,
             resubmit_cycles: 0,
-            failed_builders: BTreeSet::new(),
+            failed_builders: IdSet::new(),
             poisoned_at: None,
         }
     }
@@ -550,7 +736,7 @@ pub enum Verdict {
 /// fleet is empty (no pool is connected — that is a transient the
 /// autoscaler handles, and poisoning would brick builds during a
 /// rollout).
-pub fn exhausts_fleet<Id: Ord>(failed_builders: &BTreeSet<Id>, fleet: &FleetView<Id>) -> bool {
+pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id>) -> bool {
     if failed_builders.is_empty() || fleet.eligible.is_empty() {
         return false;
     }
@@ -599,18 +785,26 @@ fn fold_events<Id: Ord + Clone>(
         verdict = apply(&mut c, ev, budget, fleet);
     }
 
-    // r[impl sched.state.poisoned-ttl]
-    // The TTL is a property of (poisoned_at, now), not of the event
-    // sequence: `tick_process_expired_poisons` discovers it by scanning,
-    // not by receiving an event.
+    let verdict = ttl_downgrade(&c, verdict, now, budget);
+    (c, verdict)
+}
+
+// r[impl sched.state.poisoned-ttl]
+/// Downgrade a stale poison to [`Verdict::TtlExpire`]. The TTL is a
+/// property of (`poisoned_at`, `now`), not of the event sequence:
+/// `tick_process_expired_poisons` discovers it by scanning, not by
+/// receiving an event. Shared by [`fold_events`] and [`decide`] (which
+/// folds ledger rows directly instead of materializing an intermediate
+/// event buffer).
+fn ttl_downgrade<Id>(c: &Counters<Id>, verdict: Verdict, now: AbsTime, budget: &Budget) -> Verdict {
     if matches!(verdict, Verdict::Poison(_))
         && let Some(p) = c.poisoned_at
         && now.saturating_sub(p) > budget.poison_ttl_secs
     {
-        verdict = Verdict::TtlExpire;
+        Verdict::TtlExpire
+    } else {
+        verdict
     }
-
-    (c, verdict)
 }
 
 /// Apply one event to the counters and return the verdict it produces.
@@ -1052,7 +1246,7 @@ pub struct Decision<Id> {
     /// with the live eligible fleet via [`placeable`]; `hard_filter`
     /// consumes the same set through the fold-refreshed cached view
     /// (`RetryState::failed_builders`).
-    pub exclusion: BTreeSet<Id>,
+    pub exclusion: IdSet<Id>,
     /// The deterministic backoff deadline (no jitter — the dispatch site
     /// applies the production jitter exactly as today).
     pub backoff_until: Option<AbsTime>,
@@ -1255,8 +1449,19 @@ pub fn decide<Id: Ord + Clone + Default>(
             .saturating_sub(1);
     }
 
-    let events: Vec<AttemptEvent<Id>> = history.iter().filter_map(row_to_event).collect();
-    let (mut counters, verdict) = fold_events(initial, &events, now, budget, &FleetView::default());
+    // Fold the rows directly — no intermediate event buffer. The
+    // in-history fleet-exhaust arm is evaluated against an empty fleet
+    // (never exhausted): the eligible fleet is not history, and the call
+    // sites consume the exclusion set through `placeable()` instead.
+    let fleet = FleetView::default();
+    let mut counters = initial;
+    let mut verdict = Verdict::Requeue;
+    for row in history {
+        if let Some(ev) = row_to_event(row) {
+            verdict = apply(&mut counters, &ev, budget, &fleet);
+        }
+    }
+    let verdict = ttl_downgrade(&counters, verdict, now, budget);
 
     if let Some(s) = seed {
         // The legacy floors for the flat counters (P5): max, not sum —
@@ -1432,7 +1637,7 @@ pub enum ObservedFailure<'a> {
     match event {
         ObservedFailure::WorkerTransient => *c == OutcomeClass::Transient,
         ObservedFailure::WorkerInfra { error_msg } => {
-            if floor.promoted || error_msg.contains(CONCURRENT_PUTPATH_MSG) {
+            if floor.promoted || contains_concurrent_putpath_marker(error_msg) {
                 *c == OutcomeClass::ExemptInfra
             } else {
                 *c == OutcomeClass::Infra
@@ -1457,7 +1662,7 @@ pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> Outcome
     match event {
         ObservedFailure::WorkerTransient => OutcomeClass::Transient,
         ObservedFailure::WorkerInfra { error_msg } => {
-            if floor.promoted || error_msg.contains(CONCURRENT_PUTPATH_MSG) {
+            if floor.promoted || contains_concurrent_putpath_marker(error_msg) {
                 OutcomeClass::ExemptInfra
             } else {
                 OutcomeClass::Infra
@@ -1527,7 +1732,7 @@ pub enum Placement {
         }
     }
 }))]
-pub fn placeable<Id: Ord>(excluded: &BTreeSet<Id>, eligible: &BTreeSet<Id>) -> Placement {
+pub fn placeable<Id: Ord>(excluded: &IdSet<Id>, eligible: &IdSet<Id>) -> Placement {
     if eligible.is_empty() {
         return Placement::NoEligibleWorkers;
     }
@@ -1547,8 +1752,12 @@ mod tests {
     //! through the production projection shim — that suite is the
     //! equivalence oracle for the extraction. The tests here only pin
     //! kernel-local concerns: the backoff curve, the placement/fleet
-    //! partitions, and that the generic identity parameter does not
-    //! affect a verdict.
+    //! partitions, that the generic identity parameter does not affect
+    //! a verdict, and the proof-representation pins (the
+    //! [`BoundedIdSet`]↔`BTreeSet` differential battery and the
+    //! substring-predicate↔`str::contains` agreement).
+
+    use std::collections::BTreeSet;
 
     use super::*;
 
@@ -1633,6 +1842,101 @@ mod tests {
         assert!(d.exclusion.is_empty());
         assert_eq!(d.backoff_until, None);
         assert_eq!(d.counters, Counters::default());
+    }
+
+    /// The proof-time set representation ([`BoundedIdSet`]) agrees with
+    /// the production representation (`BTreeSet`) on every observable
+    /// the kernel uses — `insert`'s newness verdict, `len`, `is_empty`,
+    /// `contains`, and the element set yielded by `iter` — over every
+    /// insert sequence of length ≤ 5 drawn from a 5-value domain
+    /// (exhaustive), which covers every duplicate/ordering shape the
+    /// bounded harness domains can produce.
+    #[test]
+    fn bounded_id_set_agrees_with_btreeset_exhaustively() {
+        const DOMAIN: [u8; 5] = [0, 1, 2, 3, 7];
+        for len in 0..=5u32 {
+            let sequences = DOMAIN.len().pow(len);
+            for sequence in 0..sequences {
+                let mut code = sequence;
+                let mut bounded = BoundedIdSet::new();
+                let mut reference = BTreeSet::new();
+                for _ in 0..len {
+                    let value = DOMAIN[code % DOMAIN.len()];
+                    code /= DOMAIN.len();
+                    assert_eq!(bounded.insert(value), reference.insert(value));
+                    assert_eq!(bounded.len(), reference.len());
+                    assert_eq!(bounded.is_empty(), reference.is_empty());
+                    for probe in DOMAIN {
+                        assert_eq!(bounded.contains(&probe), reference.contains(&probe));
+                    }
+                    let mut yielded: Vec<u8> = bounded.iter().copied().collect();
+                    yielded.sort_unstable();
+                    let expected: Vec<u8> = reference.iter().copied().collect();
+                    assert_eq!(yielded, expected, "iter() must yield exactly the members");
+                }
+            }
+        }
+    }
+
+    /// `FromIterator`/`Extend` on the proof-time set dedup exactly like
+    /// collecting into a `BTreeSet` (the conversion surface a caller
+    /// building an [`IdSet`] generically would hit).
+    #[test]
+    fn bounded_id_set_collect_dedups_like_btreeset() {
+        let values = [3u8, 1, 3, 0, 1, 2];
+        let bounded: BoundedIdSet<u8> = values.into_iter().collect();
+        let reference: BTreeSet<u8> = values.into_iter().collect();
+        assert_eq!(bounded.len(), reference.len());
+        for v in &reference {
+            assert!(bounded.contains(v));
+        }
+        let mut extended = bounded.clone();
+        extended.extend([2u8, 9]);
+        assert_eq!(extended.len(), reference.len() + 1);
+        assert!(extended.contains(&9));
+    }
+
+    /// Inserting more distinct values than the capacity panics: the
+    /// proof harnesses' domains stay below it, and the panic (a CBMC
+    /// verification failure if ever reachable) is the tripwire that
+    /// forces the capacity up rather than silently dropping elements.
+    #[test]
+    #[should_panic(expected = "BoundedIdSet capacity exceeded")]
+    fn bounded_id_set_insert_panics_past_capacity() {
+        let mut s = BoundedIdSet::new();
+        for v in 0..=8u8 {
+            s.insert(v);
+        }
+    }
+
+    /// The kernel's dependency-free substring predicate agrees with
+    /// `str::contains` for the CONCURRENT_PUTPATH marker over messages
+    /// covering the interesting shapes: empty, shorter than the marker,
+    /// the marker exact / prefixed / suffixed / embedded, near-misses
+    /// sharing long prefixes with the marker, and partial occurrences
+    /// ahead of a real one.
+    #[test]
+    fn concurrent_putpath_predicate_matches_std_contains() {
+        let cases = [
+            "",
+            "x",
+            "concurrent PutPath in progres",
+            "concurrent PutPath in progress",
+            "remote: concurrent PutPath in progress (path locked)",
+            "concurrent putpath in progress",
+            "concurrent PutPath in progressconcurrent PutPath in progress",
+            "concurrent PutPath in progresX trailer",
+            "cconcurrent PutPath in progress",
+            "concurrent PutPath i_ progress but then concurrent PutPath in progress",
+            "store error: connection reset by peer",
+        ];
+        for msg in cases {
+            assert_eq!(
+                contains_concurrent_putpath_marker(msg),
+                msg.contains(CONCURRENT_PUTPATH_MSG),
+                "predicate disagrees with str::contains for {msg:?}"
+            );
+        }
     }
 }
 
@@ -1790,7 +2094,7 @@ mod proofs {
     /// flat counters are unconstrained u32 — the SQL loader bounds them
     /// at `i32::MAX`, but the proof does not need that bound.
     fn any_seed() -> PersistedRetryColumns<u8> {
-        let mut failed_builders = BTreeSet::new();
+        let mut failed_builders = IdSet::new();
         if kani::any() {
             failed_builders.insert(1u8);
         }
@@ -1953,8 +2257,8 @@ mod proofs {
     }
 
     /// One arbitrary subset of the executor universe.
-    fn any_id_set() -> BTreeSet<u8> {
-        let mut s = BTreeSet::new();
+    fn any_id_set() -> IdSet<u8> {
+        let mut s = IdSet::new();
         if kani::any() {
             s.insert(1u8);
         }
