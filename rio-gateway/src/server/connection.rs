@@ -398,6 +398,17 @@ async fn finish_channel_session(
              abandoning the channel close-out"
         );
     }
+    // Reap the pump rather than wait for it: the protocol reader is gone,
+    // so nothing will ever consume further client data, and on its own the
+    // pump only exits when the CLIENT acts (channel close, EOF, more data
+    // on a dead channel) or the connection ends. Waiting on the peer would
+    // retain the pump, this task, and their buffers for as long as the
+    // peer pleases — uncounted by the session cap, whose permit was
+    // already released above. Aborting is safe: the pump is a dumb copy
+    // loop with nothing to clean up beyond its pipe halves.
+    client_pump.abort();
+    // A JoinError from the abort above is expected cancellation, not a
+    // failure; only surface real panics.
     if let Err(e) = client_pump.await
         && e.is_panic()
     {
@@ -1670,6 +1681,46 @@ mod tests {
             1,
             "the permit must have been released along the way"
         );
+        Ok(())
+    }
+
+    /// The client pump only exits on its own when the CLIENT acts (channel
+    /// close / EOF / connection end). Once the protocol session is over the
+    /// reader side of its pipe is gone, so `finish_channel_session` MUST
+    /// reap the pump rather than wait for it: waiting would retain the
+    /// pump, the response task, and their buffers for as long as the peer
+    /// pleases — uncounted by the session cap, whose permit was already
+    /// released. The pump here waits on a channel whose sender the test
+    /// keeps open (the shape of a peer that never closes its channel), so
+    /// only the reap can let `finish_channel_session` return.
+    #[tokio::test]
+    async fn finish_reaps_client_pump_that_never_exits_on_its_own() -> anyhow::Result<()> {
+        let (handle, _filled, _client_io) = parked_handle_with_full_queue().await?;
+        let sem = Arc::new(Semaphore::new(1));
+        let guard = guard_holding_only_permit(&sem, handle.clone());
+
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let client_pump = tokio::spawn(async move { while client_rx.recv().await.is_some() {} });
+
+        let finish = finish_channel_session(
+            handle,
+            channel_id(1),
+            guard,
+            client_pump,
+            std::time::Duration::from_millis(200),
+        );
+        // Bounded from the outside: without the reap, the helper parks on
+        // the pump join until the peer closes the channel — i.e. forever
+        // here — and this timeout (not the harness) reports it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), finish)
+            .await
+            .expect(
+                "finish_channel_session must reap the client pump instead of waiting \
+                 for the peer to close the channel",
+            );
+        // Keep the sender alive to the very end so the pump can never have
+        // exited on its own — only the reap can have ended it.
+        drop(client_tx);
         Ok(())
     }
 
