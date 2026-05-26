@@ -934,24 +934,6 @@
                 tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
                 # Typst design book outputs.
                 inherit (docsLib) docs docs-pdf;
-                # Nightly-tier targets (heavy, scheduled/manual only).
-                # The parent is a cheap stub so enumerating `packages`
-                # (`nix flake show`) never forces the heavy evals; the
-                # real targets hang off passthru, reachable by attr
-                # path. Currently: the differential parity harness with
-                # the 32-bit (i686) entries and a real stdenv build
-                # through the native executor — NOT in `checks`, any CI
-                # matrix, or the coverage matrix. Run by
-                # .github/workflows/nightly.yml, or manually:
-                #   nix build .#nightly.vm-differential
-                nightly = (pkgs.linkFarm "rio-nightly-targets" [ ]).overrideAttrs (old: {
-                  passthru = (old.passthru or { }) // {
-                    vm-differential = import ./nix/tests/scenarios/differential.nix {
-                      inherit pkgs rio-workspace;
-                      nightly = true;
-                    };
-                  };
-                });
               }
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`

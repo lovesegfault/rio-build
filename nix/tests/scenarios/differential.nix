@@ -24,15 +24,8 @@
 {
   pkgs,
   rio-workspace,
-  # Nightly tier: adds the 32-bit (i686) corpus and a real stdenv build
-  # on top of the merge-gate corpus. Too heavy for the per-PR gate —
-  # exposed as `packages.nightly.vm-differential` (see flake.nix), run
-  # by .github/workflows/nightly.yml or manually.
-  nightly ? false,
 }:
 let
-  inherit (pkgs) lib;
-
   # The corpus builders: a static bash (the builder executable, so
   # structuredAttrs' `.attrs.sh` — bash syntax — sources cleanly, exactly
   # like stdenv builds) and a static busybox (PATH utilities).
@@ -44,14 +37,12 @@ let
 
   corpusFile = ../lib/derivations/differential-corpus.nix;
 
-  # ── Nightly tier ────────────────────────────────────────────────────
   # 32-bit busybox: every syscall in the i686-* entries goes through
   # the i386 ABI, exercising the multi-ABI seccomp filter. The glibc
   # (non-static) i686 build is used because its toolchain is
   # substitutable — the static musl32 variants would bootstrap a cross
   # toolchain from source on every cold cache.
   busybox32 = pkgs.pkgsi686Linux.busybox;
-  corpusNightlyFile = ../lib/derivations/differential-corpus-nightly.nix;
 
   # Real stdenv probe: a genuine stdenv.mkDerivation (setup.sh, phases,
   # cc-wrapper, fixupPhase) instead of an inline-busybox script. The
@@ -66,25 +57,6 @@ let
       pkgsPath = pkgs.path;
       inherit (pkgs.stdenv.hostPlatform) system;
     }).stdenv-probe;
-
-  nightlyEntryMeta = {
-    i686-trivial = {
-      expect = "parity";
-      corpus = "nightly";
-    };
-    i686-setuid-attempt = {
-      expect = "parity";
-      corpus = "nightly";
-    };
-    i686-multi-output = {
-      expect = "parity";
-      corpus = "nightly";
-    };
-    stdenv-probe = {
-      expect = "parity";
-      corpus = "stdenv";
-    };
-  };
 
   # Per-entry expectations, consumed by the testScript.
   #
@@ -180,23 +152,36 @@ let
       # now realize the same content-addressed paths as the oracle.
       expect = "parity";
     };
-  }
-  // lib.optionalAttrs nightly nightlyEntryMeta;
+    # ── Heavyweight entries: 32-bit ABI + real stdenv ──────────────────
+    i686-trivial = {
+      expect = "parity";
+    };
+    i686-setuid-attempt = {
+      expect = "parity";
+    };
+    i686-multi-output = {
+      expect = "parity";
+    };
+    stdenv-probe = {
+      expect = "parity";
+      corpus = "stdenv";
+    };
+  };
 in
 pkgs.testers.runNixOSTest {
-  name = "rio-differential" + lib.optionalString nightly "-nightly";
+  name = "rio-differential";
   # Two real sandboxed builds per corpus entry plus the driver's own
-  # closure copies; generous but bounded. The nightly tier adds the
-  # stdenv probe (a real cc invocation per side) and the i686 entries.
-  globalTimeout = if nightly then 7200 else 3600;
+  # closure copies; generous but bounded. The stdenv probe (a real cc
+  # invocation per side) and the i686 entries are the heavy tail.
+  globalTimeout = 7200;
 
   nodes.machine =
     { pkgs, ... }:
     {
       virtualisation = {
         cores = 4;
-        memorySize = if nightly then 6144 else 4096;
-        diskSize = if nightly then 16384 else 8192;
+        memorySize = 6144;
+        diskSize = 16384;
         # The oracle (`nix-build`) needs a writable store. The native
         # side does NOT build against /nix/store (the driver copies the
         # closure into a scratch dir), so the worker fixtures'
@@ -207,12 +192,9 @@ pkgs.testers.runNixOSTest {
         additionalPaths = [
           bashStatic
           busyboxStatic
+          busybox32
           sandboxShell
           "${corpusFile}"
-        ]
-        ++ lib.optionals nightly [
-          busybox32
-          "${corpusNightlyFile}"
           "${stdenvProbeFile}"
           # The nixpkgs source tree, so the VM can instantiate the
           # stdenv probe itself …
@@ -256,12 +238,9 @@ pkgs.testers.runNixOSTest {
     BUSYBOX = "${busyboxStatic}"
     SANDBOX_SHELL = "${sandboxShell}/bin/busybox"
     CORPUS = "${corpusFile}"
-    # Nightly tier only; empty strings (and never referenced) in the
-    # merge-gate variant.
-    CORPUS_NIGHTLY = "${lib.optionalString nightly "${corpusNightlyFile}"}"
-    BUSYBOX32 = "${lib.optionalString nightly "${busybox32}"}"
-    CORPUS_STDENV = "${lib.optionalString nightly "${stdenvProbeFile}"}"
-    PKGS_PATH = "${lib.optionalString nightly "${pkgs.path}"}"
+    BUSYBOX32 = "${busybox32}"
+    CORPUS_STDENV = "${stdenvProbeFile}"
+    PKGS_PATH = "${pkgs.path}"
     META = json.loads('${builtins.toJSON entryMeta}')
 
     divergences = []
@@ -273,12 +252,6 @@ pkgs.testers.runNixOSTest {
 
 
     def instantiate(attr, meta):
-        if meta.get("corpus") == "nightly":
-            return machine.succeed(
-                "nix-instantiate --impure "
-                f"--arg busybox32 'builtins.storePath \"{BUSYBOX32}\"' "
-                f"-A {attr} {CORPUS_NIGHTLY}"
-            ).strip()
         if meta.get("corpus") == "stdenv":
             # The probe file does a pristine `import <nixpkgs>` itself;
             # instantiation takes a while the first time (full stdenv
@@ -293,6 +266,7 @@ pkgs.testers.runNixOSTest {
             "nix-instantiate --impure "
             f"--arg busybox 'builtins.storePath \"{BUSYBOX}\"' "
             f"--arg bash 'builtins.storePath \"{BASH}\"' "
+            f"--arg busybox32 'builtins.storePath \"{BUSYBOX32}\"' "
             f"-A {attr} {CORPUS}"
         ).strip()
 

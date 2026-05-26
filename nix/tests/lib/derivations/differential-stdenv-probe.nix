@@ -1,15 +1,14 @@
-# Nightly-tier differential corpus: the real-stdenv probe.
+# Differential corpus: the real-stdenv probe.
 #
 # A genuine `stdenv.mkDerivation` (setup.sh, phases, cc-wrapper,
 # fixupPhase) — the one corpus entry that exercises the full stdenv
 # environment through the native executor instead of an inline busybox
-# script. Far too heavy for the merge gate; runs in the nightly tier:
-#
-#   nix build .#nightly.vm-differential
+# script. It is the heavyweight tail of the merge-gate differential
+# scenario (checks.x86_64-linux.vm-differential-standalone).
 #
 # Evaluated twice from this same file so the two sides can never drift:
 #
-#   * host side (scenarios/differential.nix, nightly branch): only to
+#   * host side (scenarios/differential.nix): only to
 #     reach `.inputDerivation`, whose closure puts the probe's
 #     build-time dependencies (cc-wrapper, binutils, glibc, coreutils,
 #     …) into the VM store via `additionalPaths`;

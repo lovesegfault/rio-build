@@ -12,21 +12,23 @@
 # known-divergence) live in scenarios/differential.nix, next to the
 # comparison logic — this file is pure derivations.
 #
-# Evaluated IN THE VM via `nix-instantiate --impure --arg busybox
-# 'builtins.storePath "<static busybox>"'`. Keep every builder script
-# inline (args = [ "-c" ... ]) — source-file inputs would land in the
-# VM's writable upper store layer, which the driver's closure copy
-# handles fine, but inline scripts keep the input closure to exactly
-# `busybox`, which keeps the per-entry copy fast.
+# Evaluated IN THE VM via `nix-instantiate --impure` with `--arg
+# busybox / bash / busybox32 'builtins.storePath "…"'`. Keep every
+# builder script inline (args = [ "-c" ... ]) — source-file inputs
+# would land in the VM's writable upper store layer, which the driver's
+# closure copy handles fine, but inline scripts keep the input closure
+# to exactly the declared builders, which keeps the per-entry copy
+# fast.
 #
-# Nightly-tier entries (stdenv, i686) are deliberately absent: they are
-# not viable in the per-PR merge gate. They live in
-# differential-corpus-nightly.nix (i686) plus a host-evaluated stdenv
-# probe (differential-stdenv-probe.nix, instantiated in the VM), wired
-# as `nix build .#nightly.vm-differential`.
+# The 32-bit (i686-busybox) entries at the bottom of this file and the
+# real-stdenv probe (differential-stdenv-probe.nix, instantiated in the
+# VM by the same scenario) are the heavyweight tail of the corpus: they
+# make the check slower, but they run in the same merge-gate scenario
+# as everything else (checks.x86_64-linux.vm-differential-standalone).
 {
   busybox,
   bash,
+  busybox32,
 }:
 let
   sh = "${bash}/bin/bash";
@@ -43,6 +45,35 @@ let
           script
         ];
         PATH = "${busybox}/bin";
+      }
+      // extra
+    );
+
+  # 32-bit variant: builder and PATH come from an i686 busybox
+  # (pkgsi686Linux — glibc, non-static; its toolchain is substitutable,
+  # unlike the from-source musl32 static variants), so every syscall in
+  # the i686-* entries goes through the i386 ABI — the multi-ABI seccomp
+  # filter and 32-bit personality handling get no coverage from the
+  # x86_64 entries.
+  sh32 = "${busybox32}/bin/sh";
+
+  mkDrv32 =
+    name: script: extra:
+    derivation (
+      {
+        inherit name;
+        # The derivation still targets the host platform — only the
+        # builder binary is 32-bit. Real Nix needs no extra-platforms
+        # entry this way, and the native executor sees an ordinary
+        # x86_64-linux job whose process happens to make i386-ABI
+        # syscalls.
+        system = builtins.currentSystem;
+        builder = sh32;
+        args = [
+          "-c"
+          script
+        ];
+        PATH = "${busybox32}/bin";
       }
       // extra
     );
@@ -364,4 +395,48 @@ rec {
     echo "built during buildPhase" > $out
     echo '@nix {"action":"setPhase","phase":"installPhase"}' >&2
   '' { };
+
+  # ── 32-bit (i686) builds ─────────────────────────────────────────────
+
+  # Baseline 32-bit build: catches gross divergence in exec/personality
+  # handling (a seccomp filter that kills i386-ABI syscalls shows up
+  # here as SIGSYS on the native side only).
+  i686-trivial = mkDrv32 "rio-diff-i686-trivial" ''
+    {
+      echo "hello from a 32-bit builder"
+      uname -m
+    } > $out
+  '' { };
+
+  # Setuid denial through the 32-bit ABI: the purity filter must EPERM
+  # the i386 fchmodat/chmod exactly like the x86_64 one (setuid-attempt
+  # above only proves the 64-bit branch). The build itself still
+  # succeeds; the recorded result must match the oracle byte-for-byte.
+  i686-setuid-attempt = mkDrv32 "rio-diff-i686-setuid" ''
+    touch $out
+    if chmod 4755 $out 2>/dev/null; then
+      echo "setuid-succeeded" > $out
+    else
+      echo "setuid-denied rc=$?" > $out
+    fi
+  '' { };
+
+  # Multi-output + inter-output reference, 32-bit edition: output
+  # registration order and reference scanning are ABI-independent, but
+  # the path-scanning runs against NARs produced by 32-bit tools (mkdir,
+  # echo, cp from the i686 busybox) — cheap to include, catches "works
+  # on 64-bit coreutils only" assumptions in canonicalisation.
+  i686-multi-output =
+    mkDrv32 "rio-diff-i686-multi-output"
+      ''
+        mkdir -p $dev $out
+        echo "development half (32-bit)" > $dev/marker
+        echo "$dev" > $out/link-to-dev
+      ''
+      {
+        outputs = [
+          "out"
+          "dev"
+        ];
+      };
 }
