@@ -1,9 +1,9 @@
 {{- /* Named template so the ConfigMap body and the checksum annotation
        hash the SAME rendered string (see controller.yaml / bug_022).
        `define` must be at top level (not inside `if`).
-       force_build_roots is rendered ahead of the Rust field landing —
-       BuildPolicy has no deny_unknown_fields, so the extra key is
-       ignored until the gateway grows it. */}}
+       Both keys come from the per-tenant build policy (gateway
+       BuildPolicy fields); force_build_roots is honored by the
+       scheduler once the force-build change lands end-to-end. */}}
 {{- define "rio.gatewayToml" -}}
 {{- range $tenant, $pol := .Values.gateway.buildPolicy }}
 [build_policy.{{ $tenant | quote }}]
