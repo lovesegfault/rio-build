@@ -24,6 +24,9 @@ pub struct BuildPolicy {
     /// derivations after a failure instead of fail-fast cancelling the
     /// rest of the submission. See `r[gw.build.per-tenant-policy]`.
     pub keep_going: bool,
+    /// `SubmitBuildRequest.force_build_roots`: do not substitute this
+    /// tenant's submission roots — see `r[sched.merge.force-build-roots]`.
+    pub force_build_roots: bool,
 }
 
 /// Tenant name → policy. TOML: `[build_policy."tenant-name"]` tables in
@@ -346,6 +349,7 @@ mod tests {
 
         [build_policy."parity-leaf"]
         keep_going = true
+        force_build_roots = true
         "#,
         |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
@@ -374,6 +378,10 @@ mod tests {
                 .copied()
                 .expect("[build_policy.\"parity-leaf\"] table must deserialize");
             assert!(pol.keep_going, "keep_going=true must round-trip");
+            assert!(
+                pol.force_build_roots,
+                "force_build_roots=true must round-trip"
+            );
         }
     );
 

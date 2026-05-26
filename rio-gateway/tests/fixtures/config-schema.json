@@ -195,6 +195,11 @@
             "description": "`SubmitBuildRequest.keep_going`: continue building independent\nderivations after a failure instead of fail-fast cancelling the\nrest of the submission. See `r[gw.build.per-tenant-policy]`.",
             "type": "boolean",
             "default": false
+          },
+          "force_build_roots": {
+            "description": "`SubmitBuildRequest.force_build_roots`: do not substitute this\ntenant's submission roots — see `r[sched.merge.force-build-roots]`.",
+            "type": "boolean",
+            "default": false
           }
         }
       }

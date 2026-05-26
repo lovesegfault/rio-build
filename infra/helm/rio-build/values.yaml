@@ -863,12 +863,15 @@ gateway:
   # Per-tenant build policy → /etc/rio/gateway.toml [build_policy.<tenant>]
   # tables. Keys are tenant names (authorized_keys comments); entries for
   # tenants that don't exist are inert. keepGoing → keep_going.
-  # forceBuildRoots → force_build_roots (no-op until the gateway implements it).
+  # forceBuildRoots → force_build_roots.
   # The qa-* entries are used only by `xtask k8s qa` scenarios (pol01/pol02),
   # which create those tenants on demand; they are no-ops otherwise.
   buildPolicy:
     qa-keep-going:
       keepGoing: true
+    qa-force-build:
+      keepGoing: true
+      forceBuildRoots: true
   # I-064 graceful drain. preStop sleep nlbDeregisterSecs (NLB stops
   # routing NEW connections) → SIGTERM → readiness=NotServing → wait
   # drainGraceSecs → stop accepting SSH → wait sessionDrainSecs for

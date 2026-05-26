@@ -851,8 +851,9 @@ pub async fn filter_and_inline_drv(
 /// (see [`handle_set_options`](crate::handler)), so the only way to set
 /// these is via the gRPC path (rio-cli), which constructs
 /// `SubmitBuildRequest` directly without going through this helper.
-/// `keep_going` instead comes from the session's resolved per-tenant
-/// [`BuildPolicy`](crate::config::BuildPolicy), not from the client.
+/// `keep_going` and `force_build_roots` instead come from the session's
+/// resolved per-tenant [`BuildPolicy`](crate::config::BuildPolicy), not
+/// from the client.
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,
@@ -871,9 +872,7 @@ pub fn build_submit_request(
         build_timeout: 0,
         build_cores: 0,
         keep_going: policy.keep_going,
-        // Wire-default false = today's behavior; the per-tenant policy
-        // plumbing for this lands separately.
-        force_build_roots: false,
+        force_build_roots: policy.force_build_roots,
     }
 }
 
@@ -978,7 +977,10 @@ mod tests {
             vec![],
             "ci",
             Some(&name),
-            BuildPolicy { keep_going: true },
+            BuildPolicy {
+                keep_going: true,
+                force_build_roots: false,
+            },
         );
         assert!(
             req.keep_going,
@@ -991,6 +993,22 @@ mod tests {
             !req_default.keep_going,
             "default policy must keep today's keep_going=false"
         );
+
+        let req_force = build_submit_request(
+            vec![],
+            vec![],
+            "ci",
+            Some(&name),
+            BuildPolicy {
+                keep_going: true,
+                force_build_roots: true,
+            },
+        );
+        assert!(
+            req_force.force_build_roots,
+            "policy force_build_roots must reach the proto"
+        );
+        assert!(!req_default.force_build_roots, "default stays false");
     }
 
     #[test]
