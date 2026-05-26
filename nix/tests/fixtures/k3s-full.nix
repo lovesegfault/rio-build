@@ -813,7 +813,25 @@ rec {
                 "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30; "
                 "echo '--- scheduler (INFO+) ---'; "
                 "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=400 2>&1 "
-                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30"
+                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30; "
+                # Every service the build depends on, not just the worker
+                # namespace: a crash-looping store or gateway makes the
+                # worker pod never appear, and without these dumps the
+                # only symptom in the test log is this timeout.
+                "echo '--- warning events (all namespaces) ---'; "
+                "k3s kubectl get events -A --field-selector type=Warning "
+                "  --sort-by=.lastTimestamp 2>&1 | tail -40; "
+                "echo '--- rio-store pods ---'; "
+                "k3s kubectl -n rio-store get pods -o wide 2>&1; "
+                "echo '--- rio-store logs (current) ---'; "
+                "k3s kubectl -n rio-store logs deploy/rio-store --tail=60 2>&1; "
+                "echo '--- rio-store logs (previous) ---'; "
+                "k3s kubectl -n rio-store logs deploy/rio-store --previous --tail=60 2>&1; "
+                "echo '--- gateway logs (tail) ---'; "
+                "k3s kubectl -n rio-system logs deploy/rio-gateway --tail=40 2>&1; "
+                "echo '--- fetcher ns ---'; "
+                "k3s kubectl -n ${nsFetchers} get job,pod -o wide 2>&1; "
+                "k3s kubectl -n ${nsFetchers} logs -l rio.build/kind=fetcher --tail=40 2>&1"
             )[1])
             raise
         # Race: the pod can transition out of Running (build finished)
