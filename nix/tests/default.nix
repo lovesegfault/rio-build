@@ -134,7 +134,14 @@ let
   };
 
   # Shared fixture for both scheduling splits — identical VM topology.
+  # withHmac: the scheduler signs per-build assignment tokens and the
+  # store verifies them — castore-FUSE reads (GetDirectory/ReadBlob/…)
+  # are tenant-scoped and only authenticate via that token, so a
+  # build-dispatching fixture without HMAC cannot mount its inputs.
+  # The scenario prelude pairs this with mkBootstrap's `tenant` so the
+  # token actually carries a tenant claim.
   schedulingFixture = standalone {
+    withHmac = true;
     workers = {
       # maxSilentTime enforcement on ALL scheduling workers. Every drv
       # that lands here MUST stay non-silent for ≥10s — cancelDrv echoes

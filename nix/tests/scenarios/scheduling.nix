@@ -56,6 +56,17 @@ let
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
 
+  # Every scheduling build runs as this tenant. The castore-FUSE store
+  # RPCs are tenant-scoped (r[store.castore.tenant-scope]) and only
+  # authenticate via the per-build assignment token, so the dispatched
+  # token must carry a tenant claim: ssh-ng builds get it from the
+  # client key's comment (mkBootstrap `tenant` below); the gRPC-direct
+  # submit helper sets SubmitBuildRequest.tenant_name to the same name
+  # so cancel-timing's build is attributed identically. Pairs with
+  # `withHmac = true` on the fixture (default.nix) — without HMAC the
+  # store has no verifier and castore reads cannot authenticate at all.
+  schedTenant = "vm-sched";
+
   # reassign: slow build, no pname → estimator default. 25s gives the
   # test ~20s to find+kill the assigned worker before the build would
   # naturally finish.
@@ -131,6 +142,7 @@ let
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
       withSeed = true;
+      tenant = schedTenant;
     }}
 
     all_workers = [worker1, worker2, worker3]
@@ -143,7 +155,12 @@ let
     def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
         """SubmitBuild via plaintext gRPC direct to :9001. Returns buildId.
         Standalone fixture variant — no port-forward. Same
-        `|| true` swallow-DeadlineExceeded as the k3s variant."""
+        `|| true` swallow-DeadlineExceeded as the k3s variant.
+        Attributes the build to the scenario tenant (the gateway does
+        the same for ssh-ng builds via the key comment) so the
+        assignment token carries the tenant claim castore-FUSE reads
+        require; an explicit tenantName in the payload wins."""
+        payload.setdefault("tenantName", "${schedTenant}")
         out = ${gatewayHost}.succeed(
             f"grpcurl -plaintext -max-time {max_time} "
             f"-protoset ${protoset}/rio.protoset "

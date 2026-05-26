@@ -175,10 +175,24 @@ rec {
       gatewayHost ? null,
       withSsh ? true,
       withSeed ? false,
+      # Run the scenario as this tenant (standalone fixtures only): the
+      # tenant row is created via AdminService CreateTenant before any
+      # SSH/seed traffic, and the client SSH key's comment names it so
+      # the gateway attributes every ssh-ng build to it
+      # (r[gw.auth.tenant-from-key-comment]) and the scheduler's
+      # assignment tokens carry its UUID — which the castore-FUSE store
+      # RPCs require (r[store.castore.tenant-scope]). `null` keeps the
+      # legacy single-tenant flow (tenant_id NULL; castore-FUSE builds
+      # cannot work in that mode). k3s scenarios provision tenants in
+      # their own preludes (lifecycle.nix is the reference) — passing
+      # `tenant` together with a k3s fixture is not supported.
+      tenant ? null,
     }:
     let
       seedHost = if fixture ? sshKeySetup then "k3s-server" else gatewayHost;
     in
+    assert lib.assertMsg (tenant == null || !(fixture ? sshKeySetup))
+      "mkBootstrap: `tenant` is standalone-only; k3s scenarios provision tenants in their preludes (see lifecycle.nix)";
     ''
       ${assertions}
 
@@ -186,8 +200,16 @@ rec {
       start_all()
       ${fixture.waitReady}
       ${fixture.kubectlHelpers or ""}
+      ${lib.optionalString (tenant != null) (provisionTenant {
+        controlHost = gatewayHost;
+        tenantName = tenant;
+        hmacKeys = fixture.hmacKeys or null;
+      })}
       ${lib.optionalString withSsh (
-        fixture.sshKeySetup or (lib.optionalString (gatewayHost != null) (sshKeySetup gatewayHost))
+        if tenant != null then
+          sshKeySetupFor gatewayHost tenant
+        else
+          fixture.sshKeySetup or (lib.optionalString (gatewayHost != null) (sshKeySetup gatewayHost))
       )}
       ${lib.optionalString withSeed (seedBusybox seedHost)}
     '';
@@ -595,21 +617,61 @@ rec {
   # with the placeholder key (gatewayTmpfiles above — authorizes
   # nothing); `>` truncates, then restart swaps it in.
   #
-  # Interpolate as `${common.sshKeySetup "control"}` in testScript.
-  # The `gatewayHost` arg is the Python variable name for the gateway
-  # node (fixture-dependent: `gateway` or `control`).
-  # -C "" sets an empty key comment. Without it, ssh-keygen defaults
-  # to `user@host` which the gateway treats as a tenant name →
-  # scheduler rejects as "unknown tenant". Empty
-  # comment = single-tenant mode (tenant_id = NULL).
-  sshKeySetup = gatewayHost: ''
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519")
+  # Interpolate as `${common.sshKeySetupFor "control" "my-tenant"}` (or
+  # via mkBootstrap's `tenant` arg). The `gatewayHost` arg is the Python
+  # variable name for the gateway node (fixture-dependent: `gateway` or
+  # `control`); `tenantComment` becomes the key comment, which the
+  # gateway reads from the MATCHED authorized_keys entry as the tenant
+  # name (r[gw.auth.tenant-from-key-comment]) and forwards on
+  # SubmitBuild. A non-empty comment therefore requires the tenant row
+  # to exist (provisionTenant) — the scheduler rejects unknown names.
+  # Mirrors the k3s fixture's `sshKeySetupFor` (Secret + rollout
+  # restart); this is the systemd-host variant.
+  sshKeySetupFor = gatewayHost: tenantComment: ''
+    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -C '${tenantComment}' -f /root/.ssh/id_ed25519")
     pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
     ${gatewayHost}.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
     ${gatewayHost}.succeed("systemctl restart rio-gateway.service")
     ${gatewayHost}.wait_for_unit("rio-gateway.service")
     ${gatewayHost}.wait_for_open_port(2222)
   '';
+
+  # Single-tenant variant: -C "" sets an empty key comment. Without it,
+  # ssh-keygen defaults to `user@host` which the gateway treats as a
+  # tenant name → scheduler rejects as "unknown tenant". Empty comment
+  # = single-tenant mode (tenant_id = NULL) — note castore-FUSE builds
+  # need a real tenant (the store's castore reads are tenant-scoped),
+  # so build-dispatching scenarios should use mkBootstrap's `tenant`.
+  sshKeySetup = gatewayHost: sshKeySetupFor gatewayHost "";
+
+  # ── Tenant provisioning (standalone fixtures) ───────────────────────
+  # Production-shaped tenant creation: AdminService CreateTenant via
+  # rio-cli — the same RPC `xtask k8s cli create-tenant`, the k3s
+  # bootstrap flow, and the vm-cli scenario use — instead of poking the
+  # tenants table with psql. When the fixture runs with HMAC
+  # (`withHmac = true`), AdminService writes require the service token;
+  # rio-cli mints it from the shared service-hmac key.
+  provisionTenant =
+    {
+      # Python variable name of the node running the scheduler
+      # (standalone fixtures: the control/gateway node).
+      controlHost,
+      tenantName,
+      # `fixture.hmacKeys` (a path) or null when the fixture runs
+      # without HMAC.
+      hmacKeys ? null,
+    }:
+    ''
+      ${controlHost}.succeed(
+          "${covShellEnv}"
+          "RIO_SCHEDULER_ADDR=localhost:9001 "
+          ${lib.optionalString (
+            hmacKeys != null
+          ) ''"RIO_SERVICE_HMAC_KEY_PATH=${hmacKeys}/service-hmac.key "''}
+          "${rio-workspace}/bin/rio-cli create-tenant '${tenantName}'"
+      )
+      print("provisioned tenant ${tenantName}")
+    '';
 
   # ── Control-plane wait ──────────────────────────────────────────────
   # Blocks until postgres + rio-store + rio-scheduler are all ready.
