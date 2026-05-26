@@ -87,6 +87,17 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
 
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
+    // P0554: per-AZ S3 Express cache tier. Zone-name→bucket map from
+    // terraform (`express_bucket_by_zone`; empty when
+    // express_supported_az_ids = [] or the subnet intersection is
+    // empty, or when the state predates the output). Non-empty → flip
+    // the store to the tiered backend and hand the chart the map; each
+    // store pod selects its own AZ's bucket at startup by matching
+    // RIO_NODE_ZONE (downward-API pod topology label) against it.
+    // Empty → leave the chart default kind=s3, which is behaviorally
+    // identical for the store and doesn't imply a cache tier that was
+    // never provisioned.
+    let express_by_zone = tf.get_map("express_bucket_by_zone");
     let store_arn = tf.get("store_iam_role_arn")?;
     let scheduler_arn = tf.get("scheduler_iam_role_arn")?;
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
@@ -98,6 +109,12 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let gateway_dns_fqdn = tf.get_opt("gateway_dns_fqdn");
 
     info!("deploy tag={tag} ami={ami_tag} registry={ecr} cluster={cluster}");
+    if !express_by_zone.is_empty() {
+        info!(
+            "S3 Express cache tier: {} per-AZ bucket(s) → store.chunkBackend.kind=tiered",
+            express_by_zone.len()
+        );
+    }
 
     let client = kube::client().await?;
 
@@ -197,7 +214,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // cold start that's 3-4min of nothing. Side-task prints
         // not-yet-Ready Deployments every 15s; aborted when helm exits.
         let progress = shared::spawn_helm_wait_progress(&client);
-        let r = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
+        let mut helm = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
             .namespace(NS)
             .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
@@ -296,7 +313,20 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // P0539a: ServiceMonitor/PodMonitor/PrometheusRule. CRDs come
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
-            .set("monitoring.enabled", "true")
+            .set("monitoring.enabled", "true");
+        // P0554 / ADR-023: S3 Express cache tier, only when terraform
+        // provisioned the per-AZ directory buckets. The map renders as
+        // ONE JSON env var on the store Deployment; the per-pod AZ →
+        // bucket match happens store-side at startup (RIO_NODE_ZONE
+        // from the pod's topology label). Flipping back to kind=s3 is
+        // instant and lossless (r[infra.express.cache-tier]).
+        if !express_by_zone.is_empty() {
+            helm = helm.set("store.chunkBackend.kind", "tiered").set_json(
+                "store.chunkBackend.expressBucketByZone",
+                json!(express_by_zone).to_string(),
+            );
+        }
+        let r = helm
             .wait(Duration::from_secs(600))
             // AMI bring-up chicken-and-egg: the chart's post-install
             // hook smoke-tests through the gateway, which needs working

@@ -1,6 +1,6 @@
 //! OpenTofu wrappers. All paths are relative to repo root.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail};
 
@@ -110,18 +110,25 @@ pub fn destroy(dir: &str) -> Result<()> {
 }
 
 /// All tofu outputs from one `-json` read. See [`outputs`].
-pub struct Outputs(HashMap<String, String>);
+pub struct Outputs(HashMap<String, serde_json::Value>);
 
 impl Outputs {
-    /// Look up one output by name. Same friendly error as the old
-    /// per-key `output()` for missing keys / empty state.
+    /// Look up one string output by name. Same friendly error as the
+    /// old per-key `output()` for missing keys / empty state; a
+    /// non-string output (map/list) gets its own message so a wrong
+    /// accessor doesn't read as "state empty".
     pub fn get(&self, name: &str) -> Result<String> {
-        self.0.get(name).cloned().with_context(|| {
-            format!(
+        match self.0.get(name) {
+            Some(serde_json::Value::String(s)) => Ok(s.clone()),
+            Some(other) => bail!(
+                "tofu output '{name}' is not a string (got: {other}); \
+                 map-valued outputs go through get_map"
+            ),
+            None => bail!(
                 "tofu output '{name}' missing or state empty — \
                  run `cargo xtask k8s -p eks up --provision` first?"
-            )
-        })
+            ),
+        }
     }
 
     /// Optional output: `None` if absent from state OR present-but-empty
@@ -129,7 +136,28 @@ impl Outputs {
     /// `gateway_dns_fqdn`). Lets deploy run against a state file that
     /// predates the output without forcing a re-provision.
     pub fn get_opt(&self, name: &str) -> Option<String> {
-        self.0.get(name).filter(|v| !v.is_empty()).cloned()
+        self.0
+            .get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Map-valued output (terraform `map(string)`), e.g.
+    /// `express_bucket_by_zone`. Empty map when the output is absent
+    /// (state predates it) or empty — both mean "feature disabled",
+    /// mirroring [`Self::get_opt`]. BTreeMap so re-serializing for
+    /// `--set-json` is deterministic across deploys.
+    pub fn get_map(&self, name: &str) -> BTreeMap<String, String> {
+        self.0
+            .get(name)
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -211,13 +239,9 @@ pub fn outputs(dir: &str) -> Result<Outputs> {
     }
     let parsed: HashMap<String, Out> =
         serde_json::from_str(raw.trim()).context("parse tofu output -json")?;
-    let map = parsed
-        .into_iter()
-        .filter_map(|(k, o)| match o.value {
-            serde_json::Value::String(s) => Some((k, s)),
-            _ => None,
-        })
-        .collect();
+    // Keep every output's raw value — string outputs go through
+    // get/get_opt, map outputs (express_bucket_by_zone) through get_map.
+    let map = parsed.into_iter().map(|(k, o)| (k, o.value)).collect();
     Ok(Outputs(map))
 }
 
@@ -238,4 +262,66 @@ pub async fn state_bucket(cfg: &XtaskConfig, aws: &aws_config::SdkConfig) -> Res
     let ident = sts.get_caller_identity().send().await?;
     let account = ident.account().context("no AWS account ID")?.to_owned();
     resolve_bucket(cfg, || Ok(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Outputs {
+        Outputs(HashMap::from([
+            ("region".into(), serde_json::json!("us-east-2")),
+            ("gateway_dns_fqdn".into(), serde_json::json!("")),
+            (
+                "express_bucket_by_zone".into(),
+                serde_json::json!({
+                    "us-east-2a": "rio-build-chunk-cache--use2-az1--x-s3",
+                    "us-east-2b": "rio-build-chunk-cache--use2-az2--x-s3",
+                }),
+            ),
+            ("empty_map".into(), serde_json::json!({})),
+        ]))
+    }
+
+    /// String accessors keep their old semantics after the storage
+    /// switch to raw JSON values: present string → value, empty string
+    /// → None for get_opt, missing → error / None, and a map-valued
+    /// output is a get() error (not "state empty").
+    #[test]
+    fn outputs_string_accessors() {
+        let o = sample();
+        assert_eq!(o.get("region").unwrap(), "us-east-2");
+        assert_eq!(o.get_opt("region").as_deref(), Some("us-east-2"));
+        assert!(o.get_opt("gateway_dns_fqdn").is_none());
+        assert!(o.get_opt("nonexistent").is_none());
+        assert!(
+            o.get("nonexistent")
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+        let err = o.get("express_bucket_by_zone").unwrap_err().to_string();
+        assert!(err.contains("not a string"), "got: {err}");
+    }
+
+    /// Map accessor: zone→bucket pairs come back typed and sorted
+    /// (BTreeMap), absent/empty outputs collapse to an empty map —
+    /// the "cache tier disabled" signal deploy keys off (P0554).
+    #[test]
+    fn outputs_map_accessor() {
+        let o = sample();
+        let m = o.get_map("express_bucket_by_zone");
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m.get("us-east-2a").map(String::as_str),
+            Some("rio-build-chunk-cache--use2-az1--x-s3")
+        );
+        assert!(o.get_map("empty_map").is_empty());
+        assert!(o.get_map("nonexistent").is_empty());
+        // Deterministic JSON for --set-json (BTreeMap key order).
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"us-east-2a":"rio-build-chunk-cache--use2-az1--x-s3","us-east-2b":"rio-build-chunk-cache--use2-az2--x-s3"}"#
+        );
+    }
 }
