@@ -634,8 +634,10 @@ in
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (worker1/worker2/worker3) for both — the
   # fragment architecture changes what RUNS, not what's BOOTED.
-  # fanout→fuse-direct cache-state chain stays in core; reassign is
-  # disruptive (SIGKILL) → own test.
+  # reassign is disruptive (SIGKILL) → own test. (The pre-castore
+  # fuse-direct/fuse-listxattr fragments asserted behavior of the old
+  # persistent whole-path FUSE mount; their castore equivalents are
+  # vm-castore-e2e subtests — P0560 §B.)
   vm-scheduling-core-standalone =
     (scheduling {
       inherit pkgs common;
@@ -647,8 +649,6 @@ in
           # r[verify builder.overlay.stacked-lower+2]
           # r[verify builder.ns.order+2]
           "fanout"
-          "fuse-direct"
-          "fuse-listxattr"
           "overlay-readdir"
           "canonical-meta"
           # r[verify obs.metric.transfer-volume]
@@ -689,8 +689,8 @@ in
           # r[verify builder.shutdown.sigint+2]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
-          # gentler sibling. Uses worker2 only — no cache-chain coupling.
-          # ~35s: SIGINT + 30s inactive-wait + restart + FUSE remount.
+          # gentler sibling. Uses worker2 only.
+          # ~35s: SIGINT + 30s inactive-wait + restart.
           #
           # sigint-graceful LAST: restarts worker2 (systemctl start) but
           # doesn't wait for scheduler re-registration (HEARTBEAT_INTERVAL

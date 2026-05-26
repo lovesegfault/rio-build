@@ -106,7 +106,7 @@ def assert_metric_delta(before, after, name, expected_delta, labels=""):
 
 def assert_metric_ge(node, port, name, floor, labels=""):
     """Assert a metric >= floor. For monotonic counters where the
-    exact value depends on timing (e.g. fuse_cache_misses)."""
+    exact value depends on timing (e.g. castore_fuse_upcalls_total)."""
     m = scrape_metrics(node, port)
     actual = m.get(name, {}).get(labels)
     assert actual is not None and actual >= floor, (

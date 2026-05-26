@@ -3,8 +3,7 @@ scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
   # overlay-readdir-correctness — does ls INSIDE a build see ALL files?
   # ══════════════════════════════════════════════════════════════════
-  # fuse-direct above proves readdir() CAN fire. This probes whether
-  # the per-build overlay (lowerdir=/nix/store:{fuse}) serves a
+  # Probes whether the per-build overlay (castore-FUSE lower) serves a
   # CORRECT listing. multifile.nix: dep has 5 files, consumer ls's it
   # with a cold overlay dcache (no child names previously looked up).
   # If overlay shortcuts via its own dcache, count<5 = correctness bug.
@@ -22,7 +21,7 @@ scope: with scope; ''
       assert count == "5", (
           f"overlay readdir returned {count} entries, expected 5. "
           f"If <5: overlay serves from stale dcache (CORRECTNESS BUG). "
-          f"If =5 but ops.rs readdir still 0: overlay reads lower "
-          f"via a path that skips /dev/fuse (coverage gap only)."
+          f"If =5 but castore-FUSE readdir upcalls stay 0: overlay reads "
+          f"the lower via a path that skips /dev/fuse (coverage gap only)."
       )
 ''

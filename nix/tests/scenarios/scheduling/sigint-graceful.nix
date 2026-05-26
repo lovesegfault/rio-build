@@ -1,43 +1,38 @@
 # scheduling subtest fragment — composed by scenarios/scheduling.nix mkTest.
 scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
-  # sigint-graceful — Ctrl+C path: main() returns, FUSE unmounts
+  # sigint-graceful — Ctrl+C path: main() returns (Drop + atexit run)
   # ══════════════════════════════════════════════════════════════════
   # Before remediation 15: worker main.rs watched SIGTERM only.
   # SIGINT hit the default handler → immediate termination → no
-  # Drop, no atexit. FUSE mount leaked (next start EBUSY), profraw
-  # never flushed (local dev Ctrl+C = zero coverage).
+  # Drop, no atexit. Per-build mounts leaked (next build EBUSY),
+  # profraw never flushed (local dev Ctrl+C = zero coverage).
   #
-  # Three-layered assertion:
+  # Two-layered assertion:
   #   1. ExecMainCode=1 (CLD_EXITED) + ExecMainStatus=0 → main()
   #      RETURNED Ok(()) via the shutdown.cancelled() select! arm.
   #      PRIMARY — SIGINT default handler would give Code=2
   #      (CLD_KILLED) Status=2 (signal number). Code=1 Status=0
-  #      proves main.rs:504 shutdown arm fired, stack unwound.
-  #   2. FUSE mount gone. Belt-and-suspenders: AutoUnmount means
-  #      the kernel unmounts on fd close regardless, so this alone
-  #      doesn't distinguish graceful from crash. But with Code=1
-  #      proven above, this confirms Mount::drop ran in the normal
-  #      unwind (what a human debugging EBUSY would check first).
-  #   3. [coverage mode only] profraw count increased → atexit
+  #      proves the shutdown arm fired and the stack unwound (the
+  #      per-build CastoreMount/OverlayMount Drops run on that
+  #      unwind; an idle worker has nothing mounted, so there is no
+  #      mountpoint left to assert on — the castore stack mounts
+  #      per-build, not at startup).
+  #   2. [coverage mode only] profraw count increased → atexit
   #      fired → LLVM flush ran. Guards .#coverage: a main.rs
   #      refactor breaking the cancellation arm would silently
   #      zero worker VM coverage.
   #
-  # Uses worker2: worker1 holds FUSE cache state for fuse-direct
-  # (core-test cache-chain coupling). worker2 is disposable here —
-  # disrupt split only.
+  # Uses worker2: worker1/worker3 keep serving the disrupt split's
+  # other fragments; worker2 is disposable here.
   #
   # Standalone fixture only (k3s worker pods are distroless, no
   # shell, no systemctl). This is the only place we can deliver
   # SIGINT to a worker PID and inspect aftermath from the host.
-  with subtest("sigint-graceful: SIGINT → main() returns → FUSE unmounts"):
-      # Baseline: mount IS present (worker running, FUSE alive).
-      # One-shot builder restarts between builds — wait for the
-      # next instance to be up and mounted (RestartSec=1s).
-      worker2.wait_until_succeeds(
-          "mountpoint -q /var/rio/fuse-store", timeout=15
-      )
+  with subtest("sigint-graceful: SIGINT → main() returns → atexit runs"):
+      # Baseline: the unit is up (one-shot builder restarts between
+      # builds — RestartSec=1s, so wait rather than assert).
+      worker2.wait_for_unit("rio-builder.service")
 
       # Coverage-mode baseline. `ls | wc -l` prints 0 on no-match
       # (wc counts lines from ls's empty stdout); `|| echo 0`
@@ -72,7 +67,7 @@ scope: with scope; ''
       # `systemctl stop` would send SIGTERM (KillSignal default) —
       # that path already works (rio-common::signal::shutdown_signal
       # watched SIGTERM from day one). SIGINT tests the NEW code
-      # at main.rs:503 (r[impl builder.shutdown.sigint]).
+      # at main.rs (r[impl builder.shutdown.sigint]).
       #
       # The unit has Restart=always (one-shot builder), so the
       # post-exit state is a ~1s blip — ExecMainCode reads 0
@@ -111,11 +106,7 @@ scope: with scope; ''
       print(f"sigint-graceful: {exit_info.strip()} (CLD_EXITED, "
             f"status 0 — main() returned)")
 
-      # SECONDARY: FUSE mount gone. Observable now (Restart=no
-      # drop-in in effect).
-      worker2.succeed("! mountpoint -q /var/rio/fuse-store")
-
-      # TERTIARY [coverage mode only]: fresh profraw appeared.
+      # SECONDARY [coverage mode only]: fresh profraw appeared.
       # LLVM registers __llvm_profile_write_file in atexit —
       # fires iff main() returns (not on signal death).
       #
@@ -152,12 +143,6 @@ scope: with scope; ''
           "systemctl start rio-builder.service"
       )
       worker2.wait_for_unit("rio-builder.service")
-      # Wait for FUSE remount so subsequent fragments (none
-      # currently, but collectCoverage + future additions) see
-      # a consistent state. FUSE mount happens early in main().
-      worker2.wait_until_succeeds(
-          "mountpoint -q /var/rio/fuse-store", timeout=30
-      )
       # Wait for scheduler re-registration. Worker heartbeats every
       # HEARTBEAT_INTERVAL_SECS=10 (rio-common/src/limits.rs:51).
       # Without this, any fragment inserted after sigint-graceful

@@ -17,24 +17,20 @@
 #
 #
 # Fragment architecture: returns { fragments, mkTest }. default.nix
-# composes into 2 parallel VM tests (core, disrupt). fanout → fuse-direct
-# chain via FUSE cache state; all else independent.
+# composes into 2 parallel VM tests (core, disrupt); all fragments are
+# independent (no cross-fragment state since the castore cutover — each
+# build serves its inputs from a per-build castore-FUSE mount).
 # worker.overlay.stacked-lower — verify marker at default.nix:subtests[fanout]
 # worker.ns.order — verify marker at default.nix:subtests[fanout]
 #   The writableStore=false pattern in common.nix:mkWorkerNode keeps the
 #   worker VM's /nix/store as a plain 9p mount (not itself an overlay),
-#   so the per-build overlay's lowerdir=/nix/store:{fuse} stack is valid.
+#   so the per-build overlay (castore-FUSE lower) stacks cleanly.
 #   A build succeeding also proves mount-namespace ordering: both overlayfs
 #   and nix-daemon's sandbox need unshare(CLONE_NEWNS); wrong order → fail.
 #
 # obs.metric.scheduler — verify marker at default.nix:subtests[load-50drv]
 # obs.metric.builder — verify marker at default.nix:subtests[load-50drv]
 # obs.metric.store — verify marker at default.nix:subtests[load-50drv]
-#
-# worker.fuse.lookup-caches — verify marker at default.nix:subtests[fanout]
-#   fanout asserts rio_builder_fuse_cache_misses_total ≥1 on each small
-#   worker. Nonzero misses prove lookup()→ensure_cached()→materialize
-#   ran and the inode→realpath mapping is cached (ops.rs:52+).
 #
 # obs.metric.transfer-volume — verify marker at default.nix:subtests[chunks]
 #   chunks asserts rio_store_put_path_bytes_total delta ≥300000 after
@@ -182,14 +178,6 @@ let
     scenario = "scheduling";
     inherit prelude fragments fixture;
     defaultTimeout = 600;
-    # fanout populates the FUSE cache that fuse-direct reads.
-    chains = [
-      {
-        before = "fanout";
-        after = "fuse-direct";
-        msg = "fuse-direct requires fanout earlier (FUSE cache state)";
-      }
-    ];
   };
 in
 {
