@@ -530,19 +530,25 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         // DB is the source of truth for poisoned_at (the in-memory DAG
         // reconstructs Instant from elapsed_secs at startup but doesn't
-        // store the original timestamp for display).
+        // store the original timestamp for display). `failed_executors`
+        // is the attempt-ledger aggregate UNIONed with the frozen legacy
+        // `failed_builders` column, so post-cutover poisons keep listing
+        // the executors that failed them and pre-066 poisons display
+        // exactly as before.
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let rows = db
-            .load_poisoned_derivations()
+            .load_poisoned_display()
             .await
-            .status_internal("load_poisoned_derivations")?;
+            .status_internal("load_poisoned_display")?;
         let derivations = rows
             .into_iter()
-            .map(|r| PoisonedDerivation {
-                drv_path: r.drv_path,
-                failed_executors: r.failed_builders,
-                poisoned_secs_ago: r.elapsed_secs.max(0.0) as u64,
-            })
+            .map(
+                |(drv_path, failed_executors, poisoned_secs_ago)| PoisonedDerivation {
+                    drv_path,
+                    failed_executors,
+                    poisoned_secs_ago: poisoned_secs_ago.max(0.0) as u64,
+                },
+            )
             .collect();
         Ok(Response::new(ListPoisonedResponse { derivations }))
     }

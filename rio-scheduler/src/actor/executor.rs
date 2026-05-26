@@ -827,8 +827,11 @@ impl DagActor {
             .await;
             match result {
                 Ok((won, d)) => {
-                    if won && let Some(state) = self.dag.node_mut(&drv_hash) {
-                        state.classify_attempt_record(exec_id, label, class, floor_flags);
+                    if won {
+                        if let Some(state) = self.dag.node_mut(&drv_hash) {
+                            state.classify_attempt_record(exec_id, label, class, floor_flags);
+                        }
+                        self.refresh_retry_view(&drv_hash);
                     }
                     decision = Some(d);
                 }
@@ -865,8 +868,11 @@ impl DagActor {
                 .await;
                 match result {
                     Ok((inserted, d)) => {
-                        if inserted && let Some(state) = self.dag.node_mut(&drv_hash) {
-                            state.push_attempt_record(row.to_record());
+                        if inserted {
+                            if let Some(state) = self.dag.node_mut(&drv_hash) {
+                                state.push_attempt_record(row.to_record());
+                            }
+                            self.refresh_retry_view(&drv_hash);
                         }
                         decision = Some(d);
                     }
@@ -882,19 +888,10 @@ impl DagActor {
         // m044, restructured: at the ceiling (`at_cap=true`) this path
         // still owns the accounting — kubelet-level OOMKilled /
         // EvictedDiskPressure means the pod died and no worker
-        // CompletionReport will ever arrive — but the cap check is now
-        // the fold's verdict above. The legacy RAM increment stays
-        // until T-1b.13 (rule 1) with its as-built shape: only an
-        // under-cap at-cap event bumps the counter, and only while the
-        // derivation is still poison-able.
+        // CompletionReport will ever arrive — but the cap check is the
+        // fold's verdict above and the charge is the classified
+        // installment row (the cached view picks it up at the refresh).
         let max = self.retry_policy.max_infra_retries;
-        if outcome.at_cap
-            && verdict_eligible
-            && let Some(state) = self.dag.node_mut(&drv_hash)
-            && state.retry.infra_count < max
-        {
-            state.retry.infra_count += 1;
-        }
 
         // Act on the verdict. Requeue verdicts are a no-op — the
         // disconnect already re-queued the derivation (or the race-ahead
@@ -1075,13 +1072,16 @@ impl DagActor {
             .await;
             match result {
                 Ok((won, d)) => {
-                    if won && let Some(state) = self.dag.node_mut(&drv_hash) {
-                        state.classify_attempt_record(
-                            exec_id,
-                            "deadline_exceeded",
-                            crate::state::OutcomeClass::Timeout,
-                            floor_flags,
-                        );
+                    if won {
+                        if let Some(state) = self.dag.node_mut(&drv_hash) {
+                            state.classify_attempt_record(
+                                exec_id,
+                                "deadline_exceeded",
+                                crate::state::OutcomeClass::Timeout,
+                                floor_flags,
+                            );
+                        }
+                        self.refresh_retry_view(&drv_hash);
                     }
                     decision = Some(d);
                 }
@@ -1092,16 +1092,6 @@ impl DagActor {
                            the budget)");
                 }
             }
-        }
-
-        // Legacy RAM bookkeeping (rule 1, until T-1b.13), as-built
-        // shape: every under-cap DeadlineExceeded consumes budget; the
-        // at-cap event is the terminal one and never incremented.
-        if verdict_eligible
-            && let Some(state) = self.dag.node_mut(&drv_hash)
-            && state.retry.timeout_count < max
-        {
-            state.retry.timeout_count += 1;
         }
 
         // Act on the verdict: Cancel reuses the worker-reported timeout
@@ -1229,13 +1219,21 @@ impl DagActor {
             .await;
             let decision = match result {
                 Ok((won, decision)) => {
-                    if won && let Some(state) = self.dag.node_mut(drv_hash) {
-                        state.classify_attempt_record(
-                            exec_id,
-                            "unreported",
-                            crate::state::OutcomeClass::ExecutorCrash,
-                            (false, false, false),
-                        );
+                    if won {
+                        if let Some(state) = self.dag.node_mut(drv_hash) {
+                            state.classify_attempt_record(
+                                exec_id,
+                                "unreported",
+                                crate::state::OutcomeClass::ExecutorCrash,
+                                (false, false, false),
+                            );
+                        }
+                        // The established crash joins the fold-backed
+                        // exclusion the dispatch-time readers consume
+                        // (`hard_filter`'s failed-on clause), so the
+                        // crashing executor is not re-offered the same
+                        // derivation within this leader tenure.
+                        self.refresh_retry_view(drv_hash);
                     }
                     decision
                 }

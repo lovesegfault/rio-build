@@ -3409,7 +3409,8 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
 // r[verify sched.db.assignment-terminal-on-status+2]
 /// I-209: PermanentFailure MUST close the active `assignments` row
 /// (`pending` → `failed`, `completed_at` set) and record the executor
-/// in `derivations.retry.failed_builders`. Pre-fix, only the success path
+/// that produced it (durably on the attempt row, surfaced through the
+/// ListPoisoned aggregate). Pre-fix, only the success path
 /// did the assignment write — every poisoned/cancelled derivation
 /// kept a `pending` row, the pruner's `NOT EXISTS assignments` never
 /// matched, and `derivations` leaked.
@@ -3448,15 +3449,21 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
     );
     assert!(has_completed_at, "completed_at stamped on terminal");
 
-    let failed: Vec<String> =
-        sqlx::query_scalar("SELECT failed_builders FROM derivations WHERE drv_hash = $1")
-            .bind("i209")
-            .fetch_one(&db.pool)
-            .await?;
+    // I-209: the executor that produced the permanent failure is
+    // recorded durably on the attempt row and surfaced through the
+    // operator listing (the legacy `failed_builders` column is frozen
+    // since the mirror-writer retirement, so the aggregate is the
+    // surface that must keep showing it).
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+    let display = sched_db.load_poisoned_display().await?;
+    let entry = display
+        .iter()
+        .find(|(path, _, _)| path == &test_drv_path("i209"))
+        .expect("poisoned listing contains the i209 derivation");
     assert_eq!(
-        failed,
+        entry.1,
         vec!["i209-w".to_string()],
-        "I-209: handle_permanent_failure records the executor"
+        "I-209: ListPoisoned aggregate records the executor"
     );
 
     // ── Part B: pruner is unblocked ────────────────────────────────────
@@ -5436,16 +5443,17 @@ async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResul
         vec!["transient", "transient"],
         "one ledger row per observed transient failure"
     );
-    // The legacy retry_count mirror column kept being written by the
-    // retry arm (rule 1).
+    // The legacy retry_count mirror column is frozen since the
+    // mirror-writer retirement (T-1b.13): the per-cycle count lives in
+    // the ledger rows alone, so the column must stay at its default.
     let retry_count: i32 =
         sqlx::query_scalar("SELECT retry_count FROM derivations WHERE drv_hash = $1")
             .bind(drv)
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(
-        retry_count, 1,
-        "legacy mirror incremented on the retry arm only"
+        retry_count, 0,
+        "frozen legacy mirror column is no longer written by the retry arm"
     );
     Ok(())
 }

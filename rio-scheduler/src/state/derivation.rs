@@ -437,10 +437,24 @@ impl DerivationStatus {
 
 /// Retry / failure-tracking sub-state of a [`DerivationState`].
 ///
-/// All fields are **in-memory only** unless otherwise noted: recovery
-/// resets them to conservative defaults (won't spuriously poison after
-/// restart). `failed_builders` is persisted; `failure_count` is
-/// re-derived from it on recovery (same-worker repeats forgiven).
+/// Since the Phase-1b collapse (T-1b.13) this is the **fold-derived
+/// cached dispatch view**: the budget counters and the per-executor
+/// exclusion set are recomputed from `decide()` over the node's
+/// committed attempt history (seeded by the carried legacy floor,
+/// decision P5) whenever that history changes
+/// (`DerivationState::refresh_retry_view_from_ledger` /
+/// `DerivationState::rebuild_retry_view_from_ledger`); no code path
+/// mutates the budget counters directly any more
+/// (`sched.retry.counters-refine-history`). Two named carve-outs stay
+/// actor-managed rather than fold-derived: [`Self::poisoned_at`]
+/// (status metadata owned by the `derivations` row,
+/// `sched.poison.ttl-persist`) and [`Self::backoff_until`] (pacing
+/// state — the production jitter is applied at the failure site and
+/// the clear-on-dispatch has no ledger event). The durable source of
+/// truth for every verdict is the appending transaction's suffix read;
+/// this view only feeds the dispatch-time readers (`hard_filter`'s
+/// exclusion, the backoff defer), diagnostics, and the resubmit-bound
+/// check.
 #[derive(Debug, Clone, Default)]
 pub struct RetryState {
     /// Number of retry attempts so far in the CURRENT poison cycle.
@@ -449,12 +463,16 @@ pub struct RetryState {
     /// [`Self::resubmit_cycles`] for the cross-cycle counter.
     pub count: u32,
     /// Number of poison→resubmit reset events. Gated against
-    /// [`POISON_RESUBMIT_RETRY_LIMIT`]. Incremented by `dag::merge` on
-    /// each resubmit-reset; persisted (`M_051`) so the bound survives
-    /// leader failover. Distinct from [`Self::count`]: a single counter
-    /// cannot be both per-cycle-reset and cross-cycle-accumulated —
-    /// when `count` served both roles, the `max_retries=2` cap was the
-    /// permanent ceiling and the resubmit bound never fired (bug_152).
+    /// [`POISON_RESUBMIT_RETRY_LIMIT`]. Seeded in memory by `dag::merge`
+    /// on each resubmit-reset (the carried prior + 1 — the documented
+    /// in-memory seed of the new cycle); the `resubmit_reset` ledger row
+    /// then carries the same index durably, so the bound survives leader
+    /// failover via the fold (the legacy `M_051` column is frozen and
+    /// only floors pre-ledger history). Distinct from [`Self::count`]: a
+    /// single counter cannot be both per-cycle-reset and
+    /// cross-cycle-accumulated — when `count` served both roles, the
+    /// `max_retries=2` cap was the permanent ceiling and the resubmit
+    /// bound never fired (bug_152).
     pub resubmit_cycles: u32,
     /// Number of InfrastructureFailure re-dispatches so far. Separate
     /// from `count` because infra failures don't count toward the
@@ -488,12 +506,14 @@ pub struct RetryState {
     pub exempt_infra_count: u32,
     /// Workers that have failed building this derivation. Drives
     /// `best_executor()` exclusion + poison threshold in distinct mode.
-    /// Persisted.
+    /// Durable via the attempt ledger (the legacy `failed_builders`
+    /// column is frozen and only floors pre-ledger history).
     pub failed_builders: HashSet<ExecutorId>,
     /// Total TransientFailure/disconnect count (same-worker repeats
     /// counted). Drives poison threshold when
     /// `PoisonConfig::require_distinct_workers = false` (single-worker
-    /// dev deployments). Recovery initializes to `failed_builders.len()`.
+    /// dev deployments). Fold-derived; floored at
+    /// `failed_builders.len()` for mixed-era histories.
     /// InfrastructureFailure does NOT increment this (T1's split).
     pub failure_count: u32,
     /// When the derivation entered the poisoned state (for TTL expiry).
@@ -513,24 +533,6 @@ pub struct RetryState {
     ///
     /// Cleared on successful dispatch (assign_to_worker).
     pub backoff_until: Option<Instant>,
-}
-
-impl RetryState {
-    /// Reset all failure-tracking fields. Call after a cache-hit
-    /// transition from Poisoned/DependencyFailed/Failed to Completed
-    /// (I-099/I-094) — the prior failures are moot once the output
-    /// exists. Does NOT change `status`; caller transitions separately.
-    pub fn clear(&mut self) {
-        self.count = 0;
-        self.resubmit_cycles = 0;
-        self.infra_count = 0;
-        self.timeout_count = 0;
-        self.last_infra_failure_at = None;
-        self.exempt_infra_count = 0;
-        self.failed_builders.clear();
-        self.failure_count = 0;
-        self.poisoned_at = None;
-    }
 }
 
 db_str_enum! {
@@ -591,7 +593,7 @@ db_str_enum! {
         /// Reset row: `dag::merge` resubmit reset of a retriable
         /// terminal node (carries the new `resubmit_cycle`).
         ResubmitReset = "resubmit_reset",
-        /// Reset row: cache-hit `RetryState::clear()` (output turned up
+        /// Reset row: cache-hit retry-state reset (output turned up
         /// in the store / re-probe found it substitutable).
         CacheHitClear = "cache_hit_clear",
         /// Reset row: admin `ClearPoison` or the poison-TTL expiry.
@@ -1719,7 +1721,7 @@ impl DerivationState {
         }
     }
 
-    // r[impl sched.merge.poisoned-resubmit-bounded+2]
+    // r[impl sched.merge.poisoned-resubmit-bounded+3]
     /// Whether a resubmit of THIS node should reset it for re-dispatch.
     ///
     /// Wraps [`DerivationStatus::is_retriable_on_resubmit`] (the
@@ -1813,11 +1815,12 @@ impl DerivationState {
     /// `poisoned_at` (and the poisoned status) stay derivations-row
     /// owned (`sched.poison.ttl-persist`): whatever the row constructor
     /// set is preserved, not overwritten by the fold's approximation.
-    /// Until T-1b.13 deletes them, the legacy RAM mutation sites keep
-    /// updating the rebuilt view exactly as they updated the forgiven
-    /// one, so the not-yet-converted dispatch-time readers
-    /// (`hard_filter`, the backoff defer) see at least as much history
-    /// as they would have seen under the old projection.
+    /// `backoff_until` IS adopted from the fold here — recovery has no
+    /// in-memory pacing state to preserve, and restoring the
+    /// deterministic deadline keeps the pre-failover backoff honored
+    /// after a leader change. The live refresh after an append uses
+    /// [`Self::refresh_retry_view_from_ledger`] instead, which preserves
+    /// the actor-managed (jittered) value.
     pub(crate) fn rebuild_retry_view_from_ledger(
         &mut self,
         budget: &crate::retry_policy::Budget,
@@ -1859,6 +1862,26 @@ impl DerivationState {
                 }
             }),
         };
+    }
+
+    /// Refresh the cached dispatch view (`self.retry`) from the seeded
+    /// fold after the in-memory attempt history changed (an append or a
+    /// two-installment classification committed). Same computation as
+    /// [`Self::rebuild_retry_view_from_ledger`], but the actor-managed
+    /// `backoff_until` carve-out is preserved instead of being replaced
+    /// by the fold's deterministic (no-jitter) deadline: the production
+    /// jitter is applied at the failure site and the clear-on-dispatch
+    /// has no ledger event to fold from, so the live pacing value must
+    /// not be clobbered by a refresh. (`poisoned_at` is preserved by the
+    /// rebuild itself.)
+    pub(crate) fn refresh_retry_view_from_ledger(
+        &mut self,
+        budget: &crate::retry_policy::Budget,
+        now_epoch_secs: crate::retry_policy::AbsTime,
+    ) {
+        let backoff_until = self.retry.backoff_until;
+        self.rebuild_retry_view_from_ledger(budget, now_epoch_secs);
+        self.retry.backoff_until = backoff_until;
     }
 
     /// Test-only: directly set status bypassing state machine validation.

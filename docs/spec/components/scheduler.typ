@@ -661,8 +661,9 @@ the 300 s window anchor, and the placement exclusion (including backstop-
 and crash-established entries that never had a per-counter column mirror)
 survive a leader change per #rref("sched.retry.failover-budget"). The
 legacy-column seed is the transitional mixed-era floor (its union/max
-semantics cannot double-count rows the still-active legacy writers also
-mirrored); it is dropped in Phase 2 together with the columns. The previous
+semantics cannot double-count rows the legacy writers --- active until the
+T-1b.13 cutover froze the columns --- also mirrored); it is dropped in
+Phase 2 together with the columns. The previous
 revision of this rule pinned the pre-ledger selective forgiveness
 (4 recovered / 1 derived / 5 defaulted), which the as-built Stage-B model
 still encodes until the Phase-1c re-encode.
@@ -1579,19 +1580,21 @@ Queue-level preemption is fully supported:
   The `poisoned → created` transition is gated by a 24h TTL.
 ]
 
-#r("sched.merge.poisoned-resubmit-bounded+2")[
+#r("sched.merge.poisoned-resubmit-bounded+3")[
   When a build merges and finds a pre-existing `poisoned` node in the global
   DAG, the node resets for re-dispatch (same as
   `cancelled`/`failed`/`dependency_failed`) iff its `resubmit_cycles` is below
   `POISON_RESUBMIT_RETRY_LIMIT` (2 cycles). An explicit client re-submission is
   treated as retry intent --- the operator presumably fixed the underlying
   cause --- but bounded so a genuinely-broken derivation cannot loop forever.
-  `resubmit_cycles` is incremented on each reset and persisted
-  (`derivations.resubmit_cycles`), so the bound accumulates across
-  re-submissions and survives scheduler restart. The reset gives the node a
-  fresh per-cycle `retry_count = 0` (full `max_retries` budget). At or above
-  the limit the node stays `poisoned` and the build fail-fasts (use the 24h TTL
-  or `ClearPoison` admin RPC to override).
+  `resubmit_cycles` is incremented on each reset and persisted durably --- the
+  `resubmit_reset` attempt-ledger row appended for the reset carries the new
+  cycle index, and the frozen legacy `derivations.resubmit_cycles` column
+  floors pre-ledger history --- so the bound accumulates across re-submissions
+  and survives scheduler restart. The reset gives the node a fresh per-cycle
+  `retry_count = 0` (full `max_retries` budget). At or above the limit the
+  node stays `poisoned` and the build fail-fasts (use the 24h TTL or
+  `ClearPoison` admin RPC to override).
 ]
 
 #r("sched.merge.stale-completed-verify+5")[
@@ -2366,14 +2369,16 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   transactional chokepoint. Mirrors `sweep_stale_live_pins`.
 ]
 
-#r("sched.db.clear-poison-batch")[
+#r("sched.db.clear-poison-batch+2")[
   `clear_poison` has a `clear_poison_batch(&[DrvHash])` variant using `WHERE
   drv_hash = ANY($1)`. The merge-time resubmit-reset path (`reset_on_resubmit`)
   clears poison for every node a resubmit flipped from terminal to fresh;
   per-hash sequential calls inside the single-threaded actor cost N round-trips
-  on the dispatch hot path. The batch variant additionally increments
-  `resubmit_cycles` (the scalar zeroes it: admin/TTL = full reset; resubmit =
-  bound accumulates).
+  on the dispatch hot path. The batch variant leaves the frozen
+  `resubmit_cycles` mirror column untouched --- the new cycle index is carried
+  by the `resubmit_reset` attempt-ledger row appended in the same transaction
+  (the scalar zeroes the column: admin/TTL = full reset; resubmit = bound
+  accumulates via the ledger).
 ]
 
 == Schema (pseudo-DDL)

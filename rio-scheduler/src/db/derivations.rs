@@ -171,58 +171,15 @@ impl SchedulerDb {
         Ok(updated)
     }
 
-    /// Increment the retry count for a derivation.
-    pub async fn increment_retry_count(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            "UPDATE derivations SET retry_count = retry_count + 1, updated_at = now() WHERE drv_hash = $1",
-            drv_hash.as_str(),
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Append a worker ID to a derivation's `failed_builders` array.
-    ///
-    /// Called from `handle_transient_failure` and `reassign_derivations`
-    /// (worker disconnect mid-build) so recovery can rebuild the
-    /// HashSet that feeds best_executor exclusion + poison detection.
-    ///
-    /// The `WHERE NOT ($2 = ANY(failed_builders))` guard makes this a
-    /// no-op when the worker is already recorded. PG arrays are NOT
-    /// sets — without the guard, a flapping worker (disconnect →
-    /// reconnect → disconnect) would append duplicates unboundedly.
-    /// Recovery builds a HashSet from this array so dupes would
-    /// collapse in-mem, but the PG row itself grows forever. The
-    /// guard keeps the array bounded to distinct-workers-ever-failed.
-    pub async fn append_failed_worker(
-        &self,
-        drv_hash: &DrvHash,
-        executor_id: &ExecutorId,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            "UPDATE derivations \
-             SET failed_builders = array_append(failed_builders, $2), updated_at = now() \
-             WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_builders))",
-            drv_hash.as_str(),
-            executor_id.as_str(),
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     // r[impl sched.sla.reactive-floor+2]
     /// Persist a derivation's reactive `resource_floor` (D4, `M_044`).
     ///
     /// Called from `bump_floor_or_count` right after the in-mem
     /// doubling so a scheduler failover between OOM and retry doesn't
     /// reset the floor to zero → re-dispatch at probe defaults → OOM
-    /// again. Same write-at-mutation pattern as `append_failed_worker`
-    /// above (NOT in `batch_upsert_derivations` — merge-time floor is
-    /// always zero and `ON CONFLICT DO UPDATE` there would clobber a
-    /// promoted floor on re-merge).
+    /// again. Write-at-mutation (NOT in `batch_upsert_derivations` —
+    /// merge-time floor is always zero and `ON CONFLICT DO UPDATE`
+    /// there would clobber a promoted floor on re-merge).
     pub async fn update_resource_floor(
         &self,
         drv_hash: &DrvHash,
@@ -351,8 +308,9 @@ impl SchedulerDb {
     /// zero `retry_count`, zero `resubmit_cycles`, status='created'. Used
     /// by ClearPoison admin RPC + TTL expiry in `handle_tick` — admin
     /// override and TTL expiry are full resets (unlike
-    /// [`Self::clear_poison_batch`], which preserves+increments
-    /// `resubmit_cycles` for the resubmit-bound).
+    /// [`Self::clear_poison_batch`], which leaves the frozen
+    /// `resubmit_cycles` mirror column untouched — the resubmit-bound is
+    /// carried by the `resubmit_reset` ledger row).
     ///
     /// Owns its connection; reset sites that already hold a transaction
     /// use `clear_poison_in_tx` instead.
@@ -362,23 +320,25 @@ impl SchedulerDb {
         tx.commit().await
     }
 
-    // r[impl sched.db.clear-poison-batch]
+    // r[impl sched.db.clear-poison-batch+2]
     /// Batch poison clear for the resubmit-reset path: one round-trip
     /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears per-cycle
-    /// state (`poisoned_at`, `failed_builders`, `retry_count`) AND
-    /// increments `resubmit_cycles` so the
-    /// `r[sched.merge.poisoned-resubmit-bounded]` bound survives leader
-    /// failover. The in-mem increment at `dag::merge` is the
-    /// dispatch-time source of truth; PG mirrors it here.
+    /// state (`poisoned_at`, `failed_builders`, `retry_count`) and
+    /// leaves the frozen `resubmit_cycles` mirror column untouched —
+    /// the new cycle index that keeps the
+    /// `r[sched.merge.poisoned-resubmit-bounded]` bound alive across a
+    /// leader failover is carried by the `resubmit_reset` ledger row
+    /// appended in the same transaction (the in-mem carry at
+    /// `dag::merge` is the dispatch-time seed it stamps).
     ///
     /// I-169: `merge.rs`' resubmit-reset path called `clear_poison`
     /// per-hash inside the single-threaded actor — a 500-node resubmit
     /// blocked heartbeat/dispatch for 500 sequential PG round-trips.
     /// Same shape as [`update_derivation_status_batch`].
     ///
-    /// NOT the same column set as [`clear_poison`]: that one zeroes
-    /// `resubmit_cycles` (admin/TTL → full reset); this one increments
-    /// it (resubmit → bound accumulates).
+    /// NOT the same column set as [`clear_poison`]: that one also
+    /// zeroes `resubmit_cycles` (admin/TTL → full reset); this one
+    /// never touches it (resubmit → bound accumulates via the ledger).
     ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
@@ -406,7 +366,6 @@ impl SchedulerDb {
         let result = sqlx::query!(
             "UPDATE derivations
              SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
-                 resubmit_cycles = resubmit_cycles + 1,
                  status = 'created', updated_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
@@ -493,6 +452,18 @@ impl SchedulerDb {
     /// `poisoned_at` is deliberately not read here — the live failure
     /// paths only run for non-terminal derivations, and the recovery-side
     /// seed construction (T-1b.12a) owns the poisoned-row variant.
+    ///
+    /// The mirror columns are frozen as of the T-1b.13 cutover: their
+    /// per-counter writers are gone and only the reset paths still zero
+    /// them, so they hold at most what the pre-cutover writers left.
+    // TODO: Phase 2 drops the `derivations.{retry_count, failed_builders,
+    // resubmit_cycles}` mirror columns, this seed loader, and the
+    // `legacy_seed` parameter of `decide()` (restoring the frozen §5a-2
+    // 3-arg signature) once the drain condition holds: no non-terminal or
+    // poisoned derivation has non-empty mirror columns together with an
+    // attempt suffix that contains no reset row — i.e. every live failure
+    // history is either fully post-066 or has passed through a reset that
+    // makes the seed unreachable.
     pub(crate) async fn load_retry_seed_in_tx(
         tx: &mut PgConnection,
         derivation_id: uuid::Uuid,
@@ -545,6 +516,53 @@ impl SchedulerDb {
                    ) AS elapsed_secs
             FROM derivations
             WHERE status = 'poisoned'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Operator-facing poisoned listing for `AdminService.ListPoisoned`:
+    /// `(drv_path, failed_executors, poisoned_secs_ago)` per poisoned
+    /// derivation, with `failed_executors` aggregated from the attempt
+    /// ledger UNIONed with the frozen legacy `failed_builders` column.
+    ///
+    /// The legacy column stopped being written at the T-1b.13 cutover,
+    /// so post-cutover poisons would otherwise display an empty executor
+    /// list; the union keeps pre-066 poisons (whose history exists only
+    /// in the column) displaying exactly as before. Only the ledger
+    /// classes whose fold arm charges the exclusion set
+    /// (`transient`, `permanent`, `backstop`, `executor_crash`) are
+    /// aggregated, so the displayed set keeps the as-built meaning of
+    /// "executors whose failure charged this derivation" rather than
+    /// every executor that ever touched it.
+    pub(crate) async fn load_poisoned_display(
+        &self,
+    ) -> Result<Vec<(String, Vec<String>, f64)>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT d.drv_path,
+                   COALESCE(
+                       (SELECT array_agg(DISTINCT e ORDER BY e)
+                        FROM (
+                            SELECT unnest(d.failed_builders) AS e
+                            UNION
+                            SELECT a.executor_id
+                            FROM drv_attempts a
+                            WHERE a.derivation_id = d.derivation_id
+                              AND a.executor_id IS NOT NULL
+                              AND a.event_kind = 'attempt'
+                              AND a.outcome_class IN
+                                  ('transient', 'permanent', 'backstop', 'executor_crash')
+                        ) u),
+                       '{}'::text[]
+                   ) AS failed_executors,
+                   COALESCE(
+                       EXTRACT(EPOCH FROM (now() - d.poisoned_at))::float8,
+                       0.0
+                   ) AS poisoned_secs_ago
+            FROM derivations d
+            WHERE d.status = 'poisoned'
             "#,
         )
         .fetch_all(&self.pool)

@@ -113,15 +113,10 @@ async fn test_transient_failure_db_fault_keeps_pre_report_state() -> TestResult 
 
     // Phase 1b posture: the appending transaction is the decision
     // point — when it cannot commit, the failure is not applied and the
-    // derivation stays in its pre-report state (the legacy mirror write
-    // failure is also logged, before the transaction runs).
+    // derivation stays in its pre-report state.
     assert!(
         logs_contain("appending transaction failed"),
         "the failed appending transaction should be logged"
-    );
-    assert!(
-        logs_contain("failed to persist failed_worker"),
-        "the legacy failed_builders mirror failure should be logged"
     );
     let post = expect_drv(&handle, "tfault-hash").await;
     assert_eq!(

@@ -940,19 +940,18 @@ impl DagActor {
             // clobbered with `[""]` at the IA-only assignment below).
             state.output_paths = paths.clone();
             // I-094 reprobe substitutable lane: failure history is moot
-            // — we're fetching the upstream-built output. Mirror the
-            // poison-clear in apply_cached_hits. Clearing here (not on
-            // SubstituteComplete{ok=true}) means a later fetch failure
-            // demotes via `revert_target_for` (Ready/Queued/
-            // DependencyFailed) and may get one more dispatch attempt
-            // — acceptable, since substitutability is evidence the
-            // world changed (Hydra/another tenant built it).
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) {
-                state.retry.clear();
-            }
+            // — we're fetching the upstream-built output. The
+            // `cache_hit_clear` reset row appended below (in
+            // `record_reset_with_clear_poison`, same shape as
+            // apply_cached_hits) is what clears the retry state: the
+            // fold's reset arm zeroes the counters and the cached view
+            // is refreshed when the row lands. Clearing at this point
+            // in the chain (not on SubstituteComplete{ok=true}) means a
+            // later fetch failure demotes via `revert_target_for`
+            // (Ready/Queued/DependencyFailed) and may get one more
+            // dispatch attempt — acceptable, since substitutability is
+            // evidence the world changed (Hydra/another tenant built
+            // it).
             // r[impl sched.merge.wanted-outputs+2]
             // The forgivable seed subset: declared output paths whose
             // name is OUTSIDE the (non-empty) wanted set. The walk
@@ -1983,12 +1982,13 @@ impl DagActor {
     ///
     /// The exclusion set is `decide()`'s `failed_builders` view over the
     /// node's in-memory attempt history (the committed ledger-suffix
-    /// mirror) — within a leader tenure it equals the legacy RAM set the
-    /// pre-collapse predicate read; across a failover the fold retains
-    /// backstop-recorded exclusions the recovered RAM set loses (D4),
-    /// the adjudicated `sched.retry.failover-budget` direction. The
-    /// other dispatch-time readers (`hard_filter`, the backoff defer)
-    /// keep reading RAM until T-1b.13.
+    /// mirror) — within a leader tenure it equals the as-built RAM set
+    /// the pre-collapse predicate read; across a failover the fold
+    /// retains backstop-recorded exclusions the old recovered RAM set
+    /// lost (D4), the adjudicated `sched.retry.failover-budget`
+    /// direction. The other dispatch-time readers (`hard_filter`, the
+    /// backoff defer) consume the same fold through the fold-refreshed
+    /// cached view (`state.retry`) since T-1b.13.
     ///
     /// The eligibility predicate is "every statically-eligible
     /// non-draining worker is in the excluded set", not

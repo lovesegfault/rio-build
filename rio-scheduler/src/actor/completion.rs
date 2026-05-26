@@ -40,24 +40,6 @@ struct CaCutoffVerified {
     output_hash: [u8; 32],
 }
 
-/// Result of [`DagActor::record_failure_and_check_poison`].
-///
-/// Floor-promotion exemption (`r[sched.retry.promotion-exempt+2]`) is
-/// NOT carried here — `TransientFailure` is never a sizing signal, so
-/// `record_failure_and_check_poison` never bumps the floor. The real
-/// promotion-exempt path is [`super::floor::FloorOutcome::promoted`],
-/// consumed in `handle_infrastructure_failure` /
-/// `handle_timeout_failure`.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct FailureOutcome {
-    /// Whether the legacy RAM view says the poison threshold is
-    /// reached. Unread since the E1 collapse (T-1b.5) — the verdict now
-    /// comes from `decide()` over the appended suffix — and retired
-    /// together with the legacy mutations in T-1b.13.
-    #[allow(dead_code)]
-    pub(super) reached_poison: bool,
-}
-
 /// Report-carried context for the worker-reported failure handlers
 /// (E1–E4): the fields of the triggering `CompletionReport` the failure
 /// paths consume, borrowed at the `handle_completion` routing match.
@@ -148,8 +130,11 @@ impl DagActor {
         .await;
         match result {
             Ok(inserted) => {
-                if inserted && let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.push_attempt_record(row.to_record());
+                if inserted {
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.push_attempt_record(row.to_record());
+                    }
+                    self.refresh_retry_view(drv_hash);
                 }
             }
             Err(e) => {
@@ -187,6 +172,24 @@ impl DagActor {
             require_distinct_workers: self.poison_config.require_distinct_workers,
             poison_resubmit_retry_limit: crate::state::POISON_RESUBMIT_RETRY_LIMIT,
             poison_ttl_secs: crate::state::POISON_TTL.as_secs(),
+        }
+    }
+
+    /// Recompute `drv_hash`'s cached dispatch view (`state.retry`) from
+    /// the seeded fold over its in-memory attempt history. Call after
+    /// every committed change to that history (an append's
+    /// `push_attempt_record`, a two-installment
+    /// `classify_attempt_record`), so the dispatch-time readers
+    /// (`hard_filter`'s exclusion, the resubmit-bound check, the
+    /// diagnostics surfaces) see the same counters the appending
+    /// transactions decide from. The `backoff_until` / `poisoned_at`
+    /// carve-outs stay actor-managed (see
+    /// `DerivationState::refresh_retry_view_from_ledger`).
+    pub(super) fn refresh_retry_view(&mut self, drv_hash: &DrvHash) {
+        let budget = self.decision_budget();
+        let now_epoch = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            state.refresh_retry_view_from_ledger(&budget, now_epoch);
         }
     }
 
@@ -296,8 +299,11 @@ impl DagActor {
         .await;
         match result {
             Ok(inserted) => {
-                if inserted && let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.push_attempt_record(row.to_record());
+                if inserted {
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.push_attempt_record(row.to_record());
+                    }
+                    self.refresh_retry_view(drv_hash);
                 }
             }
             Err(e) => {
@@ -347,10 +353,11 @@ impl DagActor {
         }
         crate::db::SchedulerDb::clear_poison_in_tx(&mut tx, drv_hash).await?;
         tx.commit().await?;
-        if let Some(row) = row
-            && let Some(state) = self.dag.node_mut(drv_hash)
-        {
-            state.push_attempt_record(row.to_record());
+        if let Some(row) = row {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.push_attempt_record(row.to_record());
+            }
+            self.refresh_retry_view(drv_hash);
         }
         Ok(())
     }
@@ -383,6 +390,7 @@ impl DagActor {
             if let Some(state) = self.dag.node_mut(&hash) {
                 state.push_attempt_record(row.to_record());
             }
+            self.refresh_retry_view(&hash);
         }
         Ok(())
     }
@@ -943,51 +951,6 @@ impl DagActor {
                    "failed to persist resource_floor");
         }
         outcome
-    }
-
-    /// Record a worker failure for `drv_hash` (in-mem + PG
-    /// best-effort) and return whether the poison threshold is
-    /// reached. Caller decides: poison_and_cascade if true,
-    /// reset_to_ready + retry if false.
-    ///
-    /// Both `failed_builders` (HashSet — for distinct-mode + best_executor
-    /// exclusion) and `failure_count` (flat counter — for non-distinct
-    /// mode) are updated; [`PoisonConfig::is_poisoned`] picks the
-    /// right one. The in-mem insert comes first (scheduler-
-    /// authoritative); PG is recovery-only. A PG blip degrades to
-    /// "might retry on the same worker once post-recovery."
-    pub(super) async fn record_failure_and_check_poison(
-        &mut self,
-        drv_hash: &DrvHash,
-        executor_id: &ExecutorId,
-    ) -> FailureOutcome {
-        // No resource_floor bump here — `TransientFailure` (build
-        // script exited nonzero) is a build-determinism signal, not a
-        // sizing signal. Floor bumps are reserved for explicit
-        // resource-exhaustion paths (controller-reported OOMKilled/
-        // DiskPressure, worker-reported CgroupOom/TimedOut). The
-        // previous I-170/I-173/I-177 over-broad promote here meant a
-        // flaky build climbed the ladder and the next submitter paid
-        // for an oversized pod.
-        {
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                state.retry.failed_builders.insert(executor_id.clone());
-                // Unconditional (doesn't check HashSet::insert's bool) —
-                // same worker counts twice. Only used when
-                // require_distinct_workers=false.
-                state.retry.failure_count += 1;
-            }
-            if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
-                error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
-                       "failed to persist failed_worker");
-            }
-        }
-        let reached_poison = self
-            .dag
-            .node(drv_hash)
-            .map(|s| self.poison_config.is_poisoned(s))
-            .unwrap_or(false);
-        FailureOutcome { reached_poison }
     }
 
     // -----------------------------------------------------------------------
@@ -2727,12 +2690,17 @@ impl DagActor {
     /// appended attempt suffix inside the appending transaction, and the
     /// fleet-exhaust arm consumes `Decision::exclusion` intersected with
     /// the live eligible fleet via `placeable()` at this site. The
-    /// legacy RAM and mirror writes (`record_failure_and_check_poison`,
-    /// `increment_retry_count`, the RAM count/backoff) stay until
-    /// T-1b.13 (rule 1); the synthesized poison-reason strings stay
-    /// as-is (A8 is out of scope); transients are never floor-promoted
-    /// and never exempt (P4) — there is deliberately no floor or
-    /// exemption logic on this arm.
+    /// failure is charged once, by the appended row (no in-place RAM
+    /// counter writes and no legacy mirror-column writes remain since
+    /// T-1b.13 — the cached view is refreshed from the fold after the
+    /// commit); the synthesized poison-reason strings stay as-is (A8 is
+    /// out of scope); transients are never floor-promoted and never
+    /// exempt (P4) — there is deliberately no floor or exemption logic
+    /// on this arm. No resource_floor bump either: `TransientFailure`
+    /// (build script exited nonzero) is a build-determinism signal, not
+    /// a sizing signal — the previous I-170/I-173/I-177 over-broad
+    /// promote here meant a flaky build climbed the ladder and the next
+    /// submitter paid for an oversized pod.
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,
@@ -2749,14 +2717,6 @@ impl DagActor {
             row.error_msg = (!report.error_msg.is_empty()).then(|| report.error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
-        // Legacy RAM + mirror writes (rule 1, until T-1b.13): the
-        // failure still lands in `failed_builders`/`failure_count` and
-        // the `failed_builders` column exactly as before — but the
-        // returned RAM verdict is no longer consulted; the fold over
-        // the appended suffix is the decision input now.
-        let FailureOutcome { reached_poison: _ } = self
-            .record_failure_and_check_poison(drv_hash, executor_id)
-            .await;
 
         if self.dag.node(drv_hash).is_none() {
             return FailureHandling::Handled;
@@ -2865,12 +2825,15 @@ impl DagActor {
             (decision, fleet_exhausted, None)
         };
 
-        // Push the committed row onto the in-memory history before
-        // acting on the verdict.
-        if let Some(row) = recorded_row
-            && let Some(state) = self.dag.node_mut(drv_hash)
-        {
-            state.push_attempt_record(row.to_record());
+        // Push the committed row onto the in-memory history and refresh
+        // the cached dispatch view before acting on the verdict, so the
+        // re-dispatch that may follow the requeue arm already sees this
+        // failure's exclusion in `hard_filter`.
+        if let Some(row) = recorded_row {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.push_attempt_record(row.to_record());
+            }
+            self.refresh_retry_view(drv_hash);
         }
 
         // Act on the verdict with the as-built reason priority:
@@ -2946,16 +2909,20 @@ impl DagActor {
                 // — no timer tasks, no cleanup if the derivation is
                 // cancelled meanwhile (backoff_until is just an Option
                 // on the state, ignored for non-Ready). Cleared on
-                // successful dispatch in assign_to_worker. The RAM
-                // count/backoff writes are the legacy view (rule 1); the
-                // production jitter stays here at the site.
+                // successful dispatch in assign_to_worker. The count
+                // itself is fold-derived (the refresh above); only the
+                // jittered pacing deadline is written here at the site
+                // (the backoff_until carve-out). The curve index is the
+                // attempt count BEFORE this failure — the fold's count
+                // already includes this event, hence the -1.
+                let backoff = self
+                    .retry_policy
+                    .backoff_duration(decision.counters.count.saturating_sub(1));
                 if let Some(state) = self.dag.node_mut(drv_hash) {
                     state.ensure_running();
                     if let Err(e) = state.transition(DerivationStatus::Failed) {
                         warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
                     }
-                    let backoff = self.retry_policy.backoff_duration(state.retry.count);
-                    state.retry.count += 1;
                     state.assigned_executor = None;
                     state.retry.backoff_until = Some(Instant::now() + backoff);
                     debug!(
@@ -2969,13 +2936,6 @@ impl DagActor {
                     } else {
                         self.push_ready(drv_hash.clone());
                     }
-                }
-                // Legacy mirror write (kept until T-1b.13): the
-                // retry_count column still feeds the as-built recovery
-                // projection. The Ready persist itself already happened
-                // inside the appending transaction.
-                if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
                 }
                 // C2c: dashboard's WatchBuild showed stale running_count
                 // through the backoff window (up to 300s) without the
@@ -3015,8 +2975,9 @@ impl DagActor {
     /// exempt-vs-counted classification comes from `classify()` over the
     /// site's floor-outcome locals, and the requeue / exempt-cap /
     /// infra-cap verdict comes from the fold over the appended attempt
-    /// suffix inside the appending transaction. The legacy RAM counter
-    /// mutations stay per verdict arm (rule 1, until T-1b.13); a failed
+    /// suffix inside the appending transaction. The charge is carried by
+    /// the appended row alone (the cached view is refreshed from the
+    /// fold; no in-place counter writes remain since T-1b.13); a failed
     /// transaction leaves the derivation in its pre-report state for
     /// re-delivery.
     pub(super) async fn handle_infrastructure_failure(
@@ -3085,10 +3046,9 @@ impl DagActor {
         // when a leaked lock (I-125a) made 4 builders hit this in a
         // row → poison at 99.7%.
         //
-        // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) now
-        // lives in `classify()` — the single append-time classifier —
-        // so the row's class is what the fold charges, and this site
-        // only mirrors it into the legacy RAM counters below.
+        // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) lives
+        // in `classify()` — the single append-time classifier — so the
+        // row's class is what the fold charges.
         let class = crate::retry_policy::classify(
             &crate::retry_policy::ObservedFailure::WorkerInfra { error_msg },
             crate::retry_policy::FloorOutcomeView {
@@ -3159,12 +3119,13 @@ impl DagActor {
             )
         };
 
-        // Push the committed row onto the in-memory history before
-        // acting on the verdict.
-        if let Some(row) = recorded_row
-            && let Some(state) = self.dag.node_mut(drv_hash)
-        {
-            state.push_attempt_record(row.to_record());
+        // Push the committed row onto the in-memory history and refresh
+        // the cached dispatch view before acting on the verdict.
+        if let Some(row) = recorded_row {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.push_attempt_record(row.to_record());
+            }
+            self.refresh_retry_view(drv_hash);
         }
 
         match decision.verdict {
@@ -3172,15 +3133,11 @@ impl DagActor {
                 crate::retry_policy::PoisonReason::ExemptInfraBudget,
             ) => {
                 // High-water terminal for the cap-exemption
-                // (`sched.retry.exempt-infra-cap`, now decided by the
-                // fold): a leaked store-side placeholder lock or a stuck
+                // (`sched.retry.exempt-infra-cap`, decided by the fold):
+                // a leaked store-side placeholder lock or a stuck
                 // floor-promote becomes an actionable poison instead of a
-                // silent livelock. The legacy RAM counter still gets the
-                // increment the as-built arm performed before its check.
+                // silent livelock.
                 let max = self.retry_policy.max_exempt_infra_retries;
-                if let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.retry.exempt_infra_count += 1;
-                }
                 warn!(
                     drv_hash = %drv_hash,
                     executor_id = %executor_id,
@@ -3226,43 +3183,20 @@ impl DagActor {
                 .await;
             }
             _ => {
-                // Requeue. Apply the legacy RAM mutations exactly as the
-                // as-built requeue arm did (rule 1, until T-1b.13): the
-                // exempt charge, the I-127 stale-window reset, and the
-                // counted-infra increment + window anchor. NO
+                // Requeue. The exempt charge, the I-127 stale-window
+                // reset, and the counted-infra increment + window anchor
+                // are all carried by the appended row and the fold (the
+                // refresh above) — nothing is mutated in place here. NO
                 // failed_builders insert, NO retry_count++, NO backoff —
                 // infra failures are worker-local and requeue
                 // immediately.
                 let Some(state) = self.dag.node_mut(drv_hash) else {
                     return FailureHandling::Handled;
                 };
-                if exempt_from_cap {
-                    state.retry.exempt_infra_count += 1;
-                }
-                if !floor_outcome.at_cap
-                    && let Some(last) = state.retry.last_infra_failure_at
-                    && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
-                {
-                    debug!(
-                        drv_hash = %drv_hash,
-                        prev_count = state.retry.infra_count,
-                        window_secs = self.retry_policy.infra_retry_window_secs,
-                        "infra-retry window elapsed — resetting counter"
-                    );
-                    state.retry.infra_count = 0;
-                }
                 if let Err(e) = state.reset_to_ready() {
                     warn!(drv_hash = %drv_hash, error = %e,
                           "infrastructure failure: reset_to_ready failed, skipping");
                     return FailureHandling::Handled;
-                }
-                // D4: `bump_floor_or_count` never mutates `infra_count`;
-                // THIS increment is the legacy single source of truth
-                // for the RAM view, after the reset above, exactly as
-                // the as-built arm ordered it.
-                if !exempt_from_cap {
-                    state.retry.infra_count += 1;
-                    state.retry.last_infra_failure_at = Some(Instant::now());
                 }
                 info!(
                     drv_hash = %drv_hash,
@@ -3281,10 +3215,10 @@ impl DagActor {
     /// E3, collapsed onto `decide()` (Phase 1b): the verdict for a
     /// permanent failure is computed by the fold over the appended
     /// attempt suffix inside the appending transaction; the in-memory
-    /// transition, the legacy RAM/mirror writes (kept until T-1b.13),
-    /// and the terminal epilogue run only after the commit. A failed
-    /// transaction leaves the derivation in its pre-report state and
-    /// the caller re-delivers the event.
+    /// transition, the cached-view refresh, and the terminal epilogue
+    /// run only after the commit. A failed transaction leaves the
+    /// derivation in its pre-report state and the caller re-delivers
+    /// the event.
     pub(super) async fn handle_permanent_failure(
         &mut self,
         drv_hash: &DrvHash,
@@ -3373,22 +3307,15 @@ impl DagActor {
             return FailureHandling::Handled;
         }
         state.retry.poisoned_at = Some(Instant::now());
-        // I-209: record which builder produced the permanent failure.
-        // Diagnostics-only — `failed_builders` doesn't gate anything
-        // on the permanent path (no retry), but rio-cli/kubectl shows
-        // an empty array as "never ran" without this. Legacy RAM write,
-        // kept until T-1b.13 (rule 1 of the Phase-1b plan).
-        state.retry.failed_builders.insert(executor_id.clone());
+        // I-209: which builder produced the permanent failure is carried
+        // by the appended `permanent` row (the fold's diagnostics-only
+        // `failed_builders` insert), so the refreshed view and the
+        // ListPoisoned aggregate both show it — rio-cli/kubectl would
+        // otherwise show an empty array as "never ran".
         if let Some(row) = recorded_row {
             state.push_attempt_record(row.to_record());
         }
-
-        // Legacy mirror write (kept until T-1b.13): the failed_builders
-        // column still feeds the as-built recovery projection.
-        if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
-            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
-                   "failed to persist failed_worker");
-        }
+        self.refresh_retry_view(drv_hash);
         self.unpin_best_effort(drv_hash).await;
 
         self.terminal_failure_epilogue(
@@ -3429,9 +3356,10 @@ impl DagActor {
     /// vs at-cap terminal-`Cancelled` verdict comes from the fold over
     /// the appended attempt suffix inside the appending transaction.
     /// The deadline-floor doubling stays at this site (it is a floor
-    /// action, not a budget decision), the legacy RAM `timeout_count`
-    /// keeps being maintained until T-1b.13, and a failed transaction
-    /// leaves the derivation in its pre-report state for re-delivery.
+    /// action, not a budget decision), the timeout count is carried by
+    /// the appended row alone (the cached view is refreshed from the
+    /// fold), and a failed transaction leaves the derivation in its
+    /// pre-report state for re-delivery.
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,
@@ -3537,6 +3465,7 @@ impl DagActor {
             if let Some(row) = recorded_row {
                 state.push_attempt_record(row.to_record());
             }
+            self.refresh_retry_view(drv_hash);
             self.unpin_best_effort(drv_hash).await;
 
             self.terminal_failure_epilogue(
@@ -3567,22 +3496,23 @@ impl DagActor {
         // `max_timeout_retries` bounds TOTAL attempts. Covers
         // cold-start (no [sla], est=None, floor=0 → {false,false})
         // where `if promoted` would never increment → infinite
-        // retry until globalTimeout. `bump_floor_or_count` no
-        // longer mutates the counter, so this is the only
-        // increment site. Legacy RAM mutation, kept until T-1b.13
-        // (rule 1) — the verdict above no longer reads it.
-        state.retry.timeout_count += 1;
+        // retry until globalTimeout. The charge is the appended
+        // `timeout` row; the cached view picks it up at the refresh
+        // below.
         if let Some(row) = recorded_row {
             state.push_attempt_record(row.to_record());
         }
-        info!(
-            drv_hash = %drv_hash,
-            executor_id = %executor_id,
-            timeout_retry_count = state.retry.timeout_count,
-            max = self.retry_policy.max_timeout_retries,
-            promoted = floor_outcome.promoted,
-            "timeout — bumped deadline floor, retrying"
-        );
+        self.refresh_retry_view(drv_hash);
+        if let Some(state) = self.dag.node(drv_hash) {
+            info!(
+                drv_hash = %drv_hash,
+                executor_id = %executor_id,
+                timeout_retry_count = state.retry.timeout_count,
+                max = self.retry_policy.max_timeout_retries,
+                promoted = floor_outcome.promoted,
+                "timeout — bumped deadline floor, retrying"
+            );
+        }
         self.requeue_after_recorded_retry(drv_hash);
         FailureHandling::Handled
     }
@@ -3704,6 +3634,7 @@ impl DagActor {
                     if let Some(state) = self.dag.node_mut(&hash) {
                         state.push_attempt_record(row.to_record());
                     }
+                    self.refresh_retry_view(&hash);
                 }
             }
             Err(e) => {

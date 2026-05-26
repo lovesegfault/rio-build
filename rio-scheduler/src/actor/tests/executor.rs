@@ -5183,6 +5183,13 @@ async fn attempt_ledger_unreported_crash_established_by_sweep() -> TestResult {
 /// established by the (test-forced) correlation-TTL sweep. As-built the
 /// establishment charged nothing, so this loop was bounded by nothing
 /// in the retry machinery.
+///
+/// Also pins the dispatch-time exclusion deferred from T-1b.11's
+/// done-gate to the reader conversion (T-1b.13): once a crash is
+/// established, the crashing executor is in the fold-backed
+/// `failed_builders` view — exactly the set `hard_filter`'s `failed-on`
+/// clause consults — so the same derivation is not re-offered to an
+/// executor id that already crashed on it.
 #[tokio::test]
 async fn phase1b_c2_unreported_crash_loop_poisons_at_threshold() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -5203,6 +5210,16 @@ async fn phase1b_c2_unreported_crash_loop_poisons_at_threshold() -> TestResult {
         barrier(&handle).await;
 
         let info = expect_drv(&handle, drv).await;
+        // The deferred hard_filter-level C2 assertion (T-1b.13): the
+        // established crash joins the fold-backed exclusion view that
+        // `hard_filter`'s `failed-on` clause reads, so the crashing
+        // executor id is excluded from placement for this derivation.
+        assert!(
+            info.retry.failed_builders.contains(w.as_str()),
+            "cycle {i}: established crash of {w} must appear in the fold-backed \
+             dispatch-time exclusion (got {:?})",
+            info.retry.failed_builders
+        );
         if i < 2 {
             assert_ne!(
                 info.status,

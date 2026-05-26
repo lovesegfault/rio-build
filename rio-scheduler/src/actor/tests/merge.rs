@@ -7321,7 +7321,7 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
 /// Sensitivity: before the fix, build #2 sees A is Poisoned →
 /// `first_dep_failed` set → fail-fasts. With the fix, A is reset in
 /// `dag.merge` → in `newly_inserted` → skipped by pre-existing loop.
-// r[verify sched.merge.poisoned-resubmit-bounded+2]
+// r[verify sched.merge.poisoned-resubmit-bounded+3]
 #[rstest::rstest]
 #[case::under_limit(1, DerivationStatus::Ready, rio_proto::types::BuildState::Active)]
 #[case::at_limit(
@@ -7375,7 +7375,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
     Ok(())
 }
 
-// r[verify sched.merge.poisoned-resubmit-bounded+2]
+// r[verify sched.merge.poisoned-resubmit-bounded+3]
 // r[verify sched.substitute.detached+5]
 /// I-094 substitutable lane: a `Poisoned` node at the resubmit limit
 /// whose output is upstream-substitutable (NOT locally present) on

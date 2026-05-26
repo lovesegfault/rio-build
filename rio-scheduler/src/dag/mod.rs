@@ -339,7 +339,7 @@ impl DerivationDag {
     /// successful merge should call `rollback_merge()` with the returned
     /// `MergeResult` fields if their persistence fails, to avoid in-memory
     /// DAG state drifting from the DB.
-    // r[impl sched.merge.poisoned-resubmit-bounded+2]
+    // r[impl sched.merge.poisoned-resubmit-bounded+3]
     pub fn merge(
         &mut self,
         build_id: Uuid,
@@ -541,6 +541,15 @@ impl DerivationDag {
                 // get the reset too; resubmit_cycles is INCREMENTED here
                 // (the reset itself IS the cycle event) so the
                 // POISON_RESUBMIT_RETRY_LIMIT bound accumulates.
+                // This is the documented in-memory seed of the new cycle
+                // (the one remaining direct write to a RetryState budget
+                // field after the T-1b.13 retirement): the old node
+                // object is destroyed here, so the new cycle index has
+                // to be carried in memory; `reset_row_for` then stamps
+                // it onto the `resubmit_reset` ledger row and the fold
+                // reproduces the same value from that row, so the cached
+                // view and the durable history agree from the first
+                // refresh onward.
                 // retry.count stays at the fresh-state default (0) → full
                 // per-cycle max_retries budget restored on every resubmit.
                 // The prior wanted set is unioned in too — the carried-over

@@ -687,15 +687,14 @@ impl DagActor {
         // is overwritten by `update_derivation_status_batch` below
         // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
         // resurrect it; this is about keeping failed_builders/poisoned_at
-        // consistent for the NEXT poison cycle. resubmit_cycles is
-        // INCREMENTED in PG here so the bound survives leader failover.
-        // Best-effort.
-        //
-        // 1a: each reset node's `resubmit_reset` ledger row (carrying
-        // the NEW cycle index) is appended in the same transaction as
-        // this batched clear, so the suffix cut and the per-cycle reset
-        // commit together.
-        // r[impl sched.db.clear-poison-batch]
+        // consistent for the NEXT poison cycle. The new cycle index is
+        // carried by each reset node's `resubmit_reset` ledger row
+        // (appended in the same transaction as this batched clear, so
+        // the suffix cut and the per-cycle reset commit together) — that
+        // row is what makes the resubmit bound survive leader failover;
+        // the legacy `resubmit_cycles` mirror column is frozen and no
+        // longer incremented here. Best-effort.
+        // r[impl sched.db.clear-poison-batch+2]
         if !merge_result.reset_on_resubmit.is_empty()
             && let Err(e) = self
                 .record_resubmit_resets(&merge_result.reset_on_resubmit)
@@ -1049,16 +1048,15 @@ impl DagActor {
                     // chain-scoped — clear it like every other completion
                     // site does.
                     state.never_forgive_paths.clear();
-                    // I-099/I-094: re-probe hit on a previously-failed node
-                    // — failure history is moot now we have the output.
-                    if matches!(
-                        from,
-                        DerivationStatus::Poisoned
-                            | DerivationStatus::DependencyFailed
-                            | DerivationStatus::Failed
-                    ) {
-                        state.retry.clear();
-                    }
+                    // I-099/I-094: re-probe hit on a previously-failed
+                    // node — failure history is moot now we have the
+                    // output. The retry-state reset is the
+                    // `cache_hit_clear` ledger row appended below for
+                    // the Poisoned/DependencyFailed cases (the fold's
+                    // reset arm zeroes the counters and the cached view
+                    // refreshes when the row lands); a `Failed`-from hit
+                    // appends no reset row, exactly as it never got a PG
+                    // poison clear — its (uncut) suffix keeps deciding.
                     from
                 };
                 cached_count += 1;
@@ -1164,7 +1162,6 @@ impl DagActor {
                       "deferred re-probe →Queued rejected; node stays {from:?}");
                 continue;
             }
-            state.retry.clear();
             info!(drv_hash = %h, ?from,
                   "deferred re-probe: pre-existing failed node's output present \
                    but inputDrv in-flight; reset to Queued (failure history moot)");

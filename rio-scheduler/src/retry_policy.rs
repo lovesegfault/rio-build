@@ -18,10 +18,12 @@
 //! itself stays the executable specification (and the model's oracle);
 //! the production decision surface layered on top of it is
 //! [`decide`] / [`classify`] / [`placeable`] (the design's §5a-2
-//! contract), which the nine entry points call as they collapse
-//! (T-1b.2 onward). Until every site has collapsed, the not-yet-collapsed
-//! sites keep reading the legacy `RetryState` counters; `#[allow(dead_code)]`
-//! on the `mod` item stays until the whole surface has callers.
+//! contract), which all nine entry points call (T-1b.2..T-1b.13). Since
+//! the T-1b.13 retirement no site mutates a `RetryState` counter in
+//! place: the cached dispatch view is refreshed from this fold whenever
+//! a node's attempt history changes, so `CountersRefineHistory` holds by
+//! construction (modulo the documented `poisoned_at`/`backoff_until`
+//! carve-outs and the dag-merge resubmit-cycle carry).
 //!
 //! ## Phase-1 scope notes (P3/P4, recorded here per the Phase-1 plan)
 //!
@@ -263,7 +265,7 @@ pub(crate) enum AttemptEvent {
     /// iff `resubmit_cycles < poison_resubmit_retry_limit`; the fold
     /// applies it unconditionally and the model checks the precondition.
     ResubmitReset { at: AbsTime },
-    /// `RetryState::clear()` on a cache-hit transition out of
+    /// The cache-hit reset on a transition out of
     /// `Poisoned`/`DependencyFailed`/`Failed` (the output turned up in
     /// the store or a re-probe found it substitutable). Clears nine of
     /// the ten counters — `backoff_until` survives.
@@ -339,9 +341,10 @@ impl Counters {
         n >= budget.poison_threshold
     }
 
-    /// `RetryState::clear()` — wipes nine of the ten fields.
-    /// `backoff_until` deliberately survives (the production `clear()`
-    /// does not touch it).
+    /// The cache-hit reset — wipes nine of the ten fields.
+    /// `backoff_until` deliberately survives (the as-built in-place
+    /// clear never touched it; since T-1b.13 this arm IS the reset —
+    /// the sites append a `cache_hit_clear` row instead of mutating).
     fn clear_for_cache_hit(&mut self) {
         let backoff = self.backoff_until;
         *self = Self {
@@ -803,7 +806,7 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
         }
 
         // ── dag::merge resubmit reset ───────────────────────────────
-        // r[impl sched.merge.poisoned-resubmit-bounded+2]
+        // r[impl sched.merge.poisoned-resubmit-bounded+3]
         // A fresh `DerivationState` is constructed (all counters at
         // their defaults, including `backoff_until`) and
         // `resubmit_cycles` is carried over and incremented — the reset
@@ -847,8 +850,8 @@ pub(crate) struct Decision {
     /// The per-executor exclusion set (the fold's `failed_builders`) in
     /// the actor's identifier vocabulary. E1's fleet-exhaust arm and the
     /// E9 dispatch backstop intersect it with the live eligible fleet via
-    /// [`placeable`]; `hard_filter` keeps reading the RAM set until the
-    /// dispatch-time readers convert (T-1b.13).
+    /// [`placeable`]; `hard_filter` consumes the same set through the
+    /// fold-refreshed cached view (`RetryState::failed_builders`).
     pub exclusion: HashSet<ExecutorId>,
     /// The deterministic backoff deadline (no jitter — the dispatch site
     /// applies the production jitter exactly as today).
@@ -1553,8 +1556,8 @@ mod tests {
     }
 
     /// The cache-hit clear wipes nine of the ten counters but preserves
-    /// `backoff_until` exactly as `RetryState::clear()` does; the admin
-    /// clear / TTL removal wipes all ten.
+    /// `backoff_until` exactly as the as-built in-place reset did; the
+    /// admin clear / TTL removal wipes all ten.
     #[test]
     fn cache_hit_clear_preserves_backoff_and_poison_clear_does_not() {
         let h = [

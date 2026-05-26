@@ -459,18 +459,17 @@ impl DagActor {
             }
             // r[impl sched.backstop.timeout+3]
             // Backstop is the no-CompletionReport path — completion.rs
-            // will never account this attempt. The legacy RAM charge
-            // stays (rule 1, until T-1b.13); the verdict now comes from
-            // decide() over the appended suffix at THIS charging site
-            // (Phase 1b), so the backstop's poison decision no longer
-            // depends on E5's re-check in `reassign_derivations`. NOT a
-            // sizing signal — `handle_timeout_failure` (worker-reported
-            // TimedOut) does the floor promotion; this scheduler-side
-            // backstop is "worker hung, never reported."
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                state.retry.failed_builders.insert(executor_id.clone());
-                state.retry.failure_count += 1;
-            }
+            // will never account this attempt, so the backstop records
+            // it: the appended `backstop` row charges
+            // `failed_builders`/`failure_count` through the fold (the
+            // cached view picks it up at the post-commit refresh), and
+            // the verdict comes from decide() over the appended suffix
+            // at THIS charging site (Phase 1b), so the backstop's poison
+            // decision no longer depends on E5's re-check in
+            // `reassign_derivations`. NOT a sizing signal —
+            // `handle_timeout_failure` (worker-reported TimedOut) does
+            // the floor promotion; this scheduler-side backstop is
+            // "worker hung, never reported."
             // The appending transaction: the backstop observation's row
             // (captured before the reassign clears the exec_id carrier)
             // plus the fold; a threshold verdict persists Poisoned in
@@ -508,6 +507,7 @@ impl DagActor {
                         if let Some(state) = self.dag.node_mut(drv_hash) {
                             state.push_attempt_record(row.to_record());
                         }
+                        self.refresh_retry_view(drv_hash);
                         if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
                             // The backstop-recorded charge crossed the
                             // poison threshold: poison at this site (the

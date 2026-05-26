@@ -2367,7 +2367,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
 /// `from_poisoned_row` left the cross-cycle counter at default 0 and
 /// `clear_poison_batch` zeroed PG on every resubmit, so failover gave a
 /// fresh budget.
-// r[verify sched.merge.poisoned-resubmit-bounded+2]
+// r[verify sched.merge.poisoned-resubmit-bounded+3]
 #[tokio::test]
 async fn test_poisoned_recovery_preserves_resubmit_cycles() -> TestResult {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
