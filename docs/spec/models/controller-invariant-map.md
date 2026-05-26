@@ -670,3 +670,109 @@ crd-absent and Fetcher configurations (consumer split) and the
 fault-lease N regime (producer guarantee);
 `ctrl.nodeclaim.budget.per-class+2` on the N base (clamp) and
 fault-rpc (failed-creates) regimes.
+
+## Stage-C corpus pin: the calibration denominator
+
+Pinned 2026-05-26 at the worktree base `746164c4f` (the formal-sprint
+tip), per the design's Stage-C first-deliverable requirement and the
+re-pin protocol above.
+
+### Churn re-pin (run immediately before this pin)
+
+`git log 607a93f3f..HEAD` over the three modeled paths returns three
+commits: the Stage-A audit's own map commit, `9283bc450` (a one-line
+rule-cross-reference comment bump in `pool/jobs.rs`, retry Phase-1b),
+and `782b6155b` (the fetcher-budget stream's successor commit, dated
+2026-05-24 — it changes the Simulator-shares-accounting chokepoints in
+`pod.rs`/`jobs.rs`, which are the G-C accounting family, outside the
+modeled protocol state). Both non-audit commits are ancestors of the
+Stage-B model commits, so the models were built against exactly this
+tree; the pinned rule versions are unchanged
+(`placeable-gate+5`, `consolidate-na+6`, `budget.per-class+2`). No
+re-validation trigger fires; Stage A and Stage B stand. The fetcher-
+budget successor is recorded here as the design's churn check requires
+(its accounting content lands in the G-C rows below as additional
+NOT-ENCODED members' context, not as new corpus members — it is a
+`feat`, not a `fix`).
+
+### The denominator
+
+The corpus is every `fix(` commit on the modeled tick bodies at the pin:
+`pool/jobs.rs` (39 of 63 commits), the `pool/job.rs` lineage followed
+through its renames (17 fix commits), and `nodeclaim_pool/` (53). The
+design's §3.4 estimate (~101) summed the per-file counts; the pinned
+DISTINCT-commit corpus is **95**, because 7 of the job.rs fixes are
+jobs.rs multi-file commits (the design assumed 8) and 7 further commits
+appear in both the jobs.rs and nodeclaim_pool lists (multi-file commits
+the per-file sum double-counts: `f97644a53`, `3f416e02e`, `bcfdc2262`,
+`9fd4b6e59`, `b570cdd8d`, `039861b56`, `d5602b3aa`). Each such commit
+gets exactly one row, in the family its repair belongs to. The three
+incidental cross-crate commits the design named (`3c3062760`,
+`c8ca42a91`, `dbc7f7cb2`) are binned in the remainder family.
+
+Excluded by the corpus definition (recorded so the boundary is checked,
+not assumed): `pool/pod.rs` commits (39/21 — k8s object construction
+outside the modeled tick bodies; G-D-disposition coverage),
+`node_informer.rs`-only commits (the M10–M13 / λ-accounting families —
+the design lists the M12/M13 pair `ff7f99ab8`/`b80d6f135` for
+checker-honesty in the calibration table but outside the denominator),
+and ComponentScaler / GC-cron / disruption commits (out-of-scope loops).
+
+### Per-family hash lists (the 95)
+
+| Family | n | Commits |
+|---|---|---|
+| G-A spawn↔reap↔queued coherence | 10 | `7f04c9d88`, `6a9ba0ef0`, `fb0953870`, `fba9086dc`, `6c4f4983d`, `9123e72d4`, `fd5d7c988`, `5e01a9ff1`, `8b0128f5a`, `004956eeb` |
+| G-B ack/ICE protocol | 7 | `cdc78f839`, `5815a7544`, `485e736a2`, `af1383c0e`, `e8bd76451`, `d6bc376d3`, `408a48bcb` |
+| G-C resource-accounting parity | 8 | `a415a9a8b`, `286566a57`, `d5602b3aa`, `073170dfb`, `5250a4b9a`, `b25836ef1`, `5c2a83761`, `bcfdc2262` |
+| G-D placement derivation | 8 | `80cfcd65c`, `039861b56`, `3f416e02e`, `2f9a3769c`, `9fd4b6e59`, `b570cdd8d`, `015667efa`, `f97644a53` |
+| G-E deadline coupling | 2 | `172776b1b`, `f73b98b1f` |
+| G-F identity/security plumbing | 3 | `a6697c6b0`, `ea10e1d74`, `acf6d476b` |
+| G-G reap delete-propagation & report-path mechanics (job.rs lineage) | 6 | `1779975f6`, `2f04e5432`, `8cbf6d7b3`, `12b86c285`, `2acd1b327`, `6d678ac87` |
+| M1 prev_idle / idle model | 7 | `34f37d7e9`, `79f86b888`, `13806e99a`, `a19394346`, `7f91f1892`, `cc2e99887`, `a12c6f9f9` |
+| M2 inflight_created / ICE detection | 5 | `0507f9874`, `08d49c52c`, `5935d9122`, `4ece337a4`, `92c2a89f2` |
+| M3/M4 sketches lifecycle (lease/PG/seed) | 10 | `92a3dc47d`, `703cbf42a`, `2d62e0b49`, `bd8e57de5`, `6052f84df`, `95fc40fb6`, `9c9bfb7c8`, `b92981881`, `df077d82b`, `3c9aa3919` |
+| M5/M6 gauge staleness | 4 | `cab0d2d46`, `d4184cf2b`, `d0c858955`, `e0d504321` |
+| FFD/cover ⇄ scheduler-config parity | 16 | `9ff9387f0`, `811489319`, `bd781b004`, `5f754baeb`, `787243ef3`, `45f83cdcd`, `f333ebed5`, `58cd38885`, `c5320b40e`, `e013b2044`, `6c8f13710`, `0fa79fcdf`, `79aa88da2`, `d674f0983`, `4fdf3337b`, `979608619` |
+| Remainder (docs/test/alert/infra sweeps + incidental cross-crate) | 9 | `2ad753db9`, `416895e3e`, `3c3062760`, `c8ca42a91`, `dbc7f7cb2`, `a49f78722`, `99a17cd2f`, `f1caa0b60`, `ff5f4e95e` |
+
+File-boundary resolutions the design left to this pin: the FFD/cover
+row absorbs the three nodeclaim_pool-touching commits the inventory had
+not grouped (`d674f0983` NodeClaim construction, `4fdf3337b` ffd.rs
+arch-matching, `979608619` cover.rs ceilings chokepoint); `3c9aa3919`
+(sketch persistence serialization) joins M3/M4; `99a17cd2f` (the
+scheduler-side authoritative-binding fix whose controller-side touch is
+the dead-node reap path — consumed input, out of model) and
+`ff5f4e95e`/`f1caa0b60`/`a49f78722` (config/alert plumbing) sit in the
+remainder. The inventory's FFD/cover "~13" members that live only in
+`node_informer.rs` are outside the corpus by the definition above; all
+13 listed there touch `nodeclaim_pool/` and are in.
+
+### Per-family encodability plan (pre-registered → pinned)
+
+The design's §3.4 pre-registration carried over per family, with the
+per-commit corrections the pin surfaced (each correction is argued in
+the calibration table's rows): G-A encodable via representatives
+`fba9086dc`, `6c4f4983d`, `8b0128f5a` (predictions: reapSafety ×2,
+gateFailClosed); G-B encodable via `cdc78f839`, `5815a7544`
+(ackSoundness, ackCoversPending), the proto/back-compat and
+scheduler-side members NOT-ENCODED; G-C / G-D / G-E / G-F NOT-ENCODED
+as pre-registered; G-G NOT-ENCODED except the `1779975f6`
+census-predicate half (prediction: ackSoundness on today's re-ack
+chain); M1 encodable via `79f86b888` (idleReapSafety) with the
+`13806e99a` busy-guard half downgraded to a redundancy probe (the
+within-tick observe-before-reap ordering covers it at model
+resolution); M2 encodable via the two halves of `08d49c52c`
+(iceMarkSoundness; the module-local inflight-conservation invariant),
+`5935d9122` re-dispositioned NOT-ENCODED (LIST-vs-delete race below
+tick atomicity), `0507f9874` treated as the mechanism's introduction;
+M3/M4 split exactly as pre-registered — `703cbf42a`
+(reloadLatchRespected) and `92a3dc47d`'s recency half
+(noMassClearAfterFailover) encodable, content/cell-key members
+NOT-ENCODED; M5/M6 NOT-ENCODED (the model carries no cleanup-set state
+— a deviation from the pre-registration, recorded); FFD/cover: the
+per-class clamp is encoded as a family-level reconstruction
+(provisioningBudget), `5f754baeb` itself re-dispositioned to its
+sizing content (NOT-ENCODED), `4ece337a4` re-dispositioned NOT-ENCODED
+(within-tick per-create granularity below the tick-global create-fault
+bit); remainder N/A.
