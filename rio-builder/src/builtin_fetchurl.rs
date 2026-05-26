@@ -84,6 +84,15 @@ const RETRY_BACKOFF: Backoff = Backoff {
 /// body itself — the server cannot amplify.)
 const MAX_RESTORED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// Where the request glue mounts the operator-configured CA bundle
+/// inside the sandbox (read-only, only when `RIO_CA_BUNDLE` is set on
+/// the worker). The fetch must keep working without it: fetcher pods
+/// have no system trust store of their own, and plain-HTTP origins and
+/// hashed mirrors are valid configurations — the FOD hash gate, not
+/// TLS, is the content-integrity boundary. TLS fetches simply require
+/// the bundle to be present.
+const SANDBOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
 /// Everything the subcommand needs, parsed from `RIO_FETCHURL_*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchurlParams {
@@ -178,7 +187,7 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
         );
     }
 
-    let client = build_client(params)?;
+    let (client, tls_roots_available) = build_client(Path::new(SANDBOX_CA_BUNDLE))?;
     let candidates = params.candidate_urls();
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -191,7 +200,7 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
                 "builtin:fetchurl: fetching {url} (attempt {}/{ATTEMPTS_PER_URL})",
                 attempt + 1
             );
-            match try_fetch_one(&client, url, params).await {
+            match try_fetch_one(&client, url, params, tls_roots_available).await {
                 Ok(()) => {
                     eprintln!("builtin:fetchurl: fetched {url}");
                     return Ok(());
@@ -218,8 +227,17 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
 /// Build the HTTP client. rustls; netrc credentials (if provided) are
 /// applied per-request in [`try_fetch_one`] because reqwest has no
 /// built-in netrc support in our feature set.
-fn build_client(_params: &FetchurlParams) -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+///
+/// TLS roots come exclusively from the sandbox CA bundle at
+/// `ca_bundle` (mounted by the glue when the operator configured one).
+/// reqwest's default behavior of loading the *system* trust store is
+/// disabled: fetcher pods have no system store, and treating that as a
+/// construction-time error broke every fetch — including plain-HTTP
+/// ones that never needed TLS in the first place. Returns the client
+/// plus whether any roots were loaded, so HTTPS attempts without roots
+/// can fail with an actionable message instead of a bare TLS error.
+fn build_client(ca_bundle: &Path) -> anyhow::Result<(reqwest::Client, bool)> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(concat!("rio-build/", env!("CARGO_PKG_VERSION")))
         // Redirects are common for source tarballs (GitHub → S3).
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -229,9 +247,95 @@ fn build_client(_params: &FetchurlParams) -> anyhow::Result<reqwest::Client> {
         // until the sandbox's max-silent kill. Idle-read bound, not a
         // total-transfer bound — multi-GB sources stay fine as long as
         // bytes keep flowing.
-        .read_timeout(Duration::from_secs(300))
-        .build()
-        .context("constructing HTTP client")
+        .read_timeout(Duration::from_secs(300));
+
+    let tls_roots_available = match std::fs::read(ca_bundle) {
+        Ok(pem) => {
+            let certs = reqwest::Certificate::from_pem_bundle(&pem)
+                .with_context(|| format!("parsing CA bundle {}", ca_bundle.display()))?;
+            if certs.is_empty() {
+                bail!("CA bundle {} contains no certificates", ca_bundle.display());
+            }
+            // Trust exactly the operator-provided bundle; never consult
+            // a (nonexistent) platform trust store.
+            builder = builder.tls_certs_only(certs);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            builder = builder.use_preconfigured_tls(no_trust_tls_config());
+            false
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading CA bundle {}", ca_bundle.display()));
+        }
+    };
+
+    let client = builder.build().context("constructing HTTP client")?;
+    Ok((client, tls_roots_available))
+}
+
+/// A rustls config whose certificate verifier rejects every server
+/// certificate, used when no CA bundle is mounted in the sandbox. This
+/// keeps client construction (and therefore plain-HTTP fetches) working
+/// on workers with no trust store at all, while an https:// URL fails
+/// verification with a message that names the fix instead of reqwest's
+/// platform-store "No CA certificates were loaded from the system"
+/// construction error. Certificate verification is never disabled — it
+/// simply cannot succeed without roots.
+fn no_trust_tls_config() -> rustls::ClientConfig {
+    #[derive(Debug)]
+    struct NoTrustedRoots;
+
+    impl rustls::client::danger::ServerCertVerifier for NoTrustedRoots {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Err(rustls::Error::General(format!(
+                "no CA roots are configured in the sandbox (set RIO_CA_BUNDLE on \
+                 the worker so a bundle is mounted at {SANDBOX_CA_BUNDLE})"
+            )))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            // Unreachable in practice: certificate verification above
+            // fails before any signature check.
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("aws-lc-rs supports the default TLS protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(NoTrustedRoots))
+    .with_no_client_auth()
 }
 
 /// One GET attempt: stream the body to a temp file next to the output,
@@ -241,6 +345,7 @@ async fn try_fetch_one(
     client: &reqwest::Client,
     url: &str,
     params: &FetchurlParams,
+    tls_roots_available: bool,
 ) -> anyhow::Result<()> {
     let parent = params
         .output
@@ -254,7 +359,17 @@ async fn try_fetch_one(
     if let Some((user, pass)) = netrc_credentials(params.netrc.as_deref(), url)? {
         req = req.basic_auth(user, Some(pass));
     }
-    let resp = req.send().await.context("request failed")?;
+    let resp = req.send().await.with_context(|| {
+        if url.starts_with("https://") && !tls_roots_available {
+            format!(
+                "request failed (https URL, but no CA roots are available in the \
+                 sandbox: configure RIO_CA_BUNDLE on the worker so a bundle is \
+                 mounted at {SANDBOX_CA_BUNDLE}, or use an http:// origin/mirror)"
+            )
+        } else {
+            "request failed".to_string()
+        }
+    })?;
     let status = resp.status();
     if !status.is_success() {
         // 5xx / 408 / 429 are worth retrying against the same URL;
@@ -633,5 +748,64 @@ mod tests {
         p.output = out_dir.path().join("mirror-out");
         fetch(&p).await.expect("mirror fetch");
         assert_eq!(std::fs::read(&p.output).unwrap(), b"from-mirror");
+    }
+
+    /// A missing CA bundle must not be fatal: fetcher pods carry no
+    /// system trust store, and plain-HTTP fetches never need one. (This
+    /// is the regression vm-fetcher-split-k3s caught: reqwest's default
+    /// system-store loading turned "no bundle" into a construction-time
+    /// error for every fetch.)
+    #[test]
+    fn client_builds_without_ca_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.crt");
+        let (_client, roots) = build_client(&missing).expect("client without bundle");
+        assert!(!roots, "no roots should be reported as available");
+    }
+
+    /// A present-but-useless bundle (no parseable certificates) is a
+    /// configuration error worth failing loudly on (silently proceeding
+    /// without the operator's roots would downgrade every TLS fetch to
+    /// the actionable-failure path for no visible reason).
+    #[test]
+    fn garbage_ca_bundle_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("garbage.crt");
+        std::fs::write(&bundle, b"not a pem").unwrap();
+        let err = build_client(&bundle).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("contains no certificates"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// An https URL attempted with no roots fails with a message that
+    /// names the knob (RIO_CA_BUNDLE / the sandbox bundle path), not a
+    /// bare TLS handshake error.
+    #[tokio::test]
+    async fn https_without_roots_names_the_knob() {
+        use axum::{Router, routing::get};
+
+        // A plain-HTTP listener; speaking TLS at it fails the handshake,
+        // which is exactly the no-roots failure mode we want to wrap.
+        let app = Router::new().route("/file", get(|| async { "irrelevant" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, roots) = build_client(&dir.path().join("none.crt")).unwrap();
+        assert!(!roots);
+
+        let mut p = params(&format!("https://{addr}/file"), &[]);
+        p.output = dir.path().join("out");
+        let err = try_fetch_one(&client, &p.url, &p, roots)
+            .await
+            .expect_err("https without roots must fail");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("RIO_CA_BUNDLE"),
+            "error should name the CA-bundle knob: {chain}"
+        );
     }
 }

@@ -19119,6 +19119,10 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "rustls",
+          "packageId": "rustls"
+        },
+        {
           "name": "schemars",
           "packageId": "schemars"
         },

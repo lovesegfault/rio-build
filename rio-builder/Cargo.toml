@@ -73,6 +73,10 @@ regex = { workspace = true }
 # streaming HTTP download of FOD sources. rustls via the workspace
 # feature set; "stream" for bytes_stream() → file/decoder piping.
 reqwest = { workspace = true, features = ["stream"] }
+# builtin:fetchurl builds a no-trust rustls config when the sandbox has
+# no CA bundle (plain-HTTP fetches must keep working there); shares the
+# workspace aws-lc-rs provider already linked via tonic/reqwest.
+rustls = { workspace = true }
 # xz decode for `unpack = true` fetchurl payloads (same crate the store
 # uses for substituter NARs; only the xz codec is exercised here).
 async-compression = { workspace = true }
