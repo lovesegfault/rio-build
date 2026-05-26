@@ -500,11 +500,16 @@ impl DagActor {
     /// `validate_and_ingest`), gated on the node being childless in the
     /// DAG.
     ///
-    /// Known window: if the derivations transaction commits but the
-    /// Pending→Active write below fails, the rolled-back build's prune
-    /// marker stays persisted on (possibly shared) childless rows; the
-    /// topdown fail-fast clears the marker it consumes, which is the
-    /// recovery path for such stale flags.
+    /// The PG side of Pending→Active rides the SAME transaction
+    /// (`activate_build_tx`, the last statement before commit), so a
+    /// committed merge implies an Active build and an activation
+    /// failure rolls back every side effect of the merge — including
+    /// the `topdown_pruned` stamps — rather than leaving them persisted
+    /// for a build the caller is rejecting. Only the in-memory
+    /// `BuildInfo` transition remains here, applied after the commit
+    /// succeeds. (The topdown fail-fast still clears the marker it
+    /// consumes, as defense-in-depth for stale-flag shapes that do not
+    /// involve this path at all.)
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
@@ -549,21 +554,23 @@ impl DagActor {
             );
         }
 
-        // Transition build to active. If DB write fails, caller rolls back.
-        // Pending→Active is always a valid transition for a fresh build; we
-        // debug_assert the outcome but don't branch on it (Rejected here
-        // would be a bug in BuildInfo::transition, not a recoverable error).
-        let outcome = self
-            .transition_build(build_id, BuildState::Active)
-            .await
-            .inspect_err(
-                |e| error!(build_id = %build_id, error = %e, "transition to Active failed; rolling back"),
-            )?;
-        debug_assert_eq!(
-            outcome,
-            super::build::TransitionOutcome::Applied,
+        // The PG half of Pending→Active already committed inside the
+        // merge transaction (activate_build_tx); apply the in-memory
+        // half now that the commit is durable. Pending→Active is always
+        // a valid transition for a fresh build; debug_assert rather
+        // than branch (a rejection here would be a bug in
+        // BuildInfo::transition, not a recoverable error). Other build
+        // transitions keep going through `transition_build` (DB-first
+        // via the pool) — only the merge path is transactional.
+        let applied = self
+            .builds
+            .get_mut(&build_id)
+            .is_some_and(|b| b.transition(BuildState::Active).is_ok());
+        debug_assert!(
+            applied,
             "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
         );
+        let _ = applied;
         Ok(())
     }
 
@@ -1782,6 +1789,16 @@ impl DagActor {
         edge_parents.sort_unstable();
         edge_parents.dedup();
         crate::db::SchedulerDb::clear_topdown_pruned_for_parents(&mut tx, &edge_parents).await?;
+
+        // Batch 4: Pending→Active for the build, in the SAME transaction.
+        // A committed merge therefore implies an Active builds row; a
+        // failure here aborts the whole merge (derivation upserts incl.
+        // the topdown_pruned stamps, links, edges) instead of leaving
+        // committed side effects behind for a build the caller is about
+        // to reject and roll back in memory. The in-memory BuildInfo
+        // transition happens in `persist_and_activate` only after this
+        // commit succeeds.
+        crate::db::SchedulerDb::activate_build_tx(&mut tx, build_id).await?;
 
         // r[verify sched.db.tx-commit-before-mutate]
         // In-mem mutation ordering invariant: no newly-inserted node has

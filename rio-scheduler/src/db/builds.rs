@@ -4,6 +4,7 @@
 //! queries (single-table since I-103). The shared SELECT clause lives in
 //! [`super::list_builds_select!`].
 
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::{BuildListRow, SchedulerDb, list_builds_select};
@@ -199,6 +200,27 @@ impl SchedulerDb {
     pub async fn delete_build(&self, build_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query!("DELETE FROM builds WHERE build_id = $1", build_id)
             .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Flip a build to Active inside an existing transaction. The merge
+    /// path runs this as the LAST statement of `persist_merge_to_db`'s
+    /// transaction so a committed merge implies an Active build: an
+    /// activation failure aborts the whole merge — including the
+    /// `topdown_pruned` stamps and the build_derivations links — instead
+    /// of leaving committed side effects behind for a build the caller
+    /// is about to reject and roll back in memory. Mirrors the
+    /// `BuildState::Active` arm of [`Self::update_build_status`]; all
+    /// other (non-merge) status transitions keep going through that
+    /// pool-level method via `transition_build`.
+    pub(crate) async fn activate_build_tx(
+        tx: &mut PgConnection,
+        build_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE builds SET status = 'active', started_at = now() WHERE build_id = $1")
+            .bind(build_id)
+            .execute(&mut *tx)
             .await?;
         Ok(())
     }

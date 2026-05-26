@@ -1584,6 +1584,173 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
 }
 
 // r[verify sched.merge.substitute-topdown+6]
+/// A pruned merge whose build-activation write fails must reject the
+/// build AND leave nothing of the merge behind in PG — in particular no
+/// `topdown_pruned = true` on a shared pre-existing childless root.
+/// Pre-fix the merge transaction (with the stamp) committed first and
+/// the Pending→Active flip ran as a separate statement: a transient
+/// failure there rejected the build but the stamp survived in PG, ready
+/// to be restored onto a childless node at the next failover and turn a
+/// routine substitute failure into a wrongful terminal fail-fast.
+///
+/// The activation failure is injected with a test-installed PG trigger
+/// that rejects exactly the `builds.status → 'active'` flip (B1 is
+/// already active when the trigger is created, so only B2's activation
+/// can hit it) — no production fault seam, and the failing statement is
+/// precisely the one that used to run outside the transaction.
+#[tokio::test]
+async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // B1: plain merge of root R only — childless, nothing substitutable
+    // → no prune, R seeds Ready, B1 Active. R is the shared node a
+    // rejected later merge must not leave stamped.
+    let r_out = test_store_path("tda-r-out");
+    let mut r_b1 = make_node("tda-r");
+    r_b1.expected_output_paths = vec![r_out.clone()];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![r_b1], vec![], false).await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "precondition: B1 live and Active"
+    );
+    // Positive control for the in-transaction activation: a committed
+    // merge implies the builds row is already 'active' in PG (B1 has no
+    // substitutable outputs and no workers, so nothing can advance it
+    // past Active before this query).
+    let (b1_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+        .bind(b1)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        b1_status, "active",
+        "committed merge must leave the builds row Active in PG"
+    );
+
+    // Make B2's demand set substitutable so the prune fires.
+    let s_out = test_store_path("tda-s-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(r_out.clone());
+        subs.push(s_out.clone());
+    }
+
+    // Deterministic activation failure: reject any builds-row flip to
+    // 'active' from now on. B1 is already active; the only statement
+    // this can hit is B2's activation.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_activation() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected activation failure'; END $$; \
+         CREATE TRIGGER reject_activation BEFORE UPDATE OF status ON builds \
+         FOR EACH ROW WHEN (NEW.status = 'active') EXECUTE FUNCTION reject_activation();",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // B2: {R → R-dep, S → S-dep}; demand = {R, S}, both substitutable →
+    // prune fires, keeps {R, S} (both had a dependency dropped) → the
+    // persist transaction stamps them — and must then abort on the
+    // activation statement.
+    let mut r_b2 = make_node("tda-r");
+    r_b2.expected_output_paths = vec![r_out.clone()];
+    let mut r_dep = make_node("tda-r-dep");
+    r_dep.expected_output_paths = vec![test_store_path("tda-r-dep-out")];
+    let mut s = make_node("tda-s");
+    s.expected_output_paths = vec![s_out.clone()];
+    let mut s_dep = make_node("tda-s-dep");
+    s_dep.expected_output_paths = vec![test_store_path("tda-s-dep-out")];
+
+    let b2 = Uuid::new_v4();
+    let reply = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: b2,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![r_b2, r_dep, s, s_dep],
+            edges: vec![
+                make_test_edge("tda-r", "tda-r-dep"),
+                make_test_edge("tda-s", "tda-s-dep"),
+            ],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            reply.as_ref().err().and_then(|e| e.downcast_ref()),
+            Some(ActorError::Database(_))
+        ),
+        "B2's merge must be rejected by the injected activation failure, got {reply:?}"
+    );
+    // Guard against the scenario silently degrading: the prune must
+    // actually have fired before the activation failure.
+    assert_eq!(
+        recorder.get("rio_scheduler_topdown_prune_total{}"),
+        1,
+        "B2's submission should have taken the roots-only prune path"
+    );
+
+    // Load-bearing: the activation failure must take the WHOLE merge
+    // transaction with it — the shared root's row keeps a clean marker.
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tda-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg_pruned,
+        "rejected merge must not leave topdown_pruned persisted on the shared \
+         pre-existing root (the stamp must roll back with the activation failure)"
+    );
+    // The rest of the merge rolled back with it.
+    let s_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM derivations WHERE drv_hash = 'tda-s'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        s_rows, 0,
+        "B2's newly-inserted derivation rows must roll back with the failed activation"
+    );
+    let b2_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM builds WHERE build_id = $1")
+            .bind(b2)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_ne!(
+        b2_status.as_deref(),
+        Some("active"),
+        "a rejected build must never be active in PG"
+    );
+
+    // In-memory: stamp never applied (it runs only after a successful
+    // persist), B2 unknown, B1 untouched.
+    assert!(
+        !expect_drv(&handle, "tda-r").await.topdown_pruned,
+        "rejected merge must not leave the in-memory stamp either"
+    );
+    assert!(
+        matches!(
+            try_query_status(&handle, b2).await?,
+            Err(ActorError::BuildNotFound(_))
+        ),
+        "rejected B2 should be unknown after rollback"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B1 unaffected by B2's failed merge"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+6]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
