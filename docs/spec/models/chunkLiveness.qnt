@@ -511,6 +511,458 @@ module chunkLiveness {
   pure def countsForOne(parsed: Set[int]): int -> int =
     HASHES.mapBy(h => if (parsed.contains(h)) 1 else 0)
 
+  // --- 6. actions ---------------------------------------------------------
+  //
+  // Each action is one production SQL transaction (or one named
+  // non-transactional step: the S3 PUT fan-out, the crash injections,
+  // the clock). Preconditions are the code path's guards; effects are
+  // its state mutations; the function each mirrors is named in its doc
+  // comment. Actions are guarded (disabled when their preconditions
+  // fail), not thin always-enabled no-ops.
+
+  /// `metadata::insert_manifest_uploading` via `ingest::claim_placeholder`
+  /// (the successful-insert arm): mint a fresh claim (placeholder
+  /// generation), insert the 'uploading' row with references protecting
+  /// the closure, arm the drop-guard. The AlreadyComplete and
+  /// Concurrent outcomes write nothing and are not modeled as actions.
+  action claimPath(u: int, p: int): bool = all {
+    ups.get(u).pc == UIdle,
+    paths.get(p).status == PNone,
+    paths' = paths.set(p, {
+      status: PUploading,
+      gen: paths.get(p).gen + 1,
+      staleness: 0,
+      mdata: NoMd,
+      corrupt: false,
+    }),
+    ups' = ups.set(u, { ...ups.get(u), pc: UClaimed, path: p, claim: paths.get(p).gen + 1 }),
+    chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// `metadata::upgrade_manifest_to_chunked` via `cas::stage_chunked`
+  /// step 2 (one transaction): FOR UPDATE token capture on the
+  /// 'uploading' row, manifest_data INSERT, refcount UPSERT with
+  /// `RETURNING (uploaded_at IS NULL) AS needs_upload`. The chunk list
+  /// is the adversary's choice (any non-empty subset — FastCDC output
+  /// content is irrelevant to liveness). The needs-upload verdict is
+  /// keyed on uploaded_at (M_033 / store.cas.upsert-inserted+2); the
+  /// skippedPutWithoutPresence ghost records any verdict that skips an
+  /// unconfirmed chunk (impossible as encoded — the CR-4 regression
+  /// guard). The code's WHERE has no claim filter — only
+  /// status='uploading' — and the model mirrors that faithfully: the
+  /// guard is the row's existence, not its generation.
+  action upgradeManifest(u: int, list: Set[int]): bool = {
+    val p = ups.get(u).path
+    val needs = list.filter(h => not(chunks.get(h).uploadedAt))
+    all {
+      ups.get(u).pc == UClaimed,
+      paths.get(p).status == PUploading,
+      paths.get(p).mdata == NoMd,
+      paths' = paths.set(p, { ...paths.get(p), mdata: Md(list) }),
+      chunks' = upsertChunks(chunks, list),
+      ups' = ups.set(u, { ...ups.get(u), pc: UUpgraded, list: list, needsUpload: needs, tokenStale: false }),
+      wit' = { ...wit, skippedPutWithoutPresence: or {
+        wit.skippedPutWithoutPresence,
+        list.exists(h => not(needs.contains(h)) and not(chunks.get(h).uploadedAt)),
+      } },
+      s3' = s3, outbox' = outbox, orphanCand' = orphanCand, leakedRefs' = leakedRefs,
+    }
+  }
+
+  /// `cas::do_upload`: the bounded-concurrency S3 PUT fan-out for the
+  /// needs-upload set (collapsed to one action — see the header's
+  /// granularity note; not a SQL transaction).
+  action uploadChunks(u: int): bool = all {
+    ups.get(u).pc == UUpgraded,
+    s3' = s3.union(ups.get(u).needsUpload),
+    ups' = ups.set(u, { ...ups.get(u), pc: UPutDone }),
+    paths' = paths, chunks' = chunks, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// `metadata::mark_chunks_uploaded` (cas::stage_chunked step 4b, one
+  /// statement): set uploaded_at for the chunks this uploader PUT,
+  /// where still NULL. The presence commit point
+  /// (store.cas.chunk-upload-committed).
+  action markUploaded(u: int): bool = all {
+    ups.get(u).pc == UPutDone,
+    chunks' = chunks.keys().mapBy(h =>
+      val c = chunks.get(h)
+      if (ups.get(u).needsUpload.contains(h) and c.present) { ...c, uploadedAt: true } else c),
+    ups' = ups.set(u, { ...ups.get(u), pc: UMarked }),
+    paths' = paths, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// `metadata::complete_manifest_chunked` → `complete_manifest_in_conn`
+  /// (one transaction): claim-gated status flip to 'complete' +
+  /// narinfo fill; updated_at = now(). The guard defuses on success.
+  action completeManifest(u: int): bool = {
+    val p = ups.get(u).path
+    all {
+      ups.get(u).pc == UMarked,
+      completeAdmitted(p, ups.get(u).claim),
+      paths' = paths.set(p, { ...paths.get(p), status: PComplete, staleness: 0 }),
+      ups' = ups.set(u, { ...ups.get(u), pc: UDone }),
+      chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+      leakedRefs' = leakedRefs, wit' = wit,
+    }
+  }
+
+  /// The completion attempt when the claim no longer matches (the row
+  /// was reaped, possibly re-claimed by a successor):
+  /// `complete_manifest_in_conn` touches zero rows and returns
+  /// PlaceholderMissing; `cas::put_chunked` then falls through to the
+  /// claim-gated reap (which will also no-op). Modeled as the pc move
+  /// onto the reap path; no durable state changes.
+  action completeFailsForeign(u: int): bool = all {
+    ups.get(u).pc == UMarked,
+    not(completeAdmitted(ups.get(u).path, ups.get(u).claim)),
+    ups' = ups.set(u, { ...ups.get(u), pc: UReaping }),
+    paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// The owner decides to abandon the upload and clean up via the
+  /// claim-gated reap: the explicit `abort_upload` / `abort_placeholder`
+  /// on an ingest error, the complete-failure cleanup arm of
+  /// `cas::put_chunked`, or the drop-guard's spawned `reap_one` after
+  /// the handler future was dropped (`ingest::PlaceholderGuard::drop`).
+  /// No durable change yet — the reap is the next transaction.
+  action abortToReap(u: int): bool = all {
+    Set(UClaimed, UUpgraded, UPutDone, UMarked).contains(ups.get(u).pc),
+    ups' = ups.set(u, { ...ups.get(u), pc: UReaping }),
+    paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// An upload or mark failure sends the uploader to the in-process
+  /// rollback (`cas::stage_chunked`'s error arms call `rollback()`).
+  /// No durable change yet.
+  action uploadFailsToRollback(u: int): bool = all {
+    Set(UUpgraded, UPutDone).contains(ups.get(u).pc),
+    ups' = ups.set(u, { ...ups.get(u), pc: URollback }),
+    paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// `cas::heartbeat_uploading` (one statement, claim-gated): bump
+  /// updated_at for the owner's own 'uploading' row. Fired by the
+  /// guard's 30 s wall-clock task and the per-64-chunks progress hook.
+  /// A post-upgrade heartbeat invalidates the captured
+  /// PlaceholderToken (the C4 deliberate false-negative).
+  action heartbeat(u: int): bool = {
+    val p = ups.get(u).path
+    all {
+      Set(UClaimed, UUpgraded, UPutDone, UMarked, URollback, UReaping).contains(ups.get(u).pc),
+      ups.get(u).path != 0,
+      heartbeatAdmitted(p, ups.get(u).claim),
+      paths' = paths.set(p, { ...paths.get(p), staleness: 0 }),
+      ups' = ups.set(u, { ...ups.get(u),
+        tokenStale: or {
+          ups.get(u).tokenStale,
+          Set(UUpgraded, UPutDone, UMarked, URollback).contains(ups.get(u).pc),
+        } }),
+      wit' = { ...wit, heartbeatReset: wit.heartbeatReset or paths.get(p).staleness > 0 },
+      chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+      leakedRefs' = leakedRefs,
+    }
+  }
+
+  /// `metadata::delete_manifest_chunked_uploading` (DEC-1, one
+  /// transaction): the token-gated in-process rollback. If the
+  /// 'uploading' row is still this uploader's generation and its own
+  /// heartbeat has not advanced updated_at since the upgrade, decrement
+  /// each of its written hashes by one and delete the
+  /// manifest_data/manifests/narinfo placeholder rows — NO zero-detect
+  /// and NO outbox enqueue (rows left at zero are the orphan-chunk
+  /// sweep's job after the grace TTL). Otherwise a no-op (left for the
+  /// orphan scanner).
+  action rollbackTx(u: int): bool = {
+    val p = ups.get(u).path
+    // The specifically-C4 no-op shape: still my row, but my own
+    // heartbeat advanced updated_at after the upgrade. Every other
+    // no-op cause (row gone, foreign generation) is the late-cleanup
+    // contention the claim/token machinery exists for.
+    val ownRowStaleToken = and {
+      paths.get(p).status == PUploading,
+      paths.get(p).gen == ups.get(u).claim,
+      ups.get(u).tokenStale,
+    }
+    all {
+      ups.get(u).pc == URollback,
+      if (rollbackAdmitted(p, ups.get(u).claim, ups.get(u).tokenStale)) all {
+        paths' = paths.set(p, emptyPath(paths.get(p).gen)),
+        chunks' = chunks.keys().mapBy(h =>
+          val c = chunks.get(h)
+          if (ups.get(u).list.contains(h) and c.present) { ...c, rc: c.rc - 1 } else c),
+        ups' = ups.set(u, { ...ups.get(u), pc: UAborted }),
+        s3' = s3, outbox' = outbox, orphanCand' = orphanCand, leakedRefs' = leakedRefs, wit' = wit,
+      } else all {
+        ups' = ups.set(u, { ...ups.get(u), pc: UAborted }),
+        wit' = { ...wit,
+          lateCleanupNoop: wit.lateCleanupNoop or not(ownRowStaleToken),
+          rollbackNoopStaleToken: wit.rollbackNoopStaleToken or ownRowStaleToken,
+        },
+        paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+        leakedRefs' = leakedRefs,
+      },
+    }
+  }
+
+  /// `gc::orphan::reap_one(ReapBy::Claim(claim))` (one transaction):
+  /// the owner-side claim-gated reap used by abort_placeholder, the
+  /// drop-guard, and put_chunked's complete-failure cleanup. If the
+  /// 'uploading' row still carries this claim: read its chunk_list
+  /// inside the transaction, DELETE narinfo (CASCADE manifests +
+  /// manifest_data), decrement the parsed unique hashes, soft-delete
+  /// the ones that hit zero and enqueue them (decrement_and_enqueue).
+  /// A corrupt chunk_list parses to empty — decrement skipped, leak
+  /// recorded (C12). If the claim does not match (reaped + re-claimed,
+  /// or already completed): no-op.
+  action reapByClaim(u: int): bool = {
+    val p = ups.get(u).path
+    val parsed = parsedListOf(p)
+    val res = decrementAndZero(chunks, countsForOne(parsed))
+    all {
+      ups.get(u).pc == UReaping,
+      if (claimReapAdmitted(p, ups.get(u).claim)) all {
+        paths' = paths.set(p, emptyPath(paths.get(p).gen)),
+        chunks' = res.cm,
+        outbox' = outbox.union(res.zeroed),
+        leakedRefs' = leakedRefs.keys().mapBy(h =>
+          if (listOf(p).contains(h) and not(parsed.contains(h)))
+            leakedRefs.get(h) + 1
+          else leakedRefs.get(h)),
+        ups' = ups.set(u, { ...ups.get(u), pc: UAborted }),
+        s3' = s3, orphanCand' = orphanCand, wit' = wit,
+      } else all {
+        ups' = ups.set(u, { ...ups.get(u), pc: UAborted }),
+        wit' = { ...wit, lateCleanupNoop: true },
+        paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+        leakedRefs' = leakedRefs,
+      },
+    }
+  }
+
+  /// The shared stale-reclaim transaction body
+  /// (`gc::orphan::reap_one(ReapBy::Stale{..})`): re-check the
+  /// staleness predicate inside the transaction (FOR UPDATE), DELETE
+  /// narinfo (CASCADE), decrement the parsed unique hashes, soft-delete
+  /// + enqueue the zeroed ones. Used by the hot-path reclaim (300 s,
+  /// fired from a conflicting claim attempt) and the orphan scanner
+  /// (15 min). The liveOwnerReaped ghost records a reap of a row whose
+  /// owner is alive in a guard-armed phase (S5's harm).
+  action reapStale(p: int, isHotpath: bool): bool = {
+    val parsed = parsedListOf(p)
+    val res = decrementAndZero(chunks, countsForOne(parsed))
+    all {
+      if (isHotpath) hotpathStale(p) else scannerStale(p),
+      paths' = paths.set(p, emptyPath(paths.get(p).gen)),
+      chunks' = res.cm,
+      outbox' = outbox.union(res.zeroed),
+      leakedRefs' = leakedRefs.keys().mapBy(h =>
+        if (listOf(p).contains(h) and not(parsed.contains(h)))
+          leakedRefs.get(h) + 1
+        else leakedRefs.get(h)),
+      wit' = { ...wit,
+        liveOwnerReaped: wit.liveOwnerReaped or ownerLiveForced(p),
+        hotpathReaped: wit.hotpathReaped or isHotpath,
+        scannerReaped: wit.scannerReaped or not(isHotpath),
+      },
+      ups' = ups, s3' = s3, orphanCand' = orphanCand,
+    }
+  }
+
+  /// The hot-path stale reclaim (`ingest::claim_placeholder` step 3,
+  /// I-207): a conflicting claim attempt finds a stale 'uploading'
+  /// placeholder (>= 300 s without progress) and reaps it before
+  /// retrying its own insert. Modeled as a standalone action — the
+  /// environment always has a writer able to attempt the path, so the
+  /// only load-bearing part of "who triggers it" is the threshold.
+  action hotPathReclaim(p: int): bool = reapStale(p, true)
+
+  /// The background orphan scanner (`gc::orphan::scan_once`, 15 min
+  /// cadence): reaps stale 'uploading' placeholders one transaction
+  /// per row.
+  action scannerReap(p: int): bool = reapStale(p, false)
+
+  /// One path-GC sweep batch over a single unreachable path
+  /// (`gc::sweep::sweep_one_batch` with the path-level mark and
+  /// re-check abstracted into the environment's choice — see the
+  /// header's G4b scope note): DELETE narinfo (CASCADE manifests +
+  /// manifest_data), decrement the parsed unique hashes by 1, zero-
+  /// detect, enqueue. Only 'complete' manifests are ever swept
+  /// ('uploading' rows are mark roots).
+  action pathSweepOne(p: int): bool = {
+    val parsed = parsedListOf(p)
+    val res = decrementAndZero(chunks, countsForOne(parsed))
+    all {
+      paths.get(p).status == PComplete,
+      paths' = paths.set(p, emptyPath(paths.get(p).gen)),
+      chunks' = res.cm,
+      outbox' = outbox.union(res.zeroed),
+      leakedRefs' = leakedRefs.keys().mapBy(h =>
+        if (listOf(p).contains(h) and not(parsed.contains(h)))
+          leakedRefs.get(h) + 1
+        else leakedRefs.get(h)),
+      ups' = ups, s3' = s3, orphanCand' = orphanCand, wit' = wit,
+    }
+  }
+
+  /// One path-GC sweep batch covering BOTH paths in the same
+  /// transaction (`sweep_one_batch` collects the whole batch's hashes
+  /// into one UNNEST decrement, by count): a chunk referenced by both
+  /// dying manifests is decremented by 2 in one statement — the
+  /// adfd303d7-C2 by-count discipline (store.chunk.refcount-decrement).
+  action pathSweepBatch: bool = {
+    val counts = HASHES.mapBy(h =>
+      PATHS.filter(p => parsedListOf(p).contains(h)).size())
+    val res = decrementAndZero(chunks, counts)
+    all {
+      PATHS.forall(p => paths.get(p).status == PComplete),
+      PATHS.size() >= 2,
+      paths' = PATH_KEYS.mapBy(p => emptyPath(paths.get(p).gen)),
+      chunks' = res.cm,
+      outbox' = outbox.union(res.zeroed),
+      leakedRefs' = leakedRefs.keys().mapBy(h =>
+        leakedRefs.get(h) +
+          PATHS.filter(p => listOf(p).contains(h) and not(parsedListOf(p).contains(h))).size()),
+      wit' = { ...wit, sweptSharedByCount: or {
+        wit.sweptSharedByCount,
+        HASHES.exists(h => counts.get(h) >= 2),
+      } },
+      ups' = ups, s3' = s3, orphanCand' = orphanCand,
+    }
+  }
+
+  /// The orphan-chunk sweep's outer SELECT (`sweep_orphan_chunks`):
+  /// snapshot the candidate set (refcount = 0, not deleted, past the
+  /// grace TTL) outside any transaction. The snapshot can go stale —
+  /// that staleness is C11, and the inner UPDATE's re-check is the
+  /// guard.
+  action orphanSelect: bool = all {
+    orphanCand == Set(),
+    HASHES.exists(h => orphanCandidate(h)),
+    orphanCand' = HASHES.filter(h => orphanCandidate(h)),
+    paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, ups' = ups,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// The orphan-chunk sweep's batch transaction (`sweep_orphan_batch`):
+  /// UPDATE ... WHERE refcount = 0 AND deleted = FALSE re-checks each
+  /// candidate at execution time; rows that still match are
+  /// soft-deleted (uploaded_at cleared) and enqueued. A candidate
+  /// resurrected since the SELECT is excluded by the re-check
+  /// (orphanRecheckSaved).
+  action orphanSweepBatch: bool = {
+    val zeroed = orphanCand.filter(h => and {
+      chunks.get(h).present,
+      chunks.get(h).rc == 0,
+      not(chunks.get(h).deleted),
+    })
+    all {
+      orphanCand != Set(),
+      chunks' = chunks.keys().mapBy(h =>
+        val c = chunks.get(h)
+        if (zeroed.contains(h)) { ...c, deleted: true, uploadedAt: false } else c),
+      outbox' = outbox.union(zeroed),
+      orphanCand' = Set(),
+      wit' = { ...wit, orphanRecheckSaved: or {
+        wit.orphanRecheckSaved,
+        orphanCand.exists(h => not(zeroed.contains(h))),
+      } },
+      paths' = paths, s3' = s3, ups' = ups, leakedRefs' = leakedRefs,
+    }
+  }
+
+  /// One drain row transaction (`gc::drain::drain_one_row`, success
+  /// path): lock the outbox row, re-check `(deleted AND refcount = 0)`
+  /// on the chunk FOR UPDATE; if still dead, issue the backend
+  /// DeleteObject and remove the outbox row; if resurrected, skip the
+  /// delete and drop the row. The deletedWhileReferenced ghost records
+  /// CR-1's action form at the only irreversible step.
+  action drainOne(h: int): bool = all {
+    outbox.contains(h),
+    if (stillDead(h)) all {
+      s3' = s3.exclude(Set(h)),
+      outbox' = outbox.exclude(Set(h)),
+      wit' = { ...wit,
+        s3Deleted: true,
+        deletedWhileReferenced: wit.deletedWhileReferenced or refs(h) != Set(),
+      },
+      paths' = paths, chunks' = chunks, orphanCand' = orphanCand, ups' = ups,
+      leakedRefs' = leakedRefs,
+    } else all {
+      outbox' = outbox.exclude(Set(h)),
+      wit' = { ...wit, drainSkippedResurrected: true },
+      paths' = paths, chunks' = chunks, s3' = s3, orphanCand' = orphanCand, ups' = ups,
+      leakedRefs' = leakedRefs,
+    },
+  }
+
+  /// The drain's C10 window: the backend DeleteObject succeeded but the
+  /// transaction commit did not — the outbox row survives and the next
+  /// pass re-processes it (the S3 delete is idempotent). Crash-regime
+  /// only.
+  action drainCrashAfterS3(h: int): bool = all {
+    ENABLE_CRASH,
+    outbox.contains(h),
+    stillDead(h),
+    s3' = s3.exclude(Set(h)),
+    wit' = { ...wit,
+      s3Deleted: true,
+      deletedWhileReferenced: wit.deletedWhileReferenced or refs(h) != Set(),
+    },
+    paths' = paths, chunks' = chunks, outbox' = outbox, orphanCand' = orphanCand, ups' = ups,
+    leakedRefs' = leakedRefs,
+  }
+
+  /// Process death (the C1/C2/C5/C6/C7 windows, by phase): the
+  /// uploader stops forever; its guard, heartbeat task and pending
+  /// cleanup never run. Crash-regime only.
+  action crash(u: int): bool = all {
+    ENABLE_CRASH,
+    Set(UClaimed, UUpgraded, UPutDone, UMarked, URollback, UReaping).contains(ups.get(u).pc),
+    ups' = ups.set(u, { ...ups.get(u), pc: UCrashed }),
+    paths' = paths, chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// Data damage: an existing manifest_data.chunk_list becomes
+  /// unparseable (the C12 surface — `Manifest::deserialize` fails at
+  /// reap/sweep time). Corrupt-regime only.
+  action corruptChunkList(p: int): bool = all {
+    ENABLE_CORRUPT,
+    paths.get(p).mdata != NoMd,
+    not(paths.get(p).corrupt),
+    paths' = paths.set(p, { ...paths.get(p), corrupt: true }),
+    chunks' = chunks, s3' = s3, outbox' = outbox, orphanCand' = orphanCand, ups' = ups,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
+  /// The abstract clock: one unit of time passes. Placeholder
+  /// staleness and chunk age advance (saturating at their caps — see
+  /// the header's saturation note). The precondition encodes the
+  /// production heartbeat contract: time cannot advance past the
+  /// heartbeat deadline for a placeholder whose owner is alive in a
+  /// guard-armed phase (the 30 s wall-clock guard task), which is what
+  /// keeps live uploads strictly below both reclaim thresholds.
+  action tick: bool = all {
+    PATHS.forall(p =>
+      (paths.get(p).status == PUploading and ownerLiveForced(p)) implies
+        paths.get(p).staleness + 1 <= HB_DEADLINE),
+    paths' = PATH_KEYS.mapBy(p =>
+      val r = paths.get(p)
+      if (r.status == PUploading) { ...r, staleness: minInt(r.staleness + 1, STALE_CAP) } else r),
+    chunks' = HASHES.mapBy(h =>
+      val c = chunks.get(h)
+      if (c.present) { ...c, age: minInt(c.age + 1, AGE_CAP) } else c),
+    s3' = s3, outbox' = outbox, orphanCand' = orphanCand, ups' = ups,
+    leakedRefs' = leakedRefs, wit' = wit,
+  }
+
   // --- 8. init ------------------------------------------------------------
 
   action init = all {
@@ -539,4 +991,40 @@ module chunkLiveness {
     },
   }
 
+  // --- 9. step ------------------------------------------------------------
+
+  action step = {
+    nondet u = UPLOADERS.oneOf()
+    nondet p = PATHS.oneOf()
+    nondet h = HASHES.oneOf()
+    nondet list = LIST_CHOICES.oneOf()
+    any {
+      // the writers (W1-W4 collapse onto this state machine)
+      claimPath(u, p),
+      upgradeManifest(u, list),
+      uploadChunks(u),
+      markUploaded(u),
+      completeManifest(u),
+      completeFailsForeign(u),
+      abortToReap(u),
+      uploadFailsToRollback(u),
+      heartbeat(u),
+      rollbackTx(u),
+      reapByClaim(u),
+      // the background accountants
+      hotPathReclaim(p),
+      scannerReap(p),
+      pathSweepOne(p),
+      pathSweepBatch,
+      orphanSelect,
+      orphanSweepBatch,
+      drainOne(h),
+      // the fault alphabet
+      crash(u),
+      drainCrashAfterS3(h),
+      corruptChunkList(p),
+      // the clock
+      tick,
+    }
+  }
 }
