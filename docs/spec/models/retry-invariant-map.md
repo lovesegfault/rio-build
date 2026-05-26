@@ -1725,3 +1725,170 @@ event-level ledger that makes the trace projection trivial. The
 quint-connect machinery (`#[quint_run]`, the ITF replay pattern in
 `rio-store/src/logs/mbt_tests.rs` / `rio-lease/src/mbt_tests.rs`)
 transfers directly if so.
+
+### The acceptance table: the historical fix corpus against the post-collapse architecture
+
+Design §4's closing assurance item: "the 45-fix families each get a
+'cannot recur by construction' or 'checked by invariant X' verdict."
+The Stage-C calibration table above proved the *model* would re-find
+each encodable bug in the *as-built* code; this table records, for the
+same corpus, what holds the bug class down in the *post-collapse* code
+— the architecture every row below now runs on: no site mutates a
+counter (the counters are `decide()`'s fold of the durable suffix,
+refreshed per append), every charge/verdict/status persist commits or
+fails as one appending transaction, classification happens once at
+append time (`classify()`), placement consumes the fold's exclusion set
+(`placeable()`), recovery rebuilds the view from the same fold, and the
+decision arithmetic carries stated Kani contracts
+(`kani-rio-scheduler`, manual target).
+
+Verdict legend, following the log campaign's table: **CONSTRUCTION** —
+the state or code path the bug lived in does not exist post-collapse;
+the cited mechanism is what replaced it (the residual risk for every
+such row is a defect in the shared fold/classifier itself, owned
+jointly by the Kani contracts, the fold unit battery, and the
+`quint-retry-policy-*` regimes). **CHECKED(...)** — the mechanism is
+still live (deliberately kept); the named invariant / Kani harness /
+test holds the hazard down. **OUTSIDE** — no footprint in the collapsed
+decision path then or now; the named conventional vehicle owns it,
+unchanged by this campaign. Kani harness citations refer to the stated
+contracts (the manual `kani-rio-scheduler` target — see the
+assurance-layer verification status above); they are cited as the
+precise property statements and are never a row's sole checker.
+
+#### G1 — counter incremented on the wrong path / not incremented where needed
+
+The family-level verdict is CONSTRUCTION: there is no per-site
+increment left to put on a wrong path. Each entry point classifies and
+appends; which budget an event charges is decided exactly once, in
+`apply()`'s arm for that event class, and `countersRefineHistory` is an
+identity in the post-collapse encoding (the cached view, the durable
+fold and the spec ghost advance together). Per-row:
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `8283d4362` half a (window reset wiped at-cap accounting) | CONSTRUCTION | The I-127 window reset exists in exactly one place — the fold's infra arm, gated on the event's own `at_cap` — and no site re-implements it. Pinned by the fold window-reset unit tests (incl. the exempt fall-through) and the `quint-retry-policy-witness-window-reset` / `-exempt-fallthrough` reachability witnesses. |
+| `8283d4362` half b (controller at-cap OOM never cap-checked) | CONSTRUCTION | E6's at-cap charge is the same fold arm E2 uses; a per-channel cap divergence has no site to live in. `check_decide_contract` proves `infra_count ≤ max_infra_retries` over every history; D2's anchor stamp is the same arm (flipped to HOLD in the dual regime). |
+| `172776b1b` (E7 had no cap action; its fix introduced the D1 poison) | CONSTRUCTION | The timeout cap has one terminal arm: `Cancel` at the cap on both channels (T-1b.10, the D1 adjudication). `check_decide_contract`'s partition clause ties `Cancel` to the exhausted timeout budget; `verdictMatchesFold` HOLDs in the dual regime; `d1ControllerTimeoutCapCancelsRun` and the E7 cap tests pin the concrete history. The 172776b1b livelock cannot return: the cap arm is terminal by construction. |
+| `9c20d04e3` (E4 charge gated on a promotion a cold start never produces) | CONSTRUCTION | The fold's worker-timeout arm charges unconditionally; `classify()` never consults the floor for timeouts (kani `check_classify_contract`). |
+| `db457374f` deadline-accounting half (E7 charge gated on the floor outcome) | CONSTRUCTION | Same mechanism as `9c20d04e3`, controller channel (`ControllerDeadlineExceeded` arm charges unconditionally below the cap). |
+| `db457374f` backstop half (the wedge backstop recorded nothing) | CONSTRUCTION + CHECKED(`attemptsBoundedGlobal`, crash regime) | E8 appends a `backstop` row and routes its verdict through `decide()` at its own site (T-1b.6); the charge is durable by the appending transaction (`durableMirrorsCharges` identity). |
+| `db457374f` stream-epoch + heartbeat-binding halves | OUTSIDE | Executor-lifecycle machinery, untouched by this campaign; transfers to the executor-lifecycle campaign (#1). |
+| `8a016a393` (at-cap OOM double-counted by floor bump + handler) | CONSTRUCTION | `bump_resource_floor` still mutates no counter; the handler's charge is one fold arm over one ledger row, and one execution can have at most one attempt row (the 066 `exec_id` partial unique index — the second installment is an UPDATE). `noDoubleCount` stays a live invariant (dual regime). |
+| `c13f6a277` (I-213: floor-promoted transients consumed `max_retries`) | OUTSIDE (unchanged vehicle, P4) | The exemption stays infra-class only; `classify()` never marks a transient exempt — now also a Kani-proven clause of `check_classify_contract` — and behavioral coverage stays with `test_transient_failure_promotion_exempt_from_max_retries` (`sched.retry.promotion-exempt+3`). |
+| `8d38cb999` (disconnect path charged floor-promoted evictions) | CONSTRUCTION | A bare disconnect appends a `disconnected` row that charges nothing (fold's disconnect arm); only an established crash charges (C2/P1), and establishment requires the classification window to have closed empty. Crash-regime `attemptsChargedOnce` + executor tests. |
+| `dc094dd0c` (assigned-only disconnects counted toward poison) | CONSTRUCTION | Same mechanism — the disconnect arm charges nothing regardless of Assigned/Running. |
+| `a60d58a32` (no CONCURRENT_PUTPATH exemption, no 300 s window) | CONSTRUCTION | Both are single fold/classifier arms now: the exemption is `classify()`'s predicate (kani-contracted on both channels), the window is the fold's infra arm. Reachability pinned by the window-reset and exempt-cap witnesses. |
+| `699ad52e1` exempt-cap root cause (the exempt path had no budget) | CONSTRUCTION | The exemption's own budget is one fold arm (increment-then-check); `check_decide_contract` ties `Poison(ExemptInfraBudget)` to the exhausted cap and proves an exempt charge at the cap never requeues. |
+
+#### G2 — counter splits
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `a4bcb5623` (per-cycle vs cross-cycle conflated) | CONSTRUCTION | `count` is per-cycle by the suffix cut (the loader returns rows at-or-after the most recent durable reset row) and `resubmit_cycles` advances only on durable resubmit-reset rows; no site owns either, so they cannot be re-merged at a site. Pinned by the fold resubmit-reset unit tests and the recovery test that the resubmit bound survives failover. |
+| `2f07ea909` (ORIGIN: K8s-aware retry feature) | n/a (origin) | The placement exclusion it introduced is now `placeable()` over the fold's exclusion set + `hard_filter` over the fold-derived view (kani `check_placeable_contract`); the P3 keep-and-document note (the transient cap is defaults-shadowed by exactly this exclusion) is recorded at the cap check in `retry_policy.rs`. |
+
+#### G3 — cascade missing / double / hanging build
+
+The cascade deliberately stayed an actor-side graph operation
+downstream of a `Poison` verdict (design §4); it is CHECKED, not
+by-construction.
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `af0eb62c6` (poison did not cascade at all) | CHECKED(`cascadeReachesExactlyTheDependents`, all regimes) | Cascade rows are appended in the same transaction as the trigger's poison row; `sched.poison.cascade-dependents` carries the runtime obligation. |
+| `3973a4f54` (recovery did not re-cascade) | CHECKED(`cascadeReachesExactlyTheDependents`, failover regime) | `sched.recovery.failed-dep-cascade` + the recovery-cascade tests. |
+| `5b4543c3a` transitive-depfailed half (depth ≥ 2 persistence) | OUTSIDE | Build/DAG-level bookkeeping; keep-going and recovery test suites. |
+| `891a6520d` build-summary half (spurious Succeeded) | OUTSIDE | Build-summary accounting; `sched.recovery.poisoned-failed-count` + recovery tests. |
+| `d91df7e9f` (derivation_hashes pruning, hung keep-going build) | OUTSIDE | Build-level totals; keep-going tests. |
+| `e45f2d966` dep-failed-seed half (merge-time transitive seeding) | OUTSIDE | `sched.merge.dep-failed-transitive` + merge tests. |
+| `33b1f855c` (cascade didn't finalize retained exec logs) | SUBS | Subject deleted by the log campaign (LogService owns logs; 065_drop_drv_logs). |
+| `699ad52e1` drv_name-cascade-key part | OUTSIDE | Identity plumbing; the cascade walk keys on the DAG node, covered by the cascade tests. |
+
+#### G4 — poison state desynced between memory and PG, or never cleared
+
+The family-level mechanism: there is no second store for the budget
+counters to desync against — the mirror writers are gone, and the
+charge, the verdict and the status persist commit or fail as one
+transaction (`attemptTxFails` in the model is the only failure shape
+left, and it charges nothing).
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `b874e5120` (clear ran in-mem first, PG best-effort) | CONSTRUCTION + CHECKED(`clearedPoisonClearsDurably`) | Poison clears are durable rows written PG-first inside the reset transaction (`clear_poison_in_tx` joins the reset row's transaction); the invariant stays live in the worker/dual/failover regimes. |
+| `f9adf3c76` (expired poison reloaded with a fresh TTL) | CHECKED(`recoveryPreservesPoisonStatus` + the recovery TTL filter) | Recovery still filters expired poisons; `quint-retry-policy-witness-ttl-expiry` pins the expiry as reachable; recovery tests pin the reload behavior. |
+| `7078da256` (reset-in-place left stub fields) | CONSTRUCTION | Poisoned nodes are removed and re-merged fresh on clear (the post-fix behavior is the only behavior); resubmit/merge tests. |
+| `b09c5b312` X6 half (E5 threshold re-check) | CHECKED (kept by decision P2) | The re-check is now a `decide()` caller over the durable suffix + seed — the same fold as everywhere else — serving the disconnect/force-drain re-poison path and the post-failover backstop for a lost poison persist. |
+| `b09c5b312` X13 half (TTL clear left PG exclusions behind) | CHECKED(`clearedPoisonScrubsExclusions`) | The clear scrubs the durable exclusion state in the same transaction; the legacy column is also zeroed by the same clear (frozen-column hygiene until the Phase-2 drop). |
+| `84a692492` (transient retry persisted Failed instead of Ready) | CHECKED | The status persist is part of the appending transaction whose verdict it reflects, and recovery re-runs `decide()` for every non-terminal derivation and enforces the verdict (T-1b.12b), so a wrong persisted status converges at the next recovery instead of wedging. Recovery enforcement tests. |
+| `cbda4119a` (poison_and_cascade on an unexpected state) | OUTSIDE | Defense-in-depth transition guard, unchanged; state-machine tests. |
+| `ea36f98f2` (poison persisted bytes not text) | OUTSIDE | SQL serialization; sqlx compile-checked queries + migration tests. |
+| `01faf80b7` (reset kept a stale traceparent) | OUTSIDE | Tracing metadata; observability tests. |
+
+#### G5 — the same dead executor counted twice
+
+The dedup/correlation machinery was deliberately NOT deleted (design
+non-goal); the family is CHECKED, with one schema-level CONSTRUCTION
+half: one execution can have at most one attempt row.
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `ee9302b86` (race-ahead report didn't suppress the re-report) | CHECKED(`noDoubleCount`, dual regime) + CONSTRUCTION (schema half) | The 066 `exec_id` partial unique index makes the controller's installment an UPDATE on the disconnect's row, never a second row; the live dedup state is still modeled and still checked. |
+| `e872b2b49` (non-promoting report consumed the correlation entry) | CHECKED | The two-installment correlation is keyed by the released `exec_id` carried in `recently_disconnected`; a non-promoting report deliberately does not establish (P1), preserving the classification window — the property the calibration's `pendingReportKeepsItsEntry` stated is now structural in the row lifecycle and exercised by `lateInstallmentAfterRedispatchRun` + the executor-termination tests. |
+| `c5c5ccd17` (deposed leader still poisoned/requeued) | OUTSIDE | The lease fence; owned by `leaderElection.qnt` and the rio-lease campaign (assume–guarantee). |
+| `db457374f` stream-epoch half (late disconnect removed the reconnected worker) | OUTSIDE | Executor-lifecycle campaign (#1). |
+
+#### G6 — floor ladder vs retry budget
+
+All nine commits: OUTSIDE (unchanged vehicle), exactly as
+pre-registered. The ladder itself (`floor.rs`) is untouched by the
+campaign — zero lines changed — and its internals stay with its unit
+tests. What the campaign did change is the *charging consequence* of a
+floor outcome: it is consumed once, at append time, by `classify()`
+(kani-contracted on both channels), so the G1-calibrated charging bugs
+around promoted/at-cap outcomes are covered by the rows above, and a
+new divergence between channels would have to be introduced inside the
+single classifier rather than at two sites.
+
+#### G7 — fleet-exhaust / placement
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `a62631c90` (exhaust check filtered by kind only) | CHECKED (split) | The exhaust *predicate* is `placeable()` over (exclusion × eligible fleet) — kani `check_placeable_contract` — but the *eligibility computation* feeding it (kind/system/features) is still dispatch-time code owned by the dispatch tests; heterogeneous-eligibility modeling stays a named NOT-ENC dimension and transfers to the executor-lifecycle campaign. |
+| `699ad52e1` draining-exclusion root cause (draining workers padded the fleet) | CHECKED(`placementSound` + kani + `test_fleet_exhaustion_defers_under_one_shot`) | The eligible set excludes draining workers at the call site; the empty-fleet defer is normative (`sched.dispatch.fleet-exhaust+3`) and proven for the predicate by `check_placeable_contract` / `check_fold_fleet_exhaust_arm`. |
+| `c03d52787` (resubmitted build joined a poisoned node and hung) | OUTSIDE | Build-level merge interaction; merge/keep-going tests. |
+
+#### G8 — failover loses or fabricates attempt history
+
+The family-level verdict is CONSTRUCTION: the history is durable and
+recovery rebuilds the view by running the same fold over it
+(`failoverPreservesHistory`, first checked at T-1c.3, HOLDs in the
+failover regime); the selective forgiveness this family's bugs lived in
+no longer exists.
+
+| Corpus row | Post-collapse verdict | Mechanism / checker |
+|---|---|---|
+| `891a6520d` poison-set half (NULL-timestamp window; remove_build reap) | CHECKED(`recoveryPreservesPoisonStatus`, failover regime) | The poison stamp is atomic with its transaction; recovery preserves unexpired poisons; the reap-interaction at code resolution stays with the recovery tests (the NOT-ENC note carries forward). |
+| `5b4543c3a` recovery halves (wrong recovered failed-count / dropped cascade) | CHECKED(`failoverPreservesHistory` + `cascadeReachesExactlyTheDependents`) | The recovered view is the fold of the reloaded suffix (+ legacy seed); the A-1a-4 recovery battery asserts the suffix reloads identically across a flap. |
+| family-level reconstruction row (`failure_count` not derived from durable evidence) | CONSTRUCTION | There is no reconstruction left: the recovered counters ARE the fold of durable rows. The lossy projection survives only as the legacy seed's degenerate case, and `check_decide_contract` / `check_legacy_seed_merge_monotone` prove the merge never drops below what the columns support. `recoveryNeverFabricatesFailures` stays live. |
+| `f9adf3c76` (expired poison reloaded) | CHECKED | Same row as G4 above. |
+| `0fce3e697`, `43a7df620`, `0745c2ce4` (lease generation floor / claims) | OUTSIDE | Owned by `leaderElection.qnt`, the rio-lease Kani contract, and `mbt-rio-lease` (assume–guarantee composition). |
+
+#### Summary
+
+Of the corpus rows above: the two dominant families the design §1
+called out — "counter incremented on the wrong path" (G1) and "the same
+dead pod counted twice" (G5's charge half) — are closed by
+construction: the first because per-site increments no longer exist,
+the second because one execution can produce at most one attempt row
+and the second observer's installment is an UPDATE. The G4
+memory-vs-PG desync family is closed by the appending transaction (one
+commit point for charge + verdict + status). The G8 failover family is
+closed by the durable history plus the seeded recovery fold. The
+mechanisms that deliberately survived — the cascade walk, the dedup/
+correlation layer, the E5 re-check, recovery's poison-TTL filter, the
+placement eligibility computation — are each named CHECKED above with
+the invariant, Kani harness, or test that owns them. The rows that were
+never in the decision path (build-level bookkeeping, serialization,
+tracing metadata, the floor ladder's internals, the lease fence) keep
+their existing vehicles, unchanged.
