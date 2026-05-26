@@ -176,10 +176,12 @@ pub(super) struct PreparedOutput {
     /// Sorted full-store-path references to register.
     pub references: Vec<String>,
     /// Content-address descriptor (`fixed:[r:]<algo>:<base32>`) for
-    /// floating-CA outputs, recorded by the native result pipeline.
-    /// `None` for input-addressed outputs. Threaded into both the
-    /// PutPath metadata and the returned `ValidatedPathInfo` so
-    /// substituting clients see the `CA:` narinfo field.
+    /// content-addressed outputs — floating-CA finalization or a
+    /// fixed-output derivation's declared hash, recorded by the native
+    /// result pipeline. `None` for input-addressed outputs. Threaded
+    /// into both the PutPath metadata and the returned
+    /// `ValidatedPathInfo` so substituting clients see the `CA:`
+    /// narinfo field.
     pub content_address: Option<String>,
 }
 
