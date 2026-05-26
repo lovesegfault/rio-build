@@ -860,6 +860,14 @@ gateway:
   # limit raised to 4Gi (I-134) to accommodate. Lower on memory-
   # constrained gateway pods (I-135).
   maxTransitiveInputs: 1048576
+  # Per-tenant build policy → /etc/rio/gateway.toml [build_policy.<tenant>]
+  # tables. Keys are tenant names (authorized_keys comments); entries for
+  # tenants that don't exist are inert. keepGoing → keep_going.
+  # The qa-* entries are used only by `xtask k8s qa` scenarios (pol01/pol02),
+  # which create those tenants on demand; they are no-ops otherwise.
+  buildPolicy:
+    qa-keep-going:
+      keepGoing: true
   # I-064 graceful drain. preStop sleep nlbDeregisterSecs (NLB stops
   # routing NEW connections) → SIGTERM → readiness=NotServing → wait
   # drainGraceSecs → stop accepting SSH → wait sessionDrainSecs for

@@ -1,3 +1,16 @@
+{{- /* Named template so the ConfigMap body and the checksum annotation
+       hash the SAME rendered string (see controller.yaml / bug_022).
+       `define` must be at top level (not inside `if`).
+       force_build_roots is rendered ahead of the Rust field landing —
+       BuildPolicy has no deny_unknown_fields, so the extra key is
+       ignored until the gateway grows it. */}}
+{{- define "rio.gatewayToml" -}}
+{{- range $tenant, $pol := .Values.gateway.buildPolicy }}
+[build_policy.{{ $tenant | quote }}]
+keep_going = {{ $pol.keepGoing | default false }}
+force_build_roots = {{ $pol.forceBuildRoots | default false }}
+{{ end -}}
+{{- end }}
 {{- if .Values.gateway.enabled }}
 {{- $g := .Values.gateway -}}
 apiVersion: apps/v1
@@ -77,6 +90,11 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 8 }}
+      annotations:
+        # Gateway reads /etc/rio/gateway.toml once at boot; subPath mounts
+        # don't live-update. Hash the rendered body so any buildPolicy edit
+        # rolls the pod. helm/25-gateway-buildpolicy-toml.sh enforces.
+        checksum/gateway-toml: {{ include "rio.gatewayToml" . | sha256sum }}
     spec:
       serviceAccountName: rio-gateway
       {{- if .Values.karpenter.enabled }}
@@ -186,6 +204,18 @@ spec:
               readOnly: true
             {{- end }}
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 12 }}
+            {{- if $g.buildPolicy }}
+            # rio_common::config::load reads /etc/rio/gateway.toml. The
+            # [build_policy."<tenant>"] tables are only settable via the
+            # TOML file layer (the RIO_ env layer mangles map keys with
+            # `-`/mixed case). subPath: jwtSign/serviceHmac mount under
+            # /etc/rio/ too — a whole-dir CM mount would shadow them.
+            # checksum annotation rolls the pod on CM change.
+            - name: gateway-config
+              mountPath: /etc/rio/gateway.toml
+              subPath: gateway.toml
+              readOnly: true
+            {{- end }}
           # tonic-health server — NOT_SERVING until connect_forever
           # succeeds (main.rs explicitly gates "" via
           # health_reporter_not_serving; tonic-health's default is
@@ -232,6 +262,11 @@ spec:
             secretName: {{ $g.ssh.authorizedKeysSecret }}
         {{- end }}
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 8 }}
+        {{- if $g.buildPolicy }}
+        - name: gateway-config
+          configMap:
+            name: rio-gateway-config
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -275,4 +310,22 @@ spec:
       {{- with $g.service.nodePort }}
       nodePort: {{ . }}
       {{- end }}
+{{- if $g.buildPolicy }}
+---
+# Mounted at /etc/rio/gateway.toml (subPath). The config loader merges
+# this UNDER env (RIO_* wins for scalars). The [build_policy."<tenant>"]
+# tables are the ONLY way to populate the per-tenant map — the RIO_ env
+# layer mangles map keys (tenant names carry `-`/mixed case). Entries
+# for tenants absent from authorized_keys are inert.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-gateway-config
+  namespace: {{ .Values.namespaces.system.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
+data:
+  gateway.toml: |
+    {{- include "rio.gatewayToml" . | nindent 4 }}
+{{- end }}
 {{- end }}
