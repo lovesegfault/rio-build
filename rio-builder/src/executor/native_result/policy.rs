@@ -242,17 +242,34 @@ pub(crate) fn check_outputs(
         };
 
         // Resolve an entry that may be a sibling output name into its
-        // store path; anything else is taken to already be a store path.
-        let resolve = |entry: &str| -> String {
-            name_to_path
-                .get(entry)
-                .map(|p| (*p).to_string())
-                .unwrap_or_else(|| entry.to_string())
+        // store path. Anything else must be a syntactically valid store
+        // path: CppNix's `checkOutputs` raises "illegal reference
+        // specifier" for entries that are neither, and silently keeping
+        // them would leave the intended ban unenforced (a typo'd output
+        // name can never match a scanned `/nix/store/...` reference).
+        let resolve = |rule: &'static str, entry: &str| -> Result<String, PolicyViolation> {
+            if let Some(p) = name_to_path.get(entry) {
+                return Ok((*p).to_string());
+            }
+            if rio_nix::store_path::StorePath::parse(entry).is_ok() {
+                return Ok(entry.to_string());
+            }
+            Err(PolicyViolation {
+                output: output.name.clone(),
+                rule,
+                detail: format!(
+                    "illegal reference specifier {entry:?} (expected a store path or an \
+                     output name)"
+                ),
+            })
         };
 
         // --- direct-reference checks --------------------------------
         if let Some(allowed) = &checks.allowed_references {
-            let allowed: HashSet<String> = allowed.iter().map(|e| resolve(e)).collect();
+            let allowed: HashSet<String> = allowed
+                .iter()
+                .map(|e| resolve("allowedReferences", e))
+                .collect::<Result<_, _>>()?;
             if let Some(bad) = output.references.iter().find(|r| !allowed.contains(*r)) {
                 return Err(PolicyViolation {
                     output: output.name.clone(),
@@ -265,8 +282,8 @@ pub(crate) fn check_outputs(
             let disallowed: HashSet<String> = checks
                 .disallowed_references
                 .iter()
-                .map(|e| resolve(e))
-                .collect();
+                .map(|e| resolve("disallowedReferences", e))
+                .collect::<Result<_, _>>()?;
             if let Some(bad) = output.references.iter().find(|r| disallowed.contains(*r)) {
                 return Err(PolicyViolation {
                     output: output.name.clone(),
@@ -304,7 +321,10 @@ pub(crate) fn check_outputs(
             };
 
             if let Some(allowed) = &checks.allowed_requisites {
-                let allowed: HashSet<String> = allowed.iter().map(|e| resolve(e)).collect();
+                let allowed: HashSet<String> = allowed
+                    .iter()
+                    .map(|e| resolve("allowedRequisites", e))
+                    .collect::<Result<_, _>>()?;
                 if let Some(bad) = requisites.iter().find(|r| !allowed.contains(**r)) {
                     return Err(PolicyViolation {
                         output: output.name.clone(),
@@ -319,8 +339,8 @@ pub(crate) fn check_outputs(
                 let disallowed: HashSet<String> = checks
                     .disallowed_requisites
                     .iter()
-                    .map(|e| resolve(e))
-                    .collect();
+                    .map(|e| resolve("disallowedRequisites", e))
+                    .collect::<Result<_, _>>()?;
                 if let Some(bad) = requisites.iter().find(|r| disallowed.contains(**r)) {
                     return Err(PolicyViolation {
                         output: output.name.clone(),
@@ -498,6 +518,30 @@ mod tests {
             output("out", &out_path(), &[], 10),
             output("dev", &dev_path(), &[&out_path()], 10),
         ];
+        check_outputs(&outs, &policy, &closure_info()).unwrap();
+    }
+
+    #[test]
+    fn illegal_reference_specifier_rejects() {
+        // CppNix raises "illegal reference specifier" for an entry that
+        // is neither a sibling output name nor a store path; keeping it
+        // as an inert literal would silently unenforce the intended ban.
+        let env = legacy_env(&[("disallowedReferences", "lib")]); // no "lib" output exists
+        let policy = OutputPolicy::parse(&env);
+        let outs = [output("out", &out_path(), &[], 10)];
+        let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
+        assert_eq!(err.rule, "disallowedReferences");
+        assert!(err.detail.contains("illegal reference specifier"), "{err}");
+        assert!(err.detail.contains("lib"), "{err}");
+    }
+
+    #[test]
+    fn store_path_and_output_name_specifiers_still_accepted() {
+        // Mixed valid specifiers: a sibling output name and a literal
+        // store path must keep working exactly as before.
+        let env = legacy_env(&[("allowedReferences", &format!("out {}", input_path()))]);
+        let policy = OutputPolicy::parse(&env);
+        let outs = [output("out", &out_path(), &[&input_path()], 10)];
         check_outputs(&outs, &policy, &closure_info()).unwrap();
     }
 
