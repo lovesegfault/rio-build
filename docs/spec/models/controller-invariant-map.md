@@ -776,3 +776,52 @@ per-class clamp is encoded as a family-level reconstruction
 sizing content (NOT-ENCODED), `4ece337a4` re-dispositioned NOT-ENCODED
 (within-tick per-create granularity below the tick-global create-fault
 bit); remainder N/A.
+
+## Stage-C verification runs (serial) and dispositions
+
+Protocol: every override ran serially with the same TLC invocation the
+CI checks use (`quint verify --backend=tlc --main=<module>
+--step=calibStep --invariant=<predicted>`); violation runs stop at the
+first counterexample, baselines and the probe run to exhaustion. The
+per-run depths and state counts are recorded in the calibration table
+below; wall-clocks live in the introducing commit message and the
+transcripts.
+
+Outcome summary:
+
+- **Twelve of twelve pre-fix overrides falsify exactly the invariant
+  their module header predicts**, on the first run, with no module
+  corrections needed after the corpus-pin commit.
+- **The one predicted-HOLDS probe holds**: `m1CalibReapBusyGuardProbe`
+  (the `13806e99a` reap_idle busy-guard half) explores the same
+  reachable state count as the as-built base regime and finds no
+  idle-reap violation. Three-way disposition: this is not a missing
+  model dimension to fix and not an incomplete invariant list — the
+  busy-guard's trigger state (a live prev_idle entry on a currently
+  busy claim at reap time) is unreachable at the model's tick-internal
+  ordering resolution because the same tick's observation prunes the
+  entry first. It is recorded as defense-in-depth below the per-read
+  snapshot abstraction, NOT as a §4(b) redundancy candidate: the real
+  loop is not atomic between the observation and the reap, which is
+  exactly the window the guard defends. Coverage: the consolidate.rs
+  reap_idle unit tests; the windowed-lambda half of the same commit is
+  NOT-ENCODED (threshold arithmetic).
+- **Both distinguishing baselines hold**: the as-built step at
+  CEILING=2 holds `ackCoversPending` (so the `5815a7544` falsification
+  is attributable to the missing re-ack, not to the widened ceiling),
+  and the as-built step at base constants holds the module-local
+  `inflightKeptWhileInFlight` (so the `08d49c52c` KEEP-arm
+  falsification is attributable to the drop-on-first-sight prune).
+  Overrides at standard regime constants use the wired Stage-B regime
+  checks as their baseline (each predicted invariant HOLDS there).
+- **The two deterministic reproducer runs pass** (`quint test`:
+  `m1AcquireClearOkOnlyRun`, `m2NoConsolidatePruneRun`), pinning the
+  documented incident shapes (the failed-reload over-reap and the
+  consolidate-only spurious-ICE chain).
+- **No stop-and-report event**: no invariant — existing or added —
+  falsified on the unmodified as-built models; the calibration added
+  no invariant to the main models at all (the one new property,
+  `inflightKeptWhileInFlight`, is module-local to the calibration and
+  holds on the as-built baseline). The main models and their wired
+  Stage-B regime checks are untouched by Stage C, so the Stage-B
+  verdict table and state counts above stand as recorded.
