@@ -161,7 +161,19 @@ pub async fn upload_all_outputs(
     ref_candidates: &[String],
     input_closure: &[String],
 ) -> Result<Vec<ValidatedPathInfo>, UploadError> {
-    let outputs = scan_new_outputs(upper_store)?;
+    let mut outputs = scan_new_outputs(upper_store)?;
+    // The executor stages the build's own .drv into the overlay upper
+    // before the daemon starts (`executor::sandbox::stage_drv`, P0560:
+    // the castore lower serves only the input closure, so the .drv
+    // cannot come from the lower). It is an input artifact, not a build
+    // output — drop exactly that basename so it is neither re-uploaded
+    // nor reported as a phantom output (collect_outputs fails the build
+    // for any uploaded path that is not a declared derivation output).
+    // Only the deriver's own basename is dropped; any OTHER unexpected
+    // file still surfaces through that guard.
+    if let Some(drv_basename) = rio_nix::store_path::basename(deriver) {
+        outputs.retain(|b| b != drv_basename);
+    }
     if outputs.is_empty() {
         return Ok(Vec::new());
     }
@@ -719,6 +731,61 @@ mod tests {
         assert!(paths.contains(&format!("/nix/store/{b2}")));
         assert!(paths.contains(&format!("/nix/store/{b3}")));
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// The executor stages the build's own .drv into the overlay upper
+    /// (executor::sandbox::stage_drv) so nix-daemon can read it; the
+    /// upload scan must skip exactly that basename — it is an input, not
+    /// an output, and collect_outputs fails the build for any uploaded
+    /// path that is not a declared derivation output. Other entries
+    /// (including a DIFFERENT stray .drv) are still scanned so the
+    /// stray-file guard keeps its teeth.
+    #[tokio::test]
+    async fn test_upload_all_outputs_skips_staged_deriver() -> anyhow::Result<()> {
+        let (store, client, chunk, _h) = mock_with_chunk_client().await?;
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("upper/nix/store");
+        fs::create_dir_all(&store_dir)?;
+
+        let out_basename = test_store_basename("hello");
+        let drv_path = test_drv_path("hello");
+        let drv_basename = rio_nix::store_path::basename(&drv_path).unwrap();
+        let other_drv_basename = test_store_basename("stray.drv");
+        fs::write(store_dir.join(&out_basename), b"the actual output")?;
+        fs::write(store_dir.join(drv_basename), b"Derive(...)")?;
+        fs::write(store_dir.join(&other_drv_basename), b"Derive(stray)")?;
+
+        let results = upload_all_outputs(&client, &chunk, &store_dir, "", &drv_path, &[], &[])
+            .await
+            .expect("upload succeeds");
+
+        let paths: std::collections::HashSet<_> =
+            results.iter().map(|r| r.store_path.to_string()).collect();
+        assert!(
+            paths.contains(&format!("/nix/store/{out_basename}")),
+            "real output must be uploaded: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&drv_path),
+            "the staged deriver .drv must NOT be uploaded or returned: {paths:?}"
+        );
+        assert!(
+            paths.contains(&format!("/nix/store/{other_drv_basename}")),
+            "only the deriver's own basename is filtered — a different stray \
+             file still reaches the upload (and the collect_outputs guard): {paths:?}"
+        );
+        // And the store never saw a PutPath/chunked Begin for the deriver.
+        assert!(
+            !store
+                .calls
+                .put_calls
+                .read()
+                .unwrap()
+                .iter()
+                .any(|p| p.store_path == drv_path),
+            "no upload RPC for the staged .drv"
+        );
         Ok(())
     }
 

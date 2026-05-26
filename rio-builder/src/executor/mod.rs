@@ -168,6 +168,15 @@ pub enum ExecutorError {
     CastoreMount(#[from] CastoreMountError),
     #[error("synthetic DB generation failed: {0}")]
     SynthDb(#[from] sqlx::Error),
+    /// Staging the assignment's `.drv` file into the per-build store
+    /// (overlay upper) failed: a write/rename error, or an existing file
+    /// at the drv path whose content differs from the assignment's.
+    /// Malformed `.drv` BYTES are `InvalidDerivation` (they fail parse
+    /// before staging is reached); this variant is node-local state/IO,
+    /// so it stays `InfrastructureFailure` — another pod plausibly
+    /// succeeds. See `sandbox::stage_drv`.
+    #[error("failed to stage .drv into per-build store: {0}")]
+    DrvStage(String),
     #[error("failed to write nix.conf: {0}")]
     NixConf(#[source] std::io::Error),
     #[error("daemon spawn failed: {0}")]
@@ -470,9 +479,15 @@ pub async fn execute_build(
     // 1. Parse the derivation. Scheduler inlines drv_content for
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
-    let drv = if assignment.drv_content.is_empty() {
+    //
+    // The RAW ATerm bytes are kept alongside the parsed form:
+    // `prepare_sandbox` stages them verbatim into the per-build store so
+    // nix-daemon can read the .drv back from disk — the castore lower
+    // serves only the input closure, so nothing else materializes it
+    // (see `sandbox::stage_drv`).
+    let (drv, drv_text): (Derivation, Vec<u8>) = if assignment.drv_content.is_empty() {
         match fetch_drv_from_store(store_client, drv_path).await {
-            Ok(d) => d,
+            Ok(pair) => pair,
             Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
         }
     } else {
@@ -492,7 +507,7 @@ pub async fn execute_build(
                 })
             });
         match parsed {
-            Ok(d) => d,
+            Ok(d) => (d, assignment.drv_content.clone()),
             Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
         }
     };
@@ -698,11 +713,12 @@ pub async fn execute_build(
             return Ok(PreDaemon::Fixture(r));
         }
 
-        // 4. Populate sandbox: synth DB, nix.conf.
+        // 4. Populate sandbox: stage the .drv, synth DB, nix.conf.
         prepare_sandbox(
             &overlay_mount,
             &drv,
             drv_path,
+            &drv_text,
             input_metadata,
             effective_cores,
             &env.systems,
@@ -1273,7 +1289,11 @@ async fn resolve_inputs(
         .map(|(path, names)| {
             let mut client = store_client.clone();
             async move {
-                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                // Raw bytes discarded: only the TOP-LEVEL .drv is staged
+                // into the per-build store (see sandbox::stage_drv) —
+                // input .drvs are never read from disk by the daemon
+                // because the BasicDerivation carries resolved inputs.
+                let (input_drv, _) = fetch_drv_from_store(&mut client, &path).await?;
                 let matching: Vec<String> = input_drv
                     .outputs()
                     .iter()
@@ -1641,6 +1661,7 @@ mod tests {
         assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
         assert!(!ExecutorError::Cgroup("EACCES".into()).is_daemon_transient());
         assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_daemon_transient());
+        assert!(!ExecutorError::DrvStage("ENOSPC".into()).is_daemon_transient());
         // NOT retryable: cgroup OOM. Retrying on the same undersized
         // pod just OOM-loops again — must escalate to scheduler for
         // resource_floor bump (I-196).
@@ -1666,6 +1687,8 @@ mod tests {
         assert!(!ExecutorError::BuildFailed("exit 1".into()).is_permanent());
         assert!(!ExecutorError::Cgroup("EACCES".into()).is_permanent());
         assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_permanent());
+        // .drv staging failures are node-local (write error / stale upper).
+        assert!(!ExecutorError::DrvStage("rename failed".into()).is_permanent());
         // is_permanent and is_daemon_transient are disjoint.
         assert!(!ExecutorError::InvalidDerivation("x".into()).is_daemon_transient());
     }

@@ -150,8 +150,10 @@ impl OverlayMount {
     /// Test-only constructor that mirrors `setup_overlay`'s field
     /// computation without touching the filesystem or requiring
     /// CAP_SYS_ADMIN. `mounted=false` so `Drop` is a no-op.
+    /// `pub(crate)` so executor::sandbox tests can drive
+    /// `prepare_sandbox` against a fake layout.
     #[cfg(test)]
-    fn for_test(build_dir: PathBuf) -> Self {
+    pub(crate) fn for_test(build_dir: PathBuf) -> Self {
         Self {
             upper: build_dir.join("upper"),
             merged: build_dir.join("nix/store"),

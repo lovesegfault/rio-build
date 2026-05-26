@@ -204,11 +204,17 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// or inline budget exceeded). The .drv is a single regular file in the
 /// store, so we fetch its NAR and extract the ATerm content via
 /// `extract_single_file`.
+///
+/// Returns the parsed [`Derivation`] AND the raw ATerm bytes: the
+/// executor stages those bytes verbatim into the per-build store
+/// (`sandbox::stage_drv`) so nix-daemon can read the .drv from disk —
+/// re-serializing the parsed form could not guarantee byte fidelity
+/// with the store path's content hash.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
-) -> Result<Derivation, ExecutorError> {
+) -> Result<(Derivation, Vec<u8>), ExecutorError> {
     // .drv files are small (KB range), but wrap in stream timeout: this is
     // the first gRPC call after setup_overlay, so a stalled store would hang
     // the build with an overlay mount held indefinitely.
@@ -236,9 +242,15 @@ pub(super) async fn fetch_drv_from_store(
         });
     };
 
-    Derivation::parse_from_nar(&nar_data).map_err(|e| {
+    // Mirrors Derivation::parse_from_nar, but keeps the extracted bytes
+    // for the caller (staging needs the exact original text).
+    let invalid = |e: &dyn std::fmt::Display| {
         ExecutorError::InvalidDerivation(format!("failed to parse .drv from NAR: {e}"))
-    })
+    };
+    let drv_bytes = rio_nix::nar::extract_single_file(&nar_data).map_err(|e| invalid(&e))?;
+    let drv_text = String::from_utf8(drv_bytes).map_err(|e| invalid(&e))?;
+    let drv = Derivation::parse(&drv_text).map_err(|e| invalid(&e))?;
+    Ok((drv, drv_text.into_bytes()))
 }
 
 /// Compute the input closure for a derivation by querying the store.
@@ -964,12 +976,15 @@ mod tests {
         let drv_path = tp("test.drv");
         store.seed(make_path_info(&drv_path, &nar, hash), nar);
 
-        let drv = fetch_drv_from_store(&mut client, &drv_path)
+        let (drv, raw) = fetch_drv_from_store(&mut client, &drv_path)
             .await
             .expect("fetch + parse should succeed");
 
         assert_eq!(drv.platform(), "x86_64-linux");
         assert_eq!(drv.outputs().len(), 1);
+        // The raw bytes are the EXACT ATerm content (what stage_drv
+        // writes into the per-build store) — not a re-serialization.
+        assert_eq!(raw, drv_text.as_bytes());
         Ok(())
     }
 
