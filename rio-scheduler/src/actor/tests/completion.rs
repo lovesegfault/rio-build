@@ -5056,3 +5056,97 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.3): E4 collapsed onto decide() — the under-cap requeue
+// vs at-cap Cancelled verdict comes from the fold over the appended
+// timeout suffix. Equivalence battery (single-tenure, worker-reported).
+// ---------------------------------------------------------------------------
+
+/// Under the cap a TimedOut still requeues with no backoff and no
+/// exclusion-set entry; at the cap it still goes terminal Cancelled —
+/// never Poisoned — and PG, the ledger, and the legacy RAM counter all
+/// agree with the as-built outcomes.
+#[tokio::test]
+async fn phase1b_e4_timeout_verdicts_unchanged() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy = crate::RetryPolicy {
+            max_timeout_retries: 1,
+            ..Default::default()
+        };
+    });
+    let _w1 = connect_builder(&handle, "e4w-a", "x86_64-linux").await?;
+    let _w2 = connect_builder(&handle, "e4w-b", "x86_64-linux").await?;
+    let drv_hash = "e4-timeout";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    // ── Attempt 1: under cap → Requeue ──────────────────────────────
+    assert!(handle.debug_force_assign(drv_hash, "e4w-a").await?);
+    complete_failure(
+        &handle,
+        "e4w-a",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TimedOut,
+        "deadline exceeded",
+    )
+    .await?;
+    barrier(&handle).await;
+    let info = expect_drv(&handle, drv_hash).await;
+    assert!(
+        matches!(
+            info.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "under cap: requeued, got {:?}",
+        info.status
+    );
+    assert_eq!(
+        info.retry.timeout_count, 1,
+        "legacy RAM counter still tracks"
+    );
+    assert!(
+        info.retry.backoff_until.is_none(),
+        "timeouts never back off"
+    );
+    assert!(
+        info.retry.failed_builders.is_empty(),
+        "timeouts never join the exclusion set"
+    );
+
+    // ── Attempt 2: cap exhausted → terminal Cancelled, not Poisoned ─
+    assert!(handle.debug_force_assign(drv_hash, "e4w-b").await?);
+    complete_failure(
+        &handle,
+        "e4w-b",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TimedOut,
+        "deadline exceeded",
+    )
+    .await?;
+    barrier(&handle).await;
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Cancelled,
+        "at the cap: terminal Cancelled (immediately resubmit-retriable)"
+    );
+    assert!(
+        info.retry.poisoned_at.is_none(),
+        "Cancelled is not Poisoned — no 24 h lockout"
+    );
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind(drv_hash)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pg_status, "cancelled", "PG persisted the verdict's status");
+    assert_eq!(
+        ledger_classes(&db.pool, drv_hash).await,
+        vec!["timeout", "timeout"],
+        "one ledger row per observed timeout"
+    );
+    Ok(())
+}

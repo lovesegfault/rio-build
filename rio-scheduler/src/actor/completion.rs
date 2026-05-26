@@ -1349,15 +1349,30 @@ impl DagActor {
             // → same timeout, so further auto-retry is a storm.
             // Poisoned's 24h TTL is way too aggressive for a timeout.
             rio_proto::types::BuildResultStatus::TimedOut => {
-                self.handle_timeout_failure(
-                    drv_hash,
-                    executor_id,
-                    FailureReportCtx {
-                        final_line_count: report_line_count,
-                        error_msg: &result.error_msg,
-                    },
-                )
-                .await;
+                let handling = self
+                    .handle_timeout_failure(
+                        drv_hash,
+                        executor_id,
+                        FailureReportCtx {
+                            final_line_count: report_line_count,
+                            error_msg: &result.error_msg,
+                        },
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        self.requeue_failure_completion(
+                            executor_id,
+                            drv_hash,
+                            status,
+                            &result.error_msg,
+                            final_line_count,
+                        );
+                    }
+                }
             }
             rio_proto::types::BuildResultStatus::Cancelled => {
                 // The early-return at :661 checks the DAG status, NOT
@@ -2519,6 +2534,14 @@ impl DagActor {
     async fn requeue_after_retry(&mut self, drv_hash: &DrvHash, attempt_row: Option<AttemptRow>) {
         self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Ready, None)
             .await;
+        self.requeue_after_recorded_retry(drv_hash);
+    }
+
+    /// Post-commit tail of a Phase-1b requeue verdict: the `Ready`
+    /// persist already happened inside the appending transaction, so
+    /// only the in-memory queueing and the dashboard progress emit
+    /// remain.
+    fn requeue_after_recorded_retry(&mut self, drv_hash: &DrvHash) {
         self.push_ready(drv_hash.clone());
         for build_id in self.get_interested_builds(drv_hash) {
             self.emit_progress(build_id);
@@ -3171,12 +3194,19 @@ impl DagActor {
     /// `handle_permanent_failure` — the build still fails THIS time,
     /// just without the 24h resubmit lockout.
     // r[impl sched.timeout.promote-on-exceed+2]
+    /// E4, collapsed onto `decide()` (Phase 1b): the under-cap requeue
+    /// vs at-cap terminal-`Cancelled` verdict comes from the fold over
+    /// the appended attempt suffix inside the appending transaction.
+    /// The deadline-floor doubling stays at this site (it is a floor
+    /// action, not a budget decision), the legacy RAM `timeout_count`
+    /// keeps being maintained until T-1b.13, and a failed transaction
+    /// leaves the derivation in its pre-report state for re-delivery.
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
-    ) {
+    ) -> FailureHandling {
         let error_msg = report.error_msg;
         // Ledger row for this observed attempt (1a): captured before
         // the floor bump / reset clears the exec_id carrier; the floor
@@ -3188,7 +3218,7 @@ impl DagActor {
             row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
-        // Bump BEFORE the cap check / state transition: even the
+        // Bump BEFORE the verdict / state transition: even the
         // terminal-path attempt should record that this deadline was
         // inadequate, so an explicit resubmit starts at the doubled
         // floor instead of replaying the timeout. Same shape as
@@ -3205,73 +3235,125 @@ impl DagActor {
             row.floor_at_cap = floor_outcome.at_cap;
         }
 
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return;
+        if self.dag.node(drv_hash).is_none() {
+            return FailureHandling::Handled;
+        }
+
+        // The verdict: decide() over the appended suffix, inside the
+        // appending transaction, with the verdict's status persisted on
+        // the same connection (Requeue → Ready, Cancel → Cancelled).
+        // The uncommitted-merge edge (no db row) keeps the as-built
+        // RAM-checked verdict — there is nothing to append or persist.
+        let (verdict, recorded_row) = if let Some(row) = attempt_row {
+            let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let status = match decision.verdict {
+                    crate::retry_policy::Verdict::Cancel => DerivationStatus::Cancelled,
+                    _ => DerivationStatus::Ready,
+                };
+                crate::db::SchedulerDb::update_derivation_status_in_tx(
+                    &mut tx, drv_hash, status, None,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(decision)
+            }
+            .await;
+            match result {
+                Ok(decision) => (decision.verdict, Some(row)),
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                          "timeout failure: appending transaction failed; derivation stays in \
+                           its pre-report state pending re-delivery");
+                    return FailureHandling::RecordFailed;
+                }
+            }
+        } else {
+            let under_cap = self
+                .dag
+                .node(drv_hash)
+                .is_some_and(|s| s.retry.timeout_count < self.retry_policy.max_timeout_retries);
+            (
+                if under_cap {
+                    crate::retry_policy::Verdict::Requeue
+                } else {
+                    crate::retry_policy::Verdict::Cancel
+                },
+                None,
+            )
         };
 
-        // Cap check BEFORE reset_to_ready. At the cap, fall through
-        // to terminal Cancelled — a build whose deadline floor is at
-        // 24h is genuinely stuck.
-        if state.retry.timeout_count < self.retry_policy.max_timeout_retries {
-            state.ensure_running();
-            if let Err(e) = state.reset_to_ready() {
-                warn!(drv_hash = %drv_hash, error = %e,
-                      "timeout failure: reset_to_ready failed, skipping");
-                return;
-            }
-            // NO insert into failed_builders (timeout is not a per-
-            // worker problem — the SAME worker with a longer deadline
-            // would succeed). NO retry_count++ (separate counter).
-            // NO backoff (next dispatch's longer deadline IS the
-            // backoff). I-200: every TimedOut consumes budget. NOT
-            // symmetric with `handle_infrastructure_failure` — infra
-            // has an outer `!promoted` exemption (via `exempt_from_
-            // cap`); timeout deliberately does not, so
-            // `max_timeout_retries` bounds TOTAL attempts. Covers
-            // cold-start (no [sla], est=None, floor=0 → {false,false})
-            // where `if promoted` would never increment → infinite
-            // retry until globalTimeout. `bump_floor_or_count` no
-            // longer mutates the counter, so this is the only
-            // increment site.
-            state.retry.timeout_count += 1;
-            info!(
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return FailureHandling::Handled;
+        };
+
+        if verdict == crate::retry_policy::Verdict::Cancel {
+            // ── Terminal path (cap exhausted) ────────────────────────
+            warn!(
                 drv_hash = %drv_hash,
                 executor_id = %executor_id,
                 timeout_retry_count = state.retry.timeout_count,
                 max = self.retry_policy.max_timeout_retries,
-                promoted = floor_outcome.promoted,
-                "timeout — bumped deadline floor, retrying"
+                "timeout: max_timeout_retries exhausted, transitioning to Cancelled"
             );
-            self.requeue_after_retry(drv_hash, attempt_row).await;
-            return;
+            state.ensure_running();
+            if let Err(e) = state.transition(DerivationStatus::Cancelled) {
+                warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                      "handle_timeout_failure: ->Cancelled transition rejected, skipping");
+                return FailureHandling::Handled;
+            }
+            if let Some(row) = recorded_row {
+                state.push_attempt_record(row.to_record());
+            }
+            self.unpin_best_effort(drv_hash).await;
+
+            self.terminal_failure_epilogue(
+                drv_hash,
+                error_msg,
+                rio_proto::types::BuildResultStatus::TimedOut,
+                report.final_line_count,
+            )
+            .await;
+            return FailureHandling::Handled;
         }
 
-        // ── Terminal path (cap exhausted) ───────────────────────────
-        warn!(
+        // ── Retry path (under cap; Requeue verdict) ──────────────────
+        state.ensure_running();
+        if let Err(e) = state.reset_to_ready() {
+            warn!(drv_hash = %drv_hash, error = %e,
+                  "timeout failure: reset_to_ready failed, skipping");
+            return FailureHandling::Handled;
+        }
+        // NO insert into failed_builders (timeout is not a per-
+        // worker problem — the SAME worker with a longer deadline
+        // would succeed). NO retry_count++ (separate counter).
+        // NO backoff (next dispatch's longer deadline IS the
+        // backoff). I-200: every TimedOut consumes budget. NOT
+        // symmetric with `handle_infrastructure_failure` — infra
+        // has an outer `!promoted` exemption (via `exempt_from_
+        // cap`); timeout deliberately does not, so
+        // `max_timeout_retries` bounds TOTAL attempts. Covers
+        // cold-start (no [sla], est=None, floor=0 → {false,false})
+        // where `if promoted` would never increment → infinite
+        // retry until globalTimeout. `bump_floor_or_count` no
+        // longer mutates the counter, so this is the only
+        // increment site. Legacy RAM mutation, kept until T-1b.13
+        // (rule 1) — the verdict above no longer reads it.
+        state.retry.timeout_count += 1;
+        if let Some(row) = recorded_row {
+            state.push_attempt_record(row.to_record());
+        }
+        info!(
             drv_hash = %drv_hash,
             executor_id = %executor_id,
             timeout_retry_count = state.retry.timeout_count,
             max = self.retry_policy.max_timeout_retries,
-            "timeout: max_timeout_retries exhausted, transitioning to Cancelled"
+            promoted = floor_outcome.promoted,
+            "timeout — bumped deadline floor, retrying"
         );
-        state.ensure_running();
-        if let Err(e) = state.transition(DerivationStatus::Cancelled) {
-            warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
-                  "handle_timeout_failure: ->Cancelled transition rejected, skipping");
-            return;
-        }
-
-        self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Cancelled, None)
-            .await;
-        self.unpin_best_effort(drv_hash).await;
-
-        self.terminal_failure_epilogue(
-            drv_hash,
-            error_msg,
-            rio_proto::types::BuildResultStatus::TimedOut,
-            report.final_line_count,
-        )
-        .await;
+        self.requeue_after_recorded_retry(drv_hash);
+        FailureHandling::Handled
     }
 
     /// Transitively walk parents of a poisoned derivation and transition all
