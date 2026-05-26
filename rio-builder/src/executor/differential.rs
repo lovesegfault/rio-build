@@ -16,7 +16,6 @@
 //! the VM test (it needs root + namespaces + a populated /nix/store).
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -180,10 +179,14 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     // 1775, build gid — the same contract real Nix gives its chroot store);
     // mirror that here or every output `mkdir` fails EACCES.
     for d in [&store_dir, &build_dir] {
-        std::os::unix::fs::chown(d, Some(cfg.uid), Some(cfg.gid))
+        // Same mode/group contract as production (1775 root:<gid>); the
+        // extra uid chown is driver-only — the VM driver pre-creates the
+        // dirs as root while production's skeleton/overlay setup already
+        // owns them appropriately.
+        super::make_store_scratch_writable(d, cfg.gid)
+            .with_context(|| format!("making {} build-writable", d.display()))?;
+        std::os::unix::fs::chown(d, Some(cfg.uid), None)
             .with_context(|| format!("chowning {} to the sandbox user", d.display()))?;
-        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o1775))
-            .with_context(|| format!("chmodding {}", d.display()))?;
     }
     for p in &closure_paths {
         let dest = store_dir.join(basename(p).unwrap_or(p.as_str()));

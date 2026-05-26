@@ -40,7 +40,6 @@ tonic = { workspace = true }
 # Scheduler's build_samples insert is gated on both being Some.
 prost-types = { workspace = true }
 fuser = { workspace = true }
-sqlx = { workspace = true }
 nix = { workspace = true }
 # llistxattr/lremovexattr in output canonicalisation (executor/
 # native_result/canonicalise.rs) — the `nix` crate does not wrap the

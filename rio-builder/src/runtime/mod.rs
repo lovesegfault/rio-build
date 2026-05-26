@@ -446,16 +446,16 @@ pub async fn spawn_build_task(
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
 
-        // Daemon-transient retry: if nix-daemon crashes mid-handshake
-        // (core dump, OOM-kill) the error surfaces as early-EOF on the
-        // wire. Retrying locally is cheaper than a scheduler round-trip
-        // (re-dispatch + re-fetch closure + re-generate synth DB) and
-        // keeps a hot-loop daemon bug from flooding the scheduler with
-        // InfrastructureFailure reports — without this, a crashing
-        // daemon caused 800+ retries in <10min (scheduler re-dispatches
-        // InfrastructureFailure immediately, no backoff). The retry
-        // budget is small (DAEMON_RETRY_MAX=3, exponential backoff
-        // r[impl builder.retry.daemon-transient]
+        // Infra-transient retry: if the native sandbox fails to set up
+        // (mount race, FUSE blip while binding an input) the build
+        // never ran. Retrying locally is cheaper than a scheduler
+        // round-trip (re-dispatch + re-fetch closure) and keeps a
+        // hot-loop worker fault from flooding the scheduler with
+        // InfrastructureFailure reports — historically a crashing
+        // build backend caused 800+ retries in <10min (scheduler
+        // re-dispatches InfrastructureFailure immediately, no backoff).
+        // The retry budget is small (INFRA_RETRY_MAX=3, exponential backoff
+        // r[impl builder.retry.infra-transient]
         // 0.5/1/2s); after exhaustion the error propagates as
         // InfrastructureFailure and the scheduler's own retry policy
         // takes over. Cancelled builds short-circuit the loop — the
@@ -484,20 +484,19 @@ pub async fn spawn_build_task(
         let mut attempt = 0u32;
         let mut prev_line_count = 0u64;
         // Most recent attempt's footer string (`Some(...)` only when a
-        // daemon ran in that attempt). Tracked across the loop so a
-        // footer is sent whenever ANY attempt ran a daemon — without
-        // this, a final attempt that fails pre-daemon (e.g.
-        // `DaemonSpawn` after a prior `Wire(UnexpectedEof)`) would
-        // silently drop the footer despite output being in the log.
+        // build process ran in that attempt). Tracked across the loop
+        // so a footer is sent whenever ANY attempt ran one — without
+        // this, a final attempt that fails during sandbox setup (after
+        // a prior attempt produced output) would silently drop the
+        // footer despite output being in the log.
         let mut last_footer_result: Option<String> = None;
         let outcome = loop {
             // First-attempt invariant: `execute_build` gates the
             // banner header on `first_line == 0`, which is true ONLY
             // on the first attempt. Every error in
-            // `is_daemon_transient()` fires AFTER the header
-            // (`DaemonSpawn`/`Handshake`/`Wire(UnexpectedEof)` all
-            // require a daemon spawn attempt, which is post-header),
-            // so a retried attempt always sees
+            // `is_infra_transient()` fires AFTER the header
+            // (`SandboxSetup` requires the pre-exec block to have run,
+            // which is post-header), so a retried attempt always sees
             // `prev_line_count >= HEADER_LINE_COUNT`. If a future
             // transient variant fires pre-header (new ExecutorError,
             // refactor of the early-return order), this catches the
@@ -522,19 +521,19 @@ pub async fn spawn_build_task(
 
             match &o.result {
                 Err(e)
-                    if e.is_daemon_transient()
-                        && attempt < executor::DAEMON_RETRY_MAX
+                    if e.is_infra_transient()
+                        && attempt < executor::INFRA_RETRY_MAX
                         && !cancelled.load(std::sync::atomic::Ordering::Acquire) =>
                 {
-                    let delay = executor::DAEMON_RETRY_BACKOFF.duration(attempt);
+                    let delay = executor::INFRA_RETRY_BACKOFF.duration(attempt);
                     attempt += 1;
                     tracing::warn!(
                         drv_path = %drv_path,
                         attempt,
-                        max = executor::DAEMON_RETRY_MAX,
+                        max = executor::INFRA_RETRY_MAX,
                         retry_in = ?delay,
                         error = %e,
-                        "daemon transient failure; retrying locally"
+                        "transient sandbox-setup failure; retrying locally"
                     );
                     tokio::time::sleep(delay).await;
                 }

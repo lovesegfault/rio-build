@@ -172,11 +172,17 @@ pub async fn run() -> i32 {
     }
 }
 
-/// Marker prefix for HTTP failures that will not change on retry
+/// Typed marker for HTTP failures that will not change on retry
 /// (4xx other than 408/429): the retry loop skips the remaining
-/// attempts for that URL. String-marked rather than a typed error so
-/// the `anyhow` context chains stay intact for the build log.
-const PERMANENT_HTTP_PREFIX: &str = "permanent: ";
+/// attempts for that URL. Carried as an `anyhow` error so the context
+/// chains in the build log stay intact; the retry loop detects it by
+/// downcast instead of string matching.
+#[derive(Debug, thiserror::Error)]
+#[error("HTTP {status} from {url}")]
+struct PermanentHttpError {
+    status: reqwest::StatusCode,
+    url: String,
+}
 
 /// Fetch `params.url` (or a mirror) to `params.output`.
 async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
@@ -210,7 +216,7 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
                     // Permanent (non-retryable) HTTP statuses skip the
                     // remaining attempts for THIS url and move on to the
                     // next candidate immediately.
-                    let permanent = e.to_string().starts_with(PERMANENT_HTTP_PREFIX);
+                    let permanent = e.downcast_ref::<PermanentHttpError>().is_some();
                     last_err = Some(e);
                     if permanent {
                         break;
@@ -382,7 +388,11 @@ async fn try_fetch_one(
         {
             bail!("HTTP {status} from {url}");
         }
-        bail!("{PERMANENT_HTTP_PREFIX}HTTP {status} from {url}");
+        return Err(PermanentHttpError {
+            status,
+            url: url.to_string(),
+        }
+        .into());
     }
 
     // Download to a temp file in the same directory (same filesystem →
