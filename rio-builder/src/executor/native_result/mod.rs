@@ -203,9 +203,12 @@ pub(crate) struct ProcessedOutput {
     pub(crate) nar_size: u64,
     /// Sorted full-store-path references (post `unsafeDiscardReferences`).
     pub(crate) references: Vec<String>,
-    /// Nix content-address descriptor (`fixed:r:sha256:…`) for
-    /// floating-CA outputs; `None` for input-addressed and fixed-output
-    /// outputs. Destined for the uploaded `PathInfo.content_address` /
+    /// Nix content-address descriptor (`fixed:[r:]<algo>:…`) for
+    /// content-addressed outputs: filled by floating-CA finalization,
+    /// and by `populate_fixed_output_descriptors` for outputs of
+    /// derivations matching the strict FOD predicate
+    /// (`is_fixed_output()`). `None` for input-addressed outputs.
+    /// Destined for the uploaded `PathInfo.content_address` /
     /// narinfo `CA:` field so substituting clients can verify the path.
     pub(crate) content_address: Option<String>,
 }
@@ -428,6 +431,16 @@ fn populate_fixed_output_descriptors(
     processed: &mut [ProcessedOutput],
     drv: &Derivation,
 ) -> Result<(), OutputRejection> {
+    // Strict-FOD gate: a `fixed:` descriptor asserts content the
+    // pipeline verified, and `verify_fod_hashes` /
+    // `enforce_fod_has_no_references` only run for derivations matching
+    // the strict `is_fixed_output()` predicate (the request glue
+    // rejects every other hash-declaring shape outright). Keying the
+    // stamping on the same predicate keeps the descriptor honest even
+    // if a non-conforming shape ever reaches this point.
+    if !drv.is_fixed_output() {
+        return Ok(());
+    }
     for o in drv.outputs() {
         if !o.has_hash_algo() || o.hash().is_empty() {
             continue;
@@ -893,6 +906,51 @@ mod tests {
             Some(format!("fixed:{}", expected.to_colon()).as_str()),
             "flat FOD output must carry its declared CA descriptor without the r: prefix"
         );
+    }
+
+    #[test]
+    fn non_strict_hash_declaring_output_gets_no_descriptor() {
+        // A hash-declaring output with a sibling does not satisfy the
+        // strict FOD predicate: the request glue rejects such shapes
+        // outright, and even if one reached this point the stamping
+        // must not vouch for content nothing verified.
+        let out_p = sp('b', "tarball");
+        let doc_p = sp('c', "tarball-doc");
+        let tmp = tempfile::tempdir().unwrap();
+        let host_out = tmp.path().join(out_p.strip_prefix("/nix/store/").unwrap());
+        let host_doc = tmp.path().join(doc_p.strip_prefix("/nix/store/").unwrap());
+        std::fs::write(&host_out, b"flat fetched bytes").unwrap();
+        std::fs::write(&host_doc, b"docs").unwrap();
+        std::fs::set_permissions(&host_out, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&host_doc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outputs = [
+            OutputToProcess {
+                name: "out".into(),
+                store_path: out_p.clone(),
+                host_path: host_out,
+            },
+            OutputToProcess {
+                name: "doc".into(),
+                store_path: doc_p.clone(),
+                host_path: host_doc,
+            },
+        ];
+        let declared_hex = "22".repeat(32);
+        let drv = drv_from_aterm_ca(
+            &[
+                ("out", &out_p, "sha256", &declared_hex),
+                ("doc", &doc_p, "", ""),
+            ],
+            &[],
+        );
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        for p in &processed.outputs {
+            assert_eq!(
+                p.content_address, None,
+                "non-strict hash-declaring shapes must not be stamped with a fixed: descriptor"
+            );
+        }
     }
 
     #[test]

@@ -162,6 +162,17 @@ pub(crate) enum GlueError {
     #[error("fixed-output output `{output}` declares an unverifiable hash: {message}")]
     FixedOutputHashInvalid { output: String, message: String },
 
+    /// A derivation declares a fixed output but is not the one shape
+    /// CppNix accepts for fixed-output derivations
+    /// (`BasicDerivation::type()`: "only one fixed output is allowed",
+    /// "single fixed output must be named \"out\"", "can't mix
+    /// derivation output types"). Rejecting the shape here keeps every
+    /// downstream FOD gate — hash verification, the no-references rule,
+    /// `fixed:` descriptor stamping, fetcher-pool routing — keyed on
+    /// one and the same strict predicate.
+    #[error("invalid fixed-output derivation: {reason}")]
+    FixedOutputBadShape { reason: String },
+
     /// The declared store path of a fixed-output output is not the path
     /// derived from its declared hash. CppNix discards the declared
     /// path for `CAFixed` outputs and recomputes it from
@@ -522,12 +533,38 @@ fn validate_fixed_output_declarations(
 ) -> Result<(), GlueError> {
     use rio_nix::hash::{HashAlgo, NixHash};
 
-    if !drv
+    let fixed_count = drv
         .outputs()
         .iter()
-        .any(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
-    {
+        .filter(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
+        .count();
+    if fixed_count == 0 {
         return Ok(());
+    }
+
+    // Shape rule — CppNix `BasicDerivation::type()`: a derivation with
+    // a fixed output must consist of exactly that one output, and it
+    // must be named `out`. After this check the strict
+    // `DerivationLike::is_fixed_output()` predicate is true iff *any*
+    // output declares a hash, so hash verification, the no-references
+    // rule, descriptor stamping and fetcher routing all see the same
+    // set of derivations — no hash-declaring shape can reach upload
+    // unverified.
+    if drv.outputs().len() != 1 {
+        let reason = if fixed_count == drv.outputs().len() {
+            "only one fixed output is allowed".to_owned()
+        } else {
+            "fixed-output and non-fixed outputs cannot be mixed in one derivation".to_owned()
+        };
+        return Err(GlueError::FixedOutputBadShape { reason });
+    }
+    if drv.outputs()[0].name() != "out" {
+        return Err(GlueError::FixedOutputBadShape {
+            reason: format!(
+                "the single fixed output must be named \"out\", not \"{}\"",
+                drv.outputs()[0].name()
+            ),
+        });
     }
 
     let drv_sp =
@@ -920,6 +957,83 @@ mod tests {
             matches!(err, GlueError::FixedOutputHashInvalid { .. }),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn fixed_output_with_sibling_output_is_rejected() {
+        // CppNix: "can't mix derivation output types".
+        let zeros = "00".repeat(32);
+        let out = fod_path("sha256", &zeros);
+        let drv = mk_drv(
+            vec![
+                DerivationOutput::new("out", out.as_str(), "sha256", zeros.as_str()).unwrap(),
+                DerivationOutput::new("doc", IN_DEP, "", "").unwrap(),
+            ],
+            &[("name", "demo")],
+        );
+        let (input_paths, input_meta) = closure();
+        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+            .unwrap_err();
+        match err {
+            GlueError::FixedOutputBadShape { reason } => {
+                assert!(reason.contains("cannot be mixed"), "{reason}")
+            }
+            other => panic!("want FixedOutputBadShape, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn multiple_fixed_outputs_are_rejected() {
+        // CppNix: "only one fixed output is allowed".
+        let zeros = "00".repeat(32);
+        let ones = "11".repeat(32);
+        let drv = mk_drv(
+            vec![
+                DerivationOutput::new(
+                    "out",
+                    fod_path("sha256", &zeros).as_str(),
+                    "sha256",
+                    zeros.as_str(),
+                )
+                .unwrap(),
+                DerivationOutput::new(
+                    "lib",
+                    fod_path("sha256", &ones).as_str(),
+                    "sha256",
+                    ones.as_str(),
+                )
+                .unwrap(),
+            ],
+            &[("name", "demo")],
+        );
+        let (input_paths, input_meta) = closure();
+        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+            .unwrap_err();
+        match err {
+            GlueError::FixedOutputBadShape { reason } => {
+                assert!(reason.contains("only one fixed output"), "{reason}")
+            }
+            other => panic!("want FixedOutputBadShape, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn fixed_output_not_named_out_is_rejected() {
+        // CppNix: "single fixed output must be named \"out\"".
+        let zeros = "00".repeat(32);
+        let drv = mk_drv(
+            vec![DerivationOutput::new("lib", OUT, "sha256", zeros.as_str()).unwrap()],
+            &[("name", "demo")],
+        );
+        let (input_paths, input_meta) = closure();
+        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+            .unwrap_err();
+        match err {
+            GlueError::FixedOutputBadShape { reason } => {
+                assert!(reason.contains("named \"out\""), "{reason}")
+            }
+            other => panic!("want FixedOutputBadShape, got: {other}"),
+        }
     }
 
     #[test]

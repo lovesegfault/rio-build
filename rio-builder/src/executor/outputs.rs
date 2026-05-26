@@ -56,8 +56,10 @@ impl BuildOutputs {
 ///   survive to registration and a stray store path the build left
 ///   behind is never uploaded (CppNix discards such paths with the
 ///   chroot; strays are logged for observability, not fatal);
-/// - `content_address` is threaded through so floating-CA narinfos
-///   carry their `CA:` field.
+/// - `content_address` is threaded through so content-addressed
+///   narinfos carry their `CA:` field — floating-CA outputs and strict
+///   fixed-output derivations (`is_fixed_output()`) carry their
+///   descriptor; input-addressed outputs carry `None`.
 #[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_native_outputs(
