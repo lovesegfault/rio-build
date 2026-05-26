@@ -12,13 +12,6 @@ description = "DAG-aware build scheduler for rio-build"
 name = "rio-scheduler"
 path = "src/main.rs"
 
-[lints.rust]
-# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
-# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
-# cargo build doesn't warn `unexpected_cfgs` on the
-# `#[cfg_attr(kani, kani::...)]` contracts in retry_policy.rs.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
-
 [features]
 # AdminService.InjectBuildSample fixture (sla-sizing VM scenario): writes
 # a synthetic build_samples row keyed on (pname, system, tenant). Runtime-
@@ -37,6 +30,11 @@ rio-auth = { workspace = true }
 # `crate::MIGRATOR` test surface stable.
 rio-migrations = { workspace = true }
 rio-proto = { workspace = true }
+# The retry/poison decision kernels (the reference fold, decide()/
+# classify()/placeable()) and their CBMC contracts. retry_policy.rs is
+# the projection shim over this crate; the kani harnesses live next to
+# the kernels so their goto model stays dependency-light.
+rio-retry-kernel = { workspace = true }
 schemars = { workspace = true }
 # `schema`-only: just `realisations` + `error` (sqlx + thiserror), no
 # aws-sdk-s3/axum/moka/reqwest. Lets ca/resolve.rs delegate to

@@ -163,27 +163,27 @@ in
     crate = crateBuildKani.members.rio-store;
   };
 
-  # rio-scheduler: the retry/poison decision kernels
-  # (rio-scheduler/src/retry_policy.rs — decide()/classify()/placeable()
-  # and the reference fold's counter arithmetic).
+  # rio-retry-kernel: the scheduler's retry/poison decision kernels
+  # (decide()/classify()/placeable() and the reference fold's counter
+  # arithmetic), extracted from rio-scheduler/src/retry_policy.rs into a
+  # dependency-free crate exactly so this check fits a merge-gate CBMC
+  # budget — inside rio-scheduler's artifact context the same harnesses
+  # inherited the crate's full reachable code, Arc-backed identifiers
+  # and f64 timestamp conversions and did not converge (>18 min per
+  # harness; numbers in the harness-introducing commit's message). The
+  # extraction is the remediation the retry campaign's Phase-2 deferral
+  # recorded in docs/spec/models/retry-invariant-map.md.
   #
-  # MANUAL TARGET for now — run with
-  #   nix build .#kani-toolchain.kani-checks.kani-rio-scheduler
-  # It is deliberately NOT gated in checks.*: CBMC on these harnesses
-  # inside rio-scheduler's artifact context (the goto model inherits the
-  # crate's full reachable code, Arc-backed identifiers, and the
-  # f64 timestamp conversions) did not complete inside a merge-gate
-  # budget when introduced (>18 min per harness without convergence;
-  # numbers in the introducing commit's message). Gate it once the
-  # counter-arithmetic kernels are extracted into a dependency-light
-  # context the way rio-store's logs/kernel.rs was (the recorded Phase-2
-  # deferral in docs/spec/models/retry-invariant-map.md), and add the
+  # MANUAL TARGET for the moment — run with
+  #   nix build .#kani-toolchain.kani-checks.kani-rio-retry-kernel
+  # The follow-up gating change promotes it into checks.*, adds the
   # verify markers for the covered sched.retry.* rules at this wiring
-  # point at the same time (markers are deliberately absent until the
-  # check actually runs in CI — the rules keep their existing
-  # unit-test / model-check verify sites meanwhile).
+  # point, and records the measured per-harness CBMC wall-clocks
+  # (markers stay absent until the check actually runs in CI — the
+  # rules keep their existing unit-test / model-check verify sites
+  # meanwhile).
   #
-  # Six harnesses:
+  # Six harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
   #   - check_decide_contract: #[kani::proof_for_contract] over bounded
   #     arbitrary attempt suffixes, scaled budgets, and optional legacy
   #     seeds — the verdict partition is consistent with the final
@@ -212,9 +212,9 @@ in
   #   - check_fold_fleet_exhaust_arm: the fold-side fleet-exhaust arm
   #     (E1) needs a non-empty fully-failed fleet; an empty fleet never
   #     poisons.
-  kani-rio-scheduler = mkKaniCheck {
-    name = "rio-scheduler";
-    crate = crateBuildKani.members.rio-scheduler;
+  kani-rio-retry-kernel = mkKaniCheck {
+    name = "rio-retry-kernel";
+    crate = crateBuildKani.members.rio-retry-kernel;
     expectedHarnesses = 6;
   };
 }

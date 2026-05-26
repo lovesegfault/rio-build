@@ -6436,6 +6436,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-retry-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "rio-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -6469,6 +6473,7 @@ dependencies = [
  "rio-migrations",
  "rio-nix",
  "rio-proto",
+ "rio-retry-kernel",
  "rio-store",
  "rio-test-support",
  "rstest",

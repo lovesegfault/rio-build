@@ -57,6 +57,10 @@
       "description": "CustomResourceDefinition types for rio-build (Pool, ComponentScaler)"
     },
     {
+      "name": "rio-retry-kernel",
+      "description": "Pure retry/poison decision kernels for the rio-build scheduler (CBMC-verified)"
+    },
+    {
       "name": "xtask",
       "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers"
     }
@@ -160,6 +164,11 @@
       "optional": [],
       "dev": []
     },
+    "rio-retry-kernel": {
+      "prod": [],
+      "optional": [],
+      "dev": []
+    },
     "rio-scheduler": {
       "prod": [
         "rio-auth",
@@ -168,6 +177,7 @@
         "rio-migrations",
         "rio-nix",
         "rio-proto",
+        "rio-retry-kernel",
         "rio-store"
       ],
       "optional": [],

@@ -56,6 +56,7 @@ specs (
           rio-migrations/src/**/*.rs
           rio-nix/src/**/*.rs
           rio-proto/src/**/*.rs
+          rio-retry-kernel/src/**/*.rs
           rio-common/src/**/*.rs
           rio-auth/src/**/*.rs
           rio-cli/src/**/*.rs

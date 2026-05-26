@@ -24,8 +24,13 @@ platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 # build path already stubs workspace-hack (nix/crate2nix.nix), so this
 # only affects local cargo + the importCargoLock-based checks (mutants/
 # fuzz/deny).
+#
+# rio-retry-kernel is the dependency-free CBMC-verified decision-kernel
+# crate (see its Cargo.toml header): it must not gain the workspace-hack
+# dependency stub, and with zero third-party deps it contributes nothing
+# to unification anyway.
 [final-excludes]
-workspace-members = ["xtask"]
+workspace-members = ["xtask", "rio-retry-kernel"]
 
 # aws-smithy-runtime[test-util] → legacy-test-util → connector-hyper-0-14-x
 # pulls hyper 0.14 / h2 0.3 / http 0.2 into [dependencies] — exactly the

@@ -14,6 +14,7 @@ members = [
   "rio-test-support",
   "rio-builder",
   "rio-crds",
+  "rio-retry-kernel",
   "workspace-hack",
   "xtask",
 ]
@@ -42,6 +43,7 @@ rio-store = { path = "rio-store", default-features = false }
 rio-test-support = { path = "rio-test-support" }
 rio-crds = { path = "rio-crds" }
 rio-lease = { path = "rio-lease" }
+rio-retry-kernel = { path = "rio-retry-kernel" }
 
 # Byte buffers
 bytes = "1"

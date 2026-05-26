@@ -806,6 +806,13 @@
       "doc": "Validated wrappers around generated proto types."
     }
   ],
+  "rio-retry-kernel": [
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Pure decision kernels for the scheduler's retry/poison machinery."
+    }
+  ],
   "rio-scheduler": [
     {
       "path": "actor/",
@@ -1065,7 +1072,7 @@
     {
       "path": "retry_policy.rs",
       "depth": 0,
-      "doc": "The reference fold over a derivation's observed failure history."
+      "doc": "The retry/poison decision surface, as the scheduler consumes it."
     },
     {
       "path": "sla/",

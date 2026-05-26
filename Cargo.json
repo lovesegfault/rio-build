@@ -13,6 +13,7 @@
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
+    "rio-retry-kernel": "rio-retry-kernel",
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
@@ -20428,6 +20429,21 @@
         "Rio Contributors"
       ]
     },
+    "rio-retry-kernel": {
+      "crateName": "rio-retry-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-retry-kernel"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-scheduler": {
       "crateName": "rio-scheduler",
       "version": "0.1.0",
@@ -20532,6 +20548,10 @@
         {
           "name": "rio-proto",
           "packageId": "rio-proto"
+        },
+        {
+          "name": "rio-retry-kernel",
+          "packageId": "rio-retry-kernel"
         },
         {
           "name": "rio-store",
