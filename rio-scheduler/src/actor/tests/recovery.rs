@@ -3629,3 +3629,48 @@ async fn test_recovery_rearms_prefix_state_for_spared_ready_entry() -> TestResul
 
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+4]
+/// `topdown_pruned` must survive leader failover: a derivations row
+/// persisted with the flag set is restored with the flag set (not
+/// reset to false) so the new leader keeps honoring the "must complete
+/// via substitution; building is invalid" invariant for childless
+/// pruned roots.
+#[tokio::test]
+async fn test_recovery_restores_topdown_pruned_flag() -> TestResult {
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // A plain single-node merge stages the build / link /
+        // derivation rows; the prune itself isn't needed to exercise
+        // the restore (merge-time persistence has its own test).
+        merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("tdrec-drv")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate to the post-prune persisted shape: mid-substitution
+        // (the detached fetch dies with the old leader) and pruned.
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = 'tdrec-drv'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+
+    let d = expect_drv(&f.handle, "tdrec-drv").await;
+    assert!(
+        d.topdown_pruned,
+        "recovery must restore topdown_pruned from PG, not reset it to false"
+    );
+    // The spawned fetch died with the old leader, so the node re-enters
+    // the normal flow (childless ⇒ Ready) — only the flag must survive.
+    assert_eq!(d.status, DerivationStatus::Ready);
+    Ok(())
+}

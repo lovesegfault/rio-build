@@ -1048,6 +1048,33 @@ pub const M_061: () = ();
 /// Read/written by **rio-scheduler** only.
 pub const M_062: () = ();
 
+/// `migrations/063_derivation_topdown_pruned.sql`
+///
+/// Failover-safe persistence of the scheduler's `topdown_pruned`
+/// marker. When the roots-only prune fires, the kept (demanded) nodes
+/// are merged WITHOUT their dependency closure, so they MUST complete
+/// via substitution — a from-source dispatch would ENOENT on inputDrvs
+/// that were never merged. The marker was previously in-memory only:
+/// after a leader failover a pruned root persisted as `substituting`
+/// was recovered childless, came back Ready, and — when its stored
+/// wanted union contained an output that was genuinely missing and not
+/// substitutable — was dispatched from source with no input-presence
+/// check (doomed dispatch → worker ENOENT → wrong-reason Poisoned →
+/// every interested build fails). Persisting the flag lets the new
+/// leader restore it and take the fail-fast (resubmit-directing) arm
+/// instead.
+///
+/// Written `true` for the kept nodes inside the same transaction that
+/// persists a pruned merge; **OR-combined on conflict**
+/// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
+/// unrelated non-pruned merge of the same drv never clears it; cleared
+/// in the same transaction that inserts edges where the node is the
+/// parent (its deps are then in the DAG, so the guard is moot). See
+/// `rio-scheduler/src/db/batch.rs` and `actor/merge.rs`.
+///
+/// Read/written by **rio-scheduler** only.
+pub const M_063: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

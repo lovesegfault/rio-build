@@ -415,7 +415,7 @@ impl DagActor {
         // Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         if let Err(e) = self
-            .persist_and_activate(build_id, &nodes, &edges, &merge_result)
+            .persist_and_activate(build_id, &nodes, &edges, &merge_result, topdown_fired)
             .await
         {
             self.cleanup_failed_merge(build_id, merge_result).await;
@@ -470,18 +470,31 @@ impl DagActor {
     /// single rollback point instead of three repeated
     /// `cleanup_failed_merge` arms. The caller does the rollback on
     /// `Err`; this fn does NOT touch in-memory state on failure.
+    ///
+    /// `topdown_fired`: the submission was pruned to its demand set, so
+    /// every persisted node is a kept node — its row gets
+    /// `topdown_pruned = true` inside the persist transaction (the
+    /// failover-safe counterpart of the post-commit in-memory stamp in
+    /// `validate_and_ingest`).
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
+        topdown_fired: bool,
     ) -> Result<(), ActorError> {
-        self.persist_merge_to_db(build_id, nodes, edges, &merge_result.newly_inserted)
-            .await
-            .inspect_err(
-                |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
-            )?;
+        self.persist_merge_to_db(
+            build_id,
+            nodes,
+            edges,
+            &merge_result.newly_inserted,
+            topdown_fired,
+        )
+        .await
+        .inspect_err(
+            |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
+        )?;
 
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
@@ -1610,12 +1623,20 @@ impl DagActor {
     /// Persist nodes and edges to the DB after a successful DAG merge.
     /// Extracted from handle_merge_dag so failures can be caught and
     /// rolled back via cleanup_failed_merge.
+    ///
+    /// `topdown_fired`: this is a roots-only-pruned merge, so `nodes`
+    /// is exactly the kept demand set — every row is upserted with
+    /// `topdown_pruned = true` (OR-on-conflict, see `db/batch.rs`).
+    /// Inside the same transaction so a rejected merge can never leak
+    /// the marker into PG, and a committed one can never lose it to a
+    /// failover that races the in-memory stamp.
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
+        topdown_fired: bool,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
@@ -1649,6 +1670,12 @@ impl DagActor {
                     // this drv — same monotonic-growth semantics as
                     // the in-memory `DerivationState::union_wanted`.
                     wanted_output_names: node.wanted_output_names.clone(),
+                    // On a pruned merge every persisted node is a kept
+                    // (demanded) node whose dep closure was dropped —
+                    // mark it so the guard survives leader failover.
+                    // OR-on-conflict upsert: a later non-pruned merge
+                    // of the same drv (false here) never clears it.
+                    topdown_pruned: topdown_fired,
                 }
             })
             .collect();
@@ -1701,6 +1728,20 @@ impl DagActor {
             .collect();
         let edge_rows = edge_rows?;
         crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
+
+        // Batch 3b: any node that just gained children (it is the
+        // parent of an edge inserted above) no longer needs the
+        // topdown_pruned guard — its deps are now in the DAG, so a
+        // from-source dispatch is no longer doomed. Clear the persisted
+        // marker in the SAME transaction as the edges so PG can never
+        // hold "pruned" + "has children" across a failover (the
+        // in-memory analogue is the children-gate clear in
+        // `handle_substitute_complete`). A pruned merge has no edges,
+        // so this is a no-op there.
+        let mut edge_parents: Vec<Uuid> = edge_rows.iter().map(|(p, _)| *p).collect();
+        edge_parents.sort_unstable();
+        edge_parents.dedup();
+        crate::db::SchedulerDb::clear_topdown_pruned_for_parents(&mut tx, &edge_parents).await?;
 
         // r[verify sched.db.tx-commit-before-mutate]
         // In-mem mutation ordering invariant: no newly-inserted node has

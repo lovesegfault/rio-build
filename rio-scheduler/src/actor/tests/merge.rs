@@ -1164,6 +1164,99 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
 }
 
 // r[verify sched.merge.substitute-topdown+4]
+/// The roots-only prune's `topdown_pruned` stamp must survive a leader
+/// failover, so it is persisted: once a pruned merge commits, the kept
+/// (demanded) node's PG row carries `topdown_pruned = true`; a later
+/// full merge that gives that node children (its deps are then in the
+/// DAG) clears the column in the same transaction that persists those
+/// edges.
+#[tokio::test]
+async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // B1: root → dep with root's wanted output substitutable upstream
+    // → the prune fires, keeps {root}, drops dep and the edge.
+    let root_out = test_store_path("tdpg-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mut root = make_node("tdpg-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("tdpg-dep");
+    dep.expected_output_paths = vec![test_store_path("tdpg-dep-out")];
+
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![root, dep],
+        vec![make_test_edge("tdpg-root", "tdpg-dep")],
+        false,
+    )
+    .await?;
+
+    // The kept node's PG row carries the flag as soon as the pruned
+    // merge commits (the MergeDag reply is sent post-persist).
+    let (pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdpg-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pruned,
+        "kept node of a committed pruned merge must persist topdown_pruned = true \
+         (in-memory only ⇒ lost on failover ⇒ doomed from-source dispatch)"
+    );
+    // The dropped dep never reached PG at all (prune commits roots-only).
+    let dep_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM derivations WHERE drv_hash = 'tdpg-dep'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(dep_rows, 0, "pruned dep must not be persisted");
+
+    // Let B1's detached fetch settle so it can't interleave with B2.
+    settle_substituting(&handle, &["tdpg-root"]).await;
+
+    // B2: a full merge that gives root its dep back: app → root → dep,
+    // app's output NOT substitutable → no prune → the edges persist →
+    // root now has a child in PG → the flag is cleared in the same
+    // transaction that inserted the edges.
+    let mut app = make_node("tdpg-app");
+    app.expected_output_paths = vec![test_store_path("tdpg-app-out")];
+    let mut root_b2 = make_node("tdpg-root");
+    root_b2.expected_output_paths = vec![root_out.clone()];
+    let mut dep_b2 = make_node("tdpg-dep");
+    dep_b2.expected_output_paths = vec![test_store_path("tdpg-dep-out")];
+
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![app, root_b2, dep_b2],
+        vec![
+            make_test_edge("tdpg-app", "tdpg-root"),
+            make_test_edge("tdpg-root", "tdpg-dep"),
+        ],
+        false,
+    )
+    .await?;
+
+    let (pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdpg-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pruned,
+        "a full merge that adds children for a previously-pruned node must \
+         clear topdown_pruned in PG (its deps are now in the DAG, so the \
+         substitution-only invariant no longer holds)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+4]
 /// `topdown_pruned` flag persistence bypass: B1 topdown-prunes R; while
 /// R's fetch is in-flight, B2 full-merges R WITH its deps. R is
 /// pre-existing `Substituting` so `dag.merge` doesn't reset it; the

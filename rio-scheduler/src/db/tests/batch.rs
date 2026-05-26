@@ -111,6 +111,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             is_fixed_output: i % 7 == 0,
             is_ca: i % 11 == 0,
             wanted_output_names: vec![],
+            topdown_pruned: false,
         })
         .collect();
 
@@ -190,6 +191,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             is_fixed_output: false,
             is_ca: false,
             wanted_output_names: vec![],
+            topdown_pruned: false,
         })
         .collect();
 
@@ -266,6 +268,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
             is_fixed_output: false,
             is_ca: false,
             wanted_output_names: wanted.iter().map(|s| s.to_string()).collect(),
+            topdown_pruned: false,
         };
         let mut tx = db.pool().begin().await?;
         SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
@@ -330,6 +333,83 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+4]
+/// `topdown_pruned` persists with OR-on-conflict semantics (a pruned
+/// merge sets it; an unrelated non-pruned merge of the same drv never
+/// clears it), is cleared only by `clear_topdown_pruned_for_parents`
+/// (the node gained children, in the same tx as its edges), and rides
+/// the recovery SELECT so a new leader can restore it.
+#[tokio::test]
+async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let drv_hash = "topdown-pruned-test";
+    let mk = |pruned: bool| DerivationRow {
+        drv_hash: drv_hash.into(),
+        drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
+        pname: Some("test-pkg".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-out", "b".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        wanted_output_names: vec![],
+        topdown_pruned: pruned,
+    };
+    let upsert = async |row: DerivationRow| -> anyhow::Result<Uuid> {
+        let mut tx = db.pool().begin().await?;
+        let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        tx.commit().await?;
+        Ok(id_map.get(drv_hash).unwrap().0)
+    };
+    let read = async || -> anyhow::Result<bool> {
+        let (got,): (bool,) =
+            sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = $1")
+                .bind(drv_hash)
+                .fetch_one(&test_db.pool)
+                .await?;
+        Ok(got)
+    };
+
+    // 1. Pruned merge sets it.
+    let id = upsert(mk(true)).await?;
+    assert!(read().await?, "pruned upsert must set topdown_pruned");
+
+    // 2. A later non-pruned merge of the same drv must NOT clear it (OR).
+    upsert(mk(false)).await?;
+    assert!(
+        read().await?,
+        "non-pruned re-upsert must not clear the marker (OR-on-conflict)"
+    );
+
+    // 3. Recovery SELECT carries it (the restore half lives in
+    //    `from_recovery_row`).
+    let recovered = db.load_nonterminal_derivations().await?;
+    let row = recovered
+        .iter()
+        .find(|r| r.drv_hash == drv_hash)
+        .expect("non-terminal row must be recovered");
+    assert!(
+        row.topdown_pruned,
+        "recovery SELECT must carry topdown_pruned"
+    );
+
+    // 4. Gaining children clears it (same-tx helper used by
+    //    persist_merge_to_db right after batch_insert_edges).
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::clear_topdown_pruned_for_parents(&mut tx, &[id]).await?;
+    tx.commit().await?;
+    assert!(
+        !read().await?,
+        "a node that gained children must have the marker cleared"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.db.batch-unnest]
 /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
 /// dense DAG over 10k nodes (fresh DB, so re-insert).
@@ -354,6 +434,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             is_fixed_output: false,
             is_ca: false,
             wanted_output_names: vec![],
+            topdown_pruned: false,
         })
         .collect();
     let mut tx = db.pool().begin().await?;

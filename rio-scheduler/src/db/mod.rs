@@ -252,6 +252,12 @@ pub(crate) struct RecoveryDerivationRow {
     pub wanted_output_names: Vec<String>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
+    /// Roots-only-prune marker (`migrations/063`): the node was kept by
+    /// a topdown prune and its dependency closure was never merged, so
+    /// it MUST complete via substitution. Restored verbatim by
+    /// `from_recovery_row` — resetting it to false is what allowed the
+    /// post-failover doomed from-source dispatch.
+    pub topdown_pruned: bool,
     pub failed_builders: Vec<String>,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
     /// (`i64`) — saturating-cast to `u64`/`u32` at hydration.
@@ -290,6 +296,7 @@ impl RecoveryDerivationRow {
             wanted_output_names: vec![],
             is_fixed_output: false,
             is_ca: false,
+            topdown_pruned: false,
             failed_builders: vec![],
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
@@ -359,6 +366,12 @@ pub(crate) struct DerivationRow {
     /// declared outputs wanted. UNIONED on conflict (with empty
     /// saturating to empty = "all") — see `batch_upsert_derivations`.
     pub wanted_output_names: Vec<String>,
+    /// Roots-only-prune marker (`migrations/063`): true for the kept
+    /// (demanded) nodes of a topdown-fired merge, false otherwise.
+    /// OR-combined on conflict so an unrelated non-pruned merge of the
+    /// same drv never clears it; cleared only when the node gains
+    /// children (see `clear_topdown_pruned_for_parents`).
+    pub topdown_pruned: bool,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

@@ -892,9 +892,14 @@ pub struct DerivationState {
     /// dispatched build would ENOENT on them. On
     /// `SubstituteComplete{ok=false}`, `handle_substitute_complete`
     /// fails every interested build instead of demoting to Ready
-    /// (which would dispatch a doomed build). r[sched.merge.
-    /// substitute-topdown]. In-mem only — same recovery semantics as
-    /// `substitute_tried`.
+    /// (which would dispatch a doomed build); the dispatch-time probes
+    /// take the same fail-fast arm for a childless flagged node whose
+    /// wanted outputs turn out missing and unsubstitutable.
+    /// r[sched.merge.substitute-topdown+4]. Persisted (`migrations/063`,
+    /// stamped in the pruned merge's own transaction, OR-on-conflict,
+    /// cleared when the node gains children) and restored by
+    /// `from_recovery_row` — unlike `substitute_tried`, losing it
+    /// across failover re-arms the doomed from-source dispatch.
     pub topdown_pruned: bool,
     /// Output paths that have already triggered a forgiven-seed-became-
     /// wanted DOWNGRADE of a substitute completion for this node
@@ -1133,7 +1138,12 @@ impl DerivationState {
             traceparent: String::new(), // recovered: no user trace
             probed_generation: 0,
             substitute_tried: false,
-            topdown_pruned: false,
+            // Persisted (`migrations/063`) precisely so it survives
+            // failover: a pruned root recovered childless MUST keep the
+            // "complete via substitution or fail fast" invariant — its
+            // inputDrvs were never merged, so a from-source dispatch on
+            // the new leader would ENOENT just like on the old one.
+            topdown_pruned: row.topdown_pruned,
             never_forgive_paths: HashSet::new(),
         })
     }
@@ -2161,6 +2171,7 @@ mod tests {
             // mattered pre-restart. Prove it's false post-restart
             // regardless.
             is_ca: true,
+            topdown_pruned: false,
             failed_builders: vec![],
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,

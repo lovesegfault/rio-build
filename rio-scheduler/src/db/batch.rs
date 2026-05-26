@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 11 bind params total regardless of
-    /// row count (vs `push_values`' 11×N, which hits PG's 65535-param
-    /// limit at ~5957 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 12 bind params total regardless of
+    /// row count (vs `push_values`' 12×N, which hits PG's 65535-param
+    /// limit at ~5461 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -54,7 +54,7 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Eleven parallel
+        // Decompose struct-of-rows into row-of-arrays. Twelve parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
@@ -75,6 +75,7 @@ impl SchedulerDb {
         let mut is_fixed_output = Vec::with_capacity(rows.len());
         let mut is_ca = Vec::with_capacity(rows.len());
         let mut wanted_output_names = Vec::with_capacity(rows.len());
+        let mut topdown_pruned = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -87,6 +88,7 @@ impl SchedulerDb {
             is_fixed_output.push(r.is_fixed_output);
             is_ca.push(r.is_ca);
             wanted_output_names.push(encode_pg_text_array(&r.wanted_output_names));
+            topdown_pruned.push(r.topdown_pruned);
         }
 
         // ON CONFLICT: update the recovery columns too. For
@@ -109,26 +111,34 @@ impl SchedulerDb {
         // persistence/recovery fallback — classification reads the live
         // effective set (`effective_wanted`, in-memory per-build
         // contributions) and only falls back to this column.
+        //
+        // topdown_pruned is OR-combined on conflict for the same reason:
+        // an unrelated, non-pruned merge of the same drv elsewhere must
+        // never clear a prior pruned merge's marker (the node is still
+        // childless until a merge actually inserts its dep edges — the
+        // only clearing site is `clear_topdown_pruned_for_parents`, in
+        // the same transaction as those edges).
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
-                 wanted_output_names)
+                 wanted_output_names, topdown_pruned)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
                 expected_output_paths::text[],
                 output_names::text[],
                 is_fixed_output, is_ca,
-                wanted_output_names::text[]
+                wanted_output_names::text[],
+                topdown_pruned
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[]
+                $11::text[], $12::bool[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
-                   is_fixed_output, is_ca, wanted_output_names)
+                   is_fixed_output, is_ca, wanted_output_names, topdown_pruned)
             -- is_ca UPDATE is idempotent-by-construction: drv_hash is
             -- deterministic (input-addressed=store path; CA=modular hash
             -- per rio-nix hashDerivationModulo). Same drv_hash → same
@@ -141,6 +151,10 @@ impl SchedulerDb {
             -- saturation. '{}' = "all wanted", so all ∪ X = all → '{}'
             -- if either side is empty; otherwise the sorted distinct
             -- union. Monotonically growing — never overwrite.
+            --
+            -- topdown_pruned: OR — set by pruned merges, never cleared
+            -- here (cleared only when the node gains children; see
+            -- clear_topdown_pruned_for_parents).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -157,7 +171,8 @@ impl SchedulerDb {
                                 || EXCLUDED.wanted_output_names
                         ) ORDER BY 1
                     )
-                END
+                END,
+                topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,
@@ -173,6 +188,7 @@ impl SchedulerDb {
         .bind(&is_fixed_output)
         .bind(&is_ca)
         .bind(&wanted_output_names)
+        .bind(&topdown_pruned)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result
@@ -236,6 +252,34 @@ impl SchedulerDb {
         )
         .bind(&parents)
         .bind(&children)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear `topdown_pruned` for derivations that just gained children
+    /// (`derivation_ids` = the parent side of edges inserted in THIS
+    /// transaction). A node with children no longer needs the
+    /// "must complete via substitution" guard — its deps are in the
+    /// DAG, so a from-source dispatch is no longer doomed. Run in the
+    /// SAME transaction as `batch_insert_edges` so the flag and the
+    /// edges can never disagree across a failover (mirrors the
+    /// in-memory clear in `handle_substitute_complete`, which is gated
+    /// on `get_children().is_empty()`).
+    pub(crate) async fn clear_topdown_pruned_for_parents(
+        tx: &mut PgConnection,
+        derivation_ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            UPDATE derivations SET topdown_pruned = false, updated_at = now()
+            WHERE derivation_id = ANY($1) AND topdown_pruned
+            "#,
+        )
+        .bind(derivation_ids)
         .execute(&mut *tx)
         .await?;
         Ok(())
