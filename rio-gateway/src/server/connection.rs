@@ -440,14 +440,18 @@ async fn finish_channel_session(
         // longer deliver anything to keep wedging future sessions.
         force_close.arm_within(super::FORCE_CLOSE_SLACK);
     }
-    // Reap the pump rather than wait for it: the protocol reader is gone,
-    // so nothing will ever consume further client data, and on its own the
-    // pump only exits when the CLIENT acts (channel close, EOF, more data
-    // on a dead channel) or the connection ends. Waiting on the peer would
-    // retain the pump, this task, and their buffers for as long as the
-    // peer pleases — uncounted by the session cap, whose permit was
-    // already released above. Aborting is safe: the pump is a dumb copy
-    // loop with nothing to clean up beyond its pipe halves.
+    // Reap the pump rather than wait for it: the session is over (on the
+    // EOF exit the protocol reader is already gone; on the send-failure
+    // and stalled-send exits the transport it would answer through is
+    // dead or wedged), so forwarding further client data serves nothing.
+    // On its own the pump only exits when the CLIENT acts (channel close,
+    // EOF, more data on a dead channel) or the connection ends; waiting
+    // on the peer would retain the pump, this task, and their buffers for
+    // as long as the peer pleases — uncounted by the session cap, whose
+    // permit was already released above. Aborting is safe: the pump is a
+    // dumb copy loop with nothing to clean up beyond its pipe halves, and
+    // a proto task that is still alive just sees inbound EOF and runs its
+    // normal wind-down.
     client_pump.abort();
     // A JoinError from the abort above is expected cancellation, not a
     // failure; only surface real panics.

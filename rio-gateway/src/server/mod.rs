@@ -636,7 +636,11 @@ impl GatewayServer {
 /// before the handle send matters: the polite disconnect rides the russh
 /// handle queue, which a hostile peer can park (key exchange held open) —
 /// the decision to disconnect must be bounded even if the polite send
-/// itself never completes.
+/// itself never completes. A third site arms it with no disconnect at
+/// all: a session whose handle-queue sends (channel data or close-out)
+/// have stalled past `HANDLE_SEND_TIMEOUT` (connection.rs) — that queue
+/// is the only path a polite disconnect could take, so the armed deadline
+/// is the entire response.
 ///
 /// Lock-free: a single `AtomicU64` of nanoseconds relative to `origin`
 /// (`NOT_ARMED` = nothing pending), so the wrapper's hot path is one
@@ -712,10 +716,12 @@ impl ForceClose {
 ///   re-key for as long as the post-auth limits allow.
 /// - **Force-close:** reads/writes fail once the shared [`ForceClose`]
 ///   deadline passes, regardless of auth state. It is armed the moment the
-///   gateway queues a `Disconnect::ByApplication` for the connection, so a
-///   peer that keeps that disconnect undeliverable (parked key exchange)
-///   or ignores it (never closes its socket) is closed within the slack
-///   anyway.
+///   gateway decides the connection must go — when a
+///   `Disconnect::ByApplication` is queued, or when a session's
+///   handle-queue sends stall past `HANDLE_SEND_TIMEOUT` (no disconnect
+///   can ride a queue in that state) — so a peer that keeps a disconnect
+///   undeliverable (parked key exchange) or ignores it (never closes its
+///   socket) is closed within the slack anyway.
 ///
 /// Cost on the hot path (authenticated, nothing armed): one relaxed atomic
 /// load per read/write poll — the pre-auth stage check latches off after
@@ -1277,10 +1283,12 @@ mod conn_deadline_tests {
             .write_all(&[0u8; 8])
             .await
             .expect("filling the duplex buffer must succeed");
-        // Armed BEFORE the write parks — the production shape: the
-        // empty-connection grace timer (or the auth-timeout path) armed the
-        // force-close while russh was already wedged in a bulk write to a
-        // peer that stopped reading.
+        // Armed BEFORE the write parks — the production shape the
+        // in-process check covers: a disconnect or stalled-send decision
+        // has already armed the force-close, and a later write (the polite
+        // disconnect, a close-out, the next bulk data chunk) parks against
+        // a peer that stopped reading. A force-close armed only AFTER the
+        // write parked is TCP_USER_TIMEOUT's case, not this one.
         force_close.arm_within(SLACK);
         // Bounded from the outside so a regression (write parked forever,
         // deadline never checked on the write path) fails the test instead
