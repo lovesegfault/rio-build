@@ -193,6 +193,8 @@ impl DagActor {
 
         self.seed_ready_queue(&failed_dep_parents).await;
 
+        self.enforce_recovered_verdicts().await;
+
         self.finalize_recovered_builds(&bd_rows).await;
 
         info!(
@@ -894,6 +896,77 @@ impl DagActor {
         }
         for hash in ready {
             self.push_ready(hash);
+        }
+    }
+
+    /// Phase 1b (T-1b.12b): re-run `decide()` for every recovered
+    /// non-terminal derivation and act on a `Poison` verdict via the
+    /// same runtime path a live failure would take
+    /// (`poison_and_cascade`: terminal transition, persist, cascade to
+    /// dependents, fail the interested builds), per the design's "a
+    /// crash between the attempt stamp and the verdict persist
+    /// converges at recovery instead of waiting for the next failure
+    /// event or the backstop".
+    ///
+    /// Scope: only the poison-able statuses (`Ready`/`Assigned`/
+    /// `Running` — `poison_and_cascade`'s own precondition). Already
+    /// poisoned rows are excluded (their TTL handling stays with the
+    /// load-time expired filter and `tick_process_expired_poisons`,
+    /// which also own the `TtlExpire` verdict), and `Cancel` is not
+    /// enforced here — the timeout cap re-converges on the next
+    /// deadline observation exactly as before. The verdict comes from
+    /// the same seeded fold the live appending transactions compute
+    /// (T-1b.12a); a legacy-columns-only history with no ledger rows
+    /// folds to `Requeue` (no decision-bearing event), so pre-066
+    /// at-threshold state still converges at its next observation, not
+    /// here. The orphan reconcile (`reset_orphan_to_ready` /
+    /// `adopt_orphan_completion`) is unchanged.
+    async fn enforce_recovered_verdicts(&mut self) {
+        let budget = self.decision_budget();
+        let now_epoch = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+        let at_budget: Vec<(DrvHash, crate::retry_policy::PoisonReason)> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Ready
+                        | DerivationStatus::Assigned
+                        | DerivationStatus::Running
+                )
+            })
+            .filter_map(|(h, s)| {
+                let decision = crate::retry_policy::decide(
+                    s.attempt_history(),
+                    &budget,
+                    now_epoch,
+                    Some(s.legacy_retry_floor()),
+                );
+                match decision.verdict {
+                    crate::retry_policy::Verdict::Poison(reason) => Some((h.into(), reason)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if at_budget.is_empty() {
+            return;
+        }
+        info!(
+            count = at_budget.len(),
+            "recovery: enforcing at-budget verdicts that were never persisted"
+        );
+        for (drv_hash, reason) in at_budget {
+            warn!(drv_hash = %drv_hash, reason = ?reason,
+                  "recovery: at-budget attempt history with no persisted verdict — poisoning");
+            self.poison_and_cascade(
+                &drv_hash,
+                &format!(
+                    "at-budget failure history recovered without a persisted verdict ({reason:?})"
+                ),
+                None,
+                None,
+            )
+            .await;
         }
     }
 

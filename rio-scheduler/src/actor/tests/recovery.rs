@@ -5738,11 +5738,17 @@ async fn phase1b_failover_budget_recovered_view_equals_fold() -> TestResult {
 // r[verify sched.retry.recovery-projection+2]
 /// Boundary-spanning merge (red-first for T-1b.12a): a derivation with
 /// non-empty legacy mirror columns (`retry_count=2`,
-/// `failed_builders={leg-a,leg-b}`, `resubmit_cycles=1`) AND post-066
+/// `failed_builders={leg-a}`, `resubmit_cycles=1`) AND post-066
 /// attempt rows with no reset row recovers the P5 union/max merge —
 /// the columns' exclusions stay, the ledger row's executor joins them,
 /// and one more counted failure still crosses the same poison threshold
 /// it would have crossed under the pre-ledger recovery.
+///
+/// The merged history is deliberately UNDER-budget (2 of 3 distinct
+/// executors): an at-budget mixed-era history converges at recovery
+/// itself once T-1b.12b enforces the recovered verdict — that variant
+/// is pinned by
+/// `phase1b_recovery_legacy_floor_contributes_to_at_budget_verdict`.
 #[tokio::test]
 async fn phase1b_recovery_merges_legacy_floor_with_post066_rows() -> TestResult {
     let drv_hash = "legmix-drv";
@@ -5753,7 +5759,7 @@ async fn phase1b_recovery_merges_legacy_floor_with_post066_rows() -> TestResult 
         // Pre-066-era state: only the mirror columns carry it.
         sqlx::query(
             "UPDATE derivations SET retry_count = 2, \
-             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
+             failed_builders = '{leg-a}', resubmit_cycles = 1 \
              WHERE drv_hash = $1",
         )
         .bind(drv_hash)
@@ -5783,13 +5789,10 @@ async fn phase1b_recovery_merges_legacy_floor_with_post066_rows() -> TestResult 
     let handle = f.handle;
 
     let info = expect_drv(&handle, drv_hash).await;
-    for legacy in ["leg-a", "leg-b"] {
-        assert!(
-            info.retry.failed_builders.contains(legacy),
-            "the legacy column exclusion {legacy} must survive into the \
-             recovered view"
-        );
-    }
+    assert!(
+        info.retry.failed_builders.contains("leg-a"),
+        "the legacy column exclusion must survive into the recovered view"
+    );
     assert!(
         info.retry.failed_builders.contains("leg-c"),
         "the post-066 row's executor must join the recovered exclusion \
@@ -5805,7 +5808,7 @@ async fn phase1b_recovery_merges_legacy_floor_with_post066_rows() -> TestResult 
         "resubmit_cycles is floored at the legacy column"
     );
     assert_eq!(
-        info.retry.failure_count, 3,
+        info.retry.failure_count, 2,
         "failure_count is the merged exclusion set's size"
     );
 
@@ -6090,5 +6093,209 @@ async fn phase1b_failover_backstop_threshold_progress_survives() -> TestResult {
         "third distinct failure after the flap poisons (threshold \
          progress 2-of-3 survived, increment-then-check)"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.12b): recovery re-runs decide() for every non-terminal
+// derivation and enforces the verdict — a crash between the attempt
+// append commit and the verdict's status persist converges at recovery
+// instead of waiting for the next failure event or the backstop.
+// ---------------------------------------------------------------------------
+
+/// Red-first for T-1b.12b: an at-budget attempt history whose verdict
+/// was never persisted (the rows are committed, the status is still
+/// `ready` — the crash-between-stamp-and-persist shape, seeded directly
+/// via `db::attempts` because recovery must converge from any committed
+/// ledger state) converges to its terminal verdict AT RECOVERY: the
+/// derivation is Poisoned in memory and PG, the cascade reaches its
+/// dependents exactly as a runtime poison would, and the interested
+/// build fails.
+#[tokio::test]
+async fn phase1b_recovery_enforces_at_budget_verdict() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // Parent depends on child; nobody is dispatched (no executors).
+        merge_chain(
+            &handle,
+            build_id,
+            &["cvg-child", "cvg-parent"],
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        barrier(&handle).await;
+        // The at-budget history: three distinct executors' counted
+        // failures, committed to the ledger with NO status persist —
+        // the verdict the old leader never got to act on.
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind("cvg-child")
+                .fetch_one(&pool)
+                .await?;
+        let mut tx = pool.begin().await?;
+        for w in ["cvg-w1", "cvg-w2", "cvg-w3"] {
+            let mut row = crate::db::attempts::AttemptRow::new(
+                derivation_id,
+                crate::state::OutcomeClass::Transient,
+                crate::state::ReportingParty::Worker,
+            );
+            row.executor_id = Some(w.into());
+            row.error_msg = Some("counted failure with no persisted verdict".into());
+            crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+        }
+        tx.commit().await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'cvg-child'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            status, "ready",
+            "fixture precondition: the verdict was never persisted"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // The node converges to its terminal verdict at recovery — before
+    // any further failure event or backstop tick.
+    let child = expect_drv(&handle, "cvg-child").await;
+    assert_eq!(
+        child.status,
+        DerivationStatus::Poisoned,
+        "an at-budget attempt history with no persisted verdict must \
+         converge to Poisoned at recovery (T-1b.12b)"
+    );
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'cvg-child'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "poisoned",
+        "the recovery-time verdict must be persisted"
+    );
+
+    // The poison at recovery cascades exactly as a runtime poison would.
+    let parent = expect_drv(&handle, "cvg-parent").await;
+    assert_eq!(
+        parent.status,
+        DerivationStatus::DependencyFailed,
+        "the recovery-time poison must cascade to dependents"
+    );
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the interested build observes the recovery-time poison"
+    );
+    Ok(())
+}
+
+/// Companion guard for T-1b.12b: recovery over an under-budget history
+/// poisons nothing (the mass-poison regression guard) — the node stays
+/// dispatchable with its recovered counters intact.
+#[tokio::test]
+async fn phase1b_recovery_under_budget_history_poisons_nothing() -> TestResult {
+    let drv_hash = "cvg-under-drv";
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind(drv_hash)
+                .fetch_one(&pool)
+                .await?;
+        let mut tx = pool.begin().await?;
+        for w in ["cvg-u1", "cvg-u2"] {
+            let mut row = crate::db::attempts::AttemptRow::new(
+                derivation_id,
+                crate::state::OutcomeClass::Transient,
+                crate::state::ReportingParty::Worker,
+            );
+            row.executor_id = Some(w.into());
+            crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert!(
+        !info.status.is_terminal(),
+        "an under-budget history must not poison at recovery, got {:?}",
+        info.status
+    );
+    assert_eq!(
+        info.retry.failed_builders.len(),
+        2,
+        "the recovered counters are intact"
+    );
+    Ok(())
+}
+
+/// The at-budget mixed-era variant of the boundary-spanning merge: the
+/// legacy floor (P5) participates in the recovery-time verdict, so a
+/// history that is at the poison threshold only when both eras are
+/// counted ({leg-a,leg-b} from the columns plus one post-066 counted
+/// row) converges to Poisoned at recovery — the same verdict the
+/// as-built code would have produced when that row's event was
+/// observed live — and the merged exclusion survives onto the poisoned
+/// node.
+#[tokio::test]
+async fn phase1b_recovery_legacy_floor_contributes_to_at_budget_verdict() -> TestResult {
+    let drv_hash = "legcap-drv";
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        sqlx::query(
+            "UPDATE derivations SET retry_count = 2, \
+             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .execute(&pool)
+        .await?;
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind(drv_hash)
+                .fetch_one(&pool)
+                .await?;
+        let mut row = crate::db::attempts::AttemptRow::new(
+            derivation_id,
+            crate::state::OutcomeClass::Transient,
+            crate::state::ReportingParty::Worker,
+        );
+        row.executor_id = Some("leg-c".into());
+        let mut tx = pool.begin().await?;
+        crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "the threshold crossed across both eras converges at recovery"
+    );
+    for w in ["leg-a", "leg-b", "leg-c"] {
+        assert!(
+            info.retry.failed_builders.contains(w),
+            "the merged exclusion {w} survives onto the poisoned node, got {:?}",
+            info.retry.failed_builders
+        );
+    }
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind(drv_hash)
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_eq!(pg_status, "poisoned", "the recovery-time verdict persists");
     Ok(())
 }
