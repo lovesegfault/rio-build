@@ -266,6 +266,38 @@ pub(in crate::grpc) fn verify_nar(
     Ok(())
 }
 
+/// Parsed `fixed:` content-address descriptor of a floating-CA upload:
+/// ingestion method (`r:` prefix → recursive/NAR, otherwise flat) plus
+/// the declared content hash, exactly as the builder's
+/// `finalize_floating_ca` records it (`fixed:[r:]<algo>:<hash>`).
+struct FixedCaDescriptor {
+    recursive: bool,
+    hash: rio_nix::hash::NixHash,
+}
+
+/// Parse `info.content_address` for the CA gate. `text:` descriptors
+/// (store-added .drv files) and anything else that is not a `fixed:`
+/// descriptor are rejected — a floating-CA *build output* upload always
+/// carries `fixed:`.
+fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescriptor, Status> {
+    let rest = s.strip_prefix("fixed:").ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: unsupported content-address descriptor {s:?} on a floating-CA upload \
+             (expected `fixed:[r:]<algo>:<hash>`)"
+        ))
+    })?;
+    let (recursive, hash_str) = match rest.strip_prefix("r:") {
+        Some(h) => (true, h),
+        None => (false, rest),
+    };
+    let hash = rio_nix::hash::NixHash::parse_colon(hash_str).map_err(|e| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: malformed content-address hash in {s:?}: {e}"
+        ))
+    })?;
+    Ok(FixedCaDescriptor { recursive, hash })
+}
+
 // r[impl sec.authz.ca-path-derived+2]
 /// Floating-CA path-authorization gate. When `claims.is_ca` is set,
 /// [`validate_put_metadata`] skipped the `store_path ∈
@@ -276,10 +308,16 @@ pub(in crate::grpc) fn verify_nar(
 /// `is_ca=true` token therefore cannot upload to any path that isn't
 /// the content-derived path of the NAR it actually sent.
 ///
-/// Floating-CA (`__contentAddressed = true`, non-FOD) always uses
-/// `nar:sha256` recursive hashing — see `dispatch.rs`'s `is_ca` gate
-/// (`state.ca.is_ca && !state.is_fixed_output`). FODs with known
-/// output paths go through the IA `expected_outputs` check instead.
+/// The ingestion method comes from the upload's own `fixed:` content
+/// address descriptor (`info.content_address`), exactly as the
+/// builder's `finalize_floating_ca` records it: `r:`-prefixed →
+/// recursive (NAR) hashing, otherwise flat (single regular file)
+/// hashing, with sha1/sha256/sha512 all accepted. The declared
+/// descriptor hash is cross-checked against the server-side recompute,
+/// so the persisted/served `CA:` field can never lie about the bytes.
+/// Uploads without a descriptor fall back to the historical
+/// recursive-SHA256 assumption. FODs with known output paths go
+/// through the IA `expected_outputs` check instead.
 ///
 /// **Self-references**: a floating-CA output whose content embeds its
 /// own store path declares itself in `references`. The expected path
@@ -288,9 +326,11 @@ pub(in crate::grpc) fn verify_nar(
 /// *claimed* path's hash part zeroed ([`HashModuloSink`]). This stays
 /// self-certifying: a forged claim would need a path whose hash part,
 /// once zeroed in the content, hashes back to exactly that path.
-/// Non-self-referencing uploads keep using the already-verified plain
-/// NAR hash (identical to the modulo hash when there are no
-/// occurrences) — no second pass over the bytes.
+/// Non-self-referencing recursive-SHA256 uploads keep using the
+/// already-verified plain NAR hash (identical to the modulo hash when
+/// there are no occurrences) — no second pass over the bytes; other
+/// algorithms re-hash the buffered NAR (or the extracted file, for
+/// flat ingestion) with the declared algorithm.
 ///
 /// `None`/non-CA claims → no-op (IA already gated, dev/service
 /// bypass already trusted).
@@ -320,28 +360,91 @@ pub(in crate::grpc) fn verify_ca_store_path(
         .collect();
     let has_self_reference = refs.len() != info.references.len();
 
-    let content_hash = if has_self_reference {
-        // Hash modulo self-references: zero every occurrence of the
-        // claimed path's hash part, then hash. O(nar) — only paid by
-        // self-referencing uploads.
-        use std::io::Write as _;
-        let mut sink = rio_nix::ca::HashModuloSink::new(
-            rio_nix::hash::HashAlgo::SHA256,
-            &info.store_path.hash_part(),
-        );
-        sink.write_all(nar_data)
-            .map_err(|e| Status::internal(format!("{ctx_label}: hash-modulo: {e}")))?;
-        sink.finish().0
-    } else {
-        // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar
-        // has already confirmed it equals SHA-256(stream)).
-        rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
-            .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))?
+    // Ingestion method: from the upload's own `fixed:` descriptor when
+    // present (the native builder records one for every floating-CA
+    // output); absent → the historical recursive-SHA256 assumption.
+    let descriptor = info
+        .content_address
+        .as_deref()
+        .map(|s| parse_fixed_ca_descriptor(s, ctx_label))
+        .transpose()?;
+    let (recursive, algo) = match &descriptor {
+        Some(d) => (d.recursive, d.hash.algo()),
+        None => (true, rio_nix::hash::HashAlgo::SHA256),
     };
+
+    use std::io::Write as _;
+    let content_hash = if recursive {
+        if has_self_reference {
+            // Hash modulo self-references: zero every occurrence of the
+            // claimed path's hash part, then hash. O(nar) — only paid
+            // by self-referencing uploads.
+            let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
+            sink.write_all(nar_data)
+                .map_err(|e| Status::internal(format!("{ctx_label}: hash-modulo: {e}")))?;
+            sink.finish().0
+        } else if algo == rio_nix::hash::HashAlgo::SHA256 {
+            // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar
+            // has already confirmed it equals SHA-256(stream)).
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
+                .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))?
+        } else {
+            // Non-SHA-256 recursive ingestion: re-hash the buffered NAR
+            // with the declared algorithm.
+            let mut w = rio_nix::ca::HashWriter::new(algo);
+            w.write_all(nar_data)
+                .map_err(|e| Status::internal(format!("{ctx_label}: nar hash ({algo}): {e}")))?;
+            w.finish()
+        }
+    } else {
+        // Flat ingestion: the content hash is over the bytes of the
+        // single regular file the NAR must contain. Self-references are
+        // unrepresentable for flat outputs (the path derivation rejects
+        // them), so a declared one can never verify.
+        if has_self_reference {
+            return Err(Status::permission_denied(format!(
+                "{ctx_label}: flat content-addressed upload declares a self-reference"
+            )));
+        }
+        let file = rio_nix::nar::extract_single_file(nar_data).map_err(|e| {
+            Status::invalid_argument(format!(
+                "{ctx_label}: flat content-addressed upload is not a single-file NAR: {e}"
+            ))
+        })?;
+        let mut w = rio_nix::ca::HashWriter::new(algo);
+        w.write_all(&file)
+            .map_err(|e| Status::internal(format!("{ctx_label}: flat hash ({algo}): {e}")))?;
+        w.finish()
+    };
+
+    // The descriptor is persisted and served to substituting clients
+    // (narinfo `CA:`); a descriptor whose hash does not match the bytes
+    // actually sent is rejected even if the claimed path is otherwise
+    // consistent.
+    if let Some(d) = &descriptor
+        && d.hash != content_hash
+    {
+        warn!(
+            store_path = %info.store_path,
+            declared = %d.hash.to_colon(),
+            computed = %content_hash.to_colon(),
+            executor_id = %claims.executor_id,
+            "{ctx_label}: content-address descriptor does not match the uploaded NAR"
+        );
+        metrics::counter!(
+            "rio_store_hmac_rejected_total",
+            "reason" => "ca_descriptor_mismatch"
+        )
+        .increment(1);
+        return Err(Status::permission_denied(format!(
+            "{ctx_label}: content-address descriptor does not match the uploaded content"
+        )));
+    }
+
     let expected = rio_nix::store_path::StorePath::make_fixed_output_with_self(
         info.store_path.name(),
         &content_hash,
-        /* recursive */ true,
+        recursive,
         &refs,
         has_self_reference,
     )
@@ -835,6 +938,114 @@ mod verify_nar_tests {
         let mut claims = ca_claims();
         claims.is_ca = false;
         verify_ca_store_path(&info, &nar, Some(&claims), "t").expect("non-CA claims = no-op");
+    }
+
+    /// Flat-method floating CA (`fixed:sha256:…`): the expected path is
+    /// derived from the hash of the FILE bytes, not the NAR — the gate
+    /// must honor the declared method instead of assuming `r:sha256`.
+    #[test]
+    fn ca_flat_descriptor_accepted_and_method_mismatch_rejected() {
+        let contents = b"flat ca payload\n";
+        let digest: [u8; 32] = Sha256::digest(contents).into();
+        let flat_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
+        let path =
+            rio_nix::store_path::StorePath::make_fixed_output("flat-ca", &flat_hash, false, &[])
+                .unwrap();
+        let nar = nar_of_file(contents);
+
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("flat floating-CA upload with a matching descriptor must pass");
+
+        // The same content claimed under the recursive-sha256-derived
+        // path while declaring the flat method: the recompute follows
+        // the declared (flat) method, so the claim cannot match.
+        let nar_digest: [u8; 32] = Sha256::digest(&nar).into();
+        let nar_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, nar_digest.to_vec())
+                .unwrap();
+        let recursive_path =
+            rio_nix::store_path::StorePath::make_fixed_output("flat-ca", &nar_hash, true, &[])
+                .unwrap();
+        let mut info = ca_info(&recursive_path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// Recursive non-SHA-256 floating CA (`fixed:r:sha512:…`): accepted
+    /// when the path is derived with the declared algorithm; the same
+    /// upload claimed under an unrelated path is rejected.
+    #[test]
+    fn ca_recursive_sha512_descriptor_accepted() {
+        use std::io::Write as _;
+        let nar = nar_of_file(b"sha512-hashed nar payload\n");
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA512);
+        w.write_all(&nar).unwrap();
+        let nar_sha512 = w.finish();
+        let path = rio_nix::store_path::StorePath::make_fixed_output(
+            "r-sha512-ca",
+            &nar_sha512,
+            true,
+            &[],
+        )
+        .unwrap();
+
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(format!("fixed:r:{}", nar_sha512.to_colon()));
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("r:sha512 floating-CA upload with a matching descriptor must pass");
+
+        let other = rio_nix::store_path::StorePath::parse(&test_store_path("imposter512")).unwrap();
+        let mut info = ca_info(&other, &[], &nar);
+        info.content_address = Some(format!("fixed:r:{}", nar_sha512.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// A descriptor whose hash does not match the uploaded bytes is
+    /// rejected even when the claimed path is consistent with the
+    /// content — the descriptor is persisted/served and must not lie.
+    #[test]
+    fn ca_descriptor_hash_mismatch_rejected() {
+        let nar = nar_of_file(b"descriptor mismatch payload\n");
+        let digest: [u8; 32] = Sha256::digest(&nar).into();
+        let nar_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
+        // Path genuinely derived from the content (r:sha256)…
+        let path =
+            rio_nix::store_path::StorePath::make_fixed_output("desc-lie", &nar_hash, true, &[])
+                .unwrap();
+        // …but the descriptor declares a different hash.
+        let other_digest: [u8; 32] = Sha256::digest(b"other bytes").into();
+        let other_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, other_digest.to_vec())
+                .unwrap();
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(format!("fixed:r:{}", other_hash.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// Flat ingestion cannot carry references or self-references; a
+    /// flat-declared upload with references is rejected outright.
+    #[test]
+    fn ca_flat_with_references_rejected() {
+        let contents = b"flat with refs\n";
+        let digest: [u8; 32] = Sha256::digest(contents).into();
+        let flat_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
+        let path =
+            rio_nix::store_path::StorePath::make_fixed_output("flat-refs", &flat_hash, false, &[])
+                .unwrap();
+        let nar = nar_of_file(contents);
+        let dep = rio_nix::store_path::StorePath::parse(&test_store_path("some-dep")).unwrap();
+        let mut info = ca_info(&path, std::slice::from_ref(&dep), &nar);
+        info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "got: {e:?}");
     }
 
     /// Incremental hashing through `accumulate_chunk` produces the same
