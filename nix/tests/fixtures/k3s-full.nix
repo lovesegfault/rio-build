@@ -360,6 +360,10 @@ let
   # needs 8472/udp both ways; kubelet 10250 for `kubectl exec`/logs
   # (agent → server AND server → agent for 2-node).
   k3sBase = {
+    # Same kernel-feature contract as the production AMI (P0560 §B):
+    # FUSE_PASSTHROUGH needs kernel >= 6.9 (asserted), fuse + overlay
+    # modules loaded before any builder pod mounts its castore lower.
+    imports = [ ../../nixos-node/kernel.nix ];
     services.k3s = {
       package = k3sPinned;
       containerdConfigTemplate = k3sContainerdConfigTmpl;
@@ -370,6 +374,17 @@ let
       "wireguard"
     ];
     boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+
+    # The rio-mountd DaemonSet (mountd-ds.yaml, enabled by default in
+    # the chart) runs on every node executor pods can land on. Its
+    # hostPath volumes use `type: Directory`, so the trees must exist
+    # before the pod schedules — same provisioning the AMI does via
+    # eks-node.nix tmpfiles, minus the XFS-prjquota loopback (the
+    # vmtest values set mountd.stagingQuotaBytes=0; quota enforcement
+    # is vm-mountd / vm-nixos-node territory). The rio-builder group
+    # mirrors the production gid for the socket chown (the vmtest
+    # SO_PEERCRED gate is keyed on gid 0 — see vmtest-full.yaml).
+    users.groups.rio-builder.gid = 990;
 
     networking.firewall = {
       allowedTCPPorts = [
@@ -473,6 +488,15 @@ let
       "d /var/lib/kubelet/seccomp/operator 0755 root root -"
       "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
       "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
+      # The three mountd-owned trees (cache/chunks RO, staging RW for
+      # executor pods; all RW for the DaemonSet). mountd-ds.yaml mounts
+      # them `type: Directory` — missing dirs are a loud
+      # ContainerCreating failure, so create them at boot like the AMI
+      # does. /run/rio-mountd is DirectoryOrCreate (kubelet creates it).
+      "d /var/rio 0755 root root -"
+      "d /var/rio/cache 0755 root root -"
+      "d /var/rio/chunks 0755 root root -"
+      "d /var/rio/staging 0755 root root -"
     ]
     # Belt-and-suspenders for coverage mode: pre-empt kubelet's
     # DirectoryOrCreate (which creates 0755 root:root) so the cov
@@ -654,18 +678,25 @@ let
           # (IO-starved by the airgap image import). We don't use
           # etcd snapshots in an ephemeral VM test.
           "--etcd-disable-snapshots"
+          # Executor pods can land on either node (no taints in the VM
+          # cluster), so the rio-mountd DaemonSet must cover this one
+          # too — its nodeAffinity keys on rio.build/node-role
+          # (mountd-ds.yaml), the same label cover.rs stamps on every
+          # production NodeClaim.
+          "--node-label"
+          "rio.build/node-role=builder"
         ];
       };
 
       # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
       # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
       # headroom. Coverage: +2GB for instrumented-image bloat.
-      # diskSize 24GB: controller adds PoolSpec.fuseCacheBytes (4Gi
-      # via vmtest-full.yaml; CRD default 8Gi for non-helm Pools;
-      # helm prod 50Gi) + LOG_BUDGET 1Gi on top of
-      # SpawnIntent.disk_bytes (sla.defaultDisk 2Gi) — every
-      # worker pod requests ≥7GiB ephemeral-storage. qemu disk image
-      # is sparse so the bump is ~free until builds actually write.
+      # diskSize 24GB: worker pods request disk×headroom (sla.defaultDisk
+      # 2Gi × 1.5) + LOG_BUDGET 1Gi ≈ 4Gi ephemeral-storage each (the
+      # per-pod fuse-cache addend is gone since P0560 — the castore
+      # input closure is served from the node-level /var/rio caches).
+      # qemu disk image is sparse so the bump is ~free until builds
+      # actually write.
       virtualisation = {
         memorySize = 8192 + k3sCovMemBump;
         cores = 8;
@@ -702,16 +733,19 @@ let
           # classifies the real agent via it.
           "--node-label"
           "rio.build/vmtest=true"
+          # rio-mountd DaemonSet placement (see the serverNode flag).
+          "--node-label"
+          "rio.build/node-role=builder"
         ];
       };
 
-      # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi
-      # with FUSE cache) + containerd tmpfs (~1.5GB layers, 3G cap)
+      # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi)
+      # + containerd tmpfs (~1.5GB layers, 3G cap)
       # + k3s agent (~500Mi). Coverage: +2GB for instrumented images.
       # diskSize 24GB: see serverNode comment — worker pods request
-      # ≥7GiB ephemeral-storage (fuseCacheBytes 4Gi via vmtest-full
-      # + log 1Gi + disk 2Gi; non-helm Pools get CRD default 8Gi →
-      # ≥11GiB); the prior 12GB → ~11GiB allocatable left zero headroom
+      # ~4Gi ephemeral-storage (disk 2Gi × 1.5 headroom + log 1Gi; no
+      # per-pod fuse-cache addend since P0560); the prior 12GB →
+      # ~11GiB allocatable left zero headroom
       # for fetcher pods (nodeSelector pins them here).
       virtualisation = {
         memorySize = 6144 + k3sCovMemBump;

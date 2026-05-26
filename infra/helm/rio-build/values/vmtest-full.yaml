@@ -162,10 +162,6 @@ pools:
 poolDefaults:
   enabled: true
   image: rio-builder
-  # 4Gi. values.yaml prod default is 50Gi → ≥51Gi ephemeral-storage
-  # request floor → Unschedulable on the 24G k3s node disks (~21Gi
-  # allocatable). Layered nonpriv overlay inherits via deep-merge.
-  fuseCacheBytes: 4294967296
   # k3s escape hatch. Most scenarios don't care about pod security
   # posture; privileged:true skips the seccomp/hostUsers caveats (k3s's
   # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN;
@@ -180,6 +176,24 @@ poolDefaults:
   tolerations: null
   nodeSelector: null
   seccompProfile: null
+
+# rio-mountd DaemonSet on the k3s VM nodes. Two deviations from the
+# production defaults, both because the k3s test nodes are not the
+# NixOS AMI:
+#   - allowedGid 0: vmtest executor pods run privileged as root
+#     (poolDefaults.privileged above) in the host userns, so their
+#     SO_PEERCRED.gid is 0. Production keeps 990; how an unprivileged
+#     hostUsers:false pod presents gid 990 is the §P0559 "socket access
+#     under hostUsers:false" work item. The gid gate itself is verified
+#     by vm-mountd.
+#   - stagingQuotaBytes 0: the k3s nodes have no XFS-prjquota /var/rio
+#     loopback (that is eks-node.nix provisioning, asserted by
+#     vm-nixos-node), so the kernel project quota cannot be applied.
+#     Quota enforcement is verified by vm-mountd against a real XFS
+#     loopback.
+mountd:
+  allowedGid: 0
+  stagingQuotaBytes: 0
 
 postgresql:
   enabled: true
