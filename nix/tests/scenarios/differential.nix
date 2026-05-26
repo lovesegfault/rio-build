@@ -62,7 +62,10 @@ let
   #
   #   expect = "parity"      → both succeed; NAR hashes + references equal
   #   expect = "both-fail"   → both fail; the native side must report
-  #                            `rio_status`
+  #                            `rio_status` (or, for rejections that
+  #                            happen in the request glue before any
+  #                            build runs, a glue error containing
+  #                            `rio_glue_error`)
   #   expect = "diverge"     → a documented divergence: `nix` describes
   #                            the oracle's behaviour, `rio_status` /
   #                            `rio_glue_error` the native side's; the
@@ -86,6 +89,25 @@ let
     symlink-output = {
       expect = "parity";
     };
+    symlink-input-consumer = {
+      expect = "parity";
+    };
+    build-user = {
+      expect = "parity";
+    };
+    hard-link-pair = {
+      expect = "parity";
+    };
+    hard-link-across-outputs = {
+      expect = "parity";
+    };
+    inner-group-writable = {
+      expect = "parity";
+    };
+    group-writable-root = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
     stray-store-path = {
       expect = "parity";
     };
@@ -105,9 +127,22 @@ let
     erg-with-drv = {
       expect = "parity";
     };
+    erg-subpath = {
+      expect = "parity";
+    };
     disallowed-requisites = {
       expect = "both-fail";
       rio_status = "OutputRejected";
+    };
+    illegal-ref-specifier = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    builtin-fetchurl-no-hash = {
+      expect = "both-fail";
+      # Rejected by the request glue (no outputHash → no network grant);
+      # the driver reports the glue error instead of a classification.
+      rio_glue_error = "outputHash";
     };
     outputchecks-maxsize = {
       expect = "both-fail";
@@ -437,10 +472,18 @@ pkgs.testers.runNixOSTest {
 
             elif expect == "both-fail":
                 assert not ok, f"{name}: oracle build unexpectedly succeeded"
-                assert report["classification"] == meta["rio_status"], (
-                    f"{name}: native classification {report['classification']} "
-                    f"!= expected {meta['rio_status']} ({report.get('error_msg')})"
-                )
+                if "rio_glue_error" in meta:
+                    # Rejected by the request glue before any build ran:
+                    # the driver reports glue_error and no classification.
+                    assert report["glue_error"] and meta["rio_glue_error"] in report["glue_error"], (
+                        f"{name}: expected glue error containing {meta['rio_glue_error']!r}, "
+                        f"got {report['glue_error']!r}"
+                    )
+                else:
+                    assert report["classification"] == meta["rio_status"], (
+                        f"{name}: native classification {report['classification']} "
+                        f"!= expected {meta['rio_status']} ({report.get('error_msg')})"
+                    )
 
             elif expect == "diverge":
                 # Documented divergence: record it, assert the native side

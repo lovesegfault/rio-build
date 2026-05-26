@@ -168,6 +168,76 @@ rec {
     echo "real output" > $out
   '' { };
 
+  # Consumes an input store path whose ROOT is itself a symlink
+  # (symlink-output above): the sandbox must present that input as the
+  # symlink it is — not a host-resolved copy of its target — exactly
+  # like CppNix's doBind. The consumer records link-ness and the link
+  # target, so a sandbox that resolves (or fails to materialize) the
+  # symlink diverges in $out.
+  symlink-input-consumer = mkDrv "rio-diff-symlink-consumer" ''
+    {
+      if [ -L ${symlink-output} ]; then echo "input-is-symlink"; else echo "input-not-symlink"; fi
+      readlink ${symlink-output} || echo "readlink-failed"
+    } > $out
+  '' { };
+
+  # Build-user identity as observed from inside the sandbox: CppNix's
+  # sandbox /etc/passwd and /etc/group name uid/gid as nixbld/nixbld,
+  # and builds do embed `id`/`whoami` output (configure scripts, test
+  # suites). The native sandbox must agree byte-for-byte.
+  build-user = mkDrv "rio-diff-build-user" ''
+    {
+      id -un
+      id -gn
+    } > $out
+  '' { };
+
+  # Hard-linked pair inside one output: canonicalisation chowns the
+  # first name to root, then must accept the second name of the same
+  # inode (CppNix's inodesSeen escape) instead of rejecting it as
+  # foreign-owned.
+  hard-link-pair = mkDrv "rio-diff-hard-link-pair" ''
+    mkdir -p $out
+    echo "linked content" > $out/a
+    ln $out/a $out/b
+  '' { };
+
+  # Hard link ACROSS two outputs of the same derivation: the inode is
+  # first seen while processing one output and reappears in the other;
+  # both CppNix and the native pipeline share the seen-inode set across
+  # a build's outputs, so this must succeed on both sides.
+  hard-link-across-outputs =
+    mkDrv "rio-diff-hard-link-across"
+      ''
+        mkdir -p $out $dev
+        echo "shared content" > $out/shared
+        ln $out/shared $dev/shared
+      ''
+      {
+        outputs = [
+          "out"
+          "dev"
+        ];
+      };
+
+  # Group-writable file INSIDE the output: canonicalisation normalizes
+  # inner modes (to 0444 here); only the output root is subject to the
+  # reject-don't-fix rule. Both sides must succeed.
+  inner-group-writable = mkDrv "rio-diff-inner-writable" ''
+    mkdir -p $out/sub
+    echo "writable for the group" > $out/sub/file
+    chmod 664 $out/sub/file
+  '' { };
+
+  # Group-writable OUTPUT ROOT: CppNix rejects the build output
+  # ("suspicious ownership or permission"), and so must the native
+  # result pipeline.
+  group-writable-root = mkDrv "rio-diff-writable-root" ''
+    mkdir -p $out
+    echo x > $out/file
+    chmod 775 $out
+  '' { };
+
   # ── structuredAttrs / passAsFile / placeholders ──────────────────────
 
   # __structuredAttrs: .attrs.json and .attrs.sh are copied into $out so
@@ -225,6 +295,25 @@ rec {
         ];
       };
 
+  # exportReferencesGraph whose target is a SUB-PATH of a store path
+  # ("${pkg}/bin/tool" style, as used by nixos module system images):
+  # CppNix runs toStorePath() on the target first, so the exported
+  # closure is the containing store path's closure. The registration
+  # file is copied into $out, so the NAR comparison pins the
+  # normalization byte-for-byte.
+  erg-subpath =
+    mkDrv "rio-diff-erg-subpath"
+      ''
+        mkdir -p $out
+        cp refs $out/refs
+      ''
+      {
+        exportReferencesGraph = [
+          "refs"
+          "${busybox}/bin/sh"
+        ];
+      };
+
   # ── Output policy checks ─────────────────────────────────────────────
 
   # disallowedRequisites violation: the output references busybox, which
@@ -233,6 +322,27 @@ rec {
     mkdir -p $out
     echo "${busybox}" > $out/forbidden-ref
   '' { disallowedRequisites = [ busybox ]; };
+
+  # allowedReferences entry that is neither a store path nor an output
+  # name: CppNix raises "illegal reference specifier" and fails the
+  # build; the native policy checks must reject it the same way instead
+  # of silently treating it as an unmatchable literal.
+  illegal-ref-specifier = mkDrv "rio-diff-illegal-spec" ''
+    echo "no references at all" > $out
+  '' { allowedReferences = [ "definitely-not-a-store-path-or-output" ]; };
+
+  # builtin:fetchurl WITHOUT a fixed-output hash: CppNix refuses to run
+  # it ("must be a fixed-output derivation") and rio's request glue must
+  # reject it before any network-enabled request exists — this is the
+  # SSRF gate for Builder pods. The URL is never contacted on either
+  # side.
+  builtin-fetchurl-no-hash = derivation {
+    name = "rio-diff-fetchurl-nohash";
+    system = builtins.currentSystem;
+    builder = "builtin:fetchurl";
+    url = "http://127.0.0.1:1/never-fetched";
+    PATH = "${busybox}/bin";
+  };
 
   # structuredAttrs outputChecks.out.maxSize violation: the output is
   # bigger than the declared cap — both sides must fail.
