@@ -91,9 +91,9 @@ pub(crate) fn header_lines(
 /// ```
 ///
 /// `result` is one of `ok`, `failed (<reason>)`, or `cancelled`.
-/// `footer_result_str` (in `crate::executor`) maps the per-attempt
-/// daemon outcome to `ok`/`failed (<reason>)` — see its doc for why
-/// exit codes aren't available — and `runtime::result::final_footer_result`
+/// `footer_result_native` (in `crate::executor`) maps the per-attempt
+/// build outcome to `ok`/`failed (<reason>)` — the result status enum
+/// carries no exit code — and `runtime::result::final_footer_result`
 /// overrides to `cancelled` from the assignment's cancel flag
 /// (best-effort: dropped by the scheduler's cancel-path seal before it
 /// reaches the stored log). The `exec` line repeats so a truncated
@@ -193,9 +193,9 @@ mod tests {
 
     #[test]
     fn footer_renders_failed() {
-        // Fixture mirrors the real domain: footer_result_str produces
-        // `failed (<reason>)`, never `failed (exit N)` — BuildStatus has
-        // no exit code.
+        // Fixture mirrors the real domain: footer_result_native produces
+        // `failed (<reason>)`, never `failed (exit N)` — the result
+        // status enum has no exit code.
         let lines = footer_lines(
             "01976e8b-test",
             "failed (PermanentFailure)",

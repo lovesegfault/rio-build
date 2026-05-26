@@ -552,9 +552,9 @@ fn fetch_extract_insert(
     // dot check passes it (47 chars, no leading dot); without this check we'd
     // gRPC the store, get InvalidArgument → EIO → circuit.record(false). Five
     // such lookups (a single configure run touches glibc's references several
-    // times) trip the breaker → ALL FUSE reads ENOENT → nix-daemon's OWN
-    // dynamic loader can't find libunistring.so.5 → daemon dies → unexpected
-    // EOF → MiscFailure → poison. Scheduler then marks the builder
+    // times) trip the breaker → ALL FUSE reads ENOENT → the sandboxed
+    // build's dynamic loader can't find its libraries → the build fails
+    // → poison. Scheduler then marks the builder
     // store-degraded and pulls it from the assignment pool. ENOENT here flows
     // through ensure_cached:166's existing record(true) — store wasn't asked,
     // but the path is unambiguously absent, which IS a healthy answer.
@@ -753,7 +753,7 @@ fn stream_nar_to_spool(
                     }
                     None => {
                         // I-189: error! (not warn!) — terminal failure
-                        // that surfaces as EIO to nix-daemon. The
+                        // that surfaces as EIO to the sandboxed build. The
                         // underlying gRPC status (h2 BrokenPipe,
                         // ResourceExhausted, …) on this line is the
                         // root cause; ops.rs's "JIT fetch failed → EIO"

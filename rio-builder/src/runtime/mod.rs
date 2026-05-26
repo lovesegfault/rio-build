@@ -103,7 +103,7 @@ pub struct BuildSpawnContext {
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
-    /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
+    /// Per-build execution timeout (from `Config.daemon_timeout_secs`).
     pub daemon_timeout: std::time::Duration,
     /// Silence timeout default (from `Config.max_silent_time`).
     /// Used when WorkAssignment's BuildOptions.max_silent_time is 0.

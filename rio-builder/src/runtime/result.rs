@@ -260,7 +260,7 @@ mod tests {
     /// the peaks `ExecuteOutcome` carried across the inner-Err boundary,
     /// not 0. Regression: previously hardcoded 0 with the false comment
     /// "Executor error → cgroup never populated" — defeating
-    /// `DaemonOutcome`'s whole purpose.
+    /// `NativeOutcome`'s whole purpose.
     #[test]
     fn test_err_completion_carries_peaks_for_cgroup_oom() {
         let r = err_completion(

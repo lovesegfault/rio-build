@@ -233,7 +233,7 @@ impl Drop for BuildCgroup {
 ///   builds/                       ← DelegateSubgroup; /proc/self/cgroup points here
 ///     cgroup.procs                ← worker PID
 ///   <drv-hash>/                   ← BuildCgroup::create per build (SIBLING of builds/)
-///     cgroup.procs                ← nix-daemon PID
+///     cgroup.procs                ← the sandboxed build's root PID
 ///     memory.peak, cpu.stat       ← resource tracking
 /// ```
 ///
@@ -610,15 +610,15 @@ pub(crate) fn parse_io_pressure_some_avg10(content: &str) -> Option<f64> {
 /// pod that's `/sys/fs/cgroup/cpu.max` — the pod's CPU limit. cgroup
 /// CPU quota does NOT reduce visible cores (sched_getaffinity / nproc
 /// see all node cores), so without this clamp `build_cores=0` →
-/// nix-daemon uses nproc → `make -j16` on a 0.5-core pod → 16×cc1 each
+/// the build env reports nproc → `make -j16` on a 0.5-core pod → 16×cc1 each
 /// at ~100MB → cgroup OOM-loop (cc1 killed, make respawns, never
 /// converges). I-196: python3-minimal stuck 15min on a `tiny` builder.
 ///
 /// I-197: builder/fetcher pools set `limits.cpu == requests.cpu`
 /// (hard, no burst — `672d1bf8`), so `cpu.max` is always a real quota
 /// in production. The `"max"` → nproc fallback only fires in VM tests
-/// / bare-metal dev. Also written to nix.conf `cores =` as
-/// defense-in-depth (see `executor::setup_nix_conf`).
+/// / bare-metal dev. Also exported as `NIX_BUILD_CORES` in the sandbox
+/// environment as defense-in-depth.
 pub fn effective_cores(parent: &Path) -> u32 {
     match fs::read_to_string(parent.join("cpu.max")) {
         Ok(s) => parse_cpu_max(&s),

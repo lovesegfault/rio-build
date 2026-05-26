@@ -86,9 +86,11 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
 
 = Hashed mirrors
 
-#r("fetcher.mirrors.hashed")[
+#r("fetcher.mirrors.hashed+2")[
   When a flat-hash FOD's origin URL is dead, `builtin:fetchurl` tries
-  `{mirror}/{algo}/{hexlower-digest}` for each configured hashed mirror first
+  `{mirror}/{algo}/{base16-digest}` (the digest as declared in the
+  derivation's `outputHash`, passed through unchanged) for each configured
+  hashed mirror first
   and only falls back to the origin on miss. Only `outputHashMode = "flat"`
   derivations qualify --- recursive (NAR-hash) FODs skip the mirror because
   the on-the-wire bytes don't correspond to the declared hash. Mirrors are

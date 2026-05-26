@@ -487,10 +487,12 @@ parsed derivation and its resolved input closure into a build-system-agnostic
 result pipeline classifies the exit and processes the outputs. No Nix binary
 is present in the worker image and no external process is delegated to.
 
-#r("builder.exec.sandbox")[
+#r("builder.exec.sandbox+2")[
   Every build runs inside a rio-exec sandbox constructed from fresh Linux
-  namespaces (mount, PID, IPC, UTS, cgroup; network only for fixed-output
-  derivations), with the input closure bind-mounted read-only inside a
+  namespaces: mount, PID, IPC, UTS, and cgroup for every build, plus a fresh
+  (loopback-only) network namespace for every build EXCEPT fixed-output
+  derivations --- FODs skip the network namespace so they retain network
+  access for their fetch. The input closure is bind-mounted read-only inside a
   writable per-build store view, a private `/proc`, `/dev` and `/etc`
   population, `pivot_root` into the per-build root, a multi-ABI seccomp
   filter denying setuid/setgid mode bits and xattr writes, and a drop to the

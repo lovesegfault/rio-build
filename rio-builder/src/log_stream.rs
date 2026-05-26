@@ -1,6 +1,6 @@
 //! Build log streaming via gRPC.
 //!
-//! Buffers STDERR_NEXT messages from `nix-daemon` and batches them into
+//! Buffers captured build-output lines and batches them into
 //! `BuildLogBatch` messages (64 lines or 100ms, whichever comes first).
 //! Batches are sent on the scheduler `BuildExecution` stream.
 //!
@@ -106,10 +106,10 @@ impl LogBatcher {
     ///
     /// `initial_line` seeds the line counter. The executor sends a
     /// `rio:` banner header (`crate::banner::HEADER_LINE_COUNT` lines)
-    /// directly on `log_tx` *before* `run_daemon_lifecycle` constructs
+    /// directly on `log_tx` *before* `run_native_lifecycle` constructs
     /// the batcher; seeding the counter lets the build's real output
     /// start numbering after the header instead of colliding at line 0.
-    /// On a daemon-transient retry the executor seeds at the prior
+    /// On an infra-transient retry the executor seeds at the prior
     /// attempt's `final_line_count` so output numbering continues
     /// monotonically across attempts. Tests that exercise the batcher
     /// in isolation pass `0`.

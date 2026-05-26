@@ -605,7 +605,7 @@
         "key": "daemon_timeout_secs",
         "type": "uint64",
         "default": "7200",
-        "description": "Timeout (seconds) for the local nix-daemon subprocess build when the client didn't specify BuildOptions.build_timeout."
+        "description": "Timeout (seconds) for the sandboxed build when the client didn't specify BuildOptions.build_timeout."
       },
       {
         "key": "max_silent_time_secs",

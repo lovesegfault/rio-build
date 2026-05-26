@@ -311,11 +311,12 @@ pub(super) async fn compute_input_closure(
 ) -> Result<Vec<ValidatedPathInfo>, ExecutorError> {
     use std::collections::HashSet;
 
-    // I-106: keep the full PathInfo from each BFS query so callers
-    // (synth_db generation in prepare_sandbox) don't have to re-query
-    // the same ~800 paths. Under ephemeral-builder load that second
-    // pass was a ~800 × N-builders QueryPathInfo burst that exhausted
-    // the store's PG pool.
+    // I-106: keep the full PathInfo from each BFS query so downstream
+    // consumers (the request glue's closure planning, FUSE prefetch
+    // sizing, output policy checks) don't have to re-query the same
+    // ~800 paths. Under ephemeral-builder load that second pass was a
+    // ~800 × N-builders QueryPathInfo burst that exhausted the store's
+    // PG pool.
     let mut closure: HashSet<String> = HashSet::new();
     let mut metadata: Vec<ValidatedPathInfo> = Vec::new();
     let mut frontier: Vec<String> = Vec::new();
@@ -666,8 +667,9 @@ mod tests {
     /// I-106: compute_input_closure now returns the full ValidatedPathInfo
     /// captured during BFS, eliminating the second QueryPathInfo pass that
     /// fetch_input_metadata used to do. This test verifies the metadata
-    /// fields are populated (not just path), proving the synth_db
-    /// generation can use this directly.
+    /// fields are populated (not just path), proving downstream consumers
+    /// (glue closure planning, FUSE prefetch sizing, policy checks) can
+    /// use this directly.
     #[tokio::test]
     async fn test_compute_input_closure_returns_full_metadata() -> anyhow::Result<()> {
         let (store, client) = spawn_and_connect().await?;
@@ -684,8 +686,9 @@ mod tests {
             .expect("p_a in closure");
         assert!(
             lib.nar_size > 0,
-            "nar_size populated (synth_db needs this) — proves we kept the \
-             full PathInfo, not just the path string"
+            "nar_size populated (FUSE prefetch sizing and closure-size \
+             policy checks need this) — proves we kept the full PathInfo, \
+             not just the path string"
         );
         Ok(())
     }

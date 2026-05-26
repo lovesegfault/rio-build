@@ -1120,7 +1120,7 @@ in
   #   builder pod. fetcher-isolation asserts the pod-level partition the
   #   chokepoint produces: fetcher pod tolerates rio.build/fetcher and
   #   NOT rio.build/kvm; builder pod tolerates NEITHER.
-  # r[verify fetcher.mirrors.hashed]
+  # r[verify fetcher.mirrors.hashed+2]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
   #   builds via {mirror}/sha256/{hex}. The fetcher pool's
   #   `hashedMirrors` (Pool spec → RIO_HASHED_MIRRORS) points at the

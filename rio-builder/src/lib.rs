@@ -1,8 +1,8 @@
 //! Build executor with FUSE store for rio-build.
 //!
-//! Receives build assignments from the scheduler, runs builds using
-//! nix-daemon within an overlayfs+FUSE environment, and uploads
-//! results to the store.
+//! Receives build assignments from the scheduler, runs builds in a
+//! native rio-exec sandbox within an overlayfs+FUSE environment, and
+//! uploads results to the store.
 //!
 //! # Architecture
 //!
@@ -17,9 +17,10 @@
 //! |   +-- lookup/getattr -> StoreService.QueryPathInfo
 //! |   +-- read/readdir -> SSD cache or StoreService.GetPath
 //! |   +-- Ephemeral local-disk cache (cache.rs)
-//! +-- Build executor (executor.rs)
+//! +-- Build executor (executor/)
 //! |   +-- Overlay management (overlay.rs)
-//! |   +-- Synthetic DB generation (synth_db.rs)
+//! |   +-- Sandbox request glue (executor/glue/)
+//! |   +-- Exit classification + output pipeline (executor/native_result/)
 //! |   +-- Log streaming (log_stream.rs)
 //! |   +-- Output upload (upload.rs)
 //! +-- Heartbeat loop (runtime.rs, 10s interval)

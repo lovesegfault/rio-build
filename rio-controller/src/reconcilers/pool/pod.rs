@@ -998,11 +998,11 @@ fn build_executor_container(
         security_context: Some(SecurityContext {
             privileged: privileged.then_some(true),
             capabilities: Some(Capabilities {
-                // nix-daemon sandbox cap set. See builderpool/
+                // Build-sandbox cap set. See builderpool/
                 // builders.rs pre-extraction commentary for the
-                // per-cap rationale (SETUID/GID for nixbld drop,
-                // NET_ADMIN for lo up in newns, SETPCAP for the
-                // inheritable-caps dance post-CVE-2022-24769, etc).
+                // per-cap rationale (SETUID/GID to drop to the build
+                // user, NET_ADMIN for lo up in the netns, SETPCAP for
+                // the inheritable-caps dance post-CVE-2022-24769, etc).
                 add: Some(vec![
                     "SYS_ADMIN".into(),
                     "SYS_CHROOT".into(),

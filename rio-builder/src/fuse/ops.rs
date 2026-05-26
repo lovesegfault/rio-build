@@ -735,9 +735,9 @@ impl Filesystem for NixStoreFs {
     // has no xattrs and no chattr flags, and the FS is read-only — these
     // implementations ARE the truthful answer, not placeholders. ENOSYS
     // (the default) and ENODATA/ENOTTY (here) are handled identically by
-    // overlayfs and nix-daemon's canonicalisePathMetaData; the explicit
-    // errnos just stop the per-call WARN spam (113× ioctl per build with
-    // chroot-store's FS_IOC_GETFLAGS probe). listxattr MUST branch on
+    // overlayfs and everything else reading the store view; the explicit
+    // errnos just stop the per-call WARN spam (historically 113× ioctl per
+    // build from the daemon-era FS_IOC_GETFLAGS probe). listxattr MUST branch on
     // size: size==0 is the size-probe (reply.size(0) is correct); size>0
     // wants the name list — reply.size(0) there serializes an 8-byte
     // fuse_getxattr_out which the kernel's fuse_verify_xattr_list reads

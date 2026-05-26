@@ -136,8 +136,6 @@ pub async fn setup(
     //     (/var/rio/fuse-store)     |   (readOnlyRoot only)
     //   cfg.overlay_base_dir        | `overlays` emptyDir
     //     (/var/rio/overlays)       |   (always)
-    //   /nix/var/{nix,log}/**       | `nix-var` emptyDir
-    //                               |   (readOnlyRoot only)
     //   /tmp (tempfile crate)       | `tmp` emptyDir, 64Mi tmpfs
     //                               |   (readOnlyRoot only)
     //   cfg.fuse_cache_dir          | `fuse-cache` emptyDir
@@ -426,10 +424,11 @@ pub(super) fn resolve_executor_identity(
         systems
     };
     // r[impl sched.dispatch.fod-builtin-any-arch]
-    // Every nix-daemon supports builtin:fetchurl — it's handled
-    // internally, no real process forked. Bootstrap derivations
-    // (busybox, bootstrap-tools) have system="builtin"; without
-    // this, a cold store permanently stalls at the DAG leaves.
+    // builtin:fetchurl is executed by the worker itself (a sandboxed
+    // re-exec of rio-builder), so any worker arch can run it.
+    // Bootstrap derivations (busybox, bootstrap-tools) have
+    // system="builtin"; without this, a cold store permanently
+    // stalls at the DAG leaves.
     // With per-arch fetcher Pools, this is what makes a `builtin`
     // FOD eligible on either arch's fetchers (hard_filter matches
     // on the union; best_executor scores across both).
@@ -480,7 +479,7 @@ pub(super) fn resolve_executor_identity(
 /// I-098: refuse to start when the host arch isn't in `RIO_SYSTEMS`.
 /// A Pool with `systems=[x86_64-linux]` whose pod lands on an
 /// arm64 node would otherwise register as x86_64, accept x86_64 drvs,
-/// and have nix-daemon refuse them at build time. CrashLoopBackOff is
+/// and fail every one at exec time (wrong-arch binaries). CrashLoopBackOff is
 /// the right shape — visible in `kubectl get pods`, doesn't poison drvs.
 ///
 /// r35 bug_039: Fetcher workers DO need arch validation for the

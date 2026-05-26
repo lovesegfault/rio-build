@@ -664,9 +664,9 @@ pub async fn execute_build(
             } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
             // r[impl builder.cores.cgroup-clamp+2]
-            // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
-            // and wopSetOptions build_cores below. I-196/I-197 rationale at
-            // crate::cgroup::effective_cores.
+            // Compute once: feeds the assignment-clamped `build_cores`
+            // (exported as NIX_BUILD_CORES in the sandbox env) below.
+            // I-196/I-197 rationale at crate::cgroup::effective_cores.
             let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
 
             // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
@@ -1208,7 +1208,7 @@ async fn run_native_lifecycle(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // r[impl builder.exec.sandbox]
+    // r[impl builder.exec.sandbox+2]
     let exec_result = rio_exec::execute(&prepared.request, &host, event_tx).await;
     let stop_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

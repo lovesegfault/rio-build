@@ -161,11 +161,16 @@ pub struct Config {
     /// intent it was spawned for. Empty in dev mode → header omitted.
     /// See `r[sec.executor.identity-token]`.
     pub executor_token: String,
-    /// Timeout (seconds) for the local nix-daemon subprocess build when
-    /// the client didn't specify BuildOptions.build_timeout. Intentionally
-    /// long (2h default) — some builds genuinely take that long; this is
-    /// a bound on blast radius of a truly stuck daemon, not an expected
-    /// build time.
+    /// Timeout (seconds) for the sandboxed build when the client didn't
+    /// specify BuildOptions.build_timeout. Intentionally long (2h
+    /// default) — some builds genuinely take that long; this is a bound
+    /// on blast radius of a truly stuck build, not an expected build
+    /// time.
+    // TODO: rename `daemon_timeout_secs` / `RIO_DAEMON_TIMEOUT_SECS` to
+    // `build_timeout_secs` / `RIO_BUILD_TIMEOUT_SECS` in a dedicated
+    // change — the env var is operator-visible (controller env
+    // injection, Pool CRD, helm values, docs), so the rename needs its
+    // own coordinated rollout.
     #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub daemon_timeout: std::time::Duration,
@@ -198,8 +203,9 @@ pub struct Config {
     pub idle_timeout: std::time::Duration,
     /// Hashed-mirror base URLs that the native `builtin:fetchurl`
     /// tries before the origin URL, as `<mirror>/<algo>/<base16-hash>`.
-    /// Successor of the nix.conf `hashed-mirrors` setting (the
-    /// ConfigMap-rendered nix.conf is unused by the native executor).
+    /// Successor of the daemon-era nix.conf `hashed-mirrors` setting
+    /// (spec rule `fetcher.mirrors.hashed`); there is no nix.conf
+    /// anywhere in the worker anymore.
     /// Env: `RIO_HASHED_MIRRORS=http://a/,http://b/` (comma-sep).
     /// Default: empty (origin URLs only).
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
@@ -207,8 +213,8 @@ pub struct Config {
     pub hashed_mirrors: Vec<String>,
     /// Extra host paths bind-mounted read-only into every build
     /// sandbox (same path inside and outside). Successor of the
-    /// nix.conf `extra-sandbox-paths` setting. Operators use this for
-    /// site-local impurities (e.g. a corporate CA directory).
+    /// daemon-era nix.conf `extra-sandbox-paths` setting. Operators use
+    /// this for site-local impurities (e.g. a corporate CA directory).
     /// Env: `RIO_EXTRA_SANDBOX_PATHS=/a,/b` (comma-sep). Default: empty.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     #[schemars(with = "Vec<String>")]

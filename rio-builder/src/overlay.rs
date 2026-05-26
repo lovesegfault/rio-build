@@ -6,11 +6,10 @@
 // r[impl builder.overlay.per-build]
 // r[impl builder.overlay.stacked-lower+2]
 //! - Work directory: required by overlayfs (same filesystem as upper)
-//! - Merged: mounted at `{build_dir}/nix/store`. nix-daemon runs with
-//!   `--store local?root={build_dir}` so it reads this as its
-//!   `realStoreDir` directly — no `/nix/store` bind-mount. Outputs
-//!   written by nix-daemon land in `{upper}/nix/store/{hash}-{name}`;
-//!   upload.rs scans that path.
+//! - Merged: mounted at `{build_dir}/nix/store` and bind-mounted writable
+//!   at `/nix/store` inside the build sandbox. Outputs written by the
+//!   build land in `{upper}/nix/store/{hash}-{name}`; upload.rs scans
+//!   that path.
 //!
 //! The overlay is cleaned up (unmounted + directories removed) on drop.
 //! Worker must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix
@@ -188,10 +187,10 @@ impl Drop for OverlayMount {
 ///
 /// The overlay's lower is the FUSE mount only — lazy-fetched build inputs
 /// from rio-store. The host `/nix/store` is NOT in the lowerdir (I-060):
-/// nix-daemon runs in the builder's namespace with `--store
-/// local?root={build_dir}`, so its binary + libs come from the host
-/// store directly. The per-build store contains exactly `{inputs} ∪
-/// {outputs}`; the daemon's runtime closure is structurally separate.
+/// the build sandbox sees only this per-build merged view at
+/// `/nix/store`, which contains exactly `{inputs} ∪ {outputs}`; the
+/// worker's own runtime closure lives in the host store and is
+/// structurally separate.
 ///
 /// # Important
 ///
@@ -471,7 +470,7 @@ mod tests {
             eprintln!(
                 "SKIP test_statfs_tmpdir_not_overlayfs: tempdir is on overlayfs \
                  (f_type={fstype:?}). The build sandbox is in the container's \
-                 writable layer — back /nix/var/nix/builds with tmpfs or a \
+                 writable layer — back /var/rio/overlays with tmpfs or a \
                  hostPath to run this test. Preflight rejection is correct \
                  here; the test's premise (\"tempdir is a normal FS\") is not."
             );

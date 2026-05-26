@@ -132,7 +132,7 @@ impl FetchurlParams {
     /// `<mirror>/<algo>/<base16-hash>`, then the origin URL. Mirrors
     /// are skipped when either hash component is missing (the glue
     /// only passes them for flat-mode FODs).
-    // r[impl fetcher.mirrors.hashed]
+    // r[impl fetcher.mirrors.hashed+2]
     pub fn candidate_urls(&self) -> Vec<String> {
         let mut urls = Vec::new();
         if !self.hash_algo.is_empty() && !self.hash_b16.is_empty() {

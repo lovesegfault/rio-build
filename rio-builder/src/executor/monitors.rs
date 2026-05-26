@@ -219,12 +219,11 @@ pub(super) fn spawn_cgroup_monitors(
 
 /// Kill the per-build cgroup tree, wait for it to drain, then drop.
 ///
-/// `daemon.kill()` in the caller SIGKILLs the nix-daemon process only.
-/// The builder is a GRANDCHILD (forked by the daemon during
-/// `wopBuildDerivation`) and is not in the daemon's process group — it
-/// lives on in the cgroup. On the success path the builder has already
-/// exited (build finished → daemon sent `STDERR_LAST`); on the timeout/
-/// error path it's still running a `sleep 3600` or a stuck compiler.
+/// Killing only the sandbox's immediate child would leave its
+/// descendants running: the build's process tree (compilers, test
+/// harnesses, anything it forked) lives on in the cgroup. On the
+/// success path that tree has already exited; on the timeout/error
+/// path it's still running a `sleep 3600` or a stuck compiler.
 ///
 /// `cgroup.kill` walks the tree: SIGKILLs everything, including sub-
 /// cgroups the daemon may have created. Idempotent — writing "1" to an

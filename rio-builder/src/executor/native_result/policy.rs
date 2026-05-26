@@ -2,9 +2,9 @@
 //! `allowedRequisites` / `disallowedRequisites` / `maxSize` /
 //! `maxClosureSize` / `unsafeDiscardReferences`.
 //!
-//! nix-daemon enforces these silently today; rio has never had code that
-//! even mentions them, so dropping the daemon without reimplementing them
-//! would silently change build semantics (stdenv uses
+//! nix-daemon enforced these silently in the daemon era; rio had no code
+//! that even mentioned them, so dropping the daemon without reimplementing
+//! them here would have silently changed build semantics (stdenv uses
 //! `disallowedRequisites` to keep bootstrap tools out of final outputs).
 //!
 //! Two disjoint sources, mirroring Nix's `DerivationOptions`:
