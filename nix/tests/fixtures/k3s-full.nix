@@ -848,6 +848,24 @@ rec {
                 "scheduler log tail",
                 "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=60",
             )
+            # The tails above are usually all DEBUG h2 noise; the lines
+            # that explain a stuck dispatch are the WARN/ERROR ones
+            # buried further back.
+            _dump(
+                "scheduler WARN+ERROR",
+                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=4000"
+                " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
+            )
+            _dump(
+                "controller WARN+ERROR",
+                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=4000"
+                " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
+            )
+            _dump(
+                "gateway WARN+ERROR",
+                "k3s kubectl -n rio-system logs deploy/rio-gateway --tail=4000"
+                " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
+            )
             _dump("fetcher ns", "k3s kubectl -n ${nsFetchers} get job,pod -o wide")
             raise
         # Race: the pod can transition out of Running (build finished)
