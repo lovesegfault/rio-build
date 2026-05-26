@@ -1064,12 +1064,16 @@ pub const M_062: () = ();
 /// leader restore it and take the fail-fast (resubmit-directing) arm
 /// instead.
 ///
-/// Written `true` for the kept nodes inside the same transaction that
-/// persists a pruned merge; **OR-combined on conflict**
+/// Written `true` — inside the same transaction that persists a pruned
+/// merge — for the kept nodes whose dependency closure the prune
+/// dropped and that are childless in the DAG at stamp time (a dep-less
+/// demanded leaf never had a closure to drop and is not marked);
+/// **OR-combined on conflict**
 /// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
 /// unrelated non-pruned merge of the same drv never clears it; cleared
 /// in the same transaction that inserts edges where the node is the
-/// parent (its deps are then in the DAG, so the guard is moot). See
+/// parent (its deps are then in the DAG, so the guard is moot) and by
+/// the topdown fail-fast when it consumes the marker. See
 /// `rio-scheduler/src/db/batch.rs` and `actor/merge.rs`.
 ///
 /// Read/written by **rio-scheduler** only.

@@ -278,7 +278,7 @@ impl DagActor {
         // resubmit re-probes). The existing check_cached_outputs at
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.
-        let (nodes, edges, topdown_fired) = match self
+        let (nodes, edges, topdown_fired, pruned_closure_parents) = match self
             .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
             .await
         {
@@ -290,9 +290,27 @@ impl DagActor {
                     "top-down: all demanded nodes substitutable; pruning deps from submission"
                 );
                 metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
-                (demanded, Vec::new(), true)
+                // Parents of the ORIGINAL submission's edges: the nodes
+                // whose dependency closure this prune is about to drop.
+                // Only these (∩ the kept set, ∩ childless-in-DAG) get
+                // the topdown_pruned marker — a dep-less demanded leaf
+                // never had a closure to drop, a from-source dispatch
+                // of it would succeed, and marking it would only turn a
+                // routine substitute failure into a wrongful terminal
+                // fail-fast. Resolved path→hash via the original node
+                // list (edges carry drv_paths on the wire).
+                let path_to_hash: HashMap<&str, &str> = nodes
+                    .iter()
+                    .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
+                    .collect();
+                let parents: HashSet<String> = edges
+                    .iter()
+                    .filter_map(|e| path_to_hash.get(e.parent_drv_path.as_str()))
+                    .map(|h| (*h).to_string())
+                    .collect();
+                (demanded, Vec::new(), true, parents)
             }
-            None => (nodes, edges, false),
+            None => (nodes, edges, false, HashSet::new()),
         };
         phase!("0-topdown-roots");
 
@@ -415,7 +433,13 @@ impl DagActor {
         // Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         if let Err(e) = self
-            .persist_and_activate(build_id, &nodes, &edges, &merge_result, topdown_fired)
+            .persist_and_activate(
+                build_id,
+                &nodes,
+                &edges,
+                &merge_result,
+                &pruned_closure_parents,
+            )
             .await
         {
             self.cleanup_failed_merge(build_id, merge_result).await;
@@ -442,15 +466,20 @@ impl DagActor {
         // fetches are spawned in reconcile_merged_state and dispatch
         // passes run on later commands, both after this returns.
         //
-        // Only nodes that are CHILDLESS in the global DAG right now are
-        // stamped: a kept node that already has children from an
-        // earlier full merge has its deps in the DAG, does not need the
-        // "must complete via substitution" guard, and stamping it would
-        // only manufacture the stale flag the fail-fast clear has to
-        // mop up. Mirrors the row-level bind in persist_merge_to_db.
+        // Only kept nodes whose dependency closure this prune actually
+        // dropped — parents of the ORIGINAL submission's edges
+        // (`pruned_closure_parents`) — and that are CHILDLESS in the
+        // global DAG right now are stamped. A dep-less demanded leaf
+        // never had a closure to drop and a kept node that already has
+        // children from an earlier full merge has its deps in the DAG;
+        // neither needs the "must complete via substitution" guard, and
+        // stamping them would only manufacture the stale flag the
+        // fail-fast clear has to mop up. Mirrors the row-level bind in
+        // persist_merge_to_db.
         if topdown_fired {
             for n in &nodes {
-                if self.dag.get_children(&n.drv_hash).is_empty()
+                if pruned_closure_parents.contains(n.drv_hash.as_str())
+                    && self.dag.get_children(&n.drv_hash).is_empty()
                     && let Some(s) = self.dag.node_mut(&n.drv_hash)
                 {
                     s.topdown_pruned = true;
@@ -493,12 +522,13 @@ impl DagActor {
     /// `cleanup_failed_merge` arms. The caller does the rollback on
     /// `Err`; this fn does NOT touch in-memory state on failure.
     ///
-    /// `topdown_fired`: the submission was pruned to its demand set, so
-    /// every persisted node is a kept node — its row gets
-    /// `topdown_pruned = true` inside the persist transaction (the
-    /// failover-safe counterpart of the post-commit in-memory stamp in
-    /// `validate_and_ingest`), gated on the node being childless in the
-    /// DAG.
+    /// `topdown_pruned_parents`: on a pruned merge, the kept nodes
+    /// whose dependency closure the prune dropped (parents of the
+    /// ORIGINAL submission's edges); empty for a non-pruned merge.
+    /// Their rows get `topdown_pruned = true` inside the persist
+    /// transaction (the failover-safe counterpart of the post-commit
+    /// in-memory stamp in `validate_and_ingest`), additionally gated on
+    /// the node being childless in the DAG.
     ///
     /// The PG side of Pending→Active rides the SAME transaction
     /// (`activate_build_tx`, the last statement before commit), so a
@@ -516,14 +546,14 @@ impl DagActor {
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
-        topdown_fired: bool,
+        topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
         self.persist_merge_to_db(
             build_id,
             nodes,
             edges,
             &merge_result.newly_inserted,
-            topdown_fired,
+            topdown_pruned_parents,
         )
         .await
         .inspect_err(
@@ -1656,23 +1686,25 @@ impl DagActor {
         reset
     }
 
-    /// Persist nodes and edges to the DB after a successful DAG merge.
+    /// Persist nodes and edges to the DB after a successful DAG merge,
+    /// and flip the build to Active as the transaction's last statement.
     /// Extracted from handle_merge_dag so failures can be caught and
     /// rolled back via cleanup_failed_merge.
     ///
-    /// `topdown_fired`: this is a roots-only-pruned merge, so `nodes`
-    /// is exactly the kept demand set — every row is upserted with
-    /// `topdown_pruned = true` (OR-on-conflict, see `db/batch.rs`).
-    /// Inside the same transaction so a rejected merge can never leak
-    /// the marker into PG, and a committed one can never lose it to a
-    /// failover that races the in-memory stamp.
+    /// `topdown_pruned_parents`: kept nodes whose dependency closure a
+    /// fired prune dropped (empty otherwise) — only their rows are
+    /// upserted with `topdown_pruned = true` (OR-on-conflict, see
+    /// `db/batch.rs`), additionally gated on being childless in the
+    /// DAG. Inside the same transaction so a rejected merge can never
+    /// leak the marker into PG, and a committed one can never lose it
+    /// to a failover that races the in-memory stamp.
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
-        topdown_fired: bool,
+        topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
@@ -1706,17 +1738,19 @@ impl DagActor {
                     // this drv — same monotonic-growth semantics as
                     // the in-memory `DerivationState::union_wanted`.
                     wanted_output_names: node.wanted_output_names.clone(),
-                    // On a pruned merge every persisted node is a kept
-                    // (demanded) node whose dep closure was dropped —
-                    // mark it so the guard survives leader failover,
-                    // but only when it is CHILDLESS in the global DAG
-                    // right now: a kept node with children from an
-                    // earlier full merge has its deps in the DAG and
-                    // must not carry the marker (mirrors the in-memory
-                    // stamp gate in validate_and_ingest).
+                    // Mark only kept nodes whose dependency closure the
+                    // prune dropped (parents of the ORIGINAL
+                    // submission's edges) so the guard survives leader
+                    // failover, and only when the node is CHILDLESS in
+                    // the global DAG right now: a dep-less demanded
+                    // leaf never had a closure to drop, and a kept node
+                    // with children from an earlier full merge has its
+                    // deps in the DAG — neither must carry the marker
+                    // (mirrors the in-memory stamp gate in
+                    // validate_and_ingest).
                     // OR-on-conflict upsert: a later non-pruned merge
                     // of the same drv (false here) never clears it.
-                    topdown_pruned: topdown_fired
+                    topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
                         && self.dag.get_children(&node.drv_hash).is_empty(),
                 }
             })

@@ -366,11 +366,15 @@ pub(crate) struct DerivationRow {
     /// declared outputs wanted. UNIONED on conflict (with empty
     /// saturating to empty = "all") — see `batch_upsert_derivations`.
     pub wanted_output_names: Vec<String>,
-    /// Roots-only-prune marker (`migrations/063`): true for the kept
-    /// (demanded) nodes of a topdown-fired merge, false otherwise.
-    /// OR-combined on conflict so an unrelated non-pruned merge of the
-    /// same drv never clears it; cleared only when the node gains
-    /// children (see `clear_topdown_pruned_for_parents`).
+    /// Roots-only-prune marker (`migrations/063`): true for kept
+    /// (demanded) nodes of a topdown-fired merge whose dependency
+    /// closure the prune dropped and that are childless in the DAG at
+    /// stamp time; false otherwise (including dep-less demanded
+    /// leaves, which never had a closure to drop). OR-combined on
+    /// conflict so an unrelated non-pruned merge of the same drv never
+    /// clears it; cleared when the node gains children
+    /// (`clear_topdown_pruned_for_parents`) and when the topdown
+    /// fail-fast consumes it.
     pub topdown_pruned: bool,
 }
 

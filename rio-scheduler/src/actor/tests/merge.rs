@@ -1584,6 +1584,86 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
 }
 
 // r[verify sched.merge.substitute-topdown+6]
+/// The `topdown_pruned` marker must land only on kept nodes whose
+/// dependency closure the prune actually dropped. A dep-less demanded
+/// leaf (here: one target of a multi-target submission with no
+/// inputDrvs of its own) never had a closure to drop — a from-source
+/// dispatch of it would succeed — so marking it would only convert a
+/// routine substitute failure into a wrongful resubmit-directing
+/// terminal failure.
+#[tokio::test]
+async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Multi-target-style submission: R → D (R's closure), plus the
+    // dep-less leaf target L. Both demanded outputs substitutable → the
+    // prune fires and keeps {R, L}; D is dropped.
+    let r_out = test_store_path("tdl-r-out");
+    let l_out = test_store_path("tdl-l-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(r_out.clone());
+        subs.push(l_out.clone());
+    }
+    let mut r = make_node("tdl-r");
+    r.expected_output_paths = vec![r_out.clone()];
+    let mut l = make_node("tdl-l");
+    l.expected_output_paths = vec![l_out.clone()];
+    let mut d = make_node("tdl-d");
+    d.expected_output_paths = vec![test_store_path("tdl-d-out")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![r, l, d],
+        vec![make_test_edge("tdl-r", "tdl-d")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, build_id).await?.total_derivations,
+        2,
+        "fixture premise: the prune fired and kept the demand set {{R, L}}"
+    );
+    assert!(
+        handle.debug_query_derivation("tdl-d").await?.is_none(),
+        "fixture premise: R's dep was dropped from the submission"
+    );
+
+    // R lost its dependency closure → marked, in memory and in PG.
+    assert!(
+        expect_drv(&handle, "tdl-r").await.topdown_pruned,
+        "kept root whose closure was dropped must be stamped"
+    );
+    let (r_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdl-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(r_pruned, "kept root's stamp must be persisted");
+
+    // L never had a closure to drop → NOT marked anywhere; building it
+    // from source stays a valid fallback.
+    assert!(
+        !expect_drv(&handle, "tdl-l").await.topdown_pruned,
+        "dep-less kept leaf must not be stamped in memory (it has no \
+         dropped closure; from-source dispatch of it is valid)"
+    );
+    let (l_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdl-l'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !l_pruned,
+        "dep-less kept leaf must not be persisted as pruned"
+    );
+
+    // Let the detached fetches settle before teardown.
+    settle_substituting(&handle, &["tdl-r", "tdl-l"]).await;
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+6]
 /// A pruned merge whose build-activation write fails must reject the
 /// build AND leave nothing of the merge behind in PG — in particular no
 /// `topdown_pruned = true` on a shared pre-existing childless root.
