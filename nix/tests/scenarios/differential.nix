@@ -130,6 +130,9 @@ let
     erg-subpath = {
       expect = "parity";
     };
+    erg-structured = {
+      expect = "parity";
+    };
     disallowed-requisites = {
       expect = "both-fail";
       rio_status = "OutputRejected";

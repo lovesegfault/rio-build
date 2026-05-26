@@ -314,6 +314,24 @@ rec {
         ];
       };
 
+  # __structuredAttrs + exportReferencesGraph: in structured-attrs mode the
+  # closure info is rendered INTO .attrs.json (closure_info_json on the
+  # native side, writeStructuredAttrs on the oracle side) instead of a flat
+  # registration file. Copying .attrs.json into $out makes the NAR
+  # comparison pin the JSON renderer's field set (SRI narHash, no `ca`
+  # field, closureSize, ordering) byte-for-byte against the oracle.
+  erg-structured =
+    mkDrv "rio-diff-erg-structured"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        cp "$NIX_ATTRS_JSON_FILE" ''${outputs[out]}/attrs.json
+      ''
+      {
+        __structuredAttrs = true;
+        exportReferencesGraph.refs = [ "${busybox}" ];
+      };
+
   # ── Output policy checks ─────────────────────────────────────────────
 
   # disallowedRequisites violation: the output references busybox, which
