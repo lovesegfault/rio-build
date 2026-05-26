@@ -7,14 +7,15 @@ paths:
 
 # Quint specification rules
 
-Distilled from [quint-llm-kit](https://github.com/informalsystems/quint-llm-kit) (Informal
-Systems' Claude Code toolkit for Quint; last reviewed at rev `520e563`) plus rio-build's own
-porting experience. When you need an idiom this file doesn't cover, clone the kit and grep its
-curated knowledge base — the language/builtin docs, a dozen pattern cards, and ~75 curated
-example specs:
-`git clone --depth 1 https://github.com/informalsystems/quint-llm-kit ~/tmp/quint-llm-kit` →
-`mcp-servers/kb/kb/docs/{builtin,lang}.md`, `kb/patterns/`, and `kb/examples/` (`classic/` has
-Paxos, TwoPhaseCommit, ReliableBroadcast; `cosmos/` has Tendermint).
+When you need an idiom this file doesn't cover, query the `quint-kb` MCP server —
+`nix/quint-mcp.nix` packages a curated Quint knowledge base and the project-scoped `.mcp.json`
+launches it in every dev-shell session. `quint_hybrid_search` is the discovery layer;
+`quint_get_doc` / `quint_get_pattern` / `quint_get_example` / `quint_get_builtin` /
+`quint_get_template` return full bodies — the language/builtin docs, a dozen pattern cards,
+~250 example specs (`classic/distributed/` has Paxos, TwoPhaseCommit, ReliableBroadcast;
+`cosmos/tendermint/` has Tendermint), templates, and posts. The example search index only
+carries per-spec summaries, so for an exhaustive grep across spec bodies use the packaged KB
+on disk: `$(dirname "$(command -v quint-kb-mcp)")/../lib/quint-kb-mcp/kb/`.
 
 Quint is TLA+ with a programmer-facing syntax, a static type system, and an effect system.
 Same semantics: a spec is `init` + a nondeterministic `step` relation + invariants. The
@@ -253,23 +254,17 @@ Rules the rio-lease driver established (the reasoning lives in its module header
       (a rejected attempt is a no-op self-loop), so enabledness-based arguments from TLA+ do
       not transfer.
 
-## Deliberate omissions (revisit when the trigger occurs)
+## Not yet needed (revisit when the trigger occurs)
 
-Re-reviewed against the kit at rev `520e563`; everything below still stands.
-
-- **Choreo** (the kit's message-passing scaffolding): rio-build's protocols modeled so far
-  are shared-register CAS races against the apiserver, not message-passing. Revisit when
-  modeling a genuinely message-passing protocol (the builder↔scheduler heartbeat/assignment
+- **Message-passing scaffolding**: the protocols modeled so far are shared-register CAS races
+  against the apiserver, not message-passing, so no message-passing framework is used. Revisit
+  when modeling a genuinely message-passing protocol (the builder↔scheduler heartbeat/assignment
   stream is the likely first candidate).
-- **The kit's `/code:*` spec-to-implementation workflow and `label-transitions` tooling**:
-  rio-build's MBT goes through quint-connect instead (see the MBT section above); revisit the
-  kit's tooling only if a future component needs transition labeling quint-connect cannot
-  express.
-- **The kit's Docker container**: rio-build uses the nix dev shell instead. The kit's MCP
-  servers are NOT omitted anymore: `nix/quint-mcp.nix` packages the KB-search server and the
-  quint LSP bridge hermetically (TypeScript build, search indices, and the embedding model
-  all vendored at build time), and the project-scoped `.mcp.json` launches them — dev-shell
-  Claude Code sessions get `quint-kb` and `quint-lsp` automatically, alongside `tracey`.
 - **Apalache's `--inductive-invariant` mode**: unnecessary while every regime's state space
   stays small enough for exhaustive TLC; it is the escape hatch if a future model outgrows
   that (prove the invariant inductive instead of enumerating the states).
+
+---
+
+*The `quint-kb` knowledge base (packaged by `nix/quint-mcp.nix`) was last synced with its
+upstream at rev `520e563`; bump it there.*
