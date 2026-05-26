@@ -204,19 +204,30 @@ rec {
   # namespaces allowed, setuid chmod denied while plain chmod works,
   # /bin/sh a regular file).
   #
+  # Also probed: /etc/hosts — both sandboxes synthesize the identical
+  # "127.0.0.1 localhost / ::1 localhost" file for non-network builds
+  # (verified against a real CppNix 2.34 sandboxed build, written by
+  # chroot-derivation-builder.cc, and pinned on the rio side by
+  # rio-exec's plan tests) — and the NOFILE rlimits: rio-exec pins the
+  # daemon-era 1048576 inside every sandbox, and the differential VM
+  # sets DefaultLimitNOFILE=1048576 so the oracle arm inherits the same
+  # value a real NixOS daemon host delivers.
+  #
   # Deliberately NOT probed (would diverge or is delivery-path
   # dependent): full /etc/passwd and /etc/group (CppNix's root/nobody
   # GECOS fields differ from rio's — accepted cosmetic deviation),
-  # /etc/hosts (CppNix writes localhost entries for every sandboxed
-  # build; rio only provides resolver files to network-enabled builds),
-  # ulimits (inherited from nix-daemon vs the worker service — not a
-  # sandbox property), and xattr probes (busybox carries no setfattr).
+  # ulimit -c (CppNix zeroes the soft core limit while the hard limit
+  # stays delivery-dependent), and xattr probes (busybox carries no
+  # setfattr).
   sandbox-identity = mkDrv "rio-diff-sandbox-identity" ''
     {
       echo "id=$(id -u) $(id -g) $(id -un) $(id -gn)"
       read h < /proc/sys/kernel/hostname; echo "hostname=$h"
       read d < /proc/sys/kernel/domainname; echo "domainname=$d"
       echo "umask=$(umask)"
+      echo "etc-hosts=$(tr '\n' ';' < /etc/hosts)"
+      echo "ulimit-n=$(ulimit -n)"
+      echo "ulimit-Hn=$(ulimit -Hn)"
       echo "passwd-nixbld=$(grep '^nixbld:' /etc/passwd)"
       echo "group-nixbld=$(grep '^nixbld:' /etc/group)"
       echo "no-new-privs=$(grep NoNewPrivs /proc/self/status)"
