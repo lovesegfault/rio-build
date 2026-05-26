@@ -508,3 +508,165 @@ of this map are its prerequisite review artifact and the Stage-B models
 are re-checked with the heartbeat-authority assumptions removed (design
 §6) — additional value, but the calibration table then needs a delta
 pass.
+
+## Stage B — the tick-level models and their verdicts
+
+Stage B builds the two models this map promised and wires them into the
+CI gate. The churn pin above was re-verified immediately before the
+model build: the only commits touching the modeled files since the
+Stage-A audit are the audit's own marker-only commit and the retry
+Phase-1b cross-reference comment bump in `pool/jobs.rs` — no
+behavior-relevant drift, no rule-version drift, so Stage A stands.
+
+- **Model J — `spawnCoherence.qnt`** (the L1 coherence protocol): the
+  `pool/{jobs,job}.rs` tick body over two intents and one pool — the
+  intent poll, the 3-valued placeable gate × pool kind, the Job
+  LIST/census, the stale/excess/orphan reap arms behind their
+  fail-closed gates, the headroom arithmetic, the 409-deduped spawn
+  pass, and the `dispatched_cells`-arming ack. Six configurations:
+  base / fault-rpc / fault-lease / fault-stale on the production
+  Builder+CRD shape, plus the crd-absent and Fetcher-pool postures
+  (the C1/C2 adjudications run as their own exhaustive checks).
+- **Model N — `nodeclaimLifecycle.qnt`** (the L10 mirror lifecycle):
+  the `nodeclaim_pool/` tick body over two NodeClaim slots and two
+  cells — the lease-edge polarity table, the ⊥-streak early-return and
+  consolidate-only modes, vanish detection vs the controller's own
+  reaps, the recency-gated Registered clears, the reload latch, the
+  placeable-gate producer guarantee, and the global / per-class /
+  per-tick cover budgets over the hw-class config mirror. Four
+  regimes: base / fault-rpc / fault-lease / fault-karpenter.
+
+Checks live in `nix/quint.nix` (`quint-spawn-coherence-*`,
+`quint-nodeclaim-*`): one exhaustive TLC check per regime, one
+expect-violation check per witness, two expect-violation checks plus a
+named-run check for the pre-registered falsifications. State counts,
+depths and wall-clocks are in the introducing commit messages and the
+checks' transcripts, not here.
+
+### Verdict table (exhaustive TLC, per regime)
+
+Model J — every invariant below holds in **all six** configurations
+(base, fault-rpc, fault-lease, fault-stale, crd-absent, fetcher):
+
+| Invariant | Family | Verdict |
+|---|---|---|
+| `ceilingRespected` | F1/I4 | HOLDS (all 6) |
+| `reapSafety` | F1/I3 | HOLDS (all 6) |
+| `orphanRemoved` | F1/I2 safety form | HOLDS (all 6) |
+| `ackSoundness` | F3/I5 | HOLDS (all 6) |
+| `ackCoversPending` | F3/I5 re-ack half | HOLDS (all 6) |
+| `degradedPolarity` | F2 | HOLDS (all 6) |
+| `gateFailClosed` | F2/I6 (per-configuration clauses) | HOLDS (all 6) |
+| `freedSlotsSpendable` | F1 tick-ordering clause | HOLDS (all 6) |
+
+Model N:
+
+| Invariant | Family | base | fault-rpc | fault-lease | fault-karpenter |
+|---|---|---|---|---|---|
+| `boundsOK` | — | HOLDS | HOLDS | HOLDS | HOLDS |
+| `idleReapSafety` | F4/I9 | HOLDS | **VIOLATED (pre-registered)** | HOLDS | HOLDS |
+| `iceMarkSoundness` | F3+F4/I7+I8 | HOLDS | HOLDS | HOLDS | HOLDS |
+| `bootSampleNotLost` | F4 BootRecordedOnce | HOLDS | **VIOLATED (pre-registered)** | HOLDS | HOLDS |
+| `noMassClearAfterFailover` | F3 | HOLDS | HOLDS | HOLDS | HOLDS |
+| `reloadLatchRespected` | F4 | HOLDS | HOLDS | HOLDS | HOLDS |
+| `singleEffectiveProvisioner` | F4/I11 | HOLDS | HOLDS | HOLDS | HOLDS |
+| `gateProducerGuarantee` | F2/I6 producer half | HOLDS | HOLDS | HOLDS | HOLDS |
+| `provisioningBudget` | F5/I10 | HOLDS | HOLDS | HOLDS | HOLDS |
+| `coverRespectsMask` | F3 mask-before-cover | HOLDS | HOLDS | HOLDS | HOLDS |
+| `degradedCoverPolarity` | F2 | HOLDS | HOLDS | HOLDS | HOLDS |
+
+The two VIOLATED cells are exactly the pre-registered
+expected-as-built-falsifications entry (the ⊥-tick early-return
+observation skip) — confirmed, not new defects. They are excluded from
+the fault-rpc HOLD check and pinned by
+`quint-nodeclaim-falsification-{idle-conflation,boot-sample-lost}`
+(expect-violation) plus the deterministic reproducer runs
+`idleConflationRun` / `bootSampleLostRun`
+(`quint-nodeclaim-runs-fault-rpc`). When the early-return skip is
+fixed, those checks flip to HOLD invariants in the fault-rpc regime
+check — the same flip protocol the retry campaign used. As
+pre-registered, the bucketed idle-age over-approximates the first
+half: the model falsifies at one skipped tick, where the real code
+additionally needs the stale entry's skew to cross the per-cell
+consolidation floor (≥300 s builders / ≥600 s fetchers vs the ≤40 s
+early-return window) — the real-world severity is bounded by that
+floor; the model's violation is the structural shape, not the
+magnitude.
+
+No falsification outside the pre-registered list appeared in any
+regime — the empty-remainder claim of the Stage-A list survived its
+first executable test.
+
+### Witness results
+
+Every witness named in the design is violated (the contended scenario
+is reachable) in its wired regime: J — excess reap, orphan reap, 409
+dedupe, unarmed-gate-blocked spawn, selector-drift reap, ungated
+crd-absent spawn, suppressed crd-absent excess; N — idle reap, create,
+class-budget bind, vanish mark, clear-of-masked-cell after a mark,
+consolidate-only reap, create failure, ceilings fail-closed, create
+resuming once ceilings load, unknown-cell drop, handoff with non-empty
+inflight, degraded reload tick, fresh clear after acquire, stale
+record-only. The design's single "crd-absent spawn while excess-reap
+stays suppressed" witness is split into the two halves named above: at
+the 2-intent scale a spawnable intent (no Job yet) cannot
+simultaneously contribute to a pending surplus, so the conjunction is
+structurally unreachable while each half is reachable and the
+fail-closed half is separately enforced by `gateFailClosed`.
+
+### Encoding notes (what is by-construction vs checked)
+
+- `SingleJobPerIntent` (I1) is enforced by the model's encoding (Jobs
+  keyed by deterministic name; a create on an occupied slot is the
+  apiserver's 409): it is not claimed as a checked invariant, and
+  `ctrl.pool.spawn-once` therefore carries **no** model verify marker —
+  it stays in `tracey query untested` until a code-level test pins it
+  (the dedupe-409 witness keeps the collision path reachable in the
+  model; the no-ack-on-collision/failure half is checked by
+  `ackSoundness`).
+- The per-tick ICE-mark dedup is by construction (set-valued marks);
+  the checked content is which cells get marked, not how many times.
+- Model N abstracts classify()'s in-live ICE/boot-timeout arms to one
+  "stuck" bit, omits the dead_nodes arm (consumed input, out of model
+  per the Stage-A out-of-model list), abstracts the placeable set's
+  content to armed/unarmed (the content guarantee J relies on is
+  carried by the J↔N assume-guarantee checklists in both model
+  headers), and omits the Pool-coverage filter (demand is modeled
+  post-coverage). The per-read snapshot abstraction and its
+  pre-registered fallback are documented in the spawnCoherence header;
+  Model N's staleness is carried by the inter-tick fault alphabet
+  (the LIST-vs-GC race) rather than a separate fault-stale regime.
+- Bounded constants: 2 intents, 2 NodeClaim slots, 2 cells, 1 pool
+  (the design allowed ≤3 claims; 2 keeps the fault regimes exhaustive
+  at CI cost, and every contended scenario the invariants quantify
+  over is proven reachable by the witnesses above). The ⊥-streak
+  threshold is 2 in the model (5 in the code) — zero / one
+  early-return tick / consolidate-only; the invariants quantify over
+  the structure, not the constant.
+- One inventory/design nit surfaced while encoding: the
+  `inflight_created` mutator list (`mod.rs`, mutator 2) and the
+  design's fault alphabet describe a clear "on config reload (the
+  config-hash gate)", but the only `inflight_created.clear()` call
+  site in the code is the lease-acquire Ok arm; the model follows the
+  code (a config-cell drop shrinks the configured set without touching
+  the inflight map). If the config-hash clear exists elsewhere or is
+  added later, the model's `configDropsCell` action is the place to
+  mirror it.
+
+### Verify-marker status (Stage-B update)
+
+Seven of the eight Stage-A rules now carry `r[verify]` markers at
+their `nix/quint.nix` wiring points: `ctrl.pool.tick-ordering` (base +
+fault-stale), `ctrl.pool.degraded-polarity` (fault-rpc),
+`ctrl.pool.ack-spawned-soundness` (base + fault-lease),
+`ctrl.nodeclaim.lease-edge-polarity` (fault-lease),
+`ctrl.nodeclaim.inflight-conservation` (fault-karpenter),
+`ctrl.nodeclaim.ice-mark-clear` (fault-karpenter + fault-lease),
+`ctrl.nodeclaim.consolidate-only-degraded` (fault-rpc).
+`ctrl.pool.spawn-once` deliberately has none (see the encoding notes).
+The amended rules gained model-side markers where the model verifies
+the amended clauses: `ctrl.nodeclaim.placeable-gate+5` on the
+crd-absent and Fetcher configurations (consumer split) and the
+fault-lease N regime (producer guarantee);
+`ctrl.nodeclaim.budget.per-class+2` on the N base (clamp) and
+fault-rpc (failed-creates) regimes.
