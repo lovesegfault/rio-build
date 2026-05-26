@@ -22,7 +22,8 @@ codecov:
     # workspace member) + vm-* coverage scenarios.
     # +1 vm-dag-delta-sync (adr-022-p0574 fork; integration re-derives the total)
     # +1 vm-store-tiered (adr-022-p0555 fork; integration re-derives the total)
-    after_n_builds: 44
+    # +1 vm-store-compat (P0580 stock-Nix binary-cache substitution)
+    after_n_builds: 45
     # Keep wait_for_ci as a floor: if a coverage job is skipped/cancelled
     # we still want to hold until CI is done rather than wait forever.
     wait_for_ci: true

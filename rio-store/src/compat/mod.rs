@@ -16,6 +16,12 @@
 //! ingested while compat was OFF, and paths committed via ingest paths
 //! that don't carry the whole NAR in RAM (`PutPathChunked`, upstream
 //! substitution).
+//!
+//! Together those two producers are what make the bucket a valid
+//! stock-Nix binary cache on its own — substitutable by a plain `nix`
+//! client with no rio process running; the `vm-store-compat` scenario
+//! proves that end to end.
+// r[impl store.compat.stock-nix-substitute]
 
 pub mod reconciler;
 pub mod writer;

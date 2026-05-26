@@ -930,9 +930,8 @@ the bucket as a plain binary cache while rio rolls out) and the
 disaster-recovery floor (PG outage degrades to the slower stock-Nix path
 instead of a total substitution outage); operators flip it OFF ("pure rio
 mode") once every consumer is rio-aware to reclaim roughly half the S3
-storage. The remaining companion requirement
-(`store.compat.stock-nix-substitute`, the end-to-end stock-`nix` VM proof)
-lands with its own plan item.
+storage. The end-to-end stock-`nix` proof of the published surface is
+#rref("store.compat.stock-nix-substitute") at the end of this section.
 
 #r("store.compat.nar-on-put")[
   For each path it publishes, the compat writer MUST upload the path's
@@ -1028,7 +1027,28 @@ the same outbox and the same drain/backoff machinery
 (#rref("store.gc.pending-deletes")); the `kind` column tells the drain which
 delete API the key belongs to. Failed deletes surface in the existing
 #(refs.metric)("rio_store_s3_deletes_stuck") gauge --- there is no separate
-compat-delete metric.
+compat-delete metric. When a dedicated compat bucket is configured
+(`binary_cache_compat.bucket`), the drain deletes `kind='blob'` rows through
+that same target --- deleting through the chunk backend would no-op in the
+wrong bucket and silently leak the objects.
+
+#r("store.compat.stock-nix-substitute")[
+  With the compat layer enabled, the S3-standard bucket MUST be a valid
+  stock-Nix binary cache on its own: a plain `nix` client given only the
+  bucket endpoint MUST be able to substitute every compat-published path ---
+  narinfo resolution, `References` closure traversal, NAR download and
+  decompression, and content verification --- with **no rio process
+  running**. Paths whose compat objects were produced by the reconciler
+  (builder uploads, paths ingested while the toggle was off) MUST be
+  indistinguishable from inline-written ones to such a client.
+]
+
+This is U6's landing condition --- the migration on-ramp (existing Nix
+infrastructure reads the bucket directly) and the PG-outage substitution
+floor --- and it is proven end to end by the `vm-store-compat` scenario:
+closures uploaded through the gateway, the toggle flipped off and back on,
+`systemctl stop rio-store`, then a stock CppNix client substitutes from the
+bucket and `nix store verify` passes.
 
 = Two-Phase Garbage Collection
 

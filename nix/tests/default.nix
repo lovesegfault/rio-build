@@ -42,6 +42,7 @@ let
   scheduling = import ./scenarios/scheduling.nix;
   put-path-chunked = import ./scenarios/put-path-chunked.nix;
   store-tiered = import ./scenarios/store-tiered.nix;
+  store-compat = import ./scenarios/store-compat.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
   # systemd fixture (HMAC/tenant/validation); e2e uses k3sFull
@@ -802,6 +803,40 @@ in
           "replica-warm-via-read-through"
           # r[verify store.backend.tiered-get-fallback]
           "local-none-passthrough"
+        ];
+      };
+
+  # Stock-Nix binary-cache compat (ADR-022 §10, U6): rio-store on the
+  # S3 (Garage) backend with binary_cache_compat at its defaults;
+  # busybox + the hello closure are uploaded through the gateway, the
+  # runtime toggle is flipped off and back on (drop-in env, the same
+  # surface helm renders), and a stock CppNix client substitutes the
+  # paths straight from the bucket after `systemctl stop rio-store` —
+  # narinfo/NAR objects, References traversal, and `nix store verify`
+  # all served by the bucket alone. The re-enable subtest pins the
+  # reconciler backfilling the path uploaded while compat was off.
+  vm-store-compat =
+    (store-compat {
+      inherit pkgs common;
+      fixture = standalone {
+        workers = { };
+        # The chunk backend comes entirely from env vars (s3 → Garage,
+        # set by the scenario); drop the fixture's default filesystem
+        # TOML so the env layer is the whole [chunk_backend] config.
+        extraStoreConfig = {
+          extraConfig = "";
+        };
+      };
+    }).mkTest
+      {
+        name = "default";
+        subtests = [
+          # r[verify store.compat.runtime-toggle]
+          "compat-off-no-narinfo"
+          # r[verify store.compat.reconcile+2]
+          "reconciler-backfill-on-reenable"
+          # r[verify store.compat.stock-nix-substitute]
+          "stock-nix-substitute"
         ];
       };
 
