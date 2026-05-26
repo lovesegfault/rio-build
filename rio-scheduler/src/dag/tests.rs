@@ -225,6 +225,52 @@ fn test_merge_duplicate_drv_in_submission_unions_contribution() -> anyhow::Resul
     Ok(())
 }
 
+/// One submission carrying the SAME drv twice where BOTH occurrences
+/// grow a pre-existing node's non-saturated wanted union: a failed
+/// merge must restore the exact pre-merge wanted set. `wanted_grown`
+/// records the node once per growth — twice here, the second prior
+/// being the already-grown value — so rollback must replay the entries
+/// in reverse for the first-captured (true pre-merge) value to stick.
+/// (The duplicate-drv test above keeps the union saturated via the
+/// empty all-wanted sentinel, which never records a second growth.)
+#[test]
+fn test_merge_rollback_duplicate_drv_restores_wanted_union() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+
+    // Pre-existing node with a non-saturated wanted set {out}.
+    let mut node = make_node("hashWG", "x86_64-linux");
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(build_a, &[node.clone()], &[], "")?;
+
+    // build_b's submission carries the drv twice; each occurrence grows
+    // the union ({out} → {dev,out} → {dev,man,out}). The merge then
+    // fails on a cycle between two other nodes.
+    let mut occ1 = node.clone();
+    occ1.wanted_output_names = vec!["dev".into()];
+    let mut occ2 = node.clone();
+    occ2.wanted_output_names = vec!["man".into()];
+    let nodes = vec![
+        occ1,
+        occ2,
+        make_node("hashWGy", "x86_64-linux"),
+        make_node("hashWGz", "x86_64-linux"),
+    ];
+    let cycle = vec![
+        make_edge("hashWGy", "hashWGz"),
+        make_edge("hashWGz", "hashWGy"),
+    ];
+    assert!(dag.merge(build_b, &nodes, &cycle, "").is_err());
+    assert_eq!(
+        dag.nodes["hashWG"].wanted_output_names,
+        vec!["out"],
+        "rollback must restore the true pre-merge wanted set, not the \
+         intermediate union captured by the second occurrence"
+    );
+    Ok(())
+}
+
 /// The resubmit-reset path destructively removes a retriable node and
 /// re-inserts fresh state; prior interest AND prior per-build
 /// contributions are carried over so the other still-interested builds'

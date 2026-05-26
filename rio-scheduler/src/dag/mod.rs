@@ -723,8 +723,13 @@ impl DerivationDag {
         }
 
         // Restore the pre-union wanted set of pre-existing nodes whose
-        // wanted set this merge grew.
-        for (hash, prior) in wanted_grown {
+        // wanted set this merge grew. Reverse order so that, when one
+        // submission carries the same drv twice and both occurrences
+        // grow the union (the node is recorded twice, the second prior
+        // being the already-grown value), the first-captured (true
+        // pre-merge) value is the one that sticks — mirroring the
+        // `contributions_recorded` restore below.
+        for (hash, prior) in wanted_grown.iter().rev() {
             if let Some(state) = self.nodes.get_mut(hash) {
                 state.wanted_output_names = prior.clone();
             }
