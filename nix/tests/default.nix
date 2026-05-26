@@ -280,7 +280,9 @@ in
   # ── rio-mountd (P0567): the privileged broker, end-to-end ───────────
   # The real rio-mountd binary against an XFS-prjquota staging loopback,
   # driven over the SOCK_SEQPACKET protocol by spike_mountd_client.
-  # Subtest map and why perf is printed-not-gated: the scenario header.
+  # Subtest map and how the P0578 perf criteria are gated under KVM
+  # (regression envelopes) vs printed-only under TCG: the scenario
+  # header.
   # r[verify builder.mountd.fuse-handoff]
   # r[verify builder.mountd.backing-broker]
   # r[verify builder.mountd.concurrency]

@@ -32,13 +32,43 @@
 #                     quota, no daemon involvement
 #   orphan-scan       daemon restart reaps leftover mountpoints,
 #                     staging trees, and .promoting placeholders
+#   perf-gate         (KVM only) a dedicated 192 MiB Promote stays
+#                     above the gated throughput floor
 #
-# Perf numbers (BackingOpen RTT, Promote throughput — P0578 vi/vii/x)
-# are printed as `PERF` lines for humans reading the CI log but NOT
-# gated: this test runs under TCG on runners without /dev/kvm, where
-# the production targets (p99 < 200 µs, ≥ 1 GiB/s) are off by 10-100×
-# and a wall-clock gate would be permanently red (see
-# .claude/rules/ci-failure-patterns.md "Wall-clock gate under load").
+# Perf criteria (P0578 vi `BackingOpen` p99 < 200 µs, vii `Promote`
+# ≥ 1 GiB/s, x concurrent p99 < 1 ms) are gated only when the guest
+# actually got KVM acceleration (`systemd-detect-virt` reports `kvm`).
+# On runners without /dev/kvm the test runs under TCG, where those
+# numbers are off by 10-100× and any wall-clock gate would be
+# permanently red (see .claude/rules/ci-failure-patterns.md
+# "Wall-clock gate under load") — there the numbers stay print-only
+# `PERF` lines, exactly the pre-gate behavior, plus an explicit
+# "not gated (TCG)" log line.
+#
+# The KVM gates are regression envelopes, not the raw targets: this
+# environment (one vCPU shared by the client, the daemon, and the
+# FUSE session thread, on a multi-tenant CI builder; staging behind a
+# loop device) measures AT or UNDER the targets themselves — KVM runs
+# on the CI builder put BackingOpen p99 at 217-221 µs vs the 200 µs
+# target, concurrent p99 at 961-1111 µs vs the 1 ms target, and the
+# 192 MiB promote at ~520 MiB/s vs the 1 GiB/s target (the
+# single-vCPU copy loop tops out around ~530 MiB/s here). The numbers
+# and the raw-target ownership (the `rio_mountd_request_seconds` /
+# `rio_mountd_promote_bytes_total` series in production
+# observability) are recorded in the plan's P0578 section. Latency
+# criteria are gated at 5× their targets (the ci-failure-patterns
+# "budget for tail, not typical" builder-variance budget); throughput
+# at ¼ of its target ≈ ½ of the measured environment ceiling. Each
+# gate takes the better of two runs before failing: a transient host
+# load spike inside a sub-second measurement window is noise, a real
+# regression (per-request fsync, serialization behind the promote
+# copy, a lock convoy, a syscall-per-page buffer) is a step change
+# that fails both runs. Throughput is gated on a dedicated 192 MiB
+# promote so fixed per-request overhead stays negligible; the 8 MiB
+# promote-verified PERF line is integrity-subtest telemetry, not the
+# criterion measurement. If an envelope still proves flaky on the
+# production builders, the agreed fallback is print-only for that
+# criterion (the plan's option-B framing), not threshold-chasing.
 {
   pkgs,
   rio-workspace,
@@ -176,6 +206,24 @@ pkgs.testers.runNixOSTest {
         m = re.search(rf"{key}=(\S+)", out)
         assert m, f"no {key}= in client output:\n{out}"
         return m.group(1)
+
+    # ── P0578 perf criteria (vi, vii, x): gated under KVM only ─────────
+    # systemd-detect-virt reports the acceleration the guest actually
+    # got: "kvm" (KVM CPUID signature) vs "qemu" (TCG). The gate values
+    # are regression envelopes around the production targets — latency
+    # at 5× the target, throughput at ¼ — with the slack rationale in
+    # the header comment; each gate takes the better of two runs before
+    # failing. Anything other than "kvm" keeps the historical
+    # print-only behavior.
+    accel = machine.succeed("systemd-detect-virt || true").strip()
+    gate_perf = accel == "kvm"
+    print(
+        f"[perf] acceleration={accel}; P0578 perf criteria "
+        + ("gated (regression envelopes)" if gate_perf else "not gated (TCG)")
+    )
+    BACKING_P99_LIMIT_US = 1000  # criterion vi target: p99 < 200 µs
+    PROMOTE_FLOOR_MIB_S = 256  # criterion vii target: ≥ 1 GiB/s ≈ 1024 MiB/s
+    CONCURRENT_P99_LIMIT_US = 5000  # criterion x target: p99 < 1 ms
 
     # ═══ Phase 1: crash recovery + staging quota (8 MiB instances) ═════
     # Runs first so the instance that gets SIGKILLed (the crash
@@ -335,23 +383,36 @@ pkgs.testers.runNixOSTest {
         wait_idle()
 
     # ── BackingOpen broker ─────────────────────────────────────────────
-    with subtest("backing-broker: BackingOpen against the kept /dev/fuse dup"):
+    def backing_bench(build_id):
         # The backing file is a real published cache entry, opened
         # read-only by the build uid the way the castore-FUSE will.
         out = machine.succeed(
             client(
                 "build2",
-                f"backing-bench --build-id b-backing --backing-file {backing_file} --iters 2000",
+                f"backing-bench --build-id {build_id} --backing-file {backing_file} --iters 2000",
             )
         )
         print(out)
         wait_idle()
+        return int(result(out, "p99"))
 
-    with subtest("concurrency: Promote does not serialize ahead of BackingOpen"):
+    with subtest("backing-broker: BackingOpen against the kept /dev/fuse dup"):
+        p99 = backing_bench("b-backing")
+        if gate_perf and p99 > BACKING_P99_LIMIT_US:
+            print(f"[perf] BackingOpen p99={p99}µs over the gate; one retry")
+            p99 = min(p99, backing_bench("b-backing-retry"))
+        if gate_perf:
+            assert p99 <= BACKING_P99_LIMIT_US, (
+                f"BackingOpen RTT p99={p99}µs exceeds the {BACKING_P99_LIMIT_US}µs gate"
+                f" under {accel} (P0578 criterion vi: p99 < 200µs in production;"
+                " gated at 5× for builder-load tail)"
+            )
+
+    def concurrency_run(build_id):
         out = machine.succeed(
             client(
                 "build1",
-                "concurrency --build-id b-conc --staging-root /var/rio/staging"
+                f"concurrency --build-id {build_id} --staging-root /var/rio/staging"
                 f" --backing-file {backing_file} --promote-mib 64 --iters 100",
             )
         )
@@ -364,6 +425,63 @@ pkgs.testers.runNixOSTest {
         before = int(result(out, "backing_before_promote"))
         assert before >= 1, f"all backing replies arrived after the promote ({before})"
         wait_idle()
+        return int(result(out, "p99"))
+
+    with subtest("concurrency: Promote does not serialize ahead of BackingOpen"):
+        p99 = concurrency_run("b-conc")
+        if gate_perf and p99 > CONCURRENT_P99_LIMIT_US:
+            print(f"[perf] concurrent BackingOpen p99={p99}µs over the gate; one retry")
+            p99 = min(p99, concurrency_run("b-conc-retry"))
+        if gate_perf:
+            assert p99 <= CONCURRENT_P99_LIMIT_US, (
+                f"concurrent BackingOpen p99={p99}µs exceeds the {CONCURRENT_P99_LIMIT_US}µs gate"
+                f" under {accel} (P0578 criterion x: p99 < 1 ms in production;"
+                " gated at 5× for builder-load tail)"
+            )
+
+    # ── Promote throughput (P0578 criterion vii) — KVM only ────────────
+    # A dedicated 192 MiB promote so the per-request fixed overhead
+    # (UDS RTT, spawn_blocking dispatch, O_EXCL create, rename) stays
+    # negligible in the measurement window; the 8 MiB promote-verified
+    # run above is fixed-overhead-dominated (~400 MiB/s) and is not the
+    # criterion measurement. Skipped — not just ungated — under TCG:
+    # generating, staging, and copying 192 MiB under emulation would
+    # add minutes for a number nothing reads.
+    with subtest("perf-gate: 192 MiB Promote throughput (KVM only)"):
+        if not gate_perf:
+            print("[perf] skipped: throughput criterion not measured under TCG")
+        else:
+
+            def promote_bench(build_id):
+                out = machine.succeed(
+                    client(
+                        "build1",
+                        f"promote --build-id {build_id} --staging-root /var/rio/staging"
+                        " --size-mib 192",
+                    )
+                )
+                print(out)
+                wait_idle()
+                return float(result(out, "mib_s")), result(out, "digest")
+
+            mib_s, digest = promote_bench("b-perf")
+            if mib_s < PROMOTE_FLOOR_MIB_S:
+                print(f"[perf] Promote throughput {mib_s:.0f} MiB/s under the gate; one retry")
+                # Same content → same digest: re-promoting redoes the
+                # full verify-copy (it does not short-circuit on the
+                # already-published entry), so the retry measures real
+                # work.
+                retry_mib_s, _ = promote_bench("b-perf-retry")
+                mib_s = max(mib_s, retry_mib_s)
+            assert mib_s >= PROMOTE_FLOOR_MIB_S, (
+                f"Promote throughput {mib_s:.0f} MiB/s is below the {PROMOTE_FLOOR_MIB_S} MiB/s"
+                f" gate under {accel} (P0578 criterion vii: ≥ 1 GiB/s in production;"
+                " gated at ¼ the target — ≈½ this environment's single-vCPU ceiling —"
+                " for builder-load tail)"
+            )
+            # Drop the 192 MiB cache entry — later subtests don't read
+            # it and the root disk is only 4 GiB.
+            machine.succeed(f"rm -f /var/rio/cache/{digest[:2]}/{digest}")
 
     # ── Metrics exporter sanity ────────────────────────────────────────
     # metrics-rs only renders a series after its first emission, so this
