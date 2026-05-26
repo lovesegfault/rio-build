@@ -869,7 +869,7 @@ them — both A and B funnel cold misses through the same userspace fetch path
 - *Executor circuit breaker.* The executor tracks consecutive store-fetch
   failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set
   and the scheduler excludes the executor from assignment. See
-  #rref("builder.fuse.circuit-breaker") and
+  `builder.fs.fetch-circuit` (ADR-022) and
   #rref("builder.heartbeat.store-degraded").
 
 A's daemon-crash failover (@a-6) is strictly better than the FUSE baseline here:

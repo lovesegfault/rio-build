@@ -178,46 +178,6 @@
       "doc": "`RIO_BUILDER_SCRIPT` test fixture (feature `test-fixtures`)."
     },
     {
-      "path": "fuse/",
-      "depth": 0,
-      "doc": "FUSE store daemon for rio-builder."
-    },
-    {
-      "path": "fuse/attr.rs",
-      "depth": 1,
-      "doc": "FUSE attribute helpers."
-    },
-    {
-      "path": "fuse/cache.rs",
-      "depth": 1,
-      "doc": "Local cache for FUSE store paths backed by the pod's emptyDir."
-    },
-    {
-      "path": "fuse/circuit.rs",
-      "depth": 1,
-      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on"
-    },
-    {
-      "path": "fuse/fetch/",
-      "depth": 1,
-      "doc": "Fetch and materialize store paths into the local cache."
-    },
-    {
-      "path": "fuse/inode.rs",
-      "depth": 1,
-      "doc": "Inode-to-path bidirectional map with kernel lookup refcounting."
-    },
-    {
-      "path": "fuse/ops.rs",
-      "depth": 1,
-      "doc": "FUSE `Filesystem` trait implementation for `NixStoreFs`."
-    },
-    {
-      "path": "fuse/read.rs",
-      "depth": 1,
-      "doc": "File content serving and prefetch for the FUSE store."
-    },
-    {
       "path": "health.rs",
       "depth": 0,
       "doc": "HTTP health endpoints for K8s probes."
@@ -295,7 +255,7 @@
     {
       "path": "store_fetch.rs",
       "depth": 0,
-      "doc": "Store-fetch primitives shared by the old FUSE (`fuse::fetch`) and"
+      "doc": "Store-fetch primitives for the castore-FUSE (`castore_fuse`)."
     },
     {
       "path": "synth_db.rs",

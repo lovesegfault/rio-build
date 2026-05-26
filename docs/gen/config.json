@@ -542,34 +542,10 @@
         "description": "requiredSystemFeatures this builder supports (e.g., \"kvm\", \"big-parallel\")."
       },
       {
-        "key": "fuse_mount_point",
-        "type": "string",
-        "default": "/var/rio/fuse-store",
-        "description": "FUSE mount point."
-      },
-      {
-        "key": "fuse_cache_dir",
-        "type": "string",
-        "default": "/var/rio/cache",
-        "description": "Local SSD cache directory for the FUSE cache."
-      },
-      {
         "key": "fuse_threads",
         "type": "uint32",
         "default": "4",
-        "description": "Number of FUSE daemon threads."
-      },
-      {
-        "key": "fuse_passthrough",
-        "type": "boolean",
-        "default": "true",
-        "description": "Defaults to `true`."
-      },
-      {
-        "key": "fuse_fetch_timeout_secs",
-        "type": "uint64",
-        "default": "60",
-        "description": "Timeout (seconds) for FUSE-initiated `GetPath` fetches."
+        "description": "fuser worker threads serving each build's castore-FUSE mount."
       },
       {
         "key": "overlay_base_dir",

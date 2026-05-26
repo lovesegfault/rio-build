@@ -72,6 +72,13 @@
     },
     {
       "enum": "CastoreMountError",
+      "name": "FuseDevice",
+      "crate": "rio-builder",
+      "msg": "cannot open /dev/fuse: {0} — is the fuse device injected into executor pods (containerd base_runtime_spec)?",
+      "doc": "Opening `/dev/fuse` failed — the device node is missing from the pod or the device cgroup denies it."
+    },
+    {
+      "enum": "CastoreMountError",
       "name": "Mount",
       "crate": "rio-builder",
       "msg": "mount(fuse.rio-castore) at {path} failed: {source}",

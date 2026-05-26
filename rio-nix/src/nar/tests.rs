@@ -500,9 +500,9 @@ fn streaming_byte_identical_single_file() -> anyhow::Result<()> {
 // -----------------------------------------------------------------------
 
 /// THE correctness invariant for restore_path_streaming:
-/// `dump → restore → dump` is byte-identical. If this diverges, the
-/// builder's FUSE fetch path materializes corrupt store paths.
-// r[verify builder.fuse.fetch-bounded-memory]
+/// `dump → restore → dump` is byte-identical. If this diverges, every
+/// consumer that materializes store paths from NAR streams writes
+/// corrupt trees.
 #[test]
 fn restore_streaming_roundtrip() -> anyhow::Result<()> {
     let src_dir = tempfile::TempDir::new()?;

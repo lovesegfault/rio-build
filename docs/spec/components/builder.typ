@@ -19,12 +19,13 @@ distinguished by `RIO_EXECUTOR_KIND`.
 
 - Receive a single build assignment from the scheduler via gRPC (one
   derivation per pod, then exit)
-- Run the @fuse store daemon (the `fuse` module) that mounts at
-  `/var/rio/fuse-store` (configurable) with lazy on-demand fetching from
-  rio-store
-- Set up the build's overlay filesystem: FUSE mount as lower layer, local SSD
-  as upper layer; the overlay's merged dir is bind-mounted at `/nix/store`
-  inside the build's mount namespace
+- Mount a per-build castore-FUSE lower (the `castore_fuse` module): prefetch
+  the closure's Directory DAG from `WorkAssignment.input_roots`, register
+  with the node's `rio-mountd` broker, and serve the build's declared inputs
+  lazily from rio-store + the node-shared backing cache
+- Set up the build's overlay filesystem: castore-FUSE mount as lower layer,
+  local SSD as upper layer; the overlay's merged dir is the per-build chroot
+  store nix-daemon points at
 - Execute build: invoke `nix-daemon --stdio` locally for sandboxed build
   execution
 - Stream build logs back to scheduler via gRPC bidirectional streaming
@@ -32,19 +33,24 @@ distinguished by `RIO_EXECUTOR_KIND`.
 - Heartbeat / health checking to scheduler
 - Resource usage reporting (CPU, memory, disk, build duration)
 
-= FUSE Store (`rio-builder::fuse`)
+= Castore-FUSE Store (`rio-builder::castore_fuse`)
 
-Each builder runs a FUSE filesystem that presents store paths to the build.
-The FUSE daemon mounts at `/var/rio/fuse-store` (configurable --- *never*
-directly at `/nix/store`, which would shadow the host store and break every
-process on the machine including the builder itself). The overlay's merged
-directory is what gets bind-mounted at `/nix/store`, and only inside the
-build's mount namespace. The FUSE daemon communicates with rio-store via gRPC
-to lazily fetch @store-path content on demand.
+Each build gets its own castore-FUSE mount presenting exactly its declared
+input closure. The builder opens `/dev/fuse`, registers with the node's
+`rio-mountd` broker, mounts the fd on a per-build mountpoint inside its own
+mount namespace (under the build's working area --- *never* directly at
+`/nix/store`, which would shadow the host store), and serves it in-process.
+Metadata is answered from an in-heap content-addressed tree prefetched at
+mount time; file bytes come from the node-shared backing cache
+(`/var/rio/cache`, mountd-owned) with JIT fetch from rio-store on miss. The
+normative requirements for this stack live in ADR-022
+(`builder.fs.*`, `builder.mountd.*`, `builder.overlay.castore-lower` ---
+see the design overview's normative-requirements index); this section keeps
+only the builder-component context around them.
 
 #figure(
-  caption: [Builder pod store layout. The FUSE mount is the overlay's lower;
-    nix-daemon's chroot store points at the merged dir.],
+  caption: [Builder pod store layout. The per-build castore-FUSE mount is the
+    overlay's lower; nix-daemon's chroot store points at the merged dir.],
   diagram(
     spacing: (16mm, 11mm),
     node-stroke: 0.5pt,
@@ -52,13 +58,15 @@ to lazily fetch @store-path content on demand.
       (0, 0),
       align(
         left,
-      )[FUSE daemon\ #text(size: 0.8em)[mount `/var/rio/fuse-store`]],
+      )[castore-FUSE\ #text(size: 0.8em)[per-build mount, served in-process]],
       name: <fuse>,
       fill: accent.lighten(88%),
     ),
     node(
       (0, 1),
-      align(left)[SSD Cache\ #text(size: 0.8em)[LRU, `Arc<Cache>`]],
+      align(
+        left,
+      )[node backing cache\ #text(size: 0.8em)[`/var/rio/cache`, mountd-owned]],
       name: <cache>,
     ),
     node(
@@ -70,8 +78,8 @@ to lazily fetch @store-path content on demand.
     node(
       (0, 2.2),
       align(left)[@overlayfs merged\ #text(size: 0.8em)[upper:
-          `/var/rio/overlays/{build}`\ lower: FUSE\ bind-mounted at
-          `/nix/store`]],
+          `/var/rio/overlays/{build}`\ lower: castore-FUSE\ the build's
+          chroot `/nix/store`]],
       name: <ov>,
     ),
     node(
@@ -107,31 +115,31 @@ to lazily fetch @store-path content on demand.
 - *Overlay-over-NFS is unsupported*: The Linux kernel does not guarantee
   overlayfs correctness over NFS/EFS. FUSE mounts appear as local filesystems
   and work correctly with overlayfs.
-- *No shared infrastructure*: Each builder manages its own cache
-  independently. No RWX PersistentVolume, no NFS/EFS/CephFS provisioning, no
-  StoreSync reconciler.
-- *Lazy loading*: Only paths actually accessed during a build are fetched. A
+- *No shared cluster infrastructure*: the only shared state is a node-local
+  cache directory owned by `rio-mountd`. No RWX PersistentVolume, no
+  NFS/EFS/CephFS provisioning, no StoreSync reconciler.
+- *Lazy loading*: Only files actually opened during a build are fetched. A
   nixpkgs @closure is tens of GB, but a typical build accesses a small
   fraction.
-- *Perfect caching*: Store paths are immutable and content-addressed. Once
-  cached, data never needs invalidation or re-fetching. The SSD cache is
-  purely additive with LRU eviction under disk pressure.
-- *Predictive prefetch*: The scheduler sends #glspl("prefetch-hint") via the build
-  execution stream before assigning work. The FUSE daemon warms its cache with
-  the build's input closure paths before the build starts.
+- *Perfect caching*: Store content is immutable and content-addressed. Once a
+  file digest is in the node cache, it never needs invalidation or
+  re-fetching; eviction under disk pressure is mountd's LRU sweep.
+- *Mount-time DAG prefetch*: the closure's Directory DAG is fetched in one
+  multi-root `GetDirectory(recursive=true)` call at mount time, so every
+  metadata operation is answered from heap for the rest of the build.
 
-== FUSE Cache
+== Node-shared backing cache
 
-- *Backend*: Local SSD (`emptyDir`)
-- *Granularity*: Whole store paths (not individual chunks). The FUSE daemon
-  reassembles NARs from chunks via rio-store and materializes them as
-  directory trees on disk.
-- *Metadata*: A lightweight SQLite index tracks cached paths
-- *Lifetime*: Pod-scoped. The cache holds one build's input closure and is
-  discarded with the `emptyDir` when the pod terminates; no eviction is
-  needed. Node-level FSx caching survives pod churn, so common paths (glibc,
-  coreutils, etc.) stay warm at the storage layer even though every pod-level
-  FUSE cache is fresh.
+- *Backend*: node-local SSD hostPath (`/var/rio/cache` + `/var/rio/chunks`),
+  owned and written exclusively by `rio-mountd`; builders read it directly
+  and publish new content only through the verified `Promote` /
+  `PromoteChunks` requests.
+- *Granularity*: individual file digests (and FastCDC chunks for the
+  streaming-fill path), not whole store paths --- identical files across
+  store paths share one cache entry.
+- *Lifetime*: node-scoped; survives pod churn, so common files (glibc,
+  coreutils, …) stay warm across builds. Disk pressure is handled by
+  mountd's watermark sweep (oldest-mtime first).
 
 #r("builder.platform.i686")[
   The per-build daemon's `nix.conf` MUST set `extra-platforms` to the worker's
@@ -142,12 +150,6 @@ to lazily fetch @store-path content on demand.
   `extra-platforms = x86_64-linux i686-linux`. The host system appearing in
   `extra-platforms` is a no-op; on aarch64 builders the line contains only
   `aarch64-linux` so the setting is inert.
-]
-
-#r("builder.fuse.cache-ephemeral-memory")[
-  The SQLite cache index is `:memory:` --- the pod's filesystem is discarded
-  after the single build, so persistence is pointless, and on tiny-class node
-  storage on-disk writes cost >1s each (I-141).
 ]
 
 #r("builder.nar.entry-name-safety")[
@@ -180,164 +182,26 @@ to that value. Any FOD that bakes `SOURCE_DATE_EPOCH` into its output (the
 fails its hash check on every rebuild. Symlink mtime is intentionally out of
 scope here: `std` has no API to set a symlink's own mtime without a new
 dependency, the `find -type f` in the SOURCE_DATE_EPOCH hook ignores
-symlinks, and the FUSE attribute layer
-(#rref("builder.fuse.canonical-metadata")) hardcodes canonical times for
-every node type regardless of on-disk state.
+symlinks, and the castore-FUSE attribute layer hardcodes canonical store
+metadata (mode/mtime/uid/gid) for every node type regardless of on-disk
+state (#rref("builder.fs.parity")).
 
-#r("builder.fuse.canonical-metadata+2")[
-  The FUSE store filesystem MUST present canonical Nix store-path metadata
-  (`mtime`/`atime`/`ctime` of one second past the Epoch, `perm` `0o444` for
-  non-executable regular files, `0o777` for symlinks, and `0o555` otherwise,
-  `uid`/`gid` of `0`) rather than the on-disk metadata of the backing cache
-  files.
-]
-
-The FUSE FS *is* the chroot store's lower layer; its visible metadata is the
-metadata builds receive. Cache files are written at fetch time with the
-process `uid`/`gid`, an `umask`-derived mode, and `mtime≈now` --- none of
-which match what Nix's reference daemon presents for valid store paths. The
-serve-side hardcode is defense-in-depth on top of
-#rref("builder.nar.canonical-mtime"): even if a cache file's on-disk
-timestamp drifts (filesystem maintenance, a future cache backend that
-forgets to canonicalize), the build never sees it. Canonical permissions
-also prevent a build from observing a writable mode on an input store path
-and attempting an in-place mutation (overlayfs would silently copy-up; a
-stock Nix build would `EACCES` --- a behavior divergence worth avoiding even
-though no in-tree build relies on it). Symlinks are the one exception:
-`canonicalisePathMetaData` never chmods them (Linux has no `lchmod(2)`), so a
-stock daemon presents the Linux-immutable `0o777`; rio mirrors that exactly.
-This does not reintroduce the writable-mode concern --- Linux ignores symlink
-permission bits for access control (`man 7 path_resolution`), so the perm
-value carries no semantics beyond cross-builder parity.
 
 == Prefetch Warm-Gate
 
-#r("builder.warmgate.handshake")[
-  On receipt of a `PrefetchHint` from the scheduler, the builder spawns one
-  fire-and-forget fetch task per hinted path (bounded by a semaphore), then a
-  joiner task that awaits ALL of them and sends
-  `PrefetchComplete{paths_fetched, paths_cached}` on the BuildExecution
-  stream. The scheduler gates the first assignment on receipt of this ACK
-  (#rref("sched.assign.warm-gate")), so the build starts with a warm cache. An
-  empty hint sends the ACK immediately. The hint handler MUST NOT block the
-  BuildExecution event loop --- per-path tasks queue in tokio's scheduler and
-  only enter the blocking pool once a permit is acquired. Per-path outcomes
-  are recorded in #(refs.metric)("rio_builder_prefetch_total")`{result}`.
+#r("builder.warmgate.handshake+2")[
+  On receipt of a `PrefetchHint` from the scheduler, the builder MUST send
+  `PrefetchComplete` on the BuildExecution stream --- the scheduler gates the
+  first assignment on receipt of this ACK (#rref("sched.assign.warm-gate")).
+  Since the castore cutover there is nothing to pre-warm at the pod level
+  (input materialization is per-build: the castore mount prefetches the
+  Directory DAG and file bytes come from the node-shared cache), so every
+  hint is acknowledged immediately with zero counts. The hint handler MUST
+  NOT block the BuildExecution event loop, and the ACK MUST go through the
+  permanent sink so it survives a stream reconnect.
 ]
 
-#r("builder.warmgate.filter")[
-  Each `PrefetchHint` path is classified BEFORE entering the blocking pool:
-  (a) JIT allowlist armed AND path NOT a declared input → skip
-  (`reason=not_input`; FUSE lookup would ENOENT it anyway); (b) JIT allowlist
-  NOT armed (initial warm-gate batch, before any assignment) AND
-  `QueryPathInfo.nar_size > 256 MiB` → skip (`reason=size_cap`); (c) declared
-  input OR under cap → fetch. The size cap stops the warm-gate from
-  speculatively pulling multi-GB sibling outputs the scheduler over-includes
-  (I-212: `approx_input_closure` sends ALL outputs of each input drv, e.g., a
-  2.9 GB `clang-debug` alongside the `clang-out` the build actually needs).
-  Declared inputs that exceed the cap are still fetched on-demand by JIT
-  lookup, so the filter never blocks a correct build. Filtered paths increment
-  #(refs.metric)("rio_builder_prefetch_filtered_total")`{reason}`.
-]
 
-#r("builder.warmgate.manifest-prime")[
-  After computing the input closure and before daemon spawn, the executor
-  issues ONE `BatchGetManifest` for the full closure and primes the FUSE
-  cache's manifest-hint map (basename → `ManifestHint`). Each subsequent JIT
-  `GetPath` carries the primed hint so the store skips its two PG lookups
-  (#rref("store.get.manifest-hint")). Any `BatchGetManifest` error degrades to
-  a no-op --- per-path `GetPath` then queries PG as before. I-110c: \~1600 PG
-  hits per builder collapse to ≤2.
-]
-
-== FUSE Implementation
-
-#r("builder.fuse.fetch-bounded-memory")[
-  `ensure_cached` MUST stream NAR bytes to a same-filesystem spool file and
-  extract via a bounded-memory streaming restore (`restore_path_streaming`);
-  it MUST NOT hold the full NAR `Vec<u8>` or the parsed `NarNode` tree in
-  memory. Peak per-fetch heap is O(chunk size) --- one 256 KiB gRPC chunk plus
-  a `BufReader` --- not O(NAR size). A 1.8 GB input previously held \~3.6 GB
-  peak (NAR bytes + parsed tree), OOMing 1 Gi-limit builders during input
-  fetch; the streaming path bounds this to under 1 MiB regardless of NAR size.
-]
-
-#r("builder.fuse.fetch-progress-timeout+2")[
-  `fuse_fetch_timeout` MUST bound the idle gap between successive stream
-  messages (`GetPath` initial response and each subsequent NarChunk), NOT the
-  wall-clock duration of the whole fetch. A stalled store (no message for
-  `fuse_fetch_timeout`) MUST trip `DeadlineExceeded` → `EIO`, preserving the
-  I-165 circuit-breaker latency (60s × 5 consecutive failures = 300s to
-  circuit-open). A healthy store streaming a multi-GB NAR (I-211: 2.9 GB
-  `clang-21.1.8-debug`) MUST complete regardless of total duration as long as
-  every inter-message gap is below the timeout. The pre-I-211 wall-clock bound
-  aborted such fetches mid-stream → daemon EIO → build failure on a healthy
-  store. Concurrent `WaitFor` threads bound staleness (time since the fetcher
-  last heartbeat progress on retry), not total elapsed, so a fetcher in its
-  retry loop is not abandoned.
-]
-
-#r("builder.fuse.retry-jitter")[
-  The JIT fetch retry loop MUST apply per-attempt full jitter (`delay ×
-  U(0.5, 1.5)`) to the `RETRY_BACKOFF` schedule, and MUST treat
-  `tonic::Code::Aborted` as transient (retry) alongside
-  `Unavailable`/`Unknown`/`ResourceExhausted`. Under thundering-herd (I-189:
-  `hello-deep-256x` ≈ 38000 drvs, hundreds of builders all `GetPath`-ing the
-  same 164 MB gcc within seconds), every builder hits the same h2 stream reset
-  and then retries at the same instant --- without jitter the retry IS the
-  herd, and a fixed 7.6 s budget exhausts. The store returns `Aborted` for
-  retryable PG conflicts (Serialization, Deadlock) with explicit retry intent;
-  without it in the transient set the no-manifest-hint fallback path EIOs
-  immediately on PG contention.
-]
-
-#r("builder.fuse.lookup-caches+2")[
-  The FUSE daemon is implemented using the `fuser` crate and runs as part of
-  the builder process (not a sidecar). It handles:
-  - `lookup`: *Top-level lookups* (direct children of the FUSE root, i.e.,
-    store basenames like `abc...-hello`) consult the per-build JIT allowlist
-    (see #rref("builder.fuse.jit-lookup")). Names that ARE registered inputs
-    MUST be materialized (whole store-path tree on disk) before returning ---
-    the kernel caches the lookup attr with 1h TTL and never calls `getattr`,
-    so child lookups (`lookup(busybox_ino, "bin")`) would hit an empty cache →
-    ENOENT otherwise. *Child lookups* (inside an already-materialized tree)
-    hit local disk directly with `symlink_metadata` --- no gRPC.
-  - `getattr`: Return file metadata from cached path info
-  - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching
-    from rio-store on cache miss
-]
-
-#r("builder.fuse.listxattr-empty")[
-  `listxattr` on a FUSE-served store path MUST return an empty list (not an
-  error) when queried with a non-zero buffer; replying with a
-  `fuse_getxattr_out{size:0}` struct to a non-zero-buffer query trips the
-  kernel's `fuse_verify_xattr_list` zero-length-name check and surfaces as
-  `-EIO` to the caller (e.g., Python's `shutil.copy2`).
-]
-
-#r("builder.fuse.circuit-breaker+3")[
-  The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER opens
-  the circuit): (a) `threshold` (default 5) consecutive fetch failures; (b)
-  `last_success.elapsed() > wall_clock_trip` (default 720s) AND at least one
-  failure since the last success --- catches the degraded-but-alive store
-  (accepting connections, serving slowly) without waiting for 5×fetch-timeout.
-  The failure-gate on (b) is critical: an idle build (no store traffic for
-  >720s, e.g., a long sleep) has a stale `last_success` but a healthy store
-  --- without the gate, the first post-idle fetch trips → EIO on upload →
-  InfrastructureFailure → reassign loop. After `auto_close_after` (default
-  30s) the circuit goes half-open: the next `check()` probes --- success
-  closes the circuit, failure re-opens it. Every singleflight `Fetch` owner
-  (`ensure_cached` AND `prefetch_path_blocking`) checks the breaker before
-  fetching and records the outcome after --- under singleflight a
-  prefetch-owned failure is observed by FUSE waiters via EIO, so prefetch is
-  NOT silent and MUST feed the breaker. The fetch timeout is
-  #(refs.cfg)("builder", "fuse_fetch_timeout_secs") (default
-  #(refs.cfg-default)("builder", "fuse_fetch_timeout_secs")) from
-  `builder.toml` --- NOT the
-  global `GRPC_STREAM_TIMEOUT`. *CRITICAL: std::sync ONLY* --- FUSE callbacks
-  run on fuser's thread pool, NOT in a tokio context. `AtomicU32` +
-  `parking_lot::Mutex`; zero `tokio::sync`, zero `.await`.
-]
 
 #r("builder.heartbeat.rpc-timeout")[
   Each heartbeat RPC MUST be bounded by a timeout strictly less than
@@ -360,26 +224,19 @@ value carries no semantics beyond cross-builder parity.
   Cleared when the breaker closes or half-opens.
 ]
 
-- `open`: Open the already-materialized local file (fast path, since `lookup`
-  fetched the tree). Falls back to `ensure_cached()` on ENOENT. With
-  passthrough enabled, hands the kernel a backing fd via `open_backing()` so
-  subsequent `read()` calls bypass userspace. *Prefetch is separate* --- it's
-  scheduler-driven via `PrefetchHint` messages on the assignment stream, not
-  triggered by `open()`.
+== Castore-FUSE Design Notes
 
-== FUSE Design Notes
-
-The FUSE daemon is split across submodules: `fuse/mod.rs` (daemon lifecycle,
-mount management, `NixStoreFs` struct), `fuse/ops.rs` (the `Filesystem` trait
-impl --- all kernel callbacks: `lookup`, `getattr`, `open`, `read`,
-`readlink`, `readdir`, `forget`), `fuse/inode.rs` (bidirectional inode↔path
-map with kernel `nlookup` refcounting), `fuse/lookup.rs` (attribute helpers:
-`stat_to_attr`, `ATTR_TTL`), `fuse/read.rs` (file-range read helper + errno
-translation), `fuse/cache.rs` (LRU cache management, SQLite-backed), and
-`fuse/fetch.rs` (`ensure_cached`: NAR fetch + extract from rio-store). The
-FUSE daemon handles concurrent access from multiple overlays via `Arc<Cache>`
-with a read-mostly access pattern --- store paths are immutable, so concurrent
-reads require no synchronization beyond the cache index.
+The castore-FUSE stack is split across submodules: `castore_fuse/mount.rs`
+(the per-build mount sequence: DAG prefetch, mountd handshake, the builder's
+own `mount(2)`, serve, teardown), `castore_fuse/tree.rs` (the immutable
+content-addressed inode table), `castore_fuse/fs.rs` (the `Filesystem` impl
+--- metadata from heap, passthrough on `open()`), `castore_fuse/open.rs` (the
+backing-cache lookup / JIT fetch / promote dispatch), `castore_fuse/stream.rs`
+(the streaming fill for large files), `castore_fuse/circuit.rs` (the fetch
+breaker), and `castore_fuse/{mountd,mountd_proto,mountd_client,sweep}.rs` (the
+privileged per-node broker, its wire protocol, the in-process client, and the
+disk-pressure sweep). The tree is immutable for the mount's lifetime, so FUSE
+callbacks read it through `&self` with no locking.
 
 *`fuser` 0.17 API (validated in Phase 1a spike):*
 
@@ -1106,38 +963,25 @@ When the profile is unset (or `privileged=true`), pods fall back to
 
 = Device Access
 
-Workers require access to `/dev/fuse` for the FUSE filesystem. Mount it as a
-`hostPath` volume:
-
-```yaml
-volumes:
-  - name: dev-fuse
-    hostPath:
-      path: /dev/fuse
-      type: CharDevice
-containers:
-  - name: builder
-    volumeMounts:
-      - name: dev-fuse
-        mountPath: /dev/fuse
-```
-
-Without `/dev/fuse`, the FUSE daemon cannot create the store mount and the
-builder will fail to start.
+Executor pods require `/dev/fuse` for the per-build castore-FUSE mount: the
+kernel only accepts a fuse `mount(2)` from the user namespace that opened the
+device, so the builder must open it itself (rio-mountd only receives a dup
+for backing-open brokering). The device node is delivered by containerd's
+`base_runtime_spec` declaring `/dev/fuse` in OCI `linux.devices`
+(#rref("sec.pod.fuse-device-plugin")) --- NOT by a hostPath volume, which the
+kernel rejects under `hostUsers: false` (idmap mounts on device nodes), and
+NOT by a device-plugin DaemonSet. Without `/dev/fuse`, the castore mount
+fails with an actionable error and the build is reported as an
+infrastructure failure.
 
 = FUSE Passthrough Mode (Linux 6.9+)
 
-#r("builder.fuse.passthrough")[
-  Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which
-  allows the FUSE daemon to hand off file descriptors to backing files. For
-  cached store paths on local SSD, passthrough mode bypasses the
-  kernel-userspace context switch entirely, providing near-native I/O
-  performance.
-]
-
-This is relevant to the FUSE daemon because the warm-cache path (store paths
-already fetched to local SSD) is the most performance-critical. With
-passthrough:
+Linux 6.9 introduced FUSE passthrough (`FUSE_PASSTHROUGH`), which lets the
+FUSE server hand the kernel a backing fd so reads bypass userspace entirely.
+The castore-FUSE warm path is built on it (`builder.fs.passthrough-on-hit` in
+ADR-022): once a file digest is in the node-shared backing cache, `open()`
+replies passthrough and reads go kernel → SSD with zero FUSE involvement.
+With passthrough:
 - Reads from cached paths go directly to the SSD-backed file via the kernel,
   no userspace FUSE daemon involvement
 - Only cache-miss reads require the full FUSE round-trip to rio-store via gRPC
@@ -1175,10 +1019,11 @@ findings:
   header file repeatedly will benefit; a build that opens thousands of small
   files once will not.
 
-*Implications for the FUSE daemon design:*
-- The FUSE cache (`fuse/cache.rs`) should maintain open file handles for
-  cached paths, not just the path data. When a file is opened via `open()`,
-  register a passthrough backing fd and keep it alive until eviction.
+*Implications for the castore-FUSE design:*
+- One backing registration per `file_digest`, refcounted across open file
+  handles (`castore_fuse/fs.rs` `BackingTable`); the registration is brokered
+  through rio-mountd because `FUSE_DEV_IOC_BACKING_OPEN` needs init-namespace
+  `CAP_SYS_ADMIN`.
 - `max_stack_depth` must be set to 1 in `init()`. Setting it to 2 allows the
   FUSE mount itself to be used as the lower layer of an overlayfs (which is
   the production layout: FUSE lower + SSD upper).
@@ -1279,31 +1124,15 @@ is stable (post Phase 3).
   burning `activeDeadlineSeconds` of compute.
 ]
 
-= Just-in-time Input Fetch
+= Input Materialization
 
-#r("builder.fuse.jit-register")[
-  The executor MUST register the build's input closure (basename → nar_size,
-  the projection of `compute_input_closure`'s result) on the FUSE cache via
-  `register_inputs()` after `compute_input_closure` and before daemon spawn.
-  This arms the FUSE `lookup()` allowlist and is the ONLY signal `lookup()`
-  uses to decide whether a top-level name may trigger a store fetch.
-]
-
-#r("builder.fuse.jit-lookup")[
-  Top-level FUSE `lookup` for a name in the registered input set MUST block on
-  `ensure_cached` with a per-path timeout of at least `nar_size /
-  JIT_MIN_THROUGHPUT_BPS` (size-scaled, floored at `fuse_fetch_timeout`;
-  I-178: a flat 60 s aborted a 1.9 GB input mid-fetch). On any fetch failure
-  it MUST return `EIO` (NEVER `ENOENT`) --- overlayfs `ovl_lookup` propagates
-  a lower's non-ENOENT error to the caller without caching a negative dentry;
-  an `ENOENT` would be negative-cached and the daemon's retry would never
-  re-ask FUSE → `MiscFailure` → `PermanentFailure` poison (the I-043 failure
-  mode). For a name NOT in the registered set (and not already on local disk),
-  `lookup` MUST return `ENOENT` immediately without contacting the store ---
-  daemon `.lock`/`.chroot`/`.check` probes, output-path pre-checks, and
-  `.links` all land here. This is a pure allowlist: builds cannot read store
-  paths outside their declared input closure (hermeticity).
-]
+Input materialization is the castore-FUSE `open()` path (ADR-022 §2.6): the
+mount-time tree IS the declared-input allowlist (a name outside the closure
+gets a cached negative dentry and never contacts the store), and a cold
+`open()` JIT-fetches the file by digest into the node-shared backing cache
+with a size-aware budget. Fetch failures surface to the build as `EIO`
+(never `ENOENT`) and are classified as infrastructure failures
+(`builder.result.input-eio-is-infra`).
 
 = Stream Relay & Reconnect
 
@@ -1354,21 +1183,6 @@ is stable (post Phase 3).
   directly would kill every running build on scheduler failover.
 ]
 
-#r("builder.result.input-enoent-is-infra+2")[
-  When the nix-daemon returns `MiscFailure` with an error message indicating a
-  missing input path (`getting attributes of path '<p>'`) and `<p>`'s basename
-  matches an entry in the build's computed input closure, the builder MUST
-  report `BuildResultStatus::InfrastructureFailure` (not `PermanentFailure`).
-  The input was verified present in rio-store by `compute_input_closure`; its
-  absence at sandbox-setup time is a worker-local materialization failure (JIT
-  fetch EIO, overlay negative-dentry race), not a build defect. I-178b: the
-  matcher MUST strip ANSI SGR escapes before parsing (the daemon colors the
-  path) and MUST match by basename only --- the daemon reports the overlay
-  path (`/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), not the bare
-  store path the closure holds. The errno suffix is NOT load-bearing: both `No
-  such file or directory` and `Input/output error` (I-179) are
-  materialization failures.
-]
 
 = Shutdown
 
@@ -1529,10 +1343,10 @@ is stable (post Phase 3).
   caption: [Builder pod failure (from the component failure matrix).],
 )
 
-When rio-store is degraded (slow but not down), builder FUSE cache misses
-queue up: read operations block, build sandboxes stall, and after 5
-consecutive `ensure_cached` failures the FUSE circuit breaker
-(#rref("builder.fuse.circuit-breaker+3")) opens and `check()` returns `EIO`
+When rio-store is degraded (slow but not down), castore-FUSE cache misses
+queue up: cold `open()`s block, build sandboxes stall, and after 5
+consecutive fetch failures the castore-FUSE fetch breaker
+(`builder.fs.fetch-circuit`, ADR-022) opens and `check()` returns `EIO`
 immediately (fail-fast). The breaker state is reported to the scheduler via
 #rref("builder.heartbeat.store-degraded") so the builder is excluded from
 assignment.
@@ -1751,7 +1565,7 @@ accumulates.
 Mitigations: benchmark FUSE read latency (p50, p99) under concurrent load and
 compare against direct filesystem reads; the `fuser` crate supports
 multi-threaded FUSE dispatch; FUSE passthrough mode (Linux 6.9+,
-#rref("builder.fuse.passthrough")) eliminates the `read()` context switch by
+`builder.fs.passthrough-on-hit` in ADR-022) eliminates the `read()` context switch by
 handing off file descriptors to backing files for cached paths on local SSD;
 file handle caching keeps backing file handles open across reads --- builds
 that open many small files once won't benefit from passthrough alone, they

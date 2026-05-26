@@ -62,4 +62,4 @@ queue up:
 - After 5 consecutive `ensure_cached` failures, the FUSE circuit breaker opens
   and `check()` returns `EIO` immediately (fail-fast). The existing
   `WAIT_DEADLINE` timeout on each fetch feeds the failure counter. See
-  `r[builder.fuse.circuit-breaker]`.
+  `builder.fs.fetch-circuit` (ADR-022).

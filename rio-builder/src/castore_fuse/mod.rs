@@ -1,10 +1,8 @@
 //! Castore-FUSE lazy `/nix/store` (ADR-022 §2).
 //!
-//! This module tree replaced the whole-store-path JIT FUSE in
-//! [`crate::fuse`] at the P0560 §A cutover: the executor mounts a
-//! per-build castore FUSE (via [`mount`]) as the overlay's only lower.
-//! The old `fuse/` module is no longer wired anywhere and is deleted by
-//! the §A deletion commit.
+//! This module tree replaced the pre-ADR-022 whole-store-path JIT FUSE
+//! at the P0560 §A cutover: the executor mounts a per-build castore
+//! FUSE (via [`mount`]) as the overlay's only lower.
 //!
 //! - [`mountd`] + [`mountd_proto`] + `bin/rio-mountd.rs` — the
 //!   privileged per-node broker (fd handoff, `BACKING_OPEN`, verified

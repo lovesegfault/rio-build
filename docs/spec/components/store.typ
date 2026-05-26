@@ -243,10 +243,11 @@ the `pending_s3_deletes` table.
   paths in ONE PostgreSQL round-trip (`LEFT JOIN manifest_data`). A
   `ManifestHint` carries the full `PathInfo` plus the `(blake3_hash, size)`
   chunk list. Same local-only / DoS-bound / validation /
-  end-user-tenant-rejection rules as #rref("store.api.batch-query"). I-110c:
-  the builder issues this once per build (#rref("builder.warmgate.manifest-prime"))
-  so each subsequent `GetPath` can supply `manifest_hint` and skip both PG
-  lookups.
+  end-user-tenant-rejection rules as #rref("store.api.batch-query"). I-110c
+  (historical): the pre-castore builder issued this once per build so each
+  subsequent `GetPath` could supply `manifest_hint` and skip both PG lookups;
+  the castore-FUSE builder no longer calls it, but the RPC remains for other
+  manifest-priming clients.
 ]
 
 #r("store.api.hash-part+2")[
@@ -1597,9 +1598,9 @@ there is no "occasional" case.
   ),
 )
 
-If rio-store is degraded (slow but not down), all executors' FUSE cache misses
-queue up: FUSE read operations block, build sandboxes stall, and the
+If rio-store is degraded (slow but not down), all executors' castore-FUSE
+cache misses queue up: cold `open()`s block, build sandboxes stall, and the
 scheduler's @backpressure mechanism (actor queue depth > 80%) rejects new builds
-with `RESOURCE_EXHAUSTED`. After 5 consecutive `ensure_cached` failures, the
-FUSE circuit breaker opens and `check()` returns `EIO` immediately (fail-fast)
---- see #rref("builder.fuse.circuit-breaker").
+with `RESOURCE_EXHAUSTED`. After 5 consecutive fetch failures, the castore-FUSE
+fetch breaker opens and `check()` returns `EIO` immediately (fail-fast)
+--- see `builder.fs.fetch-circuit` (ADR-022).

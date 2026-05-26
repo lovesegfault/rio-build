@@ -17,13 +17,6 @@ use tracing::instrument;
 
 use rio_proto::types::{ExecutorMessage, PrefetchComplete, PrefetchHint, executor_message};
 
-/// I-212 warm-gate size cap, retained only for the post-cutover spec
-/// sweep (the warm-gate fetch body it bounded was removed at the P0560
-/// §A cutover; nothing reads it).
-// r[impl builder.warmgate.filter]
-#[allow(dead_code)]
-pub(super) const PREFETCH_WARM_SIZE_CAP_BYTES: u64 = 256 * 1024 * 1024;
-
 /// Handle a PrefetchHint from the scheduler: acknowledge it immediately
 /// with `PrefetchComplete` so the warm-gate opens.
 ///
@@ -33,7 +26,7 @@ pub(super) const PREFETCH_WARM_SIZE_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// the ACK goes through the permanent sink and must not block the
 /// BuildExecution event loop even when the relay is backpressured.
 // r[impl sched.assign.warm-gate]
-// r[impl builder.warmgate.handshake]
+// r[impl builder.warmgate.handshake+2]
 #[instrument(skip_all, fields(count = prefetch.store_paths.len()))]
 pub fn handle_prefetch_hint(prefetch: PrefetchHint, stream_tx: mpsc::Sender<ExecutorMessage>) {
     let hinted = prefetch.store_paths.len();

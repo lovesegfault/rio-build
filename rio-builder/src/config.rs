@@ -78,35 +78,10 @@ pub struct Config {
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     #[schemars(with = "Vec<String>")]
     pub features: Vec<String>,
-    /// FUSE mount point. Never `/nix/store` --- that would shadow the host store.
-    pub fuse_mount_point: PathBuf,
-    /// Local SSD cache directory for the FUSE cache.
-    pub fuse_cache_dir: PathBuf,
-    /// Number of FUSE daemon threads.
+    /// fuser worker threads serving each build's castore-FUSE mount.
+    /// Bounds how many FUSE callbacks (lookups, JIT `open()` fetches)
+    /// run concurrently per build.
     pub fuse_threads: u32,
-    /// Defaults to `true`. NOT the serde bool default — see `default_true`.
-    /// A drift here (`false`) would silently disable kernel passthrough,
-    /// adding a userspace copy per FUSE read and ~2× per-build latency.
-    pub fuse_passthrough: bool,
-    /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 60.
-    /// NOT the global `GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR
-    /// uploads and passthrough. FUSE fetches are the build-critical path;
-    /// a stalled fetch blocks a fuser thread, and a few stalls freeze the
-    /// whole mount.
-    ///
-    /// I-211: this is an IDLE bound — 60s without a stream message — not
-    /// a wall-clock bound on the whole fetch. A stuck store (no chunks
-    /// arriving) still trips at 60s; a healthy store streaming a 2.9 GB
-    /// NAR completes regardless of total duration. Preserves the I-165
-    /// circuit-breaker tuning: a genuinely stalled fetch fails at 60s, so
-    /// 60s × 5 threshold failures = 300s to circuit-open (matching
-    /// `GRPC_STREAM_TIMEOUT`), and detached warm-stat threads unpark
-    /// within 60s. Pre-I-211, the wall-clock bound aborted a 2.9 GB
-    /// `clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a
-    /// healthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
-    #[serde(rename = "fuse_fetch_timeout_secs", with = "rio_common::config::secs")]
-    #[schemars(with = "u64")]
-    pub fuse_fetch_timeout: std::time::Duration,
     /// Base directory for per-build overlay upper/work layers.
     pub overlay_base_dir: PathBuf,
     /// rio-mountd UDS socket path. The DaemonSet listens on a dedicated
@@ -274,14 +249,7 @@ impl Default for Config {
             store: rio_common::config::UpstreamAddrs::with_port(9002),
             systems: Vec::new(),
             features: Vec::new(),
-            // Matches nix/modules/builder.nix. NEVER default to /nix/store:
-            // mounting FUSE there shadows the host store, breaking every
-            // process on the machine (including the builder itself).
-            fuse_mount_point: "/var/rio/fuse-store".into(),
-            fuse_cache_dir: "/var/rio/cache".into(),
             fuse_threads: 4,
-            fuse_passthrough: true,
-            fuse_fetch_timeout: std::time::Duration::from_secs(60),
             overlay_base_dir: "/var/rio/overlays".into(),
             // Match the rio-mountd DaemonSet defaults (mountd-ds.yaml /
             // bin/rio-mountd.rs) — builder pods hostPath-mount the same
@@ -364,30 +332,10 @@ pub struct CliArgs {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     features: Vec<String>,
 
-    /// FUSE mount point
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_mount_point: Option<PathBuf>,
-
-    /// FUSE cache directory
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_cache_dir: Option<PathBuf>,
-
-    /// Number of FUSE threads
+    /// fuser worker threads per castore-FUSE mount
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     fuse_threads: Option<u32>,
-
-    /// Enable FUSE passthrough mode. Use --fuse-passthrough=false to disable.
-    //
-    // clap's `bool` is a flag (presence=true, absence=false), which would
-    // make it impossible to NOT set from CLI (defeating layering).
-    // `Option<bool>` with an explicit value parser makes clap accept
-    // `--fuse-passthrough=true|false` and leaves it None when absent.
-    #[arg(long, value_parser = clap::value_parser!(bool))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_passthrough: Option<bool>,
 
     /// Overlay base directory
     #[arg(long)]
@@ -442,11 +390,7 @@ pub(crate) fn nix_system(arch: &str, os: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Regression guard against silent default drift. CRITICAL case:
-    /// `fuse_passthrough` defaults to `true` — NOT the serde bool default.
-    /// A drift to `false` adds a userspace copy per FUSE read (~2× per-build
-    /// latency) and would only show up as a VM-test timing regression,
-    /// not a hard failure.
+    /// Regression guard against silent default drift.
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
@@ -458,27 +402,7 @@ mod tests {
         assert!(d.store.addr.is_empty(), "required, no default");
         assert!(d.systems.is_empty(), "systems auto-detect");
         assert!(d.features.is_empty(), "features empty by default");
-        assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
-        assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
         assert_eq!(d.fuse_threads, 4);
-        assert_eq!(
-            d.fuse_fetch_timeout,
-            std::time::Duration::from_secs(60),
-            "FUSE fetch timeout: 60s NOT 300s (GRPC_STREAM_TIMEOUT). \
-             I-165: on a fresh ephemeral builder wall_clock_trip can't \
-             fire (no last_success), so only the 5-consecutive-failure \
-             threshold is live. 60s × 5 = 300s to circuit-open; detached \
-             warm-stat threads unpark within 60s. A drift back to 600 \
-             means warm hangs for ~10min per 3-path batch under store \
-             saturation. I-178: this is the BASE timeout; JIT lookup \
-             uses jit_fetch_timeout(this, nar_size) per path so large \
-             inputs get a size-proportional budget."
-        );
-        assert!(
-            d.fuse_passthrough,
-            "fuse_passthrough MUST default to true (phase2a behavior); \
-             serde's bool default is false so this needs explicit handling"
-        );
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
         assert_eq!(
             d.mountd_socket,
@@ -526,34 +450,22 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    /// `--fuse-passthrough` must accept explicit true/false (not a flag).
-    #[test]
-    fn cli_fuse_passthrough_explicit_bool() {
-        let args = CliArgs::try_parse_from(["rio-builder", "--fuse-passthrough", "false"]).unwrap();
-        assert_eq!(args.fuse_passthrough, Some(false));
-        let args = CliArgs::try_parse_from(["rio-builder", "--fuse-passthrough", "true"]).unwrap();
-        assert_eq!(args.fuse_passthrough, Some(true));
-        // Absent → None (layering: don't overlay).
-        let args = CliArgs::try_parse_from(["rio-builder"]).unwrap();
-        assert_eq!(args.fuse_passthrough, None);
-    }
-
     // Jailed standing-guard tests — see rio-test-support/src/config.rs.
     // When you add Config.newfield: ADD IT to both assert blocks below.
 
     rio_test_support::jail_roundtrip!(
         "builder",
         r#"
-        fuse_passthrough = false
-        fuse_fetch_timeout_secs = 222
+        disable_passthrough = true
+        jit_fetch_timeout_secs = 222
         systems = ["x86_64-linux", "aarch64-linux"]
         "#,
         |cfg: Config| {
             assert!(
-                !cfg.fuse_passthrough,
-                "TOML scalar must override the non-serde-bool default of true"
+                cfg.disable_passthrough,
+                "TOML scalar must override the compiled default of false"
             );
-            assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
+            assert_eq!(cfg.jit_fetch_timeout, std::time::Duration::from_secs(222));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
         }
     );
@@ -563,18 +475,7 @@ mod tests {
         assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
         assert!(cfg.systems.is_empty());
         assert!(cfg.features.is_empty());
-        // The critical non-serde-bool default: fuse_passthrough
-        // must survive the compiled-defaults → TOML merge as
-        // `true`. This is the load-bearing check — serde's bool
-        // default is `false`, so if the loader's base-layer
-        // serialization drops it, a pre-phase3a config silently
-        // loses kernel passthrough.
-        assert!(
-            cfg.fuse_passthrough,
-            "near-empty TOML must preserve fuse_passthrough=true \
-             via the compiled-defaults base layer"
-        );
-        assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(60));
+        assert_eq!(cfg.fuse_threads, 4);
         // Castore-FUSE knobs: every non-zero default must survive the
         // compiled-defaults base layer (serde's numeric default is 0,
         // which would turn stream_threshold_bytes=0 into "every file

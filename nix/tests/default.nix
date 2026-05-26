@@ -151,11 +151,6 @@ let
       };
       worker2 = {
         extraServiceEnv = {
-          # Non-passthrough FUSE: exercises open_files tracking,
-          # userspace read(), release(). fuse/ops.rs read() at 33%
-          # coverage before this — passthrough bypasses the kernel
-          # callback entirely.
-          RIO_FUSE_PASSTHROUGH = "false";
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
       };
@@ -651,16 +646,10 @@ in
         subtests = [
           # r[verify builder.overlay.stacked-lower+2]
           # r[verify builder.ns.order+2]
-          # r[verify builder.fuse.lookup-caches+2]
-          # r[verify builder.fuse.jit-lookup]
-          # r[verify builder.fuse.jit-register]
-          # r[verify builder.fuse.passthrough]
           "fanout"
           "fuse-direct"
-          # r[verify builder.fuse.listxattr-empty]
           "fuse-listxattr"
           "overlay-readdir"
-          # r[verify builder.fuse.canonical-metadata+2]
           "canonical-meta"
           # r[verify obs.metric.transfer-volume]
           "chunks"
@@ -1382,10 +1371,10 @@ in
   #   fod-dir subtest: recursive-hash FOD with directory output
   #   (`mkdir $out`). Regression: a whiteout at the output path
   #   makes overlayfs mkdir return EIO.
-  # r[verify builder.fuse.jit-lookup]
   #   fod-fail subtest: failing FOD propagates within 60s. Daemon's
-  #   post-fail stat($out) hits FUSE; NotInput → ENOENT without
-  #   store contact. P0308 hang would push elapsed past timeout 90.
+  #   post-fail stat($out) hits the castore lower; a name outside the
+  #   closure → ENOENT without store contact. P0308 hang would push
+  #   elapsed past timeout 90.
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {

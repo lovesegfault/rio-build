@@ -198,67 +198,6 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
     Ok(())
 }
 
-/// I-110c: one `BatchGetManifest` for the full input closure, then
-/// prime the FUSE cache's hint map so each JIT FUSE `GetPath` carries
-/// `manifest_hint` and the store skips its two PG lookups. ~1600 PG
-/// hits/builder → ≤2.
-///
-/// Hints for paths that turn out to be already on local disk are
-/// dropped by the cache-hit fast path in `ensure_cached` /
-/// `prefetch_path_blocking` — same code that decides hit-vs-miss, so
-/// the map drains as JIT lookups fire with no leak.
-///
-/// Any error degrades to a no-op — each per-path `GetPath` then
-/// queries PG as before. Prefetch is an optimization; it never fails
-/// the build.
-///
-/// Old-FUSE only: nothing calls this since the P0560 §A castore
-/// cutover (the castore mount prefetches the Directory DAG instead).
-/// Deleted together with `crate::fuse` in the §A deletion commit.
-// r[impl builder.warmgate.manifest-prime]
-#[allow(dead_code)]
-#[instrument(skip_all, fields(input_count = input_paths.len()))]
-pub(super) async fn prefetch_manifests(
-    store_client: &StoreServiceClient<Channel>,
-    fuse_cache: &crate::fuse::cache::Cache,
-    input_paths: &[String],
-) {
-    if input_paths.is_empty() {
-        return;
-    }
-    // No local-cache filter: already-cached paths get their unused
-    // hint dropped by the cache-hit fast path in `ensure_cached` /
-    // `prefetch_path_blocking` — same code that decides hit-vs-miss,
-    // so no leak and no race.
-
-    let mut client = store_client.clone();
-    match rio_proto::client::batch_get_manifest(
-        &mut client,
-        input_paths.to_vec(),
-        rio_common::grpc::GRPC_STREAM_TIMEOUT,
-    )
-    .await
-    {
-        Ok(entries) => {
-            let hints = entries.into_iter().filter_map(|(path, hint)| {
-                let basename = rio_nix::store_path::basename(&path)?.to_owned();
-                Some((basename, hint?))
-            });
-            fuse_cache.prime_manifest_hints(hints);
-            tracing::debug!(paths = input_paths.len(), "manifest prefetch primed");
-        }
-        Err(status) => {
-            // Any failure (Unavailable, DeadlineExceeded, …) — log and
-            // continue. The per-path JIT GetPath has its own retry;
-            // this is a best-effort optimization.
-            tracing::warn!(
-                error = %status,
-                "BatchGetManifest failed; per-path GetPath will query PG"
-            );
-        }
-    }
-}
-
 /// Fetch a .drv file from the store and parse it.
 ///
 /// Fallback when the scheduler sends `drv_content: empty` (cache-hit node
@@ -844,51 +783,6 @@ mod tests {
             store.calls.qpi_calls.read().unwrap().is_empty(),
             "per-path QueryPathInfo should NOT be called when batch is available"
         );
-        Ok(())
-    }
-
-    /// I-110c: `prefetch_manifests` issues ONE BatchGetManifest then
-    /// primes the FUSE cache's hint map (keyed by basename), and
-    /// `fetch_extract_insert`'s GetPath carries the hint.
-    #[tokio::test]
-    async fn test_prefetch_manifests_primes_hint_cache() -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering;
-        let (store, client) = spawn_and_connect().await?;
-        let (p_a, p_b) = (tp("hint-a"), tp("hint-b"));
-        seed_with_refs(&store, &p_a, &[]);
-        seed_with_refs(&store, &p_b, &[]);
-
-        let dir = tempfile::tempdir()?;
-        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"))?;
-
-        prefetch_manifests(&client, &cache, &[p_a.clone(), p_b.clone()]).await;
-
-        assert_eq!(
-            store.calls.batch_manifest_calls.load(Ordering::SeqCst),
-            1,
-            "one BatchGetManifest for the whole closure"
-        );
-        let b_a = rio_nix::store_path::basename(&p_a).unwrap();
-        let b_b = rio_nix::store_path::basename(&p_b).unwrap();
-        let hint_a = cache.take_manifest_hint(b_a).expect("hint primed for a");
-        assert_eq!(
-            hint_a.info.as_ref().map(|i| i.store_path.as_str()),
-            Some(p_a.as_str()),
-            "hint keyed by basename, info matches full path"
-        );
-        assert!(cache.take_manifest_hint(b_b).is_some());
-        assert!(
-            cache.take_manifest_hint(b_a).is_none(),
-            "take removes on read"
-        );
-
-        // The hint-carry-on-GetPath e2e is covered by
-        // `fuse::fetch::tests::test_prefetch_success_roundtrip` (which
-        // builds `StoreClients` directly). After dataplane2 changed
-        // `prefetch_path_blocking` to take `StoreClients` and JIT-fetch
-        // deleted the warm path, this test's scope is the
-        // BatchGetManifest → hint-map prime, asserted above.
-        let _ = (store, client);
         Ok(())
     }
 

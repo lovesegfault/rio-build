@@ -334,7 +334,6 @@ pub(super) async fn collect_outputs(
 /// check stays the load-bearing guard either way.
 ///
 // r[impl builder.result.input-eio-is-infra]
-// r[impl builder.result.input-enoent-is-infra+2]
 pub(crate) fn is_input_materialization_failure(
     nix_status: rio_nix::protocol::build::BuildStatus,
     error_msg: &str,
@@ -406,7 +405,6 @@ mod tests {
     /// (P0560) — they MUST classify as infrastructure, never as a
     /// derivation failure.
     // r[verify builder.result.input-eio-is-infra]
-    // r[verify builder.result.input-enoent-is-infra+2]
     #[test]
     fn test_is_input_materialization_failure() {
         use rio_nix::protocol::build::BuildStatus as Nix;
