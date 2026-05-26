@@ -128,9 +128,11 @@ pub enum OutputCapture {
 pub struct Isolation {
     /// When false the sandbox gets its own (empty but for loopback)
     /// network namespace. When true `CLONE_NEWNET` is omitted and the
-    /// process shares the executor's network; the caller is responsible
-    /// for binding whatever resolver/trust-store files the process
-    /// needs, because the executor will not infer them.
+    /// process shares the executor's network; the plan then also binds
+    /// the host's `/etc/resolv.conf`, `/etc/services`, and `/etc/hosts`
+    /// (and synthesizes an `nsswitch.conf`) so name resolution works.
+    /// Trust-store material (the CA bundle) is NOT inferred — that bind
+    /// stays with the caller.
     pub network: bool,
     /// uid the process runs as inside the sandbox. Without a user
     /// namespace this is a host uid — a singleton identity, which is

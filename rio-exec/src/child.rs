@@ -294,9 +294,6 @@ impl SetupError {
 /// instead of closing them immediately.
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 
-/// `include/uapi/linux/personality.h`. `PER_LINUX32` is a base
-/// personality value (it replaces the whole word); `ADDR_NO_RANDOMIZE`
-/// is a flag OR'd into it.
 /// The `RLIMIT_NOFILE` soft and hard limit a build sees. CppNix leaves
 /// the limit untouched, so daemon-era builders inherited
 /// nix-daemon.service's `LimitNOFILE=1048576`; pinning the same value
@@ -305,6 +302,9 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 /// were historically built under.
 const SANDBOX_NOFILE_LIMIT: libc::rlim_t = 1_048_576;
 
+/// `include/uapi/linux/personality.h`. `PER_LINUX32` is a base
+/// personality value (it replaces the whole word); `ADDR_NO_RANDOMIZE`
+/// is a flag OR'd into it.
 const PER_LINUX32: libc::c_ulong = 0x0008;
 const ADDR_NO_RANDOMIZE: libc::c_ulong = 0x0004_0000;
 /// The "query, do not change" argument to `personality(2)`.

@@ -26,8 +26,11 @@ impl FodHashAlgo {
     /// Parse from Nix's outputHashAlgo. Strips the "r:" recursive
     /// prefix (the prefix determines hash MODE not ALGO).
     ///
-    /// Returns None for unknown algos — caller should log+skip rather
-    /// than false-reject a valid output whose algo we don't support.
+    /// Returns None for unknown algos — the caller (`verify_fod_hashes`)
+    /// fails closed and rejects the output rather than shipping
+    /// unverified content; the gateway pre-screens the same algorithm
+    /// set at submission (`fod_algo_verifiable`), so a None here in
+    /// production means that gate was bypassed or has drifted.
     fn from_nix_str(s: &str) -> Option<Self> {
         match s.strip_prefix("r:").unwrap_or(s) {
             "sha1" => Some(Self::Sha1),
