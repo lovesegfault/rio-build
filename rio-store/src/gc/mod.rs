@@ -73,7 +73,7 @@ use tracing::{info, warn};
 use rio_proto::types::GcProgress;
 
 use crate::backend::ChunkBackend;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestError};
 
 /// Summary stats from a GC run.
 #[derive(Debug, Default, Clone)]
@@ -463,26 +463,46 @@ pub(super) async fn decrement_and_enqueue(
     decrement_hashes_and_enqueue(tx, &unique_hashes, &counts, backend).await
 }
 
-/// Deserialize a manifest's `chunk_list` and return its dedup'd hashes.
-/// A corrupt `chunk_list` is logged and yields empty (the narinfo
-/// DELETE has already CASCADEd the manifest away; worst case is leaked
-/// refcounts). A manifest CAN repeat chunks (duplicate content blocks
-/// in the NAR) — decrement once per unique hash.
+/// Deserialize a manifest's `chunk_list` and return its dedup'd chunk
+/// hashes, sorted ascending. A manifest CAN repeat chunks (duplicate
+/// content blocks in the NAR) — each unique hash appears exactly once.
+///
+/// Corrupt input (anything `Manifest::deserialize` rejects) is an
+/// `Err`, never an empty `Ok`, so a caller that must fail closed (a
+/// collector mark phase that derives liveness from the manifest fold)
+/// can distinguish "this manifest references no chunks" from "this
+/// manifest is unreadable". An empty manifest (zero entries) is NOT
+/// corrupt: it parses to `Ok` of an empty vec.
+///
+/// The ascending sort gives a deterministic order independent of the
+/// manifest's entry order; both existing consumers are
+/// order-insensitive (`decrement_hashes_and_enqueue` re-sorts its
+/// input, the sweep batch folds into a `BTreeMap`).
+pub(crate) fn try_parse_unique_chunk_hashes(
+    chunk_list: &[u8],
+) -> Result<Vec<[u8; 32]>, ManifestError> {
+    let manifest = Manifest::deserialize(chunk_list)?;
+    let mut hashes: Vec<[u8; 32]> = manifest.entries.into_iter().map(|e| e.hash).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    Ok(hashes)
+}
+
+/// Infallible wrapper around `try_parse_unique_chunk_hashes` for the
+/// legacy decrement paths: a corrupt `chunk_list` is logged and yields
+/// empty (the narinfo DELETE has already CASCADEd the manifest away;
+/// worst case is leaked refcounts — the chunks survive until a future
+/// GC sees them at actual 0). This warn-and-empty behavior is the
+/// as-built C12 skip polarity, deliberately preserved at every existing
+/// callsite; a collector that derives liveness from the manifest fold
+/// must NOT use this wrapper — treating corrupt input as "references
+/// nothing" would turn a storage leak into collected live data, so its
+/// mark phase aborts the cycle on `Err` instead.
 pub(super) fn parse_unique_chunk_hashes(chunk_list: &[u8]) -> Vec<[u8; 32]> {
-    let manifest = match Manifest::deserialize(chunk_list) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(error = %e, "GC: corrupt chunk_list, skipping decrement");
-            return Vec::new();
-        }
-    };
-    let mut seen = std::collections::HashSet::<[u8; 32]>::new();
-    manifest
-        .entries
-        .into_iter()
-        .filter(|e| seen.insert(e.hash))
-        .map(|e| e.hash)
-        .collect()
+    try_parse_unique_chunk_hashes(chunk_list).unwrap_or_else(|e| {
+        warn!(error = %e, "GC: corrupt chunk_list, skipping decrement");
+        Vec::new()
+    })
 }
 
 /// Decrement-and-enqueue body: takes pre-deduped hashes paired with
@@ -590,6 +610,77 @@ mod tests {
                 .collect(),
         }
         .serialize()
+    }
+
+    /// Every corrupt class `Manifest::deserialize` rejects surfaces as
+    /// `Err` from the fallible parse — never as an empty `Ok`.
+    #[test]
+    fn try_parse_rejects_corrupt_chunk_list() {
+        use crate::manifest::{MAX_CHUNKS, ManifestError};
+
+        // Empty input (no version byte).
+        assert!(matches!(
+            try_parse_unique_chunk_hashes(b""),
+            Err(ManifestError::Empty)
+        ));
+
+        // Unknown version byte.
+        assert!(matches!(
+            try_parse_unique_chunk_hashes(&[0xFF]),
+            Err(ManifestError::UnknownVersion(0xFF))
+        ));
+
+        // Body length not a multiple of the entry stride (truncated).
+        let mut truncated = make_manifest(&[[0x11u8; 32]]);
+        truncated.pop();
+        assert!(matches!(
+            try_parse_unique_chunk_hashes(&truncated),
+            Err(ManifestError::BadLength(_))
+        ));
+
+        // Entry count above MAX_CHUNKS.
+        let mut oversized = vec![0u8; 1 + (MAX_CHUNKS + 1) * 36];
+        oversized[0] = 1;
+        assert!(matches!(
+            try_parse_unique_chunk_hashes(&oversized),
+            Err(ManifestError::TooManyChunks(_))
+        ));
+    }
+
+    /// Duplicate hashes collapse to one occurrence each and the result
+    /// is sorted ascending (the deterministic order the callers and the
+    /// future mark batches rely on), regardless of entry order.
+    #[test]
+    fn try_parse_dedups_and_sorts_hashes() {
+        let a = [0x01u8; 32];
+        let b = [0x02u8; 32];
+        let c = [0x03u8; 32];
+        let manifest = make_manifest(&[c, a, c, b, a, c]);
+
+        let hashes = try_parse_unique_chunk_hashes(&manifest).unwrap();
+        assert_eq!(hashes, vec![a, b, c], "deduped, ascending");
+    }
+
+    /// An empty manifest (zero entries) is well-formed, not corrupt:
+    /// it parses to Ok of an empty set.
+    #[test]
+    fn try_parse_empty_manifest_is_ok_and_empty() {
+        let empty = make_manifest(&[]);
+        assert!(try_parse_unique_chunk_hashes(&empty).unwrap().is_empty());
+    }
+
+    /// The legacy infallible wrapper keeps the as-built C12 skip
+    /// polarity: corrupt input yields an empty set (warn + skip the
+    /// decrement), it does not error or panic. Pinned so the polarity
+    /// is not "fixed" out from under the callsites that rely on it.
+    #[test]
+    fn parse_unique_chunk_hashes_keeps_corrupt_skip_polarity() {
+        assert!(parse_unique_chunk_hashes(&[0xFF]).is_empty());
+        assert!(parse_unique_chunk_hashes(b"").is_empty());
+
+        // And the happy path still parses through the wrapper.
+        let h = [0x42u8; 32];
+        assert_eq!(parse_unique_chunk_hashes(&make_manifest(&[h, h])), vec![h]);
     }
 
     // r[verify store.chunk.refcount-txn]

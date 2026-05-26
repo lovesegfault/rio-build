@@ -768,3 +768,34 @@ historical defect classes, not verifications of current spec rules, and
 carry no `r[verify]` markers (the same policy as every other witness
 check and as the retry campaign's calibration checks). The five Stage-A
 rules' marker status is unchanged from Stage B.
+
+## Phase 1 (in progress)
+
+### Phase 1-pre — fallible parse landed; its Kani contract deferred
+
+The fallible `chunk_list` parse for the future fail-closed mark phase
+(`try_parse_unique_chunk_hashes` in `rio-store/src/gc/mod.rs`: corrupt
+input is an `Err`, never an empty `Ok`; the legacy
+`parse_unique_chunk_hashes` wrapper keeps the as-built C12 warn-and-empty
+polarity at the existing callsites) landed in Phase 1-pre with unit tests
+for every corrupt class, the dedup behavior, the empty-but-well-formed
+manifest, and the wrapper's pinned polarity.
+
+The design §4.6 Kani contract for that parse (no panic on arbitrary
+input; `Err` exactly when `Manifest::deserialize` rejects; on `Ok` an
+exact dedup of the entry hashes that is empty only for a zero-entry
+manifest) was attempted as a sixth `kani-rio-store` harness over bounded
+arbitrary inputs of one version byte plus four, then two, then one
+36-byte entry, each with explicit unwind bounds. None of the attempts
+converged inside the merge-gate budget on the CI builder, while the
+member's five wired harnesses verify in seconds — the dominant cost is
+the symbolic execution of the std Vec/slice/sort machinery the parse and
+dedup use (the same blowup class the retry campaign recorded for
+`kani-rio-retry-kernel`), not the contract assertions. The harness is
+therefore NOT wired and no verify marker is claimed for it; the wired
+coverage for the parse remains its unit tests plus the
+`fuzz/rio-store` `manifest_deserialize` target, and the contract returns
+with the Phase-2 Kani work (the `decide_collect` kernel), where a
+dependency-free kernel extraction is the candidate shape. Measured
+non-convergence figures are in the introducing commit message
+(`feat(rio-store): add a fallible chunk_list parse...`).

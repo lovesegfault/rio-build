@@ -155,6 +155,27 @@ in
   #   - check_manifest_covers_no_uncovered_point: a manifest reported as
   #     covering [0, up_to) really has no gap (the soundness direction
   #     of the completeness predicate that seals a log against appends).
+  #
+  # NOT wired (deferred): a sixth harness for the GC chunk-list parse
+  # contract (rio-store/src/gc/mod.rs try_parse_unique_chunk_hashes —
+  # no panic on arbitrary input; Err exactly when Manifest::deserialize
+  # rejects; on Ok an exact dedup of the entry hashes that is empty only
+  # for a zero-entry manifest, so corrupt input is never reported as an
+  # empty chunk set) was attempted with bounded arbitrary inputs of one
+  # version byte plus four, two, and finally one 36-byte entry, with
+  # explicit #[kani::unwind] bounds. None of those converged inside the
+  # merge-gate budget on the CI builder while this member's five wired
+  # harnesses verify in seconds — the dominant cost is the symbolic
+  # execution of the std Vec/slice/sort machinery the parse and dedup
+  # use, which travels with the code into the goto model (the same
+  # blowup class the rio-retry-kernel deferral below records), not the
+  # contract assertions themselves. Until a CBMC-affordable shape exists
+  # (candidate follow-ups: prove a dependency-free dedup kernel à la
+  # rio-retry-kernel, or revisit alongside the Phase-2 decide_collect
+  # kernel work), the contract is NOT claimed as verified here and no
+  # verify marker is carried for it; the parse's corrupt-class and dedup
+  # behavior is pinned by its unit tests in gc/mod.rs and the
+  # fuzz/rio-store manifest_deserialize target.
   # r[verify store.log.session-keyed]
   # r[verify store.log.ingest-bounds]
   # r[verify store.log.completeness-gate]
