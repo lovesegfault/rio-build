@@ -1632,7 +1632,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.timeout.promote-on-exceed+3]
 /// I-200 regression: cold-start (no `[sla]` → `est_deadline_secs=None`,
 /// `floor.deadline_secs=0`) means `bump_floor_or_count` returns
 /// `{promoted:false, counted:false}` (base=0 → next=0 → unchanged).
@@ -4706,7 +4706,7 @@ async fn test_heartbeat_cross_executor_spoof_rejected() -> TestResult {
 /// `max_timeout_retries=4`. Since the D1 collapse the cap's terminal
 /// state on this controller-observed path is `Cancelled` (the same as
 /// the worker-reported path), never `Poisoned`.
-// r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.timeout.promote-on-exceed+3]
 // r[verify sched.termination.deadline-exceeded+3]
 #[tokio::test]
 async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
@@ -5173,7 +5173,7 @@ async fn attempt_ledger_unreported_crash_established_by_sweep() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget]
+// r[verify sched.retry.per-executor-budget+2]
 // r[verify sched.retry.attempts-bounded+2]
 /// Phase 1b (T-1b.11), the C2 adjudication red-first: a derivation that
 /// deterministically kills its worker with no `CompletionReport`, no

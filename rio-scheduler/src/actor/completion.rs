@@ -1269,7 +1269,7 @@ impl DagActor {
                     }
                 }
             }
-            // r[impl sched.retry.per-executor-budget]
+            // r[impl sched.retry.per-executor-budget+2]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
@@ -2762,7 +2762,7 @@ impl DagActor {
             return FailureHandling::Handled;
         }
 
-        // r[impl sched.retry.per-executor-budget]
+        // r[impl sched.retry.per-executor-budget+2]
         // The live eligible fleet snapshot for the fleet-exhaust arm:
         // statically-eligible (kind/system/features), non-draining,
         // registered workers — the same construction as the E9
@@ -3424,7 +3424,7 @@ impl DagActor {
     /// cascade/events/build-fail side-effects as
     /// `handle_permanent_failure` — the build still fails THIS time,
     /// just without the 24h resubmit lockout.
-    // r[impl sched.timeout.promote-on-exceed+2]
+    // r[impl sched.timeout.promote-on-exceed+3]
     /// E4, collapsed onto `decide()` (Phase 1b): the under-cap requeue
     /// vs at-cap terminal-`Cancelled` verdict comes from the fold over
     /// the appended attempt suffix inside the appending transaction.

@@ -406,21 +406,27 @@ epilogue in the success path).
   (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 ]
 
-#r("sched.retry.per-executor-budget")[
+#r("sched.retry.per-executor-budget+2")[
   `BuildResultStatus::InfrastructureFailure` does NOT count toward the poison
   threshold. It routes through a separate `handle_infrastructure_failure`
   handler: `reset_to_ready` + retry WITHOUT inserting into `failed_builders`.
   Executor-local issues (FUSE EIO, cgroup setup fail, OOM-kill of the build
   process) are not the build's fault. `TransientFailure` (build ran, exited
   non-zero, might succeed elsewhere) DOES count. Executor disconnect DOES count
-  --- a build that crashes the daemon 3× is poisoned; false-positives from
+  --- a build that crashes the daemon 3× is poisoned: an executor crash whose
+  classifying report never arrives, once its failure is established (the
+  correlation-TTL sweep or the backstop fills
+  `termination_reason='unreported'`), joins `failed_builders` and counts
+  toward the poison threshold; false-positives from
   unrelated executor deaths are cleared by `rio-cli poison-clear`. Both knobs
   are configurable via `scheduler.toml`: `threshold` (default 3, the former
   `POISON_THRESHOLD` const), `require_distinct_workers` (default true ---
   HashSet semantics; false = any N failures poison, for single-executor dev
   deployments). The retry backoff curve is likewise a `[retry]` table.
-  `failed_builders` persisted to PG; infrastructure retry count is in-memory
-  only.
+  `failed_builders` and the infrastructure retry counts are folds over the
+  durable attempt ledger and survive leader failover
+  (#rref("sched.retry.failover-budget")); a leader change does not refresh
+  any retry budget.
 ]
 
 #r("sched.dispatch.fleet-exhaust+3")[
@@ -632,29 +638,34 @@ real classification needs). Each of those mechanisms exists because its
 absence double-counted a death (the G5 fix family); the rule states the
 property they collectively enforce so the model can check the conjunction.
 
-#r("sched.retry.recovery-projection")[
+#r("sched.retry.recovery-projection+2")[
   After a leader change, each recovered derivation's retry state MUST equal
-  the documented projection of its persisted columns and nothing more:
-  `count` from `derivations.retry_count`, `resubmit_cycles` from
-  `derivations.resubmit_cycles`, `failed_builders` from
-  `derivations.failed_builders`, `poisoned_at` from
-  `derivations.poisoned_at` (with rows past the 24 h TTL cleared rather
-  than reloaded), `failure_count` derived as `failed_builders.len()`, and
-  the remaining counters (`infra_count`, `timeout_count`,
-  `last_infra_failure_at`, `exempt_infra_count`, `backoff_until`) reset to
-  their defaults; no recovered counter may exceed the value the persisted
-  columns support.
+  the fold of its durable attempt-ledger suffix (the `drv_attempts` rows at
+  or after its most recent reset event), seeded --- transitionally, until
+  the legacy mirror columns are dropped --- by the legacy projection of
+  `derivations.{retry_count, failed_builders, resubmit_cycles}` whenever
+  those columns are non-empty and the loaded suffix contains no reset row:
+  `failed_builders` is the union of the fold's set and the column set,
+  `count` and `resubmit_cycles` take the maximum of fold and column, and
+  `failure_count` is floored at the merged set's size. A suffix that begins
+  with a reset row ignores the columns; an empty suffix degenerates to the
+  pure legacy projection (in which poisoned-row recovery never recovers
+  `count`). `poisoned_at` and the poisoned status still come from
+  `derivations` (#rref("sched.poison.ttl-persist")), with rows past the
+  24 h TTL cleared rather than reloaded; no recovered counter may exceed
+  what the durable attempt rows and the legacy columns together support.
 ]
-This is the as-built selective forgiveness, stated so the model's failover
-action reproduces the 4-recovered / 1-derived / 5-defaulted split rather
-than resetting all ten or preserving all ten. The forgiveness is
-deliberately conservative (a restart never spuriously poisons) and
-deliberately lossy (`failure_count`'s same-worker repeats are forgotten;
-the in-memory budgets refresh on every leader flap). Whether the infra,
-timeout, and exempt budgets should instead survive failover once the
-attempt history is durable is the #rref("sched.retry.failover-budget")
-decision (made at the Phase-0 exit --- the rule below states the future
-contract); this rule pins the current contract, not the future one.
+This is the Phase-1b recovery contract: the recovered view is the same
+seeded fold the live appending transactions compute, so every retry budget,
+the 300 s window anchor, and the placement exclusion (including backstop-
+and crash-established entries that never had a per-counter column mirror)
+survive a leader change per #rref("sched.retry.failover-budget"). The
+legacy-column seed is the transitional mixed-era floor (its union/max
+semantics cannot double-count rows the still-active legacy writers also
+mirrored); it is dropped in Phase 2 together with the columns. The previous
+revision of this rule pinned the pre-ledger selective forgiveness
+(4 recovered / 1 derived / 5 defaulted), which the as-built Stage-B model
+still encodes until the Phase-1c re-encode.
 
 #r("sched.retry.failover-budget")[
   Once the attempt history is durable (the Phase-1 attempt ledger), every
@@ -677,17 +688,20 @@ consistent with `FailoverPreservesHistory` as a Phase-1 acceptance
 property --- the durable ledger exists precisely so the new leader's fold
 matches the old leader's --- and the strict direction (no fresh budget
 after every leader flap during a failover storm, at the cost of poisoning
-a derivation at `infra_count = 9` of 10 on its next infra failure after a
-flap instead of granting it a fresh budget). The as-built code does NOT
-satisfy this rule: today's recovery is the documented selective
-forgiveness of #rref("sched.retry.recovery-projection"), so this rule
-deliberately carries no implementation marker --- it is the acceptance
-rule for the Phase-1b ledger fold, verified when the model is re-checked
-over the new fold, and the companion amendments (with their version
-bumps) of the two rules whose prose pins today's forgiveness
-(#rref("sched.timeout.promote-on-exceed"),
-#rref("sched.retry.per-executor-budget")) land with the Phase-1 change
-that makes the code satisfy it, not before.
+a derivation already at the cap --- `infra_count = 10` of 10, the
+non-exempt cap is check-then-increment --- on its next counted infra
+failure after a flap instead of granting it a fresh budget). The code-side
+half landed with the Phase-1b collapse: the verdict sites fold the durable
+suffix and recovery rebuilds the retry view from the same seeded fold
+(#rref("sched.retry.recovery-projection")), so a leader change no longer
+refreshes any budget. This rule still deliberately carries no
+implementation marker of its own --- it is the acceptance rule whose
+machine-checked verification arrives when the model is re-checked over the
+post-collapse fold (Phase 1c); the companion amendments (with their
+version bumps) of the two rules whose prose previously pinned the
+forgiveness (#rref("sched.timeout.promote-on-exceed"),
+#rref("sched.retry.per-executor-budget")) landed with the Phase-1b
+recovery change, as this rule required.
 
 #r("sched.poison.cascade-dependents")[
   When a derivation reaches a failure-terminal state (`Poisoned`,
@@ -748,12 +762,16 @@ keep-going build with a poisoned leaf otherwise hangs Active forever ---
 ]
 
 #r("sched.admin.clear-poison")[
-  `AdminService.ClearPoison` resets both in-memory state
-  (`reset_from_poison()`: Poisoned→Created, clear `failed_builders`, zero
-  `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`).
-  Returns `cleared=true` only if both succeed. If PG fails after in-mem reset,
-  returns `false` so the operator retries --- next recovery would restore
-  Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a
+  `AdminService.ClearPoison` resets both PostgreSQL (`db.clear_poison()`:
+  status, `poisoned_at`, `retry_count`, `failed_builders`, joined by the
+  `poison_cleared` ledger reset row) and in-memory state (the node is removed
+  from the DAG so the next submit re-inserts it fresh). Returns `cleared=true`
+  only if both succeed. PG is cleared FIRST: if the PG clear fails, the
+  in-memory state is left untouched (still Poisoned) and `false` is returned,
+  so the operator's retry finds the derivation still poisoned and can proceed
+  --- the pre-`b874e5120` in-mem-first ordering left the in-memory status
+  reset after a PG blip, so the retry hit the not-poisoned guard and the
+  clear became a permanent no-op until restart. Idempotent: calling on a
   non-poisoned or non-existent derivation returns `cleared=false` without
   error. The DAG is keyed on the full `.drv` store path; `rio-cli poison-clear`
   validates this client-side and rejects bare hashes (a silent no-match would
@@ -2031,7 +2049,7 @@ to a builder under pressure. A queued FOD is preferable to a builder with
 internet access. The #(refs.metric)("rio_scheduler_queue_depth")`{kind}` gauge
 tracks queued derivations per kind.
 
-#r("sched.timeout.promote-on-exceed+2")[
+#r("sched.timeout.promote-on-exceed+3")[
   A `BuildResultStatus::TimedOut` completion MUST double
   `resource_floor.deadline_secs` (#rref("sched.sla.reactive-floor")) and reset
   the derivation to `Ready` for re-dispatch, NOT terminal-cancel. The next
@@ -2039,13 +2057,14 @@ tracks queued derivations per kind.
   longer holds. Bounded by a separate `timeout_retry_count` against
   `RetryPolicy.max_timeout_retries`: a genuinely-infinite build still goes
   terminal (`Cancelled`, retriable on explicit resubmit) after exhausting
-  promotions instead of walking forever. `timeout_retry_count` is in-memory
-  only (recovery resets to 0, conservative) and separate from `retry_count` /
-  `infra_retry_count` so timeouts neither consume the transient budget nor get
-  masked by the infra time-window reset. I-200: before this, `TimedOut` went
-  straight to `Cancelled` and the I-199/I-197 promotion only fired on the
-  K8s-deadline-kill → disconnect path, not on the executor-side
-  `daemon_timeout_secs` → clean `TimedOut` report path.
+  promotions instead of walking forever. `timeout_retry_count` is a fold over
+  the durable attempt ledger and survives leader failover
+  (#rref("sched.retry.failover-budget")); it stays separate from
+  `retry_count` / `infra_retry_count` so timeouts neither consume the
+  transient budget nor get masked by the infra time-window reset. I-200:
+  before this, `TimedOut` went straight to `Cancelled` and the I-199/I-197
+  promotion only fired on the K8s-deadline-kill → disconnect path, not on the
+  executor-side `daemon_timeout_secs` → clean `TimedOut` report path.
 ]
 
 #r("sched.reassign.no-promote-on-ephemeral-disconnect+4")[

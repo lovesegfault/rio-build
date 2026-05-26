@@ -77,7 +77,7 @@ async fn test_stale_completion_dropped() -> TestResult {
 // m024: retry_count / starvation accounting
 // ═══════════════════════════════════════════════════════════════════════════
 
-// r[verify sched.retry.per-executor-budget]
+// r[verify sched.retry.per-executor-budget+2]
 /// Disconnecting a worker while the derivation is only Assigned (never
 /// Running) must NOT increment retry_count — the worker disconnected
 /// before starting it, no retry budget consumed.
@@ -107,7 +107,7 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget]
+// r[verify sched.retry.per-executor-budget+2]
 /// Starvation guard intersects failed_builders with LIVE workers. A
 /// stale failed-worker entry (worker disconnected after recording)
 /// must not count toward the all-workers-failed check.

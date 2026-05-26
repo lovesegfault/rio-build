@@ -12,7 +12,7 @@
 //! `Failed` is mid-retry, not stuck.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -950,6 +950,19 @@ pub struct DerivationState {
     /// decision in Phase 1a — the RAM counters in [`Self::retry`] stay
     /// authoritative until the Phase-1b collapse.
     attempt_history: Vec<AttemptRecord>,
+    /// The transitional legacy fold seed (decision P5): the
+    /// `derivations.{retry_count, failed_builders, resubmit_cycles}`
+    /// mirror columns as they were read when this node was constructed
+    /// from a recovery row. Empty for nodes merged live (their pre-066
+    /// history, if any, is read by the appending transactions directly
+    /// from the columns). Carried on the node so every fold input
+    /// construction that cannot do its own PG read — the recovered
+    /// retry view, the dispatch-time fleet-exhaust check, and (from
+    /// T-1b.13) the cached dispatch view — applies the same floor a
+    /// boundary-spanning history keeps until its first post-066 reset
+    /// event. Read-only after construction; dropped with the columns in
+    /// Phase 2.
+    legacy_retry_floor: crate::retry_policy::PersistedRetryColumns,
     /// Realized output store paths (filled on completion).
     pub output_paths: Vec<String>,
     /// Expected output paths (from the proto node at merge time).
@@ -1220,6 +1233,7 @@ impl DerivationState {
             input_srcs,
             retry: RetryState::default(),
             attempt_history: Vec::new(),
+            legacy_retry_floor: crate::retry_policy::PersistedRetryColumns::default(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
             wanted_output_names: node.wanted_output_names.clone(),
@@ -1262,7 +1276,7 @@ impl DerivationState {
     /// be defensive against PG corruption / manual edits. On error,
     /// returns `(drv_hash, err)` so the caller can log without
     /// having cloned drv_hash up front.
-    // r[impl sched.retry.recovery-projection]
+    // r[impl sched.retry.recovery-projection+2]
     pub(crate) fn from_recovery_row(
         row: crate::db::RecoveryDerivationRow,
         status: DerivationStatus,
@@ -1277,6 +1291,18 @@ impl DerivationState {
             &row.required_features,
             row.pname.as_deref(),
         );
+        // The transitional legacy fold seed (P5): captured from the
+        // mirror columns before the row is torn apart, so the recovered
+        // retry view and the dispatch-time fold inputs keep flooring a
+        // boundary-spanning history at what the columns hold.
+        // `poisoned_at` stays out of the seed — poison status and its
+        // TTL anchor are derivations-row-owned (`sched.poison.ttl-persist`).
+        let legacy_retry_floor = crate::retry_policy::PersistedRetryColumns {
+            retry_count: row.retry_count.max(0) as u32,
+            resubmit_cycles: row.resubmit_cycles.max(0) as u32,
+            failed_builders: row.failed_builders.iter().cloned().collect(),
+            poisoned_at: None,
+        };
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -1321,20 +1347,25 @@ impl DerivationState {
             },
             drv_content: Vec::new(), // worker fetches from store
             input_srcs: Vec::new(),  // unparsed (no drv_content); DAG-children-only prefetch
+            // The pure legacy projection of the mirror columns. This is
+            // only the CONSTRUCTION-TIME view: recovery re-derives the
+            // retry view from the attempt-ledger fold (seeded by
+            // `legacy_retry_floor`) via `rebuild_retry_view_from_ledger`
+            // once the suffix is loaded, so budgets survive failover
+            // (`sched.retry.failover-budget`). For a node with no
+            // attempt rows the rebuild degenerates to exactly this
+            // projection.
             retry: RetryState {
                 count: row.retry_count.max(0) as u32,
                 resubmit_cycles: row.resubmit_cycles.max(0) as u32,
-                // failure_count: initialize from failed_builders.len() —
-                // same-worker repeats are lost (in-mem only), conservative.
                 failure_count: row.failed_builders.len() as u32,
                 failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
-                // Remaining retry fields in-memory only — recovery
-                // resets to conservative defaults (see RetryState doc).
                 ..Default::default()
             },
             // Populated from the attempt ledger by the recovery load
             // (`load_attempt_suffix`) after construction.
             attempt_history: Vec::new(),
+            legacy_retry_floor,
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
             // Persisted with union-on-conflict (`migrations/062`,
@@ -1384,7 +1415,7 @@ impl DerivationState {
     /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
     /// Duration::from_secs_f64(elapsed)` — approximate but good enough
     /// for a 24h TTL.
-    // r[impl sched.retry.recovery-projection]
+    // r[impl sched.retry.recovery-projection+2]
     pub(crate) fn from_poisoned_row(
         row: crate::db::PoisonedDerivationRow,
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
@@ -1413,6 +1444,17 @@ impl DerivationState {
         // correctly; non-FOD ⟹ `[]`.
         let effective_features =
             EffectiveFeatures::derive(row.is_fixed_output, &[], row.pname.as_deref());
+        // Transitional legacy fold seed (P5). `PoisonedDerivationRow`
+        // does not carry `retry_count` (poisoned-row recovery never
+        // recovered `count`; the `sched.retry.recovery-projection+2`
+        // text records that), so the floor's count is 0; `poisoned_at`
+        // stays derivations-row-owned and out of the seed.
+        let legacy_retry_floor = crate::retry_policy::PersistedRetryColumns {
+            retry_count: 0,
+            resubmit_cycles: row.resubmit_cycles.max(0) as u32,
+            failed_builders: row.failed_builders.iter().cloned().collect(),
+            poisoned_at: None,
+        };
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -1434,6 +1476,10 @@ impl DerivationState {
             sched: SchedHint::default(),
             drv_content: Vec::new(),
             input_srcs: Vec::new(),
+            // Construction-time legacy projection; the recovery load
+            // re-derives the counters from the seeded ledger fold via
+            // `rebuild_retry_view_from_ledger` (which preserves this
+            // row-derived `poisoned_at` — `sched.poison.ttl-persist`).
             retry: RetryState {
                 resubmit_cycles: row.resubmit_cycles.max(0) as u32,
                 failure_count: row.failed_builders.len() as u32,
@@ -1444,6 +1490,7 @@ impl DerivationState {
             // Populated from the attempt ledger by the recovery load
             // (`load_attempt_suffix`) after construction.
             attempt_history: Vec::new(),
+            legacy_retry_floor,
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
             wanted_output_names: Vec::new(),
@@ -1742,6 +1789,76 @@ impl DerivationState {
     /// transaction's suffix SELECT.
     pub(crate) fn attempt_history(&self) -> &[AttemptRecord] {
         &self.attempt_history
+    }
+
+    /// The transitional legacy fold seed (decision P5) carried on the
+    /// node: the mirror columns as read at recovery construction. Empty
+    /// for live-merged nodes. Callers hand it to `decide` as the
+    /// `legacy_seed`; `decide` itself ignores an empty floor and any
+    /// floor behind a suffix that begins with a reset row.
+    pub(crate) fn legacy_retry_floor(&self) -> &crate::retry_policy::PersistedRetryColumns {
+        &self.legacy_retry_floor
+    }
+
+    // r[impl sched.retry.recovery-projection+2]
+    /// Rebuild the in-memory retry view from the attempt-ledger fold
+    /// over [`Self::attempt_history`], seeded by the carried legacy
+    /// floor (`legacy_retry_floor`, decision P5). Recovery calls this
+    /// once per loaded node after the suffix load, so the recovered
+    /// view is the same seeded fold the live appending transactions
+    /// compute — budgets and the placement exclusion survive a leader
+    /// failover (`sched.retry.failover-budget`) instead of the
+    /// pre-ledger selective forgiveness.
+    ///
+    /// `poisoned_at` (and the poisoned status) stay derivations-row
+    /// owned (`sched.poison.ttl-persist`): whatever the row constructor
+    /// set is preserved, not overwritten by the fold's approximation.
+    /// Until T-1b.13 deletes them, the legacy RAM mutation sites keep
+    /// updating the rebuilt view exactly as they updated the forgiven
+    /// one, so the not-yet-converted dispatch-time readers
+    /// (`hard_filter`, the backoff defer) see at least as much history
+    /// as they would have seen under the old projection.
+    pub(crate) fn rebuild_retry_view_from_ledger(
+        &mut self,
+        budget: &crate::retry_policy::Budget,
+        now_epoch_secs: crate::retry_policy::AbsTime,
+    ) {
+        let decision = crate::retry_policy::decide(
+            &self.attempt_history,
+            budget,
+            now_epoch_secs,
+            Some(&self.legacy_retry_floor),
+        );
+        let c = decision.counters;
+        let now = Instant::now();
+        // Epoch-seconds → Instant conversions. Past timestamps clamp at
+        // the process epoch when the node booted more recently than the
+        // event (Instant cannot represent times before boot): the
+        // clamped anchor reads as "just now", which errs on the strict
+        // side (the 300 s window has not elapsed) and self-corrects at
+        // the next counted event.
+        let to_past_instant = |t: crate::retry_policy::AbsTime| -> Instant {
+            now.checked_sub(Duration::from_secs(now_epoch_secs.saturating_sub(t)))
+                .unwrap_or(now)
+        };
+        self.retry = RetryState {
+            count: c.count,
+            resubmit_cycles: c.resubmit_cycles,
+            infra_count: c.infra_count,
+            timeout_count: c.timeout_count,
+            last_infra_failure_at: c.last_infra_failure_at.map(to_past_instant),
+            exempt_infra_count: c.exempt_infra_count,
+            failed_builders: c.failed_builders.iter().cloned().map(Into::into).collect(),
+            failure_count: c.failure_count,
+            poisoned_at: self.retry.poisoned_at,
+            backoff_until: c.backoff_until.map(|t| {
+                if t > now_epoch_secs {
+                    now + Duration::from_secs(t - now_epoch_secs)
+                } else {
+                    to_past_instant(t)
+                }
+            }),
+        };
     }
 
     /// Test-only: directly set status bypassing state machine validation.

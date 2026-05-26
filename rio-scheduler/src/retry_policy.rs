@@ -350,23 +350,30 @@ impl Counters {
         };
     }
 
-    // r[impl sched.retry.recovery-projection]
-    /// The documented post-failover projection of the persisted columns:
-    /// 4 counters recovered, `failure_count` derived as
-    /// `failed_builders.len()`, the remaining 5 reset to defaults. This
-    /// is `from_recovery_row` / `from_poisoned_row`'s retry-state
-    /// construction as a pure function, so the model's failover action
-    /// and the calibration's G8 reverts have an executable definition of
-    /// "the documented selective forgiveness".
+    // r[impl sched.retry.recovery-projection+2]
+    /// The pure legacy projection of the mirror columns — the
+    /// pre-ledger-era recovery contract, kept as an executable
+    /// definition because it is still load-bearing twice: it is the
+    /// degenerate result of the seeded fold for a derivation with an
+    /// empty attempt suffix (the `sched.retry.recovery-projection+2`
+    /// "pre-ledger fallback" clause), and it is what the as-built
+    /// Stage-B model's failover action and the calibration's G8 reverts
+    /// encode until the Phase-1c re-encode.
     ///
-    /// The projection is *not* the fold of the pre-failover history:
-    /// `failure_count` both forgets same-worker repeats (the live counter
-    /// counts them) and counts the permanent path's diagnostics-only
-    /// `failed_builders` insert (the live counter never charged it), and
-    /// `failed_builders` itself is missing every backstop-recorded
-    /// failure (divergence D4: E8 never mirrors its insert to PG). The
-    /// no-fabrication bound is that every recovered value is supported by
-    /// a persisted column — nothing is invented.
+    /// Since T-1b.12a the live recovery path no longer USES this
+    /// projection as the recovered view: recovery runs [`decide`] over
+    /// the loaded suffix with the columns as the transitional legacy
+    /// seed (P5), so a non-empty suffix contributes everything the
+    /// columns never mirrored (the 5 formerly-forgiven counters,
+    /// backstop- and crash-established exclusions). The projection is
+    /// *not* the fold of the pre-failover history: `failure_count` both
+    /// forgets same-worker repeats (the live counter counts them) and
+    /// counts the permanent path's diagnostics-only `failed_builders`
+    /// insert (the live counter never charged it), and `failed_builders`
+    /// itself is missing every backstop-recorded failure (divergence
+    /// D4: E8 never mirrors its insert to PG). The no-fabrication bound
+    /// is that every recovered value is supported by a persisted column
+    /// — nothing is invented.
     pub fn recovery_projection(persisted: &PersistedRetryColumns) -> Self {
         Self {
             count: persisted.retry_count,
@@ -641,7 +648,7 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
         }
 
         // ── E4: handle_timeout_failure ──────────────────────────────
-        // r[impl sched.timeout.promote-on-exceed+2]
+        // r[impl sched.timeout.promote-on-exceed+3]
         AttemptEvent::WorkerTimeout { at: _, executor: _ } => {
             if c.timeout_count < budget.max_timeout_retries {
                 c.timeout_count += 1;
@@ -730,7 +737,7 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
                 // `poison_and_cascade` here (24 h TTL, bounded
                 // resubmit); E4 produces terminal `Cancelled` for the
                 // same exhausted budget, and
-                // `sched.timeout.promote-on-exceed+2` names `Cancelled`
+                // `sched.timeout.promote-on-exceed+3` names `Cancelled`
                 // as the timeout-cap terminal state. The two reports
                 // describe the same physical deadline overrun and which
                 // arrives first is a race, so a channel-invariant fold
@@ -766,7 +773,7 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
         }
 
         // ── The establishment sweep (C2, Phase 1b T-1b.11) ──────────
-        // r[impl sched.retry.per-executor-budget]
+        // r[impl sched.retry.per-executor-budget+2]
         // A released execution whose classifying report never arrived,
         // established by the correlation-TTL sweep (or recorded by the
         // backstop, which has its own arm above): charges the
@@ -878,10 +885,15 @@ pub(crate) struct Decision {
 /// because set inserts are idempotent. (`count`'s floor is applied after
 /// the fold, so the per-cycle transient cap check inside the fold sees
 /// only the post-066 rows during the transition; the distinct-worker
-/// threshold — the production-default bound — sees the merged set. The
-/// recovery-side merge helper in T-1b.12a unifies this.) A suffix that
-/// begins with a reset row ignores the seed; an empty suffix degenerates
-/// to the pure legacy projection, exactly as recovery does today.
+/// threshold — the production-default bound — sees the merged set.) A
+/// suffix that begins with a reset row ignores the seed; an empty suffix
+/// degenerates to the pure legacy projection. This one function is the
+/// shared merge point for every fold input construction: the appending
+/// transactions read the columns on their own connection
+/// (`load_retry_seed_in_tx`), while recovery's retry-view rebuild and
+/// the dispatch-time fleet-exhaust check pass the floor carried on the
+/// node (`DerivationState::legacy_retry_floor`), so all of them apply
+/// exactly the same P5 semantics (`sched.retry.recovery-projection+2`).
 pub(crate) fn decide(
     history: &[AttemptRecord],
     budget: &Budget,
@@ -1892,7 +1904,7 @@ mod tests {
         assert_eq!(d.exclusion.len(), 3);
     }
 
-    // r[verify sched.retry.per-executor-budget]
+    // r[verify sched.retry.per-executor-budget+2]
     /// C2 (T-1b.11): an `executor_crash` history charges the
     /// threshold/exclusion budget — each established crash joins
     /// `failed_builders` and increments `failure_count`, the placement

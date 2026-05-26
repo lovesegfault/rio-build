@@ -325,14 +325,11 @@ impl DagActor {
         // Rehydrate each loaded node's in-memory attempt history from
         // `drv_attempts` (the rows since its last reset event), so the
         // Phase-1b fold has the same input on both sides of a leader
-        // failover. NO decision change here: `from_recovery_row` /
-        // `from_poisoned_row` and the `is_poisoned()` reconcile
-        // re-check stay exactly as-is — the RAM counters remain
-        // authoritative until the 1b collapse. Worst case is
-        // O(rows-since-last-reset × loaded nodes); the per-cycle suffix
-        // is bounded (~70 rows: 50 exempt-infra + 10 infra + 4 timeout
-        // + 2 transient + 3 poison-threshold), so the realistic shape
-        // is ~1 row per node (design §4.3).
+        // failover. Worst case is O(rows-since-last-reset × loaded
+        // nodes); the per-cycle suffix is bounded (~70 rows: 50
+        // exempt-infra + 10 infra + 4 timeout + 2 transient + 3
+        // poison-threshold), so the realistic shape is ~1 row per node
+        // (design §4.3).
         let drv_ids: Vec<Uuid> = id_to_hash.keys().copied().collect();
         let attempt_suffixes = self.db.load_attempt_suffix(&drv_ids).await?;
         let mut attempt_rows_loaded = 0usize;
@@ -351,6 +348,29 @@ impl DagActor {
                 rows = attempt_rows_loaded,
                 "loaded attempt-ledger suffixes for recovered derivations"
             );
+        }
+
+        // --- Rebuild every loaded node's retry view from the fold ---
+        // Phase 1b (T-1b.12a): the recovered retry view is `decide()`'s
+        // counters over the loaded suffix, seeded by the legacy mirror
+        // columns captured at construction (the same seeded fold the
+        // live appending transactions compute), replacing the pre-ledger
+        // selective forgiveness — budgets, the 300 s window anchor, and
+        // the placement exclusion (including backstop- and
+        // crash-established entries that never had a column mirror)
+        // survive a leader failover (`sched.retry.failover-budget`).
+        // Runs for EVERY loaded node, not only those with attempt rows:
+        // with an empty suffix the seeded fold degenerates to the pure
+        // legacy projection, exactly what construction already set.
+        // `poisoned_at`/status stay row-owned (`sched.poison.ttl-persist`),
+        // and the verdict is not acted on here — recovery-time verdict
+        // enforcement is T-1b.12b.
+        let budget = self.decision_budget();
+        let now_epoch = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+        for hash in id_to_hash.values() {
+            if let Some(state) = self.dag.node_mut(hash) {
+                state.rebuild_retry_view_from_ledger(&budget, now_epoch);
+            }
         }
 
         // --- Load edges + add to DAG ---

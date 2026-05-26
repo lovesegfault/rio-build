@@ -219,7 +219,7 @@ impl rio_common::config::ValidateConfig for Config {
             !cfg.tick_interval.is_zero(),
             "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
         );
-        // r[impl sched.retry.per-executor-budget]
+        // r[impl sched.retry.per-executor-budget+2]
         // `RetryPolicy::backoff_duration` computes
         // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
         // crashes on the first retry. And jf > 1 makes `clamped * (1 - jf)`

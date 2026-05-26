@@ -1042,13 +1042,20 @@ in
     # The fault-persist / failover regime: the dual-channel alphabet plus
     # one leader failover and one silently-lost best-effort PG mirror
     # write. The recovery invariants are load-bearing here: the
-    # post-failover state is exactly the documented 4-recovered /
-    # 1-derived / 5-defaulted projection of whatever PG actually holds
-    # (poisoned rows via from_poisoned_row, non-terminal rows via
-    # from_recovery_row, TTL-expired poison cleared, the orphan
+    # post-failover state is exactly the PRE-LEDGER documented
+    # 4-recovered / 1-derived / 5-defaulted projection of whatever PG
+    # actually holds (poisoned rows via from_poisoned_row, non-terminal
+    # rows via from_recovery_row, TTL-expired poison cleared, the orphan
     # reconcile's threshold re-check), and lost writes only ever make
     # recovery more forgiving, never fabricate history.
-    # r[verify sched.retry.recovery-projection]
+    #
+    # NOTE (Phase 1b, T-1b.12a): this regime still checks the AS-BUILT
+    # model's selective forgiveness, which is no longer the production
+    # recovery contract — sched.retry.recovery-projection+2 (the seeded
+    # ledger fold) is verified by the recovery/failover tests in
+    # rio-scheduler/src/actor/tests/recovery.rs; the model-side verify
+    # marker returns here with the Phase-1c failover-regime re-wiring
+    # (T-1c.3), once the re-encoded model checks the new contract.
     quint-retry-policy-failover = mkQuintCheck {
       name = "retry-policy-failover";
       spec = "retryPolicy";

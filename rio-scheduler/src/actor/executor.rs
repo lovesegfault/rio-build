@@ -962,7 +962,7 @@ impl DagActor {
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
     /// to fire its own `daemon_timeout`. Bump `resource_floor.
     /// deadline_secs` (D4) and count the timeout
-    /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+2]`, same
+    /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+3]`, same
     /// I-200 semantics as `handle_timeout_failure`): every timeout
     /// consumes budget regardless of promotion, so
     /// `max_timeout_retries` bounds TOTAL attempts. NOT gated on
@@ -1174,7 +1174,7 @@ impl DagActor {
     /// report deliberately establishes nothing (the classification
     /// window for a promoting or DeadlineExceeded report stays open
     /// until this sweep).
-    // r[impl sched.retry.per-executor-budget]
+    // r[impl sched.retry.per-executor-budget+2]
     pub(super) async fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
         let expired: Vec<super::DisconnectedAttempt> = self
             .recently_disconnected

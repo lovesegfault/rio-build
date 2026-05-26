@@ -2026,11 +2026,15 @@ impl DagActor {
     // r[impl sched.dispatch.fleet-exhaust+3]
     pub(super) fn dispatch_fleet_exhausted(&self, drv_hash: &DrvHash) -> Option<usize> {
         let state = self.dag.node(drv_hash)?;
+        // The carried node floor (P5, T-1b.12a): a recovered
+        // boundary-spanning history keeps its pre-066 `failed_builders`
+        // in the dispatch-time exclusion without a per-pass PG read;
+        // empty for live-merged nodes and ignored behind a reset row.
         let decision = crate::retry_policy::decide(
             state.attempt_history(),
             &self.decision_budget(),
             crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-            None,
+            Some(state.legacy_retry_floor()),
         );
         let eligible: HashSet<ExecutorId> = self
             .executors

@@ -5606,3 +5606,489 @@ async fn attempt_ledger_failover_reloads_identical_history() -> TestResult {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.12a): recovery builds the retry view from the seeded
+// ledger fold — the failover-budget acceptance tests.
+//   - the recovered in-memory view equals `decide()`'s counters over the
+//     loaded suffix (budgets, the 300 s window anchor, and the placement
+//     exclusion survive a leader change);
+//   - a boundary-spanning history (legacy mirror columns + post-066 rows
+//     with no reset row) recovers the union/max merge (P5);
+//   - a suffix that begins with a reset row ignores the columns;
+//   - a pre-ledger history (columns only, no rows) degenerates to the
+//     legacy projection;
+//   - the two event-driven failover scenarios (design §6(b) and D4) are
+//     regression pins — their verdicts were already fold-decided at the
+//     collapsed sites (T-1b.4/T-1b.5/T-1b.6), so they are NOT red-first.
+// ---------------------------------------------------------------------------
+
+// r[verify sched.retry.recovery-projection+2]
+/// Failover-budget acceptance (red-first for T-1b.12a): a derivation
+/// whose suffix holds 9 counted infra rows plus one E8 `backstop` row
+/// for executor W recovers — before any further failure event — with
+/// the in-memory retry view equal to the seeded fold over that suffix:
+/// `infra_count = 9` (not forgiven to 0), the 300 s window anchor set,
+/// and the placement-exclusion input that `hard_filter` / the backoff
+/// defer still read from RAM containing W (the backstop charge that
+/// never had a PG mirror, divergence D4).
+#[tokio::test]
+async fn phase1b_failover_budget_recovered_view_equals_fold() -> TestResult {
+    let drv_hash = "fbw-drv";
+    let f = RecoveryFixture::run(async move |handle, _pool| {
+        let drv_path = test_drv_path(drv_hash);
+        let _w1 = connect_executor(&handle, "fbw-w1", "x86_64-linux").await?;
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        // 9 counted (non-exempt, in-window) infra failures: under the
+        // default max_infra_retries=10 cap, every one requeues.
+        for attempt in 0..9 {
+            assert!(
+                handle.debug_force_assign(drv_hash, "fbw-w1").await?,
+                "force-assign should succeed at infra attempt {attempt}"
+            );
+            complete_failure(
+                &handle,
+                "fbw-w1",
+                &drv_path,
+                rio_proto::types::BuildResultStatus::InfrastructureFailure,
+                &format!("infra attempt {attempt}"),
+            )
+            .await?;
+        }
+        barrier(&handle).await;
+        let pre = expect_drv(&handle, drv_hash).await;
+        assert_eq!(pre.retry.infra_count, 9, "precondition: 9 counted infra");
+
+        // One E8 backstop fire from a distinct executor W: charges the
+        // threshold/exclusion budget in RAM and in the ledger row, but
+        // never had a per-counter PG mirror (D4).
+        let _wbs = connect_executor(&handle, "fbw-bs", "x86_64-linux").await?;
+        assert!(
+            handle.debug_force_assign(drv_hash, "fbw-bs").await?,
+            "force-assign to the backstop executor"
+        );
+        assert!(handle.debug_backdate_running(drv_hash, 200).await?);
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        let pre = expect_drv(&handle, drv_hash).await;
+        assert!(
+            pre.retry.failed_builders.contains("fbw-bs"),
+            "precondition: the backstop charged the exclusion in RAM"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Immediately after recovery — no further failure event delivered.
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.retry.infra_count, 9,
+        "the infra budget must survive failover (was forgiven to 0 \
+         before T-1b.12a)"
+    );
+    assert!(
+        info.retry.last_infra_failure_at.is_some(),
+        "the 300 s window anchor must survive failover"
+    );
+    assert!(
+        info.retry.failed_builders.contains("fbw-bs"),
+        "the backstop-recorded exclusion (D4) must survive failover into \
+         the RAM set hard_filter reads, got {:?}",
+        info.retry.failed_builders
+    );
+    assert!(
+        info.retry.failure_count >= 1,
+        "the backstop's threshold charge must survive failover"
+    );
+
+    // The recovered view IS the seeded fold over the loaded suffix.
+    let history = handle
+        .debug_query_attempt_history(drv_hash)
+        .await?
+        .expect("node present post-failover");
+    let decision = crate::retry_policy::decide(
+        &history,
+        &crate::retry_policy::Budget::default(),
+        crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+        None,
+    );
+    let c = &decision.counters;
+    assert_eq!(info.retry.infra_count, c.infra_count);
+    assert_eq!(info.retry.count, c.count);
+    assert_eq!(info.retry.failure_count, c.failure_count);
+    assert_eq!(info.retry.exempt_infra_count, c.exempt_infra_count);
+    assert_eq!(info.retry.timeout_count, c.timeout_count);
+    assert_eq!(info.retry.resubmit_cycles, c.resubmit_cycles);
+    assert_eq!(
+        info.retry.last_infra_failure_at.is_some(),
+        c.last_infra_failure_at.is_some()
+    );
+    let ram_exclusion: std::collections::HashSet<String> = info
+        .retry
+        .failed_builders
+        .iter()
+        .map(|e| e.as_str().to_string())
+        .collect();
+    assert_eq!(ram_exclusion, c.failed_builders);
+    Ok(())
+}
+
+// r[verify sched.retry.recovery-projection+2]
+/// Boundary-spanning merge (red-first for T-1b.12a): a derivation with
+/// non-empty legacy mirror columns (`retry_count=2`,
+/// `failed_builders={leg-a,leg-b}`, `resubmit_cycles=1`) AND post-066
+/// attempt rows with no reset row recovers the P5 union/max merge —
+/// the columns' exclusions stay, the ledger row's executor joins them,
+/// and one more counted failure still crosses the same poison threshold
+/// it would have crossed under the pre-ledger recovery.
+#[tokio::test]
+async fn phase1b_recovery_merges_legacy_floor_with_post066_rows() -> TestResult {
+    let drv_hash = "legmix-drv";
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        // Pre-066-era state: only the mirror columns carry it.
+        sqlx::query(
+            "UPDATE derivations SET retry_count = 2, \
+             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .execute(&pool)
+        .await?;
+        // Post-066-era state: one ledger row (executor leg-c) appended
+        // directly — the mirror columns deliberately do NOT learn about
+        // it, the shape every row has once the legacy writers retire.
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind(drv_hash)
+                .fetch_one(&pool)
+                .await?;
+        let mut row = crate::db::attempts::AttemptRow::new(
+            derivation_id,
+            crate::state::OutcomeClass::Transient,
+            crate::state::ReportingParty::Worker,
+        );
+        row.executor_id = Some("leg-c".into());
+        row.error_msg = Some("post-066 transient".into());
+        let mut tx = pool.begin().await?;
+        crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    for legacy in ["leg-a", "leg-b"] {
+        assert!(
+            info.retry.failed_builders.contains(legacy),
+            "the legacy column exclusion {legacy} must survive into the \
+             recovered view"
+        );
+    }
+    assert!(
+        info.retry.failed_builders.contains("leg-c"),
+        "the post-066 row's executor must join the recovered exclusion \
+         (union merge, P5), got {:?}",
+        info.retry.failed_builders
+    );
+    assert!(
+        info.retry.count >= 2,
+        "count is floored at the legacy retry_count"
+    );
+    assert!(
+        info.retry.resubmit_cycles >= 1,
+        "resubmit_cycles is floored at the legacy column"
+    );
+    assert_eq!(
+        info.retry.failure_count, 3,
+        "failure_count is the merged exclusion set's size"
+    );
+
+    // One more counted failure crosses the same cap it would have
+    // crossed under the pre-ledger recovery: the distinct-worker poison
+    // threshold (default 3).
+    let _w4 = connect_executor(&handle, "leg-w4", "x86_64-linux").await?;
+    assert!(handle.debug_force_assign(drv_hash, "leg-w4").await?);
+    complete_failure(
+        &handle,
+        "leg-w4",
+        &test_drv_path(drv_hash),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "one more counted failure",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "the next counted failure crosses the distinct-worker threshold \
+         over the merged (legacy ∪ ledger) exclusion set"
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.recovery-projection+2]
+/// A suffix that begins with a reset row ignores the legacy columns:
+/// the reset cleared the within-cycle state under both eras' semantics,
+/// so the recovered view is the fold of the post-reset rows only.
+#[tokio::test]
+async fn phase1b_recovery_reset_row_ignores_legacy_columns() -> TestResult {
+    let drv_hash = "legreset-drv";
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        sqlx::query(
+            "UPDATE derivations SET retry_count = 2, \
+             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .execute(&pool)
+        .await?;
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind(drv_hash)
+                .fetch_one(&pool)
+                .await?;
+        // The suffix starts at a reset row (admin poison-clear shape),
+        // followed by one post-reset attempt from a fresh executor.
+        let reset = crate::db::attempts::AttemptRow::new_reset(
+            derivation_id,
+            crate::state::OutcomeClass::PoisonCleared,
+            crate::state::ReportingParty::Admin,
+            0,
+        );
+        let mut attempt = crate::db::attempts::AttemptRow::new(
+            derivation_id,
+            crate::state::OutcomeClass::Transient,
+            crate::state::ReportingParty::Worker,
+        );
+        attempt.executor_id = Some("post-w".into());
+        let mut tx = pool.begin().await?;
+        crate::db::SchedulerDb::append_attempt(&mut tx, &reset).await?;
+        crate::db::SchedulerDb::append_attempt(&mut tx, &attempt).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    for legacy in ["leg-a", "leg-b"] {
+        assert!(
+            !info.retry.failed_builders.contains(legacy),
+            "a suffix that begins with a reset row must ignore the legacy \
+             columns (got {legacy} in {:?})",
+            info.retry.failed_builders
+        );
+    }
+    assert!(
+        info.retry.failed_builders.contains("post-w"),
+        "the post-reset row still counts"
+    );
+    assert_eq!(info.retry.count, 1, "fold of the post-reset rows only");
+    assert_eq!(
+        info.retry.resubmit_cycles, 0,
+        "the columns' resubmit_cycles is ignored behind the reset row"
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.recovery-projection+2]
+/// Pre-ledger fallback: a derivation with non-empty mirror columns and
+/// NO attempt rows recovers exactly the pure legacy projection, as it
+/// did before the ledger existed.
+#[tokio::test]
+async fn phase1b_recovery_pre_ledger_columns_only_is_legacy_projection() -> TestResult {
+    let drv_hash = "legonly-drv";
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        sqlx::query(
+            "UPDATE derivations SET retry_count = 2, \
+             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(info.retry.count, 2);
+    assert_eq!(info.retry.resubmit_cycles, 1);
+    assert_eq!(info.retry.failure_count, 2);
+    assert_eq!(info.retry.failed_builders.len(), 2);
+    assert!(info.retry.failed_builders.contains("leg-a"));
+    assert!(info.retry.failed_builders.contains("leg-b"));
+    assert_eq!(info.retry.infra_count, 0);
+    assert_eq!(info.retry.timeout_count, 0);
+    Ok(())
+}
+
+/// Failover-budget regression (design §6(b), corrected fencepost — NOT
+/// red-first: the verdict has been fold-decided at the collapsed E2
+/// site over durable rows since T-1b.4): a derivation already at the
+/// non-exempt infra cap (`infra_count = max_infra_retries`, reachable
+/// without poisoning because the cap is check-then-increment) with a
+/// non-empty exclusion set fails over; ONE more counted infra failure
+/// after recovery poisons it, and the exclusion survives.
+#[tokio::test]
+async fn phase1b_failover_infra_budget_survives_to_poison() -> TestResult {
+    let drv_hash = "focap-drv";
+    let f = RecoveryFixture::run(async move |handle, _pool| {
+        let drv_path = test_drv_path(drv_hash);
+        let _w1 = connect_executor(&handle, "focap-w1", "x86_64-linux").await?;
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        // Drive infra_count to the cap (default max_infra_retries=10):
+        // check-then-increment, so 10 failures leave the node alive at
+        // infra_count=10.
+        for attempt in 0..10 {
+            assert!(
+                handle.debug_force_assign(drv_hash, "focap-w1").await?,
+                "force-assign should succeed at infra attempt {attempt}"
+            );
+            complete_failure(
+                &handle,
+                "focap-w1",
+                &drv_path,
+                rio_proto::types::BuildResultStatus::InfrastructureFailure,
+                &format!("infra attempt {attempt}"),
+            )
+            .await?;
+        }
+        // A non-empty exclusion set: one transient failure.
+        assert!(handle.debug_force_assign(drv_hash, "focap-w1").await?);
+        complete_failure(
+            &handle,
+            "focap-w1",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            "transient for the exclusion set",
+        )
+        .await?;
+        barrier(&handle).await;
+        let pre = expect_drv(&handle, drv_hash).await;
+        assert_eq!(pre.retry.infra_count, 10, "precondition: at the cap");
+        assert!(
+            !pre.status.is_terminal(),
+            "precondition: alive at the cap (check-then-increment), got {:?}",
+            pre.status
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert!(
+        info.retry.failed_builders.contains("focap-w1"),
+        "the exclusion set survives the failover"
+    );
+    assert!(
+        !info.status.is_terminal(),
+        "recovery alone must not poison (T-1b.12b owns recovery-time \
+         verdict enforcement; this history is under every budget's \
+         poison point until the next counted failure)"
+    );
+
+    // ONE more counted infra failure (well within the 300 s window)
+    // crosses the cap the pre-failover history already filled.
+    let _w2 = connect_executor(&handle, "focap-w2", "x86_64-linux").await?;
+    assert!(handle.debug_force_assign(drv_hash, "focap-w2").await?);
+    complete_failure(
+        &handle,
+        "focap-w2",
+        &test_drv_path(drv_hash),
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "first infra failure after the flap",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "the infra budget filled before the flap poisons on the next \
+         counted infra failure — a leader change is not a reset event"
+    );
+    Ok(())
+}
+
+/// D4 regression (NOT red-first: the threshold verdict folds over
+/// durable `backstop` rows at the collapsed sites since T-1b.5/T-1b.6):
+/// backstop-recorded poison-threshold progress (2 of 3 distinct
+/// executors) survives a failover, and the third distinct failure after
+/// recovery poisons.
+#[tokio::test]
+async fn phase1b_failover_backstop_threshold_progress_survives() -> TestResult {
+    let drv_hash = "fobs-drv";
+    let f = RecoveryFixture::run(async move |handle, _pool| {
+        let _w1 = connect_executor(&handle, "fobs-w1", "x86_64-linux").await?;
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        // Two backstop fires from two distinct wedged executors.
+        for w in ["fobs-w1", "fobs-w2"] {
+            if w != "fobs-w1" {
+                let _w = connect_executor(&handle, w, "x86_64-linux").await?;
+            }
+            assert!(
+                handle.debug_force_assign(drv_hash, w).await?,
+                "force-assign to {w}"
+            );
+            assert!(handle.debug_backdate_running(drv_hash, 200).await?);
+            handle.send_unchecked(ActorCommand::Tick).await?;
+            barrier(&handle).await;
+        }
+        let pre = expect_drv(&handle, drv_hash).await;
+        assert_eq!(
+            pre.retry.failed_builders.len(),
+            2,
+            "precondition: two distinct backstop charges, got {:?}",
+            pre.retry.failed_builders
+        );
+        assert!(!pre.status.is_terminal(), "2 of 3 — still alive");
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert!(
+        info.retry.failed_builders.contains("fobs-w1")
+            && info.retry.failed_builders.contains("fobs-w2"),
+        "backstop-recorded threshold progress survives the failover \
+         (got {:?})",
+        info.retry.failed_builders
+    );
+
+    // The third distinct failure crosses the threshold.
+    let _w3 = connect_executor(&handle, "fobs-w3", "x86_64-linux").await?;
+    assert!(handle.debug_force_assign(drv_hash, "fobs-w3").await?);
+    complete_failure(
+        &handle,
+        "fobs-w3",
+        &test_drv_path(drv_hash),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "third distinct failure",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "third distinct failure after the flap poisons (threshold \
+         progress 2-of-3 survived, increment-then-check)"
+    );
+    Ok(())
+}
