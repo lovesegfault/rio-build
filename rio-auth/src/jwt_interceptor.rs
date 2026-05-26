@@ -348,6 +348,13 @@ mod tests {
     /// Header absent → dual-mode fallback. Workers, health probes,
     /// admin tools all take this path. They authenticate through
     /// OTHER mechanisms (HMAC service token, none).
+    ///
+    /// This is the absent-header HALF of the permanent two-branch
+    /// contract: the present-header (mint) half is the
+    /// vm-security-standalone jwt-dual-mode subtest, and the downstream
+    /// tenant_name body resolution the fallback relies on is
+    /// `test_submit_build_resolves_known_tenant` (rio-scheduler).
+    // r[verify gw.jwt.dual-mode+2]
     #[test]
     fn absent_header_passes_through() {
         let (_, vk) = keypair(0x42);

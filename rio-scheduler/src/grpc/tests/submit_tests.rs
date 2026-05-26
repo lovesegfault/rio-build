@@ -96,6 +96,15 @@ async fn test_submit_build_rejects_unknown_tenant() {
 
 /// SubmitBuild with a tenant name that IS in the tenants table → resolves
 /// to the UUID and the build is submitted successfully.
+///
+/// This is the JWT-less fallback half of the permanent dual-mode
+/// contract (no claims attached — exactly what a gateway without a
+/// signing key sends): the body `tenant_name` alone resolves to the
+/// tenant row the build is attributed to. The mint branch is the
+/// vm-security-standalone jwt-dual-mode subtest; the interceptor's
+/// absent-header pass-through is `absent_header_passes_through`
+/// (rio-auth).
+// r[verify gw.jwt.dual-mode+2]
 #[tokio::test]
 async fn test_submit_build_resolves_known_tenant() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;

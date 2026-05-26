@@ -4,15 +4,20 @@
 # section A (tenant resolution), onto the standalone fixture. Transport
 # encryption is Cilium WireGuard (no app-level mTLS).
 #
-# gw.jwt.dual-mode — verify marker at default.nix:vm-security-standalone
-# jwt-dual-mode subtest: the fixture runs the MINT branch (withJwt —
-# required since the castore cutover so the gateway's pushes are
-# attributed to the tenant); the subtest pins that the attested JWT
-# identity and the SubmitBuildRequest.tenant_name body fallback resolve
-# to the same tenant for the same key. The tenant_name-only fallback
-# branch stays covered by the scheduler-side unit tests
-# (resolve_tenant/jwt_issuance/jwt_interceptor) and the k3s prod-parity
-# wiring (jwtEnabled=false).
+# gw.jwt.dual-mode — verify markers split across the two branches:
+# the MINT branch is this scenario's jwt-dual-mode subtest (marker at
+# default.nix:vm-security-standalone; the fixture runs withJwt, which
+# the castore cutover requires anyway so the gateway's pushes are
+# attributed to the tenant) — it pins that the attested JWT identity
+# and the SubmitBuildRequest.tenant_name body fallback resolve to the
+# same tenant for the same key. The JWT-less FALLBACK branch is
+# attributed to the unit tests that exercise it directly, which carry
+# their own r[verify] markers for the rule:
+#   - rio-auth jwt_interceptor.rs::absent_header_passes_through
+#     (absent header → pass-through, no Claims attached)
+#   - rio-scheduler submit_tests.rs::test_submit_build_resolves_known_tenant
+#     (claims-less SubmitBuild → tenant_name body → builds.tenant_id)
+# plus the k3s prod-parity wiring (jwtEnabled=false) end-to-end.
 #
 # sec.boundary.grpc-hmac — verify marker at default.nix:vm-security-standalone
 # HMAC-verifier proves the trust boundary: service-HMAC gates the
