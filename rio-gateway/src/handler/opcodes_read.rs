@@ -301,9 +301,10 @@ pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + U
 /// for unix:// daemon-socket clients. The wire payload MUST still be drained
 /// to keep the stream in sync (golden-conformance requirement); the values
 /// are logged for diagnostics but otherwise discarded — `SubmitBuildRequest`
-/// build options are reachable only via the gRPC path (rio-cli), not
-/// `nix-build --option`. See the setoptions-unreachable VM subtest in
-/// scheduling.nix.
+/// build options are reachable via the gRPC path (rio-cli) or, for
+/// `keep_going` on ssh-ng submissions, via the per-tenant gateway build
+/// policy (`build_policy` in gateway.toml) — never via `nix-build --option`.
+/// See the setoptions-unreachable VM subtest in scheduling.nix.
 #[instrument(skip_all)]
 pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,

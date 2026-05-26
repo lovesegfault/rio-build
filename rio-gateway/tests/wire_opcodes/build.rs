@@ -49,6 +49,10 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
     // Verify scheduler received the submit request.
     let submits = h.scheduler.submit_calls.read().unwrap().clone();
     assert_eq!(submits.len(), 1, "scheduler should receive one SubmitBuild");
+    assert!(
+        !submits[0].keep_going,
+        "default policy must stay keep_going=false on the wire"
+    );
 
     h.finish().await;
     Ok(())
