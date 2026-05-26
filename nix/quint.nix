@@ -1670,6 +1670,86 @@ in
       witness = "s5LiveOwnerNeverReaped";
     };
 
+    # Stage-C calibration witnesses for the chunk-refcount subsystem (the
+    # historical-fix corpus replayed against the as-built model — the
+    # refcount-formal campaign's Phase-0 Stage C). Each check
+    # instantiates the as-built chunkLiveness model, swaps ONE owner-side
+    # entry point for its PRE-FIX behavior (the calibration module's
+    # `calibStep`), and passes only while the checker still falsifies the
+    # invariant the corresponding historical fix protects — machine-
+    # checked evidence that the model would re-find that bug class if it
+    # were reintroduced, and that the invariant is not vacuous for it.
+    # The full per-commit calibration table (and the evidence-only
+    # override modules that are not wired here) lives in
+    # docs/spec/models/refcount-invariant-map.md; these five are the
+    # representative per-family regression guards (one per encodable
+    # family, deepest consequence, cheap state space). Deliberately no
+    # tracey markers (same policy as the other witness checks).
+
+    # G1 (1cd975b90): the in-process rollback loses its PlaceholderToken /
+    # generation gate — a late rollback fires against a reaped-and-
+    # re-claimed placeholder, erasing the successor's reference and
+    # re-decrementing an already-reclaimed one, so the counter stops
+    # refining the manifest fold (the under-count direction M_023 exists
+    # to catch).
+    quint-refcount-calib-g1-token-rollback = mkQuintWitnessCheck {
+      name = "refcount-calib-g1-token-rollback";
+      spec = "calibration/refcount-g1";
+      main = "refcountCalibG1RollbackPreToken";
+      extraSpecs = [ "chunkLiveness" ];
+      step = "calibStep";
+      witness = "cr3CounterRefinesFold";
+    };
+
+    # G2 (e5bdbff1b / I-040): the owner-side reap reverts to the
+    # inline-only delete — manifests deleted, chunk accounting kept — so
+    # an unreferenced chunk is stranded above zero (the permanent-leak
+    # shape the I-040 incident produced).
+    quint-refcount-calib-g2-inline-reap = mkQuintWitnessCheck {
+      name = "refcount-calib-g2-inline-reap";
+      spec = "calibration/refcount-g2";
+      main = "refcountCalibG2ReapInlineOnly";
+      extraSpecs = [ "chunkLiveness" ];
+      step = "calibStep";
+      witness = "cr3CounterRefinesFold";
+    };
+
+    # G3 (dd5c11376 / M_033): the needs-upload verdict is keyed on the
+    # liveness record instead of uploaded_at — a writer skips the PUT for
+    # a chunk nobody confirmed, the 2026-04-06 data-loss precondition.
+    quint-refcount-calib-g3-counter-presence = mkQuintWitnessCheck {
+      name = "refcount-calib-g3-counter-presence";
+      spec = "calibration/refcount-g3";
+      main = "refcountCalibG3CounterAsPresence";
+      extraSpecs = [ "chunkLiveness" ];
+      step = "calibStep";
+      witness = "cr4PresenceFromConfirmedUpload";
+    };
+
+    # G4a (aa738a5d7 / M_006): the drain loses its same-transaction
+    # re-check before DeleteObject — a chunk resurrected by a re-upload
+    # between soft-delete and drain loses its object while referenced
+    # (the data-loss invariant's action form).
+    quint-refcount-calib-g4a-drain-recheck = mkQuintWitnessCheck {
+      name = "refcount-calib-g4a-drain-recheck";
+      spec = "calibration/refcount-g4a";
+      main = "refcountCalibG4aDrainNoRecheck";
+      extraSpecs = [ "chunkLiveness" ];
+      step = "calibStep";
+      witness = "cr1NoLiveChunkCollected";
+    };
+
+    # G5 (a1b49b4a3): no heartbeat — a live, progressing upload outlives
+    # the stale threshold and the reclaim path reaps it mid-flight.
+    quint-refcount-calib-g5-no-heartbeat = mkQuintWitnessCheck {
+      name = "refcount-calib-g5-no-heartbeat";
+      spec = "calibration/refcount-g5";
+      main = "refcountCalibG5NoHeartbeat";
+      extraSpecs = [ "chunkLiveness" ];
+      step = "calibStep";
+      witness = "s5LiveOwnerNeverReaped";
+    };
+
     # Implementation conformance (model-based testing). The regime checks
     # above prove the PROTOCOL; this one proves rio-lease implements
     # that protocol: rio-lease/src/mbt_tests.rs replays traces generated

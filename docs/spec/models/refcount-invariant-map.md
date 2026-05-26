@@ -25,8 +25,9 @@ amendments are listed at the end so they are not silently forgotten).
 Subject and evidence base: `rio-store` at the `formal-sprint` branch point
 this worktree was cut from; file:line evidence for every protocol claim is
 the inventory (cited as "inventory §N"). The Stage-B model (`chunkLiveness.qnt`)
-and the calibration table are later Phase-0 stages and are NOT part of this
-document's claims.
+and the Stage-C calibration were delivered after this audit and carry their
+own sections below; the audit text in this section makes no claims about
+them.
 
 ## The decision sites (the columns of every row below)
 
@@ -480,3 +481,290 @@ why CR-3 needs no crash-regime carve-out.
 - The Stage-C calibration corpus (design §3.4) is the next stage and is
   NOT part of this section's claims; its overrides will import this model
   the way `calibration/retry-g*.qnt` import `retryPolicyAsBuilt.qnt`.
+
+## Stage-C calibration: the historical-fix corpus replayed against the model
+
+The ~35-fix corpus (inventory §5, families G1–G7, plus the design's
+pre-registered G2×G3 joint-revert row) replayed against
+`chunkLiveness.qnt`: for each corpus commit the pre-fix behavior is either
+expressed as an override of the as-built model and shown to falsify an
+invariant (the model would re-find that bug), or its non-encodability is
+dispositioned with the missing dimension named. Method per the retry
+campaign's Stage C (and the design's §3.4 model-side-override correction):
+each override is a module in `docs/spec/models/calibration/refcount-g*.qnt`
+that instantiates the as-built model, replaces ONE owner-side entry point
+with a local PRE-FIX variant, and exposes the swapped transition relation
+as `calibStep` selected with `quint verify --step=calibStep`. The reference
+fold `refs(h)`, the ghost sensors, and every invariant keep their as-built
+definitions — they are the oracle, not part of the reverted behavior.
+Where a module restricts the alphabet below a Stage-B regime's constants,
+the distinguishing baseline (the as-built actions over the same
+restriction — the module's imported default `step`, or an explicit
+`baselineStep` where the restriction itself changes an action) was run
+against the same invariant and is recorded as HOLDS; modules that reuse a
+Stage-B regime's constants verbatim cite that regime's exhaustive Stage-B
+verdict as their baseline. No main-model file was touched by this stage:
+no invariant was added to `chunkLiveness.qnt`, the four regime checks are
+bit-identical to Stage B, and the only new invariant anywhere is one
+module-local ownership restatement (`completionRequiresCurrentOwner`,
+below), per the retry campaign's local-invariant precedent.
+
+Verdicts are exhaustive TLC results (violation runs stop at the first
+counterexample); depth = transitions in the counterexample, states =
+generated/distinct at the point TLC stopped, both from single-worker runs
+so the counterexamples are the deterministic shallowest ones; wall-clocks
+live in the introducing commit's message. Re-run command shape (the local
+apalache-server prelude of `nix/quint.nix` applies):
+
+```
+quint verify --backend=tlc --main=<module> --step=calibStep \
+  --invariant=<invariant> docs/spec/models/calibration/refcount-g<N>.qnt
+```
+
+The S4/L3 encoding caveat, recorded once: the main model's
+`s4OwnerOnlyMutation` / `l3NoForeignFreshen` are admission-predicate
+regression guards (they quantify over the as-built admission predicates
+themselves — the logService authGate pattern), so they bind edits to the
+main model's predicates and structurally cannot falsify from an additive
+override module. The ownership content of a G1 revert therefore falsifies
+here through its state-level consequences (CR-3 / M_023 / CR-4 / CR-1) or
+through a module-local restatement over the pre-fix admission predicate —
+which is where the design's §3.4 prediction ("S4, then CR-3") lands at
+this model's resolution.
+
+### Calibration table
+
+Classification legend: **ENC** — encodable, override written and run;
+**ENC-A** — encodable, covered by the named sibling override (disposition
+by analogy within the family, design §3.4); **NOT-ENC** — the model
+abstracts the mechanism away (the missing dimension is named); **SUBS** —
+the fix's subject no longer exists in the tree. Verdict format:
+invariant @ step (depth, generated/distinct).
+
+#### G1 — a late or foreign cleanup clobbered someone else's upload (ownership/identity)
+
+| Commit | Pre-fix behavior reverted | Class | Override module (calibration/refcount-g1.qnt) | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `1cd975b90` | DEC-1 rollback carries no PlaceholderToken / generation gate and takes no FOR UPDATE ownership lock — it deletes whatever 'uploading' row the path has and decrements the roller-back's own hash set against it | ENC | `refcountCalibG1RollbackPreToken` | S4-content via consequences: CR-3, then M_023 | **FALSIFIES** cr3CounterRefinesFold @ calibStep (depth 8, 208,974/12,056) and m023NonNegative @ calibStep (depth 8, 208,974/12,056) — the late rollback erases the successor's placeholder and re-decrements an already-reclaimed reference below zero; the incident shape is pinned by `g1PreTokenDoubleDecrementRun`. Baseline: contend-regime constants verbatim (Stage-B exhaustive HOLDS) |
+| `937a9c928` (completion half) | completion not claim-gated — a stale uploader that resumes after its placeholder was reaped and re-claimed flips the successor's in-flight placeholder to 'complete'; reaching that state also needs the contract-free clock of the progress-driven-heartbeat era (a stalled owner missed heartbeats while alive) | ENC | `refcountCalibG1CompletionUnclaimGated` | S4-content via the local ownership form, then CR-1 | **FALSIFIES** local `completionRequiresCurrentOwner` @ calibStep (depth 9, 53,278/5,798) and cr1NoLiveChunkCollected @ calibStep (depth 10, 142,842/15,174 — the foreign flip makes the successor's still-uploading manifest readable). Baselines over the same relaxed-clock alphabet: the local invariant **HOLDS exhaustively** (38,684,545/1,608,957) — the falsification is attributable to the claim gate; CR-1 does NOT hold on that baseline (depth 13, 2,458,154/187,657) via the independent late-mark window recorded under Findings, so the CR-1 run is supporting evidence, not the attribution |
+| `937a9c928` (heartbeat half) | heartbeat not claim-gated — a stale uploader keeps a foreign placeholder artificially fresh | NOT-ENC | — | — | the harm is an eventuality (the foreign freshen delays reaping; nothing is corrupted), outside this safety model; the ownership content is the same claim-gate discipline the completion half falsifies, and `l3NoForeignFreshen` guards the main model's heartbeat admission predicate. Coverage stays with the claim-gated heartbeat unit tests (store.put.placeholder-claim+2) |
+| `bf7e516e4` C1 | the owner-side reap (drop-guard / abort / complete-failure cleanup) matches on the path alone, not the claim — a late drop-guard reaps the successor's in-flight manifest and chunk accounting | ENC | `refcountCalibG1ReapPathMatched` | S4-content via consequences: CR-4 | **FALSIFIES** cr4PresenceFromConfirmedUpload @ calibStep (depth 11, 17,722/6,084) — the foreign reap soft-deletes and enqueues the successor's chunk; the successor commits presence on the soft-deleted row and the drain removes the just-uploaded object. Baseline (as-built step over the same one-path/one-hash restriction): HOLDS (185,649/35,161) |
+| `ae5f3190b` | hash/size length validation on the rollback path | NOT-ENC | — | — | input validation; pre-registered per-commit exception (design §3.4); existing unit tests |
+| `31bd9c512` | orphan scanner re-checks staleness inside the reap transaction | ENC-A | covered by `refcountCalibG1ReapPathMatched` (reap acting on a stale view of the row) | — | by analogy (sibling falsified); the literal pre-fix mechanism (the re-check moved inside the transaction) is an intra-transaction read/write split below the one-action-per-SQL-transaction granularity |
+| `539c2be7c` | reap re-checks status inside the transaction (reap-then-reupload race) | ENC-A | covered by `refcountCalibG1ReapPathMatched` | — | by analogy (same shape: a reap admitted against a row that changed under it) |
+| `31ce52b14` | reap re-reads chunk_list inside the transaction (stale-chunk-list double decrement) | ENC-A | covered by `refcountCalibG1RollbackPreToken` (a decrement justified by a stale view, double-charging a generation) | — | by analogy (sibling falsified) |
+
+#### G2 — a cleanup path forgot the chunks (leaked refcounts)
+
+| Commit | Pre-fix behavior reverted | Class | Override module (calibration/refcount-g2.qnt) | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `e5bdbff1b` (I-040) | the owner-side reap uses the inline-only delete: manifest rows deleted, chunk accounting never touched | ENC | `refcountCalibG2ReapInlineOnly` | CR-3, then CR-2 (the leak) | **FALSIFIES** cr3CounterRefinesFold @ calibStep (depth 4, 25/20) and cr2NoStrandedGarbage @ calibStep (depth 4, 25/20). Baseline (as-built step over the same one-uploader restriction): HOLDS both (1,072/398) |
+| `dbb42232a` | abort_upload and the batch drop path still inline-only | ENC-A | covered by `refcountCalibG2ReapInlineOnly` — the model's writers funnel every owner-side cleanup through the same reap action, so this is the same revert at model resolution | CR-3 | by analogy (sibling falsified) |
+| `adfd303d7` C2 | the path-sweep batch decrements a chunk shared by N dying manifests once, not N times | ENC | `refcountCalibG2SweepCollapsedCount` | CR-3, then CR-2 | **FALSIFIES** cr3CounterRefinesFold @ calibStep (depth 11, 3,348,835/146,119) and cr2NoStrandedGarbage @ calibStep (depth 11, 3,348,835/146,119) — the by-count clause of store.chunk.refcount-decrement, exercised end-to-end. Baseline: contend-regime constants verbatim (Stage-B exhaustive HOLDS) |
+| `d617bf3e5` | the M_023 `CHECK (refcount >= 0)` plus wiring the standalone orphan-chunk sweep | split | — | — | CHECK half: a passive schema constraint whose model image (`m023NonNegative`) is an invariant in every regime, not a mechanism an override can revert; the under-count class it detects is demonstrated by the `1cd975b90` override driving a counter to −1. Sweep-wiring half: **NOT-ENC** — the existence/cadence of a background collection loop is below the structural CR-2 encoding (the same pre-registered treatment as the 15-minute/hourly cadences); coverage stays with the sweep unit tests and the wired orphan-sweep witnesses |
+| `8d93ce6c1` | chunk_tenants junction cleanup | SUBS | — | — | the table was dropped by migration 035; the subject no longer exists |
+
+#### G3 — the counter was used as an S3-presence signal (data loss)
+
+| Commit | Pre-fix behavior reverted | Class | Override module (calibration/refcount-g3.qnt) | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `dd5c11376` (M_033) | the needs-upload verdict is keyed on the liveness record (row already exists ⇒ "someone else uploaded") instead of `uploaded_at` | ENC | `refcountCalibG3CounterAsPresence` | CR-4, then CR-1 (the production data-loss trace) | **FALSIFIES** cr4PresenceFromConfirmedUpload @ calibStep (depth 4, 1,602/145) and cr1NoLiveChunkCollected @ calibStep (depth 7, 115,050/7,014) — two concurrent writers of the same content; the loser skips the PUT nobody confirmed and completes. Baseline: crash-regime constants verbatim (Stage-B exhaustive HOLDS) |
+| `b1c7a9497` | the dedup verdict read in a separate statement after the upsert (re-query race) | ENC-A | covered by `refcountCalibG3CounterAsPresence` — the re-query race only loses data under the counter-as-presence semantics; both shapes produce the same harm state (a PUT skipped for an unconfirmed chunk) | CR-4 | by analogy (sibling falsified); the atomicity content is what the as-built `upgradeManifest` encodes and `store.cas.upsert-inserted+2` pins |
+| `127168477` | FastCDC duplicate hashes in one UNNEST batch crash the upsert | NOT-ENC | — | — | set-collapsed `chunk_list` and SQL-error granularity; pre-registered per-commit exception (design §3.4); covered by the upsert dedup unit test and the `manifest_deserialize` fuzz target |
+| `00fd5b12d` | the PutChunk RPC did not set `uploaded_at` | SUBS | — | — | the RPC was deleted (`c5bb34612`); the subject no longer exists |
+| G2×G3 joint revert (design §3.4 pre-registered row) | inline-only reap leaves a stale refcount behind a deleted manifest; counter-as-presence dedup then trusts it and skips the needed re-upload (the I-040 stale-skip trace) | ENC | `refcountCalibG3JointStaleSkip` | CR-4, then CR-1 | **FALSIFIES** cr4PresenceFromConfirmedUpload @ calibStep (depth 4, 1,262/121) and cr1NoLiveChunkCollected @ calibStep (depth 7, 76,630/4,969); BFS reports the two-concurrent-writers variant as the shallowest counterexample, and the documented I-040 reap-then-stale-skip shape is pinned deterministically by the module's `g3JointStaleSkipRun`. Baseline: contend-regime constants verbatim (Stage-B exhaustive HOLDS) |
+
+#### G4 — collect raced a concurrent re-reference (G4a chunk-level / G4b path-level)
+
+| Commit | Pre-fix behavior reverted | Class | Override module (calibration/refcount-g4a.qnt) | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `aa738a5d7` (M_006) | the drain deletes the backend object with no same-transaction re-check of the chunk's current state (the resurrect arm is left as built — the minimal delta) | ENC (G4a) | `refcountCalibG4aDrainNoRecheck` | CR-1 in the contend regime | **FALSIFIES** cr1NoLiveChunkCollected @ calibStep (depth 7, 63,334/4,030) — a re-upload resurrects the enqueued chunk and the pre-fix drain deletes its object while referenced (the action-form ghost). Baseline: contend-regime constants verbatim (Stage-B exhaustive HOLDS) |
+| `a2d4c6cd8` (drain re-check half) | the drain re-check ran without FOR UPDATE — its verdict could be stale at DeleteObject time | ENC-A | covered by `refcountCalibG4aDrainNoRecheck`: at one-action-per-SQL-transaction granularity the lockless re-check's staleness window collapses onto "the delete does not observe the concurrent resurrect" | CR-1 | by analogy (sibling falsified); the missing dimension for a literal encoding is an intra-transaction read/write split |
+| `a2d4c6cd8` (path_tenants + cycle-reclaim halves) | sweep deletes path_tenants; cycle reclaim via temp-table anti-join | NOT-ENC (G4b) | — | — | path-level reachability GC, pre-registered NOT-ENCODED; covered by `store.gc.sweep-path-tenants`, `store.gc.sweep-cycle-reclaim` and the sweep tests |
+| `2b68855c5`, `261e78c9d`, `7d5ff71dc` | the mark-vs-PutPath story (advisory lock, then placeholder-references + re-check) | NOT-ENC (G4b) | — | — | path unreachability is an abstract environment choice in `chunkLiveness.qnt` (design §3.2); covered by `store.gc.two-phase`, `store.put.placeholder-refs` and the mark/sweep tests |
+| `62851c73d`, `132446e7e`, `5ba946682`, `adfd303d7` C1/C3, `bf7e516e4` C5 | sweep resurrection transitivity, referrer-first ordering, settle-before-delete, path_tenants re-check | NOT-ENC (G4b) | — | — | same disposition: `store.gc.sweep-recheck+2`, `store.gc.sweep-referrer-order`, `store.gc.sweep-cycle-reclaim`, `store.gc.tenant-retention` and their tests; the replacement leaves this layer untouched (design §4.3, §8) |
+
+#### G5 — the repair loops reaped live uploads (heartbeat/liveness)
+
+| Commit | Pre-fix behavior reverted | Class | Override module (calibration/refcount-g5.qnt) | Predicted | Verdict |
+|---|---|---|---|---|---|
+| `a1b49b4a3` | no heartbeat exists — an upload that outlives the stale threshold is reapable mid-flight | ENC | `refcountCalibG5NoHeartbeat` | S5 | **FALSIFIES** s5LiveOwnerNeverReaped @ calibStep (depth 4, 152/35) — the hot-path reclaim reaps a live, guard-armed owner. Baseline (as-built step over the same constants): HOLDS (9,705/981). Complements the Stage-B threshold-order check: that one inverts the ordering, this one removes the heartbeat itself |
+| `064ceadbd` | wall-clock-driven guard heartbeat + claim plumbing for inline/slow ingests | ENC-A | heartbeat-existence content covered by `refcountCalibG5NoHeartbeat` (the model does not distinguish progress-driven from wall-clock heartbeats); the inline-ingest plumbing is outside the chunked-upload scope | S5 | by analogy (sibling falsified) |
+| `2d7e4f9fd` (I-207) | no hot-path stale reclaim — a stale placeholder blocks every re-claim of its path until the 15-minute scanner | witness-form (pre-registered) | `refcountCalibG5NoHotpathReclaim` | the `noHotpathReclaim` witness becomes unviolable; no safety falsification | **AS PRE-REGISTERED**: noHotpathReclaim HOLDS under calibStep (268,869/46,623 — the repair path is gone) while boundsOK, m023NonNegative, CR-1, CR-2, CR-3, CR-4 and S5 all HOLD over the same alphabet (268,869/46,623) — the revert's harm is latency, not safety. The with-mechanism half of the pair is the wired Stage-B witness `quint-chunk-liveness-witness-hotpath-reclaim` |
+| `da351aaff`, `f6bf0a546` | heartbeat/reap tasks moved to spawn_monitored | NOT-ENC | — | — | operability; pre-registered per-commit exception (the G7 treatment) |
+
+#### G6 — lock order (4 commits)
+
+`595b7ed9b`, `d64dbc4b0`, `5ad99b458`, `bf7e516e4` C4: **NOT-ENCODED**,
+exactly as pre-registered (design §3.4) — PG row-lock acquisition order is
+below the model's transaction-atomic granularity. Coverage stays with
+`store.chunk.lock-order`, `with_sorted_retry`, and the existing tests; the
+replacement shrinks the rule's site list but does not retire it.
+
+#### G7 — background-loop operability (6 commits)
+
+`bf7e516e4` C2/C3/C6/C7/C9, `adfd303d7` C4, `660825f19`, `947aaba79`,
+`468fd725a`, `a97af109b`: **NOT-ENCODED**, as pre-registered — pagination,
+per-row transaction isolation, gauge resets, SKIP LOCKED multi-replica
+behavior and poison-row livelocks are below this model's granularity. The
+design's "encode L4 only if cheap" option was evaluated and declined: a
+faithful L4 would need per-row error injection and loop iteration
+structure the model deliberately lacks. Coverage stays with the existing
+loop tests; the replacement's collector inherits exactly this obligation
+(design §7, the single-point-of-non-collection risk).
+
+### HOLDS rows and their dispositions
+
+No override predicted to falsify returned HOLDS: every ENC row above
+falsified its predicted invariant on the first run, so none of the three
+HOLDS dispositions (model gap / unstated property / redundancy candidate)
+was triggered. The two rows that record HOLDS verdicts are both
+by-construction: the `2d7e4f9fd` witness-form row (pre-registered by the
+design as a liveness/latency property, demonstrated by the witness pair
+plus the safety-intact run) and the restricted-alphabet baselines (HOLDS
+is their required outcome, and all of them hold — with the one CR-1
+baseline exception documented as a finding below, which is why that row's
+attribution rests on the module-local ownership invariant instead). No
+new invariant falsified on the unmodified model; there is no
+stop-and-report event.
+
+### Findings
+
+- **The late-mark window (found by the `937a9c928` baseline run, walked
+  against the code).** `mark_chunks_uploaded` is
+  `UPDATE chunks SET uploaded_at = now() WHERE blake3_hash = ANY($1) AND
+  uploaded_at IS NULL` — no `deleted` guard, no claim/generation gate
+  (metadata/chunked.rs). If an owner's row is stale-reclaimed while the
+  owner is still alive between its S3 PUTs and its mark (the reclaim
+  decrements, soft-deletes, clears `uploaded_at`, enqueues), the owner's
+  late mark re-asserts `uploaded_at` on the soft-deleted row; the drain's
+  re-check (`deleted AND refcount = 0`) then passes and deletes the
+  object, leaving confirmed-presence metadata with no backend object; the
+  next writer of the same content trusts `uploaded_at` (CR-4-compliant)
+  and skips the PUT — the M_033 harm shape without consulting the
+  counter. As built this interleaving is excluded **solely by the
+  heartbeat contract** (a live owner heartbeats every 30 s, so its row
+  cannot reach the 300 s reclaim threshold between PUT and mark): the
+  Stage-B crash regime holds CR-1 because a crashed owner never marks and
+  a live owner is never reaped. The model run that exposes it relaxes
+  exactly that contract (the calibration's contract-free clock), so this
+  is **not** an as-built falsification and not a stop-and-report event —
+  it is a documented dependency: `uploaded_at`-as-presence (CR-4(b),
+  CR-1) leans on the heartbeat contract, not only S5. The dependency
+  survives the replacement unchanged (mark, the drain re-check, and the
+  reapers all survive — design §4.2), so it is carried into the Phase-1
+  input list rather than being priced here.
+
+### Permanent expect-violation witnesses (wired into nix/quint.nix)
+
+Five of the ten override modules are wired as `quint-refcount-calib-*`
+checks — one representative per encodable family with a plausible
+regression path and a cheap state space (the retry campaign's
+proportion). Each passes only while the checker still falsifies the
+invariant under the module's `calibStep`.
+
+| Check | Module | Violated invariant | Guards against |
+|---|---|---|---|
+| `quint-refcount-calib-g1-token-rollback` | `refcountCalibG1RollbackPreToken` | `cr3CounterRefinesFold` | losing the PlaceholderToken / generation gate on the in-process rollback (1cd975b90) |
+| `quint-refcount-calib-g2-inline-reap` | `refcountCalibG2ReapInlineOnly` | `cr3CounterRefinesFold` | a cleanup path reverting to the inline-only delete (e5bdbff1b / I-040) |
+| `quint-refcount-calib-g3-counter-presence` | `refcountCalibG3CounterAsPresence` | `cr4PresenceFromConfirmedUpload` | re-keying the needs-upload verdict on the liveness record (dd5c11376 / M_033) |
+| `quint-refcount-calib-g4a-drain-recheck` | `refcountCalibG4aDrainNoRecheck` | `cr1NoLiveChunkCollected` | dropping the drain's same-transaction re-check before DeleteObject (aa738a5d7 / M_006) |
+| `quint-refcount-calib-g5-no-heartbeat` | `refcountCalibG5NoHeartbeat` | `s5LiveOwnerNeverReaped` | losing the heartbeat that keeps live uploads below the reclaim thresholds (a1b49b4a3) |
+
+The remaining five modules (`refcountCalibG1CompletionUnclaimGated`,
+`refcountCalibG1ReapPathMatched`, `refcountCalibG2SweepCollapsedCount`,
+`refcountCalibG3JointStaleSkip`, `refcountCalibG5NoHotpathReclaim`) are
+evidence modules: committed, typechecked with the tree, re-runnable with
+the command above, not in CI. G1/G2's wired checks guard machinery the
+campaign intends to delete (the token, the decrement family); they stay
+in CI until Phase 1c removes that machinery and are then retired or
+re-pointed exactly as the retry campaign's were in its Phase 2; the
+G3/G4a/G5 checks guard mechanisms that survive the replacement and are
+re-pointed at the counter-free model of record in Phase 2 (design §3.4).
+
+### Phase-0 exit-gate verdict (calibration criterion)
+
+**Met for the calibration clause of design §5 / §5a.** Every encodable
+family (G1, G2, G3, G4a, G5) falsifies at least one campaign invariant
+through a representative override — G1: 3 overrides falsify (plus the
+module-local ownership form); G2: 2; G3: 2 (including the pre-registered
+joint-revert row); G4a: 1; G5: 1 plus the pre-registered witness-form
+row — all as predicted, each row recording the falsified invariant,
+depth, and state count, with restricted-alphabet overrides carrying their
+baseline HOLDS and regime-verbatim overrides citing the Stage-B
+exhaustive verdicts. Every non-encodable row (G4b, G6, G7, and the
+per-commit NOT-ENC / ENC-A / SUBS rows inside G1–G5) carries its
+pre-registered disposition with the missing dimension and the covering
+rule/test named. No encodable-family representative failed to falsify
+without an accepted explanation (§5a bullet 1 not tripped); no §3.3
+invariant falsified on the unmodified as-built model (§5a bullet 4 not
+tripped — the late-mark finding arises only under a relaxed clock and is
+dispositioned above); the Stage-A consumer audit already established §5a
+bullet (a) clean and the `'uploading'`-as-live spec check (§5a bullet 3)
+closed. The calibration input to the go/no-go is therefore green. The
+remaining Phase-0 gate items are outside this stage and still open: the
+mark-scan cost measurement on production-scale data (and the junction
+fallback decision it prices), the collect-soundness enforcement choice
+(timeout vs monitored assumption), and the drafting of the replacement
+`#r()` rules (`store.chunk.liveness-derived`, `store.gc.chunk-collect`).
+
+### Phase-1 input list
+
+What the calibration adds to the Phase-1 plan beyond the design's
+existing commitments:
+
+- **The late-mark window is a named dependency to keep or close.** The
+  replacement keeps `mark_chunks_uploaded`, the drain re-check, and the
+  stale reclaims verbatim, so CR-1/CR-4(b) keep leaning on the heartbeat
+  contract through the window described under Findings. Phase 1a's
+  replacement model (design §4.6) should add a late-mark witness pair
+  alongside the mark-stale-race pair (reachability under a relaxed
+  contract; excluded under the kept contract), and Phase 1 should either
+  add `AND deleted = FALSE` to the mark statement (a one-conjunct change
+  that closes the window structurally — the resurrect path already
+  forces a re-upload after any soft-delete, so the narrowing costs
+  nothing) or carry "the wall-clock heartbeat task outlives the PUT
+  fan-out" as a named, monitored assumption next to the §4.1
+  writer-transaction bound. Decision belongs to Phase 1a, not here (no
+  Rust is touched in Phase 0).
+- **The §4.6 acceptance re-run set gains one member.** Beyond the
+  design's G4a/G5 re-runs, the `937a9c928` completion-clobber override
+  should be re-pointed at the replacement model: the completion claim
+  gate survives as a path-row janitor and its falsifiable content
+  (premature visibility of an in-flight successor) is unchanged by the
+  counter's removal.
+- **G1/G2 acceptance rows flip to "cannot recur by construction"** once
+  the counter, the token, and the decrement family are deleted (design
+  §4.6); their wired calibration checks are retired or re-pointed in
+  Phase 2. Until Release B ships, they stay in CI guarding the as-built
+  machinery.
+- **Keep the dedup verdict atomic with the upsert when the touch lands.**
+  The `b1c7a9497` subsumption note: Phase 1a adds `last_referenced_at`
+  to the same upsert statement; the §4.5 amendment of
+  `store.cas.upsert-inserted+2` must keep the RETURNING-atomic wording so
+  the pre-`b1c7a9497` re-query shape cannot reappear alongside the new
+  column.
+- **Loop-existence obligations stay outside the model.** The structural
+  CR-2 encoding cannot see a missing background loop (the `d617bf3e5`
+  sweep-wiring half), so the replacement's collector-existence and
+  backstop-cadence obligations are carried by the runtime metrics and
+  alerts the design already specifies plus the L4-style operability
+  tests — not by the model. Do not claim model coverage for them in the
+  Phase-1 exit gates.
+- **The S4/L3 admission-predicate caveat carries over.** The replacement
+  model should keep ownership gates falsifiable at the consequence level
+  (the calibration override pattern), since its admission-predicate forms
+  will have the same structural blindness to additive overrides.
+- **I-207 stays latency-only.** The hot-path reclaim's chunk-awareness
+  can be deleted in Phase 1c without a safety re-run (the witness-form
+  row shows safety is untouched by its absence); what must be preserved
+  is the path-level latency obligation (a stale placeholder yields within
+  the 300 s threshold), which it keeps as a path-row janitor.
+
+### Stage-C verify-marker status
+
+No new tracey markers: the calibration checks are regression guards for
+historical defect classes, not verifications of current spec rules, and
+carry no `r[verify]` markers (the same policy as every other witness
+check and as the retry campaign's calibration checks). The five Stage-A
+rules' marker status is unchanged from Stage B.
