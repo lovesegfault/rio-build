@@ -1275,29 +1275,28 @@ with a size-aware budget. Fetch failures surface to the build as `EIO`
     [Build execution (spawns nix-daemon in mount namespace, drives protocol)],
 
     src("rio-builder/src/overlay.rs"), [overlayfs setup and teardown],
-    src("rio-builder/src/fuse/mod.rs"),
-    [FUSE daemon lifecycle, mount management, `NixStoreFs` struct],
+    src("rio-builder/src/castore_fuse/mount.rs"),
+    [Per-build castore mount sequence: DAG prefetch, mountd handshake, the
+      builder's own `mount(2)`, serve, teardown],
 
-    src("rio-builder/src/fuse/ops.rs"),
-    [`Filesystem` trait implementation (all kernel callbacks: `lookup`,
-      `getattr`, `open`, `read`, `readlink`, `readdir`, `forget`, `init`,
-      `destroy`)],
+    src("rio-builder/src/castore_fuse/fs.rs"),
+    [`Filesystem` trait implementation (metadata from the in-heap tree,
+      passthrough/keep-cache `open()`, streaming-window `read()`)],
 
-    src("rio-builder/src/fuse/inode.rs"),
-    [Bidirectional inode↔path map with kernel `nlookup` refcounting],
+    src("rio-builder/src/castore_fuse/tree.rs"),
+    [Content-addressed inode table + the multi-root `GetDirectory` prefetch],
 
-    src("rio-builder/src/fuse/lookup.rs"),
-    [Attribute helpers: `stat_to_attr`, `ATTR_TTL`, `BLOCK_SIZE`],
+    src("rio-builder/src/castore_fuse/open.rs"),
+    [`open()` dispatch: backing-cache hit, whole-file JIT fetch + promote,
+      streaming-fill attach],
 
-    src("rio-builder/src/fuse/read.rs"),
-    [File-range read helper (`pread`) + `io::Error` → `Errno` translation],
+    src("rio-builder/src/castore_fuse/stream.rs"),
+    [Streaming fill for large files (chunk window, node chunk cache,
+      `GetChunks`, `PromoteChunks`)],
 
-    src("rio-builder/src/fuse/cache.rs"),
-    [LRU cache management (SQLite-indexed, SSD-backed)],
-
-    src("rio-builder/src/fuse/fetch/"),
-    [`ensure_cached`: NAR fetch + extract from rio-store (prefetch +
-      on-demand)],
+    src("rio-builder/src/castore_fuse/mountd.rs"),
+    [`rio-mountd`: the privileged per-node broker (backing-open ioctls,
+      verified promotes, staging quota)],
 
     src("rio-builder/src/synth_db.rs"),
     [Synthetic SQLite DB generation for nix-daemon],

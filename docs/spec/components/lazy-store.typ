@@ -174,8 +174,9 @@ is the Apache-2.0 Rust reference.
 
 == Builder mount sequence
 
-Replacing #(refs.gh)("rio-builder/src/fuse/mod.rs:494")
-`mount_fuse_background()`:
+Replacing the pre-castore `mount_fuse_background()` (today's equivalent:
+#(refs.gh)("rio-builder/src/castore_fuse/mount.rs")
+`mount_castore_background()`):
 
 ```rust
 pub fn mount_erofs_background(mount_point: &Path, cache_dir: &Path,
@@ -268,7 +269,8 @@ struct cachefiles_read {    // OP_READ payload
 )
 
 *rio-builder daemon* (`tokio::io::unix::AsyncFd`, not `mio` like Nydus, to
-share the runtime with #(refs.gh)("rio-builder/src/fuse/fetch/")):
+share the runtime with the builder's store-fetch path,
+#(refs.gh)("rio-builder/src/castore_fuse/open.rs")):
 
 ```rust
 async fn fscache_upcall_loop(dev: File, clients: StoreClients,
@@ -838,7 +840,8 @@ _correct about runtime simplicity_ but undersells three things:
   file in 2 wk with no KASAN splats, B's risk estimate drops and the week-4
   decision has real data on both sides.
 + *Keep FUSE as the fallback* behind the existing flag throughout — all three
-  share #(refs.gh)("rio-builder/src/fuse/fetch/").
+  share the builder's userspace fetch path
+  (#(refs.gh)("rio-builder/src/castore_fuse/open.rs")).
 
 = Rationale
 
@@ -853,7 +856,7 @@ load.
 
 The mitigations are layered, and the kernel-filesystem choice doesn't change
 them — both A and B funnel cold misses through the same userspace fetch path
-(#(refs.gh)("rio-builder/src/fuse/fetch/")):
+(#(refs.gh)("rio-builder/src/castore_fuse/open.rs")):
 
 - *Fetch timeout.* `fetch_extract_insert` wraps the entire
   gRPC-fetch-plus-stream-drain in `GRPC_STREAM_TIMEOUT` (300 s). A stalled
@@ -942,9 +945,8 @@ Our code:
 - #(refs.gh)("rio-store/src/grpc/put_path/"), #(refs.gh)("rio-store/src/cas.rs"),
   #(refs.gh)("rio-store/src/chunker.rs"), #(refs.gh)("rio-store/src/manifest.rs")
 - #(refs.gh)("rio-proto/proto/types.proto")
-- #(refs.gh)("rio-builder/src/fuse/mod.rs"),
-  #(refs.gh)("rio-builder/src/fuse/ops.rs"),
-  #(refs.gh)("rio-builder/src/fuse/fetch/"),
+- #(refs.gh)("rio-builder/src/castore_fuse/"),
+  #(refs.gh)("rio-builder/src/store_fetch.rs"),
   #(refs.gh)("rio-builder/src/overlay.rs")
 
 Background:

@@ -1,17 +1,18 @@
 //! I-115: nix-daemon's sandbox temp probes (`.chroot`/`.lock`/`.check`)
-//! reach store GetPath instead of FUSE-side ENOENT fast-path.
+//! reach store GetPath instead of a FUSE-side ENOENT fast-path.
 //!
-//! The original fix added a suffix denylist; that was later REPLACED by
-//! the JIT allowlist (`r[builder.fuse.jit-lookup]`), which is strictly
-//! stronger: only basenames in the per-build registered-input set
-//! trigger a fetch; everything else (the ~67 daemon probes per build)
-//! gets fast ENOENT. The metric is
-//! `rio_builder_fuse_jit_lookup_total{outcome="reject"}`.
+//! The original fix added a suffix denylist, later replaced by the
+//! old-FUSE JIT allowlist, and since the castore cutover the property
+//! is structural: the per-build castore mount serves `lookup()` from a
+//! tree prefetched at mount time, so a name outside the closure gets a
+//! cached negative dentry and NO lookup ever contacts the store. The
+//! observable signal is `rio_builder_castore_fuse_upcalls_total{op="lookup"}`
+//! ticking on a busy builder while the build proceeds.
 //!
 //! Regression check: submit a build, scrape its builder pod, assert
-//! `reject` > 0. If the allowlist gate were broken (e.g. `jit_classify`
-//! short-circuited to `KnownInput`), every probe would fall through to
-//! the store and `reject` would stay 0.
+//! lookup upcalls > 0 (the castore lookup path is live and answering
+//! from heap). If the castore mount were bypassed or broken, the build
+//! would fail outright or the counter would stay 0.
 
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct TempSuffixFastpath;
 
-const METRIC: &str = "rio_builder_fuse_jit_lookup_total";
+const METRIC: &str = "rio_builder_castore_fuse_upcalls_total";
 
 #[async_trait]
 impl Scenario for TempSuffixFastpath {
@@ -44,27 +45,27 @@ impl Scenario for TempSuffixFastpath {
         let bg = ctx.nix_build_via_gateway_bg(0, "i115", 30, 1);
 
         // Poll for any running builder, then scrape every one and sum
-        // `outcome="reject"` across them. With ephemeral one-build-per-
+        // `op="lookup"` across them. With ephemeral one-build-per-
         // pod workers we can't tie a pod to OUR build, but the property
-        // is cluster-level: if the JIT gate is broken, EVERY builder's
-        // reject count is 0.
+        // is cluster-level: if the castore lookup path is broken, EVERY
+        // builder's lookup count is 0.
         // Scrape EVERY builder on EVERY tick for the full 60s window —
         // don't break at first non-empty (a freshly-started pod from a
-        // concurrent scenario may have reject=0 because its daemon
-        // probes haven't fired yet; OUR build's pod might be later in
-        // the window). The property is cluster-level: gate broken ⇒
+        // concurrent scenario may have lookup=0 because its castore
+        // mount only just appeared; OUR build's pod might be later in
+        // the window). The property is cluster-level: path broken ⇒
         // EVERY scrape across the window shows 0.
-        let mut reject_sum = 0.0;
+        let mut lookup_sum = 0.0;
         let mut scraped = 0usize;
         for _ in 0..12 {
             sleep(Duration::from_secs(5)).await;
             for p in &ctx.running_pods(QaCtx::NS_BUILDERS, QaCtx::BUILDER_LABEL)? {
                 if let Ok(s) = scrape_builder(ctx, p).await {
-                    reject_sum += s.labeled(METRIC, "outcome", "reject").unwrap_or(0.0);
+                    lookup_sum += s.labeled(METRIC, "op", "lookup").unwrap_or(0.0);
                     scraped += 1;
                 }
             }
-            if reject_sum > 0.0 {
+            if lookup_sum > 0.0 {
                 break; // proven; no need to keep scraping
             }
         }
@@ -78,12 +79,13 @@ impl Scenario for TempSuffixFastpath {
                     .into(),
             ));
         }
-        if reject_sum > 0.0 {
+        if lookup_sum > 0.0 {
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(
-                "{METRIC}{{outcome=\"reject\"}} == 0 across {scraped} builder pod(s) — \
-                 JIT-lookup fast-path not firing; daemon temp probes likely hitting GetPath"
+                "{METRIC}{{op=\"lookup\"}} == 0 across {scraped} builder pod(s) — \
+                 the castore-FUSE lookup path is not serving; builds are either not \
+                 mounting the castore lower or not reaching their inputs"
             )))
         }
     }
