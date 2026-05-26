@@ -425,10 +425,13 @@ let
           )
           # On-curve samples (S=30 P=2000) -> synth-cost gets a fit on
           # the next refresh tick so intent_for takes the solve branch.
+          # Injected on the vm-sla tenant key: the real synth-cost build
+          # below is attributed to vm-sla, and the solve looks up the
+          # fit under the intent's own ModelKey.
           for c, t in [(4, 530), (8, 280), (16, 155), (32, 92.5), (64, 61.25)]:
               grpcurl_admin("InjectBuildSample", {
                   "pname": "synth-cost", "system": "x86_64-linux",
-                  "tenant": "", "durationSecs": t,
+                  "tenant": sla_tenant_id, "durationSecs": t,
                   "peakMemoryBytes": 1073741824,
                   "cpuLimitCores": c, "cpuSecondsTotal": t * c * 0.9,
               })
@@ -465,7 +468,8 @@ let
           if not aff:
               # Diagnostic: which solve_intent_for gate failed?
               st = json.loads(grpcurl_admin("SlaStatus", {
-                  "pname": "synth-cost", "system": "x86_64-linux", "tenant": "",
+                  "pname": "synth-cost", "system": "x86_64-linux",
+                  "tenant": sla_tenant_id,
               }))
               raise AssertionError(
                   "SpawnIntent.nodeAffinity empty: solve_full gate not "
@@ -597,7 +601,7 @@ let
               for hw, k in band_admit:
                   grpcurl_admin("InjectBuildSample", {
                       "pname": "synth-admit", "system": "x86_64-linux",
-                      "tenant": "", "durationSecs": t_ref / k,
+                      "tenant": sla_tenant_id, "durationSecs": t_ref / k,
                       "peakMemoryBytes": 1073741824,
                       "cpuLimitCores": c, "cpuSecondsTotal": (t_ref/k) * c * 0.9,
                       "hwClass": hw,
@@ -609,13 +613,14 @@ let
           for c in (4, 8, 16, 32, 64):
               grpcurl_admin("InjectBuildSample", {
                   "pname": "synth-serial", "system": "x86_64-linux",
-                  "tenant": "", "durationSecs": 10000,
+                  "tenant": sla_tenant_id, "durationSecs": 10000,
                   "peakMemoryBytes": 1073741824,
                   "cpuLimitCores": c, "cpuSecondsTotal": 10000.0 * c * 0.9,
               })
           wait_estimator_tick()
           st = json.loads(grpcurl_admin("SlaStatus", {
-              "pname": "synth-admit", "system": "x86_64-linux", "tenant": "",
+              "pname": "synth-admit", "system": "x86_64-linux",
+              "tenant": sla_tenant_id,
           }))
           assert st.get("hasFit"), f"synth-admit no fit after 15 hw-tagged samples: {st}"
           # Stop the worker so synth-admit stays Ready and shows up in

@@ -112,21 +112,24 @@ let
   # SpawnIntent and the controller injects it as a pod env var;
   # standalone has no SpawnIntent flow, so mint one here with
   # intent_id="" (matches the worker's empty Config.intent_id →
-  # heartbeat body check passes), kind=0 (Builder — standalone workers
-  # heartbeat the proto default; deny_unknown_fields means the field
-  # MUST be present), and a far-future expiry. Signed with the SAME
-  # hmac.key the scheduler loads so require_executor() verifies.
+  # heartbeat body check passes), the worker's kind (proto wire i32:
+  # 0=Builder, 1=Fetcher — the scheduler rejects a heartbeat whose body
+  # kind differs from the token's, so a fixture worker that sets
+  # RIO_EXECUTOR_KIND=fetcher needs a fetcher-kind token), and a
+  # far-future expiry. Signed with the SAME hmac.key the scheduler
+  # loads so require_executor() verifies.
   # Written as a systemd EnvironmentFile (KEY=value) — NOT
   # readFile-into-env: eval-time readFile of a derivation output is
   # an IFD anti-pattern even now that the hmacKeys derivation is
   # deterministic. r[sec.executor.identity-token].
-  executorTokenEnv =
-    pkgs.runCommand "rio-executor-token-env"
+  executorTokenEnvFor =
+    kind:
+    pkgs.runCommand "rio-executor-token-env-kind${toString kind}"
       {
         nativeBuildInputs = [ pkgs.python3 ];
       }
       ''
-        python3 - ${hmacKeys}/hmac.key > $out <<'EOF'
+        python3 - ${hmacKeys}/hmac.key ${toString kind} > $out <<'EOF'
         import base64, hashlib, hmac, json, sys
         key = open(sys.argv[1], "rb").read()
         # Mirror rio-auth load_key() trailing-newline trim.
@@ -135,7 +138,7 @@ let
                 key = key[: -len(suf)]
                 break
         claims = json.dumps(
-            {"intent_id": "", "kind": 0, "expiry_unix": 9999999999},
+            {"intent_id": "", "kind": int(sys.argv[2]), "expiry_unix": 9999999999},
             separators=(",", ":"),
         ).encode()
         sig = hmac.new(key, claims, hashlib.sha256).digest()
@@ -270,21 +273,29 @@ let
   # withHmac, also mount the static executor-token EnvironmentFile so
   # rio-builder presents x-rio-executor-token (otherwise the
   # scheduler's require_executor() rejects the BuildExecution stream
-  # and every heartbeat with Unauthenticated).
-  workerNodes = lib.mapAttrs (name: args: {
-    imports = [
-      (common.mkWorkerNode (
-        args
-        // {
-          hostName = name;
-          otelEndpoint = workerOtelEndpoint;
-        }
-      ))
-    ];
-    systemd.services.rio-builder.serviceConfig.EnvironmentFile = lib.mkIf withHmac [
-      "${executorTokenEnv}"
-    ];
-  }) workers;
+  # and every heartbeat with Unauthenticated). The token's kind follows
+  # the worker's RIO_EXECUTOR_KIND (fetcher workers heartbeat kind=1
+  # and the scheduler rejects a kind/token mismatch).
+  workerNodes = lib.mapAttrs (
+    name: args:
+    let
+      executorKind = if (args.extraServiceEnv.RIO_EXECUTOR_KIND or "") == "fetcher" then 1 else 0;
+    in
+    {
+      imports = [
+        (common.mkWorkerNode (
+          args
+          // {
+            hostName = name;
+            otelEndpoint = workerOtelEndpoint;
+          }
+        ))
+      ];
+      systemd.services.rio-builder.serviceConfig.EnvironmentFile = lib.mkIf withHmac [
+        "${executorTokenEnvFor executorKind}"
+      ];
+    }
+  ) workers;
 
 in
 {
