@@ -348,17 +348,28 @@ pkgs.testers.runNixOSTest {
     def check_entry(name, meta):
         with subtest(f"corpus entry: {name}"):
             drv = instantiate(name, meta)
-            # Later corpus entries depend on earlier entries' outputs
-            # (e.g. erg-with-drv exports the trivial entry's graph), and
-            # the native driver computes its input closure with
-            # `nix-store -qR`, which requires every input to be a valid
-            # store path. Realise the entry's input derivations first so
-            # the native side sees the same materialized inputs the
-            # oracle build would create on demand.
-            refs = machine.succeed(f"nix-store -q --references {drv}")
-            input_drvs = " ".join(r for r in refs.split() if r.endswith(".drv"))
-            if input_drvs:
-                machine.succeed(f"nix-store --realise {input_drvs} >/dev/null")
+            # stdenv-probe is exempt from the input pre-realisation: its
+            # toolchain inputs are pre-seeded via additionalPaths
+            # (inputDerivation closure) with exactly the outputs the
+            # build uses (bash[out], stdenv[out]). `nix-store --realise`
+            # on those input drvs would demand ALL their outputs
+            # (dev/man/doc/info/debug too), which this network-less,
+            # substituter-less VM could only satisfy by building bash
+            # and its whole bootstrap from source. Every other entry's
+            # inputs are single-output and fully shipped (or are sibling
+            # corpus entries), so the pre-realise stays for them.
+            if meta.get("corpus") != "stdenv":
+                # Later corpus entries depend on earlier entries' outputs
+                # (e.g. erg-with-drv exports the trivial entry's graph), and
+                # the native driver computes its input closure with
+                # `nix-store -qR`, which requires every input to be a valid
+                # store path. Realise the entry's input derivations first so
+                # the native side sees the same materialized inputs the
+                # oracle build would create on demand.
+                refs = machine.succeed(f"nix-store -q --references {drv}")
+                input_drvs = " ".join(r for r in refs.split() if r.endswith(".drv"))
+                if input_drvs:
+                    machine.succeed(f"nix-store --realise {input_drvs} >/dev/null")
             report = native_build(name, drv)
             try:
                 run_entry_assertions(name, meta, drv, report)
