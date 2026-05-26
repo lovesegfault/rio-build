@@ -1804,6 +1804,11 @@
       "doc": "Cross-tenant: B cannot read A's output via narinfo."
     },
     {
+      "path": "k8s/qa/scenarios/pol01_keep_going.rs",
+      "depth": 3,
+      "doc": "pol01: per-tenant keep_going over ssh-ng (`r[gw.build.per-tenant-policy]`)."
+    },
+    {
       "path": "k8s/qa/scheduler.rs",
       "depth": 2,
       "doc": "Two-phase scenario scheduler."
