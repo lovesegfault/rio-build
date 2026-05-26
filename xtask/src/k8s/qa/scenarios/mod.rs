@@ -59,6 +59,7 @@ mod i209_assignment_terminal;
 mod iso01_cross_tenant_listbuilds;
 mod iso02_cross_tenant_same_drv;
 mod iso03_cross_tenant_path_read;
+mod pol01_keep_going;
 
 pub static ALL: &[&dyn Scenario] = &[
     // ─── Shared (read-only) ───────────────────────────────────────────
@@ -91,6 +92,7 @@ pub static ALL: &[&dyn Scenario] = &[
     &i204_big_parallel_routing::BigParallelRouting,
     &i052_addmultiple_sequential::AddMultipleSequential,
     &i110_batch_rpc_scale::BatchRpcScale,
+    &pol01_keep_going::KeepGoingPolicy,
     // ─── Tenant{count:2} (cross-tenant isolation) ─────────────────────
     &iso01_cross_tenant_listbuilds::CrossTenantListBuilds,
     &iso02_cross_tenant_same_drv::CrossTenantSameDrv,
