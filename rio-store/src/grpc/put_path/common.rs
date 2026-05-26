@@ -329,8 +329,16 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
 /// Non-self-referencing recursive-SHA256 uploads keep using the
 /// already-verified plain NAR hash (identical to the modulo hash when
 /// there are no occurrences) — no second pass over the bytes; other
-/// algorithms re-hash the buffered NAR (or the extracted file, for
-/// flat ingestion) with the declared algorithm.
+/// algorithms re-hash the buffered NAR with the declared algorithm,
+/// and flat ingestion hashes the single file's bytes in place from the
+/// buffered NAR (no extraction copy, no artificial size ceiling).
+///
+/// When a `fixed:` descriptor is present but disagrees with the plain
+/// hash, the gate retries once with the hash modulo the claimed path's
+/// own hash part before rejecting: structured-attrs
+/// `unsafeDiscardReferences` legitimately produces uploads whose bytes
+/// embed their own path while declaring no self-reference, and CppNix
+/// mints those paths from exactly that modulo hash.
 ///
 /// `None`/non-CA claims → no-op (IA already gated, dev/service
 /// bypass already trusted).
@@ -383,18 +391,43 @@ pub(in crate::grpc) fn verify_ca_store_path(
             sink.write_all(nar_data)
                 .map_err(|e| Status::internal(format!("{ctx_label}: hash-modulo: {e}")))?;
             sink.finish().0
-        } else if algo == rio_nix::hash::HashAlgo::SHA256 {
-            // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar
-            // has already confirmed it equals SHA-256(stream)).
-            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
-                .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))?
         } else {
-            // Non-SHA-256 recursive ingestion: re-hash the buffered NAR
-            // with the declared algorithm.
-            let mut w = rio_nix::ca::HashWriter::new(algo);
-            w.write_all(nar_data)
-                .map_err(|e| Status::internal(format!("{ctx_label}: nar hash ({algo}): {e}")))?;
-            w.finish()
+            let plain = if algo == rio_nix::hash::HashAlgo::SHA256 {
+                // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar
+                // has already confirmed it equals SHA-256(stream)).
+                rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
+                    .map_err(|e| {
+                        Status::internal(format!("{ctx_label}: nar_hash construct: {e}"))
+                    })?
+            } else {
+                // Non-SHA-256 recursive ingestion: re-hash the buffered NAR
+                // with the declared algorithm.
+                let mut w = rio_nix::ca::HashWriter::new(algo);
+                w.write_all(nar_data).map_err(|e| {
+                    Status::internal(format!("{ctx_label}: nar hash ({algo}): {e}"))
+                })?;
+                w.finish()
+            };
+            // Descriptor-gated fallback for *unrecorded* self-references:
+            // CppNix's structured-attrs `unsafeDiscardReferences` mints
+            // paths whose bytes embed their own hash while declaring no
+            // self-reference, and the `fixed:` descriptor then carries the
+            // hash *modulo* those occurrences. If the descriptor disagrees
+            // with the plain hash, re-hash modulo the claimed path's own
+            // hash before concluding anything — still self-certifying (the
+            // modulus is the claimed path itself), and the extra pass is
+            // only paid when the plain hash already failed to match.
+            match &descriptor {
+                Some(d) if d.hash != plain => {
+                    let mut sink =
+                        rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
+                    sink.write_all(nar_data).map_err(|e| {
+                        Status::internal(format!("{ctx_label}: hash-modulo fallback: {e}"))
+                    })?;
+                    sink.finish().0
+                }
+                _ => plain,
+            }
         }
     } else {
         // Flat ingestion: the content hash is over the bytes of the
@@ -406,17 +439,22 @@ pub(in crate::grpc) fn verify_ca_store_path(
                 "{ctx_label}: flat content-addressed upload declares a self-reference"
             )));
         }
-        // extract_single_file copies the file bytes out of the buffered
-        // NAR, briefly doubling peak memory for this upload — fine at
-        // FOD/flat-output sizes; offset-based hashing over the NAR slice
-        // is the future option if that ever matters.
-        let file = rio_nix::nar::extract_single_file(nar_data).map_err(|e| {
+        // Hash the file bytes in place from the already-buffered NAR: no
+        // copy of the contents, and no size ceiling beyond the store's own
+        // upload limit (the general-purpose NAR parser's 256 MiB
+        // single-content cap does not apply to flat verification).
+        let (off, len) = single_file_nar_content_range(nar_data).map_err(|e| {
             Status::invalid_argument(format!(
                 "{ctx_label}: flat content-addressed upload is not a single-file NAR: {e}"
             ))
         })?;
+        let len = usize::try_from(len).map_err(|_| {
+            Status::invalid_argument(format!(
+                "{ctx_label}: flat content length does not fit this platform"
+            ))
+        })?;
         let mut w = rio_nix::ca::HashWriter::new(algo);
-        w.write_all(&file)
+        w.write_all(&nar_data[off..off + len])
             .map_err(|e| Status::internal(format!("{ctx_label}: flat hash ({algo}): {e}")))?;
         w.finish()
     };
@@ -791,6 +829,114 @@ impl StoreServiceImpl {
     }
 }
 
+/// Locate the contents of a single-regular-file NAR inside `nar`,
+/// returning `(offset, length)` of the file bytes without copying them
+/// and without the general-purpose parser's per-file size cap.
+///
+/// The framing is validated strictly: magic, `regular` type (an
+/// optional `executable` marker is allowed, matching what flat
+/// ingestion accepts), zero padding, a closing parenthesis, and no
+/// trailing bytes. Anything else — directories, symlinks, truncation —
+/// is an error, so this is exactly as strict as the extracting parser
+/// it replaces, minus the copy and the cap.
+fn single_file_nar_content_range(nar: &[u8]) -> Result<(usize, u64), String> {
+    fn read_u64(nar: &[u8], pos: &mut usize) -> Result<u64, String> {
+        let end = pos
+            .checked_add(8)
+            .ok_or_else(|| "length field overflows".to_string())?;
+        let bytes = nar
+            .get(*pos..end)
+            .ok_or_else(|| "truncated NAR: expected a length field".to_string())?;
+        *pos = end;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("8-byte slice")))
+    }
+    fn read_token<'a>(nar: &'a [u8], pos: &mut usize) -> Result<&'a [u8], String> {
+        let len = read_u64(nar, pos)?;
+        let len = usize::try_from(len).map_err(|_| "token length overflows".to_string())?;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| "token length overflows".to_string())?;
+        let tok = nar
+            .get(*pos..end)
+            .ok_or_else(|| "truncated NAR: token".to_string())?;
+        *pos = end;
+        let pad = (8 - len % 8) % 8;
+        let pad_end = pos
+            .checked_add(pad)
+            .ok_or_else(|| "padding overflows".to_string())?;
+        let padding = nar
+            .get(*pos..pad_end)
+            .ok_or_else(|| "truncated NAR: token padding".to_string())?;
+        if padding.iter().any(|b| *b != 0) {
+            return Err("non-zero token padding".to_string());
+        }
+        *pos = pad_end;
+        Ok(tok)
+    }
+    fn expect(nar: &[u8], pos: &mut usize, want: &[u8]) -> Result<(), String> {
+        let tok = read_token(nar, pos)?;
+        if tok != want {
+            return Err(format!(
+                "expected `{}`, found `{}`",
+                std::str::from_utf8(want).unwrap_or("<non-utf8>"),
+                std::str::from_utf8(tok).unwrap_or("<non-utf8>")
+            ));
+        }
+        Ok(())
+    }
+
+    let mut pos = 0usize;
+    expect(nar, &mut pos, b"nix-archive-1")?;
+    expect(nar, &mut pos, b"(")?;
+    expect(nar, &mut pos, b"type")?;
+    let ty = read_token(nar, &mut pos)?;
+    if ty != b"regular" {
+        return Err(format!(
+            "not a regular file (type `{}`)",
+            std::str::from_utf8(ty).unwrap_or("<non-utf8>")
+        ));
+    }
+    let mut tok = read_token(nar, &mut pos)?;
+    if tok == b"executable" {
+        let empty = read_token(nar, &mut pos)?;
+        if !empty.is_empty() {
+            return Err("malformed executable marker".to_string());
+        }
+        tok = read_token(nar, &mut pos)?;
+    }
+    if tok != b"contents" {
+        return Err(format!(
+            "expected `contents`, found `{}`",
+            std::str::from_utf8(tok).unwrap_or("<non-utf8>")
+        ));
+    }
+    let len = read_u64(nar, &mut pos)?;
+    let len_usize = usize::try_from(len).map_err(|_| "content length overflows".to_string())?;
+    let offset = pos;
+    let content_end = offset
+        .checked_add(len_usize)
+        .ok_or_else(|| "content length overflows".to_string())?;
+    if nar.len() < content_end {
+        return Err("truncated NAR: contents".to_string());
+    }
+    let pad = (8 - len_usize % 8) % 8;
+    let pad_end = content_end
+        .checked_add(pad)
+        .ok_or_else(|| "content padding overflows".to_string())?;
+    let padding = nar
+        .get(content_end..pad_end)
+        .ok_or_else(|| "truncated NAR: content padding".to_string())?;
+    if padding.iter().any(|b| *b != 0) {
+        return Err("non-zero content padding".to_string());
+    }
+    let mut tail = pad_end;
+    expect(nar, &mut tail, b")")?;
+    if tail != nar.len() {
+        return Err("trailing bytes after the single-file NAR".to_string());
+    }
+    Ok((offset, len))
+}
+
 // r[verify sec.drv.validate]
 // r[verify store.integrity.verify-on-put]
 #[cfg(test)]
@@ -909,6 +1055,121 @@ mod verify_nar_tests {
         let info = ca_info(&path, &[], &nar);
         let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
         assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// Discarded self-reference (structured-attrs `unsafeDiscardReferences`):
+    /// the bytes embed the claimed path, `references` is empty, and the
+    /// `fixed:` descriptor carries the modulo hash — the shape both CppNix
+    /// and the native builder produce. The gate must accept it, and still
+    /// reject the same NAR claimed under a different path.
+    #[test]
+    fn ca_discarded_self_reference_with_descriptor_accepted() {
+        use std::io::Write as _;
+        let drv =
+            rio_nix::store_path::StorePath::parse(&test_drv_path("selfref-discarded")).unwrap();
+        let scratch =
+            rio_nix::store_path::StorePath::make_scratch_output_path(&drv, "out").unwrap();
+        let content_at_scratch = format!("I live at {}\n", scratch.as_str()).into_bytes();
+        let nar_at_scratch = nar_of_file(&content_at_scratch);
+        let mut sink =
+            rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &scratch.hash_part());
+        sink.write_all(&nar_at_scratch).unwrap();
+        let (modulo, _) = sink.finish();
+        // Self flag OFF: the references were discarded.
+        let final_path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "selfref-discarded",
+            &modulo,
+            true,
+            &[],
+            false,
+        )
+        .unwrap();
+        let final_content = String::from_utf8(content_at_scratch)
+            .unwrap()
+            .replace(&scratch.hash_part(), &final_path.hash_part())
+            .into_bytes();
+        let nar = nar_of_file(&final_content);
+
+        let mut info = ca_info(&final_path, &[], &nar);
+        info.content_address = Some(format!("fixed:r:{}", modulo.to_colon()));
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("discarded-self upload with a modulo descriptor must pass");
+
+        // Same NAR + descriptor claimed under a different path: the
+        // fallback modulus changes, nothing matches, still rejected.
+        let other = rio_nix::store_path::StorePath::parse(&test_store_path("imposter2")).unwrap();
+        let mut info = ca_info(&other, &[], &nar);
+        info.content_address = Some(format!("fixed:r:{}", modulo.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// Flat verification has no 256 MiB ceiling: a single-file NAR whose
+    /// contents exceed the general-purpose parser's per-file cap still
+    /// verifies (the store's own upload limit is the only ceiling).
+    #[test]
+    fn ca_flat_contents_beyond_the_parser_cap_accepted() {
+        fn push_tok(buf: &mut Vec<u8>, tok: &[u8]) {
+            buf.extend_from_slice(&(tok.len() as u64).to_le_bytes());
+            buf.extend_from_slice(tok);
+            buf.resize(buf.len() + (8 - tok.len() % 8) % 8, 0);
+        }
+        // 256 MiB + 9 bytes of zeros, framed by hand so the test does not
+        // depend on the writer (or pay for a second copy).
+        let len: usize = 256 * 1024 * 1024 + 9;
+        let mut nar = Vec::with_capacity(len + 192);
+        for t in [
+            b"nix-archive-1".as_slice(),
+            b"(",
+            b"type",
+            b"regular",
+            b"contents",
+        ] {
+            push_tok(&mut nar, t);
+        }
+        nar.extend_from_slice(&(len as u64).to_le_bytes());
+        let contents_start = nar.len();
+        nar.resize(nar.len() + len, 0);
+        nar.resize(nar.len() + (8 - len % 8) % 8, 0);
+        push_tok(&mut nar, b")");
+
+        let digest: [u8; 32] = Sha256::digest(&nar[contents_start..contents_start + len]).into();
+        let flat_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
+        let path =
+            rio_nix::store_path::StorePath::make_fixed_output("flat-big", &flat_hash, false, &[])
+                .unwrap();
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("flat upload larger than the old parser cap must pass");
+    }
+
+    #[test]
+    fn single_file_nar_content_range_validates_framing() {
+        // Round-trip against the writer for both executable flavors.
+        for executable in [false, true] {
+            let node = rio_nix::nar::NarNode::Regular {
+                executable,
+                contents: b"hello".to_vec(),
+            };
+            let mut nar = Vec::new();
+            rio_nix::nar::serialize(&mut nar, &node).unwrap();
+            let (off, len) = single_file_nar_content_range(&nar).expect("valid single-file NAR");
+            assert_eq!(&nar[off..off + len as usize], b"hello");
+        }
+        // Directory NARs are not single files.
+        let dir = rio_nix::nar::NarNode::Directory { entries: vec![] };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &dir).unwrap();
+        assert!(single_file_nar_content_range(&nar).is_err());
+        // Trailing garbage is rejected.
+        let mut nar = nar_of_file(b"x");
+        nar.extend_from_slice(b"garbage!");
+        assert!(single_file_nar_content_range(&nar).is_err());
+        // Truncation is rejected.
+        let nar = nar_of_file(b"some contents here");
+        assert!(single_file_nar_content_range(&nar[..nar.len() - 4]).is_err());
     }
 
     #[test]
