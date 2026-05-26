@@ -127,8 +127,9 @@ pub(super) const STREAM_CHANNEL_BUF: usize = 4;
 /// [`UploadError::InvalidReference`] rather than silently dropped:
 /// dropping would corrupt the output's reference graph and break GC
 /// reachability. `deriver` may be empty (dev mode), which maps to
-/// `None`. Fields not known at upload time (`registration_time`,
-/// `signatures`, `content_address`, …) are left default; the store
+/// `None`. `content_address` carries the output's own CA descriptor
+/// when it has one. Fields not known at upload time
+/// (`registration_time`, `signatures`, …) are left default; the store
 /// fills them server-side.
 pub(super) fn uploaded_info(
     store_path: StorePath,

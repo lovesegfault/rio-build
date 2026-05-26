@@ -6,8 +6,9 @@
 //! makes the path a cache hit (narinfo + manifests via CASCADE,
 //! path_tenants, and — unless `--keep-realisations` — the realisations
 //! rows resolving to it) so the next submission misses the cache and
-//! re-executes. Chunk data is untouched; GC reclaims orphans on its
-//! normal sweep. Idempotent: invalidating an absent path reports
+//! re-executes. Chunk refcounts are decremented alongside; chunks that
+//! drop to zero are marked deleted and enqueued for backend deletion.
+//! Idempotent: invalidating an absent path reports
 //! `found = false` and exits 0.
 
 use rio_proto::types::InvalidatePathRequest;

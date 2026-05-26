@@ -361,8 +361,9 @@ enum Cmd {
     /// Invalidate a store path's cache metadata (narinfo, manifests,
     /// path_tenants, and by default its realisations) so the next
     /// submission misses the cache and re-executes. Operator
-    /// remediation for wrong-content uploads; does NOT delete chunk
-    /// data (GC reclaims orphans). Talks to StoreAdminService directly.
+    /// remediation for wrong-content uploads; chunk refcounts are
+    /// decremented and zeroed chunks queued for backend deletion. Talks
+    /// to StoreAdminService directly.
     InvalidatePath(invalidate_path::Args),
     /// Generate an ed25519 narinfo signing keypair in Nix's
     /// `name:base64` format (what `signing_key_path` loads and what

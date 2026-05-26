@@ -136,8 +136,9 @@ pub struct OutputToUpload {
     /// `unsafeDiscardReferences`. A self-referencing output lists its
     /// own final path here.
     pub references: Vec<String>,
-    /// `fixed:[r:]<algo>:<hash>` descriptor for floating-CA outputs;
-    /// `None` for input-addressed and fixed-output outputs.
+    /// `fixed:[r:]<algo>:<hash>` descriptor for content-addressed
+    /// outputs — floating-CA finalization or a fixed-output derivation's
+    /// declared hash; `None` for input-addressed outputs.
     pub content_address: Option<String>,
 }
 

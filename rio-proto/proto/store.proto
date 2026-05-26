@@ -179,7 +179,8 @@ service StoreAdminService {
   // realisations/realisation_deps rows resolving to it) so the next
   // submission misses the cache and re-executes. Operator remediation
   // for wrong-content uploads; idempotent (absent path → found=false,
-  // zero counts). Does NOT delete chunk data — GC reclaims orphaned
-  // chunks on its normal sweep.
+  // zero counts). Chunk refcounts referenced by the deleted
+  // manifests are decremented in the same transaction; chunks that drop
+  // to zero are marked deleted and enqueued for backend deletion.
   rpc InvalidatePath(rio.types.InvalidatePathRequest) returns (rio.types.InvalidatePathResponse);
 }
