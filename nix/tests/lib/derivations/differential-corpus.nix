@@ -396,8 +396,10 @@ rec {
   # closure info is rendered INTO .attrs.json (closure_info_json on the
   # native side, writeStructuredAttrs on the oracle side) instead of a flat
   # registration file. Copying .attrs.json into $out makes the NAR
-  # comparison pin the JSON renderer's field set (SRI narHash, no `ca`
-  # field, closureSize, ordering) byte-for-byte against the oracle.
+  # comparison pin the JSON renderer's field set (colon-form nixbase32
+  # narHash, narSize, references, closureSize, `valid`, and `ca` for
+  # content-addressed members, key ordering) byte-for-byte against the
+  # oracle.
   erg-structured =
     mkDrv "rio-diff-erg-structured"
       ''
@@ -644,6 +646,26 @@ rec {
         __structuredAttrs = true;
         __contentAddressed = true;
         outputHashMode = "recursive";
+        outputHashAlgo = "sha256";
+        unsafeDiscardReferences.out = true;
+      };
+
+  # The flat-mode sibling of ca-discard-self: the output is a single
+  # regular file whose bytes embed the output's own path, with the
+  # recorded references discarded. CppNix still applies rewriteOutput
+  # before the flat hash, so the native side must hash the rewritten
+  # bytes too — path, descriptor, and registered (empty) reference set
+  # must match the oracle.
+  ca-discard-self-flat =
+    mkDrv "rio-diff-ca-discard-self-flat"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        echo "I live at ''${outputs[out]}" > ''${outputs[out]}
+      ''
+      {
+        __structuredAttrs = true;
+        __contentAddressed = true;
+        outputHashMode = "flat";
         outputHashAlgo = "sha256";
         unsafeDiscardReferences.out = true;
       };

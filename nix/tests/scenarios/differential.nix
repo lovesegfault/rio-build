@@ -216,6 +216,14 @@ let
       expect = "parity";
       references_must_be_empty = true;
     };
+    ca-discard-self-flat = {
+      # Flat-mode variant: the single-file output embeds its own path,
+      # references discarded. The flat hash must be computed over the
+      # rewritten bytes (CppNix runs rewriteOutput before hashing in
+      # flat mode too), so both arms mint the same path.
+      expect = "parity";
+      references_must_be_empty = true;
+    };
     # ── Heavyweight entries: 32-bit ABI + real stdenv ──────────────────
     i686-trivial = {
       expect = "parity";
