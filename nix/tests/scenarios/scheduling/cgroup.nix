@@ -16,15 +16,18 @@ scope: with scope; ''
       build("${cgroupDrv}")
 
       # psql -qtA: NULL → empty line. grep matches ≥7 digits = ≥1MB.
-      # wait_until_succeeds: small window between client-sees-built
-      # and scheduler-actor DB commit. 10s is overkill but costs
-      # nothing when the happy path commits in <100ms.
+      # wait_until_succeeds: window between client-sees-built and the
+      # scheduler-actor DB commit. The happy path commits in <100ms,
+      # but under a contended builder (full check-matrix runs) the
+      # commit has repeatedly taken >10s — the wait returns as soon as
+      # the row appears, so the wide ceiling only matters on the slow
+      # tail.
       ${gatewayHost}.wait_until_succeeds(
           "sudo -u postgres psql rio -qtAc "
           "\"SELECT peak_memory_bytes FROM build_samples "
           "WHERE pname = 'rio-sched-cgroup'\" | "
           "grep -qE '^[0-9]{7,}$'",
-          timeout=10,
+          timeout=60,
       )
 
       # CPU: the drv sleeps 3s specifically so the 1Hz poll fires
@@ -40,6 +43,6 @@ scope: with scope; ''
           "AND peak_cpu_cores IS NOT NULL "
           "AND peak_cpu_cores > 0\" | "
           "grep -qE '^[0-9]'",
-          timeout=10,
+          timeout=60,
       )
 ''
