@@ -485,6 +485,13 @@
     },
     {
       "enum": "DerivationError",
+      "name": "NotInputAddressed",
+      "crate": "rio-nix",
+      "msg": "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA outputs derive their paths from content, not from the derivation hash)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
       "name": "RecursionLimitExceeded",
       "crate": "rio-nix",
       "msg": "derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)",

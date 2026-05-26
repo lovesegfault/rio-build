@@ -14,30 +14,57 @@
 //! what an untrusted client or worker declares.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
-use std::path::PathBuf;
 
 use rio_nix::derivation::{Derivation, DerivationError, input_addressed_output_paths};
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drv")
+/// The committed `.drv` fixtures, embedded at compile time so the test is
+/// hermetic in the Nix build sandbox (no runtime filesystem walk, no
+/// CARGO_MANIFEST_DIR dependence — same pattern as `ca_golden.rs`). A
+/// missing file is a compile error naming the path.
+const FIXTURES: &[(&str, &str)] = &[
+    (
+        "ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv",
+        include_str!("fixtures/drv/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"),
+    ),
+    (
+        "jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv",
+        include_str!("fixtures/drv/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"),
+    ),
+    (
+        "5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv",
+        include_str!("fixtures/drv/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"),
+    ),
+    (
+        "21ch52rirzg5lvidpl4d41wp9z8y5paj-rio-golden-structured.drv",
+        include_str!("fixtures/drv/21ch52rirzg5lvidpl4d41wp9z8y5paj-rio-golden-structured.drv"),
+    ),
+    (
+        "92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv",
+        include_str!("fixtures/drv/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv"),
+    ),
+];
+
+/// Parse every embedded fixture, keyed by its original store path.
+fn load_fixtures() -> BTreeMap<String, Derivation> {
+    FIXTURES
+        .iter()
+        .map(|(name, text)| {
+            // Fixtures carry a trailing newline (end-of-file-fixer); the
+            // ATerm is the trimmed content.
+            let drv = Derivation::parse(text.trim_end())
+                .unwrap_or_else(|e| panic!("fixture {name} does not parse: {e}"));
+            (format!("/nix/store/{name}"), drv)
+        })
+        .collect()
 }
 
-/// Load every fixture drv keyed by its original store path.
-fn load_fixtures() -> BTreeMap<String, Derivation> {
-    let mut map = BTreeMap::new();
-    for entry in fs::read_dir(fixture_dir()).expect("fixture dir") {
-        let entry = entry.expect("dir entry");
-        let name = entry.file_name().into_string().expect("utf8 fixture name");
-        if !name.ends_with(".drv") {
-            continue;
-        }
-        let text = fs::read_to_string(entry.path()).expect("read fixture");
-        // Fixtures carry a trailing newline (end-of-file-fixer); the ATerm is the trimmed line.
-        let drv = Derivation::parse(text.trim_end()).expect("parse fixture");
-        map.insert(format!("/nix/store/{name}"), drv);
-    }
-    map
+/// Fixture text by filename suffix (for tests that need the raw ATerm).
+fn fixture_text(suffix: &str) -> &'static str {
+    FIXTURES
+        .iter()
+        .find(|(name, _)| name.ends_with(suffix))
+        .unwrap_or_else(|| panic!("no committed fixture ends with {suffix}"))
+        .1
 }
 
 fn fixture_path<'a>(fixtures: &'a BTreeMap<String, Derivation>, suffix: &str) -> &'a str {
@@ -51,7 +78,18 @@ fn fixture_path<'a>(fixtures: &'a BTreeMap<String, Derivation>, suffix: &str) ->
 /// fixture, for every output.
 fn assert_matches_oracle(fixtures: &BTreeMap<String, Derivation>, drv_path: &str) {
     let drv = &fixtures[drv_path];
-    let resolve = |p: &str| fixtures.get(p);
+    // Every referenced input drv must itself be a committed fixture —
+    // fail with the offending path rather than an opaque unwrap if one
+    // is ever missing.
+    let resolve = |p: &str| {
+        let found = fixtures.get(p);
+        assert!(
+            found.is_some(),
+            "input derivation {p} is not among the committed fixtures in \
+             rio-nix/tests/fixtures/drv/ — regenerate or add it"
+        );
+        found
+    };
     let mut cache = HashMap::new();
     let derived = input_addressed_output_paths(drv, drv_path, &resolve, &mut cache)
         .expect("derive output paths");
@@ -158,9 +196,7 @@ fn tampered_declared_path_is_detected() {
 
     // Re-parse the consumer with its declared output path (and matching env
     // value) replaced by the victim's path — exactly the crafted-drv attack.
-    let consumer_text =
-        fs::read_to_string(fixture_dir().join(consumer_path.strip_prefix("/nix/store/").unwrap()))
-            .expect("read consumer fixture");
+    let consumer_text = fixture_text("-rio-golden-consumer.drv");
     let tampered_text = consumer_text.trim_end().replace(&original_out, &victim_out);
     assert_ne!(consumer_text, tampered_text, "tamper must change the drv");
     let tampered = Derivation::parse(&tampered_text).expect("parse tampered drv");
