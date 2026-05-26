@@ -1327,3 +1327,205 @@ check), and the two new invariants strengthen checks that already carry
 the relevant rules' markers (`sched.retry.recovery-projection` on the
 failover regime check; the clear-ordering discipline is part of
 `sched.admin.clear-poison`'s existing code-level verification).
+
+## Phase-1 close-out (T-1c.5)
+
+Phase 1 of the retry-formal campaign is complete: the durable attempt
+ledger (1a), the nine-site collapse onto `decide()` / `classify()` /
+`placeable()` with the adjudicated behavior changes (1b), and the model
+flip to the post-collapse encoding with the pre-registered
+falsifications proven as invariants (1c). This section is the campaign
+record the design's §5 Phase-1 gates ask for; the per-task evidence
+lives in the introducing commits and the CI transcripts.
+
+### Verdict table v2 (post-collapse encoding)
+
+Every cell is an exhaustive TLC verdict of the named check against the
+post-collapse `retryPolicy.qnt`; cells marked **flipped** were
+falsified-as-pre-registered against the as-built encoding and now HOLD.
+State counts per regime are in the T-1c.4 commit message and the check
+transcripts.
+
+| Design invariant | Model form | worker | dual | crash | failover |
+|---|---|---|---|---|---|
+| `AttemptsBounded` (charge discipline, now total over the alphabet) | `attemptsChargedOnce` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `AttemptsBounded` (boundedness clause) | `attemptsBoundedGlobal` | not checked (no uncharged end in the alphabet) | not checked (subsumed by the crash regime) | **HOLDS (flipped — C2)** | not checked |
+| `PoisonIsTerminalUntilCleared` | `poisonIsTerminalUntilCleared` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `CascadeReachesExactlyTheDependents` | `cascadeReachesExactlyTheDependents` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `CountersRefineHistory` | `countersRefineHistory` | HOLDS | **HOLDS (flipped — D2/D3)** | HOLDS | HOLDS |
+| `VerdictIsChannelInvariant` | `verdictMatchesFold` | HOLDS | **HOLDS (flipped — D1)** | HOLDS | HOLDS |
+| `PlacementIsAFunctionOfExclusionAndFleet` | `placementSound` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `NoDoubleCount` | `noDoubleCount` | HOLDS (vacuous — no deaths) | HOLDS | HOLDS | HOLDS |
+| durable completeness (D4's surface) | `durableMirrorsCharges` | HOLDS | **HOLDS (flipped — D4)** | HOLDS | HOLDS |
+| `RecoveryNeverFabricatesFailures` | `recoveryNeverFabricatesFailures` | HOLDS | HOLDS | HOLDS | HOLDS |
+| `FailoverPreservesHistory` *(new acceptance property)* | `failoverPreservesHistory` | n/a (no failover) | n/a | n/a | **HOLDS (first checked here)** |
+| poison-set survival | `recoveryPreservesPoisonStatus` | n/a | n/a | n/a | HOLDS |
+| clear durability / scrub | `clearedPoisonClearsDurably`, `clearedPoisonScrubsExclusions` | HOLDS | HOLDS | n/a (no resets) | HOLDS |
+| `RecoveryIsTheDocumentedProjection` | — | retired with the as-built encoding (the selective forgiveness it stated is no longer the contract); superseded by `failoverPreservesHistory` + `recoveryNeverFabricatesFailures` + `recoveryPreservesPoisonStatus` |  |  |  |
+
+The four retired expect-violation checks
+(`quint-retry-policy-divergence-{verdict,counters,durable}`,
+`quint-retry-policy-crash-unbounded`) are replaced by the HOLD cells
+above plus the establishment/crash-terminal/tx-failure witnesses; the
+deterministic reproducer runs survive in the named-run checks with the
+adjudicated outcomes (`d1ControllerTimeoutCapCancelsRun`,
+`d2AtCapAnchorRun`, `d3PromotedChargesExemptBudgetRun`,
+`d4BackstopDurableRun`, `c2CrashLoopBoundedRun`,
+`c2EstablishmentChargesRun`, `lateInstallmentAfterRedispatchRun`).
+
+### Spec rules amended or added in Phase 1
+
+| Rule | Change | Owning task |
+|---|---|---|
+| `sched.retry.failover-budget` | new at the Phase-0 exit (budgets survive failover); `r[impl]` on the recovery-time ledger fold rebuild and `r[verify]` on the failover regime check landed in 1c | T-1c.3 |
+| `sched.termination.deadline-exceeded+2 → +3` | the controller path takes terminal `Cancelled` at `max_timeout_retries` (D1; dissolves contradiction C4, resolves C1) | T-1b.10 |
+| `sched.timeout.promote-on-exceed+2 → +3` | the in-memory-only / recovery-resets-to-0 forgiveness prose dropped; the timeout budget survives failover | T-1b.12a |
+| `sched.retry.per-executor-budget → +2` | established-crash membership clause (C2) + failover-survival prose replacing the forgiveness prose (the single bump P1 commits to) | T-1b.12a |
+| `sched.retry.recovery-projection → +2` | the recovery contract is the ledger fold seeded by the legacy columns (reset-row suffixes ignore the seed; empty suffixes degenerate to the legacy projection); fixes the Stage-B-found poisoned-row `count` over-claim | T-1b.12a |
+| `sched.db.clear-poison-batch → +2`, `sched.merge.poisoned-resubmit-bounded → +3` | frozen mirror column / ledger-carried resubmit cycle | T-1b.13 |
+| `sched.admin.clear-poison` | prose-only correction of the stale pre-b874e5120 ordering description (no bump) | T-1b.12a |
+
+### C2: the charge, the budget, and the establishment vehicles (P1)
+
+An attempt whose classifying report never arrives is charged once its
+failure is **established**: the charge is the threshold/exclusion
+budget (`failed_builders[executor]` + `failure_count`, nothing else),
+applied by the fold's `EstablishedCrash` arm. The establishment
+vehicles are the correlation-TTL sweep (installment + in-transaction
+`decide()` + status persist, the same spine as every collapsed site)
+and the E8 backstop (which charges and decides at its own site); the
+controller's non-promoting report deliberately does **not** establish,
+preserving the classification window for a promoting or
+DeadlineExceeded report for the same death. Unestablished
+`disconnected` rows stay uncharged. The A5 membership question for this
+class is folded into `sched.retry.per-executor-budget+2`'s
+established-crash clause.
+
+### Deletions taken and not taken
+
+Taken (T-1b.13): the 17 in-place `RetryState` budget-counter mutations
+(every E1–E8 arm, the cache-hit clears, the
+`record_failure_and_check_poison` helper and its
+`FailureOutcome::reached_poison` carrier); the per-counter mirror
+writers `increment_retry_count` and `append_failed_worker`;
+`clear_poison_batch`'s `resubmit_cycles` increment; the 1a-era
+`requeue_after_retry` / `record_attempt_with_status` /
+`fill_attempt_termination` shims as their callers collapsed.
+`persist_poisoned`'s pool-owning form survives only for the row-less
+degraded paths (E5 re-check, recovery enforcement, no-db-id fallbacks);
+every row-bearing site persists inside its appending transaction.
+
+Not taken, with rationale:
+
+- **E5's poison-threshold re-check in `reassign_derivations`** (P2,
+  the narrowed b09c5b312-X6 disposition): kept, converted into a
+  `decide()` caller over the durable suffix + seed. The backstop no
+  longer depends on it (E8 decides at its own site since T-1b.6), but
+  it remains the disconnect-time and force-drain-time re-poison path
+  and the post-failover backstop for a lost `persist_poisoned` write,
+  and within a single tenure it is structurally unreachable — exactly
+  the probe's claim.
+- **The per-cycle transient-cap poison arm** (P3): keep-and-document.
+  Defaults-shadowed (the distinct-worker threshold fires first under
+  production defaults) but spec-mandated
+  (`sched.retry.transient-budget`'s final clause) and live in
+  non-distinct/dev configurations; the shadowing is documented at the
+  cap check in `retry_policy.rs`.
+- **The mirror columns** (`derivations.{retry_count, failed_builders,
+  resubmit_cycles}`) (P5): writers retired, columns kept as the frozen
+  transitional legacy seed. The DROP is Phase 2, gated on the drain
+  condition recorded at `load_retry_seed_in_tx`: no non-terminal or
+  poisoned derivation with non-empty mirror columns and a reset-free
+  suffix.
+
+### P4: the floor on transient attempts stays out of the model
+
+The I-213 promotion-exemption regression class
+(`c13f6a277`) is carried by `classify()` keeping the
+promoted/CONCURRENT_PUTPATH event in the exempt infra class on both
+reporting channels and by the existing
+`sched.retry.promotion-exempt+3` unit tests
+(`test_transient_failure_promotion_exempt_from_max_retries`); the
+transient arm gains no exemption, the floor oracle is not extended to
+transient events, and the model deliberately stays NOT-ENC there — the
+fold and the model would have nothing to encode that the as-built code
+does not already refuse to do.
+
+### The transitional legacy floor (P5) and its residual
+
+Wherever the fold runs, a derivation whose mirror columns are non-empty
+and whose suffix has no reset row is seeded: union for
+`failed_builders`, max for `count` and `resubmit_cycles`,
+`failure_count` floored at the merged set size; a reset-row suffix
+ignores the seed; an empty suffix degenerates to the pure legacy
+projection. Residual, accepted: within a boundary-spanning cycle the
+per-cycle `count` is floored at max(column, fold) rather than their sum
+— never below what either era supports, never above the true history;
+exact summation would require the ledger backfill P5 declines. The
+floor and the columns are dropped together in Phase 2 behind the drain
+condition above.
+
+### A5 / A7 / A10: carried as-built asymmetries (disposition (b))
+
+Which failure classes join the placement-exclusion set (A5, beyond the
+C2 addition), the per-class backoff asymmetry (A7), and the per-counter
+fencepost conventions (A10) are all carried exactly as built — the
+`Attempt` record's `outcome_class`, flags and timestamps are the
+discriminating inputs, `decide()` reproduces each counter's own
+convention, and no policy change was taken. This closes the divergence
+catalog's open (b)/(c) rows without new spec rules.
+
+### Model-side close-out
+
+- The as-built Stage-B encoding is frozen at `retryPolicyAsBuilt.qnt`,
+  imported only by the Stage-C calibration corpus; the six wired
+  `quint-retry-calib-*` checks and the fourteen evidence modules are
+  unchanged, still falsify/typecheck (re-confirmed at T-1c.1 and
+  T-1c.4), and remain re-runnable per `calibration/README.md`.
+- The post-collapse `retryPolicy.qnt` main encodes the appending
+  transaction as the single advance point for the cached view, the
+  durable ledger fold and the reference-fold ghost; the establishment
+  (`establishUnreportedCrash`) and the appending-transaction fault
+  (`attemptTxFails`) join the alphabet; the crash regime runs two slots
+  with `ATTEMPT_BOUND = THRESHOLD = 2 < MAX_ATTEMPTS = 4` so the C2
+  boundedness HOLD is carried by the charging machinery, not the
+  dispatch ceiling (the establishment abstraction and the
+  identity-freshness placement bound are recorded in the T-1c.1
+  subsection above).
+- Pre-registered witness re-points, executed: `noControllerCapPoison` →
+  `noControllerCapCancelled` (the cap-Cancelled terminal on the
+  controller channel); `noPgWriteLost` → `noAttemptTxFailure`
+  (`quint-retry-policy-witness-tx-failure` replaces
+  `-witness-pg-write-lost`). New witnesses: `noEstablishedCrashCharge`
+  (crash-charge), `noCrashLoopTerminal` (crash-terminal).
+- Retired as-built-only artifacts: `recoveryIsTheDocumentedProjection`,
+  `recoveryProjectionNonTerminal` / `recoveryProjectionPoisoned`,
+  `failoverForgivenessRun` (replaced by `failoverHistorySurvivesRun`),
+  `lostPoisonMirrorFailoverRun` (replaced by
+  `txFailureNothingChargedRun` — the lost-`persist_poisoned`
+  -as-independent-mirror-write class is structurally impossible for
+  post-066 attempts: the charge, the verdict and the status persist
+  commit or fail as one transaction), and the live-only
+  `RTimeoutBudget` poison reason (no producer once E7-at-cap is
+  Cancel).
+- The deferred verify markers landed: `sched.retry.failover-budget`
+  (impl on `rebuild_retry_view_from_ledger`, verify on the failover
+  regime check) and the model-side
+  `sched.retry.recovery-projection+2` verify (back on the failover
+  regime check). `tracey query untested` shows zero untested rules in
+  the `sched.retry.*`, `sched.timeout.*`, `sched.poison.*`,
+  `sched.backstop.*` and `sched.termination.*` domains — no retry-rule
+  verification is deferred to Phase 2.
+
+### Phase-2 hand-off
+
+Kani on `decide()`/`placeable()` (all histories up to the budget bound);
+MBT replaying model traces against the fold and the in-memory list; the
+acceptance table built from the calibration corpus, after which
+`retryPolicyAsBuilt.qnt`, the calibration corpus and the six
+`quint-retry-calib-*` checks are retired (design §5, Phase-2 row); the
+mirror-column DROP plus the legacy-floor removal behind the drain
+condition (restoring `decide()`'s frozen 3-argument shape); a real
+ledger GC policy to replace the P8 retention assertion; and the
+deferred policy questions left open on purpose (A7 uniform backoff, A10
+fencepost unification, A8 poison-reason strings).
