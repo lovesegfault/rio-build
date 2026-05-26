@@ -19095,10 +19095,6 @@
           "packageId": "prost-types"
         },
         {
-          "name": "regex",
-          "packageId": "regex"
-        },
-        {
           "name": "reqwest",
           "packageId": "reqwest"
         },

@@ -36,11 +36,34 @@ use std::path::Path;
 
 use rio_nix::derivation::Derivation;
 use rio_nix::hash::{HashAlgo, NixHash};
-use rio_nix::store_path::basename;
+use rio_nix::store_path::{STORE_DIR, StorePath, basename};
 use rio_proto::validated::ValidatedPathInfo;
 use serde_json::Value;
 
 use super::GlueError;
+
+/// CppNix `toStorePath()`: a graph target may name any path *inside* a
+/// store path (`"${pkg}/bin/tool"` — the shape `writeReferencesToFile`
+/// and NixOS initrd builders produce); the exported closure is that of
+/// the containing store path. Truncate to the `/nix/store/<hash>-<name>`
+/// root and validate it is a well-formed store path; paths outside the
+/// store are rejected exactly as CppNix's `toStorePath` rejects them.
+fn to_store_path_root(target: &str) -> Result<String, GlueError> {
+    let rel = target
+        .strip_prefix(STORE_DIR)
+        .and_then(|r| r.strip_prefix('/'))
+        .ok_or_else(|| GlueError::ExportRefsNotAStorePath {
+            path: target.to_owned(),
+        })?;
+    let base = rel.split('/').next().unwrap_or("");
+    let root = format!("{STORE_DIR}/{base}");
+    if StorePath::parse(&root).is_err() {
+        return Err(GlueError::ExportRefsNotAStorePath {
+            path: target.to_owned(),
+        });
+    }
+    Ok(root)
+}
 
 /// Index over the build's input closure metadata.
 pub(crate) struct ClosureIndex<'a> {
@@ -83,10 +106,15 @@ impl<'a> ClosureIndex<'a> {
         let mut queue: Vec<&str> = Vec::new();
 
         for t in targets {
-            if !self.input_closure.contains(t.as_str()) {
+            // CppNix normalizes each target with `toStorePath()` before
+            // the closure walk, so sub-paths inside a store path are
+            // valid targets; the containment gate then applies to the
+            // containing store path.
+            let root = to_store_path_root(t)?;
+            let Some(canonical) = self.input_closure.get(root.as_str()) else {
                 return Err(GlueError::ExportRefsOutsideClosure { path: t.clone() });
-            }
-            queue.push(t.as_str());
+            };
+            queue.push(canonical);
         }
 
         while let Some(p) = queue.pop() {
@@ -369,7 +397,9 @@ mod tests {
     const A: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
     const B: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b";
     const C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-c";
-    const OUTSIDE: &str = "/nix/store/oooooooooooooooooooooooooooooooo-outside";
+    // Well-formed store path (valid nixbase32 hash) that is simply not a
+    // member of the fixture's input closure.
+    const OUTSIDE: &str = "/nix/store/wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww-outside";
 
     fn fixture() -> (Vec<ValidatedPathInfo>, Vec<String>) {
         // a → b → c, with a also → c (diamond-ish) and c self-referencing.
@@ -406,6 +436,44 @@ mod tests {
         let index = ClosureIndex::new(&infos, &paths);
         let err = index.registration_text(&[OUTSIDE.to_string()]).unwrap_err();
         assert!(matches!(err, GlueError::ExportRefsOutsideClosure { path } if path == OUTSIDE));
+    }
+
+    /// CppNix `toStorePath()` semantics: a target naming a path *inside*
+    /// a store path exports the closure of the containing store path.
+    #[test]
+    fn sub_store_path_target_normalizes_to_its_root() {
+        let (infos, paths) = fixture();
+        let index = ClosureIndex::new(&infos, &paths);
+        let direct = index.registration_text(&[B.to_string()]).unwrap();
+        let via_sub = index.registration_text(&[format!("{B}/bin/tool")]).unwrap();
+        assert_eq!(
+            via_sub, direct,
+            "a sub-path target must export exactly its containing store path's closure"
+        );
+        // The structured form goes through the same normalization.
+        let json = index
+            .closure_info_json(&[format!("{B}/share/doc/readme")])
+            .unwrap();
+        assert_eq!(json, index.closure_info_json(&[B.to_string()]).unwrap());
+    }
+
+    /// …and anything not under the store dir at all is rejected the way
+    /// CppNix's `toStorePath` rejects it, before the closure walk.
+    #[test]
+    fn target_outside_the_store_is_rejected() {
+        let (infos, paths) = fixture();
+        let index = ClosureIndex::new(&infos, &paths);
+        for bad in [
+            "/etc/passwd",
+            "relative/path",
+            "/nix/store/not-a-valid-name",
+        ] {
+            let err = index.registration_text(&[bad.to_string()]).unwrap_err();
+            assert!(
+                matches!(&err, GlueError::ExportRefsNotAStorePath { path } if path == bad),
+                "{bad}: expected ExportRefsNotAStorePath, got {err:?}"
+            );
+        }
     }
 
     const DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-probe.drv";

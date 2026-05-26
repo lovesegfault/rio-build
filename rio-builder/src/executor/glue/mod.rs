@@ -72,6 +72,12 @@ pub(crate) enum GlueError {
     #[error("exportReferencesGraph path {path} is outside the build's input closure")]
     ExportRefsOutsideClosure { path: String },
 
+    /// CppNix runs every graph target through `toStorePath()`, which
+    /// requires the path to live under the store dir; anything else is
+    /// rejected with "path '…' is not in the Nix store".
+    #[error("exportReferencesGraph path {path} is not in the Nix store")]
+    ExportRefsNotAStorePath { path: String },
+
     #[error("exportReferencesGraph: no metadata for closure path {path}")]
     ExportRefsMissingMetadata { path: String },
 

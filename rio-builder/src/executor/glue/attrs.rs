@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use super::GlueError;
 use super::env::rewrite;
-use super::refs_graph::{ClosureIndex, validate_graph_name};
+use super::refs_graph::ClosureIndex;
 
 /// The two structured-attrs files, already placeholder-rewritten.
 #[derive(Debug)]
@@ -67,10 +67,13 @@ pub(crate) fn prepare_structured_attrs(
     // exportReferencesGraph: { <key>: <path or [paths]> } → closure info.
     if let Some(Value::Object(erg)) = map.get("exportReferencesGraph").cloned().as_ref() {
         for (key, val) in erg {
-            // Same tenant-input guard as the flat form: the key is
-            // attacker-controlled; reject non-identifier names before
-            // doing anything with them (parity with CppNix).
-            validate_graph_name(key)?;
+            // Unlike the flat form (where the name becomes a file path
+            // under /build and CppNix validates it), the structured form
+            // performs NO key validation in CppNix: the key only ever
+            // becomes a JSON key in `.attrs.json`, and the `.attrs.sh`
+            // writer below skips non-identifier keys exactly like
+            // CppNix's `writeStructuredAttrsShell`. Rejecting here would
+            // refuse derivations real Nix builds.
             let targets: Vec<String> = match val {
                 Value::String(s) => vec![s.clone()],
                 Value::Array(a) => a
@@ -270,6 +273,39 @@ mod tests {
         );
     }
 
+    /// CppNix performs no key-name validation for the structured
+    /// `exportReferencesGraph` form (the key never becomes a filesystem
+    /// path — unlike the flat form, where the name is a file under
+    /// /build); names the flat form rejects, including traversal-shaped
+    /// ones, must be accepted here, land in `.attrs.json` as plain JSON
+    /// keys, and simply be skipped by the shell serialization.
+    #[test]
+    fn structured_graph_keys_are_not_name_validated() {
+        let json = json!({
+            "__structuredAttrs": true,
+            "exportReferencesGraph": { "closure info.json": [], "../escape": [] }
+        });
+        let files = prepare_structured_attrs(
+            &json,
+            &["out".to_string()],
+            &empty_closure(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&files.attrs_json).unwrap();
+        for key in ["closure info.json", "../escape"] {
+            assert!(
+                parsed.get(key).is_some(),
+                "graph key {key:?} must appear in .attrs.json: {parsed}"
+            );
+        }
+        let sh = String::from_utf8(files.attrs_sh).unwrap();
+        assert!(
+            !sh.contains("closure info.json") && !sh.contains("escape"),
+            ".attrs.sh must skip non-identifier keys:\n{sh}"
+        );
+    }
+
     #[test]
     fn attrs_json_keys_are_sorted_at_every_level() {
         // CppNix (nlohmann::json) emits lexicographically sorted keys at
@@ -424,23 +460,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, GlueError::StructuredAttrsNotObject));
-    }
-
-    #[test]
-    fn export_refs_graph_key_is_validated() {
-        // The structured form's graph names (JSON keys) get the same
-        // tenant-input guard as the flat form: traversal-shaped names
-        // are rejected before any use.
-        let err = prepare_structured_attrs(
-            &json!({"exportReferencesGraph": {"../escape": ["/nix/store/x"]}}),
-            &["out".to_string()],
-            &empty_closure(),
-            &BTreeMap::new(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, GlueError::ExportRefsInvalidName { ref name } if name == "../escape"),
-            "{err}"
-        );
     }
 }
