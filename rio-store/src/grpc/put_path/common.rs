@@ -365,6 +365,11 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
 /// trusted control plane (gateway `nix copy` ingestion, store-added
 /// text paths) is not subject to worker authorization.
 ///
+/// Error split (deliberate, pre-existing pattern): a descriptor that
+/// cannot be parsed at all is `InvalidArgument` (malformed request),
+/// while content/path mismatches against a well-formed descriptor are
+/// `PermissionDenied` (authorization failure).
+///
 /// [`HashModuloSink`]: rio_nix::ca::HashModuloSink
 pub(in crate::grpc) fn verify_ca_store_path(
     info: &ValidatedPathInfo,
@@ -1509,6 +1514,32 @@ mod verify_nar_tests {
         wrong.content_address = Some(format!("fixed:{}", hash.to_colon()));
         let err = verify_ca_store_path(&wrong, &nar, Some(&claims), "t")
             .expect_err("flat path not derived from the content must be rejected");
+        assert!(
+            err.message().contains("content-derived"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // r[verify sec.authz.ca-path-derived+5]
+    /// Method confusion on the fixed-output arm: the descriptor honestly
+    /// matches the bytes under the WRONG method (flat) while the claimed
+    /// path was minted recursively — the path re-derivation rejects, the
+    /// same way the floating-CA arm pins its method-mismatch case.
+    #[test]
+    fn fod_method_confusion_rejected_for_non_ca_uploads() {
+        use std::io::Write as _;
+        let content = b"method confusion bytes\n";
+        // Claimed path minted with the recursive (NAR) hash.
+        let (path, nar, _recursive_descriptor) = build_fod_recursive_upload("fod-method", content);
+        // Descriptor presented with the flat (file-bytes) hash — honest
+        // for the bytes, but for the wrong ingestion method.
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(content).unwrap();
+        let flat_hash = w.finish();
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
+        let err = verify_ca_store_path(&info, &nar, Some(&ia_claims()), "t")
+            .expect_err("flat descriptor against a recursively-minted path must be rejected");
         assert!(
             err.message().contains("content-derived"),
             "unexpected error: {err}"
