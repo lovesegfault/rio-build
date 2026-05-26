@@ -12,10 +12,12 @@
 // mirror columns and their writers are retired (the transitional
 // mixed-era legacy seed is code-level only, see WHAT IS NOT MODELED).
 //
-// The pre-collapse (as-built) encoding is frozen at
-// `retryPolicyAsBuilt.qnt`, imported only by the Stage-C calibration
-// corpus. The divergences that file reproduces are fixed here exactly as
-// Phase 1b adjudicated them:
+// The pre-collapse (as-built) encoding was frozen at
+// `retryPolicyAsBuilt.qnt` for the Stage-C calibration corpus and was
+// retired with it in Phase 2 (the acceptance table in
+// retry-invariant-map.md is the surviving record). The divergences that
+// encoding reproduced are fixed here exactly as Phase 1b adjudicated
+// them:
 //   - D1: the controller-observed timeout-cap exhaustion (E7) ends
 //     terminal Cancelled, the same verdict as the worker-observed E4.
 //   - D2: an at-cap controller termination (E6) stamps the 300 s window
@@ -961,6 +963,16 @@ module retryPolicy {
     },
     dStatus == DReady,
   })
+  /// Violated when a leader failover lands on a still-poisoned, unexpired
+  /// durable row (the recoveryPreservesPoisonStatus contention is
+  /// reachable). Added when the Stage-C corpus -- whose G8 calibration
+  /// check previously pinned this reachability -- was retired in Phase 2.
+  val noFailoverOnPoisonedRow = not(and {
+    justFailedOver,
+    pg.status == PgPoisoned,
+    match pg.poisonedAt { | NoTime => false | At(t) => now - t <= POISON_TTL },
+  })
+
   /// Violated when an appending transaction fails (the bounded
   /// re-delivery fault is reachable in the fault regime).
   val noAttemptTxFailure = not(txFaultsLeft < TX_FAULTS)
@@ -2366,8 +2378,8 @@ module retryPolicyDual {
   /// D1 regression pin (the divergence is fixed): the exhausted timeout
   /// budget observed exclusively on the controller channel ends terminal
   /// Cancelled -- the same verdict the worker channel produces -- never
-  /// Poisoned. (The as-built reproducer of the Poisoned arm lives in
-  /// retryPolicyAsBuilt.qnt.)
+  /// Poisoned. (The as-built reproducer of the Poisoned arm lived in
+  /// retryPolicyAsBuilt.qnt, retired in Phase 2.)
   run d1ControllerTimeoutCapCancelsRun =
     init
       .then(dispatchTo("w1"))

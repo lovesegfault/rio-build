@@ -218,9 +218,10 @@ let
       # it at the same relative position — quint resolves `from "../x"`
       # against the importing file's directory.
       extraSpecs ? [ ],
-      # Non-default step action (the Stage-C calibration modules expose
-      # their pre-fix transition relation as `calibStep` next to the
-      # imported as-built `step`). null means quint's default (`step`).
+      # Non-default step action (an override module can expose an
+      # alternative transition relation, the way the retired Stage-C
+      # calibration corpus exposed its pre-fix `calibStep`). null means
+      # quint's default (`step`).
       step ? null,
     }:
     pkgs.runCommand "quint-${name}"
@@ -323,8 +324,9 @@ let
       witness,
       # Same semantics as mkQuintCheck's extraSpecs.
       extraSpecs ? [ ],
-      # Same semantics as mkQuintCheck's step (used by the Stage-C
-      # calibration checks to select the pre-fix transition relation).
+      # Same semantics as mkQuintCheck's step (no current caller; kept
+      # for override modules that select a non-default transition
+      # relation).
       step ? null,
     }:
     pkgs.runCommand "quint-${name}"
@@ -953,9 +955,7 @@ in
     # it exists after the Phase-1b nine-site collapse -- every entry
     # point's verdict is the reference fold (decide()) over the durable
     # attempt ledger, evaluated and persisted in the appending
-    # transaction -- and the Stage-B as-built encoding is frozen at
-    # retryPolicyAsBuilt.qnt, imported only by the calibration corpus
-    # below. Checks come in three flavours:
+    # transaction. Checks come in two flavours:
     #   - the per-regime HOLD checks below (exhaustive TLC), now
     #     including the invariants whose as-built falsifications were
     #     pre-registered at Stage B and fixed by Phase 1b: the D1
@@ -966,9 +966,14 @@ in
     #     acceptance evidence, not a silent edit);
     #   - the witness checks (non-vacuity: every cap, reset, channel
     #     race, establishment and fault the invariants quantify over is
-    #     reachable);
-    #   - the calibration checks (the historical-fix corpus replayed
-    #     against the FROZEN as-built encoding).
+    #     reachable).
+    # The Stage-B as-built encoding (retryPolicyAsBuilt.qnt), its Stage-C
+    # calibration corpus (calibration/retry-*.qnt) and the six
+    # quint-retry-calib-* checks were retired in Phase 2 once the
+    # acceptance table consolidated their evidence -- see
+    # docs/spec/models/retry-invariant-map.md (the calibration table is
+    # the per-override record; the acceptance table records what holds
+    # each bug family down post-collapse).
     # The named-run checks replay the deterministic reproducer runs (one
     # per formerly-documented divergence, now ending in the adjudicated
     # outcomes) so the precise documented shape stays pinned even though
@@ -1314,93 +1319,15 @@ in
       main = "retryPolicyFailover";
       witness = "noAttemptTxFailure";
     };
-
-    # Stage-C calibration witnesses (the historical-fix corpus replayed
-    # against the model). Each check instantiates the as-built model,
-    # swaps ONE entry point for its PRE-FIX behavior (the calibration
-    # module's `calibStep`), and passes only while the checker still
-    # falsifies the invariant the corresponding historical fix protects --
-    # machine-checked evidence that the model would re-find that bug class
-    # if it were reintroduced, and that the invariant is not vacuous for
-    # it. The full 45-commit calibration table (and the evidence-only
-    # override modules that are not wired here) lives in
-    # docs/spec/models/retry-invariant-map.md; these six are the
-    # representative per-family regression guards (cheap, deepest
-    # consequence). Deliberately no tracey markers (same policy as the
-    # other witness checks).
-
-    # G1 (8283d4362): the controller-reported at-cap OOM path loses its
-    # cap check -> infra_count exceeds the budget and nothing poisons.
-    quint-retry-calib-g1-controller-cap = mkQuintWitnessCheck {
-      name = "retry-calib-g1-controller-cap";
-      spec = "calibration/retry-g1";
-      main = "retryCalibG1ControllerOomUncapped";
-      extraSpecs = [ "retryPolicyAsBuilt" ];
-      step = "calibStep";
-      witness = "boundsOK";
-    };
-
-    # G2 (a4bcb5623): the resubmit reset stops splitting the per-cycle
-    # and cross-cycle counters -> the live counters diverge from the fold
-    # at the first reset.
-    quint-retry-calib-g2-resubmit-split = mkQuintWitnessCheck {
-      name = "retry-calib-g2-resubmit-split";
-      spec = "calibration/retry-g2";
-      main = "retryCalibG2ResubmitSharedCounter";
-      extraSpecs = [ "retryPolicyAsBuilt" ];
-      step = "calibStep";
-      witness = "countersRefineHistory";
-    };
-
-    # G3 (af0eb62c6): poison without the dependent cascade -> a
-    # failure-terminal derivation with a still-Ready dependent.
-    quint-retry-calib-g3-cascade = mkQuintWitnessCheck {
-      name = "retry-calib-g3-cascade";
-      spec = "calibration/retry-g3";
-      main = "retryCalibG3PoisonWithoutCascade";
-      extraSpecs = [ "retryPolicyAsBuilt" ];
-      step = "calibStep";
-      witness = "cascadeReachesExactlyTheDependents";
-    };
-
-    # G4 (b874e5120): the admin clear runs in-memory first with a
-    # best-effort PG clear -> a clear observation behind a still-poisoned
-    # durable row (also the non-vacuity guard for the
-    # clearedPoisonClearsDurably invariant added with the calibration).
-    quint-retry-calib-g4-clear-ordering = mkQuintWitnessCheck {
-      name = "retry-calib-g4-clear-ordering";
-      spec = "calibration/retry-g4";
-      main = "retryCalibG4ClearInMemFirst";
-      extraSpecs = [ "retryPolicyAsBuilt" ];
-      step = "calibStep";
-      witness = "clearedPoisonClearsDurably";
-    };
-
-    # G5 (ee9302b86): the race-ahead termination report stops marking the
-    # completion -> the same pod death is counted twice through the
-    # disconnect-then-re-report path.
-    quint-retry-calib-g5-race-ahead = mkQuintWitnessCheck {
-      name = "retry-calib-g5-race-ahead";
-      spec = "calibration/retry-g5";
-      main = "retryCalibG5RaceAheadKeepsPending";
-      extraSpecs = [ "retryPolicyAsBuilt" ];
-      step = "calibStep";
-      witness = "noDoubleCount";
-    };
-
-    # G8: the poison set fails to survive failover -> a durable,
-    # unexpired Poisoned row behind a derivation recovered as anything
-    # but Poisoned (the recoveryPreservesPoisonStatus non-vacuity guard;
-    # anchored on 891a6520d's poison-set half -- the poisoned_at-IS-NULL
-    # load filter and the remove_build reap, abstracted at model
-    # resolution as "not reloaded").
-    quint-retry-calib-g8-poison-reload = mkQuintWitnessCheck {
-      name = "retry-calib-g8-poison-reload";
-      spec = "calibration/retry-g8";
-      main = "retryCalibG8PoisonedRowNotReloaded";
-      extraSpecs = [ "retryPolicyAsBuilt" ];
-      step = "calibStep";
-      witness = "recoveryPreservesPoisonStatus";
+    # The recoveryPreservesPoisonStatus contention (a still-poisoned,
+    # unexpired durable row at the moment of failover) stays pinned
+    # reachable after the Stage-C corpus retirement -- the retired G8
+    # calibration check was its only other wired pin.
+    quint-retry-policy-witness-failover-poisoned = mkQuintWitnessCheck {
+      name = "retry-policy-witness-failover-poisoned";
+      spec = "retryPolicy";
+      main = "retryPolicyFailover";
+      witness = "noFailoverOnPoisonedRow";
     };
 
     # Implementation conformance (model-based testing). The regime checks

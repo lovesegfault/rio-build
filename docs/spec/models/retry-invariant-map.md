@@ -1963,3 +1963,40 @@ What this phase records instead:
 
 The `// TODO:` at `load_retry_seed_in_tx` (db/derivations.rs) is the
 code-side anchor for this decision and now points at this subsection.
+### Retirement of the as-built model and the calibration corpus
+
+Design §5's Phase-2 row and the Phase-2 hand-off both schedule the
+retirement once the acceptance table exists; with the table above in
+place, the frozen Stage-B encoding (`retryPolicyAsBuilt.qnt`), the
+Stage-C override corpus (`docs/spec/models/calibration/retry-*.qnt` +
+its README), and the six `quint-retry-calib-*` checks are deleted. The
+post-collapse `retryPolicy.qnt`, its regime/witness/named-run checks,
+and the `kani-rio-scheduler` contracts are the live verification stack;
+the calibration table and the Stage-B/Stage-C sections above are the
+surviving record of what the corpus demonstrated (the per-override
+verdicts, depths and state counts remain valid statements about the
+retired artifacts as they existed at the Phase-1c freeze, and the
+corpus remains recoverable from git history if a future campaign wants
+to replay it).
+
+What the retired checks guarded and where that duty now lives:
+
+- The six per-family regression guards existed to prove the *as-built
+  model* would re-find each family's representative bug. The as-built
+  code they encoded no longer exists; the post-collapse architecture's
+  protection per family is the acceptance table above (construction
+  mechanisms + the live invariants + the Kani contracts).
+- Two of the six doubled as non-vacuity anchors for invariants that
+  remain live in the post-collapse model: `clearedPoisonClearsDurably`
+  / `clearedPoisonScrubsExclusions` (the G4 check) and
+  `recoveryPreservesPoisonStatus` (the G8 check). The clear-discipline
+  antecedent stays pinned by the wired TTL-expiry and cache-hit
+  witnesses (a clear is reachable). The failover-on-a-poisoned-row
+  antecedent had no other wired pin, so the retirement adds one:
+  `noFailoverOnPoisonedRow` in `retryPolicy.qnt` (a pure `val`; no
+  transition-relation change), wired as
+  `quint-retry-policy-witness-failover-poisoned` in the failover
+  regime — the witness discipline keeps one expect-violation check per
+  contended precondition. The historical falsification evidence stays
+  in the calibration table. No live invariant loses its exhaustive
+  HOLD check.
