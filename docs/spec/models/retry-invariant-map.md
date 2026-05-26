@@ -765,6 +765,47 @@ gateway connection-bounding and KEDA commits touch nothing under
   the no-charge semantics are unchanged. The new `never_forgive_paths`
   clears that land beside those lanes are DAG bookkeeping only.
 
+### 2026-05-26 re-validation: re-authored forgiveness-scoping pair, gateway lifecycle hardening
+
+The third harden-subst rebase (origin tip `5b0023a6c`) lands a rewritten
+branch history: the two forgiveness-scoping commits — `cd4495f40`
+(`never_forgive_paths` scoped to the substitution chain that created it)
+and `6e9791cdf` (spent forgiveness cleared when a stale-Completed reset
+opens a new chain) — arrive re-authored with new hashes and expanded
+messages, but their cumulative content is exactly what the 2026-05-25
+subsection already analyzed: the previous-base→new-tip delta contains no
+file under `rio-scheduler/`, `rio-common/`, `rio-proto/`, or
+`rio-migrations/` (no new migrations; the attempt-ledger migration stays
+066). The genuinely new work this round — rio-gateway connection/session
+lifecycle hardening (force-close, session capacity, write-path
+deadlines), KEDA/infra fixes, and a test-only MockScheduler ResolveTenant
+latency knob — touches nothing under `rio-scheduler/src/`. Re-checked
+against the merged tree:
+
+- **(a) E5 and the fold's charging semantics: unaffected.** The rebase
+  introduces zero scheduler-side change: `actor/executor.rs` (E5),
+  `actor/dispatch.rs`, `actor/merge.rs`, `actor/completion.rs`, and
+  `retry_policy.rs` in the merged tree are byte-identical to pre-rebase
+  `formal-sprint`, with the chain-end `never_forgive_paths.clear()` in
+  `handle_completion` still sitting ahead of the verdict dispatch and the
+  line-count stamping exactly as resolved at the previous rebase. No new
+  event reaches E5; the gateway hardening changes *when* SSH
+  sessions/connections end (an existing cancellation pathway), not which
+  scheduler events exist or what they charge. The substitution-failure
+  carve-out holds.
+- **(b) Substitution-delta notes: no new deltas.** The 2026-05-25 bullets
+  already record the chain-scoped `never_forgive_paths` (cleared at every
+  chain ending, re-cleared by the stale-Completed reset opening the next
+  chain) and the live effective wanted set; the re-authored pair changes
+  no clear site and adds none, so notes (1)–(7) and the 2026-05-25
+  amendments stand as written.
+- **(c) Attempt ledger: nothing new recorded.** `handle_substitute_complete`
+  still calls none of `append_attempt` / `append_attempts_batch` /
+  `record_attempt_with_poison` / `append_attempt_standalone`, and
+  `substitution` remains absent from the `OutcomeClass` alphabet. The only
+  substitution-adjacent rows remain the `cache_hit_clear` resets already
+  described above; their contents and no-charge semantics are untouched.
+
 ## Stage-C calibration: the historical-fix corpus replayed against the model
 
 The 45-commit fix corpus (inventory §5, eight families G1–G8) replayed
