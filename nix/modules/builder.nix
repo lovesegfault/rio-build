@@ -83,6 +83,10 @@ in
           RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
           RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;
           RIO_METRICS_ADDR = cfg.metricsAddr;
+          # Static /bin/sh exposed inside every build sandbox.
+          RIO_SANDBOX_SHELL = "${pkgs.pkgsStatic.busybox}/bin/sh";
+          # CA bundle mounted into network (fixed-output) sandboxes.
+          RIO_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         }
         // lib.optionalAttrs (cfg.workerId != null) {
           RIO_EXECUTOR_ID = cfg.workerId;
@@ -155,13 +159,6 @@ in
         path = [
           pkgs.fuse3
         ];
-
-        environment = {
-          # Static /bin/sh exposed inside every build sandbox.
-          RIO_SANDBOX_SHELL = "${pkgs.pkgsStatic.busybox}/bin/sh";
-          # CA bundle mounted into network (fixed-output) sandboxes.
-          RIO_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-        };
       };
 
     # Ensure /var/rio/* directories exist (worker creates them too, but this
