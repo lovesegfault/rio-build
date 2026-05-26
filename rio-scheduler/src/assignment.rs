@@ -117,8 +117,10 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
 /// closed / intent-reserved / failed-on / resource-fit)?
 ///
 /// This is the subset of [`rejection_reason`] that does not change
-/// without the executor reconfiguring or disconnecting. Used by
-/// `failed_builders_exhausts_fleet` (I-065) so its definition of "the
+/// without the executor reconfiguring or disconnecting. Used by the
+/// fleet-exhaust eligible-fleet snapshots (I-065: the E9
+/// `dispatch_fleet_exhausted` backstop and E1's fleet arm, both
+/// consumers of `retry_policy::placeable`) so their definition of "the
 /// fleet" matches what `find_executor` actually considers — drift
 /// between the two was a multi-arch silent-hang: a kind-only filter
 /// counted system-/feature-mismatched workers toward the fleet, so an
@@ -758,10 +760,12 @@ mod tests {
     /// (I-065): `handle_transient_failure` poisons immediately on the
     /// failure-report path; `dispatch_ready` poisons as a backstop for
     /// paths that bypass it (worker disconnect, recovery reconcile).
-    /// Both call `failed_builders_exhausts_fleet`, which is kind-aware
-    /// — the original check (`self.executors.keys().all(...)`) counted
-    /// fetchers against a builder drv and never tripped on mixed
-    /// clusters. See actor/{dispatch.rs,completion.rs}.
+    /// Both consume `retry_policy::placeable` over a
+    /// `statically_eligible`-filtered fleet snapshot, which is
+    /// kind-aware — the original check
+    /// (`self.executors.keys().all(...)`) counted fetchers against a
+    /// builder drv and never tripped on mixed clusters. See
+    /// actor/{dispatch.rs,completion.rs}.
     #[test]
     fn all_workers_failed_below_threshold_poisons_upstream() {
         // 2-worker cluster — below the default poison_threshold of 3.

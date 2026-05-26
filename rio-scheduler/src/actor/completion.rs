@@ -2770,13 +2770,13 @@ impl DagActor {
         // r[impl sched.retry.per-executor-budget]
         // The live eligible fleet snapshot for the fleet-exhaust arm:
         // statically-eligible (kind/system/features), non-draining,
-        // registered workers — the same construction as the as-built
-        // `failed_builders_exhausts_fleet` predicate. Under one-shot
-        // semantics (I-188; the only mode) failed workers are draining
-        // and the controller spawns fresh executor ids, so this arm
-        // stays the defense-in-depth backstop it has always been; the
-        // dispatch-time backstop (E9) covers paths that bypass this
-        // handler until its own collapse (T-1b.7).
+        // registered workers — the same construction as the E9
+        // dispatch-time backstop (`dispatch_fleet_exhausted`). Under
+        // one-shot semantics (I-188; the only mode) failed workers are
+        // draining and the controller spawns fresh executor ids, so
+        // this arm stays the defense-in-depth backstop it has always
+        // been; the dispatch-time backstop (E9) covers paths that
+        // bypass this handler (worker disconnect, recovery reconcile).
         let eligible: HashSet<ExecutorId> = self
             .dag
             .node(drv_hash)
@@ -2886,9 +2886,8 @@ impl DagActor {
         // complete.
         if fleet_exhausted {
             // I-065 operator triage + metric, emitted at the arm that
-            // acts on the placeable() verdict (the as-built emission
-            // inside `failed_builders_exhausts_fleet` keeps serving the
-            // dispatch-time backstop until T-1b.7).
+            // acts on the placeable() verdict (the E9 dispatch-time
+            // backstop emits the same pair at its own verdict arm).
             if let Some(state) = self.dag.node(drv_hash) {
                 warn!(
                     drv_hash = %drv_hash,

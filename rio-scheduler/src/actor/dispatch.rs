@@ -363,19 +363,40 @@ impl DagActor {
                 // No eligible worker.
                 //
                 // I-065: if EVERY currently-registered worker of
-                // the matching kind is in failed_builders, this
-                // derivation can never dispatch on this fleet —
-                // it would defer forever (poison threshold
+                // the matching kind is in the fold-derived exclusion
+                // set, this derivation can never dispatch on this
+                // fleet — it would defer forever (poison threshold
                 // counts failures, but with N workers you can't
                 // exceed N). Poison now so the build fails
                 // visibly instead of hanging silently.
                 //
                 // The "every registered worker" check (not
-                // `failed_builders.len() >= total`) handles
-                // worker replacement: failed_builders may hold
-                // stale IDs that don't count against the
-                // current fleet.
-                if self.failed_builders_exhausts_fleet(&drv_hash) {
+                // `excluded.len() >= total`) handles worker
+                // replacement: the exclusion set may hold stale IDs
+                // that don't count against the current fleet.
+                if let Some(failed_on) = self.dispatch_fleet_exhausted(&drv_hash) {
+                    // I-065 operator triage + metric, emitted at the
+                    // arm that acts on the placeable() verdict (the
+                    // pre-collapse predicate emitted them itself;
+                    // placeable() is pure, so they live here now).
+                    if let Some(state) = self.dag.node(&drv_hash) {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            system = %state.system,
+                            // §13e + r35: intentional bypass — the
+                            // operator triaging an unroutable drv needs
+                            // to see what the tenant DECLARED.
+                            // `effective_features` is the routing
+                            // artifact.
+                            declared_features = ?state.required_features(),
+                            effective_features = ?state.effective_features().as_slice(),
+                            failed_on,
+                            "failed_builders excludes every statically-eligible worker \
+                             (kind+system+features); poisoning (would otherwise defer \
+                             forever — see I-065)"
+                        );
+                    }
+                    metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
                     // 1a: the fleet-exhaust verdict gets a marker row
                     // (not a charge — the fold treats it as a no-op
                     // event), appended in the same transaction as the
@@ -1955,76 +1976,73 @@ impl DagActor {
         }
     }
 
-    /// I-065: has `failed_builders` excluded EVERY currently-registered
+    /// I-065 (E9, collapsed onto `placeable()` in Phase 1b): has the
+    /// fold-derived exclusion set covered EVERY currently-registered
     /// statically-eligible **non-draining** worker (matching kind +
     /// system + features)?
     ///
-    /// Predicate is "every statically-eligible non-draining worker is
-    /// in the failed set", not `failed_builders.len() >= total`. The
-    /// latter over-counts stale IDs: b0 fails, b0 is replaced by b2,
-    /// b1 fails → set={b0,b1} len=2, total=2 → would poison, but b2
-    /// was never tried. The fleet filter MUST match the
-    /// static-eligibility subset of `rejection_reason` — a kind-only
-    /// filter let an x86 drv that failed on every x86 worker defer
-    /// forever in a multi-arch cluster because aarch64 workers (which
-    /// `find_executor` rejects on system-mismatch) kept the fleet
+    /// The exclusion set is `decide()`'s `failed_builders` view over the
+    /// node's in-memory attempt history (the committed ledger-suffix
+    /// mirror) — within a leader tenure it equals the legacy RAM set the
+    /// pre-collapse predicate read; across a failover the fold retains
+    /// backstop-recorded exclusions the recovered RAM set loses (D4),
+    /// the adjudicated `sched.retry.failover-budget` direction. The
+    /// other dispatch-time readers (`hard_filter`, the backoff defer)
+    /// keep reading RAM until T-1b.13.
+    ///
+    /// The eligibility predicate is "every statically-eligible
+    /// non-draining worker is in the excluded set", not
+    /// `excluded.len() >= total`. The latter over-counts stale IDs: b0
+    /// fails, b0 is replaced by b2, b1 fails → set={b0,b1} len=2,
+    /// total=2 → would poison, but b2 was never tried. The fleet filter
+    /// MUST match the static-eligibility subset of `rejection_reason` —
+    /// a kind-only filter let an x86 drv that failed on every x86 worker
+    /// defer forever in a multi-arch cluster because aarch64 workers
+    /// (which `find_executor` rejects on system-mismatch) kept the fleet
     /// "non-exhausted".
     ///
-    /// Draining workers are excluded: under one-shot semantics
-    /// (I-188; the only mode), a just-failed worker is `draining=true`
-    /// but still in `self.executors` at completion-time. Counting it
-    /// meant `poolSize=1` poisoned on the FIRST transient failure
-    /// (fleet={E1}, failed={E1} → exhausted), bypassing `max_retries`
-    /// and `poison_config.threshold`. Excluding it lets the
-    /// empty-fleet guard below return `false` → re-queue → controller
-    /// spawns a fresh `executor_id ∉ failed_builders`. Under one-shot
-    /// this function therefore returns `false` in practice (failed
-    /// workers drain; fresh workers ∉ failed_builders); it remains as
-    /// defense-in-depth for any future path where a worker fails
-    /// without draining. Poison-on-repeated-failure flows through
-    /// `PoisonConfig::is_poisoned(threshold)` instead.
+    /// Draining workers are excluded from the fleet: under one-shot
+    /// semantics (I-188; the only mode), a just-failed worker is
+    /// `draining=true` but still in `self.executors` at
+    /// completion-time. Counting it meant `poolSize=1` poisoned on the
+    /// FIRST transient failure (fleet={E1}, failed={E1} → exhausted),
+    /// bypassing `max_retries` and `poison_config.threshold`. Excluding
+    /// it lets the empty-fleet clause defer → re-queue → controller
+    /// spawns a fresh `executor_id` outside the exclusion set. Under
+    /// one-shot this check therefore stays un-exhausted in practice
+    /// (failed workers drain; fresh workers are not excluded); it
+    /// remains as defense-in-depth for any future path where a worker
+    /// fails without draining. Poison-on-repeated-failure flows through
+    /// the threshold verdict instead.
     ///
-    /// Returns false (don't poison) when zero statically-eligible
-    /// non-draining workers are registered — that's "no pool connected
-    /// for this system/features", a transient that the freeze
-    /// detector, unroutable-system gauge, and autoscaler handle.
-    /// Poisoning then would brick builds during a deployment rollout.
+    /// Returns `None` (don't poison) when the placement verdict is not
+    /// `FleetExhausted` — including when zero statically-eligible
+    /// non-draining workers are registered ("no pool connected for this
+    /// system/features", a transient that the freeze detector,
+    /// unroutable-system gauge, and autoscaler handle; poisoning then
+    /// would brick builds during a deployment rollout). Returns
+    /// `Some(excluded_count)` when exhausted; the caller owns the I-065
+    /// operator warn + metric at the arm that acts on the verdict.
     // r[impl sched.dispatch.fleet-exhaust+3]
-    pub(super) fn failed_builders_exhausts_fleet(&self, drv_hash: &DrvHash) -> bool {
-        let Some(state) = self.dag.node(drv_hash) else {
-            return false;
-        };
-        if state.retry.failed_builders.is_empty() {
-            return false;
-        }
-        let mut fleet = self
+    pub(super) fn dispatch_fleet_exhausted(&self, drv_hash: &DrvHash) -> Option<usize> {
+        let state = self.dag.node(drv_hash)?;
+        let decision = crate::retry_policy::decide(
+            state.attempt_history(),
+            &self.decision_budget(),
+            crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+            None,
+        );
+        let eligible: HashSet<ExecutorId> = self
             .executors
             .values()
-            .filter(|w| !w.is_draining() && crate::assignment::statically_eligible(w, state));
-        // `all()` on an empty iterator is vacuously true — peek first.
-        let Some(first) = fleet.next() else {
-            return false;
-        };
-        let exhausted = std::iter::once(first)
-            .chain(fleet)
-            .all(|w| state.retry.failed_builders.contains(&w.executor_id));
-        if exhausted {
-            warn!(
-                drv_hash = %drv_hash,
-                system = %state.system,
-                // §13e + r35: intentional bypass — the operator triaging
-                // an unroutable drv needs to see what the tenant
-                // DECLARED. `effective_features` is the routing artifact.
-                declared_features = ?state.required_features(),
-                effective_features = ?state.effective_features().as_slice(),
-                failed_on = state.retry.failed_builders.len(),
-                "failed_builders excludes every statically-eligible worker \
-                 (kind+system+features); poisoning (would otherwise defer \
-                 forever — see I-065)"
-            );
-            metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
-        }
-        exhausted
+            .filter(|w| !w.is_draining() && crate::assignment::statically_eligible(w, state))
+            .map(|w| w.executor_id.clone())
+            .collect();
+        matches!(
+            crate::retry_policy::placeable(&decision.exclusion, &eligible),
+            crate::retry_policy::Placement::FleetExhausted
+        )
+        .then_some(decision.exclusion.len())
     }
 
     /// Find a worker for this derivation: intent-match (ADR-023)

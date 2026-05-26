@@ -2718,11 +2718,12 @@ async fn connect_executor_with_intent(
 // ---------------------------------------------------------------------------
 
 // r[verify sched.dispatch.fleet-exhaust+3]
-/// `failed_builders_exhausts_fleet` under one-shot (I-188) semantics:
-/// failed workers are draining and excluded from the fleet count, so
-/// the drv DEFERS (Ready) for the controller to spawn fresh workers,
-/// rather than poisoning. When a fresh statically-eligible worker
-/// connects, the drv dispatches to it.
+/// The dispatch-time fleet-exhaust backstop (`dispatch_fleet_exhausted`,
+/// `placeable()` over the fold-derived exclusion) under one-shot (I-188)
+/// semantics: failed workers are draining and excluded from the fleet
+/// count, so the drv DEFERS (Ready) for the controller to spawn fresh
+/// workers, rather than poisoning. When a fresh statically-eligible
+/// worker connects, the drv dispatches to it.
 ///
 /// The original I-065 multi-arch silent-hang scenario (an x86 drv
 /// that failed on every x86 worker, with aarch64 padding keeping a
@@ -5867,11 +5868,22 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     Ok(())
 }
 
-/// E9 (Phase 1a): the dispatch-time fleet-exhaust poison appends one
-/// `fleet_exhaust` marker row — a verdict marker with no execution of
-/// its own — after the trigger's earlier failure rows.
+/// E9 (Phase 1a + T-1b.7): the dispatch-time fleet-exhaust poison —
+/// now `placeable()` over the fold-derived exclusion — appends one
+/// `fleet_exhaust` marker row (a verdict marker with no execution of
+/// its own) after the trigger's earlier failure rows, and increments
+/// `rio_scheduler_poison_fleet_exhausted_total` at the dispatch-time
+/// arm that acts on the verdict (the emission moved there from the
+/// deleted RAM-reading predicate; no other test pins it).
 #[tokio::test]
 async fn attempt_ledger_e9_fleet_exhaust_marker_row() -> TestResult {
+    // current-thread runtime: the actor task shares this OS thread at
+    // .await points, so the thread-local recorder sees its counter!()
+    // calls (same mechanism as the cancel-signals metric test).
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let metric_key = "rio_scheduler_poison_fleet_exhausted_total{}";
+
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy.backoff_base_secs = 0.0;
@@ -5892,6 +5904,7 @@ async fn attempt_ledger_e9_fleet_exhaust_marker_row() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
+    let before = recorder.get(metric_key);
 
     // The same executor identity reconnects fresh (not draining): every
     // statically-eligible worker has now already failed this drv, so
@@ -5906,7 +5919,7 @@ async fn attempt_ledger_e9_fleet_exhaust_marker_row() -> TestResult {
     assert_eq!(
         expect_drv(&handle, drv_hash).await.status,
         DerivationStatus::Poisoned,
-        "failed_builders covers the whole eligible fleet → dispatch-time poison"
+        "the fold-derived exclusion covers the whole eligible fleet → dispatch-time poison"
     );
     let classes = ledger_classes(&db.pool, drv_hash).await;
     assert_eq!(
@@ -5919,6 +5932,14 @@ async fn attempt_ledger_e9_fleet_exhaust_marker_row() -> TestResult {
     assert!(
         marker.exec_id.is_none() && marker.executor_id.is_none(),
         "the verdict marker is not an execution"
+    );
+    assert_eq!(
+        recorder.get(metric_key) - before,
+        1,
+        "the dispatch-time fleet-exhaust poison increments \
+         rio_scheduler_poison_fleet_exhausted_total exactly once; \
+         registered counters: {:#?}",
+        recorder.all_keys(),
     );
     Ok(())
 }

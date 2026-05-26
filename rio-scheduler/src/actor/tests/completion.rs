@@ -1420,8 +1420,8 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
 /// - **pool_2_no_premature_poison**: 2 distinct of 2 workers (below
 ///   threshold=3) → Ready (re-queued for fresh workers), NOT
 ///   Poisoned. Under one-shot, both failed workers are draining →
-///   `failed_builders_exhausts_fleet` excludes them → empty fleet →
-///   `false` → re-queue. The controller spawns fresh `executor_id`s
+///   the eligible-fleet snapshot excludes them → empty fleet →
+///   `placeable()` defers → re-queue. The controller spawns fresh `executor_id`s
 ///   ∉ `failed_builders`; poison flows ONLY through
 ///   `is_poisoned(threshold)` once 3 distinct accumulate.
 /// - **pool_1_no_premature_poison** (bug_108 regression): poolSize=1,
