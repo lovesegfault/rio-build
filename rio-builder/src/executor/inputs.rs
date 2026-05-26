@@ -111,7 +111,11 @@ fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec
 /// enters the store.
 ///
 /// For `r:<algo>` (recursive): hash the NAR serialization of the output
-/// path. For `<algo>` (flat): hash the file contents directly.
+/// path. For `<algo>` (flat): hash the file contents directly — and,
+/// like CppNix, require the output to be exactly one non-executable
+/// regular file (an executable and a non-executable file with the same
+/// bytes would collide on one store path, so the shape is part of the
+/// contract, not just the bytes).
 ///
 /// `upper_store` is `{overlay_upper}/nix/store` — callers pass
 /// `OverlayMount::upper_store()`.
@@ -157,6 +161,46 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
             // output is rejected without entering the store.
             compute_local_nar_hash(&fs_path, algo)?
         } else {
+            // CppNix rejects a flat fixed-output that is not exactly one
+            // non-executable regular file even when the bytes hash
+            // correctly (`derivation-builder.cc`, CAFixed/flat branch):
+            // an executable and a non-executable file with identical
+            // bytes would otherwise collide on the same store path. The
+            // floating-CA pipeline already enforces the same rule
+            // (`CaFlatNotSingleFile` in `native_result/ca.rs`); mirror
+            // it here. lstat so a symlink is reported as a symlink
+            // instead of being followed to its target's bytes.
+            let md = std::fs::symlink_metadata(&fs_path)
+                .with_context(|| format!("failed to stat FOD output {}", fs_path.display()))?;
+            if md.file_type().is_symlink() || !md.is_file() {
+                bail!(
+                    "FOD flat output '{}' must be a single regular file \
+                     (outputHashMode=flat), but {} is a {}",
+                    output.name(),
+                    output.path(),
+                    if md.file_type().is_symlink() {
+                        "symlink"
+                    } else {
+                        "non-regular file"
+                    },
+                );
+            }
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = md.permissions().mode();
+                if mode & 0o111 != 0 {
+                    bail!(
+                        "FOD flat output '{}' must be a non-executable regular \
+                         file (outputHashMode=flat), but {} has mode {:o}; an \
+                         executable and a non-executable file with the same \
+                         bytes would collide on one store path, so CppNix \
+                         rejects this shape",
+                        output.name(),
+                        output.path(),
+                        mode & 0o7777,
+                    );
+                }
+            }
             // Flat hash — stream file contents through a digest
             // sink. Same O(1)-memory contract as the recursive
             // branch above (see compute_local_flat_hash doc).
@@ -571,6 +615,54 @@ mod tests {
         let expected = hex::encode(sha2::Sha256::digest(&content));
         let drv = make_fod_drv("/nix/store/test-flat-large", "sha256", &expected);
         verify_fod_hashes(&drv, &store_dir)
+    }
+
+    /// CppNix rejects a flat FOD output that is not a single
+    /// NON-EXECUTABLE regular file even when the bytes hash correctly:
+    /// executability is part of the contract because two files with
+    /// identical bytes but different modes would collide on one store
+    /// path.
+    #[test]
+    fn test_verify_fod_flat_executable_rejected() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let content = b"#!/bin/sh\necho fetched\n";
+        let (_tmp, store_dir) = seed_output("test-flat-exec", content)?;
+        std::fs::set_permissions(
+            store_dir.join("test-flat-exec"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        // The declared hash is CORRECT for the bytes — only the shape is wrong.
+        let declared = correct_fod_hash(&store_dir, "test-flat-exec", content, "sha256")?;
+        let drv = make_fod_drv("/nix/store/test-flat-exec", "sha256", &declared);
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("executable flat FOD must be rejected like CppNix");
+        assert!(
+            err.to_string().contains("non-executable"),
+            "error should explain the shape rule: {err}"
+        );
+        Ok(())
+    }
+
+    /// A symlink pointing at content whose bytes match the declared flat
+    /// hash is still rejected: the output must BE a regular file, not
+    /// point at one (CppNix lstats the output).
+    #[test]
+    fn test_verify_fod_flat_symlink_rejected() -> anyhow::Result<()> {
+        let content = b"symlink target bytes";
+        let (_tmp, store_dir) = seed_output("test-flat-target", content)?;
+        std::os::unix::fs::symlink(
+            store_dir.join("test-flat-target"),
+            store_dir.join("test-flat-link"),
+        )?;
+        let declared = correct_fod_hash(&store_dir, "test-flat-link", content, "sha256")?;
+        let drv = make_fod_drv("/nix/store/test-flat-link", "sha256", &declared);
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("symlinked flat FOD must be rejected like CppNix");
+        assert!(
+            err.to_string().contains("regular file"),
+            "error should mention the regular-file requirement: {err}"
+        );
+        Ok(())
     }
 
     /// Unknown algo (e.g., md5): fail-closed. This function is the sole
