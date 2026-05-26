@@ -1156,6 +1156,32 @@ pub const M_063: () = ();
 /// Read/written by **rio-scheduler** only.
 pub const M_064: () = ();
 
+/// `migrations/065_force_build_roots.sql`
+///
+/// Persistence for the per-build force-build-roots policy
+/// (`SubmitBuildRequest.force_build_roots`): `builds.force_build_roots`
+/// plus the per-(build, derivation) submission-root marker
+/// `build_derivations.is_root`, so recovery can rebuild the per-node
+/// "do not substitute" sticky-OR after leader failover.
+///
+/// `DEFAULT FALSE` is deliberate — the flag is opt-in per submission
+/// (gateway stamps it from tenant policy; absent = today's substitute-
+/// friendly behavior). 004's `keep_going DEFAULT true` is NOT a
+/// precedent: that default encoded recovery semantics for pre-existing
+/// builds, not an opt-in policy.
+///
+/// `is_root` lives on `build_derivations` because "was a root of this
+/// build's submission" is a per-(build, derivation) fact: the same
+/// derivation can be a root of build A and an interior node of build B,
+/// and the global `derivation_edges` table (deduped across all builds)
+/// cannot reconstruct which nodes were parentless *within one
+/// submission*.
+///
+/// Both columns are written only on the insert path (insert_build /
+/// link_build_derivations); no backfill — pre-existing rows keep FALSE,
+/// which preserves their original (non-forced) semantics.
+pub const M_065: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
