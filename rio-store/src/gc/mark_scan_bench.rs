@@ -1,32 +1,58 @@
 //! Mark-scan cost measurement for the lazy chunk collector (design §5a go/no-go).
 //!
 //! Seeds N synthetic chunked paths (`narinfo` + `manifests` + `manifest_data`
-//! with realistic `chunk_list` blobs) and then runs the collector's mark phase
-//! exactly as the shadow/live collector will: stream `manifest_data.chunk_list`
-//! joined to `manifests` in keyset pages on ONE connection, parse each blob
-//! with [`super::try_parse_unique_chunk_hashes`], and accumulate the live set
-//! into a `TEMP TABLE live_chunks(blake3_hash BYTEA PRIMARY KEY)` via batched
-//! `INSERT … ON CONFLICT DO NOTHING`.
+//! with realistic `chunk_list` blobs) and then measures the collector's mark
+//! phase — deriving the live-chunk set from the durable manifests at scan
+//! time, no new write-path state, the live set rebuilt per cycle into a
+//! session temp table — in several formulations of that same architecture:
 //!
-//! The measurement reports wall-clock for the mark phase, rows scanned,
-//! references parsed, mark-set size (distinct hashes), and the temp-table
-//! size — the numbers the go/no-go threshold (full scan at the ~1.5 M-path
-//! scale, linear-or-better growth, temp-table-bounded memory) is judged
-//! against. Measured figures are volatile and belong in the introducing
-//! commit message and the invariant map, never in this file.
+//! - `mark_scan_bench` — the design §4.1 prescribed shape: stream
+//!   `manifest_data.chunk_list` joined to `manifests` in keyset pages on ONE
+//!   connection, parse each blob with [`super::try_parse_unique_chunk_hashes`],
+//!   and accumulate the live set into a `TEMP TABLE live_chunks(blake3_hash
+//!   BYTEA PRIMARY KEY)` via batched `INSERT … ON CONFLICT DO NOTHING`.
+//! - `mark_scan_bench_copy_groupby` — same scan and client-side fallible
+//!   parse, but references stream into an unindexed temp table via
+//!   `COPY … FROM STDIN (FORMAT binary)` and are deduplicated once at the
+//!   end by a single set-based `GROUP BY` into `live_chunks` (no per-row
+//!   `ON CONFLICT` probe, no btree maintained during the scan).
+//! - `mark_scan_bench_server_side` — no client round-trip: a fail-closed
+//!   validation pass (version byte, 36-byte entry alignment, `MAX_CHUNKS`)
+//!   followed by one `CREATE TEMP TABLE live_chunks AS SELECT DISTINCT
+//!   <hash slice>` that expands every `chunk_list` inside the server
+//!   (`generate_series` + `substring` over a once-per-row detoasted copy).
 //!
-//! `#[ignore]`d: the measurement-scale run takes minutes by design. Run it
+//! Each test reports wall-clock (per phase and total), rows scanned,
+//! references parsed/expanded, mark-set size (distinct hashes), table sizes,
+//! and the database-wide temp-file spill delta — the numbers the go/no-go
+//! threshold (full scan at the ~1.5 M-path scale, linear-or-better growth,
+//! bounded memory) is judged against. Measured figures are volatile and
+//! belong in the introducing commit message and the invariant map, never in
+//! this file.
+//!
+//! `#[ignore]`d: the measurement-scale runs take minutes by design. Run one
 //! explicitly, e.g.:
 //!
 //! ```text
 //! MARK_SCAN_BENCH_PATHS=1500000 \
-//!   cargo nextest run -p rio-store -E 'test(mark_scan_bench)' --run-ignored all
+//!   cargo nextest run -p rio-store -E 'test(mark_scan_bench_server_side)' \
+//!   --run-ignored all --release
 //! ```
 //!
 //! Env knobs (all optional):
 //! - `MARK_SCAN_BENCH_PATHS`        — number of chunked paths to seed (default 2000, smoke scale)
 //! - `MARK_SCAN_BENCH_SEED_WORKERS` — parallel seeding tasks (default 12; seeding only — the
 //!   mark scan itself is always one connection, like the collector)
+//! - `MARK_SCAN_BENCH_WORK_MEM`     — session `work_mem` for the set-based formulations
+//!   (default 4GB; bounds the dedup aggregate, which spills to temp files past it)
+//! - `MARK_SCAN_BENCH_COPY_ROWS`    — references per `COPY` statement in the copy+GROUP BY
+//!   formulation (default 1,000,000)
+//!
+//! At or below 20 k paths the alternative formulations also run the
+//! prescribed shape on the same fixture and assert both produce a mark set
+//! of the same cardinality; at every scale they assert a known manifest's
+//! hashes are all present in the produced live set (decisive against
+//! slicing/encoding misalignment).
 //!
 //! The per-path entry-count mix approximates the inventory's volume shape:
 //! median a few dozen entries, a long tail up to ~160k entries (the
@@ -277,20 +303,51 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// The measurement. Smoke scale by default; see the module doc for the
-/// measurement-scale invocation.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "mark-scan cost measurement: minutes-long at measurement scale, run explicitly"]
-async fn mark_scan_bench() {
-    let n_paths = env_u64("MARK_SCAN_BENCH_PATHS", 2_000);
-    let seed_workers = env_u64("MARK_SCAN_BENCH_SEED_WORKERS", 12).max(1);
-    // Shared-pool size scales with the population so the dedup factor
-    // stays roughly constant across scale points.
-    let pool_size = (n_paths * 4).clamp(4_096, 8_000_000);
+/// Session `work_mem` for the set-based formulations. Alphanumeric-only
+/// guard keeps the value safe to splice into `SET work_mem = '…'`.
+fn env_work_mem() -> String {
+    let v = std::env::var("MARK_SCAN_BENCH_WORK_MEM").unwrap_or_else(|_| "4GB".to_string());
+    assert!(
+        !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric()),
+        "MARK_SCAN_BENCH_WORK_MEM must be a plain PostgreSQL memory quantity, e.g. 4GB"
+    );
+    v
+}
 
-    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+/// At or below this path count the alternative formulations also run the
+/// prescribed shape on the same fixture and compare mark-set cardinality.
+/// Above it the prescribed shape is too slow to re-run casually and its
+/// figures are already on record.
+const EQUIVALENCE_MAX_PATHS: u64 = 20_000;
 
-    // ---- Seed (parallel; fixture setup, not part of the measurement) ----
+/// Deterministic membership sample: the (capped) hash list of path 0's
+/// manifest. Every alternative formulation must mark all of them —
+/// cardinality alone could mask a uniform slicing offset, this cannot.
+fn sample_hashes(pool_size: u64) -> Vec<[u8; 32]> {
+    let blob = build_chunk_list(0, pool_size);
+    let mut hashes =
+        super::try_parse_unique_chunk_hashes(&blob).expect("synthetic manifest is well-formed");
+    hashes.truncate(64);
+    hashes
+}
+
+/// Fixture-seeding outcome (never part of a measured phase).
+struct SeededVolume {
+    entries_seeded: u64,
+    blob_bytes: u64,
+    manifest_data_bytes: i64,
+    seed_secs: f64,
+}
+
+/// Seed the synthetic narinfo/manifests/manifest_data volume with
+/// `seed_workers` parallel tasks and refresh planner stats. Fixture setup
+/// shared by every formulation; never part of a measured phase.
+async fn seed_fixture(
+    db: &rio_test_support::TestDb,
+    n_paths: u64,
+    seed_workers: u64,
+    pool_size: u64,
+) -> SeededVolume {
     let seed_started = Instant::now();
     // db.pool caps at 5 connections; reopen() extra pools so the seed
     // workers are not connection-starved.
@@ -316,8 +373,8 @@ async fn mark_scan_bench() {
         entries_seeded += r;
         blob_bytes += b;
     }
-    let seed_elapsed = seed_started.elapsed();
-    // Planner stats so the join strategy matches a steady-state table.
+    let seed_secs = seed_started.elapsed().as_secs_f64();
+    // Planner stats so the scan/join strategy matches a steady-state table.
     sqlx::query("ANALYZE manifest_data")
         .execute(&db.pool)
         .await
@@ -335,6 +392,399 @@ async fn mark_scan_bench() {
             .fetch_one(&db.pool)
             .await
             .expect("manifest_data size");
+    SeededVolume {
+        entries_seeded,
+        blob_bytes,
+        manifest_data_bytes,
+        seed_secs,
+    }
+}
+
+/// Cumulative temp-file bytes written database-wide (`pg_stat_database`),
+/// read before/after a formulation to report its spill volume. Spill is
+/// the *bounded-memory* mechanism for the set-based aggregates — past
+/// `work_mem` they partition to temp files instead of growing resident.
+async fn db_temp_bytes(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> i64 {
+    sqlx::query_scalar("SELECT temp_bytes FROM pg_stat_database WHERE datname = current_database()")
+        .fetch_one(&mut **conn)
+        .await
+        .expect("pg_stat_database temp_bytes")
+}
+
+/// `EXPLAIN` (no execution) of one statement, for the measurement record.
+async fn explain_lines(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    sql: &str,
+) -> Vec<String> {
+    // AssertSqlSafe: wraps one of this module's fixed statements, test-only.
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT text) {sql}")))
+        .fetch_all(&mut **conn)
+        .await
+        .expect("EXPLAIN")
+}
+
+/// Reduce an `EXPLAIN` plan to one line: top node + planned worker count.
+fn summarize_plan(lines: &[String]) -> String {
+    let top = lines.first().map(String::as_str).unwrap_or("").trim();
+    let workers = lines
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("Workers Planned: "))
+        .unwrap_or("0");
+    format!("{top} [workers_planned={workers}]")
+}
+
+/// Every hash of one known manifest must be present in the produced
+/// `live_chunks`. Runs on the mark connection before the temp tables are
+/// dropped; never part of a measured phase.
+async fn assert_sample_marked(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    sample: &[[u8; 32]],
+) {
+    let sample_vecs: Vec<Vec<u8>> = sample.iter().map(|h| h.to_vec()).collect();
+    let present: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks WHERE blake3_hash = ANY($1)")
+            .bind(&sample_vecs)
+            .fetch_one(&mut **conn)
+            .await
+            .expect("sample membership probe");
+    assert_eq!(
+        present,
+        sample.len() as i64,
+        "every sampled reference from a known manifest is in the live set"
+    );
+}
+
+/// `COPY … (FORMAT binary)` per-statement header: 11-byte signature,
+/// 4-byte flags (0), 4-byte header-extension length (0).
+const COPY_BINARY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0";
+
+/// One binary COPY tuple for a single BYTEA(32) column: field count
+/// (i16 = 1) + field length (i32 = 32) + 32 hash bytes.
+const COPY_TUPLE_BYTES: usize = 2 + 4 + 32;
+
+/// The copy+GROUP BY formulation's dedup statement. `mark_refs` is
+/// deliberately not ANALYZEd first: with no column stats the planner uses
+/// its default distinct estimate and picks the hash aggregate (the
+/// intended set-based dedup); sampled stats on a near-all-distinct bytea
+/// column tend to push it to an external sort of the whole reference
+/// stream instead.
+const DEDUP_SQL: &str =
+    "CREATE TEMP TABLE live_chunks AS SELECT blake3_hash FROM mark_refs GROUP BY blake3_hash";
+
+/// One complete `COPY mark_refs FROM STDIN (FORMAT binary)` statement
+/// carrying `rows` pre-encoded tuples.
+async fn copy_refs(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    tuples: &[u8],
+    rows: usize,
+) {
+    let raw: &mut sqlx::PgConnection = &mut *conn;
+    let mut copy = raw
+        .copy_in_raw("COPY mark_refs (blake3_hash) FROM STDIN (FORMAT binary)")
+        .await
+        .expect("begin COPY");
+    copy.send(COPY_BINARY_HEADER).await.expect("COPY header");
+    copy.send(tuples).await.expect("COPY tuples");
+    // Binary-format trailer: field count -1.
+    copy.send(&(-1i16).to_be_bytes()[..])
+        .await
+        .expect("COPY trailer");
+    let copied = copy.finish().await.expect("finish COPY");
+    assert_eq!(copied, rows as u64, "COPY row count matches encoded tuples");
+}
+
+/// Outcome of one alternative-formulation mark run. `total` is the
+/// wall-clock from the first mark statement to `live_chunks` being
+/// complete — the figure the §5a threshold is judged against; the two
+/// phases are formulation-specific (documented at each runner).
+struct AltMarkStats {
+    rows_scanned: u64,
+    refs_fed: u64,
+    mark_set_size: i64,
+    refs_table_bytes: i64,
+    live_table_bytes: i64,
+    phase1: std::time::Duration,
+    phase2: std::time::Duration,
+    total: std::time::Duration,
+    spill_delta_bytes: i64,
+    plan_summary: String,
+}
+
+/// Candidate "copy + GROUP BY": the same one-connection keyset scan and
+/// fallible client-side parse as [`run_mark_scan`], but the parsed
+/// references stream into an unindexed session temp table with
+/// `COPY … FROM STDIN (FORMAT binary)` and are deduplicated once at the
+/// end by a single set-based `GROUP BY` into `live_chunks` — no per-row
+/// `ON CONFLICT` probe, no btree maintained during the scan.
+///
+/// Phase 1 = scan + parse + COPY; phase 2 = the `GROUP BY`
+/// materialization. Client memory stays bounded by one page of manifests
+/// plus one COPY buffer; server memory by `work_mem` (the aggregate
+/// spills to temp files past it) plus the session temp tables.
+async fn run_mark_scan_copy_groupby(
+    pool: &PgPool,
+    work_mem: &str,
+    copy_batch_rows: usize,
+    print_plan: bool,
+    sample: &[[u8; 32]],
+) -> AltMarkStats {
+    /// Manifest rows fetched per page (same as the prescribed shape).
+    const PAGE_ROWS: i64 = 1000;
+
+    let mut conn = pool.acquire().await.expect("acquire mark connection");
+    // AssertSqlSafe: SET can't take bind parameters; the value is
+    // alphanumeric-guarded by env_work_mem. Test-only.
+    sqlx::query(sqlx::AssertSqlSafe(format!("SET work_mem = '{work_mem}'")))
+        .execute(&mut *conn)
+        .await
+        .expect("set work_mem");
+    // A TEMP table is already session-local and never WAL-logged (the
+    // UNLOGGED property is implied); no PK, no index — dedup happens
+    // once, set-based, in phase 2.
+    sqlx::query("CREATE TEMP TABLE mark_refs (blake3_hash BYTEA)")
+        .execute(&mut *conn)
+        .await
+        .expect("create mark_refs");
+    let spill_before = db_temp_bytes(&mut conn).await;
+
+    let started = Instant::now();
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut rows_scanned = 0u64;
+    let mut refs_fed = 0u64;
+    // Pre-encoded COPY tuple stream for the in-flight batch (the
+    // per-statement header/trailer are added at flush time).
+    let mut tuples: Vec<u8> = Vec::with_capacity(copy_batch_rows * COPY_TUPLE_BYTES + 64);
+    let mut tuple_rows = 0usize;
+    loop {
+        let page: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT md.store_path_hash, md.chunk_list \
+               FROM manifest_data md \
+               JOIN manifests m USING (store_path_hash) \
+              WHERE md.store_path_hash > $1 \
+              ORDER BY md.store_path_hash \
+              LIMIT $2",
+        )
+        .bind(&cursor)
+        .bind(PAGE_ROWS)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("mark page fetch");
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().expect("non-empty page").0.clone();
+        for (_hash, chunk_list) in &page {
+            rows_scanned += 1;
+            let hashes = super::try_parse_unique_chunk_hashes(chunk_list)
+                .expect("bench seeds only well-formed manifests");
+            refs_fed += hashes.len() as u64;
+            for h in &hashes {
+                tuples.extend_from_slice(&1i16.to_be_bytes());
+                tuples.extend_from_slice(&32i32.to_be_bytes());
+                tuples.extend_from_slice(h);
+            }
+            tuple_rows += hashes.len();
+        }
+        if tuple_rows >= copy_batch_rows {
+            copy_refs(&mut conn, &tuples, tuple_rows).await;
+            tuples.clear();
+            tuple_rows = 0;
+        }
+    }
+    if tuple_rows > 0 {
+        copy_refs(&mut conn, &tuples, tuple_rows).await;
+        tuples.clear();
+    }
+    let phase1 = started.elapsed();
+
+    let plan = explain_lines(&mut conn, DEDUP_SQL).await;
+    if print_plan {
+        for line in &plan {
+            println!("mark_scan_bench plan| {line}");
+        }
+    }
+    sqlx::query(DEDUP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("dedup GROUP BY");
+    let total = started.elapsed();
+    let phase2 = total - phase1;
+
+    let spill_delta_bytes = db_temp_bytes(&mut conn).await - spill_before;
+    let mark_set_size: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("mark set count");
+    let refs_table_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('mark_refs')")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("mark_refs size");
+    let live_table_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('live_chunks')")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("live_chunks size");
+    assert_sample_marked(&mut conn, sample).await;
+    sqlx::query("DROP TABLE live_chunks, mark_refs")
+        .execute(&mut *conn)
+        .await
+        .expect("drop temp tables");
+
+    AltMarkStats {
+        rows_scanned,
+        refs_fed,
+        mark_set_size,
+        refs_table_bytes,
+        live_table_bytes,
+        phase1,
+        phase2,
+        total,
+        spill_delta_bytes,
+        plan_summary: summarize_plan(&plan),
+    }
+}
+
+/// The server-side formulation's mark statement: expand every
+/// `chunk_list` inside the server and deduplicate with one set-based
+/// aggregate. The `OFFSET 0` lateral materializes, once per manifest row,
+/// a detoasted copy of the entry block (version byte dropped) plus the
+/// entry count, so the per-entry `substring` slices an in-memory value
+/// instead of re-fetching TOAST data per entry, and the `generate_series`
+/// lateral is parameterized by the small integer count (any Memoize node
+/// the planner adds then caches series by entry count instead of hashing
+/// whole blobs). Entry `i` (1-based) starts at body offset `36·i − 35`.
+const SERVER_MARK_SQL: &str = "CREATE TEMP TABLE live_chunks AS \
+     SELECT DISTINCT substring(d.body FROM 36 * g.i - 35 FOR 32) AS blake3_hash \
+       FROM manifest_data md \
+       JOIN manifests m USING (store_path_hash) \
+       CROSS JOIN LATERAL \
+         (SELECT substring(md.chunk_list FROM 2) AS body, \
+                 (octet_length(md.chunk_list) - 1) / 36 AS n \
+          OFFSET 0) AS d \
+       CROSS JOIN LATERAL \
+         generate_series(1, d.n) AS g(i)";
+
+/// Candidate "server-side expansion": no client round-trip — a
+/// fail-closed validation pass over the joined manifests (version byte,
+/// 36-byte entry alignment, `MAX_CHUNKS` bound; any violation aborts,
+/// preserving the §4.4 corrupt-manifest polarity), then the single
+/// [`SERVER_MARK_SQL`] expansion + dedup statement.
+///
+/// Phase 1 = the validation pass; phase 2 = the expansion + dedup
+/// statement. The client never sees a `chunk_list`; server memory is
+/// bounded by `work_mem` (the aggregate spills to temp files past it)
+/// plus the session temp table.
+async fn run_mark_scan_server_side(
+    pool: &PgPool,
+    work_mem: &str,
+    print_plan: bool,
+    sample: &[[u8; 32]],
+) -> AltMarkStats {
+    let mut conn = pool.acquire().await.expect("acquire mark connection");
+    // AssertSqlSafe: SET can't take bind parameters; the value is
+    // alphanumeric-guarded by env_work_mem. Test-only.
+    sqlx::query(sqlx::AssertSqlSafe(format!("SET work_mem = '{work_mem}'")))
+        .execute(&mut *conn)
+        .await
+        .expect("set work_mem");
+    let spill_before = db_temp_bytes(&mut conn).await;
+
+    // Manifest format invariants enforced server-side, fail-closed: a
+    // corrupt chunk_list must abort the cycle, never read as "references
+    // nothing". 36 = the serialized entry size (32-byte BLAKE3 + u32 LE
+    // size), \x01 = the format version byte; both fixed by
+    // rio_store::manifest. The version probe uses substring (empty on an
+    // empty blob) rather than get_byte so a zero-length blob is reported
+    // as malformed instead of erroring mid-scan.
+    let validate_sql = format!(
+        "SELECT COUNT(*) \
+           FROM manifest_data md \
+           JOIN manifests m USING (store_path_hash) \
+          WHERE octet_length(md.chunk_list) < 1 \
+             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
+             OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
+             OR (octet_length(md.chunk_list) - 1) / 36 > {}",
+        crate::manifest::MAX_CHUNKS
+    );
+
+    let plan = explain_lines(&mut conn, SERVER_MARK_SQL).await;
+    if print_plan {
+        for line in &plan {
+            println!("mark_scan_bench plan| {line}");
+        }
+    }
+
+    let started = Instant::now();
+    // AssertSqlSafe: interpolates only the MAX_CHUNKS integer const, test-only.
+    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(validate_sql))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("validation pass");
+    assert_eq!(
+        malformed, 0,
+        "fail-closed: the fixture seeds only well-formed manifests"
+    );
+    let phase1 = started.elapsed();
+    sqlx::query(SERVER_MARK_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("server-side mark");
+    let total = started.elapsed();
+    let phase2 = total - phase1;
+
+    let spill_delta_bytes = db_temp_bytes(&mut conn).await - spill_before;
+    let mark_set_size: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("mark set count");
+    let live_table_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('live_chunks')")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("live_chunks size");
+    // Fixture totals for the record (what the statement walked); not part
+    // of the formulation itself.
+    let (rows_scanned, refs_fed): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM((octet_length(md.chunk_list) - 1) / 36), 0)::BIGINT \
+           FROM manifest_data md \
+           JOIN manifests m USING (store_path_hash)",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("fixture totals");
+    assert_sample_marked(&mut conn, sample).await;
+    sqlx::query("DROP TABLE live_chunks")
+        .execute(&mut *conn)
+        .await
+        .expect("drop temp table");
+
+    AltMarkStats {
+        rows_scanned: rows_scanned as u64,
+        refs_fed: refs_fed as u64,
+        mark_set_size,
+        refs_table_bytes: 0,
+        live_table_bytes,
+        phase1,
+        phase2,
+        total,
+        spill_delta_bytes,
+        plan_summary: summarize_plan(&plan),
+    }
+}
+
+/// The measurement. Smoke scale by default; see the module doc for the
+/// measurement-scale invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "mark-scan cost measurement: minutes-long at measurement scale, run explicitly"]
+async fn mark_scan_bench() {
+    let n_paths = env_u64("MARK_SCAN_BENCH_PATHS", 2_000);
+    let seed_workers = env_u64("MARK_SCAN_BENCH_SEED_WORKERS", 12).max(1);
+    // Shared-pool size scales with the population so the dedup factor
+    // stays roughly constant across scale points.
+    let pool_size = (n_paths * 4).clamp(4_096, 8_000_000);
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+
+    // ---- Seed (parallel; fixture setup, not part of the measurement) ----
+    let seeded = seed_fixture(&db, n_paths, seed_workers, pool_size).await;
 
     // ---- Mark scan (the measurement) ----
     let (rows_scanned, refs_parsed, mark_set_size, temp_table_bytes, elapsed) =
@@ -342,12 +792,15 @@ async fn mark_scan_bench() {
 
     println!(
         "mark_scan_bench: paths={n_paths} seed_workers={seed_workers} shared_pool={pool_size}\n\
-         mark_scan_bench: seeded entries={entries_seeded} blob_bytes={blob_bytes} \
-         manifest_data_total_bytes={manifest_data_bytes} seed_secs={:.1}\n\
+         mark_scan_bench: seeded entries={} blob_bytes={} \
+         manifest_data_total_bytes={} seed_secs={:.1}\n\
          mark_scan_bench: SCAN rows_scanned={rows_scanned} refs_parsed={refs_parsed} \
          mark_set_size={mark_set_size} temp_table_bytes={temp_table_bytes} \
          scan_secs={:.3}",
-        seed_elapsed.as_secs_f64(),
+        seeded.entries_seeded,
+        seeded.blob_bytes,
+        seeded.manifest_data_bytes,
+        seeded.seed_secs,
         elapsed.as_secs_f64(),
     );
 
@@ -355,11 +808,161 @@ async fn mark_scan_bench() {
     // recorded in the invariant map from the printed figures.
     assert_eq!(rows_scanned, n_paths, "every seeded manifest is scanned");
     assert!(
-        refs_parsed > 0 && refs_parsed <= entries_seeded,
+        refs_parsed > 0 && refs_parsed <= seeded.entries_seeded,
         "per-manifest dedup'd references are bounded by the seeded entries"
     );
     assert!(
         mark_set_size > 0 && (mark_set_size as u64) <= refs_parsed,
         "mark set is non-empty and no larger than the parsed references"
     );
+}
+
+/// Alternative formulation 1: client parse + binary `COPY` into an
+/// unindexed temp table + one set-based `GROUP BY`. Smoke scale by
+/// default; see the module doc for the measurement-scale invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "mark-scan cost measurement: minutes-long at measurement scale, run explicitly"]
+async fn mark_scan_bench_copy_groupby() {
+    let n_paths = env_u64("MARK_SCAN_BENCH_PATHS", 2_000);
+    let seed_workers = env_u64("MARK_SCAN_BENCH_SEED_WORKERS", 12).max(1);
+    let work_mem = env_work_mem();
+    let copy_batch_rows = env_u64("MARK_SCAN_BENCH_COPY_ROWS", 1_000_000).max(1) as usize;
+    let pool_size = (n_paths * 4).clamp(4_096, 8_000_000);
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    let seeded = seed_fixture(&db, n_paths, seed_workers, pool_size).await;
+    let sample = sample_hashes(pool_size);
+
+    let stats = run_mark_scan_copy_groupby(
+        &db.pool,
+        &work_mem,
+        copy_batch_rows,
+        n_paths <= EQUIVALENCE_MAX_PATHS,
+        &sample,
+    )
+    .await;
+
+    println!(
+        "mark_scan_bench[copy_groupby]: paths={n_paths} seed_workers={seed_workers} \
+         shared_pool={pool_size} work_mem={work_mem} copy_rows={copy_batch_rows}\n\
+         mark_scan_bench[copy_groupby]: seeded entries={} blob_bytes={} \
+         manifest_data_total_bytes={} seed_secs={:.1}\n\
+         mark_scan_bench[copy_groupby]: SCAN rows_scanned={} refs_copied={} mark_set_size={} \
+         refs_table_bytes={} live_table_bytes={} spill_delta_bytes={} \
+         copy_secs={:.3} dedup_secs={:.3} scan_secs={:.3}\n\
+         mark_scan_bench[copy_groupby]: dedup_plan={}",
+        seeded.entries_seeded,
+        seeded.blob_bytes,
+        seeded.manifest_data_bytes,
+        seeded.seed_secs,
+        stats.rows_scanned,
+        stats.refs_fed,
+        stats.mark_set_size,
+        stats.refs_table_bytes,
+        stats.live_table_bytes,
+        stats.spill_delta_bytes,
+        stats.phase1.as_secs_f64(),
+        stats.phase2.as_secs_f64(),
+        stats.total.as_secs_f64(),
+        stats.plan_summary,
+    );
+
+    assert_eq!(
+        stats.rows_scanned, n_paths,
+        "every seeded manifest is scanned"
+    );
+    assert!(
+        stats.refs_fed > 0 && stats.refs_fed <= seeded.entries_seeded,
+        "per-manifest dedup'd references are bounded by the seeded entries"
+    );
+    assert!(
+        stats.mark_set_size > 0 && (stats.mark_set_size as u64) <= stats.refs_fed,
+        "mark set is non-empty and no larger than the copied references"
+    );
+
+    // Cross-formulation equivalence at small scale: the prescribed shape
+    // and the set-based dedup must agree on the live set's cardinality.
+    if n_paths <= EQUIVALENCE_MAX_PATHS {
+        let (_, baseline_refs, baseline_mark_set, _, _) = run_mark_scan(&db.pool).await;
+        assert_eq!(
+            baseline_refs, stats.refs_fed,
+            "both formulations parse the same reference stream"
+        );
+        assert_eq!(
+            baseline_mark_set, stats.mark_set_size,
+            "both formulations derive the same live-set cardinality"
+        );
+    }
+}
+
+/// Alternative formulation 2: fully server-side expansion + dedup, no
+/// client round-trip. Smoke scale by default; see the module doc for the
+/// measurement-scale invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "mark-scan cost measurement: minutes-long at measurement scale, run explicitly"]
+async fn mark_scan_bench_server_side() {
+    let n_paths = env_u64("MARK_SCAN_BENCH_PATHS", 2_000);
+    let seed_workers = env_u64("MARK_SCAN_BENCH_SEED_WORKERS", 12).max(1);
+    let work_mem = env_work_mem();
+    let pool_size = (n_paths * 4).clamp(4_096, 8_000_000);
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    let seeded = seed_fixture(&db, n_paths, seed_workers, pool_size).await;
+    let sample = sample_hashes(pool_size);
+
+    let stats = run_mark_scan_server_side(
+        &db.pool,
+        &work_mem,
+        n_paths <= EQUIVALENCE_MAX_PATHS,
+        &sample,
+    )
+    .await;
+
+    println!(
+        "mark_scan_bench[server_side]: paths={n_paths} seed_workers={seed_workers} \
+         shared_pool={pool_size} work_mem={work_mem}\n\
+         mark_scan_bench[server_side]: seeded entries={} blob_bytes={} \
+         manifest_data_total_bytes={} seed_secs={:.1}\n\
+         mark_scan_bench[server_side]: SCAN rows_scanned={} refs_expanded={} mark_set_size={} \
+         live_table_bytes={} spill_delta_bytes={} \
+         validate_secs={:.3} aggregate_secs={:.3} scan_secs={:.3}\n\
+         mark_scan_bench[server_side]: mark_plan={}",
+        seeded.entries_seeded,
+        seeded.blob_bytes,
+        seeded.manifest_data_bytes,
+        seeded.seed_secs,
+        stats.rows_scanned,
+        stats.refs_fed,
+        stats.mark_set_size,
+        stats.live_table_bytes,
+        stats.spill_delta_bytes,
+        stats.phase1.as_secs_f64(),
+        stats.phase2.as_secs_f64(),
+        stats.total.as_secs_f64(),
+        stats.plan_summary,
+    );
+
+    assert_eq!(
+        stats.rows_scanned, n_paths,
+        "every seeded manifest is scanned"
+    );
+    assert!(
+        stats.refs_fed > 0 && stats.refs_fed <= seeded.entries_seeded,
+        "expanded references are bounded by the seeded entries"
+    );
+    assert!(
+        stats.mark_set_size > 0 && (stats.mark_set_size as u64) <= stats.refs_fed,
+        "mark set is non-empty and no larger than the expanded references"
+    );
+
+    // Cross-formulation equivalence at small scale: the prescribed
+    // client-side parse and the server-side expansion must agree on the
+    // live set's cardinality.
+    if n_paths <= EQUIVALENCE_MAX_PATHS {
+        let (_, _, baseline_mark_set, _, _) = run_mark_scan(&db.pool).await;
+        assert_eq!(
+            baseline_mark_set, stats.mark_set_size,
+            "both formulations derive the same live-set cardinality"
+        );
+    }
 }

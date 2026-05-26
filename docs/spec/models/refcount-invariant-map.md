@@ -872,3 +872,95 @@ both change under a junction-maintained mark), so recording a choice
 now would prejudge the re-entry. The Wave A1 stop-and-report record is
 `refcount-a1-blocker-T-1a.1.md` (campaign working notes, alongside the
 design and plan documents).
+
+#### T-1a.1 follow-up — set-based mark formulations (measurement spike, not a design decision)
+
+Before the §5a re-entry prices the junction fallback, two set-based
+reformulations of the SAME scan-time mark — liveness still derived
+from `manifest_data` at collect time, no new write-path state, the
+live set still rebuilt per cycle into a session temp table — were
+measured with the same harness, fixture, scale points, and hardware as
+the NO-GO record above (`gc::mark_scan_bench`, release profile, single
+backend, session `work_mem = 4GB` for the set-based dedup, PostgreSQL
+defaults otherwise; raw transcripts in the introducing commit
+message):
+
+- **copy + GROUP BY** (`mark_scan_bench_copy_groupby`) — the
+  prescribed keyset scan and fallible client-side parse, unchanged,
+  but references stream into an unindexed temp table via binary `COPY`
+  and are deduplicated once at the end by a single set-based
+  `GROUP BY` into `live_chunks` — no per-row `ON CONFLICT` probe, no
+  btree maintained during the scan.
+- **server-side expansion** (`mark_scan_bench_server_side`) — no
+  client round-trip at all: a fail-closed validation pass (version
+  byte, 36-byte entry alignment, `MAX_CHUNKS`; any violation aborts
+  the cycle, preserving the §4.4 polarity), then one
+  `CREATE TEMP TABLE … AS SELECT DISTINCT` statement that expands
+  every `chunk_list` inside the server (`generate_series` +
+  `substring` over a once-per-manifest detoasted copy) and
+  deduplicates in the same statement.
+
+Both formulations produce exactly the prescribed mark product (a
+session temp table holding the distinct live hashes) and are pinned to
+it: at every scale they reproduce the mark-set cardinality the
+prescribed shape produced, and a known manifest's hashes are asserted
+present in the result (a slicing/encoding-misalignment check). The
+collect-phase anti-join stays outside the measured window, exactly as
+in the NO-GO record.
+
+| Formulation | 15 k paths | 150 k paths | 1.5 M paths | growth per 10× paths | spill at 1.5 M |
+|---|---|---|---|---|---|
+| Prescribed (per-row `ON CONFLICT`; the NO-GO above) | 11.1 s | 163.0 s | 2293.8 s (38 min 14 s) | 14.7×, 14.1× | n/a (20 GB PK btree) |
+| Copy + `GROUP BY` | 1.9 s | 29.0 s | 374.3 s (6 min 14 s) | 15.0×, 12.9× | 2.5 GB |
+| Server-side expansion | 1.5 s | 18.8 s | 219.7 s (3 min 40 s) | 12.4×, 11.7× | 2.5 GB |
+
+Verdict against the sign-off item 5 threshold (full mark scan ≤ 5
+minutes at the ~1.5 M-path scale; linear-or-better growth; bounded
+memory):
+
+- **Copy + GROUP BY: does not meet.** Roughly 1.25× the five-minute
+  budget at 1.5 M (clause 1 fail); growth still super-linear
+  (clause 2 fail); only the memory clause holds (the client holds one
+  page plus one ~38 MB COPY buffer, the server side is
+  `work_mem`-bounded and spills to temp files). Most of its cost is
+  the single-connection round-trip itself — about half the wall-clock
+  goes to pulling ~12 GB of blobs out and pushing ~12.5 GB of
+  references back over one connection before dedup even starts.
+- **Server-side expansion: meets the time and memory clauses with
+  margin on this hardware.** 3 min 40 s is ~73 % of the budget
+  (clause 1 pass); memory is bounded by `work_mem` (≈2.5 GB of
+  temp-file spill observed) plus the ~9.4 GB result table (clause 3
+  pass). Growth is 12.4× then 11.7× per 10× paths — ≈1.2× per decade
+  against the reference volume, so not strictly linear (clause 2
+  marginal), but per-reference throughput falls only 2.4 → 1.5 M
+  refs/s across two decades versus 306 k → 144 k refs/s for the
+  prescribed shape; the degradation is attributable to the dedup hash
+  outgrowing CPU caches and to the spill at the largest point, not to
+  a per-row probe that keeps getting more expensive. A further 10×
+  store (15 M chunked paths) extrapolates to ~40 minutes — graceful
+  degradation, not unbounded headroom.
+
+Caveats carried from the NO-GO record: same dev-box hardware
+(tmpfs-backed PostgreSQL, fsync off, EPYC clocks), so absolute times
+remain a lower bound on production cost and the ~27 % margin shrinks
+on a slower database host; the dominant cost is single-core CPU in the
+expansion + aggregate, and `workers_planned = 0` throughout (no
+parallel query was used — headroom exists there if the statement's
+target is made non-temporary). Other shapes were not pursued: the
+threshold was met with margin by a same-architecture formulation
+(the spike's stop-early condition), and the "anti-join `chunks`
+directly against the aggregated references" variant needs a populated
+production-scale `chunks` table in the fixture to mean anything. An
+incremental mark (only manifests changed since the last cycle) was
+likewise not measured: it changes the §4.1 correctness argument (the
+live set would no longer be re-derived from scratch each cycle) and is
+out of scope for a measurement spike.
+
+What this changes for the §5a re-entry: the junction fallback is no
+longer the only priced option. The scan-time architecture has a
+formulation that fits the stated budget at the design-point scale with
+no new write-path state; the re-entry can weigh the junction's
+write-amplification and blob-vs-junction drift obligations against a
+server-side mark whose remaining risks are production-hardware margin,
+the strictness of the linear-growth clause, and plan-shape sensitivity
+across PostgreSQL versions, rather than against a 38-minute scan.
