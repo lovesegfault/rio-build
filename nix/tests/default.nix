@@ -59,6 +59,7 @@ let
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
+  castore-e2e = import ./scenarios/castore-e2e.nix;
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
@@ -272,6 +273,38 @@ let
   lifecycleProdParityMod = lifecycle {
     inherit pkgs common;
     fixture = k3sProdParity { };
+  };
+
+  # Shared castore-e2e module (P0560 §B). Prod-parity fixture (the §B
+  # fixture rows — kernel.nix import, mountd DS, /var/rio hostPaths —
+  # all live in k3s-full, which prod-parity wraps; the bootstrap Job's
+  # expected AWS failure is irrelevant here).
+  #
+  # jwtEnabled: source attribution. The prelude's seed pushes run as
+  # the vm-castore tenant (SSH key comment), the gateway mints the
+  # session JWT for them, and the store writes path_tenants rows
+  # (store.put.tenant-attribution) — without that every castore mount
+  # of a client-pushed source returns NotFound and the whole scenario
+  # dies at the first build.
+  #
+  # store.replicas=1 is restated (it is also the chart default) so the
+  # eio-circuit-breaker subtest's scale-0/scale-1 outage stays
+  # deterministic even if a values-file default ever changes.
+  #
+  # vmtest-castore.yaml pins all executor pods to k3s-agent so the
+  # node-cache reuse assertions are same-node by construction (the
+  # store stays pinned to k3s-server by vmtest-full.yaml).
+  castoreMod = castore-e2e {
+    inherit pkgs common;
+    fixture = k3sProdParity {
+      jwtEnabled = true;
+      extraValuesTyped = {
+        "store.replicas" = 1;
+      };
+      extraValuesFiles = [
+        ../../infra/helm/rio-build/values/vmtest-castore.yaml
+      ];
+    };
   };
 
   composefs-spike = import ./scenarios/composefs-spike.nix;
@@ -1547,6 +1580,119 @@ in
       #   bootstrap-job-ran since both exercise prod-config-only.
       "bootstrap-tenant"
     ];
+  };
+
+  # ── castore-e2e splits (2 tests, k3s prod-parity fixture) ────────────
+  # P0560 §B: the castore-FUSE stack end-to-end on the production pod
+  # path. Two tests built from one fragments-style scenario
+  # (scenarios/castore-e2e.nix) — a monolith would not fit a 30 min
+  # globalTimeout. Per-build metric assertions are taken during each
+  # build's sleep tail (one-shot pods), cache assertions are host-side
+  # probes of /var/rio on k3s-agent; no wall-clock gates anywhere.
+  vm-castore-e2e-core = castoreMod.mkTest {
+    name = "core";
+    subtests = [
+      "seed-core"
+      # r[verify builder.fs.castore-stack]
+      # r[verify builder.fs.castore-dag-source]
+      # r[verify builder.fs.digest-fuse-open]
+      # r[verify builder.fs.streaming-open]
+      # r[verify builder.fs.streaming-open-threshold]
+      # r[verify builder.overlay.castore-lower]
+      # r[verify builder.fs.fd-handoff-ordering+2]
+      # r[verify builder.mountd.fuse-handoff+2]
+      # r[verify builder.fs.shared-backing-cache]
+      # r[verify obs.metric.castore-fuse]
+      # r[verify obs.metric.mountd]
+      # r[verify store.index.putpath-bg-warm]
+      #   cold-read: first build to touch a 32 MiB input — the open
+      #   dispatches as miss_stream (streaming engaged above the 8 MiB
+      #   threshold), the 4 KiB sibling as miss_small, exactly one DAG
+      #   prefetch runs, the streamed prefix byte-compares against the
+      #   separately-pushed head, the fill promotes into
+      #   /var/rio/{cache,chunks}, and rio-mountd's Mount/Promote
+      #   counters move. The prelude's nar_indexed gate plus this read
+      #   is the putpath-bg-warm evidence; the build running at all on
+      #   a castore lower under the one-shot pod path is the
+      #   castore-stack / overlay-lower / fd-handoff evidence.
+      "cold-read"
+      # r[verify builder.fs.passthrough-on-hit]
+      # r[verify builder.fs.shared-backing-cache]
+      # r[verify builder.fs.node-digest-cache]
+      #   warm-read: a different drv re-reads the same input on the same
+      #   node — open_case=hit, served via passthrough, zero read
+      #   upcalls, zero fetched bytes, no remote-path opens.
+      "warm-read"
+      # r[verify builder.fs.passthrough-on-hit]
+      #   passthrough-small: a ≤threshold input opened twice (miss then
+      #   hit) — both passthrough, zero read upcalls, never streamed.
+      "passthrough-small"
+      # r[verify builder.fs.node-digest-cache]
+      # r[verify builder.fs.shared-backing-cache]
+      #   cross-build-dedup: a third distinct drv re-reads cold-read's
+      #   inputs — ≥32 MiB served from the node cache, zero remote bytes.
+      "cross-build-dedup"
+      # r[verify builder.fs.castore-inode-digest]
+      #   inode-dedup: two store paths with identical bytes report the
+      #   same inode inside the sandbox (stat -c %i) and one cache entry.
+      "inode-dedup"
+      # r[verify builder.fs.castore-cache-config]
+      #   stat-dcache-absorbed: five traversals of a 50-file tree keep
+      #   lookup/getattr/readdir upcalls at one-traversal counts
+      #   (infinite TTLs + READDIRPLUS + FOPEN_CACHE_DIR absorb repeats).
+      "stat-dcache-absorbed"
+      # r[verify builder.fs.listxattr-size-branch]
+      #   xattr-copy: GNU cp -a (llistxattr size probe + size>0 fetch)
+      #   of a file and a tree out of the castore lower succeeds.
+      "xattr-copy"
+      # r[verify builder.fs.node-chunk-cache]
+      #   chunk-cache-stream: evict the whole-file backing entry, leave
+      #   the chunks, stream again — the fill sources node_ssd chunks,
+      #   re-fetches (almost) nothing, and re-promotes the file.
+      "chunk-cache-stream"
+      #   cache-readonly: the sandbox's attempt to create
+      #   /var/rio/cache/ab/test never lands (P0571 posture; asserted on
+      #   passthrough-small's pod evidence + a host probe).
+      "cache-readonly"
+    ];
+    globalTimeout = 1800;
+  };
+
+  vm-castore-e2e-faults = castoreMod.mkTest {
+    name = "faults";
+    subtests = [
+      "seed-faults"
+      #   chunk-warm: clean streaming baseline (fixture canary) + cache
+      #   pre-warm for mountd-restart; fills the chunk inventory
+      #   integrity-fail corrupts.
+      "chunk-warm"
+      # r[verify builder.fs.file-digest-integrity]
+      #   integrity-fail: a size-preserving corruption of a node-cache
+      #   chunk is caught by the streaming fill's whole-file BLAKE3 —
+      #   integrity_fail_total == 1, the reader gets EIO, nothing is
+      #   promoted, and the store layer never sees it.
+      "integrity-fail"
+      # r[verify builder.fs.fetch-circuit]
+      #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
+      #   never-cached opens all fail fast (bounded EIO, not hangs) and
+      #   the fetch breaker opens after 5 consecutive failures.
+      "eio-circuit-breaker"
+      # r[verify builder.result.input-eio-is-infra]
+      #   eio-infra-retry: with the store's chunk objects offline, the
+      #   daemon's execve of a castore-served builder gets EIO; the
+      #   executor reclassifies the MiscFailure as InfrastructureFailure,
+      #   the scheduler re-queues (never failed/poisoned), and the build
+      #   completes once the chunks are restored.
+      "eio-infra-retry"
+      # r[verify builder.mountd.orphan-scan]
+      #   mountd-restart: force-delete the broker DaemonSet pod
+      #   mid-build — the held passthrough fd keeps working, the build
+      #   completes, the restarted daemon's startup scan reaps a planted
+      #   staging orphan while /var/rio/{cache,chunks} survive, and a
+      #   follow-up build promotes through the new daemon.
+      "mountd-restart"
+    ];
+    globalTimeout = 1800;
   };
 }
 # Spike: P0564 — confirm /dev/kvm via extra-sandbox-paths (hostPath
