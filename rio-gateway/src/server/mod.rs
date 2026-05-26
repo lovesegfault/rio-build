@@ -12,7 +12,7 @@ pub use keys::{
     spawn_authorized_keys_watcher,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -846,6 +846,7 @@ impl russh::server::Server for GatewayServer {
             session_sem: Arc::clone(&self.session_sem),
             max_channels_per_connection: self.max_channels_per_connection,
             open_channels: 0,
+            accepted_channels: HashSet::new(),
             empty_connection_grace: self.empty_connection_grace,
             handshake_timeout: self.handshake_timeout,
             idle: Arc::new(connection::EmptyConnectionTimer::new()),
