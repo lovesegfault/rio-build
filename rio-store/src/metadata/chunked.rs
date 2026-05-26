@@ -222,6 +222,13 @@ pub(crate) async fn upgrade_manifest_to_chunked(
 /// second one is a no-op (0 rows updated). The timestamp is the FIRST
 /// confirmed upload, not the last.
 ///
+/// `AND deleted = FALSE` closes the late-mark window: an owner whose
+/// row was stale-reclaimed (soft-deleted, `uploaded_at` cleared)
+/// between its S3 PUTs and this call must not re-assert presence on a
+/// row whose backend object the drain is about to delete — a deleted
+/// row's presence is (re-)established only by the resurrecting upsert
+/// plus a fresh PUT.
+///
 /// Hashes are sorted before binding — same lock-order discipline as
 /// every other `chunks` writer (`r[store.chunk.lock-order]`).
 // r[impl store.cas.chunk-upload-committed]
@@ -234,7 +241,7 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
     sorted.sort_unstable();
     sqlx::query(
         "UPDATE chunks SET uploaded_at = now() \
-         WHERE blake3_hash = ANY($1) AND uploaded_at IS NULL",
+         WHERE blake3_hash = ANY($1) AND uploaded_at IS NULL AND deleted = FALSE",
     )
     .bind(&sorted)
     .execute(pool)
@@ -635,6 +642,61 @@ mod tests {
                 .unwrap();
         assert_eq!(rc, 1, "resurrected: 0→1");
         assert!(!del, "resurrected: deleted flipped false");
+    }
+
+    // r[verify store.cas.chunk-upload-committed]
+    /// The late-mark window: an owner whose chunk row was stale-reclaimed
+    /// (soft-deleted, `uploaded_at` cleared) between its S3 PUTs and its
+    /// mark must NOT re-assert `uploaded_at` on the soft-deleted row —
+    /// the drain is about to delete the backend object, so a re-asserted
+    /// presence would let the next writer of the same content skip its
+    /// PUT against an object that no longer exists (the M_033 harm shape
+    /// without consulting the counter). Presence on a soft-deleted row is
+    /// (re-)established only by the resurrecting upsert + a fresh PUT.
+    #[tokio::test]
+    async fn mark_chunks_uploaded_skips_soft_deleted_rows() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Owner stages a chunked upload far enough to create the chunk
+        // row (refcount=1, uploaded_at NULL — its S3 PUTs are in flight).
+        let chunk = vec![0x7Eu8; 32];
+        let sph = vec![0x7Au8; 32];
+        seed_placeholder(&db.pool, &sph).await;
+        let _ = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph,
+            b"manifest-late-mark",
+            std::slice::from_ref(&chunk),
+            &[1024],
+        )
+        .await
+        .unwrap();
+
+        // The stale reclaim fires while the owner is still uploading:
+        // its chunk-row effect is soft-delete + uploaded_at cleared
+        // (`decrement_and_enqueue`). Simulate exactly that row state.
+        sqlx::query("UPDATE chunks SET deleted = TRUE, uploaded_at = NULL WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // The owner's late mark lands after the reclaim.
+        mark_chunks_uploaded(&db.pool, std::slice::from_ref(&chunk))
+            .await
+            .unwrap();
+
+        // The soft-deleted row must NOT have presence re-asserted.
+        let uploaded: bool =
+            sqlx::query_scalar("SELECT uploaded_at IS NOT NULL FROM chunks WHERE blake3_hash = $1")
+                .bind(&chunk)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            !uploaded,
+            "late mark must not re-assert uploaded_at on a soft-deleted chunk row"
+        );
     }
 
     // r[verify store.cas.upsert-inserted+2]

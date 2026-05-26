@@ -905,13 +905,20 @@ module chunkLiveness {
 
   /// `metadata::mark_chunks_uploaded` (cas::stage_chunked step 4b, one
   /// statement): set uploaded_at for the chunks this uploader PUT,
-  /// where still NULL. The presence commit point
+  /// where still NULL and not soft-deleted (`AND deleted = FALSE` — the
+  /// late-mark guard: a row stale-reclaimed between the PUT fan-out and
+  /// this mark keeps uploaded_at NULL; presence on a soft-deleted row is
+  /// re-established only by the resurrecting upsert + a fresh PUT). Under
+  /// the heartbeat contract that interleaving is unreachable here, so the
+  /// guard does not change this model's reachable states; the witness
+  /// pair that shows it load-bearing under a relaxed contract belongs to
+  /// the replacement (collector) model. The presence commit point
   /// (store.cas.chunk-upload-committed).
   action markUploaded(u: int): bool = all {
     ups.get(u).pc == UPutDone,
     chunks' = chunks.keys().mapBy(h =>
       val c = chunks.get(h)
-      if (ups.get(u).needsUpload.contains(h) and c.present) { ...c, uploadedAt: true } else c),
+      if (ups.get(u).needsUpload.contains(h) and c.present and not(c.deleted)) { ...c, uploadedAt: true } else c),
     ups' = ups.set(u, { ...ups.get(u), pc: UMarked }),
     paths' = paths, s3' = s3, outbox' = outbox, orphanCand' = orphanCand,
     leakedRefs' = leakedRefs, wit' = wit,
