@@ -119,6 +119,7 @@ pub async fn compute(
 /// `set_nar_index`'s `claim_id IS NOT DISTINCT FROM` fence then
 /// no-ops if GC + a re-upload raced us between the commit and this
 /// write, exactly like the indexer loop's read-then-fence.
+#[instrument(skip(pool, nar), fields(nar_len = nar.len()))]
 pub async fn compute_from_bytes(
     pool: &PgPool,
     nar: &[u8],
@@ -183,7 +184,9 @@ pub fn maybe_spawn_eager(
         let timer = std::time::Instant::now();
         match compute_from_bytes(&pool, &nar, &store_path, Some(claim_id)).await {
             Ok(()) => {
-                metrics::histogram!("rio_store_nar_index_compute_seconds")
+                // `source="eager"`: in-RAM bytes, so this population is
+                // hash+persist only (no chunk fetch / reassemble).
+                metrics::histogram!("rio_store_nar_index_compute_seconds", "source" => "eager")
                     .record(timer.elapsed().as_secs_f64());
             }
             Err(e) => {
@@ -243,7 +246,9 @@ pub fn spawn_indexer_loop(
                 let timer = std::time::Instant::now();
                 match compute(&pool, &cache, &path, u64::MAX, None).await {
                     Ok(_) => {
-                        metrics::histogram!("rio_store_nar_index_compute_seconds")
+                        // `source="loop"`: full pipeline — chunk fetch +
+                        // reassemble + nar_ls + persist.
+                        metrics::histogram!("rio_store_nar_index_compute_seconds", "source" => "loop")
                             .record(timer.elapsed().as_secs_f64());
                     }
                     Err(e) => {

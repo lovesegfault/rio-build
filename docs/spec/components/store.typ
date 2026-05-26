@@ -331,7 +331,10 @@ builds, so any caller presenting one is a builder; routing builders onto
 `PutPathChunked` keeps FastCDC CPU on the (ephemeral, per-build) builder pod
 and eliminates the store-side whole-NAR buffer for build outputs. Token
 *validity* failures (missing/garbage/expired/wrong-key tokens) are rejected by
-the verification step itself and never reach this gate.
+the verification step itself and never reach this gate. Wire compatibility:
+the `role` claim is serde-defaulted, so a pre-role assignment token whose JSON
+carries no `role` key deserializes as `Builder` and hits the same gate ---
+legacy builder tokens cannot slip through the buffered RPCs by omission.
 
 + *Idempotency check + `'uploading'` placeholder:* If a `'complete'` manifest
   already exists for this path, return success immediately (fast-path no-op).

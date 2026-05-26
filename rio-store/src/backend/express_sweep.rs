@@ -31,14 +31,17 @@
 //! Kubernetes (`KUBERNETES_SERVICE_HOST` present) each replica runs a
 //! [`rio_lease`] loop on the per-AZ Lease
 //! `rio-store-express-sweep-{az_id}` and only sweeps while it holds it.
-//! If the kube client cannot be built or the Lease cannot be reached
-//! (no service-account token mounted, apiserver egress denied, RBAC
-//! missing — see `infra/helm/rio-build/templates/store-rbac.yaml`), the
-//! lease loop logs a warning and exits; that replica then **never
-//! sweeps** and the bucket's age-based lifecycle expiration
-//! (`infra/eks/s3-express.tf`) is the only growth bound. Outside
-//! Kubernetes (VM tests, dev, standalone single-replica) there is no
-//! lease infrastructure and the replica sweeps unconditionally.
+//! If the kube client cannot be built (no service-account token
+//! mounted), the lease loop logs a warning and exits; if the client
+//! builds but the Lease stays unreachable (apiserver egress denied,
+//! RBAC missing — see
+//! `infra/helm/rio-build/templates/store-rbac.yaml`), the loop keeps
+//! retrying every renewal interval (~5 s) without ever acquiring.
+//! Either way that replica **never sweeps** and the bucket's age-based
+//! lifecycle expiration (`infra/eks/s3-express.tf`) is the only growth
+//! bound. Outside Kubernetes (VM tests, dev, standalone single-replica)
+//! there is no lease infrastructure and the replica sweeps
+//! unconditionally.
 //!
 //! ## Memory envelope
 //!
@@ -383,9 +386,9 @@ impl rio_lease::LeaseHooks for SweepLeaseHooks {
 ///
 /// - In Kubernetes (`KUBERNETES_SERVICE_HOST` set by the kubelet): the
 ///   per-AZ Lease `rio-store-express-sweep-{az_id}` elects one sweeper;
-///   this replica sweeps only while it holds it. If the kube client/Lease
-///   is unreachable the lease loop exits with a warning and this replica
-///   never sweeps.
+///   this replica sweeps only while it holds it. A replica whose kube
+///   client cannot be built (loop exits) or whose Lease stays
+///   unreachable (loop retries forever without acquiring) never sweeps.
 /// - Outside Kubernetes: sole replica by assumption — always leader.
 fn sweep_leader_state(az_id: &str, shutdown: rio_common::signal::Token) -> rio_lease::LeaderState {
     let generation = Arc::new(AtomicU64::new(1));

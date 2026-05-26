@@ -310,6 +310,13 @@ impl StoreServiceImpl {
                 )));
             }
             WalkOutcome::Mismatch(msg) => {
+                // Folded into the NAR-hash-mismatch counter on purpose:
+                // a stored chunk whose length disagrees with the
+                // manifest means the recomputed NAR could never hash to
+                // the claim, so operationally it is the same "builder's
+                // manifest doesn't describe the stored bytes" signal —
+                // not worth a separate series until someone needs to
+                // tell the two apart.
                 metrics::counter!("rio_store_narhash_mismatch_total").increment(1);
                 metrics::counter!("rio_store_put_path_total", "result" => "error")
                     .increment(unskipped(&skipped));
@@ -383,6 +390,13 @@ impl StoreServiceImpl {
         }
 
         // --- CA path recompute + deferred placeholder claim -----------
+        // bug_094's held-open-stream squat choreography (claim a CA
+        // placeholder, then stall the legacy PutPath stream) is no
+        // longer exercisable anywhere: builders are rejected from the
+        // legacy RPCs outright (`hmac_builder_token_putpath_rejected`),
+        // and on this path the structural assertions below — claim only
+        // AFTER the verify walk + `verify_ca_store_path` — are what
+        // replace that test (`ca_path_recompute_gates_commit`).
         // r[impl store.put.chunked-ca]
         // r[impl sec.authz.ca-path-derived+2]
         if is_ca {
@@ -501,7 +515,7 @@ impl StoreServiceImpl {
             while let Some(msg) = stream.message().await? {
                 let chunk = expect_chunk(msg)?;
                 let (digest, bytes) =
-                    check_novel_frame(&chunk, validated, next_novel).map_err(|e| *e)?;
+                    check_novel_frame(chunk, validated, next_novel).map_err(|e| *e)?;
                 next_novel += 1;
                 backend
                     .put(&digest, bytes)
@@ -527,6 +541,14 @@ impl StoreServiceImpl {
     /// (`Err`), and reports Incomplete/Unavailable/Mismatch via
     /// [`WalkOutcome`] so the caller can map them to the §6.3 verdict
     /// table.
+    ///
+    /// TODO: unlike [`Self::drain_chunked_stream`], the walk's
+    /// `stream.message()` waits are not wrapped in
+    /// `GRPC_STREAM_TIMEOUT` — a builder that stalls mid-stream parks
+    /// this handler (and its placeholder heartbeats / budget permits)
+    /// until the connection dies. That matches the legacy buffered
+    /// ingest (also untimed), but once a per-receive deadline exists
+    /// there it should be applied here too.
     // r[impl store.chunk.self-verify]
     #[allow(clippy::too_many_arguments)]
     async fn verify_walk(
@@ -613,7 +635,7 @@ impl StoreServiceImpl {
                                 };
                                 let chunk = expect_chunk(msg)?;
                                 let (digest, bytes) =
-                                    match check_novel_frame(&chunk, validated, next_novel) {
+                                    match check_novel_frame(chunk, validated, next_novel) {
                                         Ok(x) => x,
                                         Err(e) => return Err(*e),
                                     };
@@ -739,9 +761,11 @@ fn expect_chunk(msg: PutPathChunkedRequest) -> Result<PutPathChunkedChunk, Statu
 /// Validate one novel `Chunk` frame against the wire-order contract:
 /// `frame.digest == novel[next_novel]`, `len(bytes) == manifest_len[d]`,
 /// `blake3(bytes) == d`. All violations → `INVALID_ARGUMENT` (boxed so
-/// the hot loop's `Result` stays one word).
+/// the hot loop's `Result` stays one word). Takes the frame by value so
+/// the accepted body is handed back as a zero-copy `Bytes` over the
+/// decoded buffer instead of a fresh copy per chunk.
 fn check_novel_frame(
-    chunk: &PutPathChunkedChunk,
+    chunk: PutPathChunkedChunk,
     validated: &ValidatedBegin,
     next_novel: usize,
 ) -> Result<([u8; 32], Bytes), Box<Status>> {
@@ -789,7 +813,7 @@ fn check_novel_frame(
             hex::encode(actual)
         ))));
     }
-    Ok((digest, Bytes::copy_from_slice(&chunk.data)))
+    Ok((digest, Bytes::from(chunk.data)))
 }
 
 /// Spawn the bounded deduped-chunk prefetch task. Walks the global

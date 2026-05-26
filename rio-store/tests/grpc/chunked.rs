@@ -33,11 +33,12 @@ async fn test_chunked_small_nar_is_single_chunk() -> TestResult {
     .bind(&store_path)
     .fetch_one(&s.db.pool)
     .await?;
-    // 1 version byte + one 36-byte entry.
-    assert_eq!(chunk_list.len(), 1 + 36, "one manifest entry");
+    // Assert through the Manifest codec (what GetPath / the GC sweep
+    // decode) instead of pinning the serialized byte layout.
+    let manifest = rio_store::manifest::Manifest::deserialize(&chunk_list)?;
+    assert_eq!(manifest.entries.len(), 1, "one manifest entry");
     assert_eq!(
-        u32::from_le_bytes(chunk_list[33..37].try_into().unwrap()) as usize,
-        nar_len,
+        manifest.entries[0].size as usize, nar_len,
         "the single chunk spans the whole NAR"
     );
 

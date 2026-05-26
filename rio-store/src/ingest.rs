@@ -85,6 +85,13 @@ pub struct IngestHooks {
 /// `rio_store_put_path_total`) are NOT emitted here — that's a
 /// PutPath-specific counter. Only the stale-reclaim counter (whose
 /// name the caller supplies) is emitted.
+///
+/// TODO: `chunk_backend` is `Option` here (and on
+/// [`spawn_placeholder_guard`] / [`abort_placeholder`]) only because the
+/// gc-layer `reap_one` it feeds still takes an Option — every live
+/// caller passes `Some(&self.chunk_backend)` since the chunk backend
+/// became required config (P0583). Tighten these to `&Arc<dyn
+/// ChunkBackend>` together with the gc-layer Options.
 pub async fn claim_placeholder(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -146,21 +153,6 @@ pub async fn claim_placeholder(
     }
 }
 
-/// How [`persist_nar`] failed. The caller maps this to its own error
-/// domain (`tonic::Status` for gRPC, `SubstituteError` for
-/// substitution). `cas::put_chunked`'s internal rollback
-/// (`delete_manifest_chunked_uploading`) already ran; the placeholder
-/// is GONE (best-effort). Caller's `abort_placeholder` is a harmless
-/// no-op but not required.
-#[derive(Debug)]
-pub struct PersistError(pub anyhow::Error);
-
-impl std::fmt::Display for PersistError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// Persist a validated, hash-verified NAR for ONE output via
 /// [`cas::put_chunked`] (FastCDC + S3 + refcounts, own write-ahead +
 /// rollback). A NAR shorter than `CHUNK_MIN` is a single chunk equal to
@@ -171,6 +163,13 @@ impl std::fmt::Display for PersistError {
 /// `nar_data` is borrowed (not consumed) so the PutPath caller can keep
 /// the buffer alive for the post-commit eager `nar_index` pass
 /// (`r[store.index.putpath-eager]`) without cloning a multi-GiB Vec.
+///
+/// On error the caller maps the [`anyhow::Error`] to its own domain
+/// (`tonic::Status` for gRPC, `SubstituteError` for substitution).
+/// `cas::put_chunked`'s internal rollback
+/// (`delete_manifest_chunked_uploading`) already ran; the placeholder
+/// is GONE (best-effort). Caller's `abort_placeholder` is a harmless
+/// no-op but not required.
 pub async fn persist_nar(
     pool: &PgPool,
     chunk_backend: &Arc<dyn ChunkBackend>,
@@ -179,7 +178,7 @@ pub async fn persist_nar(
     nar_data: &[u8],
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
-) -> Result<(), PersistError> {
+) -> Result<(), anyhow::Error> {
     let stats = cas::put_chunked(
         pool,
         chunk_backend,
@@ -188,8 +187,7 @@ pub async fn persist_nar(
         nar_data,
         chunk_upload_max_concurrent,
     )
-    .await
-    .map_err(PersistError)?;
+    .await?;
     debug!(
         store_path = %info.store_path.as_str(),
         total_chunks = stats.total_chunks,

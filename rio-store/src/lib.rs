@@ -444,7 +444,9 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         "rio_store_nar_index_compute_seconds",
-        "Per-path NAR reassemble + nar_ls + persist (indexer_loop + eager PutPath)"
+        "Per-path nar_ls + persist duration, labeled by source: `loop` \
+         (indexer_loop — chunk fetch + reassemble + nar_ls + persist) vs \
+         `eager` (PutPath's in-RAM buffer — nar_ls + persist only, no fetch)"
     );
     describe_counter!(
         "rio_store_nar_index_eager_total",

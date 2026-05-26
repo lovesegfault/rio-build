@@ -308,6 +308,12 @@ impl StoreServiceImpl {
     /// backend, which replaces the memory default before anything is
     /// stored. A chunk backend is mandatory — there is no inline-in-PG
     /// fallback.
+    ///
+    /// TODO: the silent memory default exists only for the test
+    /// harnesses; a production wiring bug that forgets
+    /// `with_chunk_cache` would quietly store chunks in RAM. Make the
+    /// cache a required constructor argument and move the memory
+    /// default into a `new_for_tests()` — ~32 call sites, all tests.
     pub fn new(pool: PgPool) -> Self {
         let cache = Arc::new(ChunkCache::new(Arc::new(
             crate::backend::MemoryChunkBackend::new(),
@@ -882,7 +888,12 @@ impl StoreService for StoreServiceImpl {
     /// [`crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES`]) write-through.
     /// `NotFound` if the path has no complete manifest. Builder-internal
     /// like `BatchGetManifest`: the response carries `file_digest`
-    /// capability tokens, so end-user tenants are refused.
+    /// capability tokens, so end-user tenants are refused. The
+    /// gateway's delta-sync capability probe
+    /// (`rio-gateway::substitute::probe_path`) is a sanctioned
+    /// anonymous caller — it strips the end-user JWT (the path was
+    /// already tenant-authorized by its preceding `QueryPathInfo`) and
+    /// only consumes the structural index, never file contents.
     // r[impl store.index.rpc]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndex"))]
     async fn get_nar_index(

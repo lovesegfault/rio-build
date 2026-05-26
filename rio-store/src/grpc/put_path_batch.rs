@@ -35,7 +35,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
-use super::put_path::common::{ChunkedStaged, PlaceholderGuard};
+use super::put_path::common::{PlaceholderGuard, StagedOutput};
 use super::put_path::{
     PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
@@ -72,7 +72,7 @@ struct OutputAccum {
     /// Phase-2 staging result. `None` until phase 2 ran; carries the
     /// staged chunk set phase-3 flips durable alongside
     /// [`metadata::complete_manifest_in_conn`].
-    staged: Option<ChunkedStaged>,
+    staged: Option<StagedOutput>,
     /// Ownership token from `PlaceholderClaim::Owned` — set in phase-2
     /// for every output that is NOT `already_complete`. Threaded into
     /// phase-3's `complete_manifest_in_conn` so the status flip is
@@ -413,7 +413,7 @@ impl StoreServiceImpl {
             if let Some((signer, was_tenant)) = resolved_signer {
                 self.sign_with_resolved(signer, *was_tenant, &mut info);
             }
-            let ChunkedStaged { chunk_hashes } = accum.staged.take().expect("staged in phase 2");
+            let StagedOutput { chunk_hashes } = accum.staged.take().expect("staged in phase 2");
             let claim = accum
                 .claim
                 .expect("set in phase-2 for non-already_complete");

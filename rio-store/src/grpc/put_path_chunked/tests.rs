@@ -464,6 +464,31 @@ fn reject_path_not_in_expected_outputs() {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
 
+/// An assignment whose `drv_hash` is an input-addressed `.drv` store
+/// path requires a non-empty `Begin.deriver`: an empty deriver would
+/// silently skip the deriver↔assignment binding for a builder that
+/// demonstrably knows its derivation. CA assignments carry an opaque
+/// modular hash (not parseable as a store path) and stay exempt — they
+/// are bound by the post-verify CA-path recompute instead.
+#[test]
+fn reject_empty_deriver_when_assignment_names_a_drv_path() {
+    let (mut begin, _t) = valid_begin();
+    begin.deriver = String::new();
+    let claims = rio_auth::hmac::AssignmentClaims {
+        executor_id: "builder-0".into(),
+        drv_hash: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-thing.drv".into(),
+        expected_outputs: vec![begin.outputs[0].store_path.clone()],
+        is_ca: false,
+        expiry_unix: u64::MAX,
+        tenant: None,
+        role: rio_auth::hmac::TokenRole::Builder,
+        input_closure_digest: String::new(),
+    };
+    let err = validate_begin(&begin, Some(&claims)).expect_err("should be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("deriver"), "got {:?}", err.message());
+}
+
 /// Accepts a Begin whose claims match (the happy path under HMAC).
 #[test]
 fn accept_with_matching_claims() {

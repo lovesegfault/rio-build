@@ -449,14 +449,12 @@ impl DirectoryService for DirectoryServiceImpl {
                 "manifest has no manifest_data row (content unreadable)",
             ));
         };
-        let plan = BlobPlan::Chunked(
-            Arc::clone(&self.chunk_cache),
-            build_chunk_plan(&chunk_list, nar_offset, end)?,
-        );
+        let plan = build_chunk_plan(&chunk_list, nar_offset, end)?;
+        let cache = Arc::clone(&self.chunk_cache);
 
         let (tx, rx) = tokio::sync::mpsc::channel(READ_BLOB_CHANNEL_DEPTH);
         rio_common::task::spawn_monitored("read-blob-stream", async move {
-            let stream_fut = stream_blob(&tx, plan, digest);
+            let stream_fut = stream_blob(&tx, cache, plan, digest);
             match tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, stream_fut).await {
                 Err(_) => {
                     warn!(
@@ -535,6 +533,14 @@ impl DirectoryService for DirectoryServiceImpl {
         let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
+        // TODO: store.proto documents FailedPrecondition for a manifest
+        // with no chunk list ("inline manifest — use ReadBlob"), but this
+        // returns DATA_LOSS like read_blob does — post-P0583 every
+        // manifest is chunked, so a missing manifest_data row here is
+        // corruption, not a legacy shape. The builder's StatBlob→ReadBlob
+        // fallback keys on FailedPrecondition and therefore stays dormant
+        // until a store-side decision either changes this status or
+        // updates the proto doc (and retires the dormant fallback).
         let Some(chunk_list) = chunk_list else {
             return Err(Status::data_loss(
                 "manifest has no manifest_data row (content unreadable)",
@@ -574,15 +580,9 @@ fn nar_window(nar_offset: i64, file_size: i64) -> Result<(u64, u64), Status> {
     Ok((nar_offset, end))
 }
 
-/// Resolved fetch plan for one `ReadBlob`.
-enum BlobPlan {
-    /// Chunk hashes in NAR order with the byte range to emit from each.
-    /// Pre-slicing every chunk (not just first/last) keeps the stream
-    /// loop branch-free. Carrying the cache here proves a plan always
-    /// has a backend.
-    Chunked(Arc<ChunkCache>, Vec<ChunkSlice>),
-}
-
+/// One chunk of a `ReadBlob`/`StatBlob` fetch plan: chunk hashes in NAR
+/// order with the byte range to emit from each. Pre-slicing every chunk
+/// (not just first/last) keeps the stream loop branch-free.
 struct ChunkSlice {
     hash: [u8; 32],
     /// Total chunk size from the manifest. `ReadBlob`'s stream loop
@@ -648,9 +648,13 @@ fn build_chunk_plan(
 ///
 /// Returns `true` only on a clean stream with the body matching
 /// `file_digest`, so the caller can gate the latency histogram.
-async fn stream_blob(tx: &FrameTx, plan: BlobPlan, file_digest: [u8; 32]) -> bool {
+async fn stream_blob(
+    tx: &FrameTx,
+    cache: Arc<ChunkCache>,
+    slices: Vec<ChunkSlice>,
+    file_digest: [u8; 32],
+) -> bool {
     let mut hasher = blake3::Hasher::new();
-    let BlobPlan::Chunked(cache, slices) = plan;
     let mut chunk_stream = futures_util::stream::iter(slices)
         .map(|s| {
             let cache = Arc::clone(&cache);

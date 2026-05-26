@@ -167,16 +167,24 @@ pub(super) fn validate_begin(
     // `DerivationNode.drv_hash` from `drv_path`) and an opaque modular
     // hash for CA derivations. Only the store-path form is comparable
     // to `Begin.deriver`; the CA case is authorized by the post-verify
-    // CA-path recompute instead.
+    // CA-path recompute instead. When the claim IS the store-path form
+    // the deriver is required — an empty `Begin.deriver` would silently
+    // skip the binding for a builder that demonstrably knows its .drv.
     if let Some(c) = claims
-        && !begin.deriver.is_empty()
         && StorePath::parse(&c.drv_hash).is_ok()
-        && begin.deriver != c.drv_hash
     {
-        return Err(invalid(format!(
-            "Begin.deriver {:?} does not match the assignment's derivation {:?}",
-            begin.deriver, c.drv_hash
-        )));
+        if begin.deriver.is_empty() {
+            return Err(invalid(
+                "Begin.deriver is required when the assignment token names an \
+                 input-addressed derivation",
+            ));
+        }
+        if begin.deriver != c.drv_hash {
+            return Err(invalid(format!(
+                "Begin.deriver {:?} does not match the assignment's derivation {:?}",
+                begin.deriver, c.drv_hash
+            )));
+        }
     }
     let deriver = if begin.deriver.is_empty() {
         None
@@ -712,6 +720,14 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
 /// an adversarial deep chain cannot blow the thread stack; bounded by
 /// [`MAX_WALK_DEPTH`], [`MAX_WALK_ENTRIES`], and
 /// [`MAX_NAR_FRAMING_BYTES`].
+///
+/// TODO: this single pass does five jobs (NAR framing emission, chunk-run
+/// alignment, castore digest collection, NAR-index entry building, and
+/// the DoS bounds), which is why it runs ~370 lines. If it grows again,
+/// split it along the "emit framing" vs "collect castore artifacts"
+/// seam: the framing walk is the only part that needs the byte-exact NAR
+/// order, while the digest/index collection only needs the visited-node
+/// stream.
 fn walk_output(
     root: &root_node::Node,
     directories: &HashMap<[u8; 32], Directory>,

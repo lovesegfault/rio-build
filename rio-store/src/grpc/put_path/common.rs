@@ -56,7 +56,7 @@ const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
 /// `status='complete'` flip and the `durable = TRUE` flip for the
 /// carried chunk set remain for the batch tx (ADR-022 §6.2
 /// durable-presence).
-pub(in crate::grpc) struct ChunkedStaged {
+pub(in crate::grpc) struct StagedOutput {
     pub(in crate::grpc) chunk_hashes: Vec<Vec<u8>>,
 }
 
@@ -123,6 +123,13 @@ impl PutAuth {
 /// path-not-in-claims failure, increments the
 /// `hmac_rejected_total{reason=path_not_in_claims}` counter before
 /// erroring.
+///
+/// Note: with the builder-chunked-only gate ([`PutAuth::deny_builder_role`])
+/// every caller that still reaches the legacy RPCs presents a service
+/// token (or nothing), so `hmac_claims` is always `None` here today and
+/// the claims-dependent step 6 is unreachable until a second `TokenRole`
+/// variant exists. It stays as defense-in-depth; remove it together with
+/// the legacy buffered RPCs when they are retired.
 // r[impl sec.boundary.grpc-hmac]
 pub(in crate::grpc) fn validate_put_metadata(
     mut raw_info: rio_proto::types::PathInfo,
@@ -320,6 +327,12 @@ pub(in crate::grpc) fn verify_nar(
 ///
 /// `None`/non-CA claims → no-op (IA already gated, dev/service
 /// bypass already trusted).
+///
+/// The live claims-bearing caller is `PutPathChunked`'s post-verify CA
+/// gate; on the legacy buffered RPCs the builder-chunked-only gate
+/// means claims are always `None` (see [`validate_put_metadata`]'s
+/// note), so the legacy call sites exercise only the no-op branch until
+/// those RPCs are retired.
 pub(in crate::grpc) fn verify_ca_store_path(
     info: &ValidatedPathInfo,
     hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
@@ -651,9 +664,9 @@ impl StoreServiceImpl {
         Ok(claim)
     }
 
-    /// gRPC wrapper around [`ingest::persist_nar`]: maps
-    /// [`ingest::PersistError`] → `tonic::Status` via `storage_error`
-    /// so `BackendAuthError` → `FailedPrecondition` and the builder
+    /// gRPC wrapper around [`ingest::persist_nar`]: maps its
+    /// `anyhow::Error` → `tonic::Status` via `storage_error` so
+    /// `BackendAuthError` → `FailedPrecondition` and the builder
     /// fails fast instead of retrying forever.
     pub(in crate::grpc) async fn persist_nar(
         &self,
@@ -672,7 +685,7 @@ impl StoreServiceImpl {
             PUTPATH_HOOKS,
         )
         .await
-        .map_err(|e| storage_error(ctx_label, e.0))?;
+        .map_err(|e| storage_error(ctx_label, e))?;
         Ok(())
     }
 
@@ -693,7 +706,7 @@ impl StoreServiceImpl {
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: &Bytes,
-    ) -> Result<ChunkedStaged, Status> {
+    ) -> Result<StagedOutput, Status> {
         let stats = cas::stage_chunked(
             &self.pool,
             &self.chunk_backend,
@@ -705,7 +718,7 @@ impl StoreServiceImpl {
         .await
         .map_err(|e| storage_error("PutPathBatch: stage_chunked", e))?;
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-        Ok(ChunkedStaged {
+        Ok(StagedOutput {
             chunk_hashes: stats.chunk_hashes,
         })
     }

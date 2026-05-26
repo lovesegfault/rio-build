@@ -1618,6 +1618,35 @@ mod tests {
         });
     }
 
+    /// A templating layer that renders the env var as an empty string
+    /// (helm normally omits it instead) must load as an EMPTY map — no
+    /// parse error, no spurious one-entry map — so the replica degrades
+    /// to direct S3-standard reads exactly like an absent var.
+    #[test]
+    fn chunk_backend_kind_env_tiered_zone_map_empty_string_is_empty_map() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            jail.set_env("RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE", "");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                Some(ChunkBackendKind::Tiered {
+                    express_bucket_by_zone,
+                    ..
+                }) => {
+                    assert!(
+                        express_bucket_by_zone.is_empty(),
+                        "empty env string must deserialize to an empty map, got \
+                         {express_bucket_by_zone:?}"
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
     /// Selection decision table (P0554). Pure function — no env, no
     /// loader. Explicit bucket wins; otherwise zone+map must both be
     /// present and matching; every other combination selects nothing
