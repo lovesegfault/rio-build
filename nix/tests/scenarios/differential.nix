@@ -277,6 +277,17 @@ pkgs.testers.runNixOSTest {
         pkgs.nix
       ];
 
+      # Both arms are launched from the test backdoor service, so both
+      # inherit ITS file-descriptor limits. The systemd default (1024
+      # soft) is an artifact of the harness, not of any real deployment:
+      # daemon-era builders ran under nix-daemon.service's
+      # LimitNOFILE=1048576, and rio-exec now pins the same value inside
+      # the sandbox. Give the whole VM that limit so the oracle arm is
+      # representative of a real NixOS daemon host and the
+      # sandbox-identity corpus entry can compare `ulimit -n` across the
+      # two arms.
+      systemd.settings.Manager.DefaultLimitNOFILE = 1048576;
+
       nix.settings = {
         sandbox = true;
         experimental-features = [

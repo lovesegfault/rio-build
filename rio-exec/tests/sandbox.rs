@@ -316,6 +316,9 @@ async fn isolation_properties_are_observed_inside_the_sandbox() {
             echo "uid=$(id -u)"
             echo "gid=$(id -g)"
             echo "cwd=$(pwd)"
+            echo "nofile-soft=$(ulimit -n)"
+            echo "nofile-hard=$(ulimit -Hn)"
+            echo "etc-hosts=$(cat /etc/hosts | tr '\n' ';')"
             echo "root-listing=$(ls / | tr '\n' ',')"
             echo "---passwd---"
             cat /etc/passwd
@@ -334,6 +337,16 @@ async fn isolation_properties_are_observed_inside_the_sandbox() {
     assert!(probe.contains(&format!("uid={SANDBOX_UID}")), "{probe}");
     assert!(probe.contains(&format!("gid={SANDBOX_GID}")), "{probe}");
     assert!(probe.contains("cwd=/work"), "{probe}");
+    // RLIMIT_NOFILE is pinned by the child setup (daemon-era 1048576),
+    // independent of whatever limits this test process itself has.
+    assert!(probe.contains("nofile-soft=1048576"), "{probe}");
+    assert!(probe.contains("nofile-hard=1048576"), "{probe}");
+    // The non-network sandbox synthesizes the same /etc/hosts CppNix
+    // writes for every sandboxed build.
+    assert!(
+        probe.contains("etc-hosts=127.0.0.1 localhost;::1 localhost;"),
+        "{probe}"
+    );
 
     // The sandbox root contains exactly the fixed skeleton plus the
     // top-level component of every mount target that actually exists on

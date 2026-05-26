@@ -297,6 +297,14 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 /// `include/uapi/linux/personality.h`. `PER_LINUX32` is a base
 /// personality value (it replaces the whole word); `ADDR_NO_RANDOMIZE`
 /// is a flag OR'd into it.
+/// The `RLIMIT_NOFILE` soft and hard limit a build sees. CppNix leaves
+/// the limit untouched, so daemon-era builders inherited
+/// nix-daemon.service's `LimitNOFILE=1048576`; pinning the same value
+/// here keeps the build-visible limit identical across delivery paths
+/// (pod, systemd unit, test harness) and identical to what packages
+/// were historically built under.
+const SANDBOX_NOFILE_LIMIT: libc::rlim_t = 1_048_576;
+
 const PER_LINUX32: libc::c_ulong = 0x0008;
 const ADDR_NO_RANDOMIZE: libc::c_ulong = 0x0004_0000;
 /// The "query, do not change" argument to `personality(2)`.
@@ -528,6 +536,38 @@ fn setup(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
     // SAFETY: setrlimit reads the struct.
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
         return Err(SetupError::new(SetupPhase::Rlimit, Errno::last()));
+    }
+    // File-descriptor limit: pin RLIMIT_NOFILE so the build-visible
+    // value does not depend on how the executor itself was launched
+    // (pod OCI spec, systemd unit, test harness). CppNix never touches
+    // this limit, so daemon-era builders simply inherited
+    // nix-daemon.service's LimitNOFILE — 1048576 on NixOS — and that
+    // inherited value is the de-facto sandbox ABI existing packages
+    // were built under. Pin exactly that. We are still root here (the
+    // uid/gid drop happens below), so raising the hard limit succeeds
+    // wherever the executor has CAP_SYS_RESOURCE; if it does not and
+    // the inherited hard limit is lower, clamp to the inherited hard
+    // limit instead of failing the build.
+    let nofile = libc::rlimit {
+        rlim_cur: SANDBOX_NOFILE_LIMIT,
+        rlim_max: SANDBOX_NOFILE_LIMIT,
+    };
+    // SAFETY: setrlimit/getrlimit read and write plain structs.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
+        let mut inherited = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) } != 0 {
+            return Err(SetupError::new(SetupPhase::Rlimit, Errno::last()));
+        }
+        let clamped = libc::rlimit {
+            rlim_cur: SANDBOX_NOFILE_LIMIT.min(inherited.rlim_max),
+            rlim_max: inherited.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &clamped) } != 0 {
+            return Err(SetupError::new(SetupPhase::Rlimit, Errno::last()));
+        }
     }
     // A deterministic umask and default signal dispositions: the
     // executor's own mask and handlers (tokio installs several) must
