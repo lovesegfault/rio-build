@@ -148,6 +148,13 @@ pub(crate) fn sweep_pass(dirs: &SweepDirs, live_build_ids: &Mutex<HashSet<String
 /// The sweep pass with the free-space probe and watermarks injected,
 /// so the selection / ordering / stop-condition logic is testable
 /// against a tempdir without filling a real filesystem.
+///
+/// TODO: a triggered pass runs to its stop condition without checking a
+/// shutdown token between candidates, so a worst-case eviction (hundreds
+/// of thousands of unlinks, minutes) makes SIGTERM wait for the pass —
+/// or get killed by the unit's stop grace period mid-eviction (safe but
+/// unaccounted). Thread the daemon's shutdown token through here and
+/// check it alongside the free-space probe if that ever bites.
 pub(crate) fn sweep_pass_with(
     dirs: &SweepDirs,
     live_build_ids: &Mutex<HashSet<String>>,
@@ -176,6 +183,12 @@ pub(crate) fn sweep_pass_with(
     );
     let started = std::time::Instant::now();
 
+    // A failed mid-pass probe stops the WHOLE pass: later tiers must not
+    // pay their readdir+sort only to hit the same dead probe, and the
+    // closing "exhausted evictable entries" warning would misattribute
+    // the early stop.
+    let mut probe_failed = false;
+
     // ── Phase 1: orphaned staging trees.
     let mut orphans = staging_candidates(&dirs.staging, live_build_ids);
     orphans.sort_by_key(|(_, mtime)| *mtime);
@@ -190,6 +203,7 @@ pub(crate) fn sweep_pass_with(
             // is the one wrong answer — stop the pass.
             None => {
                 warn!("sweep: free-space probe failed mid-pass; stopping");
+                probe_failed = true;
                 break;
             }
         }
@@ -203,11 +217,18 @@ pub(crate) fn sweep_pass_with(
     }
 
     // ── Phase 2 + 3: chunk cache, then backing cache, oldest first.
-    if !stats.reached_high_water {
+    if !stats.reached_high_water && !probe_failed {
         for (root, tier) in [(&dirs.chunks, "chunks"), (&dirs.cache, "cache")] {
-            if evict_cache_tier(root, tier, high_pct, free, &mut stats) {
-                stats.reached_high_water = true;
-                break;
+            match evict_cache_tier(root, tier, high_pct, free, &mut stats) {
+                TierOutcome::ClearedHighWater => {
+                    stats.reached_high_water = true;
+                    break;
+                }
+                TierOutcome::Exhausted => {}
+                TierOutcome::ProbeFailed => {
+                    probe_failed = true;
+                    break;
+                }
             }
         }
     }
@@ -219,7 +240,9 @@ pub(crate) fn sweep_pass_with(
             freed_bytes = stats.freed_bytes,
             "sweep: free space back above high-water mark"
         );
-    } else {
+    } else if !probe_failed {
+        // Probe failures already warned with the real cause; this
+        // message is reserved for the genuinely-exhausted case.
         warn!(
             removed = stats.removed,
             freed_bytes = stats.freed_bytes,
@@ -230,25 +253,36 @@ pub(crate) fn sweep_pass_with(
     stats
 }
 
+/// Outcome of one cache tier's eviction loop.
+enum TierOutcome {
+    /// Free space cleared the high-water mark; the pass is done.
+    ClearedHighWater,
+    /// Every candidate in this tier was processed and the mark still
+    /// has not cleared — continue with the next tier.
+    Exhausted,
+    /// The free-space probe failed; the caller stops the whole pass.
+    ProbeFailed,
+}
+
 /// Evict `root`'s shard entries oldest-first until the high-water mark
-/// clears. Returns `true` when it cleared.
+/// clears.
 fn evict_cache_tier(
     root: &Path,
     tier: &'static str,
     high_pct: f64,
     free: &mut dyn FnMut() -> Option<f64>,
     stats: &mut SweepStats,
-) -> bool {
+) -> TierOutcome {
     let mut entries = cache_candidates(root);
     entries.sort_by_key(|e| e.mtime);
     for entry in entries {
         match free() {
-            Some(pct) if pct > high_pct => return true,
+            Some(pct) if pct > high_pct => return TierOutcome::ClearedHighWater,
             Some(_) => {}
             // Probe failure mid-pass: stop rather than evict blindly.
             None => {
                 warn!("sweep: free-space probe failed mid-pass; stopping");
-                return false;
+                return TierOutcome::ProbeFailed;
             }
         }
         match std::fs::remove_file(&entry.path) {
@@ -267,7 +301,16 @@ fn evict_cache_tier(
             }
         }
     }
-    free().is_some_and(|pct| pct > high_pct)
+    // Tier exhausted; one more probe decides whether the next tier is
+    // needed at all (and a dead probe still short-circuits the pass).
+    match free() {
+        Some(pct) if pct > high_pct => TierOutcome::ClearedHighWater,
+        Some(_) => TierOutcome::Exhausted,
+        None => {
+            warn!("sweep: free-space probe failed mid-pass; stopping");
+            TierOutcome::ProbeFailed
+        }
+    }
 }
 
 /// A published cache/chunk entry that may be evicted.
@@ -284,7 +327,7 @@ struct Candidate {
 /// the stale ones.
 fn cache_candidates(root: &Path) -> Vec<Candidate> {
     let mut out = Vec::new();
-    for shard in read_dir_or_empty(root) {
+    for shard in read_dir_root(root) {
         if !shard.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
@@ -322,7 +365,7 @@ fn staging_candidates(
     live_build_ids: &Mutex<HashSet<String>>,
 ) -> Vec<(String, SystemTime)> {
     let live = live_build_ids.lock().ignore_poison().clone();
-    read_dir_or_empty(staging)
+    read_dir_root(staging)
         .into_iter()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
@@ -402,11 +445,27 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 /// `read_dir` that swallows errors (missing dir, permission) — the
-/// sweep treats anything it cannot list as not evictable.
+/// sweep treats anything it cannot list as not evictable. Used for
+/// shard subdirs and size accounting, where a vanished entry mid-walk
+/// is routine.
 fn read_dir_or_empty(path: &Path) -> Vec<std::fs::DirEntry> {
     std::fs::read_dir(path)
         .map(|rd| rd.filter_map(Result::ok).collect())
         .unwrap_or_default()
+}
+
+/// `read_dir` over a tier ROOT (cache/, chunks/, staging/). Same
+/// fallback as [`read_dir_or_empty`], but warns: the daemon creates the
+/// roots at startup, so an unlistable root means the sweep is silently
+/// blind to a whole tier — worth a log line, unlike the per-shard case.
+fn read_dir_root(root: &Path) -> Vec<std::fs::DirEntry> {
+    match std::fs::read_dir(root) {
+        Ok(rd) => rd.filter_map(Result::ok).collect(),
+        Err(e) => {
+            warn!(root = %root.display(), error = %e, "sweep: cannot list tier root");
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,7 +651,8 @@ mod tests {
         let promoting = fx.put(&fx.dirs.cache, "aaaa.promoting", KIB, 100);
         let partial = fx.put(&fx.dirs.cache, "bbbb.partial", KIB, 100);
 
-        // 9 KiB used on a 10 KiB disk → triggered; orphans alone clear it.
+        // 10 KiB used on a 10 KiB disk → 0% free → triggered; reaping
+        // the two orphans (dead-build 6 KiB + tombstone 1 KiB) clears it.
         let stats = fx.sweep(10 * KIB as u64);
 
         assert!(stats.triggered);
@@ -628,7 +688,8 @@ mod tests {
     }
 
     /// A probe that dies mid-pass stops the sweep instead of letting it
-    /// evict blindly with no stop condition.
+    /// evict blindly with no stop condition — and stops the WHOLE pass:
+    /// later tiers are not listed only to hit the same dead probe.
     #[test]
     fn probe_failure_mid_pass_stops_eviction() {
         let fx = Fx::new();
@@ -655,12 +716,17 @@ mod tests {
         assert_eq!(stats.removed, 0, "nothing may be evicted blind");
         assert!(kept_a.exists());
         assert!(kept_b.exists());
+        assert_eq!(
+            calls, 2,
+            "the pass must stop at the first failed mid-pass probe (trigger + one \
+             chunk-tier check), not fall through to the cache tier"
+        );
     }
 
     /// Missing trees (fresh node, dirs not created yet) are handled
     /// without error.
     #[test]
-    fn missing_dirs_are_a_noop() {
+    fn missing_dirs_do_not_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = SweepDirs {
             cache: tmp.path().join("nope/cache"),

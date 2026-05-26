@@ -28,9 +28,15 @@
 //! 3-state shape, but that one is single-threaded-actor (plain `u32`);
 //! this one needs atomics because fuser's thread pool is multi-threaded.
 //!
-//! WONTFIX: scheduler and builder breakers intentionally diverge on
-//! interior mutability (plain u32 actor-local vs AtomicU32). Consolidate
-//! only if a third breaker appears.
+//! WONTFIX (carried over from `fuse/circuit.rs`, which the P0560
+//! cutover deletes): scheduler and builder breakers intentionally
+//! diverge on interior mutability (plain u32 actor-local vs AtomicU32).
+//! This copy is nominally the "third breaker" the original's
+//! consolidate-trigger names, but it *replaces* the old-FUSE copy
+//! rather than joining it — once P0560 removes `fuse/circuit.rs` the
+//! count is back to two (scheduler + this). Keep the rationale here so
+//! that deletion doesn't strand it; consolidate only if a third
+//! *surviving* breaker appears.
 //
 // r[impl builder.fs.fetch-circuit]
 

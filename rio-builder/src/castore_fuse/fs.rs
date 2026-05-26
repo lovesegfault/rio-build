@@ -40,6 +40,14 @@ use crate::IgnorePoison;
 const TTL: Duration = Duration::MAX;
 
 /// Per-open-file-handle state, for `release()`.
+///
+/// TODO: the three fields encode mutually exclusive open modes —
+/// passthrough (`backing_digest` only), keep-cache (`file` only), and
+/// streaming (`stream` only) — so this wants to be a three-variant enum
+/// that makes the invalid combinations unrepresentable. Deferred until
+/// the next time the open-mode dispatch changes shape; the construction
+/// sites in `open()` and the accessors in `read()`/`release()` all need
+/// to move together.
 struct OpenEntry {
     /// The `file_digest` whose shared backing registration this fh
     /// holds a reference on, if the open replied passthrough.
@@ -50,7 +58,10 @@ struct OpenEntry {
     /// `FOPEN_KEEP_CACHE` (passthrough disabled or not negotiated) so
     /// `read()` can serve from it. Passthrough opens drop their fd —
     /// the kernel holds its own reference via the backing registration.
-    file: Option<File>,
+    /// `Arc` so `read()` can clone the handle out and drop the `opens`
+    /// lock before the disk pread (positional `read_at`, no shared
+    /// cursor to race on).
+    file: Option<Arc<File>>,
     /// The in-flight P0575 streaming fill this fh reads from, when the
     /// open landed in the streaming window (cache miss above the
     /// stream threshold). `read()` serves from the shared partially-
@@ -138,6 +149,13 @@ pub struct CastoreFs {
     /// both register (the round-trip is a sub-millisecond UDS ioctl
     /// broker, the same cost the old module paid for the in-process
     /// ioctl under its `backing_state` write lock).
+    ///
+    /// TODO: because this is one global mutex, that brokered round-trip
+    /// also serializes opens/releases of *unrelated* digests behind a
+    /// slow mountd reply (lock convoy under `make -jN` fan-out). The
+    /// fix shape is per-digest locking — the same pattern `StreamFill`
+    /// uses for fills — keeping only the digest→entry map lookup under
+    /// the global lock.
     backings: Mutex<BackingTable>,
     next_fh: AtomicU64,
     /// Concurrent-open ceiling. Not an LRU: backing ids are released
@@ -591,7 +609,7 @@ impl Filesystem for CastoreFs {
                                 fh,
                                 OpenEntry {
                                     backing_digest: None,
-                                    file: Some(file),
+                                    file: Some(Arc::new(file)),
                                     stream: None,
                                 },
                             );
@@ -604,7 +622,7 @@ impl Filesystem for CastoreFs {
                         fh,
                         OpenEntry {
                             backing_digest: None,
-                            file: Some(file),
+                            file: Some(Arc::new(file)),
                             stream: None,
                         },
                     );
@@ -661,8 +679,13 @@ impl Filesystem for CastoreFs {
             return;
         }
 
-        let Some(file) = files.get(&fh.0).and_then(|e| e.file.as_ref()) else {
-            drop(files);
+        // Clone the Arc'd handle out and release the opens lock before
+        // the disk pread — a slow read must not stall open()/release(),
+        // which need the write half. `read_at` is positional, so the
+        // shared handle has no cursor to race on.
+        let file = files.get(&fh.0).and_then(|e| e.file.as_ref()).cloned();
+        drop(files);
+        let Some(file) = file else {
             tracing::error!(
                 ino = ino.0,
                 fh = fh.0,
@@ -674,7 +697,7 @@ impl Filesystem for CastoreFs {
             return;
         };
         let mut buf = vec![0u8; size as usize];
-        match read_at_full(file, &mut buf, offset) {
+        match read_at_full(&file, &mut buf, offset) {
             Ok(n) => {
                 buf.truncate(n);
                 reply.data(&buf);

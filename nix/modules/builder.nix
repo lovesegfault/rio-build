@@ -42,6 +42,9 @@ in
 
     fuseCacheDir = lib.mkOption {
       type = lib.types.path;
+      # Legacy-FUSE default; same path the mountd-owned backing cache now
+      # uses. Harmless while the old FUSE stays unmounted — both option and
+      # old stack go away at the P0560 cutover.
       default = "/var/rio/cache";
       description = "FUSE local cache directory (`RIO_FUSE_CACHE_DIR`).";
     };

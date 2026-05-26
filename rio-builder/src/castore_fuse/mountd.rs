@@ -187,6 +187,13 @@ fn backing_close(fuse_fd: BorrowedFd<'_>, id: u32) -> std::io::Result<()> {
 /// builder's own staging files, castore-FUSE inodes, random host files
 /// it can read — is left alone; the broker must not become a
 /// touch-arbitrary-files oracle.
+///
+/// TODO: this re-fstats both base dirs and re-reads `geteuid()` on every
+/// `BackingOpen` even though all three are fixed for the daemon's
+/// lifetime — cache the two `st_dev`s and the euid in the connection's
+/// shared state if BackingOpen latency ever matters (it is dwarfed by
+/// the UDS round-trip today). The raw `libc::futimens` could also become
+/// the safe `nix` wrapper once it grows a `UTIME_NOW` constructor.
 fn touch_backing_entry(cache_base: &OwnedFd, chunks_base: &OwnedFd, backing: BorrowedFd<'_>) {
     let Ok(st) = nix::sys::stat::fstat(backing) else {
         return;

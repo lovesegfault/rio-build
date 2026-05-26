@@ -192,16 +192,21 @@ impl MountdClient {
     }
 
     /// Allocate a seq, register the reply slot, and send one frame.
+    ///
+    /// TODO: `send_frame` runs on the blocking socket with no deadline —
+    /// it is the one mountd interaction not bounded by
+    /// `mountd_request_timeout` (the caller's `recv_timeout` only starts
+    /// after the send returns). A wedged daemon that stops draining the
+    /// socket buffer can therefore park a FUSE thread in `sendmsg`
+    /// indefinitely; bound it with `SO_SNDTIMEO` (or poll-with-deadline)
+    /// if that ever shows up in practice.
     fn send_request(
         &self,
         req: Req,
         fds: &[RawFd],
     ) -> Result<(u32, Receiver<Delivery>), MountdError> {
-        let bytes_seq = self.shared().next_seq.fetch_add(1, Ordering::Relaxed);
-        let frame = proto::encode(&Request {
-            seq: bytes_seq,
-            req,
-        })?;
+        let seq = self.shared().next_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&Request { seq, req })?;
         // Rendezvous capacity 1: the reader's send never blocks even if
         // the caller has already timed out and gone away (the buffered
         // slot absorbs the late reply, then the whole channel drops).
@@ -213,17 +218,17 @@ impl MountdClient {
                     "connection already closed".into(),
                 ));
             };
-            map.insert(bytes_seq, tx);
+            map.insert(seq, tx);
         }
         let _send_guard = self.shared().send.lock().ignore_poison();
         if let Err(e) = proto::send_frame(self.shared().sock.as_raw_fd(), &frame, fds) {
             // Send failed — deregister so the slot doesn't leak.
             if let Some(map) = self.shared().pending.lock().ignore_poison().as_mut() {
-                map.remove(&bytes_seq);
+                map.remove(&seq);
             }
             return Err(e.into());
         }
-        Ok((bytes_seq, rx))
+        Ok((seq, rx))
     }
 
     /// Send `req` (with optional `SCM_RIGHTS` fds) and block for its

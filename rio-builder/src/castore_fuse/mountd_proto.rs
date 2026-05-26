@@ -14,8 +14,10 @@
 //! Requests carry a `seq` echoed in the reply so the daemon can answer
 //! out of order: `BackingOpen`/`BackingClose` are answered inline
 //! (sub-ms), `Promote`/`PromoteChunks` run on `spawn_blocking` and
-//! reply when the copy+hash finishes. The client correlates via
-//! `HashMap<u32, oneshot::Sender<Reply>>`.
+//! reply when the copy+hash finishes. The client (`mountd_client`, std
+//! threads — no tokio) correlates via a `HashMap<u32,
+//! std::sync::mpsc::SyncSender>` of capacity-1 reply slots that its
+//! reader thread fills.
 // r[impl builder.mountd.backing-broker]
 
 use std::io::{IoSlice, IoSliceMut};

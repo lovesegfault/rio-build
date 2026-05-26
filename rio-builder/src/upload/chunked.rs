@@ -73,6 +73,10 @@ const CHUNK_MAX: usize = 256 * 1024;
 /// Mirror of rio-nix's `MAX_NAR_DEPTH` / `MAX_DIRECTORY_ENTRIES`
 /// (`pub(super)` there). The producer must not emit a tree the consumer
 /// is guaranteed to reject.
+///
+/// TODO: export the two constants from `rio_nix::nar` (which already
+/// exposes `validate_entry_name` pub) and use them here so this mirror
+/// cannot drift from the parser's bounds.
 const MAX_NAR_DEPTH: usize = 256;
 const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
 
@@ -600,6 +604,13 @@ async fn probe_novel(
 /// `WorkAssignment.input_closure` passed through verbatim — the store
 /// asserts `blake3(sorted(input_closure))` matches the assignment
 /// token's `input_closure_digest` claim.
+///
+/// TODO: there is no client-side pre-check of the server's Begin bounds
+/// (MAX_DIR_NODES, MAX_CHUNKS, MAX_BATCH_OUTPUTS): an output that
+/// exceeds them is fully walked, sent, rejected with INVALID_ARGUMENT,
+/// and then pointlessly retried up to MAX_UPLOAD_RETRIES times. Checking
+/// the walked totals here and failing the build immediately would save
+/// the retry budget and name the offending bound to the operator.
 fn assemble_begin(
     outputs: &[WalkedOutput],
     novel: &[[u8; 32]],
@@ -647,6 +658,7 @@ async fn put_path_chunked_once(
     store_client: &StoreServiceClient<Channel>,
     chunk_client: &ChunkServiceClient<Channel>,
     outputs: &[WalkedOutput],
+    sources: &Arc<HashMap<[u8; 32], ChunkSource>>,
     assignment_token: &str,
     deriver: &str,
     input_closure: &[String],
@@ -661,23 +673,13 @@ async fn put_path_chunked_once(
 
     let begin = assemble_begin(outputs, &novel, deriver, input_closure);
 
-    // Source map for the producer task: every novel digest's on-disk
-    // location. The walk records the first occurrence per digest per
-    // output; across outputs the first output containing the digest
-    // wins (the bytes are identical by content-addressing).
-    let mut sources: HashMap<[u8; 32], ChunkSource> = HashMap::new();
-    for o in outputs {
-        for (d, s) in &o.chunk_sources {
-            sources.entry(*d).or_insert_with(|| s.clone());
-        }
-    }
-
     let (tx, rx) = mpsc::channel::<PutPathChunkedRequest>(STREAM_CHANNEL_BUF);
 
     // Producer: Begin first, then the novel chunk bodies in `novel`
     // order. Sync disk reads → spawn_blocking; `blocking_send` gives
     // backpressure against the gRPC send window.
     let novel_owned = novel.clone();
+    let sources = Arc::clone(sources);
     let producer = tokio::task::spawn_blocking(move || -> Result<(), tonic::Status> {
         if tx
             .blocking_send(PutPathChunkedRequest {
@@ -835,6 +837,21 @@ pub(super) async fn upload_outputs_chunked(
         "uploading build outputs (PutPathChunked)"
     );
 
+    // Source map for the producer task: every novel digest's on-disk
+    // location. The walk records the first occurrence per digest per
+    // output; across outputs the first output containing the digest
+    // wins (the bytes are identical by content-addressing). Built once
+    // here (not per attempt) — only `novel` changes between retries.
+    let sources: Arc<HashMap<[u8; 32], ChunkSource>> = Arc::new({
+        let mut sources = HashMap::new();
+        for o in outputs {
+            for (d, s) in &o.chunk_sources {
+                sources.entry(*d).or_insert_with(|| s.clone());
+            }
+        }
+        sources
+    });
+
     let mut last_err = None;
     for attempt in 0..MAX_UPLOAD_RETRIES {
         if attempt > 0 {
@@ -844,6 +861,7 @@ pub(super) async fn upload_outputs_chunked(
             store_client,
             chunk_client,
             outputs,
+            &sources,
             assignment_token,
             deriver,
             input_closure,
@@ -1176,6 +1194,66 @@ mod tests {
             order,
             vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]],
             "first-occurrence order: A B C D"
+        );
+    }
+
+    /// The walk's defensive depth bound: a directory chain nested past
+    /// MAX_NAR_DEPTH is rejected instead of being emitted for the
+    /// server to reject later. Of the walk's other defensive limits,
+    /// MAX_DIRECTORY_ENTRIES (a million entries in one dir) and the
+    /// `validate_entry_name` guard ('/', NUL, '.', '..') cannot be
+    /// constructed through a real filesystem in a unit test — the
+    /// kernel forbids those names and a million-file fixture is too
+    /// slow — so they stay covered by rio-nix's own parser tests.
+    #[test]
+    fn fused_walk_rejects_overdeep_nesting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("nix/store");
+        let basename = rio_test_support::fixtures::test_store_basename("deep");
+        let mut deep = store_dir.join(&basename);
+        for _ in 0..=MAX_NAR_DEPTH {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let err = fused_walk_output(
+            &store_dir,
+            &basename,
+            &CandidateSet::from_paths(std::iter::empty::<&str>()),
+        )
+        .expect_err("over-deep nesting must be rejected");
+        let UploadError::UploadExhausted { source, .. } = &err else {
+            panic!("unexpected error shape: {err:?}");
+        };
+        assert!(
+            source.message().contains("nest"),
+            "rejection must name the nesting bound, got: {}",
+            source.message()
+        );
+    }
+
+    /// Read-during-write detection: a file that shrinks between the
+    /// stat that emitted the NAR length prefix and the content read
+    /// fails the walk loudly (the framing no longer describes the
+    /// bytes). Simulated by passing a stat-time length larger than the
+    /// file's real size.
+    #[test]
+    fn chunk_file_detects_truncation_during_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shrunk");
+        std::fs::write(&path, vec![0x5Au8; 8 * 1024]).unwrap();
+        let candidates = CandidateSet::from_paths(std::iter::empty::<&str>());
+        let mut state = WalkState {
+            hasher: Sha256::new(),
+            scanner: RefScanSink::new(candidates.hashes()),
+            nar_size: 0,
+            chunk_manifest: Vec::new(),
+            directories: HashMap::new(),
+            chunk_sources: HashMap::new(),
+        };
+        let err = chunk_file(&mut state, &path, 16 * 1024).expect_err("shrunk file must fail");
+        assert!(
+            err.to_string().contains("changed during fused walk"),
+            "got: {err}"
         );
     }
 

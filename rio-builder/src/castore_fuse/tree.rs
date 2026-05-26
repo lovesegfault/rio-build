@@ -86,6 +86,13 @@ pub enum TreeError {
     /// A digest field on the wire was not 32 bytes.
     #[error("malformed digest ({len} bytes, want 32) in {context}")]
     BadDigest { len: usize, context: String },
+    /// A `Directory` body's child lists are not strictly name-sorted.
+    /// `lookup` binary-searches them, so accepting the body would
+    /// mis-resolve names (spurious ENOENT mid-build) instead of failing
+    /// the mount; the store enforces the canonical sorted encoding at
+    /// upload time, so this means a corrupt or non-conforming server.
+    #[error("Directory body {digest} has unsorted child lists (non-canonical encoding)")]
+    UnsortedDirectory { digest: String },
 }
 
 /// Immutable content-addressed inode table for one castore mount.
@@ -237,6 +244,19 @@ impl InoMap {
         // Iteration order doesn't matter: inserting the same
         // content-derived ino twice writes the same Node both times.
         for (digest, dir) in &dirs {
+            // `lookup` binary-searches the three child lists, trusting
+            // the canonical-encoding sort order the store enforces at
+            // upload time. Verify it once per body at mount time so a
+            // corrupt or non-conforming server fails the mount loudly
+            // instead of mis-resolving names mid-build.
+            let sorted = dir.directories.is_sorted_by(|a, b| a.name < b.name)
+                && dir.files.is_sorted_by(|a, b| a.name < b.name)
+                && dir.symlinks.is_sorted_by(|a, b| a.name < b.name);
+            if !sorted {
+                return Err(TreeError::UnsortedDirectory {
+                    digest: hex::encode(digest),
+                });
+            }
             for d in &dir.directories {
                 let child = digest32(&d.digest, "DirectoryEntry.digest")?;
                 if !dirs.contains_key(&child) {
@@ -287,6 +307,12 @@ impl InoMap {
     }
 
     /// `true` if the closure is empty (no input roots).
+    ///
+    /// Deliberately keyed on `roots`, not `len() == 0`: [`Self::assemble`]
+    /// accepts `Directory` bodies that no root reaches (their children
+    /// still get inodes, so `len() > 0`), but with no roots the mount
+    /// presents an empty tree — which is what callers gating on
+    /// "anything to mount?" care about.
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
@@ -858,6 +884,25 @@ pub(super) mod tests {
         // A root pointing at a digest with no body at all.
         let err = InoMap::assemble(&fx.roots, HashMap::new()).expect_err("no bodies");
         assert!(matches!(err, TreeError::MissingDirectory { .. }));
+    }
+
+    /// A Directory body whose child list is not byte-lex name-sorted is
+    /// rejected at mount time: `lookup` binary-searches the lists, so
+    /// accepting a non-canonical body would mis-resolve names instead
+    /// of failing loudly.
+    #[test]
+    fn assemble_rejects_unsorted_directory_body() {
+        let fx = fixture();
+        let mut dirs = fx.dirs.clone();
+        dirs.get_mut(&fx.hello_share)
+            .expect("fixture has the share body")
+            .files
+            .reverse(); // copy.txt / doc.txt now out of order
+        let err = InoMap::assemble(&fx.roots, dirs).expect_err("unsorted body");
+        assert!(
+            matches!(err, TreeError::UnsortedDirectory { .. }),
+            "got {err:?}"
+        );
     }
 
     /// An input root with no `node` set (the scheduler dispatched an
