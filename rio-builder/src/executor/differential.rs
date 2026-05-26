@@ -223,6 +223,12 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
         timeout: Some(cfg.timeout),
         max_silent: None,
         max_log_bytes: None,
+        // The driver never dispatches builtin:fetchurl entries (they are
+        // reported as unsupported below), so the re-exec binary, mirror
+        // list, and netrc are irrelevant here.
+        builder_binary: None,
+        hashed_mirrors: Vec::new(),
+        netrc: None,
     };
 
     let mut report = Report {
@@ -245,7 +251,7 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
         &opts,
     ) {
         Ok(GluePlan::Sandbox(p)) => p,
-        Ok(GluePlan::BuiltinFetchurl) => {
+        Ok(GluePlan::BuiltinFetchurl(_)) => {
             report.plan = "builtin-fetchurl".to_string();
             return Ok(report);
         }
