@@ -138,7 +138,7 @@ pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
-// 9 args is over clippy's default of 7. The alternatives
+// More args than clippy's default cap of 7. The alternatives
 // (grouping into a struct, or building SessionContext at the call
 // site) both add more noise than the extra args cost. The session
 // entry point is the natural narrowing-point: everything before is
@@ -157,6 +157,10 @@ pub async fn run_protocol<R, W>(
     store_client: &mut StoreServiceClient<Channel>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: Option<NormalizedName>,
+    // Per-tenant build policy resolved by connection.rs from
+    // `Config::build_policy` for this session's tenant. Default
+    // (all-false) for tenants not in the map and single-tenant mode.
+    build_policy: crate::config::BuildPolicy,
     jwt: crate::handler::SessionJwt,
     service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     // Per-tenant rate limiter, shared across all sessions via
@@ -186,6 +190,7 @@ where
         store_client.clone(),
         scheduler_client.clone(),
         tenant_name,
+        build_policy,
         jwt,
         service_signer,
         limiter,

@@ -199,6 +199,9 @@ pub struct GatewayServer {
     /// all their concurrent SSH connections, not per-connection.
     /// See `r[gw.rate.per-tenant]`.
     limiter: TenantLimiter,
+    /// Per-tenant build-policy map from gateway.toml; resolved per
+    /// connection in `channel_exec` and stamped onto SubmitBuildRequest.
+    build_policy: Arc<crate::config::BuildPolicyMap>,
     /// Per-tenant store-quota cache (30s TTL). Clones share state
     /// — a quota reading fetched by one connection is warm for all.
     /// Always enabled: single-tenant mode (empty `tenant_name`)
@@ -277,6 +280,7 @@ impl GatewayServer {
             resolve_timeout: std::time::Duration::from_millis(500),
             service_signer: None,
             limiter: TenantLimiter::disabled(),
+            build_policy: Arc::new(Default::default()),
             quota_cache: QuotaCache::new(),
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             session_sem: Arc::new(Semaphore::new(DEFAULT_MAX_SESSIONS)),
@@ -319,6 +323,14 @@ impl GatewayServer {
     /// so main.rs composes alongside `with_jwt_signing_key`.
     pub fn with_rate_limiter(mut self, limiter: TenantLimiter) -> Self {
         self.limiter = limiter;
+        self
+    }
+
+    /// Install the per-tenant build-policy map (from
+    /// `Config::build_policy`). Until called, every tenant resolves to
+    /// `BuildPolicy::default()` — identical to pre-policy behavior.
+    pub fn with_build_policy(mut self, map: crate::config::BuildPolicyMap) -> Self {
+        self.build_policy = Arc::new(map);
         self
     }
 
@@ -1139,6 +1151,7 @@ impl russh::server::Server for GatewayServer {
             // with scheduler/store which never need it.
             service_signer: self.service_signer.clone(),
             limiter: self.limiter.clone(),
+            build_policy: Arc::clone(&self.build_policy),
             quota_cache: self.quota_cache.clone(),
             sessions: HashMap::new(),
             tenant_name: None,

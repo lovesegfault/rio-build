@@ -670,6 +670,10 @@ pub struct ConnectionHandler {
     /// the same `dashmap` entry regardless of which SSH connection
     /// submits.
     pub(super) limiter: TenantLimiter,
+    /// Per-tenant build-policy map, shared (`Arc`) with `GatewayServer`.
+    /// Resolved against `tenant_name` once per channel in `channel_exec`
+    /// — the session sees the resolved `BuildPolicy`, not the map.
+    pub(super) build_policy: Arc<crate::config::BuildPolicyMap>,
     /// Per-tenant quota cache, cloned from `GatewayServer`. Shared
     /// state — a quota fetched by one channel is warm for all.
     pub(super) quota_cache: QuotaCache,
@@ -1553,6 +1557,13 @@ impl Handler for ConnectionHandler {
         let mut store_client = self.store_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
+        // Per-tenant build policy. Resolved once per channel; tenants
+        // not in the map (and single-tenant mode) get the default
+        // (all-false) — identical to pre-policy behavior.
+        let build_policy = tenant_name
+            .as_ref()
+            .and_then(|t| self.build_policy.get(t.as_str()).copied())
+            .unwrap_or_default();
         // One token per SSH connection, shared across all channels.
         // The spawned task gets a `SessionJwt` (cached + signing_key)
         // and refreshes lazily on every `.token()` access — covers
@@ -1587,6 +1598,7 @@ impl Handler for ConnectionHandler {
                     &mut store_client,
                     &mut scheduler_client,
                     tenant_name,
+                    build_policy,
                     jwt,
                     service_signer,
                     limiter,

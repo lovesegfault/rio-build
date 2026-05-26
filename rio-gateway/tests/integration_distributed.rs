@@ -300,9 +300,10 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     let mut ctx = SessionContext::new(
         store_client,
         scheduler_client,
-        None,                                     // tenant
-        rio_gateway::handler::SessionJwt::none(), // jwt
-        None,                                     // service_signer
+        None,                                        // tenant
+        rio_gateway::config::BuildPolicy::default(), // build_policy
+        rio_gateway::handler::SessionJwt::none(),    // jwt
+        None,                                        // service_signer
         rio_gateway::TenantLimiter::disabled(),
         rio_gateway::QuotaCache::new(),
     );
@@ -398,6 +399,7 @@ async fn test_read_error_cancels_active_builds() -> anyhow::Result<()> {
         store_client,
         scheduler_client,
         None,
+        rio_gateway::config::BuildPolicy::default(),
         rio_gateway::handler::SessionJwt::none(),
         None,
         rio_gateway::TenantLimiter::disabled(),

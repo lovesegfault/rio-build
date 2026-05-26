@@ -27,6 +27,7 @@ pub fn spawn_session_task(
     mut store_client: StoreServiceClient<Channel>,
     mut sched_client: SchedulerServiceClient<Channel>,
     tenant: Option<NormalizedName>,
+    policy: rio_gateway::config::BuildPolicy,
     jwt: rio_gateway::handler::SessionJwt,
     shutdown: CancellationToken,
 ) -> (DuplexStream, JoinHandle<()>) {
@@ -39,6 +40,7 @@ pub fn spawn_session_task(
             &mut store_client,
             &mut sched_client,
             tenant,
+            policy,
             jwt,
             None,
             rio_gateway::TenantLimiter::disabled(),
@@ -146,7 +148,29 @@ impl GatewaySession {
     ///
     /// [`new`]: Self::new
     pub async fn new_with_tenant(tenant_name: &str) -> anyhow::Result<Self> {
-        Self::new_inner(tenant_name, rio_gateway::handler::SessionJwt::none()).await
+        Self::new_inner(
+            tenant_name,
+            rio_gateway::handler::SessionJwt::none(),
+            Default::default(),
+        )
+        .await
+    }
+
+    /// Like [`new_with_tenant`] but with an explicit per-tenant build
+    /// policy on the session (what connection.rs would have resolved
+    /// from `Config::build_policy`).
+    ///
+    /// [`new_with_tenant`]: Self::new_with_tenant
+    pub async fn new_with_tenant_and_policy(
+        tenant_name: &str,
+        policy: rio_gateway::config::BuildPolicy,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            tenant_name,
+            rio_gateway::handler::SessionJwt::none(),
+            policy,
+        )
+        .await
     }
 
     /// Handshake-ready session with `jwt_token` set on the
@@ -165,7 +189,7 @@ impl GatewaySession {
         };
         let session_jwt =
             rio_gateway::handler::SessionJwt::new(Some((jwt.to_string(), claims)), None);
-        let mut sess = Self::new_inner("", session_jwt).await?;
+        let mut sess = Self::new_inner("", session_jwt, Default::default()).await?;
         do_handshake(&mut sess.stream).await?;
         send_set_options(&mut sess.stream).await?;
         Ok(sess)
@@ -174,6 +198,7 @@ impl GatewaySession {
     async fn new_inner(
         tenant_name: &str,
         jwt: rio_gateway::handler::SessionJwt,
+        policy: rio_gateway::config::BuildPolicy,
     ) -> anyhow::Result<Self> {
         // Idempotent (try_init); output captured per-test via
         // with_test_writer, shown only on failure. Without this,
@@ -197,6 +222,7 @@ impl GatewaySession {
             store_client.clone(),
             scheduler_client.clone(),
             tenant,
+            policy,
             jwt,
             shutdown.child_token(),
         );

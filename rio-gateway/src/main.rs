@@ -151,8 +151,18 @@ async fn main() -> anyhow::Result<()> {
         info!("x-rio-service-token minting enabled on store PutPath");
     }
 
+    // Per-tenant build policy: tenants not in the map get the all-false
+    // default, so an empty map is exactly pre-policy behavior.
+    if !cfg.build_policy.is_empty() {
+        info!(
+            tenants = cfg.build_policy.len(),
+            "per-tenant build policy loaded"
+        );
+    }
+
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
         .with_rate_limiter(limiter)
+        .with_build_policy(cfg.build_policy.clone())
         .with_max_connections(cfg.max_connections)
         .with_max_sessions(cfg.max_sessions)
         .with_max_channels_per_connection(cfg.max_channels_per_connection)

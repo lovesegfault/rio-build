@@ -326,6 +326,10 @@ pub struct SessionContext {
     /// [`NormalizedName`] type guarantees the `Some` case is trimmed
     /// and whitespace-free — no downstream `.trim()` needed.
     pub tenant_name: Option<NormalizedName>,
+    /// Resolved per-tenant build policy for this session's tenant;
+    /// default = all-false (tenant not in `Config::build_policy`, or
+    /// single-tenant mode).
+    pub build_policy: crate::config::BuildPolicy,
     /// Per-session JWT minted at SSH auth time. Injected as
     /// `x-rio-tenant-token` on outbound gRPC calls. Read via
     /// [`SessionJwt::token`] — the accessor lazily re-mints when near
@@ -368,10 +372,15 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
+    // One over clippy's default cap of 7 — same trade-off as
+    // `run_protocol` (its mirror): a params struct here would just be
+    // SessionContext again, minus the session-scoped maps.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store_client: StoreServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
         tenant_name: Option<NormalizedName>,
+        build_policy: crate::config::BuildPolicy,
         jwt: SessionJwt,
         service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         limiter: TenantLimiter,
@@ -384,6 +393,7 @@ impl SessionContext {
             has_seen_build_paths_with_results: false,
             active_build_ids: HashMap::new(),
             tenant_name,
+            build_policy,
             jwt,
             service_signer,
             limiter,
