@@ -960,6 +960,122 @@ async fn test_silent_tcp_connection_is_reaped() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.conn.exit-status+3]
+/// bug_004: a peer that sends its SSH banner, never completes the key
+/// exchange, and keeps sending small transport packets (`SSH_MSG_IGNORE`)
+/// is the worst pre-auth squatter: russh only drains server-queued
+/// messages between key exchanges (`!kex.active()` on the
+/// `receiver.recv()` arm of its session loop), so the polite
+/// `SSH_MSG_DISCONNECT` queued by the pre-auth deadline is never
+/// delivered, and every received packet resets both `alive_timeouts` and
+/// the inactivity timer, so neither keepalive nor inactivity ever fires.
+/// Without a hard bound such a peer holds its `max_connections` permit,
+/// fd, and tasks forever (and never appears in `connections_active`,
+/// which only counts connections that reached an auth callback).
+///
+/// The gateway must therefore force-close the transport a short, fixed
+/// slack after the polite disconnect at the pre-auth deadline. Observable
+/// here with `max_connections = 1`: while the parked peer is alive a real
+/// client is rejected at the connection cap; within
+/// `grace + PRE_AUTH_FORCE_CLOSE_SLACK` (+ scheduling margin) the slot
+/// must be released exactly once and a real client must connect and
+/// authenticate, and the parked peer's socket must be closed.
+#[tokio::test]
+async fn test_kex_parked_preauth_connection_is_force_closed() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE).with_max_connections(1))
+            .await?;
+
+    // Raw TCP peer: real SSH banner, then never a KEXINIT — only periodic
+    // SSH_MSG_IGNORE packets. Pre-KEX packets are cleartext with no MAC:
+    //   uint32 packet_length | byte padding_length | payload | padding
+    // payload = [SSH_MSG_IGNORE(2), uint32 data_len = 0]; 6 bytes of
+    // padding brings the total to 16 (a multiple of 8, padding ≥ 4).
+    // russh tolerates IGNORE at any point (its packet dispatch
+    // early-returns on IGNORE/UNIMPLEMENTED/DEBUG) and treats it as
+    // liveness, which is exactly what makes this peer unreapable by the
+    // transport's own keepalive/inactivity limits.
+    const SSH_MSG_IGNORE_PACKET: [u8; 16] = [
+        0, 0, 0, 12, // packet_length = 12
+        6,  // padding_length
+        2,  // SSH_MSG_IGNORE
+        0, 0, 0, 0, // ignore payload: empty string
+        0, 0, 0, 0, 0, 0, // padding
+    ];
+    let mut parked = tokio::net::TcpStream::connect(addr).await?;
+    parked.write_all(b"SSH-2.0-rio-test-kex-parked\r\n").await?;
+    let (mut parked_read, mut parked_write) = parked.into_split();
+    let trickle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if parked_write
+                .write_all(&SSH_MSG_IGNORE_PACKET)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Precondition: the parked peer holds the only permit, so a real
+    // client is rejected at the connection cap. Proves the permit is
+    // actually consumed, so the success assertion below can't pass
+    // vacuously.
+    let denied = connect_and_auth(addr, client_key.clone()).await;
+    assert!(
+        denied.is_err(),
+        "while the KEX-parked peer holds the only permit, a second connection \
+         must be rejected at the connection cap"
+    );
+
+    // Within grace + slack (+ generous scheduling margin) the gateway must
+    // have force-closed the parked transport and released its slot: a real
+    // client can connect and authenticate. The polite disconnect alone can
+    // never achieve this — russh cannot deliver it while the peer keeps
+    // the initial key exchange open.
+    let force_close_budget =
+        GRACE + rio_gateway::server::PRE_AUTH_FORCE_CLOSE_SLACK + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + force_close_budget;
+    let mut admitted = None;
+    while tokio::time::Instant::now() < deadline {
+        match connect_and_auth(addr, client_key.clone()).await {
+            Ok(session) => {
+                admitted = Some(session);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+        }
+    }
+    assert!(
+        admitted.is_some(),
+        "the KEX-parked peer must be force-closed within the pre-auth deadline \
+         plus its slack, releasing the connection slot for a real client"
+    );
+
+    // The parked socket itself must have been closed by the gateway (we
+    // read the server banner it sent at accept, then EOF / reset). Bounded
+    // so a regression can't hang the test.
+    let mut buf = Vec::new();
+    let read_back = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        parked_read.read_to_end(&mut buf),
+    )
+    .await
+    .expect("gateway must close the KEX-parked connection (read_to_end timed out)");
+    // EOF (Ok) and ECONNRESET (Err) are both acceptable proofs of death.
+    drop(read_back);
+
+    trickle.abort();
+    drop(admitted);
+    srv.abort();
+    Ok(())
+}
+
 // ===========================================================================
 // I-109 — authorized_keys hot-reload
 // ===========================================================================

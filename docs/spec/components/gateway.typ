@@ -1173,13 +1173,20 @@ exactly `--stdio`. This allows clients that send a full store path (e.g.,
   of a 64-worker run.
 ]
 
-"As soon as the transport is able to deliver it" is a real qualifier, not
-hedging: russh only drains server-queued messages (including this disconnect)
-between key exchanges, so a peer that keeps a key exchange perpetually in
-flight defers delivery for as long as it keeps the exchange active --- an
-upstream russh constraint. Such a peer is bounded only by the transport's
-keepalive/inactivity limits, not by the grace; a peer that goes silent
-mid-exchange is caught by `keepalive_max` (\~300 s).
+"As soon as the transport is able to deliver it" is a real qualifier: russh
+only drains server-queued messages (including this disconnect) between key
+exchanges, so a peer that keeps a key exchange perpetually in flight defers
+delivery for as long as it keeps the exchange active --- an upstream russh
+constraint --- and the transport's own limits never step in for such a peer,
+because every packet it trickles (e.g. `SSH_MSG_IGNORE`) resets both the
+keepalive failure counter and the inactivity timer. The bound is therefore
+delivered in two stages: the polite `SSH_MSG_DISCONNECT` at the grace for
+every peer russh can deliver it to, and a forced transport close
+`PRE_AUTH_FORCE_CLOSE_SLACK` (5 s) after the deadline for one it cannot ---
+the accept-site read deadline fails the still-unauthenticated transport,
+which ends russh's session loop and releases the connection slot and fd
+through the normal drop path. A peer that goes silent mid-exchange is still
+caught earlier by `keepalive_max` (\~300 s).
 
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at

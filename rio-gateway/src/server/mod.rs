@@ -14,8 +14,10 @@ pub use keys::{
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -28,6 +30,7 @@ use rio_proto::StoreServiceClient;
 use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Server as _, run_stream};
 use russh::{Disconnect, MethodKind, MethodSet};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tonic::transport::Channel;
@@ -87,7 +90,9 @@ pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 /// has not authenticated within it is disconnected by the accept-site
 /// deadline in [`GatewayServer::run_on_listener`] (russh has no
 /// login-grace of its own, and an answering-but-idle client never trips
-/// `inactivity_timeout`/`keepalive_max`).
+/// `inactivity_timeout`/`keepalive_max`), with
+/// [`PRE_AUTH_FORCE_CLOSE_SLACK`] bounding how long that disconnect may
+/// remain undeliverable before the transport is closed outright.
 ///
 /// A ControlMaster mux whose in-flight session count transits through
 /// zero between builds must NOT lose its transport — the master would
@@ -100,6 +105,24 @@ pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 /// which an idle-but-keepalive-answering client never trips.
 /// Overridable for tests via `with_empty_connection_grace`.
 pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Extra time after the pre-auth deadline's polite `SSH_MSG_DISCONNECT`
+/// before the gateway force-closes a still-unauthenticated transport
+/// (`r[gw.conn.exit-status+3]`).
+///
+/// The polite disconnect is queued through the russh session handle, and
+/// russh only drains handle messages between key exchanges — a peer that
+/// keeps the initial key exchange perpetually in flight (banner, then
+/// trickled `SSH_MSG_IGNORE`s and never a KEX reply) defers delivery
+/// indefinitely while also resetting the keepalive/inactivity timers with
+/// every packet it sends, so nothing transport-level ever reaps it. After
+/// this slack the accept-site read deadline fails the transport read,
+/// which ends russh's session loop and drops the connection handler — the
+/// permit, fd, and tasks are released exactly once through the normal
+/// drop path. A few seconds is plenty for any deliverable disconnect to
+/// have been delivered and acted on; only a peer gaming the key exchange
+/// ever reaches the hard close.
+pub const PRE_AUTH_FORCE_CLOSE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The SSH server that accepts connections and spawns protocol sessions.
 pub struct GatewayServer {
@@ -440,6 +463,20 @@ impl GatewayServer {
                 // forever.
                 let auth_deadline = tokio::time::Instant::now() + auth_grace;
                 // r[impl gw.conn.exit-status+3]
+                // Hard backstop a fixed slack later, enforced on the
+                // transport itself: the polite disconnect below cannot
+                // reach a peer that keeps the initial key exchange in
+                // flight (russh only drains handle messages between key
+                // exchanges), so after the slack the wrapper fails the
+                // read, russh's session loop returns the error, and the
+                // handler/stream drop releases the permit and fd. See
+                // [`PreAuthDeadline`].
+                let stream = PreAuthDeadline::new(
+                    stream,
+                    Arc::clone(&stage),
+                    auth_deadline + PRE_AUTH_FORCE_CLOSE_SLACK,
+                );
+                // r[impl gw.conn.exit-status+3]
                 // Phase 1 — version exchange / transport setup. A client
                 // that never sends its SSH identification string parks
                 // `run_stream` inside `read_ssh_id`, which russh bounds
@@ -477,13 +514,17 @@ impl GatewayServer {
                 // alive; an auth that lands in the instant between that
                 // check and the disconnect being processed is still torn
                 // down — the same inherent boundary race as any idle
-                // timeout, and the client just reconnects. One carve-out:
-                // russh only drains server-queued messages between key
-                // exchanges (`!kex.active()`), so a peer that keeps a
-                // key exchange perpetually in flight defers delivery of
-                // this disconnect and is bounded by the transport's
-                // keepalive/inactivity limits instead (upstream
-                // constraint).
+                // timeout, and the client just reconnects. Delivery
+                // caveat: russh only drains server-queued messages
+                // between key exchanges (`!kex.active()`), so a peer
+                // that keeps a key exchange perpetually in flight never
+                // receives this polite disconnect — for that peer the
+                // [`PreAuthDeadline`] read deadline force-closes the
+                // transport `PRE_AUTH_FORCE_CLOSE_SLACK` after this
+                // deadline instead. The polite path stays because for
+                // every deliverable case (rejected key, wedged
+                // ssh-agent, stalled-but-not-rekeying client) it ends
+                // the connection cleanly and promptly.
                 tokio::select! {
                     r = &mut session => {
                         if let Err(e) = r {
@@ -517,6 +558,118 @@ impl GatewayServer {
                 }
             });
         }
+    }
+}
+
+// r[impl gw.conn.exit-status+3]
+/// Transport wrapper that enforces the pre-auth deadline at the stream
+/// level: once the hard deadline (accept + grace +
+/// [`PRE_AUTH_FORCE_CLOSE_SLACK`]) passes with the connection still not
+/// authenticated, reads fail with `TimedOut`, russh's read loop returns
+/// the error, the spawned session task ends, and the handler + stream
+/// drop — releasing the connection permit and fd exactly once through
+/// the normal drop path.
+///
+/// Why a stream wrapper and not the session handle: the deadline's
+/// polite `SSH_MSG_DISCONNECT` travels through the russh handle, and
+/// russh 0.61 only drains handle messages between key exchanges
+/// (`!kex.active()` gates the `receiver.recv()` arm of its session
+/// loop), so a peer that keeps the initial key exchange perpetually in
+/// flight never receives it — while every packet it trickles (e.g.
+/// `SSH_MSG_IGNORE`) resets russh's keepalive failure counter and
+/// inactivity timer, so no transport-level limit reaps it either. russh
+/// offers no way to abort the session loop it spawned (`RunningSession`
+/// wraps a result oneshot, not an abortable `JoinHandle`), which leaves
+/// the transport itself as the only reliable lever. The deadline is
+/// armed once at accept and never consulted again after the connection
+/// reaches `ConnStage::Authenticated`; an authenticated session can idle
+/// or re-key for as long as the post-auth limits allow.
+struct PreAuthDeadline<S> {
+    inner: S,
+    /// Highest [`connection::ConnStage`] reached, shared with the
+    /// `ConnectionHandler`. At `Authenticated` and above the wrapper is
+    /// permanently transparent.
+    stage: Arc<AtomicU8>,
+    /// Fires at accept + grace + [`PRE_AUTH_FORCE_CLOSE_SLACK`]. Boxed
+    /// so the wrapper stays `Unpin` (russh requires it of the stream).
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// Latched once the deadline has fired so subsequent reads keep
+    /// failing without polling a completed timer again.
+    expired: bool,
+}
+
+impl<S> PreAuthDeadline<S> {
+    fn new(inner: S, stage: Arc<AtomicU8>, deadline: tokio::time::Instant) -> Self {
+        Self {
+            inner,
+            stage,
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            expired: false,
+        }
+    }
+
+    /// Whether the pre-auth deadline applies and has passed. Registers
+    /// the timer with the task context so the parked read is woken when
+    /// it fires (the whole point — a KEX-parked peer's read would
+    /// otherwise only be re-polled when the peer sends more bytes).
+    fn check_expired(&mut self, cx: &mut TaskContext<'_>) -> bool {
+        if self.stage.load(Ordering::Relaxed) >= connection::ConnStage::Authenticated as u8 {
+            return false;
+        }
+        if !self.expired && self.deadline.as_mut().poll(cx).is_ready() {
+            self.expired = true;
+        }
+        self.expired
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PreAuthDeadline<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.check_expired(cx) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pre-auth deadline exceeded with authentication incomplete; closing transport",
+            )));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+/// Writes delegate untouched: pre-auth server writes are tiny (banner,
+/// KEXINIT, auth replies) and never park; failing the read side is what
+/// ends russh's session loop.
+impl<S: AsyncWrite + Unpin> AsyncWrite for PreAuthDeadline<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 }
 
