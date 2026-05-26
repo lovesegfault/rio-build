@@ -155,6 +155,35 @@ pub(crate) enum GlueError {
     )]
     FetchurlBuilderBinaryUnknown,
 
+    /// A fixed-output output declares an `outputHashAlgo`/`outputHash`
+    /// pair the pipeline cannot interpret (unknown algorithm, non-hex
+    /// hash, wrong digest length). Same fail-closed stance as the
+    /// result pipeline's `FodDeclaredHashInvalid`.
+    #[error("fixed-output output `{output}` declares an unverifiable hash: {message}")]
+    FixedOutputHashInvalid { output: String, message: String },
+
+    /// The declared store path of a fixed-output output is not the path
+    /// derived from its declared hash. CppNix discards the declared
+    /// path for `CAFixed` outputs and recomputes it from
+    /// `(method, algo, hash)` (`makeFixedOutputPath`), so a mismatching
+    /// `.drv` can never place content at the declared path there; rio
+    /// keeps the declared path as the working path downstream, so the
+    /// equivalent guarantee is to reject the mismatch outright before
+    /// planning the build. Without this, a crafted `.drv` could pair
+    /// another derivation's well-known fixed-output path with the hash
+    /// of attacker-chosen bytes and have those bytes registered, signed
+    /// and served at that path.
+    #[error(
+        "fixed-output output `{output}` declares store path {declared}, but its declared \
+         outputHash derives {expected}; refusing to build content for a path its hash does \
+         not bind"
+    )]
+    FixedOutputPathMismatch {
+        output: String,
+        declared: String,
+        expected: String,
+    },
+
     /// The constructed request failed `rio_exec` boundary validation.
     /// Carries only the validation message (never the executor's
     /// infrastructure error variants — those cannot occur here, and
@@ -280,6 +309,11 @@ pub(crate) fn derivation_into_request(
     paths: &SandboxPaths,
     opts: &SandboxOptions,
 ) -> Result<GluePlan, GlueError> {
+    // CppNix-parity fixed-output validation runs before ANY planning —
+    // including the builtin:fetchurl dispatch below, whose declared
+    // output path is just as tenant-controlled as a sandboxed FOD's.
+    validate_fixed_output_declarations(drv_path, drv)?;
+
     // builtin: builders never get a generic sandbox request — they
     // re-exec this binary's __builtin-fetchurl subcommand instead.
     if let Some(rest) = drv.builder().strip_prefix("builtin:") {
@@ -461,6 +495,96 @@ pub(crate) fn derivation_into_request(
     })))
 }
 
+/// CppNix-parity validation of declared fixed-output (`CAFixed`)
+/// outputs, run before any sandbox or builtin planning.
+///
+/// **Path↔hash binding** (CppNix `Derivation::checkInvariants` /
+/// `makeFixedOutputPath`): a fixed output can only ever live at the
+/// store path derived from its declared `(method, algo, hash)`. CppNix
+/// enforces this structurally — the parsed `CAFixed` output stores only
+/// the content address and every consumer recomputes the path — so a
+/// `.drv` whose declared path disagrees with its hash simply cannot
+/// place content there. rio keeps the declared path as the working path
+/// through planning, verification and upload, so the equivalent
+/// guarantee is to reject any disagreement here, before the build
+/// exists anywhere. The store-path *name* is CppNix's
+/// `outputPathName(drvName, outputName)` (the derivation name for
+/// `out`, `<drvName>-<outputName>` otherwise), with the derivation name
+/// taken from the `.drv` store path minus its `.drv` suffix
+/// (`drvPathToName`) — the same source CppNix uses for derivations
+/// loaded from the store.
+///
+/// Outputs that declare an algo but no hash (floating-CA / impure) and
+/// plain input-addressed outputs are not subject to this rule.
+fn validate_fixed_output_declarations(
+    drv_path: &str,
+    drv: &BasicDerivation,
+) -> Result<(), GlueError> {
+    use rio_nix::hash::{HashAlgo, NixHash};
+
+    if !drv
+        .outputs()
+        .iter()
+        .any(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
+    {
+        return Ok(());
+    }
+
+    let drv_sp =
+        store_path::StorePath::parse(drv_path).map_err(|e| GlueError::BadDerivationPath {
+            path: drv_path.to_owned(),
+            message: e.to_string(),
+        })?;
+    let drv_name = drv_sp
+        .name()
+        .strip_suffix(".drv")
+        .unwrap_or_else(|| drv_sp.name());
+
+    for o in drv
+        .outputs()
+        .iter()
+        .filter(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
+    {
+        let raw_algo = o.hash_algo();
+        let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
+            Some(rest) => (true, rest),
+            None => (false, raw_algo),
+        };
+        let algo: HashAlgo = algo_str
+            .parse()
+            .map_err(|_| GlueError::FixedOutputHashInvalid {
+                output: o.name().to_owned(),
+                message: format!("unsupported outputHashAlgo '{raw_algo}'"),
+            })?;
+        let digest = hex::decode(o.hash()).map_err(|_| GlueError::FixedOutputHashInvalid {
+            output: o.name().to_owned(),
+            message: format!("outputHash is not valid base16: {}", o.hash()),
+        })?;
+        let hash = NixHash::new(algo, digest).map_err(|e| GlueError::FixedOutputHashInvalid {
+            output: o.name().to_owned(),
+            message: e.to_string(),
+        })?;
+        let path_name = if o.name() == "out" {
+            drv_name.to_owned()
+        } else {
+            format!("{drv_name}-{}", o.name())
+        };
+        let expected = store_path::StorePath::make_fixed_output(&path_name, &hash, recursive, &[])
+            .map_err(|e| GlueError::FixedOutputHashInvalid {
+                output: o.name().to_owned(),
+                message: e.to_string(),
+            })?;
+        if expected.as_str() != o.path() {
+            return Err(GlueError::FixedOutputPathMismatch {
+                output: o.name().to_owned(),
+                declared: o.path().to_owned(),
+                expected: expected.as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Plan the derivation's outputs: where each one will be produced inside
 /// the sandbox, and the placeholder rewrites that point builders at
 /// those locations.
@@ -630,6 +754,25 @@ mod tests {
         }
     }
 
+    /// The store path a fixed output of `DRV` (derivation name "demo")
+    /// must declare for the given outputHashAlgo and base16 hash — i.e.
+    /// the path `validate_fixed_output_declarations` derives.
+    fn fod_path(algo: &str, hash_hex: &str) -> String {
+        let (recursive, plain) = match algo.strip_prefix("r:") {
+            Some(rest) => (true, rest),
+            None => (false, algo),
+        };
+        let hash = rio_nix::hash::NixHash::new(
+            plain.parse::<rio_nix::hash::HashAlgo>().unwrap(),
+            hex::decode(hash_hex).unwrap(),
+        )
+        .unwrap();
+        StorePath::make_fixed_output("demo", &hash, recursive, &[])
+            .unwrap()
+            .as_str()
+            .to_owned()
+    }
+
     #[test]
     fn sandbox_request_shape() {
         let prepared = prepare(&ia_drv());
@@ -701,17 +844,15 @@ mod tests {
 
     #[test]
     fn fod_gets_network_and_ca_bundle() {
+        let zeros = "00".repeat(32);
+        let out = fod_path("sha256", &zeros);
         let fod = mk_drv(
-            vec![
-                DerivationOutput::new(
-                    "out",
-                    OUT,
-                    "sha256",
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                )
-                .unwrap(),
+            vec![DerivationOutput::new("out", out.as_str(), "sha256", zeros.as_str()).unwrap()],
+            &[
+                ("name", "demo"),
+                ("out", out.as_str()),
+                ("outputHashMode", "flat"),
             ],
-            &[("name", "demo"), ("out", OUT), ("outputHashMode", "flat")],
         );
         let prepared = prepare(&fod);
         assert!(prepared.request.isolation.network);
@@ -721,6 +862,63 @@ mod tests {
                 .mounts
                 .iter()
                 .any(|m| m.target == Path::new("/etc/ssl/certs/ca-certificates.crt") && m.optional)
+        );
+    }
+
+    #[test]
+    fn fixed_output_declared_path_must_match_the_declared_hash() {
+        // The attack shape: a well-formed store path that belongs to
+        // some other content, declared together with the hash of
+        // attacker-chosen bytes. Must be rejected before any planning,
+        // for both ingestion methods.
+        let zeros = "00".repeat(32);
+        for algo in ["sha256", "r:sha256"] {
+            let drv = mk_drv(
+                vec![DerivationOutput::new("out", OUT, algo, zeros.as_str()).unwrap()],
+                &[("name", "demo"), ("out", OUT)],
+            );
+            let (input_paths, input_meta) = closure();
+            let err =
+                derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+                    .unwrap_err();
+            match err {
+                GlueError::FixedOutputPathMismatch {
+                    declared, expected, ..
+                } => {
+                    assert_eq!(declared, OUT);
+                    assert_eq!(expected, fod_path(algo, &zeros));
+                }
+                other => panic!("want FixedOutputPathMismatch, got: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_output_with_consistent_path_is_accepted() {
+        let zeros = "00".repeat(32);
+        for algo in ["sha256", "r:sha256"] {
+            let out = fod_path(algo, &zeros);
+            let drv = mk_drv(
+                vec![DerivationOutput::new("out", out.as_str(), algo, zeros.as_str()).unwrap()],
+                &[("name", "demo"), ("out", out.as_str())],
+            );
+            let prepared = prepare(&drv);
+            assert_eq!(prepared.outputs[0].path, out, "algo {algo}");
+        }
+    }
+
+    #[test]
+    fn fixed_output_with_undecodable_hash_is_rejected() {
+        let drv = mk_drv(
+            vec![DerivationOutput::new("out", OUT, "sha256", "zz").unwrap()],
+            &[("name", "demo"), ("out", OUT)],
+        );
+        let (input_paths, input_meta) = closure();
+        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+            .unwrap_err();
+        assert!(
+            matches!(err, GlueError::FixedOutputHashInvalid { .. }),
+            "got: {err}"
         );
     }
 
@@ -756,16 +954,10 @@ mod tests {
 
     #[test]
     fn builtin_fetchurl_is_dispatched_not_sandboxed() {
+        let zeros = "00".repeat(32);
+        let out = fod_path("sha256", &zeros);
         let drv = BasicDerivation::new(
-            vec![
-                DerivationOutput::new(
-                    "out",
-                    OUT,
-                    "sha256",
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                )
-                .unwrap(),
-            ],
+            vec![DerivationOutput::new("out", out.as_str(), "sha256", zeros.as_str()).unwrap()],
             BTreeSet::new(),
             "builtin".into(),
             "builtin:fetchurl".into(),
