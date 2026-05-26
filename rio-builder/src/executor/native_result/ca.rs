@@ -177,19 +177,28 @@ pub(crate) fn finalize_floating_ca(
             })?;
 
         // Hash modulo the output's own scratch hash. Recursive method
-        // hashes the NAR; flat hashes the file bytes (which cannot
-        // contain store references — `make_fixed_output_with_self`
-        // rejects flat outputs with references or self-references, so a
-        // flat output with sibling hits fails below with that error).
+        // hashes the NAR; flat hashes the file bytes — with the
+        // accumulated sibling scratch→final rewrites applied first, so
+        // the hash describes the bytes that are actually restored and
+        // uploaded (CppNix runs `rewriteOutput` before hashing in flat
+        // mode too). Textual store references CAN appear in flat
+        // content even though `make_fixed_output_with_self` rejects
+        // *recorded* flat references: structured-attrs
+        // `unsafeDiscardReferences` empties the recorded set while
+        // leaving the bytes untouched.
         let (modulo_hash, self_hits) = if recursive {
             let mut sink = HashModuloSink::new(algo, &scratch_hash);
             sink.write_all(&nar_buf).expect("hashing is infallible");
             sink.finish()
         } else {
-            let bytes = std::fs::read(&out.host_path).map_err(|e| OutputRejection::CaFinalize {
-                output: out.name.clone(),
-                message: format!("reading {}: {e}", out.host_path.display()),
-            })?;
+            let mut bytes =
+                std::fs::read(&out.host_path).map_err(|e| OutputRejection::CaFinalize {
+                    output: out.name.clone(),
+                    message: format!("reading {}: {e}", out.host_path.display()),
+                })?;
+            for (from, to) in &hash_rewrites {
+                replace_in_buf(&mut bytes, from, to);
+            }
             let mut sink = HashModuloSink::new(algo, &scratch_hash);
             sink.write_all(&bytes).expect("hashing is infallible");
             sink.finish()

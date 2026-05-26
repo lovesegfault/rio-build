@@ -1013,6 +1013,156 @@ mod tests {
         );
     }
 
+    /// A FLAT floating-CA output whose bytes embed a *sibling's* scratch
+    /// path, with its references discarded via structured-attrs
+    /// `unsafeDiscardReferences` (a flat output with *recorded*
+    /// references is rejected outright). The flat hash must be computed
+    /// over the sibling-rewritten bytes — the bytes that are actually
+    /// restored and uploaded — exactly like CppNix, which runs
+    /// `rewriteOutput` before hashing regardless of the ingestion mode.
+    #[test]
+    fn floating_ca_flat_sibling_reference_discarded_hashes_rewritten_bytes() {
+        let dep_scratch = sp('s', "dep");
+        let out_scratch = sp('w', "blob");
+        let tmp = tempfile::tempdir().unwrap();
+
+        let dep_host = tmp
+            .path()
+            .join(dep_scratch.strip_prefix("/nix/store/").unwrap());
+        std::fs::create_dir_all(&dep_host).unwrap();
+        std::fs::write(dep_host.join("payload"), b"dep content").unwrap();
+
+        let out_host = tmp
+            .path()
+            .join(out_scratch.strip_prefix("/nix/store/").unwrap());
+        std::fs::write(&out_host, format!("points at {dep_scratch}/payload\n")).unwrap();
+        std::fs::set_permissions(&out_host, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let outputs = [
+            OutputToProcess {
+                name: "dep".into(),
+                store_path: dep_scratch.clone(),
+                host_path: dep_host,
+            },
+            OutputToProcess {
+                name: "out".into(),
+                store_path: out_scratch.clone(),
+                host_path: out_host,
+            },
+        ];
+        let json = serde_json::json!({ "unsafeDiscardReferences": { "out": true } }).to_string();
+        let drv = drv_from_aterm_ca(
+            &[("dep", "", "r:sha256", ""), ("out", "", "sha256", "")],
+            &[("__json", &json)],
+        );
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let dep = processed.outputs.iter().find(|o| o.name == "dep").unwrap();
+        let out = processed.outputs.iter().find(|o| o.name == "out").unwrap();
+
+        // The flat content on disk has been rewritten to dep's final path…
+        let bytes = std::fs::read(&out.host_path).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.contains(&dep.store_path),
+            "content must be rewritten to dep's final path: {text}"
+        );
+        assert!(
+            !text.contains(&dep_scratch),
+            "no scratch path may survive in the flat content: {text}"
+        );
+        assert!(out.references.is_empty(), "discarded references stay empty");
+
+        // …and the minted path/descriptor describe exactly those rewritten
+        // bytes (this is what the store's flat CA gate recomputes).
+        let hash = rio_nix::hash::NixHash::compute(rio_nix::hash::HashAlgo::SHA256, &bytes);
+        let want = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "blob",
+            &hash,
+            false,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out.store_path,
+            want.as_str(),
+            "flat path must derive from the rewritten bytes"
+        );
+        assert_eq!(
+            out.content_address.as_deref(),
+            Some(format!("fixed:{}", hash.to_colon()).as_str())
+        );
+    }
+
+    /// FLAT floating-CA output embedding its *own* scratch path under
+    /// `unsafeDiscardReferences` — the unit-level mirror of the
+    /// `ca-discard-self-flat` differential corpus entry. The embedded
+    /// hash is rewritten to the final hash and the path satisfies the
+    /// store gate's flat fixed-point check (hash the uploaded bytes
+    /// modulo the claimed path's own hash, re-derive, compare).
+    #[test]
+    fn floating_ca_flat_discarded_self_reference_fixed_point() {
+        let scratch = sp('s', "selfblob");
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp
+            .path()
+            .join(scratch.strip_prefix("/nix/store/").unwrap());
+        std::fs::write(&host, format!("I live at {scratch}\n")).unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outputs = [OutputToProcess {
+            name: "out".into(),
+            store_path: scratch.clone(),
+            host_path: host,
+        }];
+        let json = serde_json::json!({ "unsafeDiscardReferences": { "out": true } }).to_string();
+        let drv = drv_from_aterm_ca(&[("out", "", "sha256", "")], &[("__json", &json)]);
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let out = &processed.outputs[0];
+        assert!(out.references.is_empty());
+        assert_ne!(out.store_path, scratch);
+
+        let final_path = rio_nix::store_path::StorePath::parse(&out.store_path).unwrap();
+        let scratch_parsed = rio_nix::store_path::StorePath::parse(&scratch).unwrap();
+        let bytes = std::fs::read(&out.host_path).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.contains(&final_path.hash_part()),
+            "embedded hash must be rewritten to the final hash: {text}"
+        );
+        assert!(
+            !text.contains(&scratch_parsed.hash_part()),
+            "the scratch hash must not survive finalization: {text}"
+        );
+
+        // Store-gate fixed point, flat edition.
+        let mut sink = rio_nix::ca::HashModuloSink::new(
+            rio_nix::hash::HashAlgo::SHA256,
+            &final_path.hash_part(),
+        );
+        sink.write_all(&bytes).unwrap();
+        let (modulo, hits) = sink.finish();
+        assert!(hits > 0, "the rewritten self-hash must be present");
+        let rederived = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "selfblob",
+            &modulo,
+            false,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rederived.as_str(),
+            out.store_path,
+            "flat discarded-self fixed point"
+        );
+        assert_eq!(
+            out.content_address.as_deref(),
+            Some(format!("fixed:{}", modulo.to_colon()).as_str())
+        );
+    }
+
     #[test]
     fn floating_ca_unsupported_algo_rejected() {
         let scratch = sp('s', "old");
