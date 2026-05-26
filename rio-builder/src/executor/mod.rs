@@ -663,6 +663,23 @@ pub async fn execute_build(
             .await
             .map_err(ExecutorError::OverlayTaskPanic)??;
 
+            // The native executor has no movePath step: the sandboxed build
+            // writes its outputs directly into the merged store view (the
+            // glue mounts it writable at /nix/store). The merged root is
+            // created root:root 0755 by the overlay mount, which the build
+            // user (uid 1000) cannot create entries in — give it the same
+            // 1775 root:<build-gid> mode Nix gives a chroot store. This is
+            // a metadata-only copy-up onto the upper layer; the FUSE lower
+            // is never touched.
+            make_store_scratch_writable(overlay_mount.merged_dir(), SANDBOX_BUILD_GID).map_err(
+                |e| {
+                    ExecutorError::SandboxSetup(format!(
+                        "preparing writable store scratch {}: {e}",
+                        overlay_mount.merged_dir().display()
+                    ))
+                },
+            )?;
+
             // 3. Resolve inputDrvs → BasicDerivation + full input closure.
             let ResolvedInputs {
                 basic_drv,
@@ -1574,6 +1591,21 @@ async fn run_native_lifecycle(
 const SANDBOX_BUILD_UID: u32 = 1000;
 const SANDBOX_BUILD_GID: u32 = 100;
 
+/// Make the per-build store scratch (the overlay merged `/nix/store`
+/// view) writable by the sandboxed build user: `1775 root:<gid>`, the
+/// same mode Nix gives a chroot store. Without this the build's
+/// `mkdir $out` fails with `EACCES` — under the daemon the chroot store
+/// was a daemon-owned directory and outputs were `movePath`d into the
+/// merged view by root afterwards; the native executor has the build
+/// write its outputs into the merged view directly.
+fn make_store_scratch_writable(merged_store: &std::path::Path, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Mode first so the (root-only) chown is the only step that can
+    // fail in unprivileged unit tests.
+    std::fs::set_permissions(merged_store, std::fs::Permissions::from_mode(0o1775))?;
+    std::os::unix::fs::chown(merged_store, None, Some(gid))
+}
+
 /// What [`native_log_loop`] reports back to the lifecycle.
 struct LogLoopResult {
     final_line_count: u64,
@@ -2409,6 +2441,35 @@ mod tests {
         assert!(!ExecutorError::Glue("unsupported builtin".into()).is_daemon_transient());
         assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
         assert!(!ExecutorError::BuildFailed("exit 1".into()).is_permanent());
+    }
+
+    /// The merged store scratch must end up `1775` (and `root:<gid>` when
+    /// running privileged) so the sandboxed uid-1000 build can create its
+    /// output paths in `/nix/store` — vm-ca-cutoff caught the activation
+    /// shipping a root:root 0755 merged root.
+    #[test]
+    fn store_scratch_made_group_writable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let euid_root = nix::unistd::geteuid().is_root();
+        let res = make_store_scratch_writable(dir.path(), SANDBOX_BUILD_GID);
+        let mode = std::fs::metadata(dir.path())
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o1775, "store scratch must be 1775");
+        if euid_root {
+            res.expect("chown succeeds as root");
+            assert_eq!(
+                std::fs::metadata(dir.path()).expect("stat").gid(),
+                SANDBOX_BUILD_GID
+            );
+        } else {
+            // Unprivileged: the chmod half must have applied (asserted
+            // above); the chown half is allowed to fail.
+            let _ = res;
+        }
     }
 
     /// `footer_result_native` covers the same domain the daemon-era
