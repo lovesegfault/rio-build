@@ -295,8 +295,10 @@ impl EmptyConnectionTimer {
 /// the connection's live-session count. Held by the session's response
 /// task and dropped when the session ACTUALLY ends — the protocol task
 /// has returned (client EOF, handshake/idle timeout, protocol error, or
-/// graceful shutdown), BEFORE the server-side `exit-status`/`eof`/`close`
-/// are attempted — or when the `ChannelSession` is dropped early (client
+/// graceful shutdown) or its output can no longer be delivered (a send
+/// stalled past [`HANDLE_SEND_TIMEOUT`], so the transport is treated as
+/// wedged), BEFORE the server-side `exit-status`/`eof`/`close` are
+/// attempted — or when the `ChannelSession` is dropped early (client
 /// channel close, connection end) and the response task is aborted with
 /// it.
 ///
@@ -338,6 +340,28 @@ impl Drop for SessionGuard {
     }
 }
 
+/// How long the gateway waits for this connection's russh handle queue to
+/// accept a single send — a response-data chunk in
+/// [`pump_session_responses`], or the end-of-session close-out batch in
+/// [`finish_channel_session`] — before concluding the transport is wedged.
+///
+/// The handle queue is shared by every session on the connection and is
+/// only drained between key exchanges, so a wait here is normally just
+/// fair-share queueing behind other sessions' chunks. Even a fully loaded
+/// multiplexed connection (`max_channels_per_connection` = 512 sessions ×
+/// 32 KiB chunks) on a slow client link clears a full round of sends in
+/// well under a minute at ~1 MB/s, so congestion alone cannot exhaust this
+/// bound. A send the queue has not accepted after this long is not slow —
+/// the queue is not draining at all (a peer holding a key exchange open
+/// forever, or one that stopped reading with the kernel buffer full).
+/// 300 s matches the gateway's existing tolerance for an unresponsive
+/// peer, the SSH keepalive policy in
+/// [`build_ssh_config`](super::build_ssh_config) (30 s interval × (9 + 1)
+/// misses), while turning "forever" into "minutes" for a genuinely parked
+/// queue: the wedged transport is detected and force-closed instead of
+/// pinning sessions, tasks, and buffers until the pod restarts.
+pub(super) const HANDLE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// End-of-session bookkeeping run by the response task once the protocol
 /// handler's output stream is exhausted: release the session's capacity
 /// FIRST (drop the [`SessionGuard`]), then make a bounded best-effort
@@ -356,17 +380,27 @@ impl Drop for SessionGuard {
 ///   peer's transport cooperation, so the guard drops before the first
 ///   send. The empty-connection grace the drop may arm measures live
 ///   sessions, not whether these close-out bytes were flushed.
-/// - The sends are bounded by `close_out_timeout` so a full queue cannot
-///   park this task forever either. A connection in that state has been
-///   (or is about to be) told to disconnect, and the transport
-///   force-close ([`super::ConnDeadline`]) bounds *that*; skipping the
-///   exit-status/eof/close on such a connection costs nothing.
+/// - The sends are bounded by `close_out_timeout`, but generously
+///   ([`HANDLE_SEND_TIMEOUT`] in production): a session ending is NORMAL
+///   on a healthy multiplexed connection — one build of many finishing
+///   while its siblings keep streaming — and on a congested client link
+///   the close-out can legitimately queue behind those siblings for a
+///   while. Abandoning it early would strand that client's foreground
+///   `ssh` (and the `nix` invocation blocked on it), exactly the hang the
+///   exit-status rule exists to prevent, so the budget must be one that
+///   congestion alone cannot exhaust. The bound exists so a queue that
+///   has genuinely stopped draining cannot park this task forever; when
+///   it expires the transport is treated as wedged — the close-out is
+///   abandoned and the connection's force-close is armed so the
+///   accept-site deadline ([`super::ConnDeadline`]) ends the connection
+///   without further cooperation from the peer.
 async fn finish_channel_session(
     handle: russh::server::Handle,
     channel_id: ChannelId,
     session_guard: SessionGuard,
     client_pump: tokio::task::JoinHandle<()>,
     close_out_timeout: std::time::Duration,
+    force_close: Arc<super::ForceClose>,
 ) {
     drop(session_guard);
     // r[impl gw.conn.exit-status+3]
@@ -394,9 +428,17 @@ async fn finish_channel_session(
     {
         warn!(
             channel = ?channel_id,
+            timeout_secs = close_out_timeout.as_secs(),
             "timed out delivering exit-status/eof/close (russh handle queue not draining); \
-             abandoning the channel close-out"
+             abandoning the channel close-out and force-closing the connection"
         );
+        // A queue that would not accept the close-out within the generous
+        // budget is wedged, not congested (see the doc above). Treat the
+        // transport as dead: arming the force-close lets the accept-site
+        // deadline end the connection without any further cooperation
+        // from the peer, instead of leaving a transport that can no
+        // longer deliver anything to keep wedging future sessions.
+        force_close.arm_within(super::FORCE_CLOSE_SLACK);
     }
     // Reap the pump rather than wait for it: the protocol reader is gone,
     // so nothing will ever consume further client data, and on its own the
@@ -414,6 +456,102 @@ async fn finish_channel_session(
     {
         error!(channel = ?channel_id, "client pump task panicked: {e}");
     }
+}
+
+/// Body of the per-session response task: forward protocol output to the
+/// SSH client one bounded send at a time, then run the end-of-session
+/// bookkeeping ([`finish_channel_session`]).
+///
+/// Every `Handle::data` send is bounded by `send_timeout`
+/// ([`HANDLE_SEND_TIMEOUT`] in production). The sends ride the
+/// per-connection russh handle queue, which the peer can park (a key
+/// exchange held open forever, or a reader that simply stops draining the
+/// socket); without the bound this task would wait inside the loop
+/// indefinitely while still owning the [`SessionGuard`], pinning a global
+/// session permit, the channels-active gauge, and the connection's
+/// live-session count. Nothing else can step in: the wedged guards keep
+/// the live-session count positive, so the empty-connection grace never
+/// fires, no disconnect is queued, and the transport force-close is never
+/// armed — a handful of such connections could pin the pod's entire
+/// session capacity until restart.
+///
+/// A send that exhausts the bound therefore means the transport is
+/// wedged, not slow, and the fault is connection-level (every pump on
+/// this connection is equally stuck), so the response is connection-level
+/// too: arm the transport force-close — the accept-site deadline then
+/// tears the connection down without the peer's cooperation — and end
+/// this session so its capacity is released.
+async fn pump_session_responses(
+    mut outbound_reader: tokio::io::DuplexStream,
+    handle: russh::server::Handle,
+    channel_id: ChannelId,
+    session_guard: SessionGuard,
+    client_pump: tokio::task::JoinHandle<()>,
+    force_close: Arc<super::ForceClose>,
+    send_timeout: std::time::Duration,
+) {
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        match outbound_reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                metrics::counter!("rio_gateway_bytes_total", "direction" => "tx")
+                    .increment(n as u64);
+                // russh 0.58: Handle::data takes `impl Into<Bytes>`
+                // (was CryptoVec). Vec<u8> satisfies the bound.
+                match tokio::time::timeout(send_timeout, handle.data(channel_id, buf[..n].to_vec()))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        warn!(channel = ?channel_id, "response pump: SSH send failed");
+                        metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send")
+                            .increment(1);
+                        break;
+                    }
+                    Err(_) => {
+                        // Not slow — wedged: the queue accepted nothing for
+                        // the entire generous bound (see the fn doc). Arm
+                        // the transport force-close for this
+                        // connection-level fault, then fall through to
+                        // finish_channel_session so this session stops
+                        // counting against the global cap.
+                        warn!(
+                            channel = ?channel_id,
+                            timeout_secs = send_timeout.as_secs(),
+                            "response pump: SSH send stalled (handle queue not draining); \
+                             treating the transport as wedged and force-closing the connection"
+                        );
+                        metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send_stall")
+                            .increment(1);
+                        force_close.arm_within(super::FORCE_CLOSE_SLACK);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "error reading protocol response");
+                break;
+            }
+        }
+    }
+    // The protocol session is over: release the permit, the gauge,
+    // and the live-session count, then deliver the close-out to
+    // the client on a best-effort, bounded basis. Waiting for the
+    // client to acknowledge (or for the close-out sends to make it
+    // through a handle queue the peer may have parked) would let a
+    // client that ignores the close pin a global session slot
+    // indefinitely — the dead session must stop counting the
+    // moment the server is done with it.
+    finish_channel_session(
+        handle,
+        channel_id,
+        session_guard,
+        client_pump,
+        send_timeout,
+        force_close,
+    )
+    .await;
 }
 
 // r[impl gw.conn.exit-status+3]
@@ -1194,7 +1332,7 @@ impl Handler for ConnectionHandler {
         let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
         let (inbound_reader, mut inbound_writer) = tokio::io::duplex(256 * 1024);
-        let (mut outbound_reader, outbound_writer) = tokio::io::duplex(256 * 1024);
+        let (outbound_reader, outbound_writer) = tokio::io::duplex(256 * 1024);
 
         // Task: forward SSH client data -> inbound pipe
         let client_pump = rio_common::task::spawn_monitored("client-pump", async move {
@@ -1261,45 +1399,24 @@ impl Handler for ConnectionHandler {
             .instrument(tracing::info_span!("channel", channel = ?channel_id)),
         );
 
-        // Task: pump protocol responses -> SSH client
+        // Task: pump protocol responses -> SSH client. The body is a free
+        // fn so the parked-handle-queue behavior can be unit-tested; it
+        // owns the SessionGuard and runs `finish_channel_session` when the
+        // protocol output ends or a send stalls.
         let handle = session.handle();
+        // A stalled send (or close-out) is a connection-level fault: the
+        // pump arms this connection's transport force-close, shared with
+        // the accept-site `ConnDeadline` wrapper that enforces it.
+        let force_close = Arc::clone(&self.force_close);
         let response_task = rio_common::task::spawn_monitored("response-task", async move {
-            let mut buf = vec![0u8; 32 * 1024];
-            loop {
-                match outbound_reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        metrics::counter!("rio_gateway_bytes_total", "direction" => "tx")
-                            .increment(n as u64);
-                        // russh 0.58: Handle::data takes `impl Into<Bytes>`
-                        // (was CryptoVec). Vec<u8> satisfies the bound.
-                        if handle.data(channel_id, buf[..n].to_vec()).await.is_err() {
-                            warn!(channel = ?channel_id, "response pump: SSH send failed");
-                            metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send")
-                                .increment(1);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "error reading protocol response");
-                        break;
-                    }
-                }
-            }
-            // The protocol session is over: release the permit, the gauge,
-            // and the live-session count, then deliver the close-out to
-            // the client on a best-effort, bounded basis. Waiting for the
-            // client to acknowledge (or for the close-out sends to make it
-            // through a handle queue the peer may have parked) would let a
-            // client that ignores the close pin a global session slot
-            // indefinitely — the dead session must stop counting the
-            // moment the server is done with it.
-            finish_channel_session(
+            pump_session_responses(
+                outbound_reader,
                 handle,
                 channel_id,
                 session_guard,
                 client_pump,
-                super::FORCE_CLOSE_SLACK,
+                force_close,
+                HANDLE_SEND_TIMEOUT,
             )
             .await;
         });
@@ -1556,7 +1673,17 @@ mod tests {
         let handler = server.new_client(None);
 
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
-        let config = Arc::new(super::super::build_ssh_config(host_key));
+        let mut config = super::super::build_ssh_config(host_key);
+        // The production keepalive policy would end this completely silent
+        // session on its own once enough (virtual) time passes, and then
+        // the parked sends would FAIL fast instead of blocking. The peer
+        // these tests model defeats exactly that backstop: every packet it
+        // trickles resets the liveness clocks while the queue still never
+        // drains. Disable the liveness timers so the parked state holds
+        // across paused-clock advances, as it does against that peer.
+        config.keepalive_interval = None;
+        config.inactivity_timeout = None;
+        let config = Arc::new(config);
 
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
         // run_stream reads the client identification string before
@@ -1630,6 +1757,7 @@ mod tests {
             guard,
             tokio::spawn(async {}),
             std::time::Duration::from_secs(600),
+            Arc::new(super::super::ForceClose::new()),
         ));
 
         // The permit must come back promptly even though the close-out can
@@ -1669,6 +1797,7 @@ mod tests {
             guard,
             tokio::spawn(async {}),
             std::time::Duration::from_millis(200),
+            Arc::new(super::super::ForceClose::new()),
         );
         // Generous outer bound: the helper must return on its own once the
         // 200 ms close-out budget expires; without the bound it would park
@@ -1680,6 +1809,152 @@ mod tests {
             sem.available_permits(),
             1,
             "the permit must have been released along the way"
+        );
+        Ok(())
+    }
+
+    // r[verify gw.conn.session-cap]
+    /// A peer that parks the handle queue must not be able to pin session
+    /// capacity through the response pump: each `Handle::data` send is
+    /// bounded by [`HANDLE_SEND_TIMEOUT`], and when that bound expires the
+    /// pump must end the session (releasing the [`SessionGuard`]'s permit)
+    /// and treat the transport as wedged (force-close armed). Without
+    /// both, every wedged connection pins its sessions' permits until the
+    /// pod restarts, and the empty-connection grace can never step in
+    /// because the wedged guards themselves keep the live-session count
+    /// positive.
+    ///
+    /// Real-time setup (mock gRPC, russh session, queue fill), then the
+    /// clock is paused so the test can cross the production bound
+    /// instantly. Uses the production constant on the real production
+    /// task body ([`pump_session_responses`]).
+    #[tokio::test]
+    async fn stalled_response_send_releases_permit_and_arms_force_close() -> anyhow::Result<()> {
+        let (handle, _filled, _client_io) = parked_handle_with_full_queue().await?;
+        let sem = Arc::new(Semaphore::new(1));
+        let guard = guard_holding_only_permit(&sem, handle.clone());
+        assert_eq!(sem.available_permits(), 0, "guard must hold the permit");
+        let force_close = Arc::new(super::super::ForceClose::new());
+
+        // Protocol output waiting to be forwarded. The writer half stays
+        // alive so the pump can only leave its loop via the send bound —
+        // never via EOF.
+        let (outbound_reader, mut proto_writer) = tokio::io::duplex(64 * 1024);
+        proto_writer.write_all(b"protocol response bytes").await?;
+
+        tokio::time::pause();
+        let pump = tokio::spawn(pump_session_responses(
+            outbound_reader,
+            handle,
+            channel_id(1),
+            guard,
+            tokio::spawn(async {}),
+            Arc::clone(&force_close),
+            HANDLE_SEND_TIMEOUT,
+        ));
+        // Let the pump reach the parked send and register its timeout.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Well inside the bound: a fair-share wait behind a slow but still
+        // draining link must not be treated as a stall.
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "a send still inside HANDLE_SEND_TIMEOUT must not end the session"
+        );
+        assert!(
+            force_close.armed_deadline().is_none(),
+            "a send still inside HANDLE_SEND_TIMEOUT must not arm the force-close"
+        );
+
+        // Past the bound: the stalled send must end the session (the
+        // permit comes back via finish_channel_session) and arm the
+        // connection's transport force-close.
+        tokio::time::advance(HANDLE_SEND_TIMEOUT).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "a send stalled past HANDLE_SEND_TIMEOUT must release the session permit"
+        );
+        assert!(
+            force_close.armed_deadline().is_some(),
+            "a send stalled past HANDLE_SEND_TIMEOUT must arm the transport force-close"
+        );
+        pump.abort();
+        Ok(())
+    }
+
+    // r[verify gw.conn.exit-status+3]
+    /// The close-out budget must tolerate congestion and only condemn the
+    /// transport once it is exhausted. A session ending is normal on a
+    /// healthy multiplexed connection (one build of many finishing while
+    /// its siblings keep streaming), so with the production budget
+    /// ([`HANDLE_SEND_TIMEOUT`]) the close-out must still be pending a few
+    /// seconds in — abandoning it that early on a merely congested link
+    /// strands the client's foreground `ssh` and the `nix` invocation
+    /// blocked on it. Once the budget expires against a genuinely parked
+    /// queue, the helper must abandon the close-out, arm the force-close,
+    /// and return.
+    #[tokio::test]
+    async fn parked_close_out_outlasts_congestion_then_arms_force_close() -> anyhow::Result<()> {
+        let (handle, _filled, _client_io) = parked_handle_with_full_queue().await?;
+        let sem = Arc::new(Semaphore::new(1));
+        let guard = guard_holding_only_permit(&sem, handle.clone());
+        let force_close = Arc::new(super::super::ForceClose::new());
+
+        tokio::time::pause();
+        let finish = tokio::spawn(finish_channel_session(
+            handle,
+            channel_id(1),
+            guard,
+            tokio::spawn(async {}),
+            HANDLE_SEND_TIMEOUT,
+            Arc::clone(&force_close),
+        ));
+        // Let the helper park on the first close-out send.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // A few seconds in — the kind of delay ordinary congestion
+        // produces — the close-out must still be pending and the
+        // transport must not yet be condemned.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !finish.is_finished(),
+            "the close-out must not be abandoned after a few seconds of queueing"
+        );
+        assert!(
+            force_close.armed_deadline().is_none(),
+            "the force-close must not be armed before the close-out budget expires"
+        );
+
+        // Past the full budget the queue is provably wedged: abandon the
+        // close-out, arm the force-close, return.
+        tokio::time::advance(HANDLE_SEND_TIMEOUT).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), finish)
+            .await
+            .expect("finish_channel_session must return once the close-out budget expires")?;
+        assert!(
+            force_close.armed_deadline().is_some(),
+            "an exhausted close-out budget must arm the transport force-close"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit must have been released before the close-out attempt"
         );
         Ok(())
     }
@@ -1708,6 +1983,7 @@ mod tests {
             guard,
             client_pump,
             std::time::Duration::from_millis(200),
+            Arc::new(super::super::ForceClose::new()),
         );
         // Bounded from the outside: without the reap, the helper parks on
         // the pump join until the peer closes the channel — i.e. forever
