@@ -100,6 +100,7 @@ async fn test_attempt_fill_termination_first_writer_wins() -> anyhow::Result<()>
         exec_id,
         "deadline_exceeded",
         OutcomeClass::Timeout,
+        (false, false, false),
     )
     .await?;
     tx.commit().await?;
@@ -114,6 +115,7 @@ async fn test_attempt_fill_termination_first_writer_wins() -> anyhow::Result<()>
         exec_id,
         "unreported",
         OutcomeClass::ExecutorCrash,
+        (false, false, false),
     )
     .await?;
     tx.commit().await?;

@@ -691,8 +691,15 @@ impl DagActor {
             crate::state::OutcomeClass::Infra
         };
         if let Some((derivation_id, exec_id)) = released {
-            self.fill_attempt_termination(&drv_hash, derivation_id, exec_id, label, class)
-                .await;
+            self.fill_attempt_termination(
+                &drv_hash,
+                derivation_id,
+                exec_id,
+                label,
+                class,
+                (outcome.promoted, outcome.promoted, outcome.at_cap),
+            )
+            .await;
         } else if race_ahead {
             let row = self
                 .attempt_row_for(&drv_hash, class, crate::state::ReportingParty::Controller)
@@ -814,6 +821,7 @@ impl DagActor {
                 exec_id,
                 "deadline_exceeded",
                 crate::state::OutcomeClass::Timeout,
+                (false, outcome.promoted, outcome.at_cap),
             )
             .await;
         }
@@ -886,6 +894,7 @@ impl DagActor {
                 exec_id,
                 "unreported",
                 crate::state::OutcomeClass::ExecutorCrash,
+                (false, false, false),
             )
             .await;
         }

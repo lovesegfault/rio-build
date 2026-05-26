@@ -1709,12 +1709,16 @@ impl DerivationState {
         exec_id: Uuid,
         termination_reason: &str,
         outcome_class: OutcomeClass,
+        (exempt, floor_promoted, floor_at_cap): (bool, bool, bool),
     ) -> bool {
         for record in self.attempt_history.iter_mut().rev() {
             if record.exec_id == Some(exec_id) {
                 if record.termination_reason.is_none() {
                     record.termination_reason = Some(termination_reason.to_string());
                     record.outcome_class = outcome_class;
+                    record.exempt = exempt;
+                    record.floor_promoted = floor_promoted;
+                    record.floor_at_cap = floor_at_cap;
                     return true;
                 }
                 return false;

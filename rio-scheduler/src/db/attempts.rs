@@ -389,10 +389,16 @@ impl SchedulerDb {
         exec_id: Uuid,
         termination_reason: &str,
         outcome_class: OutcomeClass,
+        // The classifying report's floor outcome `(exempt, promoted,
+        // at_cap)`: the discriminators the fold reads for the
+        // controller-classified infra family (all false for
+        // non-classifying fills such as the establishment sweep).
+        (exempt, floor_promoted, floor_at_cap): (bool, bool, bool),
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE drv_attempts \
-             SET termination_reason = $3, outcome_class = $4 \
+             SET termination_reason = $3, outcome_class = $4, \
+                 exempt = $5, floor_promoted = $6, floor_at_cap = $7 \
              WHERE derivation_id = $1 AND exec_id = $2 \
                AND termination_reason IS NULL",
         )
@@ -400,6 +406,9 @@ impl SchedulerDb {
         .bind(exec_id)
         .bind(termination_reason)
         .bind(outcome_class.as_str())
+        .bind(exempt)
+        .bind(floor_promoted)
+        .bind(floor_at_cap)
         .execute(&mut *tx)
         .await?;
         Ok(result.rows_affected() == 1)

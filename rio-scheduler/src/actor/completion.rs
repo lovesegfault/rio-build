@@ -267,6 +267,12 @@ impl DagActor {
         exec_id: Uuid,
         termination_reason: &str,
         outcome_class: OutcomeClass,
+        // The classifying report's floor outcome `(exempt, promoted,
+        // at_cap)` — carried onto the row so the fold can tell a
+        // counted at-cap controller termination from the
+        // charges-nothing cold-start shape; all false for
+        // non-classifying fills (the establishment sweep).
+        floor: (bool, bool, bool),
     ) -> bool {
         if !self.leader.is_leader() {
             return false;
@@ -279,6 +285,7 @@ impl DagActor {
                 exec_id,
                 termination_reason,
                 outcome_class,
+                floor,
             )
             .await?;
             tx.commit().await?;
@@ -288,7 +295,12 @@ impl DagActor {
         match result {
             Ok(won) => {
                 if won && let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.classify_attempt_record(exec_id, termination_reason, outcome_class);
+                    state.classify_attempt_record(
+                        exec_id,
+                        termination_reason,
+                        outcome_class,
+                        floor,
+                    );
                 }
                 won
             }
