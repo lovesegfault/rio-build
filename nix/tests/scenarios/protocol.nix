@@ -400,6 +400,11 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
+      # Castore tenancy: every ssh-ng build (and the inputs the client
+      # pushes for it) is attributed to this tenant; the dispatched
+      # assignment token carries its UUID so the tenant-scoped castore
+      # mounts can read those inputs.
+      tenant = "vm-protocol";
     }}
 
     store_url = "ssh-ng://${gatewayHost}"

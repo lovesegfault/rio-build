@@ -40,6 +40,8 @@ pkgs.testers.runNixOSTest {
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
       withSeed = true;
+      # Castore tenancy: seed + CA-chain builds all run as this tenant.
+      tenant = "vm-ca-cutoff";
     }}
 
     import time

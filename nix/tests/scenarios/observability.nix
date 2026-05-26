@@ -61,6 +61,8 @@ pkgs.testers.runNixOSTest {
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
       withSeed = true;
+      # Castore tenancy: the traced builds run as this tenant.
+      tenant = "vm-obs";
     }}
 
     import re

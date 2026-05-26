@@ -1,8 +1,10 @@
 # Toxiproxy chaos fixture: standalone topology + fault-injection proxy.
 #
-# Wraps the standalone pattern (PG + store + scheduler + gateway on one
-# control VM, 1 worker VM, 1 client VM) with a toxiproxy-server systemd
-# unit ON THE CONTROL VM sitting between scheduler↔store and worker↔store.
+# Composes the standalone fixture (PG + store + scheduler + gateway on
+# one control VM, 1 worker VM, 1 client VM — including the castore
+# tenancy wiring: HMAC assignment/service keys and the edge JWT that
+# attributes gateway pushes) and adds a toxiproxy-server systemd unit ON
+# THE CONTROL VM sitting between scheduler↔store and worker↔store.
 #
 # Topology (all on the NixOS-test vlan; hostnames auto-resolve):
 #
@@ -46,26 +48,15 @@
 #   scenarios here target the unary-RPC retry/timeout/breaker paths.
 #
 # Returns the same shape as standalone.nix:
-#   { nodes, waitReady, pyNodeVars, gatewayHost, pki }
+#   { nodes, waitReady, pyNodeVars, gatewayHost, hmacKeys }
 # plus `toxiproxyHost` (= "control") for scenarios that want to be
 # explicit about where toxiproxy-cli runs.
 {
   pkgs,
-  rio-workspace,
-  rioModules,
-  coverage ? false,
   ...
-}:
+}@fixtureArgs:
 let
   inherit (pkgs) lib;
-  common = import ../common.nix {
-    inherit
-      pkgs
-      rio-workspace
-      rioModules
-      coverage
-      ;
-  };
 
   # Proxy definitions. toxiproxy-server -config reads this JSON on boot
   # and creates both proxies with zero toxics → transparent pass-through.
@@ -119,51 +110,57 @@ in
 # No per-test knobs for now. `_:` keeps the call shape consistent
 # with standalone (callsite: `toxiproxy { }`). Not `{ }:` — statix
 # W10 flags empty destructuring patterns.
-_: {
+_:
+let
+  # The standalone base: castore tenancy recipe on (the chaos builds
+  # mount their inputs through the tenant-scoped castore surface like
+  # any other build), scheduler pointed at the store THROUGH the proxy,
+  # psql on control for the mkBootstrap seed-attribution assert.
+  base = (import ./standalone.nix fixtureArgs) {
+    workers = {
+      worker = { };
+    };
+    withHmac = true;
+    withJwt = true;
+    extraSchedulerConfig = {
+      storeAddr = "localhost:19002";
+    };
+    extraPackages = [ pkgs.postgresql_18 ];
+  };
+in
+{
   gatewayHost = "control";
   toxiproxyHost = "control";
+  inherit (base) pyNodeVars hmacKeys;
 
-  nodes = {
+  nodes = base.nodes // {
     control = {
       imports = [
-        (common.mkControlNode {
-          hostName = "control";
-          # Override scheduler's storeAddr through the proxy. `//` in
-          # mkControlNode (common.nix:327) makes this win over the
-          # `storeAddr = "localhost:9002"` default.
-          extraSchedulerConfig = {
-            storeAddr = "localhost:19002";
-          };
+        base.nodes.control
+        toxiproxyModule
+        {
           # 29002: worker_store proxy listener (cross-VM).
           # 9093: worker metrics port (scraped in subtest 2/4 assertions).
-          extraFirewallPorts = [
+          networking.firewall.allowedTCPPorts = [
             29002
             9093
           ];
-        })
-        toxiproxyModule
+          # Belt-and-suspenders: scheduler unit waits for toxiproxy unit.
+          # The Before= on toxiproxy already implies this, but explicit
+          # After= on the scheduler side survives if someone later drops
+          # the Before= (which would otherwise silently reintroduce the race).
+          systemd.services.rio-scheduler.after = [ "toxiproxy.service" ];
+        }
       ];
-      # Belt-and-suspenders: scheduler unit waits for toxiproxy unit.
-      # The Before= on toxiproxy already implies this, but explicit
-      # After= on the scheduler side survives if someone later drops
-      # the Before= (which would otherwise silently reintroduce the race).
-      systemd.services.rio-scheduler.after = [ "toxiproxy.service" ];
     };
-
     worker = {
-      imports = [
-        (common.mkWorkerNode {
-          hostName = "worker";
-        })
-      ];
-      # mkWorkerNode hardcodes storeAddr = "control:9002" with no override
-      # hook. Layer a module-merge override instead of patching common.nix.
-      # mkForce because the module's own value is also a plain string
-      # (common.nix:402) — two plain strings at the same option = conflict.
+      imports = [ base.nodes.worker ];
+      # The standalone worker module hardcodes storeAddr = "control:9002";
+      # route it through the worker_store proxy instead. mkForce because
+      # the module's own value is also a plain string — two plain strings
+      # at the same option = conflict.
       services.rio.worker.storeAddr = lib.mkForce "control:29002";
     };
-
-    client = common.mkClientNode { gatewayHost = "control"; };
   };
 
   # Boot sequence mirrors standalone.waitReady, plus the proxy checks
@@ -192,6 +189,4 @@ _: {
         timeout=30,
     )
   '';
-
-  pyNodeVars = "control, worker, client";
 }

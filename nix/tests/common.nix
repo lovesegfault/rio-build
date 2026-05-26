@@ -668,6 +668,31 @@ rec {
   # so build-dispatching scenarios should use mkBootstrap's `tenant`.
   sshKeySetup = gatewayHost: sshKeySetupFor gatewayHost "";
 
+  # ── Service-token mint (standalone fixtures) ────────────────────────
+  # HMAC service token from a KEY FILE path (argv[1]) — the standalone
+  # twin of lifecycle.nix's stdin-base64 variant (k8s Secrets arrive
+  # base64-wrapped; the fixture's hmac-keys files are the raw key
+  # bytes). Claims shape mirrors rio-auth's ServiceClaims; the trailing
+  # newline trim mirrors rio_auth::hmac::load_key so the signer and the
+  # verifier read the same bytes. Scenarios use it to authenticate
+  # AdminService grpcurl calls when the fixture runs withHmac.
+  signServiceTokenFile = pkgs.writeScript "sign-service-token-file" ''
+    #!${pkgs.python3}/bin/python3
+    import base64, hashlib, hmac, json, sys, time
+    key = open(sys.argv[1], "rb").read()
+    for suf in (b"\r\n", b"\n"):
+        if key.endswith(suf):
+            key = key[: -len(suf)]
+            break
+    claims = json.dumps(
+        {"caller": "rio-cli", "expiry_unix": int(time.time()) + 3600},
+        separators=(",", ":"),
+    ).encode()
+    tag = hmac.new(key, claims, hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    print(f"{b64(claims)}.{b64(tag)}")
+  '';
+
   # ── Tenant provisioning (standalone fixtures) ───────────────────────
   # Production-shaped tenant creation: AdminService CreateTenant via
   # rio-cli — the same RPC `xtask k8s cli create-tenant`, the k3s

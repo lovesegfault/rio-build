@@ -89,6 +89,8 @@ pkgs.testers.runNixOSTest {
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
       withSeed = true;
+      # Castore tenancy: the fault-injected builds run as this tenant.
+      tenant = "vm-chaos";
     }}
 
     import time

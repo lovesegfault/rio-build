@@ -86,6 +86,8 @@ let
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
       withSeed = true;
+      # Castore tenancy: seed + chunked-upload builds run as this tenant.
+      tenant = "vm-ppc";
     }}
 
     all_workers = [worker]

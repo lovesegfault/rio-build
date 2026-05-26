@@ -75,6 +75,15 @@ let
   # InjectBuildSample fixture gate. tickIntervalSecs=2 so the estimator
   # refit fires fast enough for wait_until_succeeds.
   slaSizingFixture = standalone {
+    # Castore tenancy recipe: the scripted-telemetry worker still
+    # performs the real castore mount before the fixture intercept
+    # (executor/mod.rs — "after overlay+input setup"), so its builds
+    # need a tenant-bearing assignment token (withHmac) and a
+    # tenant-attributed seed (withJwt). The scenario prelude bootstraps
+    # as tenant vm-sla and adds the service token to its AdminService
+    # grpcurl calls (withHmac gates those too).
+    withHmac = true;
+    withJwt = true;
     workers = {
       worker = {
         extraServiceEnv = {
@@ -325,6 +334,13 @@ in
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
+      # Castore tenancy recipe: HMAC so dispatched assignment tokens
+      # carry the tenant claim the tenant-scoped castore reads need;
+      # JWT so the inputs the client pushes during the build are
+      # attributed to the tenant (store.put.tenant-attribution). The
+      # scenario prelude bootstraps as tenant vm-protocol.
+      withHmac = true;
+      withJwt = true;
       # psql for the eager-nar-index subtest's manifests/castore-table
       # assertions.
       extraPackages = [ pkgs.postgresql_18 ];
@@ -356,6 +372,10 @@ in
     inherit pkgs common;
     nameSuffix = "-lix";
     fixture = standalone {
+      # Same tenancy recipe as vm-protocol-warm-standalone (the Lix
+      # client only changes the ssh-ng peer, not the auth chain).
+      withHmac = true;
+      withJwt = true;
       clientNixPackage = lixPackage;
       extraClientModules = [
         {
@@ -396,12 +416,23 @@ in
       # HMAC on this fixture — build-1 failing here means the is_ca
       # bypass at rio-store/src/grpc/mod.rs regressed.
       withHmac = true;
+      # Castore tenancy recipe: JWT so the seeded busybox closure is
+      # attributed to the prelude's tenant (vm-ca-cutoff) and the
+      # tenant-scoped castore mounts can read it.
+      withJwt = true;
+      # psql for the mkBootstrap seed-attribution assert.
+      extraPackages = [ pkgs.postgresql_18 ];
     };
   };
 
   vm-protocol-cold-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
+      # Castore tenancy recipe (see vm-protocol-warm-standalone). The
+      # cold DAG's FOD output is attributed by the scheduler at
+      # completion, so the consumer's mount works without a seed.
+      withHmac = true;
+      withJwt = true;
       workers = {
         worker = {
         };
@@ -745,6 +776,11 @@ in
     (put-path-chunked {
       inherit pkgs common;
       fixture = standalone {
+        # Castore tenancy recipe (tenant vm-ppc in the prelude): HMAC
+        # for the assignment-token tenant claim, JWT for the seeded
+        # closure's path_tenants attribution.
+        withHmac = true;
+        withJwt = true;
         workers = {
           worker = { };
         };
@@ -862,6 +898,13 @@ in
   vm-security-standalone = security.standalone {
     fixture = standalone {
       withHmac = true;
+      # Castore tenancy: the scenario's builds run under the team-test
+      # tenant, and the gateway's session JWT is what attributes the
+      # seeded closure to it (store.put.tenant-attribution) — without
+      # it no build in this scenario can mount its inputs. The
+      # jwt-dual-mode subtest's framing moved with this (see the
+      # scenario file).
+      withJwt = true;
       extraPackages = [
         pkgs.grpcurl
         pkgs.grpc-health-probe
@@ -926,6 +969,9 @@ in
   vm-observability-standalone = observability {
     inherit pkgs common;
     fixture = standalone {
+      # Castore tenancy recipe (tenant vm-obs in the prelude).
+      withHmac = true;
+      withJwt = true;
       workers = {
         worker1 = {
         };
@@ -935,6 +981,8 @@ in
         };
       };
       withOtel = true;
+      # psql for the mkBootstrap seed-attribution assert.
+      extraPackages = [ pkgs.postgresql_18 ];
     };
   };
 

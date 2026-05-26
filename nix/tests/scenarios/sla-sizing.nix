@@ -130,6 +130,9 @@ let
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
       withSeed = true;
+      # Castore tenancy: the scripted-telemetry builds still mount the
+      # castore lower, so they need a tenant like any real build.
+      tenant = "vm-sla";
     }}
 
     all_workers = [worker]
@@ -139,9 +142,17 @@ let
       dumpLogsExpr = "dump_all_logs([${gatewayHost}] + all_workers)";
     }}
 
+    # withHmac gates AdminService writes behind x-rio-service-token;
+    # mint one from the fixture's service key (same claims shape the
+    # gateway/rio-cli use).
+    service_token = ${gatewayHost}.succeed(
+        "${common.signServiceTokenFile} ${fixture.hmacKeys}/service-hmac.key"
+    ).strip()
+
     def grpcurl_admin(method: str, payload: dict) -> str:
         return ${gatewayHost}.succeed(
             f"grpcurl -plaintext -protoset ${protoset}/rio.protoset "
+            f"-H 'x-rio-service-token: {service_token}' "
             f"-d '{json.dumps(payload)}' "
             f"localhost:9001 rio.admin.AdminService/{method}"
         )
@@ -150,6 +161,7 @@ let
         return ${gatewayHost}.succeed(
             "${common.covShellEnv}"
             "RIO_SCHEDULER_ADDR=localhost:9001 "
+            "RIO_SERVICE_HMAC_KEY_PATH=${fixture.hmacKeys}/service-hmac.key "
             f"${rioCli} {args} 2>&1"
         )
 
