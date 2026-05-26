@@ -427,6 +427,40 @@ rec {
         outputHash = recursivePayloadNar;
       };
 
+  # Flat-mode FOD whose bytes match the declared hash but which is made
+  # executable: CppNix rejects a flat fixed-output that is not exactly
+  # one NON-executable regular file even when the hash matches
+  # (derivation-builder.cc, CAFixed branch) — otherwise an executable
+  # and a non-executable file with identical bytes would collide on the
+  # same store path. The native FOD gate must reject the same shape.
+  fod-flat-executable =
+    mkDrv "rio-diff-fod-flat-exec"
+      ''
+        printf '%s' '${flatPayload}' > $out
+        chmod 0755 $out
+      ''
+      {
+        outputHashMode = "flat";
+        outputHashAlgo = "sha256";
+        outputHash = flatPayloadSha256;
+      };
+
+  # Flat-mode FOD whose $out is a symlink (to an input-closure path, so
+  # the link target always exists when either side inspects it): CppNix
+  # rejects any flat fixed-output that is not a regular file, before
+  # looking at content at all. The native side must not follow the
+  # symlink and accept the target's bytes.
+  fod-flat-symlink =
+    mkDrv "rio-diff-fod-flat-symlink"
+      ''
+        ln -s ${busybox}/bin/busybox $out
+      ''
+      {
+        outputHashMode = "flat";
+        outputHashAlgo = "sha256";
+        outputHash = flatPayloadSha256;
+      };
+
   # FOD whose produced content does NOT match the declared hash: both
   # sides must fail the build (hash mismatch / output rejection).
   fod-mismatch =

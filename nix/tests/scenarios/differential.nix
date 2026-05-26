@@ -164,6 +164,19 @@ let
     fod-recursive = {
       expect = "parity";
     };
+    fod-flat-executable = {
+      # CppNix: "output path ... should be a non-executable regular
+      # file" (flat CA shape rule); the native FOD gate enforces the
+      # same shape, so the matching content hash must not save it.
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    fod-flat-symlink = {
+      # CppNix rejects a non-regular flat fixed output before hashing;
+      # the native side must not follow the symlink to its target.
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
     fod-mismatch = {
       expect = "both-fail";
       rio_status = "OutputRejected";
