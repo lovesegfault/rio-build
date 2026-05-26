@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rio_gateway::server::{GatewayServer, build_ssh_config};
+use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
 use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use russh::server::Server as _;
@@ -432,6 +433,90 @@ async fn test_many_multiplexed_sessions_all_succeed() -> anyhow::Result<()> {
     }
 
     drop(chans);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// ===========================================================================
+// Healthy-path data flow — exec'd session output reaches the client
+// ===========================================================================
+
+/// End-to-end proof that an exec'd session's protocol output actually
+/// reaches the SSH client as channel data: the client speaks the first
+/// step of the nix worker protocol (`WORKER_MAGIC_1`) and must get the
+/// gateway's handshake reply (`WORKER_MAGIC_2` + protocol version) back on
+/// the same channel. This is what catches a mis-wired response path —
+/// output sent on the wrong channel, through a dropped write half, or not
+/// flowing at all — which the channel-lifecycle tests in this file never
+/// notice because they only look at control replies (`channel_success`,
+/// `channel_failure`, close).
+///
+/// The hostile counterpart — a client that withholds CHANNEL_WINDOW_ADJUST
+/// so the gateway's sends park on an exhausted window — is deliberately
+/// NOT staged here: a stock russh client grants window automatically as it
+/// consumes data and offers no way to suppress that. The window-starved
+/// behavior is pinned at the unit level instead
+/// (`window_starved_send_releases_permit_and_arms_force_close` in
+/// `server/connection.rs`), against the same send seam the production
+/// write half implements; the window-parking semantics of the write half
+/// itself are russh's own contract, covered by its test suite.
+#[tokio::test]
+async fn test_exec_session_streams_protocol_reply_to_client() -> anyhow::Result<()> {
+    common::init_test_logging();
+    let (addr, client_key, srv) = spawn_ssh_server().await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    let mut ch = session.channel_open_session().await?;
+    ch.exec(true, "nix-daemon --stdio").await?;
+    let msg = ch.wait().await.expect("server reply to exec");
+    anyhow::ensure!(
+        matches!(msg, russh::ChannelMsg::Success),
+        "exec must be admitted: {msg:?}"
+    );
+
+    // First step of the nix worker protocol: the client magic. The
+    // gateway's protocol task replies with WORKER_MAGIC_2 + its protocol
+    // version; all wire integers are u64 LE.
+    ch.data(&WORKER_MAGIC_1.to_le_bytes()[..]).await?;
+
+    // Collect channel data until the 16-byte reply is complete. Bounded so
+    // a response path that drops the output fails the test instead of
+    // hanging it.
+    let mut reply = Vec::new();
+    while reply.len() < 16 {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ch.wait())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out waiting for the handshake reply; got {} bytes so far",
+                    reply.len()
+                )
+            })?;
+        match msg {
+            Some(russh::ChannelMsg::Data { data }) => reply.extend_from_slice(&data),
+            Some(other) => {
+                anyhow::ensure!(
+                    !matches!(other, russh::ChannelMsg::Eof | russh::ChannelMsg::Close),
+                    "channel ended before the handshake reply arrived: {other:?}"
+                );
+            }
+            None => anyhow::bail!("channel closed before the handshake reply arrived"),
+        }
+    }
+
+    assert_eq!(
+        u64::from_le_bytes(reply[0..8].try_into().expect("8-byte slice")),
+        WORKER_MAGIC_2,
+        "first 8 bytes of the reply must be WORKER_MAGIC_2"
+    );
+    assert_eq!(
+        u64::from_le_bytes(reply[8..16].try_into().expect("8-byte slice")),
+        PROTOCOL_VERSION,
+        "next 8 bytes must be the gateway's advertised protocol version"
+    );
+
+    drop(ch);
     drop(session);
     srv.abort();
     Ok(())

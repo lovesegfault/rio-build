@@ -124,9 +124,11 @@ pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::fro
 /// empty-connection-grace disconnects arm it the moment they are queued
 /// (the former matters because an authentication that completes with that
 /// disconnect still queued takes the connection out of the pre-auth
-/// deadline's reach), and a session whose handle-queue sends have stalled
-/// past `HANDLE_SEND_TIMEOUT` (connection.rs) arms it with no disconnect
-/// at all — a queue in that state could not deliver one. Once the
+/// deadline's reach), and a session whose sends to the client (channel
+/// data through the window-aware writer, or the close-out on the handle
+/// queue) have stalled past `HANDLE_SEND_TIMEOUT` (connection.rs) arms it
+/// with no disconnect at all — the peer is either not draining the queue a
+/// disconnect would ride or not acting on what it is sent. Once the
 /// deadline passes, the transport read or write fails,
 /// russh's session loop (or its drain loop) returns, and the handler +
 /// stream drop — releasing the permit, fd, and gauges exactly once through
@@ -637,10 +639,12 @@ impl GatewayServer {
 /// handle queue, which a hostile peer can park (key exchange held open) —
 /// the decision to disconnect must be bounded even if the polite send
 /// itself never completes. A third site arms it with no disconnect at
-/// all: a session whose handle-queue sends (channel data or close-out)
-/// have stalled past `HANDLE_SEND_TIMEOUT` (connection.rs) — that queue
-/// is the only path a polite disconnect could take, so the armed deadline
-/// is the entire response.
+/// all: a session whose sends to the client (channel data through the
+/// window-aware writer, or the close-out on the handle queue) have
+/// stalled past `HANDLE_SEND_TIMEOUT` (connection.rs) — the peer is
+/// either not draining the queue a polite disconnect would ride or not
+/// acting on anything it is sent, so the armed deadline is the entire
+/// response.
 ///
 /// Lock-free: a single `AtomicU64` of nanoseconds relative to `origin`
 /// (`NOT_ARMED` = nothing pending), so the wrapper's hot path is one
@@ -717,11 +721,12 @@ impl ForceClose {
 /// - **Force-close:** reads/writes fail once the shared [`ForceClose`]
 ///   deadline passes, regardless of auth state. It is armed the moment the
 ///   gateway decides the connection must go — when a
-///   `Disconnect::ByApplication` is queued, or when a session's
-///   handle-queue sends stall past `HANDLE_SEND_TIMEOUT` (no disconnect
-///   can ride a queue in that state) — so a peer that keeps a disconnect
-///   undeliverable (parked key exchange) or ignores it (never closes its
-///   socket) is closed within the slack anyway.
+///   `Disconnect::ByApplication` is queued, or when a session's sends to
+///   the client stall past `HANDLE_SEND_TIMEOUT` (a peer in that state is
+///   not taking what it is sent, a polite disconnect included) — so a peer
+///   that keeps a disconnect undeliverable (parked key exchange) or
+///   ignores it (never closes its socket) is closed within the slack
+///   anyway.
 ///
 /// Cost on the hot path (authenticated, nothing armed): one relaxed atomic
 /// load per read/write poll — the pre-auth stage check latches off after
@@ -1135,6 +1140,7 @@ impl russh::server::Server for GatewayServer {
             max_channels_per_connection: self.max_channels_per_connection,
             open_channels: 0,
             accepted_channels: HashSet::new(),
+            channel_writers: HashMap::new(),
             empty_connection_grace: self.empty_connection_grace,
             handshake_timeout: self.handshake_timeout,
             idle: Arc::new(connection::EmptyConnectionTimer::new(Arc::clone(

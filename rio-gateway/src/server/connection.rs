@@ -20,7 +20,7 @@ use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::PublicKey;
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{ChannelId, Disconnect};
+use russh::{ChannelId, ChannelWriteHalf, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
@@ -340,26 +340,33 @@ impl Drop for SessionGuard {
     }
 }
 
-/// How long the gateway waits for this connection's russh handle queue to
-/// accept a single send — a response-data chunk in
-/// [`pump_session_responses`], or the end-of-session close-out batch in
-/// [`finish_channel_session`] — before concluding the transport is wedged.
+/// How long the gateway waits for the SSH client to take a single send —
+/// a response-data chunk in [`pump_session_responses`] (sent through the
+/// channel's window-aware write half), or the end-of-session close-out
+/// batch in [`finish_channel_session`] (sent on the russh handle queue) —
+/// before concluding the transport is wedged.
 ///
-/// The handle queue is shared by every session on the connection and is
-/// only drained between key exchanges, so a wait here is normally just
-/// fair-share queueing behind other sessions' chunks. Even a fully loaded
-/// multiplexed connection (`max_channels_per_connection` = 512 sessions ×
-/// 32 KiB chunks) on a slow client link clears a full round of sends in
-/// well under a minute at ~1 MB/s, so congestion alone cannot exhaust this
-/// bound. A send the queue has not accepted after this long is not slow —
-/// the queue is not draining at all (a peer holding a key exchange open
-/// forever, or one that stopped reading with the kernel buffer full).
-/// 300 s matches the gateway's existing tolerance for an unresponsive
-/// peer, the SSH keepalive policy in
+/// A send can legitimately wait on two things, both peer-paced. The
+/// per-connection handle queue is shared by every session and only drained
+/// between key exchanges, so a wait there is normally fair-share queueing
+/// behind other sessions' chunks: even a fully loaded multiplexed
+/// connection (`max_channels_per_connection` = 512 sessions × 32 KiB
+/// chunks) on a slow client link clears a full round of sends in well
+/// under a minute at ~1 MB/s. A response-data send additionally waits for
+/// the client-granted SSH channel window, which the client tops up as it
+/// reads; completing one send needs at most one 32 KiB chunk's worth of
+/// window across the whole bound, so any client that is actually draining
+/// — however slowly — clears it with orders of magnitude to spare. A send
+/// still pending after this long is therefore not slow — the peer has
+/// stopped taking output entirely (a key exchange held open forever, a
+/// reader that stopped with the kernel buffer full, or a client that
+/// withholds CHANNEL_WINDOW_ADJUST while keeping TCP and keepalives
+/// healthy). 300 s matches the gateway's existing tolerance for an
+/// unresponsive peer, the SSH keepalive policy in
 /// [`build_ssh_config`](super::build_ssh_config) (30 s interval × (9 + 1)
-/// misses), while turning "forever" into "minutes" for a genuinely parked
-/// queue: the wedged transport is detected and force-closed instead of
-/// pinning sessions, tasks, and buffers until the pod restarts.
+/// misses), while turning "forever" into "minutes" for a genuinely wedged
+/// peer: the transport is detected and force-closed instead of pinning
+/// sessions, tasks, and buffers until the pod restarts.
 pub(super) const HANDLE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// End-of-session bookkeeping run by the response task once the protocol
@@ -462,31 +469,88 @@ async fn finish_channel_session(
     }
 }
 
+/// How the response pump delivers one chunk of protocol output to the SSH
+/// client. Module-private seam: production sends through the channel's
+/// window-aware write half (below); the unit tests in this file substitute
+/// controllable sinks (the russh `Handle` path, a send that never
+/// resolves) because `ChannelWriteHalf` has no public constructor and a
+/// stock russh client cannot be made to park a handle queue or withhold
+/// window on demand. Nothing outside this module can name or implement it.
+trait SessionSink {
+    /// Send one chunk toward the client. `Err` means the channel or
+    /// session is gone (russh torn down, channel closed) — the pump treats
+    /// it as the end of the session. Completion is peer-paced and possibly
+    /// unbounded; the pump wraps every call in its send timeout.
+    async fn send(&self, data: Vec<u8>) -> Result<(), ()>;
+}
+
+// r[impl gw.conn.session-cap]
+/// Production sink: the window-aware write half of the session's SSH
+/// channel, retained at `channel_open_session` and handed over at exec.
+///
+/// `data_bytes` chunks by min(max packet size, remaining window) and waits
+/// while the client-granted window is exhausted, so russh is never handed
+/// more channel data than the client has agreed to receive — the
+/// per-channel `pending_data` buffer russh keeps for data awaiting window
+/// (unbounded, drained only by client CHANNEL_WINDOW_ADJUST) stays at
+/// roughly one advertised window. `Handle::data` has no such accounting:
+/// it queues unconditionally, so a client that withholds window adjusts
+/// while keeping TCP and keepalives healthy would let the entire response
+/// stream (up to a `MAX_NAR_SIZE` NAR) accumulate in russh memory with no
+/// existing bound firing. Through the write half that client instead gets
+/// a send that never completes, which the pump's send timeout converts
+/// into the wedged-transport response.
+///
+/// Caveat that keeps the timeout load-bearing: a send parked on the window
+/// is only woken by a WINDOW_ADJUST — not by channel close or connection
+/// teardown — so it can outlive the session it belongs to; the send bound
+/// here plus the response task's abortability (`ChannelSession::Drop`) are
+/// what reclaim it. A send into an already torn-down session fails fast.
+impl SessionSink for ChannelWriteHalf<Msg> {
+    async fn send(&self, data: Vec<u8>) -> Result<(), ()> {
+        self.data_bytes(data).await.map_err(|_| ())
+    }
+}
+
 /// Body of the per-session response task: forward protocol output to the
 /// SSH client one bounded send at a time, then run the end-of-session
 /// bookkeeping ([`finish_channel_session`]).
 ///
-/// Every `Handle::data` send is bounded by `send_timeout`
-/// ([`HANDLE_SEND_TIMEOUT`] in production). The sends ride the
-/// per-connection russh handle queue, which the peer can park (a key
-/// exchange held open forever, or a reader that simply stops draining the
-/// socket); without the bound this task would wait inside the loop
-/// indefinitely while still owning the [`SessionGuard`], pinning a global
-/// session permit, the channels-active gauge, and the connection's
-/// live-session count. Nothing else can step in: the wedged guards keep
-/// the live-session count positive, so the empty-connection grace never
-/// fires, no disconnect is queued, and the transport force-close is never
-/// armed — a handful of such connections could pin the pod's entire
-/// session capacity until restart.
+/// Every send is bounded by `send_timeout` ([`HANDLE_SEND_TIMEOUT`] in
+/// production). A send completes only once the data is on the
+/// per-connection russh handle queue AND covered by SSH channel window the
+/// client has granted (the production sink is the channel's window-aware
+/// write half — see [`SessionSink`]). The peer controls both: it can park
+/// the handle queue (a key exchange held open forever, a reader that
+/// simply stops draining the socket) or withhold CHANNEL_WINDOW_ADJUST
+/// while answering keepalives. Without the bound this task would wait
+/// inside the loop indefinitely while still owning the [`SessionGuard`],
+/// pinning a global session permit, the channels-active gauge, and the
+/// connection's live-session count. Nothing else can step in: the wedged
+/// guards keep the live-session count positive, so the empty-connection
+/// grace never fires, no disconnect is queued, and the transport
+/// force-close is never armed — a handful of such connections could pin
+/// the pod's entire session capacity until restart.
 ///
-/// A send that exhausts the bound therefore means the transport is
-/// wedged, not slow, and the fault is connection-level (every pump on
-/// this connection is equally stuck), so the response is connection-level
-/// too: arm the transport force-close — the accept-site deadline then
-/// tears the connection down without the peer's cooperation — and end
-/// this session so its capacity is released.
+/// A send that exhausts the bound therefore means the peer has stopped
+/// taking output, not that it is slow (see [`HANDLE_SEND_TIMEOUT`] for the
+/// margin), and the response is connection-level: arm the transport
+/// force-close — the accept-site deadline then tears the connection down
+/// without the peer's cooperation — and end this session so its capacity
+/// is released. That stays the right scope even when the proximate stall
+/// is one channel's window: a peer that starves a channel it asked us to
+/// stream into for the entire bound is not multiplexing in good faith, and
+/// keeping the rest of its transport alive would keep the wedge it
+/// created.
+// 8 args is one over clippy's default of 7. Same call as run_protocol
+// (session.rs): each arg is a distinct moving part of the session
+// (output source, send target, close-out handle, capacity guard, …) and
+// grouping them into a struct would just rename the args at one call
+// site plus the unit tests.
+#[allow(clippy::too_many_arguments)]
 async fn pump_session_responses(
     mut outbound_reader: tokio::io::DuplexStream,
+    sink: impl SessionSink,
     handle: russh::server::Handle,
     channel_id: ChannelId,
     session_guard: SessionGuard,
@@ -501,30 +565,28 @@ async fn pump_session_responses(
             Ok(n) => {
                 metrics::counter!("rio_gateway_bytes_total", "direction" => "tx")
                     .increment(n as u64);
-                // russh 0.58: Handle::data takes `impl Into<Bytes>`
-                // (was CryptoVec). Vec<u8> satisfies the bound.
-                match tokio::time::timeout(send_timeout, handle.data(channel_id, buf[..n].to_vec()))
-                    .await
-                {
+                match tokio::time::timeout(send_timeout, sink.send(buf[..n].to_vec())).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(_)) => {
+                    Ok(Err(())) => {
                         warn!(channel = ?channel_id, "response pump: SSH send failed");
                         metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send")
                             .increment(1);
                         break;
                     }
                     Err(_) => {
-                        // Not slow — wedged: the queue accepted nothing for
-                        // the entire generous bound (see the fn doc). Arm
-                        // the transport force-close for this
-                        // connection-level fault, then fall through to
-                        // finish_channel_session so this session stops
-                        // counting against the global cap.
+                        // Not slow — wedged: the peer took nothing for the
+                        // entire generous bound (see the fn doc) — it
+                        // either let the handle queue sit undrained or
+                        // granted no channel window. Arm the transport
+                        // force-close for this connection-level fault, then
+                        // fall through to finish_channel_session so this
+                        // session stops counting against the global cap.
                         warn!(
                             channel = ?channel_id,
                             timeout_secs = send_timeout.as_secs(),
-                            "response pump: SSH send stalled (handle queue not draining); \
-                             treating the transport as wedged and force-closing the connection"
+                            "response pump: SSH send stalled (handle queue not draining or no \
+                             channel window granted); treating the transport as wedged and \
+                             force-closing the connection"
                         );
                         metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send_stall")
                             .increment(1);
@@ -685,6 +747,15 @@ pub struct ConnectionHandler {
     /// on the peer's claim. Bounded by `max_channels_per_connection`
     /// (only accepted opens insert; closes remove).
     pub(super) accepted_channels: std::collections::HashSet<ChannelId>,
+    /// Window-aware write halves of accepted channels, split off in
+    /// `channel_open_session` and held until the channel either execs
+    /// (`exec_request` moves the half into the session's response pump —
+    /// its [`SessionSink`]) or closes un-exec'd (`channel_close` discards
+    /// it). One entry per accepted, not-yet-exec'd channel, so it shares
+    /// the `accepted_channels` bound; connection teardown drops the map
+    /// with the handler. A channel whose half has already been consumed
+    /// cannot exec again — see `exec_request`.
+    pub(super) channel_writers: HashMap<ChannelId, ChannelWriteHalf<Msg>>,
     /// Grace period a connection may sit with zero active protocol
     /// sessions — from authentication (nothing exec'd yet) or from the
     /// last session ending — before it is disconnected. See
@@ -1236,6 +1307,19 @@ impl Handler for ConnectionHandler {
             return Ok(false);
         }
         self.note_channel_accepted(channel_id);
+        // Keep the channel's window-aware write half: it is what the
+        // session's response pump will send protocol output through, so
+        // the client's granted SSH window — not russh's unbounded
+        // pending-data buffer — is what paces (and bounds) per-session
+        // egress. The read half is dropped on purpose: inbound channel
+        // data already reaches the session via the `Handler::data`
+        // callback → `client_tx` → client pump, and russh delivers to a
+        // retained read half with a blocking send, so holding one we
+        // never drain would park the whole connection. russh's attempts
+        // to deliver to the dropped half fail fast and are ignored.
+        let (read_half, write_half) = channel.split();
+        drop(read_half);
+        self.channel_writers.insert(channel_id, write_half);
         // Deliberately NOT disarming the empty-connection grace timer
         // here: a bare channel open is not activity. An open-but-never-
         // exec'd channel has no ChannelSession, no session permit, and
@@ -1310,6 +1394,21 @@ impl Handler for ConnectionHandler {
                 "rejecting exec request: global session cap reached"
             );
             metrics::counter!("rio_gateway_errors_total", "type" => "session_cap").increment(1);
+            return reject_exec(session, channel_id);
+        };
+
+        // The channel's write half is what the response pump sends through
+        // (see [`SessionSink`]); each accepted channel has exactly one,
+        // and the first admitted exec consumes it. No half left means this
+        // channel already exec'd — RFC 4254 sessions run one command, and
+        // OpenSSH never re-execs a channel — so refuse rather than spawn a
+        // second protocol session whose output could not be delivered.
+        // The just-acquired permit is released by the early return.
+        let Some(write_half) = self.channel_writers.remove(&channel_id) else {
+            warn!(
+                channel = ?channel_id,
+                "rejecting exec request: channel already ran an exec"
+            );
             return reject_exec(session, channel_id);
         };
 
@@ -1403,10 +1502,13 @@ impl Handler for ConnectionHandler {
             .instrument(tracing::info_span!("channel", channel = ?channel_id)),
         );
 
-        // Task: pump protocol responses -> SSH client. The body is a free
-        // fn so the parked-handle-queue behavior can be unit-tested; it
-        // owns the SessionGuard and runs `finish_channel_session` when the
-        // protocol output ends or a send stalls.
+        // Task: pump protocol responses -> SSH client, through the
+        // channel's window-aware write half taken above. The body is a
+        // free fn so the stalled-send behavior can be unit-tested; it owns
+        // the SessionGuard and runs `finish_channel_session` when the
+        // protocol output ends or a send stalls. The handle is only for
+        // that close-out (exit-status/eof/close are small control
+        // messages); response data goes through the write half.
         let handle = session.handle();
         // A stalled send (or close-out) is a connection-level fault: the
         // pump arms this connection's transport force-close, shared with
@@ -1415,6 +1517,7 @@ impl Handler for ConnectionHandler {
         let response_task = rio_common::task::spawn_monitored("response-task", async move {
             pump_session_responses(
                 outbound_reader,
+                write_half,
                 handle,
                 channel_id,
                 session_guard,
@@ -1494,6 +1597,11 @@ impl Handler for ConnectionHandler {
             return Ok(());
         }
         debug!(channel = ?channel, "SSH channel closed");
+        // A channel that closes without ever exec'ing still has its write
+        // half parked here; discard it. Exec'd channels' halves were moved
+        // into their response pump at exec time, so this is a no-op for
+        // them.
+        self.channel_writers.remove(&channel);
         // Removing the entry aborts the response task (ChannelSession::
         // Drop), whose SessionGuard then releases the permit/gauge/live
         // count if the session was still live. r[gw.conn.exit-status+3]:
@@ -1817,10 +1925,26 @@ mod tests {
         Ok(())
     }
 
+    /// Test sink that sends through `Handle::data` — the queue-only path
+    /// with no window accounting. Lets the parked-handle-queue test below
+    /// keep pinning exactly what it always pinned: a send that the
+    /// per-connection handle queue never accepts must trip the send bound,
+    /// independently of any window bookkeeping.
+    struct HandleQueueSink {
+        handle: russh::server::Handle,
+        channel: ChannelId,
+    }
+
+    impl SessionSink for HandleQueueSink {
+        async fn send(&self, data: Vec<u8>) -> Result<(), ()> {
+            self.handle.data(self.channel, data).await.map_err(|_| ())
+        }
+    }
+
     // r[verify gw.conn.session-cap]
     /// A peer that parks the handle queue must not be able to pin session
-    /// capacity through the response pump: each `Handle::data` send is
-    /// bounded by [`HANDLE_SEND_TIMEOUT`], and when that bound expires the
+    /// capacity through the response pump: each send is bounded by
+    /// [`HANDLE_SEND_TIMEOUT`], and when that bound expires the
     /// pump must end the session (releasing the [`SessionGuard`]'s permit)
     /// and treat the transport as wedged (force-close armed). Without
     /// both, every wedged connection pins its sessions' permits until the
@@ -1849,6 +1973,10 @@ mod tests {
         tokio::time::pause();
         let pump = tokio::spawn(pump_session_responses(
             outbound_reader,
+            HandleQueueSink {
+                handle: handle.clone(),
+                channel: channel_id(1),
+            },
             handle,
             channel_id(1),
             guard,
@@ -1892,6 +2020,96 @@ mod tests {
         assert!(
             force_close.armed_deadline().is_some(),
             "a send stalled past HANDLE_SEND_TIMEOUT must arm the transport force-close"
+        );
+        pump.abort();
+        Ok(())
+    }
+
+    /// A sink whose send never resolves — the shape of a client that
+    /// withholds every CHANNEL_WINDOW_ADJUST: the production write half
+    /// parks waiting for window that never comes while TCP and keepalives
+    /// stay healthy. Only a controllable fake can stage this — the write
+    /// half has no public constructor, and a stock russh client grants
+    /// window automatically as it reads.
+    struct WindowStarvedSink;
+
+    impl SessionSink for WindowStarvedSink {
+        async fn send(&self, _data: Vec<u8>) -> Result<(), ()> {
+            std::future::pending().await
+        }
+    }
+
+    // r[verify gw.conn.session-cap]
+    /// A client that keeps the transport healthy but never grants channel
+    /// window must not be able to pin session capacity through the
+    /// response pump: the data send parks on the never-granted window, and
+    /// once it has been parked for [`HANDLE_SEND_TIMEOUT`] the pump must
+    /// end the session (releasing the [`SessionGuard`]'s permit) and arm
+    /// the transport force-close — the same wedge response as a parked
+    /// handle queue. Driven through the pump's send seam with a sink whose
+    /// send never resolves, which is how the production write half behaves
+    /// while the client-granted window stays exhausted.
+    #[tokio::test]
+    async fn window_starved_send_releases_permit_and_arms_force_close() -> anyhow::Result<()> {
+        let (handle, _filled, _client_io) = parked_handle_with_full_queue().await?;
+        let sem = Arc::new(Semaphore::new(1));
+        let guard = guard_holding_only_permit(&sem, handle.clone());
+        assert_eq!(sem.available_permits(), 0, "guard must hold the permit");
+        let force_close = Arc::new(super::super::ForceClose::new());
+
+        // Protocol output waiting to be forwarded. The writer half stays
+        // alive so the pump can only leave its loop via the send bound —
+        // never via EOF.
+        let (outbound_reader, mut proto_writer) = tokio::io::duplex(64 * 1024);
+        proto_writer.write_all(b"protocol response bytes").await?;
+
+        tokio::time::pause();
+        let pump = tokio::spawn(pump_session_responses(
+            outbound_reader,
+            WindowStarvedSink,
+            handle,
+            channel_id(1),
+            guard,
+            tokio::spawn(async {}),
+            Arc::clone(&force_close),
+            HANDLE_SEND_TIMEOUT,
+        ));
+        // Let the pump reach the parked send and register its timeout.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Well inside the bound: a client that is merely slow to grant
+        // window must not be treated as wedged.
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "a send still inside HANDLE_SEND_TIMEOUT must not end the session"
+        );
+        assert!(
+            force_close.armed_deadline().is_none(),
+            "a send still inside HANDLE_SEND_TIMEOUT must not arm the force-close"
+        );
+
+        // Past the bound: the window-starved send must end the session
+        // (the permit comes back via finish_channel_session) and arm the
+        // connection's transport force-close.
+        tokio::time::advance(HANDLE_SEND_TIMEOUT).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "a send starved of window past HANDLE_SEND_TIMEOUT must release the session permit"
+        );
+        assert!(
+            force_close.armed_deadline().is_some(),
+            "a send starved of window past HANDLE_SEND_TIMEOUT must arm the transport force-close"
         );
         pump.abort();
         Ok(())
