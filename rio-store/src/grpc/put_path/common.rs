@@ -298,7 +298,7 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
     Ok(FixedCaDescriptor { recursive, hash })
 }
 
-// r[impl sec.authz.ca-path-derived+3]
+// r[impl sec.authz.ca-path-derived+4]
 /// Floating-CA path-authorization gate. When `claims.is_ca` is set,
 /// [`validate_put_metadata`] skipped the `store_path ∈
 /// expected_outputs` check (the path isn't known at sign time). This

@@ -359,7 +359,7 @@ fn ca_path_for(name: &str, nar: &[u8]) -> String {
         .to_string()
 }
 
-// r[verify sec.authz.ca-path-derived+3]
+// r[verify sec.authz.ca-path-derived+4]
 #[tokio::test]
 async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -377,7 +377,7 @@ async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+3]
+// r[verify sec.authz.ca-path-derived+4]
 #[tokio::test]
 async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -401,7 +401,7 @@ async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+3]
+// r[verify sec.authz.ca-path-derived+4]
 /// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
 /// for is_ca tokens, so a compromised worker could open a PutPath stream
 /// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
@@ -500,7 +500,7 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+3]
+// r[verify sec.authz.ca-path-derived+4]
 /// `PutPathBatch` is the multi-output endpoint builders use; the CA
 /// path-derivation gate must apply there too. Same attack as
 /// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
