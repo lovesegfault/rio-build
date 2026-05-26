@@ -1270,6 +1270,55 @@ step 1):
   overwritten, so establishment is its only possible charge), and the
   newer death's accounting stays exact for `noDoubleCount`.
 
+#### Phase-1c re-run record (T-1c.4): regimes, witnesses, calibration
+
+The full post-collapse check set was re-run exhaustively after the flip
+(T-1c.2) and the acceptance invariants (T-1c.3); distinct/generated
+state counts per regime are recorded in the T-1c.4 commit message and
+each check's CI transcript (the as-built baselines stay in the Stage-B
+section above for comparison). Verdicts: every invariant in every
+regime's HOLD list holds — including the four that were
+falsified-as-pre-registered against the as-built encoding
+(`verdictMatchesFold` / D1, `countersRefineHistory` / D2+D3,
+`durableMirrorsCharges` / D4, `attemptsBoundedGlobal` / C2) and the new
+`failoverPreservesHistory` acceptance invariant — and every wired
+`quint-retry-policy-witness-*` reachability witness is still violated,
+with the two pre-registered re-points (the controller-cap witness now
+probes the cap-Cancelled terminal; the lost-mirror-write witness is
+replaced by the appending-transaction-failure witness) plus the two new
+establishment probes (crash-charge, crash-terminal). The six wired
+`quint-retry-calib-*` checks still falsify exactly as the calibration
+table records — they import the frozen `retryPolicyAsBuilt.qnt`, so the
+freeze is semantics-preserving and the corpus keeps its evidentiary
+value until Phase 2 retires it.
+
+Carried forward for Phase 2's acceptance table ("cannot recur by
+construction" rows):
+
+- **`countersRefineHistory` and `durableMirrorsCharges` are identities
+  in the post-collapse encoding** — every entry point advances the
+  cached view, the durable ledger fold and the reference-fold ghost
+  with the same fold application, so the per-site counter-mutation bug
+  class the Stage-C corpus replays (G1's wrong-path/wrong-counter
+  increments, G2's per-cycle/cross-cycle split, the at-cap
+  double-count, the D2/D3 channel asymmetries) cannot recur as a
+  divergence between a site and the fold; the invariants are kept as
+  cheap tripwires against encoding drift, and the residual risk — a
+  change to the fold itself — is owned by the referenceFold/decide()
+  unit batteries and the named regression runs, which pin concrete
+  histories rather than refinement.
+- **`noDoubleCount` stays a live invariant** (not true by
+  construction): the observation/dedup layer (`recently_disconnected`,
+  `last_completed`, the establishment's no-deliverable-report
+  precondition) is still explicit in the model, so a re-introduced
+  dedup defect would still falsify it; production additionally holds
+  the schema half (the exec_id partial-unique index makes the second
+  installment an UPDATE, never a second row).
+- The poison/clear lifecycle invariants (`poisonIsTerminalUntilCleared`,
+  `clearedPoisonClearsDurably`, `clearedPoisonScrubsExclusions`,
+  `recoveryPreservesPoisonStatus`) and the cascade invariant remain
+  live in the new encoding, unchanged in form.
+
 ### Stage-C verify-marker status
 
 No new tracey markers: the calibration checks are regression guards for
