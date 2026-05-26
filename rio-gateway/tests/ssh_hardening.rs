@@ -219,17 +219,18 @@ async fn connect_and_auth(
     Ok(session)
 }
 
-// r[verify gw.conn.channel-limit+3]
+// r[verify gw.conn.channel-limit+4]
 /// The per-connection bound counts SSH-level OPEN channels (not exec'd
-/// sessions): with the bound set to 8, eight opens with NO exec all
-/// succeed (under the old `sessions.len()` gate they were invisible and
-/// unbounded), the 9th receives `SSH_MSG_CHANNEL_OPEN_FAILURE`, and
-/// closing one releases the slot for a 10th.
+/// sessions) and a close frees its slot: with the bound set to 8, eight
+/// opens with NO exec all succeed (under the old `sessions.len()` gate
+/// they were invisible and unbounded), and after closing one of them a
+/// further open is accepted — the connection never exceeds the bound and
+/// stays healthy throughout.
 ///
 /// Must hold channel handles — dropping them closes the channel and
 /// decrements `open_channels`.
 #[tokio::test]
-async fn test_channel_open_absurdity_bound() -> anyhow::Result<()> {
+async fn test_channel_open_slot_reuse_under_bound() -> anyhow::Result<()> {
     common::init_test_logging();
     const BOUND: usize = 8;
     let (addr, client_key, srv) =
@@ -247,16 +248,10 @@ async fn test_channel_open_absurdity_bound() -> anyhow::Result<()> {
         chans.push(ch);
     }
 
-    // BOUND+1th: server returns Ok(false) → SSH_MSG_CHANNEL_OPEN_FAILURE
-    // → client sees Err(ChannelOpenFailure).
-    let over = session.channel_open_session().await;
-    assert!(
-        matches!(over, Err(russh::Error::ChannelOpenFailure(_))),
-        "open #{BOUND} must be refused at the absurdity bound, got {over:?}"
-    );
-
-    // Closing one frees a slot. `.close()` sends SSH_MSG_CHANNEL_CLOSE
-    // async — give the server a beat to process channel_close →
+    // Closing one frees a slot for a later open — the count is taken at
+    // open/close, so the connection sits at BOUND-1 and the next open is
+    // back under the bound. `.close()` sends SSH_MSG_CHANNEL_CLOSE async
+    // — give the server a beat to process channel_close →
     // open_channels -= 1 before we retry.
     //
     // SLEEP JUSTIFICATION: russh provides no client-side await for
@@ -273,6 +268,87 @@ async fn test_channel_open_absurdity_bound() -> anyhow::Result<()> {
 
     let retry = session.channel_open_session().await;
     assert!(retry.is_ok(), "slot should free after close: {retry:?}");
+
+    drop(chans);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.channel-limit+4]
+/// Crossing the per-connection channel bound terminates the CONNECTION,
+/// not just the offending open. russh allocates and registers per-channel
+/// state before consulting the handler and never frees it for a refused
+/// open, so a per-open `SSH_MSG_CHANNEL_OPEN_FAILURE` would let a client
+/// loop opens past the bound and grow gateway memory without bound — the
+/// over-bound open must surface as a connection-level/transport error
+/// (NOT `ChannelOpenFailure`), and the connection must be unusable
+/// afterwards.
+///
+/// Every await on the (dying) connection is bounded so a regression that
+/// leaves it half-alive fails the test instead of hanging it.
+#[tokio::test]
+async fn test_channel_open_over_bound_terminates_connection() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const BOUND: usize = 8;
+    const STEP: std::time::Duration = std::time::Duration::from_secs(10);
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_max_channels_per_connection(BOUND)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // Fill the connection up to the bound; all of these are accepted.
+    let mut chans = Vec::new();
+    for i in 0..BOUND {
+        let ch = session
+            .channel_open_session()
+            .await
+            .unwrap_or_else(|e| panic!("open #{i} should be accepted (bound={BOUND}): {e:?}"));
+        chans.push(ch);
+    }
+
+    // The BOUND+1th open crosses the bound: the gateway must end the SSH
+    // session rather than refuse the single open, so the client sees the
+    // transport die (no reply for this open, then disconnect) — never the
+    // per-open `SSH_MSG_CHANNEL_OPEN_FAILURE` of a connection that stays
+    // usable.
+    let over = tokio::time::timeout(STEP, session.channel_open_session())
+        .await
+        .map_err(|_| anyhow::anyhow!("over-bound open did not resolve within {STEP:?}"))?;
+    assert!(
+        over.is_err(),
+        "the over-bound open must fail, got a usable channel"
+    );
+    assert!(
+        !matches!(over, Err(russh::Error::ChannelOpenFailure(_))),
+        "crossing the bound must terminate the connection, not refuse the single open \
+         with SSH_MSG_CHANNEL_OPEN_FAILURE; got the per-open refusal: {over:?}"
+    );
+
+    // The connection itself must be dead: the handler error ends russh's
+    // session loop, so the client observes the close shortly after. Poll
+    // bounded — Drop-side teardown runs strictly after the error.
+    let mut closed = session.is_closed();
+    for _ in 0..40 {
+        if closed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        closed = session.is_closed();
+    }
+    assert!(
+        closed,
+        "the connection must be torn down after an over-bound open, not stay usable"
+    );
+
+    // And nothing on it works any more — a further open on the same
+    // connection fails instead of being accepted into a freed slot.
+    let after = tokio::time::timeout(STEP, session.channel_open_session())
+        .await
+        .map_err(|_| anyhow::anyhow!("post-termination open did not resolve within {STEP:?}"))?;
+    assert!(
+        after.is_err(),
+        "an open after the connection was terminated must fail, got a usable channel"
+    );
 
     drop(chans);
     drop(session);
@@ -399,7 +475,7 @@ async fn test_global_session_cap_rejects_exec_cleanly() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.channel-limit+3]
+// r[verify gw.conn.channel-limit+4]
 // r[verify gw.conn.session-cap+2]
 /// The headline regression test for the ControlMaster incident: 32
 /// concurrent `nix-daemon --stdio` sessions multiplexed onto ONE SSH

@@ -731,7 +731,7 @@ pub struct ConnectionHandler {
     /// channel's window-aware write half ([`SessionSink`]).
     pub(super) session_sem: Arc<Semaphore>,
     /// Per-connection SSH channel absurdity bound
-    /// (`r[gw.conn.channel-limit+3]`). See
+    /// (`r[gw.conn.channel-limit+4]`). See
     /// [`super::DEFAULT_MAX_CHANNELS_PER_CONNECTION`].
     pub(super) max_channels_per_connection: usize,
     /// SSH-level open channel count: incremented when
@@ -744,11 +744,11 @@ pub struct ConnectionHandler {
     /// Channel ids this connection actually ACCEPTED in
     /// `channel_open_session`. russh invokes the per-channel handler
     /// callbacks for any well-formed channel id a peer puts on the wire
-    /// — including ids that were never opened, already closed, or whose
-    /// open we refused — so the close-side bookkeeping for
-    /// `r[gw.conn.channel-limit+3]` must be keyed on our own record, not
-    /// on the peer's claim. Bounded by `max_channels_per_connection`
-    /// (only accepted opens insert; closes remove).
+    /// — including ids that were never opened or are already closed — so
+    /// the close-side bookkeeping for `r[gw.conn.channel-limit+4]` must
+    /// be keyed on our own record, not on the peer's claim. Bounded by
+    /// `max_channels_per_connection` (only accepted opens insert; closes
+    /// remove).
     pub(super) accepted_channels: std::collections::HashSet<ChannelId>,
     /// Window-aware write halves of accepted channels, split off in
     /// `channel_open_session` and held until the channel either execs
@@ -920,7 +920,7 @@ impl ConnectionHandler {
         );
     }
 
-    // r[impl gw.conn.channel-limit+3]
+    // r[impl gw.conn.channel-limit+4]
     /// Record an accepted `channel_open_session` toward the
     /// per-connection channel bound. The set membership is what later
     /// authorizes the matching close (and exec) to be acted on.
@@ -930,22 +930,22 @@ impl ConnectionHandler {
         }
     }
 
-    // r[impl gw.conn.channel-limit+3]
+    // r[impl gw.conn.channel-limit+4]
     /// Record a `CHANNEL_CLOSE` for `channel`. Returns `true` if the
     /// channel was one this connection actually accepted (now untracked
-    /// and decremented); `false` for ids that were never accepted,
-    /// already closed, or whose open we refused — the caller must treat
-    /// those as no-ops. russh dispatches the close callback for ANY
-    /// well-formed id the peer puts on the wire, so without this gate an
-    /// authenticated client could interleave real opens with forged or
-    /// duplicate closes to hold `open_channels` near zero while russh's
-    /// channel table keeps growing, defeating the absurdity bound.
+    /// and decremented); `false` for ids that were never accepted or are
+    /// already closed — the caller must treat those as no-ops. russh
+    /// dispatches the close callback for ANY well-formed id the peer
+    /// puts on the wire, so without this gate an authenticated client
+    /// could interleave real opens with forged or duplicate closes to
+    /// hold `open_channels` near zero while russh's channel table keeps
+    /// growing, defeating the absurdity bound.
     fn note_channel_closed(&mut self, channel: ChannelId) -> bool {
         if !self.accepted_channels.remove(&channel) {
             debug!(
                 channel = ?channel,
                 "ignoring CHANNEL_CLOSE for a channel this connection never accepted \
-                 (forged, duplicate, or refused open)"
+                 (forged or duplicate)"
             );
             return false;
         }
@@ -1282,7 +1282,7 @@ impl Handler for ConnectionHandler {
         self.stage
             .store(ConnStage::ChannelOpen as u8, Ordering::Relaxed);
         let channel_id = channel.id();
-        // r[impl gw.conn.channel-limit+3]
+        // r[impl gw.conn.channel-limit+4]
         // Absurdity bound on SSH-level open channels, NOT a resource
         // bound — that is the global session semaphore in
         // `exec_request`. Gate on `open_channels` (counted at
@@ -1290,24 +1290,40 @@ impl Handler for ConnectionHandler {
         // burst of N opens with no execs is invisible to the session
         // map but still allocates a russh channel-table entry each.
         //
-        // Refusing an open is a poison pill for a stock nix client
-        // behind `ControlMaster auto`: OpenSSH silently falls back to a
-        // direct connection, nix's `LocalCommand=echo started` fires
-        // there, and "started\n" lands in front of the worker-protocol
-        // handshake ("protocol mismatch, got 'started\noixd'"). So this
-        // bound sits far above any legitimate fan-out (a 128-core CI
-        // box running nix-fast-build behind one mux is ~128 channels) —
-        // a connection that reaches it is leaking channels or hostile,
-        // and a corrupted fallback is an acceptable failure mode there.
+        // Crossing the bound ends the CONNECTION (handler error ends
+        // russh's session loop), not just the offending open: russh
+        // allocates and registers the channel's state (an eager mpsc
+        // plus window ref in its per-connection channel map) BEFORE
+        // consulting this handler and never removes that entry for a
+        // refused open — the client sends no CHANNEL_CLOSE for an open
+        // that failed, and russh's open-failure removal only covers
+        // server-initiated opens — so a per-open `Ok(false)` refusal
+        // lets an over-bound client keep looping CHANNEL_OPENs and grow
+        // per-connection memory without bound, defeating the bound
+        // itself. Erroring out is the only response that keeps
+        // russh-side state bounded: nothing is inserted for this open,
+        // and the connection unwinds through the normal drop paths
+        // (conn permit/fd/gauges, per-channel tasks, session permits),
+        // surfacing via the accept-site `log_session_end`. A connection
+        // at this bound is already leaking channels or hostile —
+        // legitimate ControlMaster fan-out sits far below it (a
+        // 128-core CI box running nix-fast-build behind one mux is
+        // ~128 channels, ~4× headroom), so the corrupted-fallback
+        // concern that argues for polite per-open handling of stock nix
+        // clients does not apply here.
         if self.open_channels >= self.max_channels_per_connection {
             warn!(
                 peer = ?self.peer_addr,
                 open = self.open_channels,
                 limit = self.max_channels_per_connection,
-                "rejecting SSH channel open: per-connection channel bound reached"
+                "closing SSH connection: per-connection channel bound exceeded"
             );
             metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
-            return Ok(false);
+            anyhow::bail!(
+                "per-connection channel bound exceeded ({} open, limit {})",
+                self.open_channels,
+                self.max_channels_per_connection
+            );
         }
         self.note_channel_accepted(channel_id);
         // Keep the channel's window-aware write half: it is what the
@@ -1362,12 +1378,12 @@ impl Handler for ConnectionHandler {
             return reject_exec(session, channel_id);
         }
 
-        // r[impl gw.conn.channel-limit+3]
+        // r[impl gw.conn.channel-limit+4]
         // Same unvalidated-id exposure as channel_close: russh dispatches
         // exec_request for any well-formed channel id, including ones
-        // whose open we refused or that were never opened at all. Don't
-        // spawn a protocol session (and consume a global session permit)
-        // for a channel this connection never accepted.
+        // that were never opened at all. Don't spawn a protocol session
+        // (and consume a global session permit) for a channel this
+        // connection never accepted.
         if !self.accepted_channels.contains(&channel_id) {
             warn!(
                 channel = ?channel_id,
@@ -1386,8 +1402,8 @@ impl Handler for ConnectionHandler {
         // reply arrives, an OpenSSH mux master has already told its
         // client `MUX_S_SESSION_OPENED`, so a `channel_failure` here
         // produces a clean `ssh` exit — no fallback to a direct
-        // connection, no LocalCommand corruption (contrast with
-        // refusing the channel OPEN, see gw.conn.channel-limit+3).
+        // connection, no LocalCommand corruption (the fallback a refused
+        // channel OPEN would trigger; see gw.conn.channel-limit+4).
         // At the default cap (4096 ≈ 2.2 GiB of steady-state buffers;
         // russh-side buffering on top of that is paced per session by
         // the client-granted window via the write half taken below)
@@ -1593,7 +1609,7 @@ impl Handler for ConnectionHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // r[impl gw.conn.channel-limit+3]
+        // r[impl gw.conn.channel-limit+4]
         // Only act on closes for channels this connection actually
         // accepted (see note_channel_closed): russh hands us a close for
         // any id the peer claims, and trusting it would let forged or
@@ -1685,11 +1701,11 @@ mod tests {
         ChannelId::decode(&mut &n.to_be_bytes()[..]).expect("4 BE bytes decode as a ChannelId")
     }
 
-    // r[verify gw.conn.channel-limit+3]
+    // r[verify gw.conn.channel-limit+4]
     /// bug_005: russh invokes `channel_close` for ANY channel id a peer
-    /// puts in a `CHANNEL_CLOSE` — never-opened, already-closed, or
-    /// refused ids included — so the `open_channels` bookkeeping must
-    /// only count closes for channels this connection actually accepted.
+    /// puts in a `CHANNEL_CLOSE` — never-opened or already-closed ids
+    /// included — so the `open_channels` bookkeeping must only count
+    /// closes for channels this connection actually accepted.
     /// Otherwise an authenticated client interleaving real opens with
     /// forged closes holds `open_channels` near zero while russh
     /// channel-table entries grow without bound (defeating the
@@ -1704,7 +1720,7 @@ mod tests {
     /// frames honestly. The helpers carry the entire counting logic; the
     /// callbacks are thin wrappers around them, and the legitimate
     /// open→close→slot-freed path stays covered end-to-end by
-    /// `test_channel_open_absurdity_bound` in `ssh_hardening.rs`.
+    /// `test_channel_open_slot_reuse_under_bound` in `ssh_hardening.rs`.
     #[tokio::test]
     async fn forged_or_duplicate_channel_close_does_not_skew_open_channels() -> anyhow::Result<()> {
         use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};

@@ -1239,10 +1239,11 @@ peer that wedges the transport itself by refusing to read.
   #rref("sched.backstop.timeout").
 ]
 
-#r("gw.conn.channel-limit+3")[
+#r("gw.conn.channel-limit+4")[
   A single SSH connection may have at most `max_channels_per_connection`
-  (default 512) channels open at the SSH level; additional
-  `channel_open_session` requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The
+  (default 512) channels open at the SSH level; a connection that attempts to
+  exceed the bound MUST be terminated --- the `channel_open_session` handler
+  returns an error and the SSH session ends. The
   count MUST be taken at `channel_open_session`/`channel_close` (SSH-level
   opens), not from the exec'd-session map, so a burst of opens with no exec is
   bounded too. This is an absurdity bound on a channel-leaking or hostile
@@ -1252,12 +1253,23 @@ peer that wedges the transport itself by refusing to read.
   bounds the instance. The bound MUST sit far above any legitimate
   `ControlMaster` fan-out: one mux'd connection legitimately carries one
   channel per concurrent nix process on the client machine (64--128 for a CI
-  box running `nix-fast-build`), and refusing a channel open corrupts a stock
-  nix client behind `ControlMaster auto` (OpenSSH silently falls back to a
-  direct connection where Nix's unconsumed `LocalCommand` output lands in
-  front of the worker-protocol handshake --- `protocol mismatch, got
-  'started\noixd'`).
+  box running `nix-fast-build`).
 ]
+
+Termination rather than per-open refusal: russh allocates and registers a
+channel's state for any non-error handler result --- a refusal included ---
+and never frees it for a refused open (the client sends no `CHANNEL_CLOSE`
+for an open that failed, and russh's open-failure removal only covers
+server-initiated opens), so answering each over-bound open with
+`SSH_MSG_CHANNEL_OPEN_FAILURE` is an unbounded per-connection memory leak ---
+the client just keeps looping opens. Ending the connection is the only
+response that keeps russh-side state bounded. The `ControlMaster`-fallback
+concern that motivates the polite exec-time refusal of
+#rref("gw.conn.session-cap") (OpenSSH silently falls back to a direct
+connection where Nix's unconsumed `LocalCommand` output lands in front of the
+worker-protocol handshake --- `protocol mismatch, got 'started\noixd'`) does
+not apply to a client already 512 channels deep, which this rule already
+characterizes as leaking or hostile.
 
 The previous revision capped this at 4 "to match Nix's default `max-jobs`".
 That rationale was wrong on both ends: `max-jobs` controls local build
