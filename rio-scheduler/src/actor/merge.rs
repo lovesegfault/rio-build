@@ -245,7 +245,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+6]
+        // r[impl sched.merge.substitute-topdown+7]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -448,7 +448,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+6]
+        // r[impl sched.merge.substitute-topdown+7]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -2373,7 +2373,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+6]
+    // r[impl sched.merge.substitute-topdown+7]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///

@@ -812,7 +812,7 @@ async fn test_substitute_fetch_transient_retry() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down short-circuit: when the root is substitutable, deps are
 /// pruned from the merge — only the root's NAR is fetched, build
 /// completes immediately.
@@ -894,7 +894,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down negative: an `explicitly_requested` NON-root (a client
 /// target folded inside another target's closure by the gateway's
 /// multi-target dedup) whose wanted output is NOT available must block
@@ -973,7 +973,7 @@ async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down positive: when every demanded node — structural roots AND
 /// `explicitly_requested` non-roots — is available upstream, the prune
 /// fires and keeps the whole demand set, not just the roots.
@@ -1070,7 +1070,7 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down + deferred-fetch failure: when the prune commits and the
 /// detached `query_path_info` then fails, the build MUST fail with a
 /// resubmit-directing error — NOT dispatch the root as a build.
@@ -1168,7 +1168,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// The roots-only prune's `topdown_pruned` stamp must survive a leader
 /// failover, so it is persisted: once a pruned merge commits, the kept
 /// (demanded) node's PG row carries `topdown_pruned = true`; a later
@@ -1268,7 +1268,7 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// A kept (demanded) node that ALREADY has children in the global DAG
 /// at stamp time must NOT be stamped `topdown_pruned` — its dependency
 /// closure is in the DAG (an earlier full merge put it there), so a
@@ -1344,7 +1344,7 @@ async fn test_topdown_stamp_skips_kept_node_with_existing_children() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// `topdown_pruned` flag persistence bypass: B1 topdown-prunes R; while
 /// R's fetch is in-flight, B2 full-merges R WITH its deps. R is
 /// pre-existing `Substituting` so `dag.merge` doesn't reset it; the
@@ -1435,7 +1435,7 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// A prune-led merge that fails at the PG-persist step (step 5) must
 /// not leave `topdown_pruned=true` on a pre-existing childless root
 /// shared with an unrelated live build. `cleanup_failed_merge` →
@@ -1583,7 +1583,7 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// The `topdown_pruned` marker must land only on kept nodes whose
 /// dependency closure the prune actually dropped. A dep-less demanded
 /// leaf (here: one target of a multi-target submission with no
@@ -1663,7 +1663,7 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// A pruned merge whose build-activation write fails must reject the
 /// build AND leave nothing of the merge behind in PG — in particular no
 /// `topdown_pruned = true` on a shared pre-existing childless root.
@@ -1830,7 +1830,7 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
@@ -1940,7 +1940,7 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 // r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: a PRE-EXISTING root shared with a live build whose
 /// effective wanted set is NOT satisfiable must refuse the prune, even
@@ -2055,7 +2055,7 @@ async fn test_topdown_prune_gated_on_live_effective_wanted_of_preexisting_root()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down positive companion: a PRE-EXISTING root whose live
 /// effective wanted set IS satisfiable keeps the prune. Same shape as
 /// the negative test above, but build A wants only `out` too — the
@@ -2139,7 +2139,7 @@ async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 // r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: the submission's OWN root selector resolving to
 /// no declared output (`drv^bogus`) blocks the prune even when the
@@ -2339,7 +2339,7 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+6]
+// r[verify sched.merge.substitute-topdown+7]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///
