@@ -150,7 +150,7 @@ set preserved exactly minus TTL-expired entries.*
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `sched.retry.recovery-projection` *(new)* | **COVERS** | Was a GAP. The projection was scattered across four rules' prose — `sched.poison.ttl-persist` (`poisoned_at`), `sched.merge.poisoned-resubmit-bounded+2` (`resubmit_cycles`), `sched.retry.per-executor-budget` ("`failed_builders` persisted to PG; infrastructure retry count is in-memory only"), `sched.timeout.promote-on-exceed+2` ("`timeout_retry_count` is in-memory only, recovery resets to 0, conservative") — and no rule stated the complete 4-recovered / 1-derived / 5-defaulted split or the no-fabrication bound. The new rule states the as-built documented projection; whether the forgiveness should survive the Phase-1 ledger is the separate `sched.retry.failover-budget` spec decision the design's Phase-0 gate requires before Phase 1 starts (not made here). |
+| `sched.retry.recovery-projection` *(new)* | **COVERS** | Was a GAP. The projection was scattered across four rules' prose — `sched.poison.ttl-persist` (`poisoned_at`), `sched.merge.poisoned-resubmit-bounded+2` (`resubmit_cycles`), `sched.retry.per-executor-budget` ("`failed_builders` persisted to PG; infrastructure retry count is in-memory only"), `sched.timeout.promote-on-exceed+2` ("`timeout_retry_count` is in-memory only, recovery resets to 0, conservative") — and no rule stated the complete 4-recovered / 1-derived / 5-defaulted split or the no-fabrication bound. The new rule states the as-built documented projection; whether the forgiveness should survive the Phase-1 ledger is the separate `sched.retry.failover-budget` spec decision the design's Phase-0 gate requires — made at the Phase-0 exit (budgets survive failover; see the `FailoverPreservesHistory` section below), with this rule continuing to pin the as-built contract until the Phase-1b fold lands. |
 | `sched.recovery.poisoned-failed-count` | **COVERS** (the build-summary half) | Recovered poisoned derivations count toward the build's `failed`, never `Succeeded`. |
 | `sched.poison.ttl-persist` | **COVERS** (`poisoned_at`) | Including the expired-poison filter at reload. |
 
@@ -160,6 +160,18 @@ set preserved exactly minus TTL-expired entries.*
 | Rule | Verdict | Audit finding |
 |---|---|---|
 | `sched.retry.recovery-projection` *(new)* | **COVERS** | The projection rule's equality form subsumes the inequality form: the recovered counters are exactly the projection of the persisted columns, and the projection reads only persisted evidence (no counter is invented). Note the projection is *not* a refinement of the live state in either direction: `failure_count := failed_builders.len()` both forgets same-worker repeats (under-count) and counts the permanent path's diagnostics-only `failed_builders` insert as a poison-threshold failure that the live `failure_count` never charged (over-count, see the divergence table's A6). Both directions are the documented lossy reconstruction; the invariant bounds the recovered value by the durable evidence, not by the lost live value. |
+
+### `FailoverPreservesHistory` *(Phase-1 acceptance property — not an as-built invariant)*
+
+*The post-failover decision is never more permissive than the pre-failover
+one.* Deliberately kept off the as-built invariant list (design §3): the
+as-built behavior is the documented selective forgiveness, not a bug for
+the model to rediscover. It enters in Phase 1 as the ledger's acceptance
+property; the Phase-0 adjudication that scopes it is now a spec rule:
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.retry.failover-budget` *(new; the Phase-0 failover-budget adjudication)* | **COVERS** (the Phase-1 contract) | Records design §6's pre-committed adjudication (b), made at the Phase-0 exit: budgets are per-poison-cycle and SURVIVE leader failover — the new leader's fold over the durable attempt history yields the same remaining budgets the old leader would have enforced, and only the explicit reset events (admin/TTL poison clear, bounded resubmit, cache-hit clear), themselves durable history events, refresh a budget; a leader change is not a reset event. The as-built code does NOT satisfy it (the selective forgiveness `sched.retry.recovery-projection` pins is exactly the budget refresh this rule forbids), so the rule deliberately carries no `r[impl]` marker — it is a Phase-1 acceptance rule, not an as-built claim, and it joins the rules whose `verify` arrives with the Phase-1 model re-check over the ledger fold (the Phase-1b gate). The companion amendments + `tracey bump` of the two rules whose prose pins today's forgiveness (`sched.timeout.promote-on-exceed+2`, `sched.retry.per-executor-budget`) land with the Phase-1 change that makes the code satisfy it. Dependents: the D4 disposition, `sched.retry.recovery-projection` (which keeps pinning the as-built contract until then), and the Phase-1a ledger's recovery semantics. |
 
 ## Contradiction records
 
@@ -256,8 +268,9 @@ leaves the production code unchanged and Stage B models it as-is.
   dispatches, not data loss or wrong build outputs. Fixing it now would
   change post-failover accounting mid-campaign (invalidating this row,
   the as-built model the design requires, and the G8 calibration
-  premises), it intersects the pending `sched.retry.failover-budget`
-  decision the design's Phase-0 gate requires, and Phase 1a's
+  premises), it intersects the `sched.retry.failover-budget` decision
+  (made at the Phase-0 exit: budgets survive failover, which confirms
+  D4's fix direction and folds it into the ledger work), and Phase 1a's
   `drv_attempts` ledger makes every attempt durable at the append site,
   structurally subsuming a tactical mirror write that Phase 1b would then
   delete. Stage B encodes E8's mirror write as permanently lost in the
@@ -527,8 +540,10 @@ NOT wired: `noTransientCapPoison` (see the next section).
   (threshold 3 vs `max_retries` 2 in production; threshold 2 vs 2 at
   model scale). The "max_retries exhausted" poison arm is live only in
   the non-distinct (dev) mode or if placement stops excluding failed
-  builders. The `noTransientCapPoison` witness is therefore not wired,
-  and the arm is a Phase-1 simplification/clarification candidate.
+  builders. The `noTransientCapPoison` witness is therefore not wired;
+  the arm itself is spec-mandated (the final clause of
+  `sched.retry.transient-budget`) and defaults-shadowed rather than
+  deletable — see the keep-and-document entry in the Phase-1 input list.
 - **The D1 history also falsifies `CountersRefineHistory`.** The as-built
   E7 cap poison stamps `poisoned_at` where the fold's adjudicated verdict
   is `Cancel` (no stamp), so the counter vector diverges on the same
@@ -888,7 +903,19 @@ not in CI.
 
 ### Phase-0 exit-gate verdict
 
-**Met.** Every one of the eight families either falsifies at least one
+**Met — as corrected by the Phase-0 exit review (correction pass landed
+2026-05-25).** The verdict rests on three things, all now on record: the
+falsification record, which the exit review confirmed and the correction
+pass did not touch; the corrected dispositions and override attributions
+(the c13f6a277 re-disposition to NOT-ENC, the 891a6520d re-attribution to
+the poison-set mechanisms, the b09c5b312-X6 narrowing, the X13 encode,
+the recoveryPreservesPoisonStatus relabel and the design-§3
+clause-coverage audit); and the two spec adjudications the design's §5
+gate required, both made and recorded (the `sched.retry.failover-budget`
+rule — budgets survive failover — and the C2 charging adjudication; see
+the Phase-1 input list).
+
+Every one of the eight families either falsifies at least one
 invariant through a representative override (G1: 8 overrides falsify; G2:
 1; G3: 2; G4: 3; G5: 2; G7: 1; G8: 3 — all as predicted; the G4 count
 includes the X13 override added by the exit review's correction pass), or
@@ -906,13 +933,55 @@ The invariant list that survives calibration — the eight design
 invariants plus `durableMirrorsCharges`, `clearedPoisonClearsDurably`,
 `clearedPoisonScrubsExclusions`, `recoveryPreservesPoisonStatus`, and the
 per-event charge discipline — is
-the replacement's contract going into Phase 1.
+the replacement's contract going into Phase 1, together with the two
+adjudications above and the FailoverPreservesHistory acceptance rule.
 
 ### Phase-1 input list
 
 What the calibration adds to the Phase-1 plan beyond the divergence
 dispositions already recorded above (D1–D4, C1–C4, A5–A10):
 
+- **Adjudications recorded at the Phase-0 exit (first-class Phase-1
+  inputs — both design-§5 gate items, both now made):**
+  - **Failover-budget semantics (`sched.retry.failover-budget`, new
+    rule): budgets are per-poison-cycle and SURVIVE leader failover.**
+    Only the explicit reset events (admin/TTL poison clear, bounded
+    resubmit, cache-hit clear) — themselves durable history events —
+    refresh a budget; a leader change is not a reset event. This is
+    design §6's pre-committed adjudication (b), made and recorded as a
+    spec rule at the Phase-0 exit (see the `FailoverPreservesHistory`
+    section above): the only choice consistent with
+    `FailoverPreservesHistory` as a Phase-1 acceptance property — the
+    durable ledger exists precisely so the new leader's fold matches the
+    old leader's. The as-built code does NOT satisfy it (the selective
+    forgiveness stays the as-built contract, `sched.retry.recovery-projection`,
+    until Phase 1b), so the rule has no `r[impl]` today and joins the
+    rules whose `verify` arrives with the Phase-1 model re-check over
+    the ledger fold. Phase-1 deliverables it pins: the ledger's recovery
+    semantics (no budget refresh on a leader flap), the D4 disposition,
+    and the amendment + `tracey bump` of
+    `sched.timeout.promote-on-exceed+2` and
+    `sched.retry.per-executor-budget` in the change that lands the fold.
+  - **C2 (the no-report hard-crash / disconnect-only loop):
+    adjudicated.** In the replacement, an attempt whose report never
+    arrives MUST be charged to a budget once its failure is established
+    — by the controller termination report's classification, the
+    disconnect classification, or the backstop, whichever arrives first
+    — so the loop is bounded. This enforces the existing
+    `sched.retry.per-executor-budget` "Executor disconnect DOES count"
+    MUST rather than changing policy (no rule amendment for the
+    direction; design §4's "charged to no budget" sentence is annotated
+    as superseded by this adjudication). It is required before the
+    Phase-1b "all invariants hold" gate is meaningful: the as-built loop
+    falsifies `attemptsBoundedGlobal` in the crash regime, and
+    `quint-retry-policy-crash-unbounded` flips to a HOLD check when
+    Phase 1 lands the charging. Which specific budget/cap a
+    disconnect-established failure charges is left to the Phase-1 plan,
+    which must say (with a rule amendment + `tracey bump` if the choice
+    amends a stated budget's definition; it may be folded into the A5
+    failed-builders-membership disposition if that disposition answers
+    boundedness explicitly). The E5 re-check item below references this
+    adjudication; settling it does not by itself license that deletion.
 - **Mechanisms probed for redundancy (neither is a free deletion):**
   - E5's poison-threshold re-check in `reassign_derivations`: the
     machine-checked claim (the b09c5b312-X6 probe) is only that the

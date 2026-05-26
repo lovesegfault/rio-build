@@ -650,9 +650,42 @@ deliberately conservative (a restart never spuriously poisons) and
 deliberately lossy (`failure_count`'s same-worker repeats are forgotten;
 the in-memory budgets refresh on every leader flap). Whether the infra,
 timeout, and exempt budgets should instead survive failover once the
-attempt history is durable is the `sched.retry.failover-budget` decision
-the Phase-0 exit gate requires before any decision site changes; this rule
-pins the current contract, not the future one.
+attempt history is durable is the #rref("sched.retry.failover-budget")
+decision (made at the Phase-0 exit --- the rule below states the future
+contract); this rule pins the current contract, not the future one.
+
+#r("sched.retry.failover-budget")[
+  Once the attempt history is durable (the Phase-1 attempt ledger), every
+  retry budget --- the per-cycle transient count, the non-exempt and
+  exempt infrastructure counts, the timeout count, the poison threshold's
+  failed-builders set, and the cross-cycle resubmit count --- MUST be
+  accounted per poison cycle and MUST survive a leader failover: the new
+  leader's fold over the durable attempt history MUST yield the same
+  remaining budgets the old leader would have enforced over the same
+  history, and only the explicit reset events (the admin or TTL poison
+  clear, the bounded resubmit reset, the cache-hit clear) --- themselves
+  durable history events --- refresh a budget. A leader change is not a
+  reset event.
+]
+This is the `sched.retry.failover-budget` decision the design pre-commits
+directionally and its Phase-0 gate requires before Phase 1 starts, made
+and recorded at the Phase-0 exit (2026-05-25):
+per-poison-cycle budgets that survive failover are the only choice
+consistent with `FailoverPreservesHistory` as a Phase-1 acceptance
+property --- the durable ledger exists precisely so the new leader's fold
+matches the old leader's --- and the strict direction (no fresh budget
+after every leader flap during a failover storm, at the cost of poisoning
+a derivation at `infra_count = 9` of 10 on its next infra failure after a
+flap instead of granting it a fresh budget). The as-built code does NOT
+satisfy this rule: today's recovery is the documented selective
+forgiveness of #rref("sched.retry.recovery-projection"), so this rule
+deliberately carries no implementation marker --- it is the acceptance
+rule for the Phase-1b ledger fold, verified when the model is re-checked
+over the new fold, and the companion amendments (with their version
+bumps) of the two rules whose prose pins today's forgiveness
+(#rref("sched.timeout.promote-on-exceed"),
+#rref("sched.retry.per-executor-budget")) land with the Phase-1 change
+that makes the code satisfy it, not before.
 
 #r("sched.poison.cascade-dependents")[
   When a derivation reaches a failure-terminal state (`Poisoned`,
