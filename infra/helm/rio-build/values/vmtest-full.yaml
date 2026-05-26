@@ -19,9 +19,15 @@ global:
 namespaces:
   create: true
 
-# HMAC Secrets provided out-of-band via hmacSecretsManifest → k3s
-# manifest. Plaintext gRPC; Cilium WireGuard handles transport
-# encryption (cilium-render.nix).
+# HMAC Secrets (rio-hmac + rio-service-hmac, both namespaces) provided
+# out-of-band via hmacSecretsManifest → k3s manifest. Plaintext gRPC;
+# Cilium WireGuard handles transport encryption (cilium-render.nix).
+# Assignment-token pair: scheduler signs WorkAssignment tokens, store
+# verifies them on PutPath/castore reads — without it every builder
+# castore read fails UNAUTHENTICATED ("DirectoryService requires a
+# tenant").
+assignmentHmac:
+  secretName: rio-hmac
 
 # EKS-only (IRSA → Secrets Manager).
 externalSecrets:

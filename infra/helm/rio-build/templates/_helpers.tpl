@@ -75,6 +75,18 @@ Families:
              on dispatch-time FindMissingPaths/QueryPathInfo so the
              store honours x-rio-probe-tenant-id
              (r[sched.dispatch.fod-substitute]); store verifies.
+  assignmentHmac  .Values.assignmentHmac.secretName non-empty.
+             SCHEDULER (signer) + STORE (verifier). Secret
+             <secretName> → /etc/rio/assignment-hmac/hmac.key, env
+             RIO_HMAC_KEY_PATH. The scheduler signs WorkAssignment
+             tokens; the store verifies them on PutPath and on castore
+             DirectoryService/BlobService reads, where the token is
+             the builder's ONLY tenant credential
+             (r[store.castore.tenant-scope] — no anonymous fallback).
+             Unset → both sides run keyless dev mode and builder
+             castore reads are rejected UNAUTHENTICATED. SEPARATE
+             mountPath from serviceHmac: scheduler+store carry both
+             families and two volumes cannot share one mountPath.
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -114,6 +126,12 @@ Families:
         "src"  (dict "secret" (dict "secretName" "rio-service-hmac"))
         "env"  (list
           (dict "name" "RIO_SERVICE_HMAC_KEY_PATH" "value" "/etc/rio/hmac/service-hmac.key")))
+      "assignmentHmac" (dict
+        "on"   (not (empty $root.Values.assignmentHmac.secretName))
+        "vol"  "assignment-hmac" "path" "/etc/rio/assignment-hmac" "ro" true
+        "src"  (dict "secret" (dict "secretName" $root.Values.assignmentHmac.secretName))
+        "env"  (list
+          (dict "name" "RIO_HMAC_KEY_PATH" "value" "/etc/rio/assignment-hmac/hmac.key")))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}

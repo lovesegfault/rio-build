@@ -57,7 +57,7 @@ spec:
               containerPort: 9092
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:9002"
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
@@ -176,7 +176,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
             {{- if eq ($s.chunkBackend).kind "filesystem" }}
             # readOnlyRootFilesystem: the filesystem chunk backend needs
             # a writable mount at baseDir. PVC (not hostPath — forbidden
@@ -204,7 +204,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 8 }}
         {{- if eq ($s.chunkBackend).kind "filesystem" }}
         - name: chunks
           persistentVolumeClaim:

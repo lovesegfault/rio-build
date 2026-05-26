@@ -78,6 +78,23 @@ jwt:
   # logs (it's public). Verify-side decodes to VerifyingKey::from_bytes.
   publicKey: ""
 
+# Assignment-token HMAC — the scheduler signs WorkAssignment tokens with
+# this key, the store verifies them on PutPath and on castore
+# DirectoryService/BlobService reads. Both sides read the SAME raw
+# 32-byte key (RIO_HMAC_KEY_PATH).
+assignmentHmac:
+  # Name of a pre-existing Secret carrying the key under data key
+  # `hmac.key`, present in BOTH the rio-system (scheduler) and rio-store
+  # (store) namespaces. externalSecrets.enabled syncs `rio-hmac` into
+  # both from the bootstrap-Job-generated rio/hmac Secrets Manager
+  # entry; the k3s VM fixture creates the same pair out-of-band.
+  # Empty (default) = keyless dev mode: unsigned tokens, no
+  # verification. Production MUST set this — the assignment token is
+  # the builder's only tenant credential on castore reads, so without
+  # this pair every builder castore read is rejected UNAUTHENTICATED
+  # ("DirectoryService requires a tenant") and builds fail closed.
+  secretName: ""
+
 # External Secrets Operator sync from AWS Secrets Manager.
 # When enabled: renders ClusterSecretStore + 3 ExternalSecrets (rio-postgres
 # with templated Aurora URL, rio-hmac, rio-signing-key). Requires ESO in the
