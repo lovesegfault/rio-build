@@ -195,9 +195,19 @@ fn canonicalise_entry(
     }
 
     // 5. Deterministic permission bits: 0444, plus 0111 iff the entry is
-    //    a directory or had any execute bit. Never on symlinks.
+    //    a directory or had the OWNER execute bit. Never on symlinks.
+    //
+    //    CppNix keys regular-file executability on `S_IXUSR` alone, both
+    //    in `canonicalisePathMetaData_` (`mode & S_IXUSR ? 0555 : 0444`)
+    //    and in the NAR dumper — a 0655 file (group/other-x, no owner-x)
+    //    is non-executable there, so keying on any execute bit would
+    //    silently diverge NAR bytes and CA store paths. Directories keep
+    //    0555 unconditionally: a directory without owner-x is pathological
+    //    (CppNix would chmod it 0444), has no NAR/path-observable effect
+    //    (NARs carry no executable flag for directories), and 0444 would
+    //    break the recursion below for unprivileged runs.
     if !is_symlink {
-        let executable = is_dir || (st.st_mode & 0o111) != 0;
+        let executable = is_dir || (st.st_mode & 0o100) != 0;
         let new_mode = if executable { 0o555 } else { 0o444 };
         if st.st_mode & 0o7777 != new_mode {
             fchmodat(
@@ -431,6 +441,48 @@ mod tests {
             std::fs::metadata(root.join("tool")).unwrap().mode() & 0o7777,
             0o555
         );
+    }
+
+    /// Executability is keyed on the OWNER execute bit only, like
+    /// CppNix's `canonicalisePathMetaData_` and NAR dumper: a file with
+    /// only group/other execute bits ends up 0444 (non-executable), not
+    /// 0555 — keying on any execute bit would diverge NAR bytes and CA
+    /// store paths from real Nix.
+    #[test]
+    fn group_or_other_exec_without_owner_exec_is_not_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("out");
+        std::fs::create_dir_all(&root).unwrap();
+        let cases = [
+            ("group-x", 0o655, 0o444),
+            ("other-x", 0o455, 0o444),
+            ("owner-x", 0o744, 0o555),
+        ];
+        // Write everything first (canonicalisation makes the root 0555),
+        // and only assert cases whose unusual mode the environment let us
+        // set (mirrors strips_setuid_bits).
+        let mut expectations = Vec::new();
+        for (name, mode, expected) in cases {
+            std::fs::write(root.join(name), b"x").unwrap();
+            std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            if std::fs::metadata(root.join(name)).unwrap().mode() & 0o7777 != mode {
+                eprintln!("skipping {name}: cannot set mode {mode:o} here");
+                std::fs::remove_file(root.join(name)).unwrap();
+                continue;
+            }
+            expectations.push((name, mode, expected));
+        }
+
+        canonicalise_output(&root, my_uid(), &mut HashSet::new()).unwrap();
+
+        for (name, mode, expected) in expectations {
+            assert_eq!(
+                std::fs::metadata(root.join(name)).unwrap().mode() & 0o7777,
+                expected,
+                "{name}: mode {mode:o} must canonicalise to {expected:o}"
+            );
+        }
     }
 
     /// The second name of an inode this build already canonicalised is
