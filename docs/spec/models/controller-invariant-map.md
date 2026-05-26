@@ -361,3 +361,150 @@ in `pool/jobs.rs` and the kwok forecast-provisioning VM wiring) and
 exercised by the cover-loop's accounting and gets its dedicated check in
 Stage B or a unit test in Phase 2 — until then the clause is impl-marked
 but its specific verification rides on the existing cover tests).
+
+## Phase 0a — churn pin and re-pin protocol
+
+Stage B builds two models of the tick bodies this audit just mapped. The
+pin below freezes what "the tick bodies" means, records the in-flight work
+adjacent to them, and states when Stage A must be re-validated. Pin date:
+2026-05-26.
+
+### What is pinned
+
+Base: the campaign works on the `formal-sprint` lineage; the Stage-A
+worktree branched at `1fa6a1c7d` ("docs(rio-scheduler): drop private
+intra-doc links in the status-persist seam docs"), and the Stage-A audit
+itself landed as `607a93f3f` adding only spec text, this map, and
+`r[impl]` comment lines — no behavior-relevant change to any modeled file.
+The modeled tick bodies as of `1fa6a1c7d`:
+
+| In-scope path | Last commit touching it (at the base tip) | Last `fix(…)` commit |
+|---|---|---|
+| `rio-controller/src/reconcilers/pool/jobs.rs` | `2fff4e938` 2026-05-24 (fetcher FUSE-cache budget split) | `f97644a53` 2026-05-11 |
+| `rio-controller/src/reconcilers/pool/job.rs` | `fba9086dc` 2026-04-23 (live pod-phase check before excess-pending DELETE) | `fba9086dc` 2026-04-23 |
+| `rio-controller/src/reconcilers/nodeclaim_pool/` (all of it: `mod`, `ffd`, `cover`, `consolidate`, `health`, `sketch`) | `2fff4e938` 2026-05-24 | `7f91f1892` 2026-05-19 |
+| `rio-controller/src/main.rs` (task wiring, gate channel, lease hooks) | `4fa50ea60` 2026-05-22 | `4fa50ea60` 2026-05-22 (acquire-epoch recovery fix, shared with rio-lease/rio-scheduler) |
+
+The gate/ICE peer-state files the models treat as environment/peer
+variables (not modeled, but their interfaces are assumed):
+
+| Peer path | Last commit at the base tip |
+|---|---|
+| `rio-scheduler/src/sla/cost.rs` (the ICE backoff ladder) | `8026d5f2b` 2026-05-15 |
+| `rio-scheduler/src/actor/mod.rs` (`dispatched_cells`, `recently_disconnected`, hung-node state) | `1a3e60eaa` 2026-05-25 — the retry campaign's Phase-1a two-installment attempt rows; an active stream, scheduler-side only |
+| `rio-scheduler/src/actor/snapshot.rs` (hung-node detector, intent snapshot) | `7f7a19b8a` 2026-05-20 |
+| `rio-controller/src/reconcilers/node_informer.rs` (pod-requested cache → `bound_intents`) | `e013b2044` 2026-05-05 |
+
+Spec-rule version pins (the design's named churn check), as of Stage A:
+`ctrl.nodeclaim.consolidate-na+6` (unchanged by this audit),
+`ctrl.nodeclaim.placeable-gate+5` (was +4),
+`ctrl.nodeclaim.budget.per-class+2` (was unversioned), plus the eight new
+Stage-A rules at their initial versions. A bump of any of these by another
+stream is a Stage-A re-validation trigger (below).
+
+The last-fix dates above are the quiet-window evidence the design asked
+Phase 0a to re-check rather than assume: the modeled files have taken no
+fix since 2026-05-19 (and `pool/job.rs` none since 2026-04-23); the only
+post-r43 change to them is the fetcher-budget feature commit.
+
+### Inventory re-pin
+
+The protocol inventory cites HEAD `e650f23a4`. That commit is not an
+ancestor of `1fa6a1c7d` — it sits on the pre-rewrite lineage of the same
+branch (merge base `ebb0270eb`, 2026-05-25). Verified for this pin:
+`git diff e650f23a4..1fa6a1c7d` is empty for every in-scope controller
+path above and for `docs/spec/components/controller.typ`, so the
+inventory's content claims and line anchors carry over to the base tip
+unchanged. The only diff in the in-scope-plus-peer set is
+`rio-scheduler/src/actor/mod.rs` (the retry Phase-1a work named above),
+which does not affect the controller tick bodies. The inventory's
+references should be read as anchored to `1fa6a1c7d` from here on.
+
+### In-flight work adjacent to the modeled files
+
+- **The fetcher-budget stream** — `2fff4e938` (2026-05-24, B. Meurer, the
+  branch owner): already landed at the base tip; touches the
+  Simulator-shares-accounting chokepoints (`pod.rs::fuse_cache_bytes`
+  selection and `jobs.rs::intent_pod_footprint`) and the nodeclaim_pool
+  sizing path. No successor commits exist beyond the base tip on any of
+  the 167 local branches (checked 2026-05-26). Any follow-up in this
+  stream that lands before Stage B starts triggers the re-pin check
+  below; ordering with this campaign is otherwise unconstrained because
+  the accounting chokepoints are outside the modeled protocol state
+  (G-C family, NOT-ENCODED).
+- **Branches touching `rio-controller/src/reconcilers/` beyond the base
+  tip** (scan of all 167 local branches, 2026-05-26): the mountd stream
+  (`3ca8d4848`, `da8044d3f`, `0ee6bf1fc`) and the no-Nix-image stream
+  (`4dae589e1`, `1e7ec443a`, `900f6f2af`) touch `pool/pod.rs` (and its
+  tests) only — pod construction, outside the modeled tick bodies and
+  outside the calibration corpus. A cluster of April-era bugfix-round
+  branches (`bugfix-fix`, `bugfix-impl`, `bugfix-residuals`,
+  `bugfix-wave*`; tips 2026-04-17..19) still exists locally and shows
+  modeled-file commits, but those are pre-rebase duplicates of fixes
+  already in the base tip under different hashes (the
+  reap-full-intent-set / spawn-iterates-all-intents / re-ack lineage of
+  the G-A/G-B corpus) — stale, not in-flight. The only live branch with
+  a modeled-file commit beyond the base tip is `retry-phase1b` (next
+  bullet). No branch carries behavior-relevant in-flight work on
+  `pool/jobs.rs`, `pool/job.rs`, or `nodeclaim_pool/`.
+- **Explicitly not started** (and per the design queued behind Phase 1):
+  the §13e fetcher-gate follow-up (extending the placeable retain to
+  Fetcher pools — would change the F2 GateFailClosed split) and the
+  executor-lifecycle candidate (would promote I2/I3/I5 to
+  correctness-critical and remove the ack-arming protocol). Neither has a
+  branch. If either starts before Phase 1, it gets a named owner and an
+  ordering against this campaign at that point, and the affected map
+  sections are re-audited.
+- **The retry campaign** (the other active campaign on this lineage,
+  same owner): its Phase-0 artifacts and Phase-1a ledger work are
+  ancestors of the base tip (`99e07563f`, `b5498a904`, `7c3ea5bcf`,
+  `7d58c5bdd`, `1a3e60eaa`, …), which is exactly the state this
+  campaign's assume-guarantee imports (the `recently_disconnected` dedup
+  assumption, the termination-report environment actions). Its Phase-1b
+  stream is in flight on the `retry-phase1b` branch (12 commits beyond
+  the base tip as of this pin); the only modeled-file touch is one
+  comment line in `pool/jobs.rs` (`b9dc13068` re-points a cross-reference
+  to the scheduler rule it bumps, `sched.termination.deadline-exceeded`)
+  — a non-triggering change under the protocol below. Ordering: it may
+  land before or after Stage B with no effect on this audit; if later
+  commits in that stream grow a behavior-relevant change to the
+  controller's deadline-report path (J11), the re-pin check catches it
+  and the affected rows (J11, the I12 out-of-model entry, the
+  deadline-exceeded near-miss) are re-audited as a contained delta.
+
+### Re-pin protocol
+
+Run the check below immediately before Stage B starts, and again before
+Stage C pins its per-commit calibration corpus:
+
+```
+git log --oneline 607a93f3f..HEAD -- \
+  rio-controller/src/reconcilers/pool/jobs.rs \
+  rio-controller/src/reconcilers/pool/job.rs \
+  rio-controller/src/reconcilers/nodeclaim_pool/
+```
+
+plus a check that the pinned rule versions above are unchanged
+(`grep -o 'placeable-gate+[0-9]*\|consolidate-na+[0-9]*\|budget.per-class+[0-9]*' docs/spec/components/controller.typ | sort -u`).
+
+Stage A MUST be re-validated before Stage B proceeds if any of:
+
+1. any commit in that range changes the modeled files beyond comments,
+   doc-comments, or tracey markers (a behavior-relevant change to a tick
+   body, however small);
+2. any pinned rule version changes (including the eight Stage-A rules);
+3. the fetcher-gate extension or the executor-lifecycle replacement
+   starts.
+
+Re-validation means: re-run this audit over the changed decision sites
+(not the whole map), update the affected verdict rows, contradiction
+records, and the expected-falsifications list, and re-pin this section
+with the new hashes. Changes that do NOT trigger re-validation:
+comment-only or marker-only commits, `pool/pod.rs` / node_informer /
+scheduler-side changes (those move the peer table at the next re-pin but
+not the audit), and spec prose outside the pinned rules. If the
+executor-lifecycle replacement is green-lit mid-campaign, the F1/F3 rows
+of this map are its prerequisite review artifact and the Stage-B models
+are re-checked with the heartbeat-authority assumptions removed (design
+§6) — additional value, but the calibration table then needs a delta
+pass.
