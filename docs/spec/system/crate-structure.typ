@@ -413,10 +413,10 @@ directory, so a new proto file cannot ship without one.
   columns: (auto, 1fr, auto, 1.2fr),
   align: (left, left, center, left),
   table.header([Dependency], [Purpose], [Phase], [Notes]),
-  [`nix` (the command-line tool)],
-  [Workers invoke `nix-daemon --stdio` for sandboxed build execution],
+  [`busybox-sandbox-shell`, `fuse3`, `util-linux`],
+  [Worker-image runtime tools: the minimal static ash bind-mounted at `/bin/sh` inside every build sandbox (`RIO_SANDBOX_SHELL`), `fusermount3` for the FUSE input store, and `mount`/`umount` for overlay teardown],
   [2],
-  [Runtime dependency, not a Rust crate. Must be present in worker container images. Protocol version must match `rio-nix`'s target (1.35+, Nix 2.18+ / Lix).],
+  [Shipped in the worker container image. Workers invoke no Nix tooling at runtime — sandboxed build execution is native (`rio-exec`); the daemon-era requirement to ship `nix` in worker images is gone.],
 )
 
 == Gotchas
