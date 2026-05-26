@@ -39,6 +39,33 @@ let
   # any other scenario's builds.
   trivialDrv = drvs.mkTrivial { marker = "proto-warm"; };
 
+  # Result-pipeline probes (run through the real builder → upload →
+  # store path; the differential harness preps its own build dir and
+  # never uploads, so these two properties need a production-path
+  # scenario):
+  #  - tmpdirProbeDrv: writes to $TMPDIR before producing $out — fails
+  #    EACCES if the sandbox's /build is not writable for the build
+  #    user.
+  #  - strayProbeDrv: writes a stray store path next to $out — the
+  #    stray must never be registered in the rio store.
+  tmpdirProbeDrv = drvs.mkCustom {
+    name = "rio-test-proto-tmpdir";
+    script = ''
+      set -e
+      echo "tmpdir scratch" > "$TMPDIR/scratch-file"
+      ''${busybox}/bin/cat "$TMPDIR/scratch-file" > $out
+    '';
+  };
+  strayProbeDrv = drvs.mkCustom {
+    name = "rio-test-proto-stray";
+    script = ''
+      set -e
+      ''${busybox}/bin/mkdir -p /nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray
+      echo leftover > /nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray/file
+      echo "real output" > $out
+    '';
+  };
+
   name = if cold then "protocol-cold" else "protocol-warm";
 
   coldScript = ''
@@ -249,6 +276,34 @@ let
         )
 
     ${pkgs.lib.optionalString withNomExitTest nomExitScript}
+
+    # ── result-pipeline properties through the production path ────────
+    # (the differential harness preps its own build dir and never
+    # uploads; these assertions need the real builder → upload → store
+    # chain.)
+
+    with subtest("build that uses $TMPDIR succeeds (sandbox /build writable)"):
+        out_tmp = client.succeed(
+            f"nix-build --no-out-link --store '{store_url}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${tmpdirProbeDrv}"
+        ).strip()
+        assert "rio-test-proto-tmpdir" in out_tmp, f"unexpected output: {out_tmp!r}"
+        client.succeed(f"nix path-info --store '{store_url}' {out_tmp}")
+
+    with subtest("stray store path created by a build is not registered"):
+        out_stray = client.succeed(
+            f"nix-build --no-out-link --store '{store_url}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${strayProbeDrv}"
+        ).strip()
+        client.succeed(f"nix path-info --store '{store_url}' {out_stray}")
+        # The stray scratch path the build wrote next to $out must not
+        # have been uploaded or registered.
+        client.fail(
+            f"nix path-info --store '{store_url}' "
+            "/nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray"
+        )
   '';
 
   # ── nom-exit / SSH connection teardown ────────────────────────────────

@@ -176,6 +176,29 @@ pkgs.testers.runNixOSTest {
             f"output:\n{out_ia2[-400:]}"
         )
 
+    # ══════════════════════════════════════════════════════════════════
+    # Non-default CA modes: flat hashing and sha512. The builder's CA
+    # finalization and the store's CA verification must agree on the
+    # declared method, or the upload is rejected and the build fails.
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("floating-CA flat + sha512 modes upload and register"):
+        for attr, marker in (("flat", "rio-ca-flat"), ("sha512", "rio-ca-sha512")):
+            out_ca = client.succeed(
+                "nix-build --no-out-link --impure "
+                f"--store '{store_url}' "
+                "--arg busybox '(builtins.storePath ${common.busybox})' "
+                f"-A {attr} "
+                "${drvs.caModes} 2>&1"
+            )
+            ca_path = next(
+                (ln for ln in out_ca.splitlines() if ln.startswith("/nix/store/")),
+                None,
+            )
+            assert ca_path and marker in ca_path, (
+                f"{attr}: expected a {marker} store path, got:\n{out_ca[-400:]}"
+            )
+            client.succeed(f"nix path-info --store '{store_url}' {ca_path}")
+
     ${common.collectCoverage fixture.pyNodeVars}
   '';
 }

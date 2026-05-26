@@ -38,6 +38,12 @@ rec {
   # submit. Drives vm-ca-cutoff-standalone.
   caChain = "${dir}/ca-chain.nix";
 
+  # Floating-CA outputs in the non-default modes (flat hashing,
+  # sha512): builder-side CA finalization and store-side verification
+  # must agree on the declared method for the upload to register.
+  # Built by ca-cutoff.nix with `-A flat` / `-A sha512`.
+  caModes = "${dir}/ca-modes.nix";
+
   # 300KiB single-file output → exceeds INLINE_THRESHOLD, forces the
   # chunked PutPath. Drives the chunks.nix chunk-count assertion.
   bigblob = "${dir}/bigblob.nix";
