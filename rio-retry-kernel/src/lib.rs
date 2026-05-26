@@ -177,21 +177,24 @@ pub type IdSet<Id> = std::collections::BTreeSet<Id>;
 pub type IdSet<Id> = BoundedIdSet<Id>;
 
 /// Capacity of [`BoundedIdSet`]. The proof harnesses' executor universe
-/// is four values (three named executors plus the "no executor recorded"
-/// default), so eight slots leave headroom for a larger universe before
-/// the insert-overflow panic (which CBMC surfaces as a verification
-/// failure) forces this constant up.
-pub const BOUNDED_ID_SET_CAPACITY: usize = 8;
+/// is exactly four values (three named executors plus the "no executor
+/// recorded" default), and every set-op loop and unwind bound scales
+/// with this constant, so it is kept at exactly that universe. A
+/// harness that ever widens its universe hits the insert-overflow panic
+/// (a CBMC verification failure, never a silent drop) and forces this
+/// constant — and the harness unwind bounds — up with it.
+pub const BOUNDED_ID_SET_CAPACITY: usize = 4;
 
 /// A fixed-capacity set with linear-scan membership — the proof-time
 /// executor-id set representation (see [`IdSet`]).
 ///
-/// Every operation is a short loop bounded by the concrete
-/// [`BOUNDED_ID_SET_CAPACITY`], with no heap allocation and no node
-/// structure, which is what the CBMC harnesses need: the cost of the
-/// goto model tracks the (small, fixed) capacity instead of the b-tree
-/// implementation. Inserting more distinct values than the capacity
-/// panics — within the harnesses' bounded domains the panic is
+/// Every operation is a plain index loop bounded by the concrete
+/// [`BOUNDED_ID_SET_CAPACITY`], with no heap allocation, no node
+/// structure, and no iterator-adapter chains (CBMC pays per closure and
+/// per adapter state it has to symbolically execute, so the
+/// implementation deliberately stays at the level of array indexing and
+/// integer comparisons). Inserting more distinct values than the
+/// capacity panics — within the harnesses' bounded domains the panic is
 /// unreachable (every harness proves that as a side effect), and the
 /// panic rather than a silent drop is what keeps the equivalence with
 /// `BTreeSet` honest.
@@ -209,7 +212,7 @@ pub struct BoundedIdSet<Id> {
 impl<Id> Default for BoundedIdSet<Id> {
     fn default() -> Self {
         Self {
-            slots: core::array::from_fn(|_| None),
+            slots: [const { None }; BOUNDED_ID_SET_CAPACITY],
         }
     }
 }
@@ -222,24 +225,67 @@ impl<Id> BoundedIdSet<Id> {
 
     /// Number of elements in the set.
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.is_some()).count()
+        let mut n = 0;
+        let mut i = 0;
+        while i < BOUNDED_ID_SET_CAPACITY {
+            if self.slots[i].is_some() {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Whether the set has no elements.
     pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(|slot| slot.is_none())
+        let mut i = 0;
+        while i < BOUNDED_ID_SET_CAPACITY {
+            if self.slots[i].is_some() {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Iterate the elements in insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = &Id> {
-        self.slots.iter().filter_map(|slot| slot.as_ref())
+    pub fn iter(&self) -> BoundedIdSetIter<'_, Id> {
+        BoundedIdSetIter {
+            slots: &self.slots,
+            next_index: 0,
+        }
     }
 }
 
 impl<Id: Ord> BoundedIdSet<Id> {
     /// Whether `value` is in the set.
     pub fn contains(&self, value: &Id) -> bool {
-        self.slots.iter().flatten().any(|v| v == value)
+        let mut i = 0;
+        while i < BOUNDED_ID_SET_CAPACITY {
+            if let Some(v) = &self.slots[i]
+                && v == value
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Whether every element of `self` is also in `other` — the
+    /// `BTreeSet::is_subset` surface [`exhausts_fleet`] and
+    /// [`placeable`] consume.
+    pub fn is_subset(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < BOUNDED_ID_SET_CAPACITY {
+            if let Some(v) = &self.slots[i]
+                && !other.contains(v)
+            {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Insert `value`; returns `true` iff it was not already present
@@ -256,13 +302,39 @@ impl<Id: Ord> BoundedIdSet<Id> {
         if self.contains(&value) {
             return false;
         }
-        match self.slots.iter().position(|slot| slot.is_none()) {
-            Some(free) => {
-                self.slots[free] = Some(value);
-                true
+        let mut i = 0;
+        while i < BOUNDED_ID_SET_CAPACITY {
+            if self.slots[i].is_none() {
+                self.slots[i] = Some(value);
+                return true;
             }
-            None => panic!("BoundedIdSet capacity exceeded: raise BOUNDED_ID_SET_CAPACITY"),
+            i += 1;
         }
+        panic!("BoundedIdSet capacity exceeded: raise BOUNDED_ID_SET_CAPACITY");
+    }
+}
+
+/// Iterator over a [`BoundedIdSet`]'s elements in insertion order. The
+/// `next()` is a plain index scan (no adapter chain) so the membership
+/// folds in the kernel, the contracts, and the harnesses stay cheap to
+/// symbolically execute.
+pub struct BoundedIdSetIter<'a, Id> {
+    slots: &'a [Option<Id>; BOUNDED_ID_SET_CAPACITY],
+    next_index: usize,
+}
+
+impl<'a, Id> Iterator for BoundedIdSetIter<'a, Id> {
+    type Item = &'a Id;
+
+    fn next(&mut self) -> Option<&'a Id> {
+        while self.next_index < BOUNDED_ID_SET_CAPACITY {
+            let slot = &self.slots[self.next_index];
+            self.next_index += 1;
+            if let Some(v) = slot {
+                return Some(v);
+            }
+        }
+        None
     }
 }
 
@@ -740,7 +812,7 @@ pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id
     if failed_builders.is_empty() || fleet.eligible.is_empty() {
         return false;
     }
-    fleet.eligible.iter().all(|w| failed_builders.contains(w))
+    fleet.eligible.is_subset(failed_builders)
 }
 
 // r[impl sched.retry.counters-refine-history+2]
@@ -1254,6 +1326,152 @@ pub struct Decision<Id> {
     pub counters: Counters<Id>,
 }
 
+// ---------------------------------------------------------------------------
+// decide()'s contract clauses, as named predicates
+//
+// The four `#[kani::ensures]` clauses on `decide()` are thin closures over
+// these predicates, and `check_decide_contract` asserts the same predicates
+// directly on the result of a plain call — one source of truth per clause,
+// two consumers. The harness deliberately does NOT use
+// `#[kani::proof_for_contract(decide)]`: kani's contract-instrumented
+// wrapper around a fold of this size did not converge inside the
+// merge-gate budget, while asserting the identical clauses over the
+// identical domain in a plain proof does. The attributes stay on the
+// function so the contract remains stated where it belongs (and remains
+// available to a future `stub_verified` caller, which would have to bring
+// its own `proof_for_contract` harness back with it).
+// ---------------------------------------------------------------------------
+
+/// Clause 1 of [`decide`]'s contract: the verdict partition is consistent
+/// with the counters it was computed from — each terminal verdict names a
+/// budget that really is at its bound, the TTL downgrade only fires on a
+/// stamped expired poison, and the fleet-exhaust reason is unreachable
+/// from `decide()` (placement is [`placeable`]'s job).
+#[cfg(kani)]
+fn decide_verdict_partition_consistent<Id: Ord>(
+    d: &Decision<Id>,
+    budget: &Budget,
+    now: AbsTime,
+) -> bool {
+    match d.verdict {
+        Verdict::Requeue => true,
+        Verdict::Poison(PoisonReason::Threshold) => {
+            d.counters.poisoned_at.is_some() && d.counters.poison_threshold_reached(budget)
+        }
+        Verdict::Poison(PoisonReason::TransientBudget) => {
+            d.counters.poisoned_at.is_some() && d.counters.count >= budget.max_retries
+        }
+        Verdict::Poison(PoisonReason::InfraBudget) => {
+            d.counters.poisoned_at.is_some() && d.counters.infra_count >= budget.max_infra_retries
+        }
+        Verdict::Poison(PoisonReason::ExemptInfraBudget) => {
+            d.counters.poisoned_at.is_some()
+                && d.counters.exempt_infra_count >= budget.max_exempt_infra_retries
+        }
+        Verdict::Poison(PoisonReason::Permanent) => d.counters.poisoned_at.is_some(),
+        Verdict::Poison(PoisonReason::FleetExhausted) => false,
+        Verdict::Cancel => d.counters.timeout_count >= budget.max_timeout_retries,
+        Verdict::TtlExpire => matches!(
+            d.counters.poisoned_at,
+            Some(p) if now.saturating_sub(p) > budget.poison_ttl_secs
+        ),
+    }
+}
+
+/// Clause 2 of [`decide`]'s contract: a Requeue verdict never exceeds a
+/// budget cap — the per-cycle/infra/timeout caps hold over every history
+/// (the seed can lift `count` above `max_retries` only with evidence the
+/// frozen legacy column already holds), and the exempt cap holds over
+/// every history whose last event is exempt-charging.
+#[cfg(kani)]
+fn decide_requeue_within_caps<Id: Ord>(
+    d: &Decision<Id>,
+    history: &[LedgerRow<Id>],
+    budget: &Budget,
+    legacy_seed: Option<&PersistedRetryColumns<Id>>,
+) -> bool {
+    let has_reset = history
+        .iter()
+        .any(|r| r.event_kind == AttemptEventKind::Reset);
+    let seeded_count_floor = match legacy_seed {
+        Some(s) if !has_reset && !s.is_empty() => s.retry_count,
+        _ => 0,
+    };
+    let last_is_exempt_charge = history.last().is_some_and(|r| {
+        r.event_kind == AttemptEventKind::Attempt
+            && ((r.reporting_party == ReportingParty::Worker
+                && r.outcome_class == OutcomeClass::ExemptInfra)
+                || (r.reporting_party != ReportingParty::Worker
+                    && !r.floor_at_cap
+                    && (r.outcome_class == OutcomeClass::ExemptInfra
+                        || (r.outcome_class == OutcomeClass::Infra && r.floor_promoted))))
+    });
+    d.counters.count <= budget.max_retries.max(seeded_count_floor)
+        && d.counters.infra_count <= budget.max_infra_retries
+        && d.counters.timeout_count <= budget.max_timeout_retries
+        && (!matches!(d.verdict, Verdict::Requeue)
+            || !last_is_exempt_charge
+            || d.counters.exempt_infra_count < budget.max_exempt_infra_retries)
+}
+
+/// Clause 3 of [`decide`]'s contract: the exclusion set contains the
+/// executor of every charged threshold attempt after the last reset row,
+/// plus every member the legacy seed holds when the seed applies.
+#[cfg(kani)]
+fn decide_exclusion_covers_charged_attempts<Id: Ord>(
+    d: &Decision<Id>,
+    history: &[LedgerRow<Id>],
+    legacy_seed: Option<&PersistedRetryColumns<Id>>,
+) -> bool {
+    let last_reset = history
+        .iter()
+        .rposition(|r| r.event_kind == AttemptEventKind::Reset);
+    let start = last_reset.map_or(0, |i| i + 1);
+    let charged_ok = history[start..].iter().all(|r| {
+        let charges_threshold = r.event_kind == AttemptEventKind::Attempt
+            && matches!(
+                r.outcome_class,
+                OutcomeClass::Transient
+                    | OutcomeClass::Permanent
+                    | OutcomeClass::Backstop
+                    | OutcomeClass::ExecutorCrash
+            );
+        !charges_threshold || r.executor.as_ref().is_none_or(|e| d.exclusion.contains(e))
+    });
+    let seed_ok = match legacy_seed {
+        Some(s) if last_reset.is_none() && !s.is_empty() => {
+            s.failed_builders.iter().all(|w| d.exclusion.contains(w))
+        }
+        _ => true,
+    };
+    charged_ok && seed_ok
+}
+
+/// Clause 4 of [`decide`]'s contract: the legacy-seed merge never drops a
+/// counter below what the frozen mirror columns support (decision P5 /
+/// design amendment A1).
+#[cfg(kani)]
+fn decide_seed_floor_respected<Id: Ord>(
+    d: &Decision<Id>,
+    history: &[LedgerRow<Id>],
+    legacy_seed: Option<&PersistedRetryColumns<Id>>,
+) -> bool {
+    let has_reset = history
+        .iter()
+        .any(|r| r.event_kind == AttemptEventKind::Reset);
+    match legacy_seed {
+        Some(s) if !has_reset && !s.is_empty() => {
+            d.counters.count >= s.retry_count
+                && d.counters.resubmit_cycles >= s.resubmit_cycles
+                && d.counters.failure_count >= s.failed_builders.len() as u32
+                && s.failed_builders
+                    .iter()
+                    .all(|w| d.counters.failed_builders.contains(w))
+        }
+        _ => true,
+    }
+}
+
 /// Phase-1b decision function: fold a derivation's attempt-ledger suffix
 /// into the budget verdict and the derived counter/exclusion views.
 ///
@@ -1311,104 +1529,36 @@ pub struct Decision<Id> {
 // threshold attempt after the last reset row plus everything the legacy
 // seed holds; and the legacy-seed merge never drops a counter below
 // what the frozen mirror columns support (decision P5 / design
-// amendment A1). Verified by `check_decide_contract` in
-// `#[cfg(kani)] mod proofs`; the two-call properties (determinism,
-// seed-vs-unseeded monotonicity, the reset-row seed bypass) are the
+// amendment A1). The clause bodies are the `decide_*` predicate
+// functions above (one source of truth); `check_decide_contract` in
+// `#[cfg(kani)] mod proofs` asserts those same predicates on the result
+// of a plain call rather than going through
+// `#[kani::proof_for_contract]`, whose contract-instrumented wrapper
+// around a fold this size does not converge inside the merge-gate
+// budget. The two-call properties (determinism, seed-vs-unseeded
+// monotonicity, the reset-row seed bypass) are the
 // `check_decide_deterministic` and `check_legacy_seed_merge_monotone`
 // harnesses.
-#[cfg_attr(kani, kani::ensures(|d: &Decision<Id>| {
-    match d.verdict {
-        Verdict::Requeue => true,
-        Verdict::Poison(PoisonReason::Threshold) => {
-            d.counters.poisoned_at.is_some() && d.counters.poison_threshold_reached(budget)
-        }
-        Verdict::Poison(PoisonReason::TransientBudget) => {
-            d.counters.poisoned_at.is_some() && d.counters.count >= budget.max_retries
-        }
-        Verdict::Poison(PoisonReason::InfraBudget) => {
-            d.counters.poisoned_at.is_some() && d.counters.infra_count >= budget.max_infra_retries
-        }
-        Verdict::Poison(PoisonReason::ExemptInfraBudget) => {
-            d.counters.poisoned_at.is_some()
-                && d.counters.exempt_infra_count >= budget.max_exempt_infra_retries
-        }
-        Verdict::Poison(PoisonReason::Permanent) => d.counters.poisoned_at.is_some(),
-        Verdict::Poison(PoisonReason::FleetExhausted) => false,
-        Verdict::Cancel => d.counters.timeout_count >= budget.max_timeout_retries,
-        Verdict::TtlExpire => matches!(
-            d.counters.poisoned_at,
-            Some(p) if now.saturating_sub(p) > budget.poison_ttl_secs
-        ),
-    }
-}))]
-#[cfg_attr(kani, kani::ensures(|d: &Decision<Id>| {
-    let has_reset = history
-        .iter()
-        .any(|r| r.event_kind == AttemptEventKind::Reset);
-    let seeded_count_floor = match legacy_seed {
-        Some(s) if !has_reset && !s.is_empty() => s.retry_count,
-        _ => 0,
-    };
-    let last_is_exempt_charge = history.last().is_some_and(|r| {
-        r.event_kind == AttemptEventKind::Attempt
-            && ((r.reporting_party == ReportingParty::Worker
-                && r.outcome_class == OutcomeClass::ExemptInfra)
-                || (r.reporting_party != ReportingParty::Worker
-                    && !r.floor_at_cap
-                    && (r.outcome_class == OutcomeClass::ExemptInfra
-                        || (r.outcome_class == OutcomeClass::Infra && r.floor_promoted))))
-    });
-    d.counters.count <= budget.max_retries.max(seeded_count_floor)
-        && d.counters.infra_count <= budget.max_infra_retries
-        && d.counters.timeout_count <= budget.max_timeout_retries
-        && (!matches!(d.verdict, Verdict::Requeue)
-            || !last_is_exempt_charge
-            || d.counters.exempt_infra_count < budget.max_exempt_infra_retries)
-}))]
-#[cfg_attr(kani, kani::ensures(|d: &Decision<Id>| {
-    let last_reset = history
-        .iter()
-        .rposition(|r| r.event_kind == AttemptEventKind::Reset);
-    let start = last_reset.map_or(0, |i| i + 1);
-    let charged_ok = history[start..].iter().all(|r| {
-        let charges_threshold = r.event_kind == AttemptEventKind::Attempt
-            && matches!(
-                r.outcome_class,
-                OutcomeClass::Transient
-                    | OutcomeClass::Permanent
-                    | OutcomeClass::Backstop
-                    | OutcomeClass::ExecutorCrash
-            );
-        !charges_threshold
-            || r.executor
-                .as_ref()
-                .is_none_or(|e| d.exclusion.contains(e))
-    });
-    let seed_ok = match legacy_seed {
-        Some(s) if last_reset.is_none() && !s.is_empty() => s
-            .failed_builders
-            .iter()
-            .all(|w| d.exclusion.contains(w)),
-        _ => true,
-    };
-    charged_ok && seed_ok
-}))]
-#[cfg_attr(kani, kani::ensures(|d: &Decision<Id>| {
-    let has_reset = history
-        .iter()
-        .any(|r| r.event_kind == AttemptEventKind::Reset);
-    match legacy_seed {
-        Some(s) if !has_reset && !s.is_empty() => {
-            d.counters.count >= s.retry_count
-                && d.counters.resubmit_cycles >= s.resubmit_cycles
-                && d.counters.failure_count >= s.failed_builders.len() as u32
-                && s.failed_builders
-                    .iter()
-                    .all(|w| d.counters.failed_builders.contains(w))
-        }
-        _ => true,
-    }
-}))]
+#[cfg_attr(
+    kani,
+    kani::ensures(|d: &Decision<Id>| decide_verdict_partition_consistent(d, budget, now))
+)]
+#[cfg_attr(
+    kani,
+    kani::ensures(|d: &Decision<Id>| decide_requeue_within_caps(d, history, budget, legacy_seed))
+)]
+#[cfg_attr(
+    kani,
+    kani::ensures(|d: &Decision<Id>| decide_exclusion_covers_charged_attempts(
+        d,
+        history,
+        legacy_seed
+    ))
+)]
+#[cfg_attr(
+    kani,
+    kani::ensures(|d: &Decision<Id>| decide_seed_floor_respected(d, history, legacy_seed))
+)]
 pub fn decide<Id: Ord + Clone + Default>(
     history: &[LedgerRow<Id>],
     budget: &Budget,
@@ -1736,7 +1886,7 @@ pub fn placeable<Id: Ord>(excluded: &IdSet<Id>, eligible: &IdSet<Id>) -> Placeme
     if eligible.is_empty() {
         return Placement::NoEligibleWorkers;
     }
-    if !excluded.is_empty() && eligible.iter().all(|w| excluded.contains(w)) {
+    if !excluded.is_empty() && eligible.is_subset(excluded) {
         Placement::FleetExhausted
     } else {
         Placement::Placeable
@@ -1848,12 +1998,12 @@ mod tests {
     /// the production representation (`BTreeSet`) on every observable
     /// the kernel uses — `insert`'s newness verdict, `len`, `is_empty`,
     /// `contains`, and the element set yielded by `iter` — over every
-    /// insert sequence of length ≤ 5 drawn from a 5-value domain
+    /// insert sequence of length ≤ 5 drawn from a capacity-sized domain
     /// (exhaustive), which covers every duplicate/ordering shape the
     /// bounded harness domains can produce.
     #[test]
     fn bounded_id_set_agrees_with_btreeset_exhaustively() {
-        const DOMAIN: [u8; 5] = [0, 1, 2, 3, 7];
+        const DOMAIN: [u8; BOUNDED_ID_SET_CAPACITY] = [0, 1, 3, 7];
         for len in 0..=5u32 {
             let sequences = DOMAIN.len().pow(len);
             for sequence in 0..sequences {
@@ -1878,12 +2028,40 @@ mod tests {
         }
     }
 
+    /// `is_subset` (the surface [`exhausts_fleet`] / [`placeable`]
+    /// consume) agrees with `BTreeSet::is_subset` over the
+    /// empty/subset/equal/superset/disjoint/overlap shapes.
+    #[test]
+    fn bounded_id_set_is_subset_agrees_with_btreeset() {
+        let pairs: [(&[u8], &[u8]); 8] = [
+            (&[], &[]),
+            (&[], &[1]),
+            (&[1], &[]),
+            (&[1], &[1, 2]),
+            (&[1, 2], &[1, 2]),
+            (&[1, 2, 3], &[1, 2]),
+            (&[1, 4], &[2, 3]),
+            (&[1, 2], &[2, 3]),
+        ];
+        for (left, right) in pairs {
+            let bounded_left: BoundedIdSet<u8> = left.iter().copied().collect();
+            let bounded_right: BoundedIdSet<u8> = right.iter().copied().collect();
+            let reference_left: BTreeSet<u8> = left.iter().copied().collect();
+            let reference_right: BTreeSet<u8> = right.iter().copied().collect();
+            assert_eq!(
+                bounded_left.is_subset(&bounded_right),
+                reference_left.is_subset(&reference_right),
+                "is_subset disagrees for {left:?} vs {right:?}"
+            );
+        }
+    }
+
     /// `FromIterator`/`Extend` on the proof-time set dedup exactly like
     /// collecting into a `BTreeSet` (the conversion surface a caller
     /// building an [`IdSet`] generically would hit).
     #[test]
     fn bounded_id_set_collect_dedups_like_btreeset() {
-        let values = [3u8, 1, 3, 0, 1, 2];
+        let values = [3u8, 1, 3, 0, 1];
         let bounded: BoundedIdSet<u8> = values.into_iter().collect();
         let reference: BTreeSet<u8> = values.into_iter().collect();
         assert_eq!(bounded.len(), reference.len());
@@ -1891,7 +2069,7 @@ mod tests {
             assert!(bounded.contains(v));
         }
         let mut extended = bounded.clone();
-        extended.extend([2u8, 9]);
+        extended.extend([1u8, 9]);
         assert_eq!(extended.len(), reference.len() + 1);
         assert!(extended.contains(&9));
     }
@@ -1904,7 +2082,7 @@ mod tests {
     #[should_panic(expected = "BoundedIdSet capacity exceeded")]
     fn bounded_id_set_insert_panics_past_capacity() {
         let mut s = BoundedIdSet::new();
-        for v in 0..=8u8 {
+        for v in 0..=u8::try_from(BOUNDED_ID_SET_CAPACITY).expect("small capacity") {
             s.insert(v);
         }
     }
@@ -1969,6 +2147,22 @@ mod proofs {
     //! no recorded executor, playing the role the empty string plays in
     //! production; the named universe is {1, 2, 3}.
     //!
+    //! Under `cfg(kani)` every executor-id set in the kernel and in
+    //! these harnesses is [`BoundedIdSet`] (via the [`IdSet`] alias): a
+    //! fixed-capacity array set whose operations are concretely bounded
+    //! scans, so the goto model carries no b-tree node or heap
+    //! machinery. `check_bounded_set_models_set_semantics` pins the
+    //! representation itself to set semantics over symbolic values; the
+    //! BTreeSet-differential unit tests in `mod tests` pin it to the
+    //! production representation. Symbolic scalars are generated as
+    //! widened bytes (`small_time`, the scaled-budget fields) so the
+    //! clock and budget arithmetic goes through structurally narrow
+    //! circuits. Unwind bounds: 7 covers the capacity-bounded set scans
+    //! and the ≤4-row history folds (each at most four iterations plus
+    //! margin) everywhere except the classification harness, whose 64
+    //! covers the windowed byte comparison over the longest
+    //! representative message.
+    //!
     //! The tracey verify markers for these harnesses live at the
     //! `kani-rio-retry-kernel` wiring point in nix/kani.nix, not here —
     //! same discipline as the VM-test subtests list.
@@ -1984,6 +2178,17 @@ mod proofs {
         let i: u8 = kani::any();
         kani::assume(i >= 1 && i <= 3);
         i
+    }
+
+    /// A symbolic instant on the abstract clock, generated as a widened
+    /// byte so the high 56 bits are structurally zero: the clock
+    /// arithmetic (window reset, TTL, backoff deadlines) then goes
+    /// through narrow circuits instead of full 64-bit ones. The bounded
+    /// domains never need more than a byte of clock anyway.
+    fn small_time(bound: u8) -> AbsTime {
+        let v: u8 = kani::any();
+        kani::assume(v <= bound);
+        AbsTime::from(v)
     }
 
     fn any_outcome_class() -> OutcomeClass {
@@ -2022,11 +2227,9 @@ mod proofs {
     /// fields `decide()` ignores (UUIDs, error messages, the recorded-at
     /// timestamp) are not part of [`LedgerRow`] at all — the scheduler's
     /// projection shim drops them before the kernel ever sees a row.
-    fn any_row(max_at: u64) -> LedgerRow<u8> {
-        let at: u64 = kani::any();
-        kani::assume(at <= max_at);
-        let cycle: i32 = kani::any();
-        kani::assume((0..=3).contains(&cycle));
+    fn any_row(max_at: u8) -> LedgerRow<u8> {
+        let cycle: u8 = kani::any();
+        kani::assume(cycle <= 3);
         LedgerRow {
             event_kind: if kani::any() {
                 AttemptEventKind::Attempt
@@ -2042,8 +2245,8 @@ mod proofs {
             reporting_party: any_reporting_party(),
             floor_promoted: kani::any(),
             floor_at_cap: kani::any(),
-            resubmit_cycle: cycle,
-            at,
+            resubmit_cycle: i32::from(cycle),
+            at: small_time(max_at),
         }
     }
 
@@ -2062,17 +2265,19 @@ mod proofs {
 
     /// Budgets scaled so every terminal is reachable within the history
     /// bound. The contract must hold for every configuration, so zero
-    /// caps and both threshold modes are included.
+    /// caps and both threshold modes are included. The fields are
+    /// generated as widened bytes (same rationale as [`small_time`]) so
+    /// the cap comparisons and the backoff multiplication stay narrow.
     fn any_small_budget() -> Budget {
-        let small_u32 = |bound: u32| -> u32 {
-            let v: u32 = kani::any();
+        let small_u32 = |bound: u8| -> u32 {
+            let v: u8 = kani::any();
             kani::assume(v <= bound);
-            v
+            u32::from(v)
         };
-        let small_u64 = |bound: u64| -> u64 {
-            let v: u64 = kani::any();
+        let small_u64 = |bound: u8| -> u64 {
+            let v: u8 = kani::any();
             kani::assume(v <= bound);
-            v
+            u64::from(v)
         };
         Budget {
             max_retries: small_u32(2),
@@ -2102,9 +2307,7 @@ mod proofs {
             failed_builders.insert(2u8);
         }
         let poisoned_at = if kani::any() {
-            let p: u64 = kani::any();
-            kani::assume(p <= 8);
-            Some(p)
+            Some(small_time(8))
         } else {
             None
         };
@@ -2116,23 +2319,101 @@ mod proofs {
         }
     }
 
-    /// Verify [`decide`] against its four `kani::ensures` contracts —
-    /// the verdict partition, the Requeue cap bounds, the
+    /// The proof-time set representation itself models set semantics
+    /// over symbolic values: insert reports newness exactly when the
+    /// value was absent, membership tracks exactly the inserted values,
+    /// `len` counts distinct values, insertion order does not affect
+    /// membership or size, and `iter()` yields exactly the members.
+    /// This is the harness-side half of the equivalence pin for the
+    /// cfg(kani) [`IdSet`] swap (the BTreeSet-differential half runs as
+    /// a unit test under every cfg).
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_bounded_set_models_set_semantics() {
+        let a: u8 = kani::any();
+        let b: u8 = kani::any();
+        let probe: u8 = kani::any();
+
+        let mut s = BoundedIdSet::<u8>::new();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(!s.contains(&probe));
+
+        // First insert: newness reported, membership and size update.
+        assert!(s.insert(a));
+        assert!(s.contains(&a));
+        assert!(!s.is_empty());
+        assert_eq!(s.len(), 1);
+        // Re-insert is idempotent and reports the value as seen.
+        assert!(!s.insert(a));
+        assert_eq!(s.len(), 1);
+
+        // Second value: newness iff distinct, size reflects it.
+        let b_was_new = s.insert(b);
+        assert_eq!(b_was_new, b != a);
+        assert!(s.contains(&b));
+        assert_eq!(s.len(), if b == a { 1 } else { 2 });
+
+        // Membership is precise: never-inserted values stay out.
+        if probe != a && probe != b {
+            assert!(!s.contains(&probe));
+        }
+
+        // Insertion order does not change membership or size.
+        let mut t = BoundedIdSet::<u8>::new();
+        t.insert(b);
+        t.insert(a);
+        assert_eq!(t.len(), s.len());
+        assert!(t.contains(&a));
+        assert!(t.contains(&b));
+
+        // iter() yields exactly the members: every yielded value is a
+        // member and the yield count matches len().
+        let mut yielded = 0;
+        for v in s.iter() {
+            assert!(*v == a || *v == b);
+            yielded += 1;
+        }
+        assert_eq!(yielded, s.len());
+    }
+
+    /// Verify [`decide`] against its four stated `kani::ensures`
+    /// clauses — the verdict partition, the Requeue cap bounds, the
     /// exclusion-set superset, and the legacy-seed floor — for every
     /// suffix of up to 4 arbitrary rows, every scaled budget, every
     /// clock value up to 16, and every (or no) legacy seed. With
     /// overflow checks on, the same run is the no-overflow proof for
     /// the fold's counter arithmetic over that domain.
-    #[kani::proof_for_contract(decide)]
-    #[kani::unwind(9)]
+    ///
+    /// The clauses are asserted via the shared `decide_*` predicate
+    /// functions (the same bodies the `#[kani::ensures]` attributes
+    /// wrap) on the result of a plain call, NOT via
+    /// `#[kani::proof_for_contract(decide)]`: the contract-instrumented
+    /// wrapper around the whole fold does not converge inside the
+    /// merge-gate budget, while the assert form proves the identical
+    /// clauses over the identical domain.
+    #[kani::proof]
+    #[kani::unwind(7)]
     fn check_decide_contract() {
         let (rows, n) = any_history::<4>();
         let history = &rows[..n];
         let budget = any_small_budget();
-        let now: AbsTime = kani::any();
-        kani::assume(now <= 16);
+        let now = small_time(16);
         let seed = if kani::any() { Some(any_seed()) } else { None };
-        let _ = decide(history, &budget, now, seed.as_ref());
+        let d = decide(history, &budget, now, seed.as_ref());
+        assert!(decide_verdict_partition_consistent(&d, &budget, now));
+        assert!(decide_requeue_within_caps(
+            &d,
+            history,
+            &budget,
+            seed.as_ref()
+        ));
+        assert!(decide_exclusion_covers_charged_attempts(
+            &d,
+            history,
+            seed.as_ref()
+        ));
+        assert!(decide_seed_floor_respected(&d, history, seed.as_ref()));
     }
 
     /// The verdict partition is deterministic: two calls on the same
@@ -2140,13 +2421,12 @@ mod proofs {
     /// — no hidden state, no clock other than `now`, no dependence on
     /// set iteration order.
     #[kani::proof]
-    #[kani::unwind(9)]
+    #[kani::unwind(7)]
     fn check_decide_deterministic() {
         let (rows, n) = any_history::<2>();
         let history = &rows[..n];
         let budget = any_small_budget();
-        let now: AbsTime = kani::any();
-        kani::assume(now <= 16);
+        let now = small_time(16);
         let seed = if kani::any() { Some(any_seed()) } else { None };
         let a = decide(history, &budget, now, seed.as_ref());
         let b = decide(history, &budget, now, seed.as_ref());
@@ -2171,13 +2451,12 @@ mod proofs {
     /// era supports" floor is the legacy-projection half plus the
     /// preserved suffix exclusions, which are asserted).
     #[kani::proof]
-    #[kani::unwind(9)]
+    #[kani::unwind(7)]
     fn check_legacy_seed_merge_monotone() {
         let (rows, n) = any_history::<3>();
         let history = &rows[..n];
         let budget = any_small_budget();
-        let now: AbsTime = kani::any();
-        kani::assume(now <= 16);
+        let now = small_time(16);
         let seed = any_seed();
         let seeded = decide(history, &budget, now, Some(&seed));
         let unseeded = decide(history, &budget, now, None);
@@ -2277,7 +2556,7 @@ mod proofs {
     /// exclusion set (always placeable), full overlap (exhausted), and
     /// every partial overlap.
     #[kani::proof_for_contract(placeable)]
-    #[kani::unwind(5)]
+    #[kani::unwind(7)]
     fn check_placeable_contract() {
         let excluded = any_id_set();
         let eligible = any_id_set();
@@ -2292,13 +2571,12 @@ mod proofs {
     /// this derivation, and an empty fleet never produces one (the
     /// empty-fleet defer clause of `sched.dispatch.fleet-exhaust+3`).
     #[kani::proof]
-    #[kani::unwind(5)]
+    #[kani::unwind(7)]
     fn check_fold_fleet_exhaust_arm() {
         // Three arbitrary worker-reported events plus a symbolic length,
         // array-backed for the same reason as `any_history`.
         let events = [(); 3].map(|_| {
-            let at: u64 = kani::any();
-            kani::assume(at <= 8);
+            let at = small_time(8);
             if kani::any() {
                 AttemptEvent::Transient {
                     at,
@@ -2323,8 +2601,7 @@ mod proofs {
         if kani::any() {
             fleet.eligible.insert(2u8);
         }
-        let now: AbsTime = kani::any();
-        kani::assume(now <= 16);
+        let now = small_time(16);
         let (counters, verdict) = reference_fold(history, now, &Budget::default(), &fleet);
         if verdict == Verdict::Poison(PoisonReason::FleetExhausted) {
             assert!(!fleet.eligible.is_empty());
