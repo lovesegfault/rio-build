@@ -833,12 +833,17 @@ impl StoreServiceImpl {
 /// returning `(offset, length)` of the file bytes without copying them
 /// and without the general-purpose parser's per-file size cap.
 ///
-/// The framing is validated strictly: magic, `regular` type (an
-/// optional `executable` marker is allowed, matching what flat
-/// ingestion accepts), zero padding, a closing parenthesis, and no
-/// trailing bytes. Anything else — directories, symlinks, truncation —
-/// is an error, so this is exactly as strict as the extracting parser
-/// it replaces, minus the copy and the cap.
+/// The framing is validated strictly: magic, `regular` type, zero
+/// padding, a closing parenthesis, and no trailing bytes. Anything
+/// else — directories, symlinks, truncation — is an error.
+///
+/// The `executable` marker is rejected: the flat content hash is over
+/// the file bytes only, so the executable and non-executable variants
+/// of the same content would otherwise verify against the same
+/// content-derived path, and every legitimate flat producer (CppNix,
+/// the builder's flat shape rules in `verify_fod_hashes` /
+/// `finalize_floating_ca`) refuses to mint a flat output that is
+/// executable in the first place.
 fn single_file_nar_content_range(nar: &[u8]) -> Result<(usize, u64), String> {
     fn read_u64(nar: &[u8], pos: &mut usize) -> Result<u64, String> {
         let end = pos
@@ -896,13 +901,13 @@ fn single_file_nar_content_range(nar: &[u8]) -> Result<(usize, u64), String> {
             std::str::from_utf8(ty).unwrap_or("<non-utf8>")
         ));
     }
-    let mut tok = read_token(nar, &mut pos)?;
+    let tok = read_token(nar, &mut pos)?;
     if tok == b"executable" {
-        let empty = read_token(nar, &mut pos)?;
-        if !empty.is_empty() {
-            return Err("malformed executable marker".to_string());
-        }
-        tok = read_token(nar, &mut pos)?;
+        return Err(
+            "executable single-file NARs are not valid flat content-addressed outputs \
+             (the flat hash ignores the bit; CppNix rejects this shape)"
+                .to_string(),
+        );
     }
     if tok != b"contents" {
         return Err(format!(
@@ -1172,17 +1177,26 @@ mod verify_nar_tests {
 
     #[test]
     fn single_file_nar_content_range_validates_framing() {
-        // Round-trip against the writer for both executable flavors.
-        for executable in [false, true] {
-            let node = rio_nix::nar::NarNode::Regular {
-                executable,
-                contents: b"hello".to_vec(),
-            };
-            let mut nar = Vec::new();
-            rio_nix::nar::serialize(&mut nar, &node).unwrap();
-            let (off, len) = single_file_nar_content_range(&nar).expect("valid single-file NAR");
-            assert_eq!(&nar[off..off + len as usize], b"hello");
-        }
+        // Round-trip against the writer for the non-executable shape.
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: b"hello".to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let (off, len) = single_file_nar_content_range(&nar).expect("valid single-file NAR");
+        assert_eq!(&nar[off..off + len as usize], b"hello");
+        // The executable marker is rejected: the flat hash ignores the
+        // bit, so accepting it would let two different NARs verify
+        // against one content-derived path (CppNix rejects the shape).
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: true,
+            contents: b"hello".to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let err = single_file_nar_content_range(&nar).unwrap_err();
+        assert!(err.contains("executable"), "got: {err}");
         // Directory NARs are not single files.
         let dir = rio_nix::nar::NarNode::Directory { entries: vec![] };
         let mut nar = Vec::new();
@@ -1317,6 +1331,32 @@ mod verify_nar_tests {
         info.content_address = Some(format!("fixed:r:{}", other_hash.to_colon()));
         let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
         assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// An executable single-file NAR claimed as a flat CA upload is
+    /// rejected: the flat hash ignores the executable bit, so accepting
+    /// it would register the executable variant at the path honest
+    /// producers only ever mint for the non-executable bytes.
+    #[test]
+    fn ca_flat_executable_nar_rejected() {
+        let contents = b"#!/bin/sh\necho pwned\n";
+        let digest: [u8; 32] = Sha256::digest(contents).into();
+        let flat_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
+        let path =
+            rio_nix::store_path::StorePath::make_fixed_output("flat-exec", &flat_hash, false, &[])
+                .unwrap();
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: true,
+            contents: contents.to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "got: {e:?}");
+        assert!(e.message().contains("executable"), "got: {}", e.message());
     }
 
     /// Flat ingestion cannot carry references or self-references; a
