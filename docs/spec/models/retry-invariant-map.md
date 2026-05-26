@@ -1149,6 +1149,32 @@ dispositions already recorded above (D1–D4, C1–C4, A5–A10):
   breached). The fix is "Cancel at the cap", never "no action at the
   cap".
 
+#### Phase-1b decision surface (T-1b.1, frozen)
+
+The §5a-2 contract as implemented in `rio-scheduler/src/retry_policy.rs`:
+`decide(&[AttemptRecord], &Budget, now: AbsTime, legacy_seed:
+Option<&PersistedRetryColumns>) -> Decision { verdict, exclusion,
+backoff_until, counters }`, a thin wrapper that maps the attempt-ledger
+suffix onto the referenceFold's event alphabet and folds it;
+`classify(&ObservedFailure, FloorOutcomeView) -> OutcomeClass`, the
+total append-time classifier carrying E2's `exempt_from_cap` predicate
+(promoted-or-CONCURRENT_PUTPATH) for both reporting channels; and
+`placeable(&exclusion, &eligible_fleet) -> Placement
+{Placeable | FleetExhausted | NoEligibleWorkers}`, the dispatch-time
+placement predicate consuming `Decision::exclusion` (the fleet-exhaust
+verdict stays out of the fold). The fourth `legacy_seed` argument is the
+transitional mixed-era floor (decision P5 / design amendment A1):
+applied only when the mirror columns are non-empty and the suffix has no
+reset row, union for `failed_builders`, max for `count` and
+`resubmit_cycles`, dropped in Phase 2 with the column drop — at which
+point the frozen 3-argument shape is restored. The fleet is not an
+argument: `decide()` never sees it, and the in-history fleet-exhaust arm
+is evaluated against an empty fleet (never exhausted). The per-cycle
+transient-cap arm is kept and documented as defaults-shadowed (P3); the
+transient arm carries no promotion exemption and `classify()` never
+consults the floor for transients (P4 — coverage stays with the
+`sched.retry.promotion-exempt+3` unit tests).
+
 ### Stage-C verify-marker status
 
 No new tracey markers: the calibration checks are regression guards for

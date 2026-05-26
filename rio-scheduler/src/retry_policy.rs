@@ -14,16 +14,36 @@
 //! exclusion set, and the budget verdicts (requeue / poison / cancel /
 //! TTL-expire).
 //!
-//! **This module is dead code until Phase 1.** Nothing in the actor calls
-//! it. It exists so that (a) the `retryPolicy.qnt` model's
-//! `CountersRefineHistory` invariant has a precise definition to compare
-//! the live counters against, (b) the divergences between the nine entry
-//! points are pinned as executable adjudications rather than prose, and
-//! (c) Phase 1's `decide()` has a tested starting point. It is wired as a
-//! module (rather than left on disk unreferenced) so clippy, rustfmt, and
-//! the unit tests run against it; `#[allow(dead_code)]` on the `mod` item
-//! suppresses the unused-item lint until Phase 1 wires it into the
-//! decision sites.
+//! **The fold became load-bearing in Phase 1b.** [`reference_fold`]
+//! itself stays the executable specification (and the model's oracle);
+//! the production decision surface layered on top of it is
+//! [`decide`] / [`classify`] / [`placeable`] (the design's §5a-2
+//! contract), which the nine entry points call as they collapse
+//! (T-1b.2 onward). Until every site has collapsed, the not-yet-collapsed
+//! sites keep reading the legacy `RetryState` counters; `#[allow(dead_code)]`
+//! on the `mod` item stays until the whole surface has callers.
+//!
+//! ## Phase-1 scope notes (P3/P4, recorded here per the Phase-1 plan)
+//!
+//! - **P3 (transient per-cycle cap):** `decide()`'s transient arm keeps
+//!   the `max_retries` cap (`PoisonReason::TransientBudget`). Under
+//!   production defaults the arm is shadowed by the distinct-worker
+//!   poison threshold (see the comment at the cap check in [`apply`]);
+//!   it stays because `sched.retry.transient-budget`'s final clause
+//!   mandates it and non-distinct/dev configurations still reach it.
+//! - **P4 (floor-promotion exemption, the c13f6a277 / I-213 class):**
+//!   the exemption is infra-class only. [`classify`] maps a
+//!   worker-reported infra failure with `floor_outcome.promoted` or a
+//!   CONCURRENT_PUTPATH message — and a promoted controller
+//!   termination — to the exempt infra class; a `TransientFailure`
+//!   classifies as `transient` with **no floor outcome consulted**, and
+//!   the transient arm carries no exemption (the as-built
+//!   `handle_transient_failure` has no floor/promotion guard).
+//!   Regression coverage for the promotion-exempt ladder stays with the
+//!   existing `sched.retry.promotion-exempt+3` unit tests
+//!   (`test_transient_failure_promotion_exempt_from_max_retries`); the
+//!   floor oracle is NOT extended to transient events and the model
+//!   deliberately does not encode one (NOT-ENC).
 //!
 //! ## What "the history" is
 //!
@@ -61,8 +81,13 @@
 //! - The backoff is the deterministic curve `min(base · multᵃ, cap)`
 //!   without the production ±jitter; the model compares `backoff_until`
 //!   modulo the jitter spread.
-//! - Executor identities are plain `String`s so the module stays a leaf
-//!   (no dependency on the actor, the DAG, the state machine, or tokio).
+//! - Executor identities are plain `String`s so the fold core stays a
+//!   leaf (no dependency on the actor, the DAG, the state machine, or
+//!   tokio). The Phase-1b decision surface ([`decide`] and friends)
+//!   consumes the state module's plain data vocabulary
+//!   ([`AttemptRecord`], [`OutcomeClass`], [`ExecutorId`]) and maps it
+//!   onto the fold's String-based events; it still has no actor, DAG, or
+//!   tokio dependency.
 //! - The fold assumes the derivation is in a dispatchable, non-terminal
 //!   state when each event arrives — the entry points' "is the node still
 //!   poison-able" status guards are upstream of the accounting, and an
@@ -70,6 +95,8 @@
 //!   observed history.
 
 use std::collections::HashSet;
+
+use crate::state::{AttemptEventKind, AttemptRecord, ExecutorId, OutcomeClass, ReportingParty};
 
 /// Abstract monotonic clock, in whole seconds since an arbitrary origin.
 pub(crate) type AbsTime = u64;
@@ -358,6 +385,18 @@ pub(crate) struct PersistedRetryColumns {
     pub poisoned_at: Option<AbsTime>,
 }
 
+impl PersistedRetryColumns {
+    /// Whether the mirror columns carry any pre-existing retry state at
+    /// all. An all-default row contributes nothing to the legacy seed
+    /// (decision P5), so [`decide`] skips the floor entirely for it.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.retry_count == 0
+            && self.resubmit_cycles == 0
+            && self.failed_builders.is_empty()
+            && self.poisoned_at.is_none()
+    }
+}
+
 /// Which budget's exhaustion produced a `Poison` verdict. The production
 /// poison reason is a free-form string (synthesized on some paths,
 /// carrying the worker's error message on others — divergence A8); the
@@ -438,7 +477,21 @@ pub(crate) fn reference_fold(
     budget: &Budget,
     fleet: &FleetView,
 ) -> (Counters, Verdict) {
-    let mut c = Counters::default();
+    fold_events(Counters::default(), history, now, budget, fleet)
+}
+
+/// The fold body shared by [`reference_fold`] (which always starts from
+/// the default counters) and [`decide`] (which may start from the
+/// transitional legacy seed): apply every event in order, then downgrade
+/// a stale poison to [`Verdict::TtlExpire`].
+fn fold_events(
+    initial: Counters,
+    history: &[AttemptEvent],
+    now: AbsTime,
+    budget: &Budget,
+    fleet: &FleetView,
+) -> (Counters, Verdict) {
+    let mut c = initial;
     let mut verdict = Verdict::Requeue;
 
     for ev in history {
@@ -489,6 +542,17 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
                 c.backoff_until = Some(at.saturating_add(backoff));
                 Verdict::Requeue
             } else {
+                // P3 (keep-and-document): under production defaults
+                // (`require_distinct_workers = true`, threshold 3,
+                // `max_retries` 2, one-shot executors that are always
+                // distinct and excluded from placement once failed) the
+                // distinct-worker threshold above fires at the same
+                // failure as — or before — this per-cycle cap, so this
+                // arm is defaults-shadowed. It stays because
+                // `sched.retry.transient-budget`'s final clause mandates
+                // it and it is live whenever the threshold exceeds
+                // `max_retries + 1` or distinct-worker counting is off
+                // (single-worker dev deployments).
                 c.poisoned_at = Some(*at);
                 Verdict::Poison(PoisonReason::TransientBudget)
             }
@@ -719,6 +783,333 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
             *c = Counters::default();
             Verdict::Requeue
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase-1b decision surface: decide() / classify() / placeable()
+//
+// The design's frozen §5a-2 contract, layered on the fold above. The nine
+// entry points become callers of these three functions as they collapse
+// (T-1b.2 onward); the fold core (`reference_fold` / `apply`) stays the
+// executable spec and is not changed by the collapse.
+// ---------------------------------------------------------------------------
+
+/// The decision-surface output for one appending-transaction read: the
+/// budget verdict plus the derived views the call sites consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Decision {
+    /// The budget verdict as of the end of the history.
+    pub verdict: Verdict,
+    /// The per-executor exclusion set (the fold's `failed_builders`) in
+    /// the actor's identifier vocabulary. E1's fleet-exhaust arm and the
+    /// E9 dispatch backstop intersect it with the live eligible fleet via
+    /// [`placeable`]; `hard_filter` keeps reading the RAM set until the
+    /// dispatch-time readers convert (T-1b.13).
+    pub exclusion: HashSet<ExecutorId>,
+    /// The deterministic backoff deadline (no jitter — the dispatch site
+    /// applies the production jitter exactly as today).
+    pub backoff_until: Option<AbsTime>,
+    /// The full fold-derived counter view.
+    pub counters: Counters,
+}
+
+/// Phase-1b decision function: fold a derivation's attempt-ledger suffix
+/// into the budget verdict and the derived counter/exclusion views.
+///
+/// `history` is the post-reset suffix in ledger order (what
+/// `load_attempt_suffix` returns, or the in-memory mirror of it),
+/// INCLUDING the row the calling site just appended — the verdict is the
+/// disposition produced by the last decision-bearing event. `now` is
+/// epoch seconds (the same clock as `AttemptRecord::occurred_at_epoch_secs`)
+/// and is consulted only for the poison-TTL downgrade.
+///
+/// The fleet-exhaust arm is deliberately NOT part of this fold: the
+/// eligible fleet is not history, so the in-history check is evaluated
+/// against an empty fleet (never exhausted) and the call sites consume
+/// [`Decision::exclusion`] through [`placeable`] instead.
+///
+/// `legacy_seed` is the **transitional** mixed-era input (decision P5 /
+/// design amendment A1, removed in Phase 2 with the mirror-column drop):
+/// when the derivation's `derivations.{retry_count, failed_builders,
+/// resubmit_cycles}` columns are non-empty and the suffix contains no
+/// reset row, the fold is floored by the legacy projection so a failure
+/// history that spans the 066 deployment keeps every counter that
+/// survives failover today. The floor semantics are union for
+/// `failed_builders`, max for `count` and `resubmit_cycles`, and
+/// `failure_count` seeded from the legacy set's size — never below what
+/// either era supports, and the set/threshold view cannot double-count
+/// because set inserts are idempotent. (`count`'s floor is applied after
+/// the fold, so the per-cycle transient cap check inside the fold sees
+/// only the post-066 rows during the transition; the distinct-worker
+/// threshold — the production-default bound — sees the merged set. The
+/// recovery-side merge helper in T-1b.12a unifies this.) A suffix that
+/// begins with a reset row ignores the seed; an empty suffix degenerates
+/// to the pure legacy projection, exactly as recovery does today.
+pub(crate) fn decide(
+    history: &[AttemptRecord],
+    budget: &Budget,
+    now: AbsTime,
+    legacy_seed: Option<&PersistedRetryColumns>,
+) -> Decision {
+    let has_reset = history
+        .iter()
+        .any(|r| r.event_kind == AttemptEventKind::Reset);
+    let seed = legacy_seed.filter(|s| !has_reset && !s.is_empty());
+
+    let mut initial = Counters::default();
+    if let Some(s) = seed {
+        // Set-shaped state seeds up front so the threshold / exclusion
+        // checks inside the fold see both eras (idempotent inserts make
+        // double-counting impossible); `failure_count` is floored at the
+        // legacy set's size (the same derivation recovery uses) so the
+        // non-distinct threshold never reads below what the columns
+        // support. No event in a reset-free suffix touches
+        // `resubmit_cycles`, so seeding it equals the max() floor.
+        initial.failed_builders = s.failed_builders.clone();
+        initial.failure_count = s.failed_builders.len() as u32;
+        initial.resubmit_cycles = s.resubmit_cycles;
+        initial.poisoned_at = s.poisoned_at;
+    }
+    // A suffix that starts at a resubmit-reset row carries the new cycle
+    // index on the row itself; seed the pre-fold counter so the reset
+    // arm's `prior + 1` reproduces it (the loader cuts the suffix at the
+    // most recent reset, so prior cycles are not otherwise visible).
+    if let Some(first) = history.first()
+        && first.event_kind == AttemptEventKind::Reset
+        && first.outcome_class == OutcomeClass::ResubmitReset
+    {
+        initial.resubmit_cycles = u32::try_from(first.resubmit_cycle)
+            .unwrap_or(0)
+            .saturating_sub(1);
+    }
+
+    let events: Vec<AttemptEvent> = history.iter().filter_map(record_to_event).collect();
+    let (mut counters, verdict) = fold_events(initial, &events, now, budget, &FleetView::default());
+
+    if let Some(s) = seed {
+        // The legacy floor for the per-cycle count (P5): max, not sum —
+        // post-066 rows that the still-active legacy writer also mirrored
+        // into the column must not count twice.
+        counters.count = counters.count.max(s.retry_count);
+    }
+
+    Decision {
+        verdict,
+        exclusion: counters
+            .failed_builders
+            .iter()
+            .map(|s| ExecutorId::from(s.clone()))
+            .collect(),
+        backoff_until: counters.backoff_until,
+        counters,
+    }
+}
+
+/// Map one ledger record onto the fold's event alphabet. Returns `None`
+/// for rows that are deliberately no-ops for the fold: the per-dependent
+/// `cascade` rows (the trigger's own poison row carries the charge) and
+/// the E9 `fleet_exhaust` verdict marker (the placement verdict is
+/// re-derived from the exclusion set and the live fleet by [`placeable`],
+/// never folded from history).
+fn record_to_event(record: &AttemptRecord) -> Option<AttemptEvent> {
+    let at = record.occurred_at_epoch_secs as AbsTime;
+    let executor = record
+        .executor_id
+        .as_ref()
+        .map(|e| e.as_str().to_string())
+        .unwrap_or_default();
+    if record.event_kind == AttemptEventKind::Reset {
+        return match record.outcome_class {
+            OutcomeClass::ResubmitReset => Some(AttemptEvent::ResubmitReset { at }),
+            OutcomeClass::CacheHitClear => Some(AttemptEvent::CacheHitClear { at }),
+            OutcomeClass::PoisonCleared => Some(AttemptEvent::PoisonCleared { at }),
+            // A reset row never carries an attempt class (writer
+            // discipline + the migration's CHECK); fold a malformed one
+            // as a no-op rather than guess.
+            _ => None,
+        };
+    }
+    let worker_reported = record.reporting_party == ReportingParty::Worker;
+    match record.outcome_class {
+        OutcomeClass::Transient => Some(AttemptEvent::Transient { at, executor }),
+        OutcomeClass::Infra | OutcomeClass::ExemptInfra => {
+            let exempt = record.outcome_class == OutcomeClass::ExemptInfra;
+            if worker_reported {
+                // E2 — the worker-reported arm, including its exempt
+                // fall-through to the stale-window reset.
+                Some(AttemptEvent::Infra {
+                    at,
+                    executor,
+                    exempt,
+                    at_cap: record.floor_at_cap,
+                })
+            } else {
+                // E6 — a controller-classified attempt (the two-installment
+                // fill, or the race-ahead append). The exemption rides on
+                // the class itself; `at_cap` on the stored floor flag.
+                //
+                // Accepted limitation for T-1b.1–T-1b.6: the 1a second
+                // installment fills only `termination_reason` +
+                // `outcome_class`, so an at-cap controller termination's
+                // row still reads `floor_at_cap = false` and folds as the
+                // charges-nothing arm here. The as-built E6 site keeps
+                // enforcing the at-cap infra cap from RAM until its own
+                // collapse (T-1b.9), which owns making the installment
+                // carry the floor outcome.
+                Some(AttemptEvent::ControllerTermination {
+                    at,
+                    executor,
+                    promoted: exempt || record.floor_promoted,
+                    at_cap: record.floor_at_cap,
+                })
+            }
+        }
+        OutcomeClass::Timeout => {
+            if worker_reported {
+                Some(AttemptEvent::WorkerTimeout { at, executor })
+            } else {
+                Some(AttemptEvent::ControllerDeadlineExceeded { at, executor })
+            }
+        }
+        OutcomeClass::Permanent => Some(AttemptEvent::Permanent { at, executor }),
+        OutcomeClass::Backstop => Some(AttemptEvent::BackstopTimeout { at, executor }),
+        // First-installment disconnect rows: classification not yet
+        // established; charges nothing, re-checks the threshold (E5).
+        OutcomeClass::Disconnected => Some(AttemptEvent::Disconnect { at, executor }),
+        // TODO: T-1b.11 (C2) — an established unreported executor crash
+        // charges the threshold/exclusion budget once that task lands.
+        // Until then it folds exactly as an uncharged disconnect
+        // re-check, which is the as-built behavior.
+        OutcomeClass::ExecutorCrash => Some(AttemptEvent::Disconnect { at, executor }),
+        OutcomeClass::Cascade | OutcomeClass::FleetExhaust => None,
+        // Reset classes only ever ride on `event_kind = 'reset'` rows
+        // (handled above); an attempt-kind row carrying one is malformed
+        // — fold it as a no-op rather than guess.
+        OutcomeClass::ResubmitReset | OutcomeClass::CacheHitClear | OutcomeClass::PoisonCleared => {
+            None
+        }
+    }
+}
+
+/// The floor-bump outcome as [`classify`] consumes it — a leaf-local
+/// mirror of the actor's `FloorOutcome` so this module keeps no actor
+/// dependency. `promoted` and `at_cap` are mutually exclusive; both are
+/// false for non-resource events and for the cold-start no-intent case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FloorOutcomeView {
+    /// The floor doubled — the attempt is a sizing signal, exempt from
+    /// the non-exempt infra cap.
+    pub promoted: bool,
+    /// The relevant dimension was already at its ceiling.
+    pub at_cap: bool,
+}
+
+/// One observed failure trigger, as the entry point sees it at append
+/// time — the input vocabulary of [`classify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedFailure<'a> {
+    /// E1 — worker `CompletionReport{TransientFailure}` or `Unspecified`.
+    WorkerTransient,
+    /// E2 — worker `CompletionReport{InfrastructureFailure}`; the error
+    /// message drives the CONCURRENT_PUTPATH half of the exemption.
+    WorkerInfra { error_msg: &'a str },
+    /// E3 — one of the seven permanent failure statuses.
+    WorkerPermanent,
+    /// E4 — worker `CompletionReport{TimedOut}`.
+    WorkerTimeout,
+    /// E5 — stream disconnect / heartbeat timeout / force-drain released
+    /// the execution; classification not yet established.
+    Disconnect,
+    /// E6 — controller `ReportExecutorTermination{OomKilled,
+    /// EvictedDiskPressure}`.
+    ControllerResourceTermination,
+    /// E7 — controller `ReportExecutorTermination{DeadlineExceeded}`.
+    ControllerDeadlineExceeded,
+    /// E8 — the scheduler-side backstop timer fired for a Running build
+    /// with no report.
+    BackstopTimeout,
+    /// The correlation-TTL sweep (or backstop) established a disconnect
+    /// whose classifying report never arrived.
+    UnreportedCrash,
+}
+
+// r[impl sched.retry.exempt-infra-cap]
+/// The third total function of the decision surface: classify one
+/// observed failure event into the ledger's outcome-class alphabet,
+/// consuming the floor outcome at append time so [`decide`] never sees
+/// the floor (G6's bug class becomes a classification bug with this
+/// single checked contract).
+///
+/// The exemption predicate is exactly E2's as-built `exempt_from_cap`
+/// (`floor_outcome.promoted || CONCURRENT_PUTPATH`), extended to the
+/// controller channel per `sched.retry.exempt-infra-cap`'s "every exempt
+/// attempt" (divergence D3's adjudicated side; the charge becomes
+/// decision-visible as the sites collapse). A transient failure never
+/// consults the floor (P4).
+pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> OutcomeClass {
+    match event {
+        ObservedFailure::WorkerTransient => OutcomeClass::Transient,
+        ObservedFailure::WorkerInfra { error_msg } => {
+            if floor.promoted || error_msg.contains(rio_proto::CONCURRENT_PUTPATH_MSG) {
+                OutcomeClass::ExemptInfra
+            } else {
+                OutcomeClass::Infra
+            }
+        }
+        ObservedFailure::WorkerPermanent => OutcomeClass::Permanent,
+        ObservedFailure::WorkerTimeout => OutcomeClass::Timeout,
+        ObservedFailure::Disconnect => OutcomeClass::Disconnected,
+        ObservedFailure::ControllerResourceTermination => {
+            if floor.promoted {
+                OutcomeClass::ExemptInfra
+            } else {
+                OutcomeClass::Infra
+            }
+        }
+        ObservedFailure::ControllerDeadlineExceeded => OutcomeClass::Timeout,
+        ObservedFailure::BackstopTimeout => OutcomeClass::Backstop,
+        ObservedFailure::UnreportedCrash => OutcomeClass::ExecutorCrash,
+    }
+}
+
+/// The placement verdict for a derivation given its exclusion set and
+/// the live eligible fleet — [`exhausts_fleet`]'s answer plus the
+/// "is there anyone left to take it" discrimination the dispatch site
+/// needs. Pure; the operator-facing exhaustion observability (warn! +
+/// metric) stays at the call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// At least one eligible worker is not in the exclusion set.
+    Placeable,
+    /// The eligible fleet is non-empty and every member has already
+    /// failed this derivation — the fleet-exhaust poison arm (E1/E9).
+    FleetExhausted,
+    /// No statically-eligible, non-draining worker is registered at all:
+    /// defer, never poison (the empty-fleet clause of
+    /// `sched.dispatch.fleet-exhaust+3` — an empty pool is a
+    /// provisioning transient).
+    NoEligibleWorkers,
+}
+
+// r[impl sched.dispatch.fleet-exhaust+3]
+/// The fleet-exhaust / placement predicate consumed by E1's fleet arm
+/// and the E9 dispatch backstop: intersect [`Decision::exclusion`] with
+/// the caller's snapshot of the statically-eligible, non-draining,
+/// registered fleet. Mirrors [`exhausts_fleet`] (and the as-built
+/// `failed_builders_exhausts_fleet`): an empty exclusion set or an empty
+/// eligible fleet never reads as exhausted.
+pub(crate) fn placeable(
+    excluded: &HashSet<ExecutorId>,
+    eligible: &HashSet<ExecutorId>,
+) -> Placement {
+    if eligible.is_empty() {
+        return Placement::NoEligibleWorkers;
+    }
+    if !excluded.is_empty() && eligible.iter().all(|w| excluded.contains(w)) {
+        Placement::FleetExhausted
+    } else {
+        Placement::Placeable
     }
 }
 
@@ -1219,6 +1610,443 @@ mod tests {
             recovered.failure_count <= live.failure_count
                 && recovered.failed_builders == live.failed_builders,
             "no fabrication: every recovered value is supported by a column"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-1b decision surface: decide() / classify() / placeable()
+    // -----------------------------------------------------------------
+
+    /// Test-side `AttemptRecord` builder: the fields the fold consumes,
+    /// everything else defaulted. `at` is epoch seconds.
+    fn rec(class: OutcomeClass, party: ReportingParty, executor: &str, at: u64) -> AttemptRecord {
+        AttemptRecord {
+            attempt_id: uuid::Uuid::now_v7(),
+            event_kind: AttemptEventKind::Attempt,
+            outcome_class: class,
+            exec_id: None,
+            executor_id: (!executor.is_empty()).then(|| ExecutorId::from(executor)),
+            termination_reason: None,
+            reporting_party: party,
+            exempt: class == OutcomeClass::ExemptInfra,
+            floor_promoted: false,
+            floor_at_cap: false,
+            error_msg: None,
+            final_line_count: None,
+            resubmit_cycle: 0,
+            occurred_at_epoch_secs: at as f64,
+            recorded_at_epoch_secs: at as f64,
+        }
+    }
+
+    /// A reset-event record (`event_kind = 'reset'`).
+    fn reset_rec(class: OutcomeClass, resubmit_cycle: i32, at: u64) -> AttemptRecord {
+        AttemptRecord {
+            event_kind: AttemptEventKind::Reset,
+            resubmit_cycle,
+            ..rec(class, ReportingParty::Scheduler, "", at)
+        }
+    }
+
+    fn worker_rec(class: OutcomeClass, executor: &str, at: u64) -> AttemptRecord {
+        rec(class, ReportingParty::Worker, executor, at)
+    }
+
+    fn decide_default(history: &[AttemptRecord], now: AbsTime) -> Decision {
+        decide(history, &Budget::default(), now, None)
+    }
+
+    fn seed(retry_count: u32, resubmit_cycles: u32, failed: &[&str]) -> PersistedRetryColumns {
+        PersistedRetryColumns {
+            retry_count,
+            resubmit_cycles,
+            failed_builders: failed.iter().map(|s| s.to_string()).collect(),
+            poisoned_at: None,
+        }
+    }
+
+    /// An empty suffix with no seed is the default state: requeue,
+    /// nothing excluded, no backoff.
+    #[test]
+    fn decide_empty_history_is_requeue() {
+        let d = decide_default(&[], 0);
+        assert_eq!(d.verdict, Verdict::Requeue);
+        assert!(d.exclusion.is_empty());
+        assert_eq!(d.backoff_until, None);
+        assert_eq!(d.counters, Counters::default());
+    }
+
+    /// decide() over worker-reported ledger rows reproduces the
+    /// reference fold's hand-computed transient-budget history: two
+    /// same-worker retries with backoff, poison via the per-cycle cap on
+    /// the third, and the executor lands in the exclusion set.
+    #[test]
+    fn decide_transient_budget_matches_the_reference_fold() {
+        let h = [
+            worker_rec(OutcomeClass::Transient, "w1", 100),
+            worker_rec(OutcomeClass::Transient, "w1", 200),
+            worker_rec(OutcomeClass::Transient, "w1", 300),
+        ];
+        let oracle_events = [t(100, "w1"), t(200, "w1"), t(300, "w1")];
+
+        let d = decide_default(&h[..2], 200);
+        let (oc, ov) = fold(&oracle_events[..2], 200);
+        assert_eq!(d.counters, oc, "counters match the reference fold");
+        assert_eq!(d.verdict, ov);
+        assert_eq!(d.backoff_until, Some(210));
+        assert!(d.exclusion.contains(&ExecutorId::from("w1")));
+
+        let d = decide_default(&h, 300);
+        let (oc, ov) = fold(&oracle_events, 300);
+        assert_eq!(d.counters, oc);
+        assert_eq!(d.verdict, ov);
+        assert_eq!(d.verdict, Verdict::Poison(PoisonReason::TransientBudget));
+    }
+
+    /// decide() over the worker infra family: the non-exempt budget is
+    /// check-then-increment with the 300 s window, exactly as the fold's
+    /// infra history; exempt rows charge only the exemption budget.
+    #[test]
+    fn decide_infra_budget_and_window_match_the_reference_fold() {
+        let mut h: Vec<AttemptRecord> = (0..10)
+            .map(|i| worker_rec(OutcomeClass::Infra, "w1", 100 + i))
+            .collect();
+        let d = decide_default(&h, 200);
+        assert_eq!(d.counters.infra_count, 10);
+        assert_eq!(d.counters.last_infra_failure_at, Some(109));
+        assert_eq!(d.verdict, Verdict::Requeue);
+        assert!(
+            d.exclusion.is_empty(),
+            "infra failures never join the exclusion set"
+        );
+
+        h.push(worker_rec(OutcomeClass::Infra, "w1", 110));
+        let d = decide_default(&h, 200);
+        assert_eq!(d.verdict, Verdict::Poison(PoisonReason::InfraBudget));
+
+        // Sparse failures past the window are forgiven before charging.
+        let sparse = [
+            worker_rec(OutcomeClass::Infra, "w1", 100),
+            worker_rec(OutcomeClass::Infra, "w1", 452),
+        ];
+        let d = decide_default(&sparse, 452);
+        assert_eq!(d.counters.infra_count, 1, "window reset then charge");
+    }
+
+    /// The worker timeout budget through decide(): four requeues then
+    /// terminal Cancel, never Poisoned.
+    #[test]
+    fn decide_worker_timeout_cap_is_cancel() {
+        let h: Vec<AttemptRecord> = (0..5)
+            .map(|i| worker_rec(OutcomeClass::Timeout, "w1", 100 + i))
+            .collect();
+        let d = decide_default(&h[..4], 200);
+        assert_eq!(d.counters.timeout_count, 4);
+        assert_eq!(d.verdict, Verdict::Requeue);
+        let d = decide_default(&h, 200);
+        assert_eq!(d.verdict, Verdict::Cancel);
+        assert_eq!(d.counters.poisoned_at, None);
+    }
+
+    /// A permanent failure poisons immediately and the TTL downgrade
+    /// works through decide()'s `now`.
+    #[test]
+    fn decide_permanent_poisons_and_ttl_expires() {
+        let h = [worker_rec(OutcomeClass::Permanent, "w1", 1_000)];
+        let d = decide_default(&h, 1_000);
+        assert_eq!(d.verdict, Verdict::Poison(PoisonReason::Permanent));
+        let ttl = Budget::default().poison_ttl_secs;
+        let d = decide_default(&h, 1_000 + ttl + 1);
+        assert_eq!(d.verdict, Verdict::TtlExpire);
+    }
+
+    /// A promoted / CONCURRENT_PUTPATH exempt-infra history: classify()
+    /// maps it to the exempt class, and decide() charges only
+    /// `exempt_infra_count` — never the transient count, never the
+    /// non-exempt infra count.
+    #[test]
+    fn decide_exempt_infra_history_charges_only_the_exemption_budget() {
+        // classify(): both exemption vehicles map to ExemptInfra.
+        assert_eq!(
+            classify(
+                &ObservedFailure::WorkerInfra { error_msg: "boom" },
+                FloorOutcomeView {
+                    promoted: true,
+                    at_cap: false
+                }
+            ),
+            OutcomeClass::ExemptInfra
+        );
+        let putpath_msg = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);
+        assert_eq!(
+            classify(
+                &ObservedFailure::WorkerInfra {
+                    error_msg: &putpath_msg
+                },
+                FloorOutcomeView::default()
+            ),
+            OutcomeClass::ExemptInfra
+        );
+
+        let h: Vec<AttemptRecord> = (0..3)
+            .map(|i| worker_rec(OutcomeClass::ExemptInfra, "w1", 100 + i))
+            .collect();
+        let d = decide_default(&h, 200);
+        assert_eq!(d.counters.exempt_infra_count, 3);
+        assert_eq!(d.counters.infra_count, 0);
+        assert_eq!(d.counters.count, 0, "never the transient budget");
+        assert_eq!(d.verdict, Verdict::Requeue);
+    }
+
+    /// The controller-classified rows: a promoted controller termination
+    /// (class `exempt_infra`, scheduler/controller-reported) charges the
+    /// exemption budget — divergence D3's adjudicated side, visible to
+    /// any collapsed reader of the exempt cap; an unestablished
+    /// `disconnected` row charges nothing.
+    #[test]
+    fn decide_controller_promoted_termination_charges_the_exemption_budget() {
+        let h = [
+            rec(
+                OutcomeClass::ExemptInfra,
+                ReportingParty::Scheduler,
+                "w1",
+                100,
+            ),
+            rec(
+                OutcomeClass::Disconnected,
+                ReportingParty::Scheduler,
+                "w1",
+                110,
+            ),
+        ];
+        let d = decide_default(&h, 120);
+        assert_eq!(d.counters.exempt_infra_count, 1, "D3: the fold charges");
+        assert_eq!(d.counters.infra_count, 0);
+        assert_eq!(d.counters.failure_count, 0);
+        assert_eq!(d.verdict, Verdict::Requeue);
+    }
+
+    /// Backstop rows charge the threshold/exclusion budget and the third
+    /// distinct wedged worker poisons; cascade and fleet-exhaust marker
+    /// rows are no-ops for the fold.
+    #[test]
+    fn decide_backstop_rows_bound_the_wedge_loop_and_markers_are_noops() {
+        let h = [
+            rec(OutcomeClass::Backstop, ReportingParty::Scheduler, "w1", 10),
+            rec(OutcomeClass::Cascade, ReportingParty::Scheduler, "", 11),
+            rec(OutcomeClass::Backstop, ReportingParty::Scheduler, "w2", 20),
+            rec(
+                OutcomeClass::FleetExhaust,
+                ReportingParty::Scheduler,
+                "",
+                21,
+            ),
+            rec(OutcomeClass::Backstop, ReportingParty::Scheduler, "w3", 30),
+        ];
+        let d = decide_default(&h[..4], 25);
+        assert_eq!(d.counters.failed_builders.len(), 2);
+        assert_eq!(d.verdict, Verdict::Requeue);
+        let d = decide_default(&h, 35);
+        assert_eq!(d.counters.failed_builders.len(), 3);
+        assert_eq!(d.verdict, Verdict::Poison(PoisonReason::Threshold));
+        assert_eq!(d.exclusion.len(), 3);
+    }
+
+    /// An `executor_crash` history charges nothing yet: the C2 charge
+    /// lands in T-1b.11; until then an established crash folds exactly
+    /// like an uncharged disconnect re-check (the as-built behavior).
+    // TODO: T-1b.11 — flip this test to assert the threshold/exclusion
+    // charge once classify()/decide() charge established crashes.
+    #[test]
+    fn decide_executor_crash_history_is_uncharged_until_t1b11() {
+        let h: Vec<AttemptRecord> = (0..4)
+            .map(|i| {
+                rec(
+                    OutcomeClass::ExecutorCrash,
+                    ReportingParty::Scheduler,
+                    &format!("w{i}"),
+                    100 + i,
+                )
+            })
+            .collect();
+        let d = decide_default(&h, 200);
+        assert_eq!(d.counters, Counters::default());
+        assert_eq!(d.verdict, Verdict::Requeue);
+        assert!(d.exclusion.is_empty());
+    }
+
+    /// A suffix that begins with a resubmit-reset row seeds
+    /// `resubmit_cycles` from the row's cycle index, and the per-cycle
+    /// budget is fresh.
+    #[test]
+    fn decide_leading_resubmit_reset_seeds_the_cycle_index() {
+        let h = [
+            reset_rec(OutcomeClass::ResubmitReset, 2, 400),
+            worker_rec(OutcomeClass::Transient, "w1", 500),
+        ];
+        let d = decide_default(&h, 500);
+        assert_eq!(d.counters.resubmit_cycles, 2, "carried from the row");
+        assert_eq!(d.counters.count, 1, "fresh per-cycle budget");
+        assert_eq!(d.verdict, Verdict::Requeue);
+
+        // Cache-hit and poison-clear reset rows behave as the fold's
+        // clear events (no cycle carried).
+        let h = [
+            worker_rec(OutcomeClass::Transient, "w1", 100),
+            reset_rec(OutcomeClass::CacheHitClear, 0, 200),
+        ];
+        let d = decide_default(&h, 200);
+        assert_eq!(d.counters.count, 0);
+        assert_eq!(d.counters.backoff_until, Some(105), "clear() keeps backoff");
+    }
+
+    /// P5 legacy seed, degenerate case: an empty suffix with non-empty
+    /// mirror columns is exactly the documented recovery projection.
+    #[test]
+    fn decide_seed_only_degenerates_to_the_legacy_projection() {
+        let s = seed(2, 1, &["legacy-a", "legacy-b"]);
+        let d = decide(&[], &Budget::default(), 0, Some(&s));
+        assert_eq!(d.counters, Counters::recovery_projection(&s));
+        assert_eq!(d.verdict, Verdict::Requeue);
+        assert_eq!(d.exclusion.len(), 2);
+    }
+
+    /// P5 legacy seed + post-066 rows: the threshold, the exclusion set,
+    /// and the resubmit bound reflect both eras — a single new distinct
+    /// failure on top of two legacy-era distinct failures crosses the
+    /// distinct-worker threshold, and `count` is floored at the column
+    /// value (max, not sum).
+    #[test]
+    fn decide_seed_plus_attempts_reflect_both_eras() {
+        let s = seed(1, 1, &["legacy-a", "legacy-b"]);
+        let h = [worker_rec(OutcomeClass::Transient, "w-new", 100)];
+        let d = decide(&h, &Budget::default(), 100, Some(&s));
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::Threshold),
+            "third distinct executor across the eras crosses the threshold"
+        );
+        assert_eq!(d.counters.failed_builders.len(), 3);
+        assert_eq!(d.exclusion.len(), 3);
+        assert!(d.exclusion.contains(&ExecutorId::from("legacy-a")));
+        assert!(d.exclusion.contains(&ExecutorId::from("w-new")));
+        assert_eq!(d.counters.resubmit_cycles, 1);
+        assert!(
+            d.counters.count >= 1,
+            "count is floored at the column value (max, not sum)"
+        );
+    }
+
+    /// P5 legacy seed: a suffix that contains a reset row ignores the
+    /// seed entirely (the reset clears within-cycle state under both
+    /// semantics and the reset row carries the cycle index itself).
+    #[test]
+    fn decide_seed_is_ignored_when_the_suffix_has_a_reset_row() {
+        let s = seed(2, 1, &["legacy-a", "legacy-b"]);
+        let h = [
+            reset_rec(OutcomeClass::ResubmitReset, 2, 400),
+            worker_rec(OutcomeClass::Transient, "w-new", 500),
+        ];
+        let d = decide(&h, &Budget::default(), 500, Some(&s));
+        assert_eq!(
+            d.counters.failed_builders.len(),
+            1,
+            "legacy executors do not leak past a reset row"
+        );
+        assert!(!d.exclusion.contains(&ExecutorId::from("legacy-a")));
+        assert_eq!(d.counters.resubmit_cycles, 2, "from the reset row");
+        assert_eq!(d.verdict, Verdict::Requeue);
+
+        // An all-default seed is also a no-op even without a reset row.
+        let empty = PersistedRetryColumns::default();
+        let h = [worker_rec(OutcomeClass::Transient, "w-new", 100)];
+        let with = decide(&h, &Budget::default(), 100, Some(&empty));
+        let without = decide(&h, &Budget::default(), 100, None);
+        assert_eq!(with.counters, without.counters);
+        assert_eq!(with.verdict, without.verdict);
+    }
+
+    /// classify() is total over the trigger alphabet and never lets a
+    /// transient failure consult the floor (P4).
+    #[test]
+    fn classify_maps_every_trigger_and_transients_never_consult_the_floor() {
+        let promoted = FloorOutcomeView {
+            promoted: true,
+            at_cap: false,
+        };
+        let none = FloorOutcomeView::default();
+        assert_eq!(
+            classify(&ObservedFailure::WorkerTransient, promoted),
+            OutcomeClass::Transient,
+            "P4: a promoted floor never reclassifies a transient failure"
+        );
+        assert_eq!(
+            classify(&ObservedFailure::WorkerInfra { error_msg: "eio" }, none),
+            OutcomeClass::Infra
+        );
+        assert_eq!(
+            classify(&ObservedFailure::WorkerPermanent, promoted),
+            OutcomeClass::Permanent
+        );
+        assert_eq!(
+            classify(&ObservedFailure::WorkerTimeout, promoted),
+            OutcomeClass::Timeout
+        );
+        assert_eq!(
+            classify(&ObservedFailure::Disconnect, none),
+            OutcomeClass::Disconnected
+        );
+        assert_eq!(
+            classify(&ObservedFailure::ControllerResourceTermination, promoted),
+            OutcomeClass::ExemptInfra
+        );
+        assert_eq!(
+            classify(&ObservedFailure::ControllerResourceTermination, none),
+            OutcomeClass::Infra
+        );
+        assert_eq!(
+            classify(&ObservedFailure::ControllerDeadlineExceeded, none),
+            OutcomeClass::Timeout
+        );
+        assert_eq!(
+            classify(&ObservedFailure::BackstopTimeout, none),
+            OutcomeClass::Backstop
+        );
+        assert_eq!(
+            classify(&ObservedFailure::UnreportedCrash, none),
+            OutcomeClass::ExecutorCrash
+        );
+    }
+
+    /// placeable(): the three-way placement verdict mirrors the as-built
+    /// fleet-exhaust predicate, including both empty-set carve-outs.
+    #[test]
+    fn placeable_mirrors_the_fleet_exhaust_predicate() {
+        let ex = |ids: &[&str]| -> HashSet<ExecutorId> {
+            ids.iter().map(|s| ExecutorId::from(*s)).collect()
+        };
+        assert_eq!(
+            placeable(&ex(&["w1", "w2"]), &ex(&["w1", "w2"])),
+            Placement::FleetExhausted
+        );
+        assert_eq!(
+            placeable(&ex(&["w1"]), &ex(&["w1", "w2"])),
+            Placement::Placeable
+        );
+        assert_eq!(
+            placeable(&ex(&[]), &ex(&["w1"])),
+            Placement::Placeable,
+            "nothing failed yet: never exhausted"
+        );
+        assert_eq!(
+            placeable(&ex(&["w1", "w2"]), &ex(&[])),
+            Placement::NoEligibleWorkers,
+            "empty pool is a provisioning transient, never a poison"
+        );
+        // The exclusion set may contain workers no longer in the fleet.
+        assert_eq!(
+            placeable(&ex(&["gone-1", "gone-2"]), &ex(&["w-fresh"])),
+            Placement::Placeable
         );
     }
 }
