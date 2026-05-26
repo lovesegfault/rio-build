@@ -605,7 +605,7 @@ pub(crate) fn parse_io_pressure_some_avg10(content: &str) -> Option<f64> {
         .ok()
 }
 
-// r[impl builder.cores.cgroup-clamp+2]
+// r[impl builder.cores.cgroup-clamp+3]
 /// Effective core count for `build_cores` (`nix --cores`, → `make -jN`).
 ///
 /// Reads `cpu.max` from the delegated-root cgroup (`parent`). In a k8s
@@ -1128,7 +1128,7 @@ mod tests {
         assert_eq!(read_single_u64(&dir.path().join("nope")), None);
     }
 
-    // r[verify builder.cores.cgroup-clamp+2]
+    // r[verify builder.cores.cgroup-clamp+3]
     /// I-196: cpu.max → effective whole-core count for `make -jN`.
     /// Ceiling division, min 1, "max" → host nproc.
     #[test]

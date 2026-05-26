@@ -387,17 +387,22 @@ tracey rule or phase deferral.
     [On `PutPath`, the store recomputes SHA-256 over the NAR bytes and rejects
       on mismatch.],
 
-    [`restrict-eval`],
+    [Eval-time path access (daemon-era `restrict-eval`)],
     [Executor],
-    [Implemented],
-    [The executor's `nix.conf` sets `restrict-eval = true`, preventing
-      derivations from accessing paths outside the Nix store during evaluation.],
+    [Structural],
+    [rio-build never evaluates Nix expressions server-side --- derivations
+      arrive pre-evaluated from the client --- so there is no evaluator whose
+      path access could need restricting; the daemon-era `restrict-eval`
+      `nix.conf` knob has no remaining surface.],
 
     [Sandbox enforcement],
     [Executor],
     [Implemented],
-    [`sandbox = true` in `nix.conf` ensures all builds run inside the Nix
-      sandbox (user/mount/PID/network namespaces).],
+    [Every build runs inside the rio-exec sandbox (user/mount/PID namespaces,
+      plus a network namespace for everything except fixed-output builds),
+      constructed unconditionally by the executor itself with no unsandboxed
+      fallback (#rref("builder.exec.sandbox+2")); the daemon-era
+      `sandbox = true` `nix.conf` knob is gone along with the daemon.],
 
     [@dag size limit],
     [Gateway + Scheduler],

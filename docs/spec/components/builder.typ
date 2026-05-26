@@ -872,7 +872,7 @@ The per-build sub-cgroup is *measurement and cancellation only*: cgroup v2
 (#rref("builder.cgroup.kill-on-teardown")) without touching the rio-builder
 process or its FUSE threads.
 
-#r("builder.cores.cgroup-clamp+2")[
+#r("builder.cores.cgroup-clamp+3")[
   The executor MUST clamp `build_cores` (exported to the build as
   `NIX_BUILD_CORES` → `make -jN`) to
   `ceil(quota/period)` from the pod cgroup's `cpu.max`, minimum 1. It MUST NOT
@@ -883,10 +883,10 @@ process or its FUSE threads.
   (no quota), use host nproc --- but builder/fetcher pools set `limits.cpu ==
   requests.cpu` (I-197, hard limits, no burst) so production pods always see a
   real quota; the `max` fallback only fires in VM tests / bare-metal dev. The
-  same clamped value MUST also be written to the per-build `nix.conf` as
-  `cores = N` and `max-jobs = 1`, appended after any operator override (later
-  lines win): defense-in-depth against an upstream `wopSetOptions` regression
-  where the daemon would otherwise fall back to nix.conf → host nproc.
+  executor MUST export the clamped value as `NIX_BUILD_CORES` in the sandbox
+  environment --- with the daemon-era per-build `nix.conf` gone, that variable
+  is the only channel through which a build learns its core budget, so this
+  clamp is the single point of enforcement.
 ]
 
 #r("builder.oom.cgroup-watch+3")[

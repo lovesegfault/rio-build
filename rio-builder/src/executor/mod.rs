@@ -658,7 +658,7 @@ pub async fn execute_build(
                 input_metadata,
             } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
-            // r[impl builder.cores.cgroup-clamp+2]
+            // r[impl builder.cores.cgroup-clamp+3]
             // Compute once: feeds the assignment-clamped `build_cores`
             // (exported as NIX_BUILD_CORES in the sandbox env) below.
             // I-196/I-197 rationale at crate::cgroup::effective_cores.
@@ -963,7 +963,7 @@ fn resolve_build_opts(
         .map(|o| o.max_silent_time)
         .filter(|&v| v > 0)
         .unwrap_or(env.max_silent_time);
-    // r[impl builder.cores.cgroup-clamp+2]
+    // r[impl builder.cores.cgroup-clamp+3]
     // I-196: NEVER pass build_cores=0 to the build env. 0 means "use
     // nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
     // quota throttles scheduling, doesn't hide CPUs). On a 16-core
@@ -972,8 +972,9 @@ fn resolve_build_opts(
     // (I-197: pools set limits.cpu == requests.cpu so cpu.max is
     // always a real quota), and cap any client-requested value at the
     // same ceiling — a client asking for --cores 64 on a 2-core pod
-    // gets 2. Computed once in the caller (also written to nix.conf in
-    // prepare_sandbox as defense-in-depth).
+    // gets 2. Computed once in the caller; the clamped value reaches
+    // the build solely as NIX_BUILD_CORES in the sandbox env (there is
+    // no per-build nix.conf anymore).
     let effective_cores = u64::from(effective_cores);
     // r[impl sched.sla.cores-reach-nix-build-cores]
     // ADR-023: scheduler-assigned cores are authoritative when set. The
@@ -1062,7 +1063,7 @@ struct NativeOutcome {
 /// failures reported by rio-exec — is carried in
 /// `NativeOutcome.build_result` so the caller tears down the overlay
 /// before propagating.
-// r[impl builder.cores.cgroup-clamp+2]
+// r[impl builder.cores.cgroup-clamp+3]
 // r[impl builder.silence.timeout-kill+3]
 // r[impl builder.stderr.forward-set-phase+2]
 #[instrument(skip_all, fields(drv_path = %args.drv_path))]
