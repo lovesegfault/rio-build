@@ -176,7 +176,15 @@ pub(super) async fn collect_native_outputs(
                 built_outputs.push(BuiltOutput {
                     output_name: out.name.clone(),
                     output_path: store_path.to_string(),
-                    output_hash: out.nar_hash.to_vec(),
+                    // The hash comes from the upload result, not the local
+                    // ProcessedOutput: for freshly-uploaded outputs the two
+                    // are the same NAR hash, but for outputs skipped by the
+                    // idempotent pre-check the result carries the STORE's
+                    // nar_hash — the bytes that actually exist — which is
+                    // what the scheduler's realisations row must record
+                    // (the upload layer pins that contract in its
+                    // skipped-path test).
+                    output_hash: result.nar_hash.to_vec(),
                 });
             }
 
