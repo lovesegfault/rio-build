@@ -158,7 +158,7 @@ impl StoreServiceImpl {
         let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
-        // r[impl sec.authz.ca-path-derived+4]
+        // r[impl sec.authz.ca-path-derived+5]
         // For is_ca tokens, validate_put_metadata skips the
         // `store_path ∈ expected_outputs` membership check (the path is
         // content-derived). The CA authorization gate —
@@ -172,6 +172,12 @@ impl StoreServiceImpl {
         // IA → claim BEFORE ingest (path is HMAC-bound); CA → claim
         // AFTER ingest (path is now content-bound). Matches
         // PutPathBatch's verify-then-claim ordering.
+        //
+        // Fixed-output uploads (is_ca=false WITH a `fixed:` descriptor)
+        // follow the IA ordering: membership already restricts the
+        // claimable paths to this worker's own assignment, and the CA
+        // gate still runs post-ingest — a content/path mismatch aborts
+        // the upload and releases the placeholder before finalize.
         let is_ca_caller = auth.hmac_claims.as_ref().is_some_and(|c| c.is_ca);
 
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();

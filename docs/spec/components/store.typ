@@ -313,8 +313,12 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+4")[
-  For floating-CA derivations (`AssignmentClaims.is_ca = true`),
+#r("sec.authz.ca-path-derived+5")[
+  Workers are untrusted: builder-side hash checks are defense-in-depth, and
+  the store is the authority on whether a claimed path is derivable from the
+  uploaded bytes. The store MUST verify every worker upload that makes a
+  content-address claim, in both token shapes. For floating-CA derivations
+  (`AssignmentClaims.is_ca = true`),
   `expected_outputs` is unknown at dispatch time. Instead of skipping
   authorization, the store recomputes the CA store path *server-side* from the
   buffered NAR using the ingestion method declared by the upload's `fixed:`
@@ -328,7 +332,15 @@ the `pending_s3_deletes` table.
   descriptor to equal the store's own recompute and the claimed path to
   re-derive from it; uploads without a descriptor are
   verified as recursive SHA-256 --- and rejects with `PERMISSION_DENIED` if it
-  does not match the uploaded `store_path`. The server-side CA-path recompute MUST run BEFORE the
+  does not match the uploaded `store_path`. For fixed-output uploads
+  (`is_ca = false` with a `fixed:` content-address descriptor, as the builder
+  records from the derivation's declared hash), the same server-side
+  recompute, descriptor cross-check, and path re-derivation MUST run in
+  addition to the `expected_outputs` membership check, so a compromised
+  worker cannot register content at a fixed-output path that the content does
+  not derive; a non-`fixed:` descriptor on a worker upload is rejected.
+  Descriptor-less `is_ca = false` uploads (input-addressed outputs,
+  daemon-era workers) remain authorized by membership alone. The server-side CA-path recompute MUST run BEFORE the
   `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
   1), so a worker holding an `is_ca` token cannot squat placeholders for paths
   it has not content-proven (it would otherwise drip-feed chunks while
