@@ -4,15 +4,18 @@
 //! overlay upper layer so that Nix recognizes the input paths. The data
 //! source is `StoreServiceClient.QueryPathInfo` for each path in the input
 // r[impl builder.synth-db.per-build]
-// r[impl builder.synth-db.derivation-outputs]
 // r[impl builder.synth-db.refs-table]
 // r[impl builder.nix.pinned-schema]
 //! closure.
 //!
 //! Schema version 10 (Nix 2.20+). Tables: Config, ValidPaths, Refs,
-//! DerivationOutputs, Realisations (empty pre-build by design — nix-daemon
-//! INSERTs here post-CA-build; rio never populates — scheduler resolves CA
-//! inputs before dispatch per phase5.md).
+//! DerivationOutputs and Realisations — the last two stay EMPTY by design:
+//! `.drv` paths are never registered in the per-build store (the daemon
+//! derives the output map from the wire-supplied `BasicDerivation`; see
+//! `executor::sandbox::prepare_sandbox`), and nix-daemon INSERTs
+//! Realisations itself post-CA-build (scheduler resolves CA inputs before
+//! dispatch per phase5.md). Both tables exist for schema parity with real
+//! Nix.
 //!
 //! Key conventions:
 //! - `registrationTime = 0` for input paths (not locally built)
@@ -28,30 +31,6 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 use tracing::instrument;
 
-/// A derivation's output map entry for the DerivationOutputs table.
-///
-/// nix-daemon's `queryPartialDerivationOutputMap()` reads this table to
-/// determine the expected output paths for a derivation. Without it,
-/// `initialOutputs[...].known` is None → `scratchPath = makeFallbackPath()`
-/// → the builder writes `$out` to the REAL path but nix-daemon checks the
-/// fallback path → "builder failed to produce output path".
-///
-/// **CA floating outputs** (empty path in the .drv) MUST NOT be represented
-/// here. nix-daemon's `queryStaticPartialDerivationOutputMap` does
-/// `parseStorePath(row.path)` unconditionally — an empty string aborts the
-/// daemon. The executor filters empty-path outputs before constructing these;
-/// `insert_drv_outputs` also skips them defensively.
-#[derive(Debug, Clone)]
-pub struct SynthDrvOutput {
-    /// Full .drv store path (must also be in ValidPaths).
-    pub drv_path: String,
-    /// Output name (e.g., "out", "dev").
-    pub output_name: String,
-    /// Full output store path. Must be non-empty (CA floating outputs
-    /// are not representable here — see struct doc).
-    pub output_path: String,
-}
-
 /// Nix store DB schema version.
 ///
 /// COUPLING WARNING: This must match the schema version expected by the
@@ -64,14 +43,11 @@ const SCHEMA_VERSION: &str = "10";
 ///
 /// The database contains the minimum schema required for Nix 2.20+
 /// to recognize store paths: Config, ValidPaths, Refs, DerivationOutputs,
-/// and Realisations (empty pre-build by design — nix-daemon writes it
-/// post-CA-build; rio never populates).
-#[instrument(skip_all, fields(path_count = paths.len(), drv_output_count = drv_outputs.len()))]
-pub async fn generate_db(
-    db_path: &Path,
-    paths: &[ValidatedPathInfo],
-    drv_outputs: &[SynthDrvOutput],
-) -> Result<(), sqlx::Error> {
+/// and Realisations. Only `paths` (the build's input closure, with `.drv`
+/// paths already filtered out by the caller) are registered;
+/// DerivationOutputs and Realisations stay empty — see the module doc.
+#[instrument(skip_all, fields(path_count = paths.len()))]
+pub async fn generate_db(db_path: &Path, paths: &[ValidatedPathInfo]) -> Result<(), sqlx::Error> {
     // SqliteConnectOptions::filename takes the path verbatim — no URI parsing.
     // Defense-in-depth for I-167: drv names can contain `?` which a
     // `sqlite://{path}?mode=rwc` string would mis-parse as a query param.
@@ -92,12 +68,10 @@ pub async fn generate_db(
 
     create_schema(&mut conn).await?;
     insert_paths(&mut conn, paths).await?;
-    insert_drv_outputs(&mut conn, drv_outputs).await?;
 
     tracing::info!(
         db_path = %db_path.display(),
         path_count = paths.len(),
-        drv_output_count = drv_outputs.len(),
         "synthetic Nix store DB generated"
     );
 
@@ -129,6 +103,9 @@ async fn create_schema(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
             FOREIGN KEY (referrer) REFERENCES ValidPaths(id),
             FOREIGN KEY (reference) REFERENCES ValidPaths(id)
         )"#,
+        // DerivationOutputs: schema parity only — never populated. .drv
+        // paths are not valid in the per-build store, so nix-daemon never
+        // queries this table (it uses the in-memory derivation fallback).
         r#"CREATE TABLE IF NOT EXISTS DerivationOutputs (
             drv INTEGER NOT NULL,
             id TEXT NOT NULL,
@@ -242,64 +219,7 @@ async fn insert_paths(
     Ok(())
 }
 
-/// Populate the DerivationOutputs table.
-///
-/// Without this, nix-daemon's `queryPartialDerivationOutputMap(drvPath)`
-/// returns empty → `initialOutputs[outputName].known` stays None → nix-daemon
-/// builds at `makeFallbackPath()` (a hash of `"rewrite:<drvPath>:name:<out>"`
-/// with all-zero content hash) instead of the real output path. The builder's
-/// `$out` env var has the REAL path (from the BasicDerivation we send on the
-/// wire), so the builder writes there, but nix-daemon checks the fallback path
-/// → "builder failed to produce output path".
-async fn insert_drv_outputs(
-    conn: &mut SqliteConnection,
-    drv_outputs: &[SynthDrvOutput],
-) -> Result<(), sqlx::Error> {
-    if drv_outputs.is_empty() {
-        return Ok(());
-    }
-    let mut tx = conn.begin().await?;
-    for out in drv_outputs {
-        // drv column is an FK to ValidPaths(id). The .drv must already be
-        // in ValidPaths (insert_paths runs first). If it's not found, this
-        // is a bug in the caller (closure didn't include the .drv).
-        let drv_id: Option<i64> = sqlx::query_scalar("SELECT id FROM ValidPaths WHERE path = ?1")
-            .bind(&out.drv_path)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(drv_id) = drv_id else {
-            tracing::warn!(
-                drv_path = %out.drv_path,
-                output = %out.output_name,
-                "DerivationOutputs insert skipped: .drv not in ValidPaths (closure bug?)"
-            );
-            continue;
-        };
-        // Defensive: CA floating outputs have no path yet. Inserting ""
-        // makes nix-daemon's parseStorePath("") abort (core dump). The
-        // executor already filters these before calling us; this is a
-        // seatbelt for any other caller.
-        if out.output_path.is_empty() {
-            tracing::warn!(
-                drv_path = %out.drv_path,
-                output = %out.output_name,
-                "DerivationOutputs insert skipped: empty output path (CA floating?)"
-            );
-            continue;
-        }
-        sqlx::query("INSERT OR IGNORE INTO DerivationOutputs (drv, id, path) VALUES (?1, ?2, ?3)")
-            .bind(drv_id)
-            .bind(&out.output_name)
-            .bind(&out.output_path)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
-
 // r[verify builder.synth-db.per-build]
-// r[verify builder.synth-db.derivation-outputs]
 // r[verify builder.synth-db.refs-table]
 // r[verify builder.nix.pinned-schema]
 #[cfg(test)]
@@ -310,7 +230,6 @@ mod tests {
     const P_GLIBC: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39";
     const P_HELLO: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello-2.12.2";
     const P_HELLO_DRV: &str = "/nix/store/cccccccccccccccccccccccccccccccc-hello-2.12.2.drv";
-    const P_DRV: &str = "/nix/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-hello.drv";
 
     fn sp(s: &str) -> StorePath {
         StorePath::parse(s).unwrap()
@@ -361,7 +280,7 @@ mod tests {
         std::fs::create_dir_all(&weird)?;
         let db_path = weird.join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await?;
+        generate_db(&db_path, &sample_paths()).await?;
 
         assert!(db_path.exists(), "db file should exist at {db_path:?}");
         let mut conn = open_db(&db_path).await?;
@@ -377,7 +296,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await?;
+        generate_db(&db_path, &sample_paths()).await?;
 
         let mut conn = open_db(&db_path).await?;
 
@@ -439,120 +358,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_db_derivation_outputs() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("db.sqlite");
-
-        // .drv file MUST be in ValidPaths for the FK to resolve.
-        let paths = vec![vpi(P_DRV, [0xab; 32])];
-        let drv_outputs = vec![
-            SynthDrvOutput {
-                drv_path: P_DRV.to_string(),
-                output_name: "out".to_string(),
-                output_path: "/nix/store/yyyy-hello".to_string(),
-            },
-            SynthDrvOutput {
-                drv_path: P_DRV.to_string(),
-                output_name: "dev".to_string(),
-                output_path: "/nix/store/zzzz-hello-dev".to_string(),
-            },
-        ];
-
-        generate_db(&db_path, &paths, &drv_outputs).await?;
-
-        let mut conn = open_db(&db_path).await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT d.id, d.path FROM DerivationOutputs d
-               JOIN ValidPaths vp ON d.drv = vp.id
-               WHERE vp.path = ?1
-               ORDER BY d.id"#,
-        )
-        .bind(P_DRV)
-        .fetch_all(&mut conn)
-        .await?;
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0],
-            ("dev".to_string(), "/nix/store/zzzz-hello-dev".to_string())
-        );
-        assert_eq!(
-            rows[1],
-            ("out".to_string(), "/nix/store/yyyy-hello".to_string())
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_generate_db_derivation_outputs_skips_empty_path() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("db.sqlite");
-
-        // CA floating output: path is "" in the .drv (computed post-build).
-        // Inserting "" would make nix-daemon's parseStorePath("") abort.
-        // The insert must be SKIPPED.
-        let paths = vec![vpi(P_DRV, [0xab; 32])];
-        let drv_outputs = vec![
-            SynthDrvOutput {
-                drv_path: P_DRV.to_string(),
-                output_name: "out".to_string(),
-                output_path: "".to_string(), // CA floating — must skip
-            },
-            SynthDrvOutput {
-                drv_path: P_DRV.to_string(),
-                output_name: "dev".to_string(),
-                output_path: "/nix/store/yyyy-ca-dev".to_string(), // IA — insert
-            },
-        ];
-
-        generate_db(&db_path, &paths, &drv_outputs).await?;
-
-        let mut conn = open_db(&db_path).await?;
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, path FROM DerivationOutputs ORDER BY id")
-                .fetch_all(&mut conn)
-                .await?;
-        assert_eq!(rows.len(), 1, "empty-path row must be skipped");
-        assert_eq!(
-            rows[0],
-            ("dev".to_string(), "/nix/store/yyyy-ca-dev".to_string())
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_generate_db_derivation_outputs_skips_missing_drv() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("db.sqlite");
-
-        // .drv NOT in ValidPaths → FK resolve fails → warn + skip (not error).
-        let drv_outputs = vec![SynthDrvOutput {
-            drv_path: "/nix/store/missing.drv".to_string(),
-            output_name: "out".to_string(),
-            output_path: "/nix/store/some-output".to_string(),
-        }];
-
-        generate_db(&db_path, &[], &drv_outputs).await?;
-
-        let mut conn = open_db(&db_path).await?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM DerivationOutputs")
-            .fetch_one(&mut conn)
-            .await?;
-        assert_eq!(count, 0, "should skip insert when .drv not in ValidPaths");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_generate_db_has_realisations_table() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[], &[]).await?;
+        generate_db(&db_path, &[]).await?;
 
         let mut conn = open_db(&db_path).await?;
 
         // Realisations table should exist (empty pre-build by design)
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Realisations")
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(count, 0);
+
+        // DerivationOutputs likewise exists for schema parity but is never
+        // populated — .drv paths are not part of the per-build store.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM DerivationOutputs")
             .fetch_one(&mut conn)
             .await?;
         assert_eq!(count, 0);
@@ -564,7 +386,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await?;
+        generate_db(&db_path, &sample_paths()).await?;
 
         let mut conn = open_db(&db_path).await?;
 
@@ -586,7 +408,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await?;
+        generate_db(&db_path, &sample_paths()).await?;
 
         let mut conn = open_db(&db_path).await?;
 
@@ -604,7 +426,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await?;
+        generate_db(&db_path, &sample_paths()).await?;
 
         let mut conn = open_db(&db_path).await?;
 
@@ -620,7 +442,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[], &[]).await?;
+        generate_db(&db_path, &[]).await?;
 
         let mut conn = open_db(&db_path).await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
@@ -642,8 +464,8 @@ mod tests {
         let db_path = dir.path().join("db.sqlite");
 
         let paths = sample_paths();
-        generate_db(&db_path, &paths, &[]).await?;
-        generate_db(&db_path, &paths, &[]).await?;
+        generate_db(&db_path, &paths).await?;
+        generate_db(&db_path, &paths).await?;
 
         let mut conn = open_db(&db_path).await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
@@ -664,7 +486,7 @@ mod tests {
         info.deriver = Some(sp(P_HELLO_DRV));
         info.signatures = vec!["sig1".to_string(), "sig2".to_string()];
         info.content_address = Some("fixed:sha256:abc".to_string());
-        generate_db(&db_path, &[info], &[]).await?;
+        generate_db(&db_path, &[info]).await?;
 
         let mut conn = open_db(&db_path).await?;
         let (deriver, sigs, ca): (Option<String>, String, String) =

@@ -700,15 +700,33 @@ overlay upper layer:
   The `SchemaVersion` in the `Config` table must match the Nix version running
   in the builder (target: Nix 2.20+ schema).
 + The database contains only path registrations for that specific build's
-  input closure --- not the entire store.
+  input closure, excluding `.drv` paths --- not the entire store.
 + After the build completes, the synthetic database is discarded along with
   the rest of the overlay upper layer.
 
-#r("builder.synth-db.derivation-outputs")[
-  The `DerivationOutputs` table MUST be populated --- `nix-daemon`'s
-  `queryPartialDerivationOutputMap()` reads it. Empty → `scratchPath =
-  makeFallbackPath(drvPath)` → `OutputRejected`.
+#r("builder.synth-db.derivation-outputs+2")[
+  `.drv` store paths MUST NOT be part of the per-build store: no
+  `ValidPaths` or `DerivationOutputs` rows in the synthetic database, and
+  no `.drv` file in the per-build store directory. With
+  `isValidPath(drvPath)` false, `nix-daemon` derives the output map from
+  the `BasicDerivation` sent over `wopBuildDerivation` (its
+  in-memory-derivation fallback); the `DerivationOutputs` table exists for
+  schema parity only and stays empty.
 ]
+
+Rationale: the daemon already holds the full derivation from the wire, so
+nothing has to be readable from disk. Registering the drv path is exactly
+what forces a disk read: with `ca-derivations` enabled,
+`Store::queryPartialDerivationOutputMap()` on a _valid_ drv path calls
+`readInvalidDerivation()`, and `hashDerivationModulo()` then recurses into
+that file's `inputDrvs`, which would require the transitive `.drv` closure
+on disk. The castore lower serves only the input closure
+(`WorkAssignment.input_roots`), so a registered-but-absent `.drv` fails the
+build with `store path '<drv>' does not exist`. The pre-castore whole-path
+FUSE materialized any path on access, which is why the previous contract
+(populate `DerivationOutputs`, keep the drv valid) worked then; under the
+castore lower the in-memory route is the only one that needs no `.drv`
+files at any DAG depth.
 
 #r("builder.executor.resolve-input-drvs")[
   The executor must merge resolved inputDrv outputs into `BasicDerivation`

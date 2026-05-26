@@ -140,8 +140,8 @@ let
   # build-dispatching fixture without HMAC cannot mount its inputs.
   # withJwt: the gateway mints the session JWT for the tenant-named
   # client key and the store verifies it, which is what attributes the
-  # seeded busybox closure to the tenant at PutPath time
-  # (r[store.put.tenant-attribution]) — without it the seed has no
+  # seeded busybox closure to the tenant at PutPath time (the
+  # store.put.tenant-attribution rule) — without it the seed has no
   # path_tenants rows and every castore mount of it returns NotFound.
   # The scenario prelude pairs both with mkBootstrap's `tenant` so the
   # assignment token actually carries a tenant claim.
