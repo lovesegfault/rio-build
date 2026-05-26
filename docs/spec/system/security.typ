@@ -62,6 +62,33 @@
   },
 )
 
+=== Component Trust
+
+The control plane --- gateway, scheduler, store, and controller --- is
+trusted. Workers (builders and fetchers) are not: they execute arbitrary
+tenant-supplied build instructions in the same pod as the code that
+prepares requests and parses outputs, so a sufficiently determined tenant
+must be assumed capable of compromising the worker process itself.
+
+#r("sec.trust.workers-untrusted")[
+  Workers (builders and fetchers) MUST be treated as untrusted. Any
+  validation a worker performs --- request-glue shape checks, output
+  policy enforcement, hash verification before upload --- is
+  defense-in-depth only. Authoritative enforcement of what may be
+  registered MUST live in the trusted plane: the gateway/scheduler for
+  submission-shape validation, and rio-store at registration time for
+  the content it accepts.
+]
+
+- *Threat*: A compromised worker uploads content that does not match what
+  the derivation legitimately produces, or claims paths it was never asked
+  to build.
+- *Mitigations*: Upload authorization is HMAC-scoped to the exact output
+  paths the scheduler assigned; the store's content-address gates
+  re-derive paths from uploaded bytes rather than trusting the claim.
+  Worker-side checks remain useful for failing fast, never as the
+  authority.
+
 === Boundary 1: Nix Client → Gateway (SSH)
 
 #r("sec.boundary.ssh-auth")[
@@ -695,9 +722,9 @@ heartbeat) plus one reconciler tick (\~10s).
 <sec-rationale-privileged>
 
 Workers require Linux kernel capabilities for two operations: overlayfs mounts
-(per-build isolation) and Nix build sandboxing (user/mount/PID namespaces,
-chroot). Kubernetes pod security must grant these capabilities without opening
-unnecessary attack surface.
+(per-build isolation) and rio-exec build sandboxing (mount/PID/IPC/UTS/cgroup
+namespaces, `pivot_root`). Kubernetes pod security must grant these
+capabilities without opening unnecessary attack surface.
 
 Worker pods request `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` via the container
 security context. Critically, `privileged: true` is NOT used --- it disables

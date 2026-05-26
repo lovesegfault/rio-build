@@ -76,7 +76,9 @@ to lazily fetch @store-path content on demand.
     ),
     node(
       (0, 3.2),
-      align(left)[nix sandbox\ #text(size: 0.8em)[(user/mount/PID/net ns)]],
+      align(
+        left,
+      )[rio-exec sandbox\ #text(size: 0.8em)[(mount/PID/IPC/UTS/cgroup ns)]],
       name: <sb>,
       stroke: (dash: "dashed"),
     ),
@@ -909,11 +911,11 @@ process or its FUSE threads.
 ]
 
 The overlay is per-build. Each build gets its own overlayfs mount with
-separate upper and work directories. The Nix sandbox provides process-level
-isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox
-is compromised, the per-build overlay upper layer ensures rogue writes are
-isolated and discarded; the next build runs in a fresh pod and sees none of
-it.
+separate upper and work directories. The rio-exec sandbox provides
+process-level isolation (mount, PID, IPC, UTS, and cgroup namespaces, plus a
+network namespace for non-FOD builds). Even if the sandbox is compromised,
+the per-build overlay upper layer ensures rogue writes are isolated and
+discarded; the next build runs in a fresh pod and sees none of it.
 
 = Fixed-Output Derivation (FOD) Handling
 
@@ -950,27 +952,28 @@ it.
 = Namespace Ordering
 <sec-ns-order>
 
-#r("builder.ns.order+2")[
-  Overlayfs and the Nix sandbox both use mounts; the per-build store is
-  reached via Nix's chroot-store mechanism, not by bind-mounting at
-  `/nix/store`. The ordering is:
+#r("builder.ns.order+3")[
+  Overlayfs and the rio-exec sandbox both use mounts; the per-build store
+  is bind-mounted writable at `/nix/store` inside the sandbox (the merged
+  overlay view), with the input closure nested read-only inside it. The
+  ordering is:
   + Builder sets up the FUSE mount at `/var/rio/fuse-store` and creates the
     per-build overlayfs (lower: FUSE only; upper: SSD; merged at
     `{build_dir}/nix/store`) --- all in the builder's mount namespace.
-  + The executor forks the rio-exec sandbox: fresh mount/PID/IPC/UTS/cgroup
-    (and, for non-FOD builds, network) namespaces, the input closure
-    bind-mounted read-only inside the writable merged store view, a fresh
-    unmasked `/proc` for the new PID namespace (containerd
-    masks `/proc` paths in non-privileged pods, and
-    PSA rejects `procMount: Unmasked` with `hostUsers: true` per KEP-4265).
-    The child's `/nix/store` is the host's; nothing is bind-mounted there.
-  + Nix sandbox does its own `unshare(CLONE_NEWNS)` for the build itself.
-  + Inside the sandbox, Nix bind-mounts each input from
-    `{build_dir}/nix/store/{hash}` (its `realStoreDir`) to the chroot's
-    `/nix/store/{hash}` (`storeDir`).
-  + Nix calls `pivot_root` to enter the chroot.
-  The builder must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix
-  invocation, as both operations require it.
+  + The executor forks the rio-exec sandbox: the intermediate unshares fresh
+    mount/PID/IPC/UTS/cgroup (and, for non-FOD builds, network) namespaces;
+    the child assembles the chroot skeleton and applies the planned binds
+    --- the merged store writable at `/nix/store`, each input closure path
+    read-only nested inside it, `/build` writable, the static sandbox shell
+    at `/bin/sh`, and a fresh unmasked `/proc` for the new PID namespace
+    (containerd masks `/proc` paths in non-privileged pods, and PSA rejects
+    `procMount: Unmasked` with `hostUsers: true` per KEP-4265).
+  + The child enters the new root with `pivot_root` (plus a belt-and-braces
+    `chroot`), lazily detaches the old root, applies the seccomp filter, and
+    drops to the build user before `execve`.
+  The builder must NOT drop `CAP_SYS_ADMIN` between overlay setup and the
+  rio-exec spawn: the overlay mounts and the child's bind/`pivot_root`
+  sequence (performed before the privilege drop) both require it.
 ]
 
 #info(title: [History (I-060)])[
@@ -987,7 +990,8 @@ it.
 = Security Context
 
 Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the
-Nix sandbox (user/mount/PID/network namespaces).
+rio-exec sandbox (mount/PID/IPC/UTS/cgroup namespaces --- plus a network
+namespace for non-FOD builds --- entered via `pivot_root`).
 
 *Required capabilities:* `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT`. Do NOT use
 `privileged: true` --- it disables @seccomp profiles entirely.
@@ -1493,7 +1497,7 @@ changes.
 introduces ordering complexity --- upper layer cleanup must be deterministic
 (unique per-build directory, discarded with the pod), and the namespace
 ordering (FUSE mount → overlayfs → nix sandbox) must be correct
-(#rref("builder.ns.order+2")). The decided approach is that each executor runs
+(#rref("builder.ns.order+3")). The decided approach is that each executor runs
 the FUSE layer that lazily fetches store paths from rio-store; each build gets
 a per-build overlayfs with the FUSE mount as lower and a per-build synthetic
 SQLite database in the upper layer. This avoids shared mutable state,

@@ -512,7 +512,7 @@ in
         name = "core";
         subtests = [
           # r[verify builder.overlay.stacked-lower+2]
-          # r[verify builder.ns.order+2]
+          # r[verify builder.ns.order+3]
           # r[verify builder.fuse.lookup-caches+2]
           # r[verify builder.fuse.jit-lookup]
           # r[verify builder.fuse.jit-register]
