@@ -1042,21 +1042,24 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
 
     // The store actually fetched lib's wanted path (no fabricated
     // success for the requested target), and never touched the
-    // dropped dep.
-    let qpi = store.calls.qpi_calls.read().unwrap();
-    assert!(
-        qpi.contains(&lib_out),
-        "lib's wanted output must be eager-fetched; qpi_calls={qpi:?}"
-    );
-    assert!(
-        qpi.contains(&app_out),
-        "app's output must be eager-fetched; qpi_calls={qpi:?}"
-    );
-    let dep_out = test_store_path("tdk-dep-out");
-    assert!(
-        !qpi.contains(&dep_out),
-        "dep was pruned and must not be fetched; qpi_calls={qpi:?}"
-    );
+    // dropped dep. Scoped so the read guard ends before the await
+    // below (clippy::await_holding_lock is lexical-scope based).
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            qpi.contains(&lib_out),
+            "lib's wanted output must be eager-fetched; qpi_calls={qpi:?}"
+        );
+        assert!(
+            qpi.contains(&app_out),
+            "app's output must be eager-fetched; qpi_calls={qpi:?}"
+        );
+        let dep_out = test_store_path("tdk-dep-out");
+        assert!(
+            !qpi.contains(&dep_out),
+            "dep was pruned and must not be fetched; qpi_calls={qpi:?}"
+        );
+    }
     assert!(
         handle.debug_query_derivation("tdk-dep").await?.is_none(),
         "dep should be pruned from the submission, not in the global DAG"
