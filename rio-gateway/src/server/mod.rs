@@ -80,7 +80,7 @@ pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 /// Grace period a connection may have zero active protocol sessions —
 /// measured from authentication (established, nothing exec'd yet) or
 /// from the last session ending — before the gateway disconnects it
-/// (`r[gw.conn.exit-status+2]`). Keyed on exec'd sessions, not open SSH
+/// (`r[gw.conn.exit-status+3]`). Keyed on exec'd sessions, not open SSH
 /// channels: a channel that is opened but never exec'd has no protocol
 /// task and no deadline of its own, so it must not count as activity.
 /// The same duration also bounds the pre-auth phase: a connection that
@@ -394,7 +394,7 @@ impl GatewayServer {
             let handler = self.new_client(Some(peer));
             let stage = Arc::clone(&handler.stage);
             let config = Arc::clone(&config);
-            let auth_deadline = self.empty_connection_grace;
+            let auth_grace = self.empty_connection_grace;
             // Detached: NOT coupled to accept-loop lifetime. The handler
             // holds `active_conns` (via `mark_real_connection`/`Drop`),
             // so main.rs's drain poll observes natural session end.
@@ -407,31 +407,66 @@ impl GatewayServer {
                 {
                     warn!(%peer, error = %e, "set_nodelay failed");
                 }
-                let mut session = match run_stream(config, stream, handler).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log_session_end(peer, &stage, &e);
-                        return;
-                    }
-                };
-                // r[impl gw.conn.exit-status+2]
-                // Pre-auth deadline: a connection that has not completed
-                // authentication within the grace is disconnected here.
-                // It has to live at the accept site because nothing
-                // post-accept bounds it: the auth callbacks have no
-                // `&mut Session` to arm the empty-connection timer with,
-                // russh 0.61 has no login-grace config (and never
-                // enforces `max_auth_attempts`), and a client that
-                // answers keepalives resets both `alive_timeouts` and
+                // One pre-auth deadline for the whole connection,
+                // measured from accept: a connection that has not
+                // completed authentication by this instant is dropped or
+                // disconnected below. It has to live at the accept site
+                // because nothing post-accept bounds it: the auth
+                // callbacks have no `&mut Session` to arm the
+                // empty-connection timer with, russh 0.61 has no
+                // login-grace config (and never enforces
+                // `max_auth_attempts`), and a client that answers
+                // keepalives resets both `alive_timeouts` and
                 // `inactivity_timeout` on every reply — so a rejected
                 // key or a wedged ssh-agent would otherwise hold its
                 // `conn_permit`, fd, and `connections_active` slot
-                // forever. The `stage` check immediately before acting
-                // keeps a connection that authenticated at the last
-                // moment alive; an auth that lands in the instant
-                // between that check and the disconnect being processed
-                // is still torn down — the same inherent boundary race
-                // as any idle timeout, and the client just reconnects.
+                // forever.
+                let auth_deadline = tokio::time::Instant::now() + auth_grace;
+                // r[impl gw.conn.exit-status+3]
+                // Phase 1 — version exchange / transport setup. A client
+                // that never sends its SSH identification string parks
+                // `run_stream` inside `read_ssh_id`, which russh bounds
+                // only by the 1 h `inactivity_timeout`, so the deadline
+                // must cover `run_stream` itself. Losing the race drops
+                // the future, which still owns the handler and the TCP
+                // stream (russh only spawns the session loop immediately
+                // before returning, with no await point after it): the
+                // conn permit and fd release through the handler's
+                // `Drop`, exactly once, and the `connections_active`
+                // gauge stays untouched because no auth callback can
+                // have fired yet (it is only incremented in
+                // `mark_real_connection`).
+                let mut session = tokio::select! {
+                    r = run_stream(config, stream, handler) => match r {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log_session_end(peer, &stage, &e);
+                            return;
+                        }
+                    },
+                    () = tokio::time::sleep_until(auth_deadline) => {
+                        debug!(
+                            %peer,
+                            deadline_secs = auth_grace.as_secs(),
+                            "no SSH handshake within the deadline; dropping connection"
+                        );
+                        return;
+                    }
+                };
+                // r[impl gw.conn.exit-status+3]
+                // Phase 2 — same deadline, transport established. The
+                // `stage` check immediately before acting keeps a
+                // connection that authenticated at the last moment
+                // alive; an auth that lands in the instant between that
+                // check and the disconnect being processed is still torn
+                // down — the same inherent boundary race as any idle
+                // timeout, and the client just reconnects. One carve-out:
+                // russh only drains server-queued messages between key
+                // exchanges (`!kex.active()`), so a peer that keeps a
+                // key exchange perpetually in flight defers delivery of
+                // this disconnect and is bounded by the transport's
+                // keepalive/inactivity limits instead (upstream
+                // constraint).
                 tokio::select! {
                     r = &mut session => {
                         if let Err(e) = r {
@@ -439,13 +474,13 @@ impl GatewayServer {
                         }
                         return;
                     }
-                    () = tokio::time::sleep(auth_deadline) => {
+                    () = tokio::time::sleep_until(auth_deadline) => {
                         if stage.load(Ordering::Relaxed)
                             < connection::ConnStage::Authenticated as u8
                         {
                             debug!(
                                 %peer,
-                                deadline_secs = auth_deadline.as_secs(),
+                                deadline_secs = auth_grace.as_secs(),
                                 "connection did not authenticate within the deadline; \
                                  disconnecting"
                             );

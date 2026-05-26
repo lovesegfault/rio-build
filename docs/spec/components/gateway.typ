@@ -1144,7 +1144,7 @@ argument (`ends_with("nix-daemon")`) and requires the last argument to be
 exactly `--stdio`. This allows clients that send a full store path (e.g.,
 `/nix/store/...-nix-2.20.0/bin/nix-daemon --stdio`) to connect successfully.
 
-#r("gw.conn.exit-status+2")[
+#r("gw.conn.exit-status+3")[
   When the protocol handler returns, the gateway MUST send `exit-status` (RFC
   4254 §6.10) on the channel before `eof`/`close`; openssh under
   `ControlMaster` waits for `exit-status` before its foreground process returns
@@ -1159,17 +1159,27 @@ exactly `--stdio`. This allows clients that send a full store path (e.g.,
   exec'd sessions, not open SSH channels: a channel that is opened but never
   exec'd has no protocol task and therefore no handshake/idle deadline of its
   own, so it MUST NOT count as activity. A connection that has not completed
-  authentication within the same grace period MUST likewise be disconnected
-  (russh provides no login-grace deadline, and the pre-auth phase has no
-  channels or sessions for the empty-connection clock to key on). The gateway
-  MUST NOT disconnect the instant the last session ends: a `ControlMaster`
-  mux's in-flight session count transits through zero between builds, and
-  killing its transport there makes the master exit, OpenSSH unlink the
-  "stale" control socket, and every remaining nix process in the batch
-  silently fall back to a direct connection whose handshake is corrupted by
-  Nix's `LocalCommand` --- one touch-zero event poisons the rest of a
-  64-worker run.
+  authentication within the same grace period MUST likewise be bounded:
+  dropped outright if it has not yet completed the SSH version exchange,
+  otherwise sent `SSH_MSG_DISCONNECT` as soon as the transport is able to
+  deliver it (russh provides no login-grace deadline, and the pre-auth phase
+  has no channels or sessions for the empty-connection clock to key on). The
+  gateway MUST NOT disconnect the instant the last session ends: a
+  `ControlMaster` mux's in-flight session count transits through zero between
+  builds, and killing its transport there makes the master exit, OpenSSH
+  unlink the "stale" control socket, and every remaining nix process in the
+  batch silently fall back to a direct connection whose handshake is
+  corrupted by Nix's `LocalCommand` --- one touch-zero event poisons the rest
+  of a 64-worker run.
 ]
+
+"As soon as the transport is able to deliver it" is a real qualifier, not
+hedging: russh only drains server-queued messages (including this disconnect)
+between key exchanges, so a peer that keeps a key exchange perpetually in
+flight defers delivery for as long as it keeps the exchange active --- an
+upstream russh constraint. Such a peer is bounded only by the transport's
+keepalive/inactivity limits, not by the grace; a peer that goes silent
+mid-exchange is caught by `keepalive_max` (\~300 s).
 
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at
@@ -1225,7 +1235,7 @@ violate.
   sessions across all connections on the instance (`max_sessions`, default
   4096). The bound MUST be enforced at `exec_request` time, before the
   session's buffers are allocated, by rejecting the exec per
-  #rref("gw.conn.exit-status+2") --- never by refusing the channel open. An
+  #rref("gw.conn.exit-status+3") --- never by refusing the channel open. An
   exec-time `channel_failure` is a clean `ssh` exit for a `ControlMaster` mux
   client (the master has already reported `MUX_S_SESSION_OPENED` to its
   client by the time the exec reply arrives), while a channel-open refusal

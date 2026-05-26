@@ -253,7 +253,7 @@ in
   #   Gates Phase-2 boot-path changes (initrd-networkd, UKI, perlless).
   vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
 
-  # r[verify gw.conn.exit-status+2]
+  # r[verify gw.conn.exit-status+3]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
   #   ControlPersist 600. `timeout 60 nom build` must exit 0 (gateway
   #   sends exit-status before eof); `connections_active` must return

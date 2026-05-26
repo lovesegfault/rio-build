@@ -23,7 +23,7 @@
   common,
   fixture,
   cold ? false,
-  # Exercise `r[gw.conn.exit-status+2]`: client has nix-output-monitor +
+  # Exercise `r[gw.conn.exit-status+3]`: client has nix-output-monitor +
   # ControlMaster ssh config; subtest asserts `nom build` exits within
   # the timeout (vs hanging until ControlPersist) and gateway-side
   # `connections_active` returns to 0. Only the CppNix warm variant
@@ -274,14 +274,14 @@ let
         )
         assert rc == 0, (
             f"nom build exited {rc} (124=timeout → gateway likely "
-            f"missing exit-status; see r[gw.conn.exit-status+2]). out: {out}"
+            f"missing exit-status; see r[gw.conn.exit-status+3]). out: {out}"
         )
 
     with subtest("gateway reaps the idle connection after the empty grace period"):
         # The mux daemon holds the TCP open for ControlPersist (600s)
         # client-side. The gateway MUST NOT disconnect the instant the
         # build's session ends (that kills a ControlMaster mid-batch
-        # — see r[gw.conn.exit-status+2]); it disconnects after the
+        # — see r[gw.conn.exit-status+3]); it disconnects after the
         # connection has had zero active protocol sessions for
         # EMPTY_CONNECTION_GRACE (60s). Budget 90s: 60s timer +
         # scrape/teardown tail under builder load. Scrape on the

@@ -122,7 +122,7 @@ impl Drop for ChannelSession {
     }
 }
 
-// r[impl gw.conn.exit-status+2]
+// r[impl gw.conn.exit-status+3]
 /// Reject an exec request and tear the channel down so the client `ssh`
 /// process exits. `channel_failure` alone leaves the channel open;
 /// openssh under ControlMaster waits for `exit-status` before its
@@ -368,7 +368,7 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    // r[impl gw.conn.exit-status+2]
+    // r[impl gw.conn.exit-status+3]
     /// Arm the empty-connection grace timer: after
     /// `empty_connection_grace` with zero active protocol sessions,
     /// disconnect the connection. Called from the places a connection
@@ -712,7 +712,7 @@ impl Handler for ConnectionHandler {
         }
     }
 
-    // r[impl gw.conn.exit-status+2]
+    // r[impl gw.conn.exit-status+3]
     /// The connection is established (counted against `r[gw.conn.cap]`,
     /// `connections_active` already incremented by the auth callbacks)
     /// but has zero active protocol sessions — start the
@@ -836,7 +836,7 @@ impl Handler for ConnectionHandler {
             return reject_exec(session, channel_id);
         };
 
-        // r[impl gw.conn.exit-status+2]
+        // r[impl gw.conn.exit-status+3]
         // An admitted exec creates a protocol session — the connection
         // is no longer empty, so disarm any pending idle-disconnect
         // (armed at auth time or when the previous last session ended).
@@ -940,7 +940,7 @@ impl Handler for ConnectionHandler {
                     }
                 }
             }
-            // r[impl gw.conn.exit-status+2]
+            // r[impl gw.conn.exit-status+3]
             // RFC 4254 §6.10: send `exit-status` BEFORE eof/close. Without
             // it, openssh's foreground client process (under ControlMaster)
             // never returns to nix → nix blocks in pipe-read → `nom build`
@@ -993,7 +993,7 @@ impl Handler for ConnectionHandler {
                     warn!(channel = ?channel, "protocol session dead, closing channel");
                     // Gauge decrement handled by ChannelSession::Drop.
                     self.sessions.remove(&channel);
-                    // r[impl gw.conn.exit-status+2]
+                    // r[impl gw.conn.exit-status+3]
                     // That removal may have ended the connection's last
                     // active session — start the empty-connection grace
                     // clock if so (the SSH channel itself may stay open
@@ -1031,7 +1031,7 @@ impl Handler for ConnectionHandler {
         // Gauge decrement handled by ChannelSession::Drop.
         self.sessions.remove(&channel);
         self.open_channels = self.open_channels.saturating_sub(1);
-        // r[impl gw.conn.exit-status+2]
+        // r[impl gw.conn.exit-status+3]
         // Last active session gone → arm a grace timer, THEN disconnect.
         //
         // Disconnecting immediately here (the previous behavior) tears

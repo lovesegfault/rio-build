@@ -437,7 +437,7 @@ async fn test_many_multiplexed_sessions_all_succeed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+2]
+// r[verify gw.conn.exit-status+3]
 /// A connection whose channel count transits through zero must survive
 /// for the grace period (a ControlMaster between builds), and must
 /// still be reaped once the grace period expires without a new channel
@@ -487,7 +487,7 @@ async fn test_connection_survives_channel_count_touching_zero() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+2]
+// r[verify gw.conn.exit-status+3]
 /// An authenticated connection that NEVER opens a channel (`ssh -N`, a
 /// ControlMaster held open with no commands, a client wedged before
 /// exec) has had zero open channels continuously since establishment,
@@ -563,7 +563,7 @@ async fn test_authenticated_connection_without_channels_is_reaped() -> anyhow::R
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+2]
+// r[verify gw.conn.exit-status+3]
 /// Converse guard for the reap tests: a client that proceeds normally —
 /// authenticates, opens a channel, and execs `nix-daemon --stdio` inside
 /// the grace window — is NOT disconnected. The admitted exec (a live
@@ -609,7 +609,7 @@ async fn test_connection_execing_within_grace_survives() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+2]
+// r[verify gw.conn.exit-status+3]
 /// A connection that attempts authentication but never succeeds (rejected
 /// key, wedged ssh-agent) must be disconnected once the grace period
 /// expires, releasing its `max_connections` slot
@@ -681,7 +681,7 @@ async fn test_unauthenticated_connection_is_reaped() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+2]
+// r[verify gw.conn.exit-status+3]
 /// A connection that authenticates and opens a channel but never sends
 /// an exec request has zero active protocol sessions — no
 /// `ChannelSession`, no session-semaphore permit, no protocol task (the
@@ -711,6 +711,72 @@ async fn test_open_channel_without_exec_is_reaped() -> anyhow::Result<()> {
     );
 
     drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.exit-status+3]
+/// A client that opens TCP but never sends its SSH identification string
+/// parks the connection inside russh's `run_stream` (`read_ssh_id` is
+/// bounded only by the 1 h `inactivity_timeout`), holding its
+/// `max_connections` permit and fd the whole time. The pre-auth deadline
+/// must cover this pre-handshake phase too.
+///
+/// `max_connections = 1` makes the released permit observable from the
+/// outside: while the silent connection is held a real client is
+/// rejected at the connection cap, and once the silent connection is
+/// dropped the same client can connect and authenticate. (The
+/// `connections_active` gauge is not asserted here on purpose — it is
+/// only ever incremented at the first auth callback, which a silent
+/// client never reaches.)
+#[tokio::test]
+async fn test_silent_tcp_connection_is_reaped() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE).with_max_connections(1))
+            .await?;
+
+    // Raw TCP connect; never send the SSH identification string.
+    let mut silent = tokio::net::TcpStream::connect(addr).await?;
+
+    // Precondition: the silent connection holds the only permit, so a
+    // real client is rejected at the connection cap. Proves the permit
+    // is actually consumed, so the success assertion below can't pass
+    // vacuously.
+    let denied = connect_and_auth(addr, client_key.clone()).await;
+    assert!(
+        denied.is_err(),
+        "while the silent connection holds the only permit, a second \
+         connection must be rejected at the connection cap"
+    );
+
+    // Past the deadline the gateway must have dropped the silent
+    // connection and released its slot: a real client can now connect
+    // and authenticate. 3× the grace mirrors the other reap tests.
+    tokio::time::sleep(GRACE * 3).await;
+    let allowed = connect_and_auth(addr, client_key).await;
+    assert!(
+        allowed.is_ok(),
+        "a TCP client that never sends the SSH banner must be dropped within \
+         the pre-auth deadline and release its connection slot: {:?}",
+        allowed.err()
+    );
+
+    // The silent socket itself must have been closed by the server: we
+    // read back the server banner it sent at accept, then EOF. Bounded
+    // so a regression can't hang the test.
+    let mut buf = Vec::new();
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut silent, &mut buf),
+    )
+    .await
+    .expect("server must close the silent connection (read_to_end timed out)")?;
+    assert!(n > 0, "expected at least the server SSH banner before EOF");
+
+    drop(silent);
+    drop(allowed);
     srv.abort();
     Ok(())
 }
