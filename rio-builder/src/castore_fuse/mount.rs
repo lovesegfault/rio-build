@@ -552,6 +552,15 @@ impl CastoreMount {
                     abort = %abort.display(),
                     "castore FUSE connection aborted"
                 ),
+                // The connection's fusectl dir is removed when the
+                // superblock dies; with the daemon already reaped and the
+                // mountpoint detached above, that routinely happens before
+                // this write. Nothing left to abort — the desired end
+                // state — so don't WARN about it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => tracing::debug!(
+                    abort = %abort.display(),
+                    "castore FUSE connection already released; nothing to abort"
+                ),
                 Err(e) => tracing::warn!(
                     abort = %abort.display(),
                     error = %e,

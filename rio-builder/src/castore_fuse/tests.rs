@@ -901,6 +901,48 @@ async fn open_miss_fetches_verifies_and_promotes() {
     );
 }
 
+/// The production caller of the open path is a fuser serve thread: a
+/// plain std thread with NO ambient tokio runtime context, holding only
+/// a `Handle` to the executor's runtime. Every async bridge on that
+/// path must therefore build its futures (notably
+/// `tokio::time::timeout`, which captures the timer driver at
+/// construction) INSIDE `Handle::block_on`, never eagerly on the
+/// calling thread.
+///
+/// Regression for the live-canary failure: the whole-file JIT fetch
+/// constructed the timeout as the `block_on` argument, panicking with
+/// "there is no reactor running" on the build's first input open();
+/// fuser turned the dropped reply into EIO, so every leaf failed with
+/// `executing '<builder>/bin/sh': Input/output error`. The
+/// `ensure_blocking` helper used by the other tests masks this class of
+/// bug — `spawn_blocking` threads carry the runtime context — so this
+/// test uses a bare `std::thread`, exactly like fuser's workers.
+// r[verify builder.fs.digest-fuse-open]
+#[tokio::test(flavor = "multi_thread")]
+async fn open_path_works_from_a_thread_without_runtime_context() {
+    let h = harness().await;
+    let content = b"fetched from a bare std thread (fuser-style)".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    let size = content.len() as u64;
+
+    let op = Arc::clone(&h.open_path);
+    let worker = std::thread::spawn(move || op.ensure_backing(&digest, size));
+    // Join on the blocking pool so the async test does not park a
+    // runtime worker on the thread join.
+    let case = tokio::task::spawn_blocking(move || worker.join())
+        .await
+        .expect("join task")
+        .expect("the open path must not panic on a thread without a runtime context")
+        .expect("whole-file fetch from a bare thread succeeds");
+
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).expect("promoted into the cache"),
+        content,
+        "the fetched bytes reached the shared cache"
+    );
+}
+
 /// Bytes that do not hash to the requested `file_digest` are never
 /// served and never promoted: the open fails with EIO and the staging
 /// dir holds no leftover `.partial`.

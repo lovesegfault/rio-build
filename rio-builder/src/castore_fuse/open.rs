@@ -475,16 +475,30 @@ impl OpenPath {
         // Stream the blob into the .partial, hashing as we go. The
         // whole attempt (connect, stream, disk writes) is bounded by
         // jit_fetch_timeout.
+        //
+        // The timeout MUST be constructed inside the async block (i.e.
+        // inside `block_on`, where the runtime context is entered):
+        // `tokio::time::timeout` grabs the runtime's timer driver at
+        // construction, and this function runs on a fuser serve thread,
+        // which has no ambient runtime context — constructing it eagerly
+        // as the `block_on` argument panics with "there is no reactor
+        // running", which fuser surfaces to the kernel as EIO on the
+        // build's very first input read (the live-canary failure mode:
+        // `executing '<builder>': Input/output error`). Same shape as
+        // every bridge in `stream.rs`.
         // r[impl builder.fs.file-digest-integrity]
-        let fetch = self.runtime.block_on(tokio::time::timeout(
-            self.cfg.jit_fetch_timeout,
-            read_blob_into(
-                self.clients.clone(),
-                *file_digest,
-                &mut file,
-                &self.assignment_token,
-            ),
-        ));
+        let fetch = self.runtime.block_on(async {
+            tokio::time::timeout(
+                self.cfg.jit_fetch_timeout,
+                read_blob_into(
+                    self.clients.clone(),
+                    *file_digest,
+                    &mut file,
+                    &self.assignment_token,
+                ),
+            )
+            .await
+        });
         let fetched = match fetch {
             Err(_elapsed) => {
                 tracing::warn!(
