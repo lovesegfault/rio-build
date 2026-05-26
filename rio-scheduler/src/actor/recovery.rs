@@ -2110,6 +2110,7 @@ impl DagActor {
                 drv_hash,
                 "poison threshold reached on recovery (orphan worker did not reconnect)",
                 None,
+                None,
             )
             .await;
             return;

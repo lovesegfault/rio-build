@@ -1689,16 +1689,13 @@ impl DerivationState {
     /// this node's attempt history. Call ONLY after the owning appending
     /// transaction has committed (the ledger is PG-authoritative; an
     /// uncommitted row must not be visible here).
-    // TODO: callers land with the 1a append sites (worker-reported exit
-    // paths, no-report paths, reset events); dead until then.
-    #[allow(dead_code)]
     pub(crate) fn push_attempt_record(&mut self, record: AttemptRecord) {
         self.attempt_history.push(record);
     }
 
     /// Replace the in-memory attempt history wholesale. Recovery-load
     /// only (the suffix loaded from `drv_attempts` after a failover).
-    // TODO: caller lands with the 1a recovery load; dead until then.
+    // TODO: the caller lands with the attempt-history recovery load (T-1a.7).
     #[allow(dead_code)]
     pub(crate) fn set_attempt_history(&mut self, history: Vec<AttemptRecord>) {
         self.attempt_history = history;

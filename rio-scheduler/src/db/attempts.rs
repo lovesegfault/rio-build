@@ -40,6 +40,9 @@ use crate::state::{
 /// (`RetryPolicy::infra_retry_window_secs`, 300 s default — re-check
 /// against the configured value when a sweep is added) and the 24 h
 /// poison TTL.
+// TODO: consult this floor from the (Phase-2) ledger GC sweep; until a
+// sweep exists it is the documentation hook only.
+#[allow(dead_code)]
 pub(crate) const LEDGER_RETENTION_FLOOR: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -131,6 +134,8 @@ impl AttemptRow {
     /// must be one of the reset classes (`resubmit_reset`,
     /// `cache_hit_clear`, `poison_cleared`); `resubmit_cycle` carries
     /// the cycle index the reset starts.
+    // TODO: callers land with the reset-event sites (T-1a.6).
+    #[allow(dead_code)]
     pub(crate) fn new_reset(
         derivation_id: Uuid,
         outcome_class: OutcomeClass,
@@ -379,6 +384,8 @@ impl SchedulerDb {
     /// `recently_disconnected` entry so the establishment fill never
     /// needs a DAG lookup (the node may already be reaped or carry the
     /// next attempt's exec_id).
+    // TODO: callers land with the no-report two-installment paths (T-1a.5).
+    #[allow(dead_code)]
     pub(crate) async fn fill_termination(
         tx: &mut PgConnection,
         derivation_id: Uuid,
@@ -411,6 +418,8 @@ impl SchedulerDb {
     /// ANY($1)` — NOT a widening of `load_nonterminal_derivations`,
     /// whose LEFT JOIN must stay one-row-per-derivation. The per-cycle
     /// suffix bound keeps this O(rows-since-last-reset × derivations).
+    // TODO: the recovery-load caller lands with the attempt-history reload (T-1a.7).
+    #[allow(dead_code)]
     pub(crate) async fn load_attempt_suffix(
         &self,
         derivation_ids: &[Uuid],

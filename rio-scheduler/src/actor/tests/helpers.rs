@@ -1354,3 +1354,50 @@ async fn test_actor_is_alive_detection() {
         "is_alive should report false after actor task dies"
     );
 }
+
+/// One `drv_attempts` row joined back to its derivation — the shape the
+/// 1a attempt-ledger assertions consume. Loaded by [`ledger_rows`].
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct LedgerRow {
+    pub event_kind: String,
+    pub outcome_class: String,
+    pub executor_id: Option<String>,
+    pub exec_id: Option<Uuid>,
+    pub termination_reason: Option<String>,
+    pub error_msg: Option<String>,
+    pub final_line_count: Option<i64>,
+    pub exempt: bool,
+    pub floor_promoted: bool,
+    pub floor_at_cap: bool,
+    pub resubmit_cycle: i32,
+}
+
+/// Every attempt-ledger row for `drv_hash`, in append order. The 1a
+/// appends run inside the handler turn (not fire-and-forget), so after
+/// the actor has processed the triggering command the rows are visible
+/// without polling.
+pub(crate) async fn ledger_rows(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<LedgerRow> {
+    sqlx::query_as(
+        "SELECT a.event_kind, a.outcome_class, a.executor_id, a.exec_id, \
+                a.termination_reason, a.error_msg, a.final_line_count, \
+                a.exempt, a.floor_promoted, a.floor_at_cap, a.resubmit_cycle \
+         FROM drv_attempts a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = $1 \
+         ORDER BY a.recorded_at, a.attempt_id",
+    )
+    .bind(drv_hash)
+    .fetch_all(pool)
+    .await
+    .expect("drv_attempts query")
+}
+
+/// The outcome classes of every ledger row for `drv_hash`, in append
+/// order — the compact shape most attempt-ledger assertions want.
+pub(crate) async fn ledger_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String> {
+    ledger_rows(pool, drv_hash)
+        .await
+        .into_iter()
+        .map(|r| r.outcome_class)
+        .collect()
+}

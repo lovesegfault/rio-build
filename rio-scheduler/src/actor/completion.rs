@@ -8,7 +8,8 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+use crate::db::attempts::AttemptRow;
+use crate::state::{DerivationStatus, DrvHash, ExecutorId, OutcomeClass, ReportingParty};
 
 use super::DagActor;
 
@@ -71,6 +72,120 @@ pub(super) struct FailureReportCtx<'a> {
 }
 
 impl DagActor {
+    // -----------------------------------------------------------------------
+    // Attempt-ledger appends (Phase 1a): one row per observed attempt,
+    // written in a site-owned transaction together with the site's
+    // status persist. Still best-effort in 1a — nothing reads the rows
+    // for decisions, so a PG failure degrades exactly as the old
+    // best-effort status persist did (log and proceed with the
+    // in-memory transition).
+    // -----------------------------------------------------------------------
+
+    /// Build the ledger row for an attempt observed on `drv_hash`,
+    /// capturing `db_id` / `exec_id` / the assigned executor / the
+    /// resubmit cycle BEFORE any state transition clears them. Returns
+    /// `None` when the node is unknown or its merge has not committed
+    /// (`db_id` is `None`) — there is nothing to key a row on; callers
+    /// fall back to the plain status persist.
+    pub(super) fn attempt_row_for(
+        &self,
+        drv_hash: &DrvHash,
+        outcome_class: OutcomeClass,
+        reporting_party: ReportingParty,
+    ) -> Option<AttemptRow> {
+        let state = self.dag.node(drv_hash)?;
+        let db_id = state.db_id?;
+        let mut row = AttemptRow::new(db_id, outcome_class, reporting_party);
+        row.exec_id = state.exec_id;
+        row.executor_id = state.assigned_executor.clone();
+        row.resubmit_cycle = i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX);
+        Some(row)
+    }
+
+    /// The 1a appending transaction for a non-poison status persist:
+    /// append `row` (when there is one) and run
+    /// [`SchedulerDb::update_derivation_status_in_tx`] on the same
+    /// connection, then push the in-memory mirror after the commit.
+    /// `row = None` (unknown node / uncommitted merge) degrades to the
+    /// plain best-effort status persist.
+    pub(super) async fn record_attempt_with_status(
+        &mut self,
+        drv_hash: &DrvHash,
+        row: Option<AttemptRow>,
+        status: DerivationStatus,
+        executor_id: Option<&ExecutorId>,
+    ) {
+        let Some(row) = row else {
+            self.persist_status(drv_hash, status, executor_id).await;
+            return;
+        };
+        #[cfg(test)]
+        self.test_counters
+            .persist_status_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result: Result<bool, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+            crate::db::SchedulerDb::update_derivation_status_in_tx(
+                &mut tx,
+                drv_hash,
+                status,
+                executor_id,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                if inserted && let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.push_attempt_record(row.to_record());
+                }
+            }
+            Err(e) => {
+                error!(drv_hash = %drv_hash, ?status, error = %e,
+                       "failed to persist attempt row + derivation status");
+            }
+        }
+    }
+
+    /// The 1a appending transaction for a poison persist: append `row`
+    /// (when there is one) and run
+    /// [`SchedulerDb::persist_poisoned_in_tx`] on the same connection,
+    /// then push the in-memory mirror after the commit. `row = None`
+    /// degrades to the plain best-effort poison persist (the reportless
+    /// poison triggers whose own rows land at their observation sites).
+    pub(super) async fn record_attempt_with_poison(
+        &mut self,
+        drv_hash: &DrvHash,
+        row: Option<AttemptRow>,
+    ) {
+        let Some(row) = row else {
+            self.persist_poisoned(drv_hash).await;
+            return;
+        };
+        let result: Result<bool, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+            crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                if inserted && let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.push_attempt_record(row.to_record());
+                }
+            }
+            Err(e) => {
+                error!(drv_hash = %drv_hash, error = %e,
+                       "failed to persist attempt row + poisoned status+timestamp");
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Best-effort persist helpers (13 call sites across actor/*)
     // -----------------------------------------------------------------------
@@ -1983,8 +2098,15 @@ impl DagActor {
         // `CompletionReport.final_line_count` when the poisoning event
         // is a worker report (E1–E2); `None` for the reportless
         // triggers (disconnect re-check, controller terminations,
-        // backstop, fleet-exhaust, recovery) — the conservative stamp.
+        // backstop, recovery) — the conservative stamp.
         final_line_count: Option<i64>,
+        // The trigger's attempt-ledger row, when this poison IS the
+        // observation being recorded (worker-reported E1/E2, the E9
+        // fleet-exhaust marker). `None` when the trigger's row was (or
+        // will be) appended at its own observation site (disconnect,
+        // backstop, controller reports) or no row applies (recovery
+        // re-check) — the poison persist then runs alone, as today.
+        attempt_row: Option<AttemptRow>,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -2010,7 +2132,7 @@ impl DagActor {
         }
         state.retry.poisoned_at = Some(Instant::now());
 
-        self.persist_poisoned(drv_hash).await;
+        self.record_attempt_with_poison(drv_hash, attempt_row).await;
         self.unpin_best_effort(drv_hash).await;
 
         self.terminal_failure_epilogue(
@@ -2132,16 +2254,18 @@ impl DagActor {
 
     /// Shared tail of the non-terminal retry paths
     /// (`handle_infrastructure_failure`, `handle_timeout_failure`
-    /// under-cap): persist `Ready`, re-queue, emit progress so the
-    /// dashboard sees the requeue. The caller has already done the
-    /// `reset_to_ready` transition + counter bookkeeping.
+    /// under-cap): persist `Ready` (together with the attempt-ledger
+    /// row the caller built for this observation), re-queue, emit
+    /// progress so the dashboard sees the requeue. The caller has
+    /// already done the `reset_to_ready` transition + counter
+    /// bookkeeping.
     ///
     /// `handle_transient_failure` does NOT use this — it goes through
     /// the `Failed→Ready` intermediate with backoff, which has
     /// different ordering constraints (push_ready inside the
     /// `node_mut` block).
-    async fn requeue_after_retry(&mut self, drv_hash: &DrvHash) {
-        self.persist_status(drv_hash, DerivationStatus::Ready, None)
+    async fn requeue_after_retry(&mut self, drv_hash: &DrvHash, attempt_row: Option<AttemptRow>) {
+        self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Ready, None)
             .await;
         self.push_ready(drv_hash.clone());
         for build_id in self.get_interested_builds(drv_hash) {
@@ -2255,6 +2379,16 @@ impl DagActor {
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
     ) {
+        // Ledger row for this observed attempt (1a): captured before
+        // any transition clears the exec_id carrier; appended together
+        // with whichever status persist this handler ends in.
+        let mut attempt_row =
+            self.attempt_row_for(drv_hash, OutcomeClass::Transient, ReportingParty::Worker);
+        if let Some(row) = attempt_row.as_mut() {
+            row.executor_id = Some(executor_id.clone());
+            row.error_msg = (!report.error_msg.is_empty()).then(|| report.error_msg.to_string());
+            row.final_line_count = report.final_line_count;
+        }
         // Record failure (in-mem HashSet insert + PG append,
         // best-effort) + get poison verdict in one call — same
         // helper as `reassign_derivations` and
@@ -2357,7 +2491,11 @@ impl DagActor {
             // pushes Ready-status drvs to the queue (seed_ready_queue's
             // Ready-only filter) → Failed drv sits in DAG forever,
             // never dispatched.
-            self.persist_status(drv_hash, DerivationStatus::Ready, None)
+            //
+            // 1a: the non-terminal retry is exactly the attempt nothing
+            // used to stamp — append its ledger row in the same
+            // transaction as the Ready persist.
+            self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Ready, None)
                 .await;
             // C2c: dashboard's WatchBuild showed stale running_count
             // through the backoff window (up to 300s) — siblings
@@ -2371,9 +2509,15 @@ impl DagActor {
             // The poison reason stays the synthesized string (the
             // worker's error_msg is diagnostics the E1 arm has never
             // surfaced here); the report's line count rides along so
-            // the final execution's log reads complete.
-            self.poison_and_cascade(drv_hash, &poison_reason, report.final_line_count)
-                .await;
+            // the final execution's log reads complete, and the ledger
+            // row joins the poison persist's transaction.
+            self.poison_and_cascade(
+                drv_hash,
+                &poison_reason,
+                report.final_line_count,
+                attempt_row,
+            )
+            .await;
         }
     }
 
@@ -2407,6 +2551,17 @@ impl DagActor {
         report: FailureReportCtx<'_>,
     ) {
         let error_msg = report.error_msg;
+        // Ledger row for this observed attempt (1a): captured before
+        // the floor bump / reset clears the exec_id carrier. The class
+        // and exemption flags are refined below once the floor outcome
+        // and the exempt predicate are known.
+        let mut attempt_row =
+            self.attempt_row_for(drv_hash, OutcomeClass::Infra, ReportingParty::Worker);
+        if let Some(row) = attempt_row.as_mut() {
+            row.executor_id = Some(executor_id.clone());
+            row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
+            row.final_line_count = report.final_line_count;
+        }
         // I-199: bump resource_floor ONLY on the worker-reported
         // `CgroupOom` infra failure (I-196 OOM watcher: build child
         // hit cgroup memory.max while the pod itself survived). Other
@@ -2464,6 +2619,18 @@ impl DagActor {
         let exempt_from_cap =
             floor_outcome.promoted || error_msg.contains(rio_proto::CONCURRENT_PUTPATH_MSG);
 
+        // Refine the ledger row with the site's classification: the
+        // exempt class plus the floor-outcome discriminators the fold
+        // will read instead of re-deriving the floor at decision time.
+        if let Some(row) = attempt_row.as_mut() {
+            row.exempt = exempt_from_cap;
+            row.floor_promoted = floor_outcome.promoted;
+            row.floor_at_cap = floor_outcome.at_cap;
+            if exempt_from_cap {
+                row.outcome_class = OutcomeClass::ExemptInfra;
+            }
+        }
+
         // r[impl sched.retry.exempt-infra-cap]
         // High-water terminal for the cap-exemption: increments on
         // EVERY exempt attempt (both CONCURRENT_PUTPATH and
@@ -2492,6 +2659,7 @@ impl DagActor {
                     drv_hash,
                     &format!("max_exempt_infra_retries={max} exceeded: {error_msg}"),
                     report.final_line_count,
+                    attempt_row,
                 )
                 .await;
                 return;
@@ -2548,6 +2716,7 @@ impl DagActor {
                     "max_infra_retries={max} exhausted after infrastructure failures: {error_msg}"
                 ),
                 report.final_line_count,
+                attempt_row,
             )
             .await;
             return;
@@ -2585,7 +2754,7 @@ impl DagActor {
             error_msg,
             "infrastructure failure — retry without poison count"
         );
-        self.requeue_after_retry(drv_hash).await;
+        self.requeue_after_retry(drv_hash, attempt_row).await;
     }
 
     pub(super) async fn handle_permanent_failure(
@@ -2595,6 +2764,16 @@ impl DagActor {
         report: FailureReportCtx<'_>,
     ) {
         let error_msg = report.error_msg;
+        // Ledger row for this observed attempt (1a): captured before
+        // the terminal transition; appended in the poison persist's
+        // transaction below.
+        let mut attempt_row =
+            self.attempt_row_for(drv_hash, OutcomeClass::Permanent, ReportingParty::Worker);
+        if let Some(row) = attempt_row.as_mut() {
+            row.executor_id = Some(executor_id.clone());
+            row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
+            row.final_line_count = report.final_line_count;
+        }
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -2617,7 +2796,7 @@ impl DagActor {
         // best-effort).
         state.retry.failed_builders.insert(executor_id.clone());
 
-        self.persist_poisoned(drv_hash).await;
+        self.record_attempt_with_poison(drv_hash, attempt_row).await;
         if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
                    "failed to persist failed_worker");
@@ -2664,6 +2843,16 @@ impl DagActor {
         report: FailureReportCtx<'_>,
     ) {
         let error_msg = report.error_msg;
+        // Ledger row for this observed attempt (1a): captured before
+        // the floor bump / reset clears the exec_id carrier; the floor
+        // flags are filled in once the bump's outcome is known.
+        let mut attempt_row =
+            self.attempt_row_for(drv_hash, OutcomeClass::Timeout, ReportingParty::Worker);
+        if let Some(row) = attempt_row.as_mut() {
+            row.executor_id = Some(executor_id.clone());
+            row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
+            row.final_line_count = report.final_line_count;
+        }
         // Bump BEFORE the cap check / state transition: even the
         // terminal-path attempt should record that this deadline was
         // inadequate, so an explicit resubmit starts at the doubled
@@ -2676,6 +2865,10 @@ impl DagActor {
                 "timeout",
             )
             .await;
+        if let Some(row) = attempt_row.as_mut() {
+            row.floor_promoted = floor_outcome.promoted;
+            row.floor_at_cap = floor_outcome.at_cap;
+        }
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -2714,7 +2907,7 @@ impl DagActor {
                 promoted = floor_outcome.promoted,
                 "timeout — bumped deadline floor, retrying"
             );
-            self.requeue_after_retry(drv_hash).await;
+            self.requeue_after_retry(drv_hash, attempt_row).await;
             return;
         }
 
@@ -2733,7 +2926,7 @@ impl DagActor {
             return;
         }
 
-        self.persist_status(drv_hash, DerivationStatus::Cancelled, None)
+        self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Cancelled, None)
             .await;
         self.unpin_best_effort(drv_hash).await;
 
@@ -2816,11 +3009,60 @@ impl DagActor {
             transitioned.insert(parent_hash);
         }
         if !transitioned.is_empty() {
-            let refs: Vec<&str> = transitioned.iter().map(DrvHash::as_str).collect();
-            self.persist_status_batch(&refs, DerivationStatus::DependencyFailed)
-                .await;
+            self.record_cascade_attempts_and_status(&transitioned).await;
         }
         transitioned
+    }
+
+    /// 1a appending transaction for the dependency-failure cascade: one
+    /// `outcome_class='cascade'` ledger row per newly-DependencyFailed
+    /// dependent (no exec_id, no executor — these nodes never ran) plus
+    /// the batched DependencyFailed status persist, committed together
+    /// in one actor-owned transaction (mirroring how the status persist
+    /// already batched). Best-effort like every 1a append: on failure,
+    /// log and proceed with the in-memory transitions — recovery
+    /// re-cascades from the poisoned leaf on partial persist, as today.
+    async fn record_cascade_attempts_and_status(&mut self, transitioned: &HashSet<DrvHash>) {
+        let refs: Vec<&str> = transitioned.iter().map(DrvHash::as_str).collect();
+        // One row per dependent whose merge has committed (db_id
+        // present); the status batch still covers every hash either way.
+        let rows: Vec<(DrvHash, AttemptRow)> = transitioned
+            .iter()
+            .filter_map(|h| {
+                let mut row =
+                    self.attempt_row_for(h, OutcomeClass::Cascade, ReportingParty::Scheduler)?;
+                row.exec_id = None;
+                row.executor_id = None;
+                Some((h.clone(), row))
+            })
+            .collect();
+        let batch: Vec<AttemptRow> = rows.iter().map(|(_, r)| r.clone()).collect();
+        let result: Result<(), sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            crate::db::SchedulerDb::append_attempts_batch(&mut tx, &batch).await?;
+            crate::db::SchedulerDb::update_derivation_status_batch_in_tx(
+                &mut tx,
+                &refs,
+                DerivationStatus::DependencyFailed,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                for (hash, row) in rows {
+                    if let Some(state) = self.dag.node_mut(&hash) {
+                        state.push_attempt_record(row.to_record());
+                    }
+                }
+            }
+            Err(e) => {
+                error!(count = refs.len(), error = %e,
+                       "failed to batch-persist cascade attempt rows + DependencyFailed status");
+            }
+        }
     }
 
     /// Collect the union of `interested_builds` over the trigger

@@ -4710,3 +4710,255 @@ async fn reportless_backstop_poison_keeps_final_line_count_null() -> TestResult 
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Attempt ledger (drv_attempts, Phase 1a): every worker-reported exit
+// path and both verdict paths write exactly one row per observed event.
+// Decisions still run on the RAM counters — these tests pin the data
+// layer only.
+// ---------------------------------------------------------------------------
+
+/// E1: each transient failure appends exactly one `transient` row — the
+/// two retry-arm attempts and the final poison-arm attempt — carrying
+/// the reporting worker and its error message.
+#[tokio::test]
+async fn attempt_ledger_e1_transient_rows() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux").await?;
+    // Pad workers so the fleet-exhaust clamp doesn't fire before
+    // max_retries (same shape as test_transient_failure_max_retries_poisons).
+    let _rx2 = connect_executor(&handle, "ale1-pad2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "ale1-pad3", "x86_64-linux").await?;
+    let drv_hash = "ale1-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    for attempt in 0..3 {
+        assert!(
+            handle.debug_force_assign(drv_hash, "flaky-worker").await?,
+            "force-assign (attempt {attempt})"
+        );
+        complete_failure(
+            &handle,
+            "flaky-worker",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            &format!("attempt {attempt} failed"),
+        )
+        .await?;
+    }
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "max_retries exhausted → poisoned (decision unchanged by the ledger)"
+    );
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(
+        rows.len(),
+        3,
+        "exactly one row per observed transient failure: {rows:?}"
+    );
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(r.event_kind, "attempt");
+        assert_eq!(r.outcome_class, "transient", "row {i}");
+        assert_eq!(r.executor_id.as_deref(), Some("flaky-worker"));
+        assert_eq!(
+            r.error_msg.as_deref(),
+            Some(format!("attempt {i} failed").as_str()),
+            "the worker's error message lands on the row"
+        );
+        assert_eq!(r.final_line_count, None, "0 = not reported → NULL");
+        assert!(!r.exempt && !r.floor_promoted && !r.floor_at_cap);
+        assert_eq!(r.resubmit_cycle, 0);
+    }
+    Ok(())
+}
+
+/// E2: a non-exempt infra failure appends an `infra` row; a
+/// CONCURRENT_PUTPATH one appends `exempt_infra` with the exemption
+/// flag set (and no floor promotion).
+#[tokio::test]
+async fn attempt_ledger_e2_infra_and_exempt_rows() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("ale2-w", "x86_64-linux").await?;
+    let drv_hash = "ale2-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    // Non-exempt infra failure (FUSE-style worker-local error).
+    assert!(handle.debug_force_assign(drv_hash, "ale2-w").await?);
+    complete_failure(
+        &handle,
+        "ale2-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "fuse: transport endpoint is not connected",
+    )
+    .await?;
+    // Exempt infra failure (lost the upload race to a concurrent PutPath).
+    assert!(handle.debug_force_assign(drv_hash, "ale2-w").await?);
+    complete_failure(
+        &handle,
+        "ale2-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        rio_proto::CONCURRENT_PUTPATH_MSG,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].outcome_class, "infra");
+    assert!(!rows[0].exempt);
+    assert_eq!(rows[1].outcome_class, "exempt_infra");
+    assert!(rows[1].exempt, "CONCURRENT_PUTPATH is cap-exempt");
+    assert!(
+        !rows[1].floor_promoted,
+        "exempt via the message, not via a floor promotion"
+    );
+    Ok(())
+}
+
+/// E3: a permanent failure appends exactly one `permanent` row carrying
+/// the worker's error message, the report's final_line_count, and the
+/// execution id of the dispatched attempt.
+#[tokio::test]
+async fn attempt_ledger_e3_permanent_row() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("ale3-w", "x86_64-linux").await?;
+    let drv_hash = "ale3-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "ale3-w".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                error_msg: "missing header: zlib.h".into(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            node_name: None,
+            hw_class: None,
+            final_line_count: 21,
+            final_resources: None,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r.outcome_class, "permanent");
+    assert_eq!(r.executor_id.as_deref(), Some("ale3-w"));
+    assert!(
+        r.exec_id.is_some(),
+        "the report-bearing attempt keeps its execution id"
+    );
+    assert_eq!(r.error_msg.as_deref(), Some("missing header: zlib.h"));
+    assert_eq!(r.final_line_count, Some(21));
+    assert_eq!(r.termination_reason, None, "single-installment row");
+    Ok(())
+}
+
+/// E4: each TimedOut appends one `timeout` row — the under-cap retry
+/// and the at-cap terminal Cancelled.
+#[tokio::test]
+async fn attempt_ledger_e4_timeout_rows() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy = crate::RetryPolicy {
+            max_timeout_retries: 1,
+            ..Default::default()
+        };
+    });
+    let _w = connect_builder(&handle, "ale4-w", "x86_64-linux").await?;
+    let drv_hash = "ale4-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    // Under cap → retry; cap (1) exhausted on the second → Cancelled.
+    for _ in 0..2 {
+        assert!(handle.debug_force_assign(drv_hash, "ale4-w").await?);
+        complete_failure(
+            &handle,
+            "ale4-w",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TimedOut,
+            "build exceeded daemon_timeout_secs",
+        )
+        .await?;
+    }
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Cancelled,
+        "timeout cap exhausted → terminal Cancelled (decision unchanged)"
+    );
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r.outcome_class == "timeout"));
+    assert!(
+        rows.iter()
+            .all(|r| r.executor_id.as_deref() == Some("ale4-w"))
+    );
+    Ok(())
+}
+
+/// A terminal failure cascades DependencyFailed to its dependent and
+/// appends one `cascade` row for the dependent — a row with no
+/// execution of its own, written in the same batch as the status
+/// persist.
+#[tokio::test]
+async fn attempt_ledger_cascade_row_for_dependent() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("alc-w", "x86_64-linux").await?;
+    let child = "alc-child";
+    let parent = "alc-parent";
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node(child), make_node(parent)],
+        vec![make_test_edge(parent, child)],
+        false,
+    )
+    .await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    complete_failure(
+        &handle,
+        "alc-w",
+        &test_drv_path(child),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "no such file or directory",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, parent).await.status,
+        DerivationStatus::DependencyFailed,
+        "the dependent must cascade"
+    );
+    assert_eq!(
+        ledger_classes(&db.pool, child).await,
+        vec!["permanent"],
+        "the trigger keeps exactly its own row"
+    );
+    let parent_rows = ledger_rows(&db.pool, parent).await;
+    assert_eq!(parent_rows.len(), 1, "{parent_rows:?}");
+    assert_eq!(parent_rows[0].outcome_class, "cascade");
+    assert!(
+        parent_rows[0].exec_id.is_none() && parent_rows[0].executor_id.is_none(),
+        "a cascade victim never ran"
+    );
+    Ok(())
+}

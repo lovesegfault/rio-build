@@ -376,8 +376,31 @@ impl DagActor {
                 // stale IDs that don't count against the
                 // current fleet.
                 if self.failed_builders_exhausts_fleet(&drv_hash) {
-                    self.poison_and_cascade(&drv_hash, "failed on every eligible worker", None)
-                        .await;
+                    // 1a: the fleet-exhaust verdict gets a marker row
+                    // (not a charge — the fold treats it as a no-op
+                    // event), appended in the same transaction as the
+                    // poison persist. A verdict marker is not an
+                    // execution: drop the stale exec_id/executor a
+                    // prior attempt may have left on the node, so the
+                    // one-row-per-execution index never swallows it.
+                    let marker = self
+                        .attempt_row_for(
+                            &drv_hash,
+                            crate::state::OutcomeClass::FleetExhaust,
+                            crate::state::ReportingParty::Scheduler,
+                        )
+                        .map(|mut row| {
+                            row.exec_id = None;
+                            row.executor_id = None;
+                            row
+                        });
+                    self.poison_and_cascade(
+                        &drv_hash,
+                        "failed on every eligible worker",
+                        None,
+                        marker,
+                    )
+                    .await;
                     return false;
                 }
                 // I-056: distinguish "no capacity right now" (defer,

@@ -5866,3 +5866,59 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     );
     Ok(())
 }
+
+/// E9 (Phase 1a): the dispatch-time fleet-exhaust poison appends one
+/// `fleet_exhaust` marker row — a verdict marker with no execution of
+/// its own — after the trigger's earlier failure rows.
+#[tokio::test]
+async fn attempt_ledger_e9_fleet_exhaust_marker_row() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.backoff_base_secs = 0.0;
+    });
+    let w_rx = connect_executor(&handle, "ale9-w", "x86_64-linux").await?;
+    let drv_hash = "ale9-drv";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    // One transient failure: ale9-w joins failed_builders and (one-shot
+    // semantics) starts draining, so the requeue finds no candidate yet.
+    complete_failure(
+        &handle,
+        "ale9-w",
+        &test_drv_path(drv_hash),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The same executor identity reconnects fresh (not draining): every
+    // statically-eligible worker has now already failed this drv, so
+    // the next dispatch pass takes the fleet-exhaust backstop. Drop the
+    // old stream first — the reconnect hijack guard rejects a new
+    // stream while the prior one is still open.
+    drop(w_rx);
+    let _w2 = connect_executor(&handle, "ale9-w", "x86_64-linux").await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "failed_builders covers the whole eligible fleet → dispatch-time poison"
+    );
+    let classes = ledger_classes(&db.pool, drv_hash).await;
+    assert_eq!(
+        classes,
+        vec!["transient", "fleet_exhaust"],
+        "one marker row for the dispatch-time verdict, after the trigger's row"
+    );
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    let marker = rows.last().expect("marker row");
+    assert!(
+        marker.exec_id.is_none() && marker.executor_id.is_none(),
+        "the verdict marker is not an execution"
+    );
+    Ok(())
+}
