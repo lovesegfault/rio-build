@@ -1,5 +1,12 @@
 //! Floating content-addressed output finalization.
 //!
+//! Peak memory: the full (rewritten) NAR of each CA output is held in
+//! memory during hashing/finalization — the operative bound for very
+//! large content-addressed outputs. Flat-method outputs additionally
+//! read the file once more for hashing; collapsing that double read is
+//! a known follow-up (TODO(M8)) kept out of the activation commit to
+//! avoid touching the harness-validated path.
+//!
 //! A floating-CA output (`outputHashAlgo` set, no declared path, no
 //! declared hash) is built into a deterministic *scratch* path because
 //! its real store path depends on its own content. After the build, the
@@ -424,13 +431,5 @@ mod tests {
         let mut short = b"ab".to_vec();
         replace_in_buf(&mut short, b"abc", b"def");
         assert_eq!(short, b"ab");
-    }
-
-    #[test]
-    fn spec_identifies_floating_ca_outputs_only() {
-        // Parsed via the ATerm round trip in mod.rs's tests; here just
-        // exercise the classification logic through DerivationOutput
-        // constructed from an ATerm-parsed derivation in mod.rs tests.
-        // (Direct construction is private to rio-nix.)
     }
 }

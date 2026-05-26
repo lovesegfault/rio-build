@@ -163,6 +163,12 @@ pub async fn run() -> i32 {
     }
 }
 
+/// Marker prefix for HTTP failures that will not change on retry
+/// (4xx other than 408/429): the retry loop skips the remaining
+/// attempts for that URL. String-marked rather than a typed error so
+/// the `anyhow` context chains stay intact for the build log.
+const PERMANENT_HTTP_PREFIX: &str = "permanent: ";
+
 /// Fetch `params.url` (or a mirror) to `params.output`.
 async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
     if params.url.starts_with("s3://") {
@@ -192,7 +198,14 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("builtin:fetchurl: attempt failed: {e:#}");
+                    // Permanent (non-retryable) HTTP statuses skip the
+                    // remaining attempts for THIS url and move on to the
+                    // next candidate immediately.
+                    let permanent = e.to_string().starts_with(PERMANENT_HTTP_PREFIX);
                     last_err = Some(e);
+                    if permanent {
+                        break;
+                    }
                 }
             }
         }
@@ -211,6 +224,12 @@ fn build_client(_params: &FetchurlParams) -> anyhow::Result<reqwest::Client> {
         // Redirects are common for source tarballs (GitHub → S3).
         .redirect(reqwest::redirect::Policy::limited(10))
         .connect_timeout(Duration::from_secs(30))
+        // A server that stalls mid-body should fail the attempt (and
+        // fall through to the next mirror/origin) instead of hanging
+        // until the sandbox's max-silent kill. Idle-read bound, not a
+        // total-transfer bound — multi-GB sources stay fine as long as
+        // bytes keep flowing.
+        .read_timeout(Duration::from_secs(300))
         .build()
         .context("constructing HTTP client")
 }
@@ -238,7 +257,17 @@ async fn try_fetch_one(
     let resp = req.send().await.context("request failed")?;
     let status = resp.status();
     if !status.is_success() {
-        bail!("HTTP {status} from {url}");
+        // 5xx / 408 / 429 are worth retrying against the same URL;
+        // anything else (404 from a mirror, 403, …) will not change on
+        // the next attempt — fail fast so the next candidate URL is
+        // tried without burning the backoff budget.
+        if status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            bail!("HTTP {status} from {url}");
+        }
+        bail!("{PERMANENT_HTTP_PREFIX}HTTP {status} from {url}");
     }
 
     // Download to a temp file in the same directory (same filesystem →
@@ -335,15 +364,25 @@ async fn restore_unpacked(tmp: &Path, params: &FetchurlParams) -> anyhow::Result
         // than this process filling the disk. Same pattern as
         // rio-store's substituter decode cap.
         let mut limited = bridge.take(MAX_RESTORED_BYTES + 1);
-        rio_nix::nar::restore_path_streaming(&mut limited, &dest)
-            .with_context(|| format!("restoring NAR to {}", dest.display()))?;
-        if limited.limit() == 0 {
-            bail!(
-                "unpacked payload exceeds the {MAX_RESTORED_BYTES}-byte cap \
-                 (decompression bomb?)"
-            );
+        let restore = rio_nix::nar::restore_path_streaming(&mut limited, &dest)
+            .with_context(|| format!("restoring NAR to {}", dest.display()))
+            .and_then(|()| {
+                if limited.limit() == 0 {
+                    bail!(
+                        "unpacked payload exceeds the {MAX_RESTORED_BYTES}-byte cap \
+                         (decompression bomb?)"
+                    );
+                }
+                Ok(())
+            });
+        if restore.is_err() {
+            // A half-restored tree at the output path would be scanned
+            // (and rejected) as a stray on the next attempt, and a
+            // retried fetch would fail on the existing destination.
+            let _ = std::fs::remove_dir_all(&dest);
+            let _ = std::fs::remove_file(&dest);
         }
-        Ok(())
+        restore
     })
     .await
     .context("NAR restore task panicked")??;
