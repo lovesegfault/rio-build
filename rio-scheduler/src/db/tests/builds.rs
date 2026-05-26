@@ -44,6 +44,24 @@ async fn test_update_build_status_pending_no_timestamps() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Activating a build whose row doesn't exist must error (RowNotFound)
+/// so the surrounding merge transaction aborts instead of committing
+/// with the build never flipped to Active. Unreachable through the
+/// single-threaded actor path today (the same command inserted the
+/// row), but cheap defense against a silent half-committed merge.
+#[tokio::test]
+async fn test_activate_build_tx_missing_build_errors() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+
+    let mut tx = test_db.pool.begin().await?;
+    let res = SchedulerDb::activate_build_tx(&mut tx, Uuid::new_v4()).await;
+    assert!(
+        matches!(res, Err(sqlx::Error::RowNotFound)),
+        "activating a nonexistent build must fail with RowNotFound, got {res:?}"
+    );
+    Ok(())
+}
+
 /// I-103: list_builds reads denormalized count columns directly — no
 /// build_derivations/derivations join. persist_build_counts writes
 /// them; the migration backfill seeds existing rows.

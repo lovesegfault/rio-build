@@ -214,14 +214,30 @@ impl SchedulerDb {
     /// `BuildState::Active` arm of [`Self::update_build_status`]; all
     /// other (non-merge) status transitions keep going through that
     /// pool-level method via `transition_build`.
+    ///
+    /// Errors with [`sqlx::Error::RowNotFound`] if the UPDATE touches
+    /// anything other than exactly one row (i.e. the build row is
+    /// missing), so the caller's transaction aborts instead of
+    /// committing a merge whose build was never activated. Unreachable
+    /// through the single-threaded actor path today — the same command
+    /// inserted the row — but kept as a cheap guard against a silent
+    /// half-done commit.
     pub(crate) async fn activate_build_tx(
         tx: &mut PgConnection,
         build_id: Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE builds SET status = 'active', started_at = now() WHERE build_id = $1")
-            .bind(build_id)
-            .execute(&mut *tx)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE builds SET status = 'active', started_at = now() WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .execute(&mut *tx)
+        .await?;
+        // != 1 rather than == 0: >1 is impossible (build_id is the PK),
+        // but anything other than exactly one activated row means the
+        // merge must not commit.
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
