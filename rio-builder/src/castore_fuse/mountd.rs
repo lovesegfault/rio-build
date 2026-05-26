@@ -94,6 +94,9 @@ pub struct MountdConfig {
     /// daemon no longer mounts anything here — the builder mounts the
     /// handed-off fd inside its own mount namespace — but the startup
     /// orphan scan still sweeps leftovers from pre-cutover daemons.
+    /// The directory is OPTIONAL: it is neither created nor required to
+    /// exist (post-cutover deployments don't provision it); the scan
+    /// simply skips a missing path.
     pub castore_dir: PathBuf,
     /// Per-build staging: `{staging_dir}/{build_id}` (0700, chowned to
     /// the connection's peer uid).
@@ -556,12 +559,15 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
         )
         .with_context(|| format!("open {}", p.display()))
     };
-    let castore_base = open_base(&cfg.castore_dir)?;
+    // The castore dir is deliberately NOT opened/created: post-cutover
+    // the daemon never mounts anything, so the dir only exists on hosts
+    // that ran a pre-cutover daemon — the orphan scan handles both
+    // cases (a missing path is simply skipped).
     let staging_base = open_base(&cfg.staging_dir)?;
     let cache_base = open_base(&cfg.cache_dir)?;
     let chunks_base = open_base(&cfg.chunks_dir)?;
 
-    reap_orphans(&cfg, &castore_base);
+    reap_orphans(&cfg);
 
     let shared = Arc::new(Shared {
         staging_base,
@@ -699,20 +705,21 @@ fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
 /// be live before the listener exists, so everything found here is an
 /// orphan: castore mountpoints (lazily unmounted then removed — only
 /// pre-cutover daemons created these; the current protocol never
-/// mounts host-side), staging trees (removed), and `.promoting`/`.tmp`
-/// placeholders in the shared caches (removed — their owning copy loop
-/// is gone).
-/// The scan walks the configured *paths* rather than the pre-opened
-/// base dirfds: it runs once at startup before any connection exists,
-/// so there is no concurrent attacker to race — the openat-only
-/// discipline matters for per-build paths derived from an
-/// adversary-chosen `build_id`, not here.
+/// mounts host-side, and the dir is optional — a missing path is
+/// skipped via `list_dir`'s empty result), staging trees (removed), and
+/// `.promoting`/`.tmp` placeholders in the shared caches (removed —
+/// their owning copy loop is gone).
+/// The scan walks the configured *paths* rather than pre-opened base
+/// dirfds: it runs once at startup before any connection exists, so
+/// there is no concurrent attacker to race — the openat-only discipline
+/// matters for per-build paths derived from an adversary-chosen
+/// `build_id`, not here.
 // r[impl builder.mountd.orphan-scan]
-fn reap_orphans(cfg: &MountdConfig, castore_base: &OwnedFd) {
+fn reap_orphans(cfg: &MountdConfig) {
     for name in list_dir(&cfg.castore_dir) {
         let mnt = cfg.castore_dir.join(&name);
         let _ = umount2(&mnt, MntFlags::MNT_DETACH);
-        if let Err(e) = unlinkat(castore_base, name.as_str(), UnlinkatFlags::RemoveDir) {
+        if let Err(e) = std::fs::remove_dir(&mnt) {
             warn!(orphan = %mnt.display(), error = %e, "could not remove orphan mountpoint");
         } else {
             info!(orphan = %mnt.display(), "reaped orphan castore mountpoint");

@@ -92,7 +92,6 @@ spec:
           command: ["/bin/rio-mountd"]
           args:
             - --socket=/run/rio-mountd/mountd.sock
-            - --castore-dir=/var/rio/castore
             - --staging-dir=/var/rio/staging
             - --cache-dir=/var/rio/cache
             - --chunks-dir=/var/rio/chunks
@@ -147,8 +146,6 @@ spec:
               mountPath: /var/rio/chunks
             - name: var-rio-staging
               mountPath: /var/rio/staging
-            - name: var-rio-castore
-              mountPath: /var/rio/castore
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
           # The daemon serves on a UDS, not TCP — the only TCP listener
           # is the metrics exporter, which binds before the socket
@@ -172,20 +169,22 @@ spec:
           hostPath:
             path: /run/rio-mountd
             type: DirectoryOrCreate
-        # `type: Directory` (not DirectoryOrCreate): the four trees are
+        # `type: Directory` (not DirectoryOrCreate): the three trees are
         # created by the AMI's tmpfiles rules ON the XFS-prjquota
         # /var/rio mount (nix/nixos-node/eks-node.nix). DirectoryOrCreate
         # would let kubelet silently create them on whatever is mounted
         # at /var/rio — including the unquota'd root fs if the XFS mount
         # failed — and the staging quota would be a no-op. A missing dir
-        # is a loud ContainerCreating failure instead.
+        # is a loud ContainerCreating failure instead. There is no
+        # /var/rio/castore volume: the daemon mounts nothing (the builder
+        # mounts its own fd inside its own mount namespace), and the
+        # startup orphan scan only looks at the path when it exists
+        # (pre-cutover hosts).
         - name: var-rio-cache
           hostPath: {path: /var/rio/cache, type: Directory}
         - name: var-rio-chunks
           hostPath: {path: /var/rio/chunks, type: Directory}
         - name: var-rio-staging
           hostPath: {path: /var/rio/staging, type: Directory}
-        - name: var-rio-castore
-          hostPath: {path: /var/rio/castore, type: Directory}
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
 {{- end }}

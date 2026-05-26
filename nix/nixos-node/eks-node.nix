@@ -131,7 +131,7 @@ in
       description = ''
         Size of the sparse `/var/rio.img` backing file for the
         XFS-with-prjquota filesystem rio-mountd owns (shared backing
-        cache, chunk cache, per-build staging, castore mountpoints).
+        cache, chunk cache, per-build staging).
         Sparse — root-volume blocks are only consumed as the caches
         fill, but a full /var/rio consumes this much of
         `karpenter.dataVolumeSize`, so keep
@@ -206,11 +206,11 @@ in
     # ── /var/rio: XFS-with-prjquota for rio-mountd ───────────────────
     # The root fs is ext4 (amazon-image.nix) and carries no project-
     # quota metadata, so /var/rio gets its own XFS on a sparse loopback
-    # backing file on the root volume. One filesystem covers all four
-    # mountd-owned trees (cache, chunks, staging, castore): only
-    # staging needs prjquota, but a dedicated fs also gives the P0571
-    # LRU sweep a statvfs budget that isn't coupled to image-pull /
-    # kubelet pressure on the root volume.
+    # backing file on the root volume. One filesystem covers all three
+    # mountd-owned trees (cache, chunks, staging): only staging needs
+    # prjquota, but a dedicated fs also gives the P0571 LRU sweep a
+    # statvfs budget that isn't coupled to image-pull / kubelet
+    # pressure on the root volume.
     #
     # Loopback (not a second EBS volume, not the instance-store RAID0):
     #   - works identically on every NodeClass (rio-default/rio-metal
@@ -822,14 +822,16 @@ in
       # bin and /etc/cni/net.d and writes there. Both must exist + be
       # writable.
       #
-      # /var/rio/{cache,chunks,staging,castore}: the four mountd-owned
-      # trees (P0567/P0571). rio-mountd open()s them O_DIRECTORY at
-      # startup and the mountd-ds.yaml hostPath mounts use
-      # `type: Directory` so a missing dir is a loud scheduling failure,
-      # not a kubelet-created root-owned surprise. tmpfiles-setup runs
+      # /var/rio/{cache,chunks,staging}: the three mountd-owned trees
+      # (P0567/P0571). rio-mountd open()s them O_DIRECTORY at startup
+      # and the mountd-ds.yaml hostPath mounts use `type: Directory` so
+      # a missing dir is a loud scheduling failure, not a
+      # kubelet-created root-owned surprise. tmpfiles-setup runs
       # After=local-fs.target, which waits for var-rio.mount (not
       # `nofail`), so these land on the XFS — never on the root fs
-      # underneath the mountpoint.
+      # underneath the mountpoint. No /var/rio/castore: per-build
+      # castore-FUSE mountpoints live inside the builder pod's own
+      # overlay_base_dir (P0560 option (b) — the daemon mounts nothing).
       tmpfiles.rules = [
         "d /etc/kubernetes/manifests 0755 root root -"
         "d /etc/cni/net.d 0755 root root -"
@@ -838,7 +840,6 @@ in
         "d /var/rio/cache 0755 root root -"
         "d /var/rio/chunks 0755 root root -"
         "d /var/rio/staging 0755 root root -"
-        "d /var/rio/castore 0755 root root -"
       ];
     };
   };

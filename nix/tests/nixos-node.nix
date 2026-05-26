@@ -248,7 +248,7 @@ pkgs.testers.runNixOSTest {
         assert fstype == "xfs", f"/var/rio fstype={fstype!r}, want xfs"
         opts = node.succeed("findmnt -rn -o OPTIONS /var/rio").strip()
         assert "prjquota" in opts, f"/var/rio mounted without prjquota: {opts!r}"
-        for d in ("cache", "chunks", "staging", "castore"):
+        for d in ("cache", "chunks", "staging"):
             # Same st_dev as the mountpoint == created on the XFS, not
             # shadowed by it.
             node.succeed(
