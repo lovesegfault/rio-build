@@ -438,7 +438,6 @@ enum PreExec {
     /// post-build section.
     Ran {
         overlay_mount: overlay::OverlayMount,
-        input_paths: Vec<String>,
         outcome: NativeOutcome,
     },
 }
@@ -762,42 +761,33 @@ pub async fn execute_build(
 
             Ok(PreExec::Ran {
                 overlay_mount,
-                input_paths,
                 outcome,
             })
         }
         .await;
 
-    let (
-        overlay_mount,
-        input_paths,
-        build_result,
-        peak_memory_bytes,
-        peak_cpu_cores,
-        final_line_count,
-    ) = match pre {
-        Err(e) => return ExecuteOutcome::pre_cgroup(e, batcher_seed),
-        #[cfg(feature = "test-fixtures")]
-        Ok(PreExec::Fixture(r)) => return ExecuteOutcome::fixture(r, batcher_seed),
-        Ok(PreExec::Ran {
-            overlay_mount,
-            input_paths,
-            outcome:
-                NativeOutcome {
-                    build_result,
-                    peak_memory_bytes,
-                    peak_cpu_cores,
-                    final_line_count,
-                },
-        }) => (
-            overlay_mount,
-            input_paths,
-            build_result,
-            peak_memory_bytes,
-            peak_cpu_cores,
-            final_line_count,
-        ),
-    };
+    let (overlay_mount, build_result, peak_memory_bytes, peak_cpu_cores, final_line_count) =
+        match pre {
+            Err(e) => return ExecuteOutcome::pre_cgroup(e, batcher_seed),
+            #[cfg(feature = "test-fixtures")]
+            Ok(PreExec::Fixture(r)) => return ExecuteOutcome::fixture(r, batcher_seed),
+            Ok(PreExec::Ran {
+                overlay_mount,
+                outcome:
+                    NativeOutcome {
+                        build_result,
+                        peak_memory_bytes,
+                        peak_cpu_cores,
+                        final_line_count,
+                    },
+            }) => (
+                overlay_mount,
+                build_result,
+                peak_memory_bytes,
+                peak_cpu_cores,
+                final_line_count,
+            ),
+        };
 
     // r[impl obs.log.worker-header]
     // Footer result string — computed BEFORE `collect_outputs` consumes
@@ -869,7 +859,6 @@ pub async fn execute_build(
                 &drv,
                 drv_path,
                 is_fod,
-                &input_paths,
                 &assignment.assignment_token,
                 start_time,
                 stop_time,

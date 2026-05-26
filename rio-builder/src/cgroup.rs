@@ -1,12 +1,13 @@
 //! Per-build cgroup v2 resource tracking.
 //!
-//! Solves the whole-tree measurement problem: `read_vmhwm_bytes(daemon.id())`
-//! measured nix-daemon's RSS (~10MB) because nix-daemon FORKS the
+//! Solves the whole-tree measurement problem: the daemon-era
+//! `read_vmhwm_bytes(daemon.id())` measured only nix-daemon's RSS (~10MB)
+//! because nix-daemon forked the
 //! builder and waitpid()s — the builder's memory never appeared in
 // r[impl builder.cgroup.sibling-layout]
 // r[impl builder.cgroup.memory-peak+2]
 //! daemon's `/proc`. cgroup `memory.peak` captures the WHOLE TREE
-//! (daemon + builder + every compiler sub-process), which is what the
+//! (the build child and every compiler sub-process), which is what the
 //! resource_floor memory-bump actually needs.
 //!
 //! Bonus: `cpu.stat usage_usec` gives us cumulative tree-wide CPU
@@ -32,7 +33,7 @@
 //! /sys/fs/cgroup/<worker-slice>/          ← delegated_root() finds this
 //!   cgroup.subtree_control                ← enable_subtree_controllers writes +memory +cpu
 //!   <drv-hash>/                           ← BuildCgroup::create makes this per build
-//!     cgroup.procs                        ← add_process writes daemon PID here
+//!     cgroup.procs                        ← rio-exec attaches the build child PID here
 //!     memory.peak                         ← kernel-tracked tree peak, read at build end
 //!     cpu.stat                            ← usage_usec, polled 1Hz for peak-cores
 //! ```
@@ -54,8 +55,8 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// RAII per-build cgroup. `Drop` removes the directory.
 ///
 /// `rmdir` fails (`EBUSY`) if processes are still in the cgroup. The
-/// executor calls `daemon.kill().await` + `daemon.wait().await` BEFORE
-/// dropping this, so the tree should be empty. If rmdir still fails
+/// executor kills and reaps the build child BEFORE dropping this, so
+/// the tree should be empty. If rmdir still fails
 /// (zombie grandchild we don't know about), we log and leak — the
 /// kernel cleans up when the processes eventually die. Leaked
 /// cgroups are empty directories under `/sys/fs/cgroup`; harmless,
@@ -105,15 +106,16 @@ impl BuildCgroup {
     ///
     /// Write `{pid}\n` to `cgroup.procs`. The kernel moves the
     /// process atomically. Fails (`EINVAL`) if the PID doesn't exist
-    /// — which means the daemon died between spawn and this call.
-    /// Executor treats that as a build failure anyway (no daemon =
-    /// no build), so bubbling this error is correct.
+    /// — which means the process died between spawn and this call.
+    /// The executor treats that as a build failure anyway, so bubbling
+    /// this error is correct.
     ///
-    /// **Ordering matters:** call this AFTER `spawn_daemon` returns
-    /// but BEFORE `run_daemon_build` — so the daemon is in the cgroup
-    /// BEFORE it forks the builder. If we added it after the fork,
-    /// the builder would be in the parent cgroup and we'd measure
-    /// only daemon RSS (back to the phase2c bug).
+    /// **Ordering matters:** attach the process BEFORE it forks the
+    /// real work — otherwise the descendants land in the parent cgroup
+    /// and only the supervisor's RSS is measured (the phase2c bug).
+    /// The native path attaches via rio-exec (the `ExecutionRequest`
+    /// cgroup field); this helper remains for callers that manage the
+    /// attach themselves.
     pub fn add_process(&self, pid: u32) -> io::Result<()> {
         // OpenOptions write (not append): cgroup.procs is a
         // pseudo-file; each write() syscall moves one PID. append
@@ -149,7 +151,7 @@ impl BuildCgroup {
     ///
     /// Path to this cgroup. Exposed so the CPU polling task can
     /// clone it (the task outlives the borrowed `&BuildCgroup`
-    /// across the `run_daemon_build` await).
+    /// across the build-execution await).
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -160,15 +162,15 @@ impl BuildCgroup {
     /// pseudo-file: write "1" → kernel sends SIGKILL to every PID
     /// in `cgroup.procs` recursively.
     ///
-    /// This is the Cancel mechanism. The daemon + builder + every
-    /// child dies immediately (SIGKILL can't be caught). nix-daemon
-    /// has no chance to do its normal cleanup (which is FINE — we're
+    /// This is the Cancel mechanism. The build child + every
+    /// descendant dies immediately (SIGKILL can't be caught). The
+    /// build has no chance to do its own cleanup (which is FINE — we're
     /// abandoning this build entirely, the overlayfs Drop handles
-    /// mount cleanup, and a crashed daemon's sandbox doesn't need
+    /// mount cleanup, and a killed build's sandbox doesn't need
     /// orderly teardown).
     ///
-    /// After this, `run_daemon_build` sees stdout EOF → returns
-    /// Err(DaemonDied or similar). The executor's error path sends
+    /// After this, the executor observes the child's exit and returns
+    /// the kill-induced failure. The executor's error path sends
     /// CompletionReport; the caller (spawn_build_task) checks the
     /// cancel flag to decide between InfrastructureFailure and
     /// Cancelled status.
@@ -507,7 +509,7 @@ fn parse_own_cgroup(content: &str) -> io::Result<PathBuf> {
 /// `pub(crate)`: the executor's CPU poll task reads `cpu.stat`
 /// directly by path (cloned from `BuildCgroup::path()`) and calls
 /// this to parse. It can't hold `&BuildCgroup` across the
-/// `run_daemon_build` await; exposing the parser is the simplest fix.
+/// build-execution await; exposing the parser is the simplest fix.
 pub(crate) fn parse_cpu_stat_usage_usec(content: &str) -> Option<u64> {
     content
         .lines()
@@ -778,7 +780,7 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 ///
 /// `root` is the PARENT cgroup (what `delegated_root()` returns) —
 /// this captures the whole worker's tree: rio-builder process + all
-/// per-build sub-cgroups + all nix-daemon subprocesses.
+/// per-build sub-cgroups + every build subprocess.
 ///
 /// CPU fraction: delta `cpu.stat usage_usec` / interval µs. 1.0 = one
 /// core fully utilized; >1.0 on multi-core. Directly comparable to
@@ -1051,7 +1053,7 @@ mod tests {
         // parsing and filesystem path are sane on the host.
         //
         // Skip under the nix sandbox: /proc/self/cgroup shows the
-        // HOST's path (e.g. system.slice/nix-daemon.service) but the
+        // HOST's path (e.g. system.slice/rio-builder.service) but the
         // sandbox's /sys/fs/cgroup mount doesn't expose it. The
         // VM-test k3s scenarios exercise this for real.
         if !std::path::Path::new(CGROUP_ROOT)

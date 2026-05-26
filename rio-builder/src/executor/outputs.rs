@@ -67,10 +67,6 @@ pub(super) async fn collect_native_outputs(
     drv: &Derivation,
     drv_path: &str,
     is_fod: bool,
-    // Retained for call-site signature stability; the upload no longer
-    // needs the input closure (each output's references come
-    // precomputed from the result pipeline).
-    _input_paths: &[String],
     assignment_token: &str,
     start_time: u64,
     stop_time: u64,

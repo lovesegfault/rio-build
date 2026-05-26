@@ -94,8 +94,8 @@ impl DagActor {
         }
 
         // Send CancelSignal + transition Cancelled. The worker's
-        // cgroup.kill SIGKILLs the daemon tree → run_daemon_build
-        // Errs → worker reports BuildResultStatus::Cancelled →
+        // cgroup.kill SIGKILLs the build tree → the native execution
+        // errs → worker reports BuildResultStatus::Cancelled →
         // completion handler is a no-op (we already transitioned).
         //
         // try_send (not send): fire-and-forget. If the worker's

@@ -122,8 +122,9 @@ pub(crate) enum GlueError {
     FetchurlMissingUrl,
 
     /// CppNix refuses to run `builtin:fetchurl` for anything but a
-    /// fixed-output derivation (`builtins/fetchurl.cc`: "'builtin:fetchurl'
-    /// must be a fixed-output derivation"). Mirroring that is also a
+    /// fixed-output derivation (enforced in its derivation build goal's
+    /// builtin dispatch: "'builtin:fetchurl' must be a fixed-output
+    /// derivation"). Mirroring that is also a
     /// security boundary: the fetchurl request is the only build path that
     /// sets `Isolation { network: true }`, and that grant must stay tied to
     /// fixed-output-ness — otherwise a tenant could submit a hash-less

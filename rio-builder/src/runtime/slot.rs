@@ -181,9 +181,9 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
 
     // Set flag BEFORE kill: if there's a race where execute_build
     // is reading the flag right now, we want "cancelled=true" to
-    // be visible by the time it sees the Err from run_daemon_build.
-    // The kill → stdout EOF → Err path has some latency (kernel
-    // delivers SIGKILL, process dies, pipe closes, tokio wakes);
+    // be visible by the time it sees the Err from the build execution.
+    // The kill → child-exit → Err path has some latency (kernel
+    // delivers SIGKILL, process dies, the executor reaps it, tokio wakes);
     // setting the flag first gives us a wider window.
     inner
         .cancelled

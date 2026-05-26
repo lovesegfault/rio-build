@@ -1,9 +1,9 @@
 //! Per-build cgroup monitor tasks: CPU peak poller, OOM watcher, drain.
 //!
-//! Spawned alongside `run_daemon_build` and stopped/read after the build
+//! Spawned alongside the native build execution and stopped/read after the build
 //! completes. Separated from `mod.rs` so the cgroup-polling mechanics
 //! (atomic-f64-max compare-exchange, kill+drain poll loop) live next to
-//! each other instead of interleaved with daemon-lifecycle orchestration.
+//! each other instead of interleaved with build-lifecycle orchestration.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::time::Duration;
 /// Read `cpu.stat` `usage_usec` from a cgroup path. Free fn (not a
 /// method on BuildCgroup) so the CPU poll task can clone the PATH
 /// and call this without holding a `&BuildCgroup` across the
-/// `run_daemon_build` await.
+/// build-execution await.
 ///
 /// Thin wrapper over the pure parser in cgroup.rs. `None` on read
 /// fail (cgroup directory removed mid-poll — shouldn't happen, the
@@ -55,8 +55,8 @@ impl CgroupMonitors {
     /// `drain_build_cgroup`.
     ///
     /// Unlike the watcher tick, this final read does NOT write
-    /// `cgroup.kill`, so `oom_detected` can be `true` while the daemon
-    /// reported `Built` (script tolerated the killed child via
+    /// `cgroup.kill`, so `oom_detected` can be `true` while the build
+    /// still reported success (the build script tolerated the killed child via
     /// `|| true` / `make -k` / retry-runner). The caller
     /// (`apply_oom_override`) gates the `CgroupOom` reclassification on
     /// `build_result.is_err()` for that reason.
@@ -75,7 +75,7 @@ impl CgroupMonitors {
 
 impl Drop for CgroupMonitors {
     fn drop(&mut self) {
-        // Abort guard: if run_daemon_build panics (or any `?` between
+        // Abort guard: if the build lifecycle panics (or any `?` between
         // spawn and the explicit `stop()` early-returns), the pollers
         // would leak as 1Hz tasks reading a dead cgroup path forever.
         // `.abort()` on a completed/already-aborted handle is a no-op,
@@ -87,13 +87,13 @@ impl Drop for CgroupMonitors {
 
 /// Spawn the per-build cgroup CPU poller and OOM watcher.
 ///
-/// Both run concurrently with `run_daemon_build` (which awaits). The
+/// Both run concurrently with the build execution (which awaits). The
 /// returned [`CgroupMonitors`] aborts them on `Drop`; the caller should
 /// call `.stop()` after the build completes to read peak CPU + OOM flag.
 ///
 /// Clones the cgroup PATH (not the `BuildCgroup` — moving it would put
 /// `Drop` in the task, which we don't want; `Drop` must run after
-/// `daemon.wait()` in the caller).
+/// the build child has been reaped in the caller).
 pub(super) fn spawn_cgroup_monitors(
     build_cgroup: &crate::cgroup::BuildCgroup,
     cgroup_parent: &Path,
@@ -121,7 +121,7 @@ pub(super) fn spawn_cgroup_monitors(
             let now_usec = read_cpu_stat(&cpu_poll_path);
             let now_instant = std::time::Instant::now();
             // Both samples must be Some. If the first read failed
-            // (cgroup not populated yet — daemon hasn't forked),
+            // (cgroup not populated yet — the build child hasn't been attached),
             // prev is None and we just advance. If THIS read fails
             // (cgroup removed? shouldn't happen until Drop), skip.
             if let (Some(prev), Some(now)) = (prev_usec, now_usec) {
@@ -197,9 +197,9 @@ pub(super) fn spawn_cgroup_monitors(
                         "cgroup oom_kill incremented during build; killing build cgroup"
                     );
                     flag.store(true, Ordering::SeqCst);
-                    // Break the make-respawn loop. run_daemon_build
-                    // sees daemon EOF; the caller's flag check converts
-                    // that into CgroupOom.
+                    // Break the make-respawn loop. The executor sees the
+                    // build exit; the caller's flag check converts that
+                    // into CgroupOom.
                     let _ = std::fs::write(kill_path.join("cgroup.kill"), "1");
                     return;
                 }
@@ -226,7 +226,7 @@ pub(super) fn spawn_cgroup_monitors(
 /// path it's still running a `sleep 3600` or a stuck compiler.
 ///
 /// `cgroup.kill` walks the tree: SIGKILLs everything, including sub-
-/// cgroups the daemon may have created. Idempotent — writing "1" to an
+/// cgroups the build may have created. Idempotent — writing "1" to an
 /// empty cgroup is a no-op — so we call it unconditionally rather than
 /// branching on `build_result.is_err()`.
 // r[impl builder.cgroup.kill-on-teardown]
@@ -239,8 +239,8 @@ pub(super) async fn drain_build_cgroup(build_cgroup: crate::cgroup::BuildCgroup)
         tracing::warn!(error = %e, "build_cgroup.kill() failed");
     }
     // cgroup.kill is async: write returns before procs are gone. Poll
-    // cgroup.procs until empty or 2s elapsed (same budget as daemon.wait;
-    // SIGKILL → exit is ~ms, 2s is vast headroom for a zombie-reparented
+    // cgroup.procs until empty or 2s elapsed (SIGKILL → exit is ~ms,
+    // so 2s is vast headroom for a zombie-reparented
     // tree). Sync read on blocking pool — 200 iterations of a single-line
     // procfs read, negligible.
     let cgroup_path_for_poll = build_cgroup.path().to_path_buf();
