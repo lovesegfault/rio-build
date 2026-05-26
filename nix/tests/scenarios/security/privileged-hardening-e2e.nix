@@ -43,9 +43,28 @@ pkgs.testers.runNixOSTest {
     ${fixture.kubectlHelpers}
 
     # Ephemeral workers: spawn one before the pod-introspection
-    # subtests below. sshKeySetup + seed + warmup build → wait_worker_pod.
-    ${fixture.sshKeySetup}
+    # subtests below. tenant + keyed SSH + seed + warmup build →
+    # wait_worker_pod.
+    #
+    # Castore tenancy recipe (P0560): the warmup and e2e builds mount
+    # the seeded busybox via tenant-scoped castore reads, so the tenant
+    # row must exist, the key comment must name it (gateway mints the
+    # session JWT — fixture jwtEnabled), and the seed goes in AFTER the
+    # key swap so it gets attributed (store.put.tenant-attribution).
+    psql_k8s(k3s_server,
+        "INSERT INTO tenants (tenant_name) VALUES ('vm-sec-nonpriv')")
+    ${fixture.sshKeySetupFor "vm-sec-nonpriv"}
     ${common.seedBusybox "k3s-server"}
+    seed_rows = int(psql_k8s(k3s_server,
+        "SELECT count(*) FROM path_tenants pt "
+        "JOIN tenants t USING (tenant_id) "
+        "WHERE t.tenant_name = 'vm-sec-nonpriv'"))
+    assert seed_rows > 0, (
+        "seeded closure has no path_tenants rows for vm-sec-nonpriv — "
+        "the gateway did not attach a session JWT to the seed push "
+        "(fixture missing jwtEnabled?) or the store could not verify it"
+    )
+    print(f"nonpriv: seed attributed to vm-sec-nonpriv ({seed_rows} rows)")
     ${common.mkBuildHelperV2 {
       gatewayHost = "k3s-server";
       dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';

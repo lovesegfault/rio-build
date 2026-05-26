@@ -396,8 +396,27 @@ let
           timeout=90,
       )
 
-      ${fixture.sshKeySetup}
+      # Castore tenancy recipe (P0560): builder castore reads are
+      # tenant-scoped, so the build's tenant must exist, the SSH key
+      # comment must name it (gateway resolves it and mints the session
+      # JWT — fixture jwtEnabled), and the seed must be pushed AFTER the
+      # key swap so the store attributes it (store.put.tenant-attribution).
+      # Same recipe as lifecycle.nix's prelude, scoped to this fragment
+      # because the stability split never builds.
+      psql_k8s(k3s_server,
+          "INSERT INTO tenants (tenant_name) VALUES ('vm-le')")
+      ${fixture.sshKeySetupFor "vm-le"}
       ${common.seedBusybox "k3s-server"}
+      seed_rows = int(psql_k8s(k3s_server,
+          "SELECT count(*) FROM path_tenants pt "
+          "JOIN tenants t USING (tenant_id) "
+          "WHERE t.tenant_name = 'vm-le'"))
+      assert seed_rows > 0, (
+          "seeded closure has no path_tenants rows for vm-le — the "
+          "gateway did not attach a session JWT to the seed push "
+          "(fixture missing jwtEnabled?) or the store could not verify it"
+      )
+      print(f"leader-election: seed attributed to vm-le ({seed_rows} rows)")
 
       import threading
 

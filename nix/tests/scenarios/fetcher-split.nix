@@ -76,8 +76,28 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap {
       inherit fixture;
-      withSeed = true;
+      withSsh = false;
     }}
+
+    # Castore tenancy recipe (P0560): the consumer half of the dispatch
+    # build runs on a Builder pod and mounts the seeded busybox through
+    # tenant-scoped castore reads. Tenant row first, key comment names
+    # it (gateway mints the session JWT — fixture jwtEnabled), seed
+    # pushed AFTER the key swap so it gets attributed.
+    psql_k8s(k3s_server,
+        "INSERT INTO tenants (tenant_name) VALUES ('vm-fetcher-split')")
+    ${fixture.sshKeySetupFor "vm-fetcher-split"}
+    ${common.seedBusybox "k3s-server"}
+    seed_rows = int(psql_k8s(k3s_server,
+        "SELECT count(*) FROM path_tenants pt "
+        "JOIN tenants t USING (tenant_id) "
+        "WHERE t.tenant_name = 'vm-fetcher-split'"))
+    assert seed_rows > 0, (
+        "seeded closure has no path_tenants rows for vm-fetcher-split — "
+        "the gateway did not attach a session JWT to the seed push "
+        "(fixture missing jwtEnabled?) or the store could not verify it"
+    )
+    print(f"fetcher-split: seed attributed to vm-fetcher-split ({seed_rows} rows)")
 
     import time
     import json as _json

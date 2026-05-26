@@ -257,7 +257,13 @@ let
 
   leMod = leader-election {
     inherit pkgs common;
-    fixture = k3sFull { };
+    # jwtEnabled: the le-build split dispatches real builds through
+    # executor pods, and tenant-scoped castore reads require the seeded
+    # closure to be attributed to a tenant — which only happens when the
+    # gateway mints the session JWT for the tenant-named client key
+    # (store.put.tenant-attribution). The stability split shares the
+    # fixture and simply never sends tokens (interceptor is dual-mode).
+    fixture = k3sFull { jwtEnabled = true; };
   };
 
   # Prod-parity lifecycle module. No jwtEnabled — bootstrap-job-ran +
@@ -934,6 +940,11 @@ in
       # /dev/fuse comes from k3s containerd base_runtime_spec (the
       # containerdConfigTemplate in fixtures/k3s-full.nix). No extra
       # airgap images needed.
+      # jwtEnabled: the warmup + e2e builds run through executor pods,
+      # so the seeded closure must be tenant-attributed (castore reads
+      # are tenant-scoped) — the scenario prelude provisions the
+      # vm-sec-nonpriv tenant and keys the client to it.
+      jwtEnabled = true;
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
       ];
@@ -1197,6 +1208,12 @@ in
   vm-componentscaler-k3s = componentscaler {
     inherit pkgs common;
     fixture = k3sFull {
+      # jwtEnabled: the 30-leaf slowFanout load must actually RUN its
+      # 120s sleeps on builder pods (queued+running ≈ 30 is what drives
+      # the predictive scale-up) — a tenant-less submission dies at the
+      # tenant-scoped castore mount and the queue collapses. The
+      # scenario prelude provisions the vm-cscaler tenant.
+      jwtEnabled = true;
       extraValuesTyped = {
         "componentScaler.store.enabled" = true;
         "componentScaler.store.min" = 1;
@@ -1344,6 +1361,11 @@ in
   vm-netpol-k3s = netpol {
     inherit pkgs common;
     fixture = k3sFull {
+      # jwtEnabled: the warmup / cross-ns probes need a builder pod that
+      # stays Running on its long-sleep build, which means the castore
+      # mount of the seeded busybox must succeed → tenant-attributed
+      # seed (scenario prelude provisions the vm-netpol tenant).
+      jwtEnabled = true;
       extraValues = {
         "networkPolicy.enabled" = "true";
       };
@@ -1364,7 +1386,13 @@ in
   # r[verify gw.ingress.v4-via-nat]
   vm-ingress-v4v6-k3s = ingress-v4v6 {
     inherit pkgs common;
-    fixture = k3sFull { withV4Nodes = true; };
+    fixture = k3sFull {
+      withV4Nodes = true;
+      # jwtEnabled: both ingress halves run a real build, so each
+      # client's seed push must be tenant-attributed for the castore
+      # mounts (the scenario keys both clients to the vm-ingress tenant).
+      jwtEnabled = true;
+    };
   };
 
   # ADR-019 builder/fetcher split end-to-end. FIRST test running both
@@ -1445,6 +1473,11 @@ in
     inherit pkgs common drvs;
     fixture = k3sFull {
       withV4Nodes = true;
+      # jwtEnabled: the consumer half of the dispatch build runs on a
+      # Builder pod and mounts the seeded busybox via castore, so the
+      # seed must be tenant-attributed (scenario prelude provisions the
+      # vm-fetcher-split tenant and keys the client to it).
+      jwtEnabled = true;
       extraValues = {
         "networkPolicy.enabled" = "true";
         "nixConf.hashedMirrors" = "http://upstream-v4/";

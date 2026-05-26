@@ -72,8 +72,29 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap {
       inherit fixture;
-      withSeed = true;
+      withSsh = false;
     }}
+
+    # Castore tenancy recipe (P0560): the warmup / cross-ns builds must
+    # actually run their long sleeps (the netns probes need a Running
+    # pod), which requires the tenant-scoped castore mount of the seeded
+    # busybox to succeed. Tenant row first, key comment names it
+    # (gateway mints the session JWT — fixture jwtEnabled), seed pushed
+    # AFTER the key swap so it gets attributed.
+    psql_k8s(k3s_server,
+        "INSERT INTO tenants (tenant_name) VALUES ('vm-netpol')")
+    ${fixture.sshKeySetupFor "vm-netpol"}
+    ${common.seedBusybox "k3s-server"}
+    seed_rows = int(psql_k8s(k3s_server,
+        "SELECT count(*) FROM path_tenants pt "
+        "JOIN tenants t USING (tenant_id) "
+        "WHERE t.tenant_name = 'vm-netpol'"))
+    assert seed_rows > 0, (
+        "seeded closure has no path_tenants rows for vm-netpol — the "
+        "gateway did not attach a session JWT to the seed push "
+        "(fixture missing jwtEnabled?) or the store could not verify it"
+    )
+    print(f"netpol: seed attributed to vm-netpol ({seed_rows} rows)")
 
     ${common.mkBuildHelperV2 {
       gatewayHost = "k3s-server";

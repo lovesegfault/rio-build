@@ -79,8 +79,29 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap {
       inherit fixture;
-      withSeed = true;
+      withSsh = false;
     }}
+
+    # Castore tenancy recipe (P0560): the slowFanout leaves must RUN
+    # their 120s sleeps on builder pods (queued+running ≈ 30 drives the
+    # predictive scale-up), which requires the tenant-scoped castore
+    # mount of the seeded busybox to succeed. Tenant row first, key
+    # comment names it (gateway mints the session JWT — fixture
+    # jwtEnabled), seed pushed AFTER the key swap so it gets attributed.
+    psql_k8s(k3s_server,
+        "INSERT INTO tenants (tenant_name) VALUES ('vm-cscaler')")
+    ${fixture.sshKeySetupFor "vm-cscaler"}
+    ${common.seedBusybox "k3s-server"}
+    seed_rows = int(psql_k8s(k3s_server,
+        "SELECT count(*) FROM path_tenants pt "
+        "JOIN tenants t USING (tenant_id) "
+        "WHERE t.tenant_name = 'vm-cscaler'"))
+    assert seed_rows > 0, (
+        "seeded closure has no path_tenants rows for vm-cscaler — the "
+        "gateway did not attach a session JWT to the seed push "
+        "(fixture missing jwtEnabled?) or the store could not verify it"
+    )
+    print(f"componentscaler: seed attributed to vm-cscaler ({seed_rows} rows)")
 
     # ── helm-no-replicas: rendered template omits spec.replicas ──────
     # With componentScaler.store.enabled=true the chart MUST omit

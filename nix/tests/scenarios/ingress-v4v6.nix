@@ -61,11 +61,19 @@ pkgs.testers.runNixOSTest {
     # The gateway's authorized_keys file is one-Secret-many-keys; both
     # clients' pubkeys go in. Each client's ssh_config (mkClientNode)
     # already routes Host k3s-server → :32222 (v6) / Host edge → :22 (v4).
+    #
+    # Castore tenancy recipe (P0560): both halves run a real build, so
+    # both keys carry the vm-ingress tenant comment (gateway resolves it
+    # and mints the session JWT — fixture jwtEnabled) and each client
+    # pushes its seed AFTER the key swap, inside the build loop below,
+    # so the closure is attributed before the build mounts it.
+    psql_k8s(k3s_server,
+        "INSERT INTO tenants (tenant_name) VALUES ('vm-ingress')")
     pubkeys = []
     for c in (client_v6, client_v4):
         c.succeed(
             "mkdir -p /root/.ssh && "
-            "ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519"
+            "ssh-keygen -t ed25519 -N ''' -C 'vm-ingress' -f /root/.ssh/id_ed25519"
         )
         pubkeys.append(c.succeed("cat /root/.ssh/id_ed25519.pub").strip())
     k3s_server.succeed(
