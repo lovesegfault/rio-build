@@ -89,6 +89,20 @@ const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
 /// Backpressure: resume accepting work below this fraction.
 const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 
+/// Phase 1b: how many times a failure completion whose appending
+/// transaction failed is re-delivered to the actor's own mailbox before
+/// the event is dropped. The derivation stays in its pre-report state
+/// either way (the worker never re-sends a `CompletionReport`); past the
+/// cap the backstop sweep is what eventually re-drives it — the trade
+/// the design makes explicitly: a PG outage stalls failure accounting
+/// instead of silently under-counting it.
+const MAX_ATTEMPT_RECORD_REDELIVERIES: u32 = 3;
+
+/// Delay before a re-delivered failure completion is pushed back onto
+/// the actor mailbox, so a brief PG blip has a chance to clear instead
+/// of burning the whole re-delivery budget within one event-loop turn.
+const ATTEMPT_RECORD_REDELIVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Number of state events to retain in each build's broadcast ring for
 /// late subscribers.
 ///
@@ -348,6 +362,14 @@ pub struct DagActor {
     /// degrades to "one OOM doesn't promote" — same as pre-I-197
     /// behavior for one cycle.
     pub(crate) recently_disconnected: HashMap<ExecutorId, DisconnectedAttempt>,
+    /// Phase 1b: per-derivation count of re-deliveries of a failure
+    /// completion whose appending transaction (attempt row, `decide()`,
+    /// status persist) failed. Bounded by
+    /// [`MAX_ATTEMPT_RECORD_REDELIVERIES`]; cleared when a later
+    /// delivery for the derivation is handled. In-memory only — after a
+    /// restart the derivation is still in its pre-report state and the
+    /// backstop sweep re-drives it.
+    pub(crate) attempt_record_retries: HashMap<DrvHash, u32>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Poison threshold + distinct-workers config. Replaces the
@@ -773,6 +795,7 @@ impl DagActor {
             hung_nodes: HashMap::new(),
             authoritative_binding: HashMap::new(),
             recently_disconnected: HashMap::new(),
+            attempt_record_retries: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
             db,
@@ -861,6 +884,7 @@ impl DagActor {
             builds,
             events,
             recently_disconnected,
+            attempt_record_retries,
             dispatched_cells,
             hung_nodes,
             authoritative_binding,
@@ -934,6 +958,11 @@ impl DagActor {
         // `ReportExecutorTermination` from the previous gen spuriously
         // bump `resource_floor` on a drv this generation never assigned.
         recently_disconnected.clear();
+        // `attempt_record_retries` tracks re-deliveries for the previous
+        // generation's pre-report derivations; after the wipe those are
+        // recovered from PG and re-driven by the backstop, so the
+        // counters are meaningless (and would slowly leak) here.
+        attempt_record_retries.clear();
         // `dispatched_cells` is keyed on the previous generation's drv
         // hashes; a stale entry would let a heartbeat for a re-spawned
         // pod clear the wrong cell.
@@ -970,6 +999,93 @@ impl DagActor {
         //   owner). The actor is a passive reader/gated-writer; the
         //   lease-transition reload is housekeeping's job.
         // - `tick_count`: harmless counter.
+    }
+
+    /// Phase 1b bounded re-enqueue: a collapsed failure handler's
+    /// appending transaction (attempt row + `decide()` + status persist)
+    /// failed, so nothing was recorded and the derivation is still in
+    /// its pre-report state. Re-deliver the completion event to the
+    /// actor's own mailbox after [`ATTEMPT_RECORD_REDELIVERY_DELAY`],
+    /// at most [`MAX_ATTEMPT_RECORD_REDELIVERIES`] times per derivation
+    /// (the worker never re-sends a `CompletionReport`, so this re-push
+    /// is the retry mechanism; past the cap the backstop sweep is the
+    /// fallback).
+    ///
+    /// The re-delivered command carries only the fields the failure
+    /// paths consume (status, error message, line count) — the
+    /// telemetry fields are success-path-only and are zeroed. The full
+    /// `handle_completion` guard chain re-runs on delivery, so a
+    /// derivation that completed or got cancelled in the meantime drops
+    /// the stale re-delivery exactly like any other stale report.
+    pub(super) fn requeue_failure_completion(
+        &mut self,
+        executor_id: &ExecutorId,
+        drv_hash: &DrvHash,
+        status: rio_proto::types::BuildResultStatus,
+        error_msg: &str,
+        final_line_count: u64,
+    ) {
+        let attempt = self
+            .attempt_record_retries
+            .entry(drv_hash.clone())
+            .or_insert(0);
+        *attempt += 1;
+        let attempt = *attempt;
+        if attempt > MAX_ATTEMPT_RECORD_REDELIVERIES {
+            error!(
+                drv_hash = %drv_hash, executor_id = %executor_id, ?status, attempt,
+                "appending transaction kept failing; giving up on re-delivery — the derivation \
+                 stays in its pre-report state until the backstop sweep re-drives it"
+            );
+            self.attempt_record_retries.remove(drv_hash);
+            return;
+        }
+        let Some(weak_tx) = self.self_tx.clone() else {
+            // Bare `run()` (tests without a self sender): nothing to
+            // re-push onto. The derivation stays pre-report; the test
+            // either re-sends the completion itself or asserts exactly
+            // this state.
+            warn!(
+                drv_hash = %drv_hash, executor_id = %executor_id,
+                "appending transaction failed and no self sender is wired; \
+                 completion event not re-delivered"
+            );
+            return;
+        };
+        warn!(
+            drv_hash = %drv_hash, executor_id = %executor_id, ?status, attempt,
+            max = MAX_ATTEMPT_RECORD_REDELIVERIES,
+            "appending transaction failed; re-delivering the completion event"
+        );
+        metrics::counter!("rio_scheduler_attempt_record_retries_total").increment(1);
+        let cmd = ActorCommand::ProcessCompletion {
+            executor_id: executor_id.clone(),
+            drv_key: drv_hash.as_str().to_string(),
+            result: rio_proto::types::BuildResult {
+                status: status.into(),
+                error_msg: error_msg.to_string(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            node_name: None,
+            hw_class: None,
+            final_resources: None,
+            final_line_count,
+        };
+        let drv = drv_hash.clone();
+        rio_common::task::spawn_monitored("attempt-record-redeliver", async move {
+            tokio::time::sleep(ATTEMPT_RECORD_REDELIVERY_DELAY).await;
+            if let Some(tx) = weak_tx.upgrade()
+                && tx.try_send(cmd).is_err()
+            {
+                tracing::warn!(
+                    drv_hash = %drv,
+                    "re-delivered completion dropped (channel full/closed); the backstop sweep \
+                     will re-drive the derivation"
+                );
+            }
+        });
     }
 
     /// Run the actor with a weak clone of its own sender for scheduling

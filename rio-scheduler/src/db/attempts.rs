@@ -169,8 +169,9 @@ impl AttemptRow {
     }
 }
 
-/// Wall-clock now as epoch seconds (the append-site `occurred_at`).
-fn epoch_now() -> f64 {
+/// Wall-clock now as epoch seconds (the append-site `occurred_at`, and
+/// the `now` the Phase-1b appending transactions hand to `decide()`).
+pub(crate) fn epoch_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -402,6 +403,45 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Single-derivation suffix load **inside the caller's transaction**
+    /// — the read half of the Phase-1b appending transaction (append the
+    /// observation's row, read the post-reset suffix it now belongs to,
+    /// fold it through `decide()`, persist the verdict, commit). Same
+    /// query shape as [`Self::load_attempt_suffix`], scoped to one
+    /// derivation and running on the transaction's connection so it sees
+    /// the row appended moments earlier.
+    pub(crate) async fn load_attempt_suffix_one_in_tx(
+        tx: &mut PgConnection,
+        derivation_id: Uuid,
+    ) -> Result<Vec<AttemptRow>, sqlx::Error> {
+        let raw: Vec<RawAttemptRow> = sqlx::query_as(
+            "SELECT a.attempt_id, a.derivation_id, a.exec_id, a.executor_id, \
+                    a.event_kind, a.outcome_class, a.termination_reason, \
+                    a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
+                    a.error_msg, a.final_line_count, a.resubmit_cycle, \
+                    EXTRACT(EPOCH FROM a.occurred_at)::float8 AS occurred_at_epoch_secs, \
+                    EXTRACT(EPOCH FROM a.recorded_at)::float8 AS recorded_at_epoch_secs \
+             FROM drv_attempts a \
+             LEFT JOIN LATERAL ( \
+                 SELECT r.recorded_at, r.attempt_id \
+                 FROM drv_attempts r \
+                 WHERE r.derivation_id = a.derivation_id \
+                   AND r.event_kind = 'reset' \
+                 ORDER BY r.recorded_at DESC, r.attempt_id DESC \
+                 LIMIT 1 \
+             ) last_reset ON TRUE \
+             WHERE a.derivation_id = $1 \
+               AND (last_reset.recorded_at IS NULL \
+                    OR (a.recorded_at, a.attempt_id) \
+                       >= (last_reset.recorded_at, last_reset.attempt_id)) \
+             ORDER BY a.recorded_at, a.attempt_id",
+        )
+        .bind(derivation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        raw.into_iter().map(AttemptRow::try_from).collect()
     }
 
     /// Batched suffix load: for every requested derivation, the ledger

@@ -71,6 +71,22 @@ pub(super) struct FailureReportCtx<'a> {
     pub(super) error_msg: &'a str,
 }
 
+/// Whether a Phase-1b-collapsed failure handler completed its appending
+/// transaction. [`Self::RecordFailed`] means nothing was recorded and no
+/// state changed — the derivation is still in its pre-report state and
+/// the completion event must be re-delivered (bounded) by the caller,
+/// because the worker never re-sends a `CompletionReport`.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailureHandling {
+    /// The event was fully processed (or legitimately dropped by a
+    /// status/precondition guard) — nothing to re-deliver.
+    Handled,
+    /// The appending transaction failed; re-deliver the completion
+    /// event via the bounded re-enqueue helper.
+    RecordFailed,
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Attempt-ledger appends (Phase 1a): one row per observed attempt,
@@ -184,6 +200,61 @@ impl DagActor {
                        "failed to persist attempt row + poisoned status+timestamp");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1b: the appending transaction is the decision point. A
+    // collapsed site appends its row, reads the post-reset suffix (plus
+    // the transitional legacy mirror-column seed) on the same
+    // connection, folds it through `decide()`, persists the verdict's
+    // status via the `_in_tx` variants, and only then — after the
+    // commit — performs the in-memory transition and epilogue. A failed
+    // transaction leaves the derivation in its pre-report state and the
+    // event is re-delivered with bounded retry
+    // (`requeue_failure_completion`).
+    // -----------------------------------------------------------------------
+
+    /// The fold's budget view of the actor's live retry/poison
+    /// configuration (plus the two compile-time poison constants).
+    pub(super) fn decision_budget(&self) -> crate::retry_policy::Budget {
+        crate::retry_policy::Budget {
+            max_retries: self.retry_policy.max_retries,
+            max_infra_retries: self.retry_policy.max_infra_retries,
+            max_timeout_retries: self.retry_policy.max_timeout_retries,
+            max_exempt_infra_retries: self.retry_policy.max_exempt_infra_retries,
+            infra_retry_window_secs: self.retry_policy.infra_retry_window_secs as u64,
+            backoff_base_secs: self.retry_policy.backoff_base_secs as u64,
+            backoff_multiplier: self.retry_policy.backoff_multiplier as u64,
+            backoff_max_secs: self.retry_policy.backoff_max_secs as u64,
+            poison_threshold: self.poison_config.threshold,
+            require_distinct_workers: self.poison_config.require_distinct_workers,
+            poison_resubmit_retry_limit: crate::state::POISON_RESUBMIT_RETRY_LIMIT,
+            poison_ttl_secs: crate::state::POISON_TTL.as_secs(),
+        }
+    }
+
+    /// The read half of a Phase-1b appending transaction: append `row`,
+    /// load the post-reset suffix it now belongs to and the legacy
+    /// mirror-column seed (decision P5) on the same connection, and fold
+    /// them through `decide()`. The caller persists the verdict's status
+    /// via the `_in_tx` variants on the same connection and commits.
+    pub(super) async fn append_and_decide_in_tx(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        row: &AttemptRow,
+    ) -> Result<crate::retry_policy::Decision, sqlx::Error> {
+        crate::db::SchedulerDb::append_attempt(tx, row).await?;
+        let suffix =
+            crate::db::SchedulerDb::load_attempt_suffix_one_in_tx(tx, row.derivation_id).await?;
+        let seed = crate::db::SchedulerDb::load_retry_seed_in_tx(tx, row.derivation_id).await?;
+        let history: Vec<crate::state::AttemptRecord> =
+            suffix.iter().map(AttemptRow::to_record).collect();
+        Ok(crate::retry_policy::decide(
+            &history,
+            &self.decision_budget(),
+            crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+            seed.as_ref(),
+        ))
     }
 
     /// Append one attempt row with NO accompanying status persist — the
@@ -1246,15 +1317,30 @@ impl DagActor {
             // (deterministic re-dispatch on persisted is_fixed_output).
             // Retry can't help.
             | rio_proto::types::BuildResultStatus::InputRejected => {
-                self.handle_permanent_failure(
-                    drv_hash,
-                    executor_id,
-                    FailureReportCtx {
-                        final_line_count: report_line_count,
-                        error_msg: &result.error_msg,
-                    },
-                )
-                .await;
+                let handling = self
+                    .handle_permanent_failure(
+                        drv_hash,
+                        executor_id,
+                        FailureReportCtx {
+                            final_line_count: report_line_count,
+                            error_msg: &result.error_msg,
+                        },
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        self.requeue_failure_completion(
+                            executor_id,
+                            drv_hash,
+                            status,
+                            &result.error_msg,
+                            final_line_count,
+                        );
+                    }
+                }
             }
             // TimedOut: I-200 bumps resource_floor.deadline and retries on
             // a larger class (longer activeDeadlineSeconds), bounded by
@@ -2938,16 +3024,38 @@ impl DagActor {
         self.requeue_after_retry(drv_hash, attempt_row).await;
     }
 
+    /// E3, collapsed onto `decide()` (Phase 1b): the verdict for a
+    /// permanent failure is computed by the fold over the appended
+    /// attempt suffix inside the appending transaction; the in-memory
+    /// transition, the legacy RAM/mirror writes (kept until T-1b.13),
+    /// and the terminal epilogue run only after the commit. A failed
+    /// transaction leaves the derivation in its pre-report state and
+    /// the caller re-delivers the event.
     pub(super) async fn handle_permanent_failure(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
-    ) {
+    ) -> FailureHandling {
         let error_msg = report.error_msg;
+        // Pre-report precondition (the same one the as-built in-memory
+        // transition enforced first): the node exists and is still in a
+        // poison-able state. handle_completion's status guards already
+        // ensure Assigned/Running; this is defense against a stale
+        // report racing a terminal transition.
+        match self.dag.node(drv_hash).map(|s| s.status()) {
+            Some(
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running,
+            ) => {}
+            Some(status) => {
+                warn!(drv_hash = %drv_hash, current = ?status,
+                      "handle_permanent_failure: not in a poison-able state, skipping");
+                return FailureHandling::Handled;
+            }
+            None => return FailureHandling::Handled,
+        }
         // Ledger row for this observed attempt (1a): captured before
-        // the terminal transition; appended in the poison persist's
-        // transaction below.
+        // any transition clears the exec_id carrier.
         let mut attempt_row =
             self.attempt_row_for(drv_hash, OutcomeClass::Permanent, ReportingParty::Worker);
         if let Some(row) = attempt_row.as_mut() {
@@ -2955,29 +3063,74 @@ impl DagActor {
             row.error_msg = (!error_msg.is_empty()).then(|| error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
+
+        let recorded_row = if let Some(row) = attempt_row {
+            // The appending transaction is the decision point: append the
+            // row, fold the suffix through decide(), persist Poisoned —
+            // commit or leave the derivation untouched.
+            let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                tx.commit().await?;
+                Ok(decision)
+            }
+            .await;
+            match result {
+                Ok(decision) => {
+                    // Permanent statuses poison unconditionally — the fold's
+                    // Permanent arm has no other verdict, so anything else
+                    // here is a decide()/mapping bug. Log it loudly but keep
+                    // the as-built terminal outcome (the equivalence the
+                    // battery pins).
+                    if !matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
+                        error!(drv_hash = %drv_hash, verdict = ?decision.verdict,
+                               "decide() returned a non-poison verdict for a permanent failure; \
+                                poisoning anyway (fold bug — investigate)");
+                    }
+                    Some(row)
+                }
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                          "permanent failure: appending transaction failed; derivation stays in \
+                           its pre-report state pending re-delivery");
+                    return FailureHandling::RecordFailed;
+                }
+            }
+        } else {
+            // No db_id yet (merge not committed): nothing to append or
+            // fold. Degrade to the as-built best-effort poison persist so
+            // the terminal outcome is preserved.
+            self.persist_poisoned(drv_hash).await;
+            None
+        };
+
         let Some(state) = self.dag.node_mut(drv_hash) else {
-            return;
+            return FailureHandling::Handled;
         };
         state.ensure_running();
         if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-            // Stale PermanentFailure (e.g., drv already Completed on
-            // another worker after reassignment). Don't write Poisoned
-            // to PG or cascade — in-mem/PG drift + spurious cascade is
-            // worse than a missed failure event.
+            // Should be unreachable given the precondition above (the
+            // actor is single-threaded, so nothing ran between the check
+            // and here besides our own awaits). Keep the as-built guard:
+            // don't cascade on a rejected transition.
             warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
                   "handle_permanent_failure: ->Poisoned transition rejected, skipping");
-            return;
+            return FailureHandling::Handled;
         }
         state.retry.poisoned_at = Some(Instant::now());
         // I-209: record which builder produced the permanent failure.
         // Diagnostics-only — `failed_builders` doesn't gate anything
         // on the permanent path (no retry), but rio-cli/kubectl shows
-        // an empty array as "never ran" without this. Mirrors the
-        // record_failure_and_check_poison shape (in-mem first, PG
-        // best-effort).
+        // an empty array as "never ran" without this. Legacy RAM write,
+        // kept until T-1b.13 (rule 1 of the Phase-1b plan).
         state.retry.failed_builders.insert(executor_id.clone());
+        if let Some(row) = recorded_row {
+            state.push_attempt_record(row.to_record());
+        }
 
-        self.record_attempt_with_poison(drv_hash, attempt_row).await;
+        // Legacy mirror write (kept until T-1b.13): the failed_builders
+        // column still feeds the as-built recovery projection.
         if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
                    "failed to persist failed_worker");
@@ -2991,6 +3144,7 @@ impl DagActor {
             report.final_line_count,
         )
         .await;
+        FailureHandling::Handled
     }
 
     /// Worker-side timeout (`BuildResultStatus::TimedOut`): promote

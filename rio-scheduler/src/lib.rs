@@ -465,6 +465,15 @@ pub fn describe_metrics() {
          worker disconnect reassign still fires. Alert if rate > 0 sustained."
     );
     describe_counter!(
+        "rio_scheduler_attempt_record_retries_total",
+        "Re-deliveries of failure completions whose attempt-recording transaction \
+         (drv_attempts append + decide() + status persist) failed. Each increment is one \
+         bounded re-push of the completion event onto the actor mailbox; the derivation \
+         stays in its pre-report state until a re-delivery lands. Sustained rate > 0 means \
+         PG is rejecting the failure-accounting write path (the backstop sweep is the \
+         fallback once the per-derivation re-delivery budget is exhausted)."
+    );
+    describe_counter!(
         "rio_scheduler_lease_acquired_total",
         "Successful K8s Lease acquisitions (leader elections won)"
     );

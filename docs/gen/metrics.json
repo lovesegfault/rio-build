@@ -74,6 +74,7 @@
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
+    "rio_scheduler_attempt_record_retries_total",
     "rio_scheduler_backstop_timeouts_total",
     "rio_scheduler_broadcast_lagged_total",
     "rio_scheduler_build_duration_seconds",
@@ -592,6 +593,11 @@
         "name": "rio_scheduler_assignments_total",
         "kind": "counter",
         "help": "Total derivation-to-worker assignments"
+      },
+      {
+        "name": "rio_scheduler_attempt_record_retries_total",
+        "kind": "counter",
+        "help": "Re-deliveries of failure completions whose attempt-recording transaction (drv_attempts append + decide() + status persist) failed. Each increment is one bounded re-push of the completion event onto the actor mailbox; the derivation stays in its pre-report state until a re-delivery lands. Sustained rate > 0 means PG is rejecting the failure-accounting write path (the backstop sweep is the fallback once the per-derivation re-delivery budget is exhausted)."
       },
       {
         "name": "rio_scheduler_backstop_timeouts_total",

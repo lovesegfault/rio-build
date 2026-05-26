@@ -483,6 +483,38 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
+    /// Load the legacy retry mirror columns
+    /// (`derivations.{retry_count, failed_builders, resubmit_cycles}`)
+    /// for one derivation, on the caller's connection — the transitional
+    /// legacy seed (decision P5) the Phase-1b appending transactions hand
+    /// to `decide()` so a failure history that spans the 066 deployment
+    /// keeps the budgets and exclusions the columns hold. Returns `None`
+    /// when the derivation row does not exist (uncommitted merge);
+    /// `poisoned_at` is deliberately not read here — the live failure
+    /// paths only run for non-terminal derivations, and the recovery-side
+    /// seed construction (T-1b.12a) owns the poisoned-row variant.
+    pub(crate) async fn load_retry_seed_in_tx(
+        tx: &mut PgConnection,
+        derivation_id: uuid::Uuid,
+    ) -> Result<Option<crate::retry_policy::PersistedRetryColumns>, sqlx::Error> {
+        let row: Option<(i32, i32, Vec<String>)> = sqlx::query_as(
+            "SELECT COALESCE(retry_count, 0), COALESCE(resubmit_cycles, 0), \
+                    COALESCE(failed_builders, '{}') \
+             FROM derivations WHERE derivation_id = $1",
+        )
+        .bind(derivation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(row.map(|(retry_count, resubmit_cycles, failed_builders)| {
+            crate::retry_policy::PersistedRetryColumns {
+                retry_count: u32::try_from(retry_count).unwrap_or(0),
+                resubmit_cycles: u32::try_from(resubmit_cycles).unwrap_or(0),
+                failed_builders: failed_builders.into_iter().collect(),
+                poisoned_at: None,
+            }
+        }))
+    }
+
     /// Load poisoned derivations with their `poisoned_at` timestamps
     /// for recovery. Separate from `load_nonterminal_derivations`
     /// because `TERMINAL_STATUSES` includes `"poisoned"`.

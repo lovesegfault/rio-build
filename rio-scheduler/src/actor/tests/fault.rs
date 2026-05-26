@@ -257,3 +257,122 @@ async fn test_transition_build_db_fault_retried_by_tick() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.2): the appending transaction is the decision point.
+// When it cannot commit, the failure is NOT applied — the derivation
+// stays in its pre-report state and the completion event is re-delivered
+// with bounded retry.
+// ---------------------------------------------------------------------------
+
+/// Posture flip: with PG down, a permanent failure leaves the derivation
+/// in its pre-report state (still Assigned, not Poisoned, no
+/// poisoned_at) instead of poisoning in memory while silently losing the
+/// accounting. The bounded re-delivery warn is logged.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn phase1b_e3_record_tx_failure_keeps_pre_report_state() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("e3fault-w", "x86_64-linux").await?;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "e3fault", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "e3fault").await.status,
+        DerivationStatus::Assigned,
+        "merged + dispatched before the fault"
+    );
+
+    db.pool.close().await;
+    complete_failure(
+        &handle,
+        "e3fault-w",
+        &test_drv_path("e3fault"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, "e3fault").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Assigned,
+        "pre-report state preserved when the appending transaction fails"
+    );
+    assert!(
+        post.retry.poisoned_at.is_none(),
+        "no in-memory poison without a committed record"
+    );
+    assert!(
+        logs_contain("appending transaction failed"),
+        "the bounded re-delivery path logged"
+    );
+    Ok(())
+}
+
+/// Bounded re-delivery convergence: a transient fault (the ledger table
+/// briefly missing) fails the first appending transaction; once the
+/// fault clears, the re-delivered completion converges to the same
+/// Poisoned + cascade outcome with exactly one ledger row.
+#[tokio::test]
+async fn phase1b_e3_record_tx_retry_converges() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("e3conv-w", "x86_64-linux").await?;
+    let child = "e3conv-c";
+    let parent = "e3conv-p";
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node(child), make_node(parent)],
+        vec![make_test_edge(parent, child)],
+        false,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx).await;
+
+    // Break only the appending transaction: hide the ledger table.
+    sqlx::query("ALTER TABLE drv_attempts RENAME TO drv_attempts_hidden")
+        .execute(&db.pool)
+        .await?;
+    complete_failure(
+        &handle,
+        "e3conv-w",
+        &test_drv_path(child),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_ne!(
+        expect_drv(&handle, child).await.status,
+        DerivationStatus::Poisoned,
+        "stays pre-report while the fault holds"
+    );
+
+    // Clear the fault; the delayed re-delivery (1 s) then lands.
+    sqlx::query("ALTER TABLE drv_attempts_hidden RENAME TO drv_attempts")
+        .execute(&db.pool)
+        .await?;
+    let mut converged = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if expect_drv(&handle, child).await.status == DerivationStatus::Poisoned {
+            converged = true;
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "re-delivered completion must converge to Poisoned"
+    );
+    assert_eq!(
+        expect_drv(&handle, parent).await.status,
+        DerivationStatus::DependencyFailed,
+        "cascade still runs on the re-delivered event"
+    );
+    assert_eq!(
+        ledger_classes(&db.pool, child).await,
+        vec!["permanent"],
+        "exactly one ledger row after convergence"
+    );
+    Ok(())
+}

@@ -4962,3 +4962,97 @@ async fn attempt_ledger_cascade_row_for_dependent() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.2): E3 collapsed onto decide() — the verdict for a
+// permanent failure comes from the fold over the appended attempt suffix
+// inside the appending transaction. These tests pin equivalence with the
+// as-built behavior (no verdict, cascade, or epilogue change).
+// ---------------------------------------------------------------------------
+
+/// Each of the seven permanent statuses still poisons the trigger,
+/// cascades DependencyFailed to its dependent, emits the trigger's
+/// DerivationFailed{PermanentFailure} epilogue event carrying the
+/// worker's error message, persists `poisoned` to PG, and appends
+/// exactly one `permanent` ledger row — the as-built outcomes,
+/// unchanged by routing the verdict through decide().
+#[tokio::test]
+async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
+    use rio_proto::types::BuildResultStatus as S;
+    let statuses = [
+        S::PermanentFailure,
+        S::CachedFailure,
+        S::DependencyFailed,
+        S::LogLimitExceeded,
+        S::OutputRejected,
+        S::NotDeterministic,
+        S::InputRejected,
+    ];
+    for (i, status) in statuses.into_iter().enumerate() {
+        let (db, handle, _task, mut rx) = setup_with_worker("e3w", "x86_64-linux").await?;
+        let child = format!("e3c{i}");
+        let parent = format!("e3p{i}");
+        let mut ev = merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node(&child), make_node(&parent)],
+            vec![make_test_edge(&parent, &child)],
+            false,
+        )
+        .await?;
+        let _ = recv_assignment(&mut rx).await;
+        complete_failure(
+            &handle,
+            "e3w",
+            &test_drv_path(&child),
+            status,
+            "deterministic boom",
+        )
+        .await?;
+        barrier(&handle).await;
+
+        let trigger = expect_drv(&handle, &child).await;
+        assert_eq!(
+            trigger.status,
+            DerivationStatus::Poisoned,
+            "{status:?} must poison the trigger"
+        );
+        assert!(
+            trigger.retry.poisoned_at.is_some(),
+            "{status:?}: poisoned_at stamped"
+        );
+        assert!(
+            trigger.retry.failed_builders.contains("e3w"),
+            "{status:?}: legacy RAM exclusion write stays in place (rule 1)"
+        );
+        assert_eq!(
+            expect_drv(&handle, &parent).await.status,
+            DerivationStatus::DependencyFailed,
+            "{status:?} must cascade to the dependent"
+        );
+        assert_eq!(
+            ledger_classes(&db.pool, &child).await,
+            vec!["permanent"],
+            "{status:?}: exactly one permanent row for the trigger"
+        );
+        let pg_status: String =
+            sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(&child)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(pg_status, "poisoned", "{status:?}: PG status persisted");
+
+        // Epilogue unchanged: the trigger's DerivationFailed event still
+        // reports PermanentFailure and carries the worker's message.
+        let drv_events = drain_derivation_events(&mut ev);
+        let failed_kind = rio_proto::types::DerivationEventKind::Failed as i32;
+        let perm = S::PermanentFailure as i32;
+        assert!(
+            drv_events.iter().any(|d| d.kind == failed_kind
+                && d.failure_status == perm
+                && d.error_message.contains("deterministic boom")),
+            "{status:?}: trigger epilogue event unchanged ({drv_events:?})"
+        );
+    }
+    Ok(())
+}
