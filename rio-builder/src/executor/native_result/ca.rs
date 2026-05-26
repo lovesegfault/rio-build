@@ -194,7 +194,16 @@ pub(crate) fn finalize_floating_ca(
             sink.write_all(&bytes).expect("hashing is infallible");
             sink.finish()
         };
-        let self_referenced = self_hits > 0;
+        // The `:self` fingerprint flag comes from the *recorded* reference
+        // set, exactly like CppNix derives it from the scanned references:
+        // under structured-attrs `unsafeDiscardReferences` the recorded set
+        // is empty, so the path is minted WITHOUT the self token even when
+        // the bytes embed the output's own scratch hash. The embedded hash
+        // is still rewritten to the final hash below (`self_hits` keeps
+        // deciding that), mirroring CppNix's unconditional rewriteOutput —
+        // and the store gate accepts that shape because the `fixed:`
+        // descriptor carries the same modulo hash.
+        let self_referenced = out.references.contains(&out.store_path);
 
         // References for the path fingerprint: the (already remapped)
         // scanned references, excluding the output itself (self is
@@ -233,13 +242,18 @@ pub(crate) fn finalize_floating_ca(
         );
 
         let scratch_str = out.store_path.clone();
-        let content_changed = sibling_hits > 0 || self_referenced;
+        // Rewriting is keyed on what the bytes contain (textual hits), not
+        // on whether the self-reference is recorded — a discarded
+        // self-reference still gets its scratch hash rewritten to the
+        // final hash, like CppNix.
+        let content_changed = sibling_hits > 0 || self_hits > 0;
 
         debug!(
             output = %out.name,
             scratch = %scratch_str,
             final_path = %final_str,
             self_referenced,
+            self_hits,
             sibling_hits,
             "finalizing floating-CA output"
         );
@@ -432,5 +446,114 @@ mod tests {
         let mut short = b"ab".to_vec();
         replace_in_buf(&mut short, b"abc", b"def");
         assert_eq!(short, b"ab");
+    }
+
+    /// Build a scratch output directory containing one file that embeds
+    /// the scratch store path, plus the matching `ProcessedOutput` and a
+    /// recursive-SHA256 `FloatingCaSpec` for it.
+    fn scratch_fixture(
+        tmp: &Path,
+        references: Vec<String>,
+    ) -> (ProcessedOutput, FloatingCaSpec, StorePath) {
+        let drv =
+            StorePath::parse("/nix/store/00000000000000000000000000000000-rio-ca-self-test.drv")
+                .unwrap();
+        let scratch = StorePath::make_scratch_output_path(&drv, "out").unwrap();
+
+        let host = tmp.join("scratch-out");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(
+            host.join("marker"),
+            format!("I live at {}\n", scratch.as_str()),
+        )
+        .unwrap();
+
+        let out = ProcessedOutput {
+            name: "out".into(),
+            store_path: scratch.as_str().to_owned(),
+            host_path: host,
+            nar_hash: [0u8; 32],
+            nar_size: 0,
+            references,
+            content_address: None,
+        };
+        let spec = FloatingCaSpec {
+            methods: HashMap::from([("out".to_owned(), (true, HashAlgo::SHA256))]),
+        };
+        (out, spec, scratch)
+    }
+
+    /// Expected modulo hash + final path for the fixture above, computed
+    /// independently of the code under test.
+    fn expected_final(scratch: &StorePath, host: &Path, self_flag: bool) -> (String, StorePath) {
+        let nar = rio_nix::nar::dump_path(host).unwrap();
+        let mut sink = HashModuloSink::new(HashAlgo::SHA256, &scratch.hash_part());
+        sink.write_all(&nar).unwrap();
+        let (modulo, _) = sink.finish();
+        let path =
+            StorePath::make_fixed_output_with_self(scratch.name(), &modulo, true, &[], self_flag)
+                .unwrap();
+        (format!("fixed:r:{}", modulo.to_colon()), path)
+    }
+
+    /// `unsafeDiscardReferences` empties the recorded reference set before
+    /// finalization: the path must be minted WITHOUT the `:self` token
+    /// (CppNix derives the flag from the recorded references), the
+    /// references must stay empty, and the embedded scratch hash must
+    /// still be rewritten to the final hash.
+    #[test]
+    fn discarded_self_reference_omits_the_self_token_but_still_rewrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut out, spec, scratch) = scratch_fixture(tmp.path(), vec![]);
+        let (want_descriptor, want_path) =
+            expected_final(&scratch, &out.host_path, /* self */ false);
+        let (_, with_self) = expected_final(&scratch, &out.host_path, /* self */ true);
+
+        finalize_floating_ca(std::slice::from_mut(&mut out), &spec).unwrap();
+
+        assert_eq!(out.store_path, want_path.as_str(), "path must omit :self");
+        assert_ne!(
+            out.store_path,
+            with_self.as_str(),
+            "the self flag must actually change the fingerprint"
+        );
+        assert!(out.references.is_empty(), "discarded references stay empty");
+        assert_eq!(
+            out.content_address.as_deref(),
+            Some(want_descriptor.as_str())
+        );
+
+        let rewritten = std::fs::read_to_string(out.host_path.join("marker")).unwrap();
+        assert!(
+            rewritten.contains(&want_path.hash_part()),
+            "embedded hash must be rewritten to the final hash"
+        );
+        assert!(
+            !rewritten.contains(&scratch.hash_part()),
+            "the scratch hash must not survive finalization"
+        );
+    }
+
+    /// A *recorded* self-reference (the normal, non-discarded case) keeps
+    /// the `:self` fingerprint token and is remapped to the final path in
+    /// the recorded reference set.
+    #[test]
+    fn declared_self_reference_keeps_the_self_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut out, spec, scratch) = scratch_fixture(
+            tmp.path(),
+            vec![/* recorded self reference */ String::new()],
+        );
+        out.references[0] = scratch.as_str().to_owned();
+        let (_, want_path) = expected_final(&scratch, &out.host_path, /* self */ true);
+
+        finalize_floating_ca(std::slice::from_mut(&mut out), &spec).unwrap();
+
+        assert_eq!(out.store_path, want_path.as_str(), "path must carry :self");
+        assert_eq!(
+            out.references,
+            vec![want_path.as_str().to_owned()],
+            "the recorded self-reference must be remapped to the final path"
+        );
     }
 }
