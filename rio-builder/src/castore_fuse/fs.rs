@@ -786,6 +786,28 @@ impl Filesystem for CastoreFs {
             reply.data(&[]);
         }
     }
+
+    // `ENOTTY`, not fuser's default `ENOSYS`: NAR-derived content has no
+    // chattr flags, so "no fileattr support" is the truthful answer.
+    // overlayfs's copy-up (`ovl_copy_fileattr`) probes FS_IOC_GETFLAGS on
+    // every lower inode it copies up and treats ENOTTY as exactly that;
+    // the explicit reply also keeps the probe off fuser's per-call
+    // ENOSYS WARN spam (the old FUSE module saw 113× per build from the
+    // chroot store's probes).
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: fuser::IoctlFlags,
+        _cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        reply.error(Errno::ENOTTY);
+    }
 }
 
 /// `pread` exactly `buf.len()` bytes at `offset`, stopping early at

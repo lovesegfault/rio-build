@@ -19,10 +19,11 @@
 //!   and the shared high-water mark advances; `read()`s inside the
 //!   verified prefix are served from the `.partial`, reads beyond it
 //!   block (bounded) until their range arrives or the fill fails.
-//! - On completion the whole-file blake3 is verified, the `.partial`
-//!   is renamed to the bare digest name and `Promote`d into the shared
-//!   backing cache — the next `open()` of this digest is a passthrough
-//!   cache hit.
+//! - On completion the whole-file blake3 is verified and the `.partial`
+//!   is renamed to the bare digest name; readers are unblocked at that
+//!   point, and the file is then `Promote`d (best-effort) into the
+//!   shared backing cache so the next `open()` of this digest is a
+//!   passthrough cache hit.
 //!
 //! The progress tracker is std::sync (`Mutex` + `Condvar`), matching
 //! the rest of the FUSE callback path; only the fill thread itself
@@ -59,6 +60,13 @@ const FETCH_LOOKAHEAD: usize = 16;
 /// batch never trips `BatchTooLarge`.
 const PROMOTE_BATCH: usize = 32;
 
+/// Upper bound on a single chunk's claimed size in a `StatBlob` window:
+/// the store's FastCDC parameters cap chunks at 4 MiB. A window claiming
+/// more (or a zero-size chunk) is malformed — rejecting it up front
+/// bounds what one `GetChunks` reply can make the fill buffer or write,
+/// instead of trusting the wire value.
+const CHUNK_SIZE_MAX: u64 = 4 * 1024 * 1024;
+
 /// Shared state of one in-flight streaming fill: the staging
 /// `.partial` being assembled, the verified-prefix high-water mark,
 /// and the fill's terminal result.
@@ -80,9 +88,9 @@ pub struct StreamFill {
     size: u64,
     /// Upper bound on any single blocked wait (a `read()` past the
     /// high-water mark, or `open()`'s first-chunk barrier). Sized to
-    /// the fill's own size-aware budget plus the promote round-trip,
-    /// so a healthy fill always finishes (or fails and wakes everyone)
-    /// before a waiter gives up.
+    /// the fill's own size-aware budget plus one mountd round-trip of
+    /// slack, so a healthy fill always finishes (or fails and wakes
+    /// everyone) before a waiter gives up.
     wait_budget: Duration,
     progress: Mutex<Progress>,
     cv: Condvar,
@@ -209,6 +217,10 @@ pub(super) struct FillContext {
     /// `staging/{build_id}/chunks/` — where remotely-fetched chunks are
     /// staged for `PromoteChunks`.
     pub staging_chunks_dir: PathBuf,
+    /// `cache/{ab}/{hex}` — the shared backing-cache entry the final
+    /// `Promote` publishes. Consulted on `RaceTimeout` to detect that a
+    /// concurrent build's promote of the same digest already landed.
+    pub cache_path: PathBuf,
     /// The mountd-owned node chunk cache root (`/var/rio/chunks`),
     /// read-only to the builder.
     pub chunks_dir: PathBuf,
@@ -228,6 +240,9 @@ pub(super) struct FillContext {
 
 /// Why a streaming fill failed. Every variant surfaces to the kernel as
 /// `EIO`; the split decides which metric/log/circuit treatment applies.
+/// Promote is deliberately NOT a variant: it runs after the verified
+/// rename and after readers have been unblocked, so its failure never
+/// fails the fill (see [`promote_streamed`]).
 enum FillError {
     /// rio-store unreachable or a gRPC stream failed (counts against
     /// the fetch circuit breaker).
@@ -239,8 +254,6 @@ enum FillError {
     Io(String),
     /// The fill exceeded its wall-clock budget.
     Timeout,
-    /// The verified file could not be promoted into the shared cache.
-    Promote(String),
 }
 
 /// Create the [`StreamFill`] for `ctx` (claiming the staging
@@ -249,8 +262,8 @@ enum FillError {
 ///
 /// The thread is detached: it keeps running after every file handle is
 /// released so the fill's promote still benefits later opens. Its
-/// lifetime is bounded by `ctx.budget` — every blocking step inside
-/// checks the deadline.
+/// lifetime is bounded by `ctx.budget` (every blocking step in the fill
+/// body checks the deadline) plus the post-publish Promote round-trip.
 pub(super) fn spawn_fill(ctx: FillContext) -> std::io::Result<Arc<StreamFill>> {
     let partial = super::open::create_partial(&ctx.partial_path)?;
     let fill = Arc::new(StreamFill::new(
@@ -319,10 +332,6 @@ fn run_fill(ctx: &FillContext, fill: &Arc<StreamFill>) {
             );
             Some(Errno::EIO)
         }
-        Err(FillError::Promote(msg)) => {
-            tracing::error!(error = %msg, "castore-fuse: promoting the streamed file failed");
-            Some(Errno::EIO)
-        }
     };
     // The breaker watches store reachability: only store-side failures
     // (and timeouts, which on this path are dominated by the remote
@@ -333,21 +342,63 @@ fn run_fill(ctx: &FillContext, fill: &Arc<StreamFill>) {
         Err(_) => {}
     }
 
-    if errno.is_some() {
-        // A failed fill leaves nothing behind: the next open of this
-        // digest starts a fresh fill (or, if mountd promoted a
-        // concurrent build's copy meanwhile, takes the hit path).
-        let _ = std::fs::remove_file(&ctx.partial_path);
-    }
-
-    // Disarm the panic guard and publish the real outcome. Ordering
-    // matters: the `.partial` is gone and the registry entry removed
-    // BEFORE waiters observe the result, so an opener that saw this
-    // fill fail and immediately retries gets a fresh fill instead of
-    // attaching to (or colliding with the staging file of) a dead one.
     let (fill, registry, digest) = scopeguard::ScopeGuard::into_inner(panic_guard);
-    registry.lock().ignore_poison().remove(&digest);
-    fill.finish(errno.map_or(Ok(()), Err));
+    match errno {
+        Some(errno) => {
+            // A failed fill leaves nothing behind: the next open of this
+            // digest starts a fresh fill (or, if mountd promoted a
+            // concurrent build's copy meanwhile, takes the hit path).
+            let _ = std::fs::remove_file(&ctx.partial_path);
+            // Ordering matters: the `.partial` is gone and the registry
+            // entry removed BEFORE waiters observe the result, so an
+            // opener that saw this fill fail and immediately retries
+            // gets a fresh fill instead of attaching to (or colliding
+            // with the staging file of) a dead one.
+            registry.lock().ignore_poison().remove(&digest);
+            fill.finish(Err(errno));
+        }
+        None => {
+            // Success is publishable the moment the verified rename
+            // landed: readers pread the renamed staging file through the
+            // fd this StreamFill already holds. The Promote that follows
+            // only matters for the NEXT open of this digest, so it must
+            // neither delay nor poison reads on handles already open —
+            // the deliberate asymmetry with the whole-file path, which
+            // has nothing to serve the kernel without the cache entry
+            // and therefore still treats a Promote failure as fatal.
+            fill.finish(Ok(()));
+            promote_streamed(ctx);
+            // Deregister last: an open() racing the promote attaches to
+            // this finished fill (and reads from staging) instead of
+            // starting a redundant one.
+            registry.lock().ignore_poison().remove(&digest);
+        }
+    }
+}
+
+/// Best-effort `Promote` of the renamed staging file into the shared
+/// backing cache, after the fill's success has been published. Failures
+/// are logged and counted, never fatal: every already-open handle keeps
+/// reading from the staging fd; only future opens of this digest lose
+/// the cache hit (they re-stream and re-attempt the promote).
+///
+/// The round-trip deadline is size-scaled like the whole-file path's
+/// (mountd re-hashes + copies the entire file), and `RaceTimeout` gets
+/// the same cache re-check + single retry.
+fn promote_streamed(ctx: &FillContext) {
+    let timeout = crate::store_fetch::jit_fetch_timeout(ctx.mountd_timeout, ctx.size);
+    if let Err(e) =
+        super::open::promote_with_race_retry(&ctx.mountd, ctx.file_digest, &ctx.cache_path, timeout)
+    {
+        metrics::counter!("rio_builder_castore_fuse_promote_fail_total").increment(1);
+        tracing::warn!(
+            digest = %hex::encode(ctx.file_digest),
+            error = %e,
+            build_fatal = e.is_build_fatal(),
+            "castore-fuse: promoting the streamed file failed; this build keeps reading from \
+             staging, but later opens of this digest will re-fetch"
+        );
+    }
 }
 
 /// One chunk's place in the fill: its content address, its full size,
@@ -384,6 +435,16 @@ fn plan_chunks(resp: &StatBlobResponse, file_size: u64) -> Result<Vec<PlannedChu
             .as_slice()
             .try_into()
             .map_err(|_| format!("chunk {i} digest is {} bytes, want 32", meta.digest.len()))?;
+        // Per-chunk size sanity: the store's FastCDC never produces an
+        // empty chunk or one above 4 MiB, so a window claiming either is
+        // malformed. Rejecting here bounds what a single GetChunks reply
+        // can make the fill buffer/write before its own length check.
+        if meta.size == 0 || meta.size > CHUNK_SIZE_MAX {
+            return Err(format!(
+                "chunk {i} claims {} bytes (want 1..={CHUNK_SIZE_MAX})",
+                meta.size
+            ));
+        }
         let start = if i == 0 {
             u64::from(resp.first_chunk_skip)
         } else {
@@ -486,21 +547,16 @@ fn fill_blob(ctx: &FillContext, fill: &StreamFill, deadline: Instant) -> Result<
             hex::encode(ctx.file_digest)
         )));
     }
-    finish_and_promote(ctx)
+    finish_rename(ctx)
 }
 
-/// Rename the verified `.partial` to the bare digest name and ask
-/// mountd to verify-copy it into the shared backing cache.
-fn finish_and_promote(ctx: &FillContext) -> Result<(), FillError> {
+/// Rename the verified `.partial` to the bare digest name (the path
+/// mountd's `Promote` reads, and the file readers keep preading through
+/// the already-open fd). The Promote itself happens after the fill's
+/// success is published — see [`promote_streamed`].
+fn finish_rename(ctx: &FillContext) -> Result<(), FillError> {
     std::fs::rename(&ctx.partial_path, &ctx.staging_path)
-        .map_err(|e| FillError::Io(format!("staging rename failed: {e}")))?;
-    match ctx.mountd.promote(ctx.file_digest, ctx.mountd_timeout) {
-        Ok(()) => Ok(()),
-        Err(e) => Err(FillError::Promote(format!(
-            "Promote failed (build_fatal={}): {e}",
-            e.is_build_fatal()
-        ))),
-    }
+        .map_err(|e| FillError::Io(format!("staging rename failed: {e}")))
 }
 
 /// What `StatBlob` said about the blob's layout.
@@ -542,7 +598,7 @@ fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatOutcome, FillEr
 
 /// Whole-file fallback for inline manifests: stream `ReadBlob` into the
 /// `.partial`, advancing the high-water mark per frame so readers
-/// unblock progressively, then verify/rename/promote as usual.
+/// unblock progressively, then verify/rename as usual.
 fn fill_from_read_blob(
     ctx: &FillContext,
     fill: &StreamFill,
@@ -578,6 +634,19 @@ fn fill_from_read_blob(
             Ok(Ok(None)) => break,
             Ok(Ok(Some(frame))) => frame,
         };
+        // Per-frame overrun guard: fail at the first frame that would
+        // exceed the inode's declared size instead of only noticing the
+        // mismatch at stream end — bounds how much junk a misbehaving
+        // ReadBlob can write into staging (and keeps the high-water mark
+        // inside the EOF readers are clamped to).
+        if offset + frame.data.len() as u64 > ctx.size {
+            return Err(FillError::Integrity(format!(
+                "ReadBlob streamed past the declared size ({} + {} > {})",
+                offset,
+                frame.data.len(),
+                ctx.size
+            )));
+        }
         hasher.update(&frame.data);
         fill.partial
             .write_all_at(&frame.data, offset)
@@ -602,7 +671,7 @@ fn fill_from_read_blob(
             hex::encode(ctx.file_digest)
         )));
     }
-    finish_and_promote(ctx)
+    finish_rename(ctx)
 }
 
 /// Mutable state of one in-progress chunk assembly.
@@ -990,6 +1059,38 @@ mod tests {
             last_chunk_take: 10,
         };
         assert!(plan_chunks(&bad_digest, 10).is_err());
+    }
+
+    /// Per-chunk size sanity: a window claiming a zero-size chunk or one
+    /// above the FastCDC 4 MiB ceiling is rejected before any byte is
+    /// fetched; a chunk exactly at the ceiling is fine.
+    #[test]
+    fn plan_chunks_rejects_out_of_bounds_chunk_sizes() {
+        let zero = StatBlobResponse {
+            chunks: vec![meta(1, 0), meta(2, 10)],
+            first_chunk_skip: 0,
+            last_chunk_take: 10,
+        };
+        assert!(
+            plan_chunks(&zero, 10)
+                .expect_err("zero-size chunk")
+                .contains("chunk 0"),
+            "the error names the offending chunk"
+        );
+
+        let oversize = StatBlobResponse {
+            chunks: vec![meta(1, CHUNK_SIZE_MAX + 1)],
+            first_chunk_skip: 0,
+            last_chunk_take: 10,
+        };
+        assert!(plan_chunks(&oversize, 10).is_err());
+
+        let at_ceiling = StatBlobResponse {
+            chunks: vec![meta(1, CHUNK_SIZE_MAX)],
+            first_chunk_skip: 0,
+            last_chunk_take: u32::try_from(CHUNK_SIZE_MAX).unwrap(),
+        };
+        assert!(plan_chunks(&at_ceiling, CHUNK_SIZE_MAX).is_ok());
     }
 
     fn test_fill(size: u64) -> (tempfile::TempDir, Arc<StreamFill>) {

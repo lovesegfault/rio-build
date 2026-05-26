@@ -35,7 +35,8 @@ use tokio::runtime::Handle;
 use rio_proto::types::ReadBlobRequest;
 
 use super::circuit::CircuitBreaker;
-use super::mountd_client::MountdClient;
+use super::mountd_client::{MountdClient, MountdError};
+use super::mountd_proto::ErrKind;
 use super::stream::{self, StreamFill};
 use crate::IgnorePoison;
 use crate::store_fetch::StoreClients;
@@ -338,6 +339,16 @@ impl OpenPath {
             return Err(outcome.err().unwrap_or(Errno::EIO));
         }
 
+        // Winner. Re-check the cache before paying the fetch: another
+        // build's promote of this digest may have landed in the window
+        // between the miss check above and winning the fill lock
+        // (mountd publishes entries node-wide, not per-build).
+        if self.cache_hit(file_digest, size) {
+            state.finish(Ok(()));
+            self.fills.lock().ignore_poison().remove(file_digest);
+            return Ok(OpenCase::Hit);
+        }
+
         // Winner: fetch, verify, promote. Always publish an outcome and
         // remove the fill entry, even on the error paths — a leaked
         // in-progress FillState would park every future opener of this
@@ -354,7 +365,7 @@ impl OpenPath {
             state.finish(Err(Errno::EIO));
             self.fills.lock().ignore_poison().remove(file_digest);
         });
-        let outcome = self.fill_and_promote(file_digest);
+        let outcome = self.fill_and_promote(file_digest, size);
         scopeguard::ScopeGuard::into_inner(unwind_guard);
         state.finish(outcome);
         self.fills.lock().ignore_poison().remove(file_digest);
@@ -392,6 +403,7 @@ impl OpenPath {
                     partial_path: self.staging_path(file_digest).with_extension("partial"),
                     staging_path: self.staging_path(file_digest),
                     staging_chunks_dir: self.staging_dir.join("chunks"),
+                    cache_path: self.cache_path(file_digest),
                     chunks_dir: self.chunks_dir.clone(),
                     clients: self.clients.clone(),
                     runtime: self.runtime.clone(),
@@ -426,7 +438,7 @@ impl OpenPath {
 
     /// The winner's fill: `ReadBlob` → staging, blake3 verify, rename,
     /// `Promote`. Returns `Err(Errno)` ready to hand to the kernel.
-    fn fill_and_promote(&self, file_digest: &[u8; 32]) -> Result<(), Errno> {
+    fn fill_and_promote(&self, file_digest: &[u8; 32], size: u64) -> Result<(), Errno> {
         // Fail fast if the store has been unreachable long enough to
         // trip the breaker — don't queue another doomed fetch behind
         // the ones already timing out.
@@ -532,12 +544,22 @@ impl OpenPath {
             let _ = std::fs::remove_file(&partial);
             return Err(Errno::EIO);
         }
-        match self
-            .mountd
-            .promote(*file_digest, self.cfg.mountd_request_timeout)
-        {
+        // The Promote round-trip is not a constant-cost request: mountd
+        // re-hashes and copies the whole staged file, so a multi-GiB
+        // promote legitimately exceeds the flat per-request timeout.
+        // Reuse the JIT throughput floor to size it; BackingOpen/
+        // BackingClose (sub-ms ioctls) keep the flat timeout.
+        let promote_timeout =
+            crate::store_fetch::jit_fetch_timeout(self.cfg.mountd_request_timeout, size);
+        match promote_with_race_retry(
+            &self.mountd,
+            *file_digest,
+            &self.cache_path(file_digest),
+            promote_timeout,
+        ) {
             Ok(()) => Ok(()),
             Err(e) => {
+                metrics::counter!("rio_builder_castore_fuse_promote_fail_total").increment(1);
                 tracing::error!(
                     digest = %hex::encode(file_digest),
                     error = %e,
@@ -546,9 +568,58 @@ impl OpenPath {
                 );
                 // Leave the staging file for post-mortem; mountd reaps
                 // the whole staging dir on connection close.
+                //
+                // Unlike the streaming fill (which keeps serving its
+                // readers from the staging fd and treats Promote as
+                // best-effort), the whole-file path has nothing to hand
+                // the kernel without the cache entry — this open replies
+                // passthrough from `cache_path`, so a failed Promote is
+                // fatal here.
                 Err(Errno::EIO)
             }
         }
+    }
+}
+
+/// Pause before the single Promote retry after a [`ErrKind::RaceTimeout`].
+/// The daemon already waited its own race window (2 s) for the concurrent
+/// winner before answering; a short client-side pause lets the winner's
+/// publish land without hammering the UDS, and the retry waits the
+/// daemon-side window again.
+const PROMOTE_RACE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// `Promote{digest}` with the documented `RaceTimeout` semantics applied.
+///
+/// `RaceTimeout` means another build's promote of the same digest held
+/// the `.promoting` placeholder past the daemon's wait window — the
+/// winner is mid-copy, not failing ([`ErrKind::RaceTimeout`] is the one
+/// promote rejection that is NOT build-fatal). Mapping it straight to
+/// EIO would fail a build whose input is moments away from being
+/// published by someone else. Instead: re-check the cache (the winner
+/// may already have published — content-addressed, so its bytes are our
+/// bytes), then retry the Promote once after a short pause, then check
+/// the cache one last time before giving up.
+pub(super) fn promote_with_race_retry(
+    mountd: &MountdClient,
+    digest: [u8; 32],
+    cache_path: &Path,
+    timeout: Duration,
+) -> Result<(), MountdError> {
+    match mountd.promote(digest, timeout) {
+        Err(MountdError::Rejected(ErrKind::RaceTimeout)) => {}
+        outcome => return outcome,
+    }
+    if cache_path.exists() {
+        return Ok(());
+    }
+    std::thread::sleep(PROMOTE_RACE_RETRY_DELAY);
+    match mountd.promote(digest, timeout) {
+        Ok(()) => Ok(()),
+        // Whatever the retry said, an existing cache entry means a
+        // promote of these bytes succeeded — which is all the caller
+        // needs.
+        Err(_) if cache_path.exists() => Ok(()),
+        Err(e) => Err(e),
     }
 }
 

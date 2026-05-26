@@ -317,6 +317,20 @@
     },
     {
       "enum": "TreeError",
+      "name": "BadStorePath",
+      "crate": "rio-builder",
+      "msg": "input root {0:?} has no usable basename",
+      "doc": "An input root's store path has no usable basename (empty, or ends in `/`) — there is no name to mount it under."
+    },
+    {
+      "enum": "TreeError",
+      "name": "DuplicateBasename",
+      "crate": "rio-builder",
+      "msg": "two input roots share the basename {0:?}",
+      "doc": "Two input roots share a store-path basename. Store-path basenames are unique by construction (the hash prefix), so this means the scheduler sent a malformed closure; accepting it would let one root silently shadow the other under `lookup(ROOT, name)`."
+    },
+    {
+      "enum": "TreeError",
       "name": "EmptyRootNode",
       "crate": "rio-builder",
       "msg": "input root {0} has an empty RootNode — scheduler sent an unindexed path",
@@ -1495,7 +1509,7 @@
     {
       "name": "FillError",
       "crate": "rio-builder",
-      "doc": "Why a streaming fill failed. Every variant surfaces to the kernel as `EIO`; the split decides which metric/log/circuit treatment applies."
+      "doc": "Why a streaming fill failed. Every variant surfaces to the kernel as `EIO`; the split decides which metric/log/circuit treatment applies. Promote is deliberately NOT a variant: it runs after the verified rename and after readers have been unblocked, so its failure never fails the fill (see [`promote_streamed`])."
     },
     {
       "name": "FrameError",

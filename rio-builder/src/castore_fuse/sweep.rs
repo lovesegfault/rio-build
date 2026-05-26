@@ -664,6 +664,59 @@ mod tests {
         assert!(partial.exists(), ".partial spared");
     }
 
+    /// The cache-tier candidate filter, exercised by a pass that
+    /// genuinely reaches the cache tier (the probe never clears the
+    /// high-water mark, so pressure stays on past the staging and chunk
+    /// phases). In-flight placeholders (`.promoting`, `.tmp`,
+    /// `.partial`) and non-file entries (a stray subdirectory) must
+    /// survive while published entries around them are evicted —
+    /// proving the spare is the filter at work, not the pass stopping
+    /// early.
+    // r[verify builder.fs.node-digest-cache]
+    #[test]
+    fn cache_tier_eviction_skips_placeholders_and_subdirs() {
+        let fx = Fx::new();
+        const KIB: usize = 1024;
+        let evictable_old = fx.put(&fx.dirs.cache, "aaaa", KIB, 1_000);
+        let evictable_new = fx.put(&fx.dirs.cache, "bbbb", KIB, 2_000);
+        let promoting = fx.put(&fx.dirs.cache, "cccc.promoting", KIB, 100);
+        let tmp = fx.put(&fx.dirs.cache, "dddd.tmp", KIB, 100);
+        let partial = fx.put(&fx.dirs.cache, "eeee.partial", KIB, 100);
+        // A stray subdirectory inside a shard (foreign junk): not a
+        // regular file, never a candidate.
+        let subdir = fx.dirs.cache.join("ab").join("not-an-entry");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("inner"), vec![0u8; KIB]).unwrap();
+
+        // The probe reports pressure on every call: the pass runs every
+        // tier to exhaustion instead of clearing high water in phase 1.
+        let stats = sweep_pass_with(
+            &fx.dirs,
+            &fx.live,
+            LOW_WATER_PCT,
+            HIGH_WATER_PCT,
+            &mut || Some(5.0),
+        );
+
+        assert!(stats.triggered);
+        assert!(
+            !stats.reached_high_water,
+            "the probe never clears, so the pass must run out of candidates: {stats:?}"
+        );
+        assert!(
+            !evictable_old.exists() && !evictable_new.exists(),
+            "published cache entries ARE evicted — the tier was genuinely processed"
+        );
+        assert_eq!(stats.removed, 2, "only the two published entries count");
+        assert!(promoting.exists(), "in-flight .promoting spared");
+        assert!(tmp.exists(), "in-flight .tmp spared");
+        assert!(partial.exists(), "in-flight .partial spared");
+        assert!(
+            subdir.join("inner").exists(),
+            "a subdirectory inside a shard is not a candidate"
+        );
+    }
+
     /// The orphan delete is atomic against a Mount that claims the same
     /// build_id between the candidate listing and the removal: once the
     /// id is in `live_build_ids`, the per-dir re-check skips it.

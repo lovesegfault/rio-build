@@ -204,6 +204,14 @@ pub fn describe_metrics() {
          (fetch timeout, integrity failure, mountd error, open ceiling). Every one \
          fails a build (as an infrastructure failure)."
     );
+    describe_counter!(
+        "rio_builder_castore_fuse_promote_fail_total",
+        "Promote round-trips that failed after a completed castore-FUSE fill (the \
+         RaceTimeout cache re-check and single retry already applied). On the \
+         whole-file path the open fails with EIO; on the streaming path the open \
+         handles keep reading from staging, but the digest is not published to the \
+         node cache so later opens re-fetch."
+    );
     describe_gauge!(
         "rio_builder_castore_fuse_circuit_open",
         "1.0 when the castore-FUSE fetch circuit breaker is open (rio-store \

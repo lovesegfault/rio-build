@@ -381,9 +381,49 @@ async fn spawn_mock_castore() -> (MockCastore, StoreClients, tokio::task::JoinHa
 
 // ─── Fake mountd ───────────────────────────────────────────────────────
 
-/// Every `PromoteChunks` batch the fake mountd received, in arrival
-/// order, for assertions on the streaming fill's batching.
-type PromotedChunkBatches = Arc<std::sync::Mutex<Vec<Vec<[u8; 32]>>>>;
+/// One scripted reply for an upcoming `Promote` request (popped
+/// front-first; an empty queue means the default copy-and-`Ok`
+/// behavior).
+struct ScriptedPromote {
+    /// The error to answer with instead of promoting.
+    reply: proto::ErrKind,
+    /// Also publish the cache entry (copy staging → cache) before
+    /// replying — simulates the concurrent winner of a promote race
+    /// having finished its own copy of the same content while this
+    /// request waited at the `.promoting` placeholder.
+    publish: bool,
+}
+
+/// Observable state of the fake mountd, shared with the test.
+#[derive(Default)]
+struct FakeMountdState {
+    /// Every `PromoteChunks` batch received, in arrival order, for
+    /// assertions on the streaming fill's batching.
+    promoted_chunk_batches: std::sync::Mutex<Vec<Vec<[u8; 32]>>>,
+    /// Every `Promote{digest}` received, in arrival order (retries
+    /// included).
+    promote_requests: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// Scripted overrides for upcoming `Promote` requests.
+    scripted_promotes: std::sync::Mutex<std::collections::VecDeque<ScriptedPromote>>,
+}
+
+impl FakeMountdState {
+    /// Queue a scripted reply for the next `Promote` request.
+    fn script_promote(&self, reply: proto::ErrKind, publish: bool) {
+        self.scripted_promotes
+            .lock()
+            .unwrap()
+            .push_back(ScriptedPromote { reply, publish });
+    }
+
+    fn promote_requests(&self) -> Vec<[u8; 32]> {
+        self.promote_requests.lock().unwrap().clone()
+    }
+
+    fn promoted_chunk_batches(&self) -> Vec<Vec<[u8; 32]>> {
+        self.promoted_chunk_batches.lock().unwrap().clone()
+    }
+}
 
 /// The daemon end of a socketpair that answers `Promote{digest}` by
 /// copying `staging/{hex}` → `cache/{ab}/{hex}` and
@@ -392,15 +432,16 @@ type PromotedChunkBatches = Arc<std::sync::Mutex<Vec<Vec<[u8; 32]>>>>;
 /// rio-mountd's verified promotes, minus the re-hash (which `vm-mountd`
 /// covers against the real daemon). `BackingOpen`/`BackingClose` reply
 /// with a synthetic id so the passthrough plumbing is exercisable
-/// without `CAP_SYS_ADMIN`. Promoted chunk batches are recorded for
-/// assertions.
+/// without `CAP_SYS_ADMIN`. Promote/PromoteChunks traffic is recorded in
+/// the returned [`FakeMountdState`], and individual `Promote` replies
+/// can be scripted (e.g. `RaceTimeout`) through it.
 fn spawn_fake_mountd(
     staging: PathBuf,
     cache: PathBuf,
     chunks: PathBuf,
 ) -> (
     super::mountd_client::MountdClient,
-    PromotedChunkBatches,
+    Arc<FakeMountdState>,
     std::thread::JoinHandle<()>,
 ) {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
@@ -414,8 +455,8 @@ fn spawn_fake_mountd(
     )
     .expect("socketpair");
     let client = super::mountd_client::MountdClient::from_fd(client_end);
-    let promoted_chunk_batches = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&promoted_chunk_batches);
+    let state = Arc::new(FakeMountdState::default());
+    let daemon_state = Arc::clone(&state);
 
     let handle = std::thread::spawn(move || {
         let mut next_backing_id = 1u32;
@@ -438,17 +479,35 @@ fn spawn_fake_mountd(
             };
             let resp = match req.req {
                 Req::Promote { digest } => {
+                    daemon_state.promote_requests.lock().unwrap().push(digest);
                     let hex = hex::encode(digest);
                     let src = staging.join(&hex);
-                    shard_copy(&src, &cache, &hex)
-                        .and_then(|()| std::fs::remove_file(&src))
-                        .map(|()| Resp::Ok)
-                        .unwrap_or_else(|e| {
-                            Resp::Err(proto::ErrKind::Retryable(format!("fake promote: {e}")))
-                        })
+                    let scripted = daemon_state.scripted_promotes.lock().unwrap().pop_front();
+                    match scripted {
+                        Some(s) => {
+                            if s.publish {
+                                // The "winner" of the promote race is
+                                // another build whose bytes are the same
+                                // (content-addressed) — its publish looks
+                                // exactly like ours would have.
+                                let _ = shard_copy(&src, &cache, &hex);
+                            }
+                            Resp::Err(s.reply)
+                        }
+                        None => shard_copy(&src, &cache, &hex)
+                            .and_then(|()| std::fs::remove_file(&src))
+                            .map(|()| Resp::Ok)
+                            .unwrap_or_else(|e| {
+                                Resp::Err(proto::ErrKind::Retryable(format!("fake promote: {e}")))
+                            }),
+                    }
                 }
                 Req::PromoteChunks { chunk_digests } => {
-                    recorded.lock().unwrap().push(chunk_digests.clone());
+                    daemon_state
+                        .promoted_chunk_batches
+                        .lock()
+                        .unwrap()
+                        .push(chunk_digests.clone());
                     chunk_digests
                         .iter()
                         .try_for_each(|digest| {
@@ -478,7 +537,7 @@ fn spawn_fake_mountd(
             }
         }
     });
-    (client, promoted_chunk_batches, handle)
+    (client, state, handle)
 }
 
 // ─── Harness ───────────────────────────────────────────────────────────
@@ -491,8 +550,8 @@ struct Harness {
     /// production). Tests pre-seed it for local-hit scenarios and
     /// assert PromoteChunks landed entries here.
     chunks: PathBuf,
-    /// Every `PromoteChunks` batch the fake mountd received.
-    promoted_chunk_batches: PromotedChunkBatches,
+    /// The fake mountd's recorded traffic + scripted-reply queue.
+    mountd_state: Arc<FakeMountdState>,
     _tmp: tempfile::TempDir,
     _server: tokio::task::JoinHandle<()>,
     _mountd: std::thread::JoinHandle<()>,
@@ -521,7 +580,7 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
     std::fs::create_dir_all(&staging).unwrap();
     std::fs::create_dir_all(&chunks).unwrap();
     let (mock, clients, server) = spawn_mock_castore().await;
-    let (mountd, promoted_chunk_batches, mountd_thread) =
+    let (mountd, mountd_state, mountd_thread) =
         spawn_fake_mountd(staging.clone(), cache.clone(), chunks.clone());
     let open_path = Arc::new(OpenPath::new(
         cache.clone(),
@@ -537,7 +596,7 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
         open_path,
         staging,
         chunks,
-        promoted_chunk_batches,
+        mountd_state,
         _tmp: tmp,
         _server: server,
         _mountd: mountd_thread,
@@ -880,6 +939,87 @@ async fn open_fails_fast_once_the_circuit_trips() {
         h.mock.read_blob_calls(),
         5,
         "the sixth open never reaches the store"
+    );
+}
+
+// ─── Promote race semantics ────────────────────────────────────────────
+
+/// `RaceTimeout` from Promote when the concurrent winner has already
+/// published the entry: the open re-checks the cache and succeeds
+/// without a second Promote round-trip — the winner's bytes ARE our
+/// bytes (content-addressed).
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_race_timeout_with_published_winner_is_not_an_error() {
+    let h = harness().await;
+    let content = b"raced but already published".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    h.mountd_state
+        .script_promote(proto::ErrKind::RaceTimeout, true);
+
+    let case = ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("RaceTimeout with the entry published must not fail the open");
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
+        content,
+        "the winner's published entry serves this open"
+    );
+    assert_eq!(
+        h.mountd_state.promote_requests().len(),
+        1,
+        "the cache re-check short-circuits the retry"
+    );
+}
+
+/// `RaceTimeout` while the winner is still copying (nothing published
+/// yet): the open retries the Promote once after a short pause and the
+/// retry succeeds — instead of the old behavior of failing the open
+/// with EIO on a condition mountd documents as retryable.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_race_timeout_retries_once_and_succeeds() {
+    let h = harness().await;
+    let content = b"raced; winner still copying".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    h.mountd_state
+        .script_promote(proto::ErrKind::RaceTimeout, false);
+
+    let case = ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("the single retry must rescue the open");
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
+        content
+    );
+    assert_eq!(
+        h.mountd_state.promote_requests(),
+        vec![digest, digest],
+        "exactly one retry follows the RaceTimeout"
+    );
+}
+
+/// A build-fatal Promote rejection (here: DigestMismatch) still fails
+/// the whole-file open with EIO — the retry protocol is reserved for
+/// the documented-retryable RaceTimeout, and the whole-file path needs
+/// the cache entry to reply passthrough.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_fatal_rejection_still_fails_the_whole_file_open() {
+    let h = harness().await;
+    let content = b"rejected by the daemon".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    h.mountd_state
+        .script_promote(proto::ErrKind::DigestMismatch, false);
+
+    let err = ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect_err("a fatal rejection fails the open");
+    assert_eq!(err.code(), fuser::Errno::EIO.code());
+    assert!(!h.open_path.cache_path(&digest).exists());
+    assert_eq!(
+        h.mountd_state.promote_requests().len(),
+        1,
+        "fatal rejections are not retried"
     );
 }
 

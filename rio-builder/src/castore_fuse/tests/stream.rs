@@ -319,7 +319,7 @@ async fn remote_chunks_are_promoted_for_other_builds() {
     })
     .await;
 
-    let batches = h.promoted_chunk_batches.lock().unwrap().clone();
+    let batches = h.mountd_state.promoted_chunk_batches();
     assert!(
         batches.iter().all(|b| b.len() <= 32),
         "PromoteChunks batches stay within the 32-chunk flush size: {:?}",
@@ -393,6 +393,25 @@ async fn a_corrupt_chunk_fails_the_fill_and_the_next_open_retries() {
             .exists()
     })
     .await;
+    // The corrupt chunk is rejected on arrival: it must be neither
+    // staged for PromoteChunks nor included in any batch already sent —
+    // a node-cache entry whose bytes don't hash to its name would
+    // poison every later build on this node.
+    assert!(
+        !h.mountd_state
+            .promoted_chunk_batches()
+            .iter()
+            .flatten()
+            .any(|d| d == &chunk_digests[2]),
+        "the corrupt chunk must never be PromoteChunks'd"
+    );
+    assert!(
+        !h.staging
+            .join("chunks")
+            .join(hex::encode(chunk_digests[2]))
+            .exists(),
+        "the corrupt chunk must never be staged for promotion"
+    );
 
     // Heal the store and open again: the dead fill was deregistered, so
     // this is a fresh fill that completes and promotes.
@@ -541,6 +560,237 @@ async fn a_whole_file_digest_mismatch_is_never_promoted() {
         last.expect_err("reads after the failed verification are EIO")
             .code(),
         fuser::Errno::EIO.code()
+    );
+}
+
+/// A Promote failure after the fill has verified and renamed is
+/// best-effort: reads on the open handle keep working (served from the
+/// staging fd), nothing corrupt or partial reaches the shared cache,
+/// and the failure stays observable (logged + counted, and the entry is
+/// simply absent from the cache so later opens re-fetch). Deliberate
+/// asymmetry with the whole-file path, where a Promote failure is fatal
+/// because the open has nothing to serve without the cache entry.
+// r[verify builder.fs.streaming-open]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promote_failure_does_not_poison_the_streaming_fill() {
+    let h = harness().await;
+    let content = patterned(4000);
+    let (digest, _chunks) = h.mock.seed_chunked_blob(&content, 1000, 8);
+    // The fill's own work succeeds; only the final Promote is rejected.
+    h.mountd_state.script_promote(
+        proto::ErrKind::Retryable("staging disk on fire".into()),
+        false,
+    );
+
+    let (fill, case) = unwrap_streaming(
+        ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
+            .await
+            .expect("streaming open"),
+    );
+    assert_eq!(case, OpenCase::MissStream);
+    assert_eq!(
+        read_blocking(&fill, 0, content.len() as u32).await.unwrap(),
+        content,
+        "the fill itself completes"
+    );
+
+    wait_until("the (failing) Promote to be attempted", || {
+        !h.mountd_state.promote_requests().is_empty()
+    })
+    .await;
+
+    assert!(
+        !h.open_path.cache_path(&digest).exists(),
+        "a failed promote publishes nothing to the shared cache"
+    );
+    assert!(
+        h.staging.join(hex::encode(digest)).exists(),
+        "the verified staging file stays — it is what open handles read from"
+    );
+    assert_eq!(
+        read_blocking(&fill, 100, 100).await.unwrap(),
+        content[100..200],
+        "reads on the open handle still succeed after the failed promote"
+    );
+
+    // The failed promote only costs future opens the cache hit: once the
+    // dead fill deregisters, a fresh open starts its own fill and — with
+    // no more scripted failures — publishes the entry.
+    let mut recovered = None;
+    for _ in 0..200 {
+        match ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
+            .await
+            .expect("re-open after the failed promote")
+        {
+            Readable::Streaming {
+                fill,
+                case: OpenCase::MissStream,
+            } => {
+                recovered = Some(fill);
+                break;
+            }
+            // Attached to the finished first fill (not yet deregistered)
+            // — harmless; try again shortly.
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    let fill2 = recovered.expect("a fresh fill must start once the failed one deregisters");
+    assert_eq!(
+        read_blocking(&fill2, 0, content.len() as u32)
+            .await
+            .unwrap(),
+        content
+    );
+    wait_until("the retry fill to promote", || {
+        h.open_path.cache_path(&digest).exists()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
+        content
+    );
+}
+
+/// A chunk window that repeats one digest (CDC plans legitimately do —
+/// identical zero-page runs) assembles byte-exact, fetches the repeated
+/// chunk over the wire exactly once, and `PromoteChunks`es it exactly
+/// once.
+// r[verify builder.fs.node-chunk-cache]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_chunk_in_the_window_is_fetched_and_promoted_once() {
+    let h = harness().await;
+    // content = A ‖ B ‖ A, window [A, B, A] with no edge padding.
+    let chunk_a = patterned(1000);
+    let mut chunk_b = patterned(1000);
+    chunk_b.reverse();
+    let content: Vec<u8> = [chunk_a.as_slice(), chunk_b.as_slice(), chunk_a.as_slice()].concat();
+    let digest = *blake3::hash(&content).as_bytes();
+    let a = h.mock.seed_chunk(chunk_a.clone());
+    let b = h.mock.seed_chunk(chunk_b.clone());
+    h.mock.state.stat_plans.lock().unwrap().insert(
+        digest,
+        StatBlobResponse {
+            chunks: vec![
+                ChunkMeta {
+                    digest: a.to_vec(),
+                    size: 1000,
+                },
+                ChunkMeta {
+                    digest: b.to_vec(),
+                    size: 1000,
+                },
+                ChunkMeta {
+                    digest: a.to_vec(),
+                    size: 1000,
+                },
+            ],
+            first_chunk_skip: 0,
+            last_chunk_take: 1000,
+        },
+    );
+
+    let (fill, _case) = unwrap_streaming(
+        ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
+            .await
+            .expect("streaming open"),
+    );
+    assert_eq!(
+        read_blocking(&fill, 0, content.len() as u32).await.unwrap(),
+        content,
+        "the repeated chunk lands at both of its window positions"
+    );
+    wait_until("the fill to promote into the backing cache", || {
+        h.open_path.cache_path(&digest).exists()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
+        content
+    );
+
+    let raw_requests = h.mock.state.chunk_requests.lock().unwrap().clone();
+    assert_eq!(
+        raw_requests.iter().filter(|d| **d == a).count(),
+        1,
+        "the repeated chunk goes over the wire once, not once per occurrence"
+    );
+    let promoted: Vec<[u8; 32]> = h
+        .mountd_state
+        .promoted_chunk_batches()
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(
+        promoted.iter().filter(|d| **d == a).count(),
+        1,
+        "the repeated chunk is PromoteChunks'd once"
+    );
+    assert!(promoted.contains(&b));
+}
+
+/// The integrity gate also covers the inline-manifest `ReadBlob`
+/// fallback: a stream whose bytes do not hash to the claimed
+/// `file_digest` fails the fill — nothing is renamed, nothing is
+/// promoted, and the streaming handle turns to EIO.
+// r[verify builder.fs.file-digest-integrity]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_read_blob_fallback_stream_fails_the_fill() {
+    let h = harness().await;
+    let content = patterned(3000);
+    let claimed = *blake3::hash(&content).as_bytes();
+    // Same length, different bytes: the per-frame overrun guard stays
+    // quiet and the whole-file digest check is what must catch it.
+    let mut corrupt = content.clone();
+    corrupt[1500] ^= 0xFF;
+    h.mock.seed_blob(claimed, corrupt);
+    h.mock
+        .state
+        .stat_errors
+        .lock()
+        .unwrap()
+        .insert(claimed, tonic::Code::FailedPrecondition);
+
+    // The fill may fail before or after open()'s first-chunk barrier
+    // (the corrupt stream is short); both surfaces are the same EIO.
+    match ensure_readable_blocking(&h.open_path, claimed, content.len() as u64).await {
+        Err(err) => assert_eq!(err.code(), fuser::Errno::EIO.code()),
+        Ok(readable) => {
+            let (fill, _case) = unwrap_streaming(readable);
+            let mut last = read_blocking(&fill, 0, 16).await;
+            for _ in 0..200 {
+                if last.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                last = read_blocking(&fill, 0, 16).await;
+            }
+            assert_eq!(
+                last.expect_err("reads fail once the verification fails")
+                    .code(),
+                fuser::Errno::EIO.code()
+            );
+        }
+    }
+
+    wait_until("the failed fill to clean up its .partial", || {
+        !h.staging
+            .join(format!("{}.partial", hex::encode(claimed)))
+            .exists()
+    })
+    .await;
+    assert!(
+        !h.open_path.cache_path(&claimed).exists()
+            && !h.staging.join(hex::encode(claimed)).exists(),
+        "a corrupt fallback stream is neither renamed into staging nor promoted"
+    );
+    assert!(
+        h.mountd_state.promote_requests().is_empty(),
+        "no Promote is even attempted for a failed fallback fill"
+    );
+    assert_eq!(
+        h.mock.read_blob_calls(),
+        1,
+        "the fallback path was exercised"
     );
 }
 

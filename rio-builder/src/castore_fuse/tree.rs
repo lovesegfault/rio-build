@@ -83,6 +83,16 @@ pub enum TreeError {
     /// A root entry in `WorkAssignment.input_roots` has no `node` set.
     #[error("input root {0} has an empty RootNode — scheduler sent an unindexed path")]
     EmptyRootNode(String),
+    /// An input root's store path has no usable basename (empty, or
+    /// ends in `/`) — there is no name to mount it under.
+    #[error("input root {0:?} has no usable basename")]
+    BadStorePath(String),
+    /// Two input roots share a store-path basename. Store-path basenames
+    /// are unique by construction (the hash prefix), so this means the
+    /// scheduler sent a malformed closure; accepting it would let one
+    /// root silently shadow the other under `lookup(ROOT, name)`.
+    #[error("two input roots share the basename {0:?}")]
+    DuplicateBasename(String),
     /// A digest field on the wire was not 32 bytes.
     #[error("malformed digest ({len} bytes, want 32) in {context}")]
     BadDigest { len: usize, context: String },
@@ -235,9 +245,21 @@ impl InoMap {
             // The synthetic root's children are keyed by store-path
             // BASENAME — that is the name a build resolves under
             // /nix/store/. Accept either a full /nix/store/<base> path
-            // or a bare basename so callers don't have to care.
-            let basename = store_path.rsplit('/').next().unwrap_or(store_path);
-            root_children.insert(basename.as_bytes().to_vec(), ino);
+            // or a bare basename so callers don't have to care. An
+            // empty basename has nothing to mount under; a duplicate
+            // would make lookup(ROOT, name) ambiguous (one root silently
+            // shadowing another) — both are typed mount-time errors.
+            let basename = store_path
+                .rsplit('/')
+                .next()
+                .filter(|b| !b.is_empty())
+                .ok_or_else(|| TreeError::BadStorePath(store_path.clone()))?;
+            if root_children
+                .insert(basename.as_bytes().to_vec(), ino)
+                .is_some()
+            {
+                return Err(TreeError::DuplicateBasename(basename.to_string()));
+            }
         }
 
         // Walk every Directory body and register each child's inode.
@@ -903,6 +925,57 @@ pub(super) mod tests {
             matches!(err, TreeError::UnsortedDirectory { .. }),
             "got {err:?}"
         );
+    }
+
+    /// Two input roots with the same store-path basename would make
+    /// `lookup(ROOT, name)` ambiguous — one root would silently shadow
+    /// the other. Reject the closure at mount time instead.
+    #[test]
+    fn assemble_rejects_duplicate_root_basenames() {
+        let fx = fixture();
+        let mut roots = fx.roots.clone();
+        // The same basename as an existing file root, under a different
+        // path prefix (so only the basename collides).
+        roots.push((
+            "/other/prefix/bbbb-script".to_string(),
+            RootNode {
+                node: Some(root_node::Node::Symlink(SymlinkEntry {
+                    name: vec![],
+                    target: b"elsewhere".to_vec(),
+                })),
+            },
+        ));
+        let err = InoMap::assemble(&roots, fx.dirs.clone()).expect_err("duplicate basename");
+        assert!(
+            matches!(err, TreeError::DuplicateBasename(ref b) if b == "bbbb-script"),
+            "got {err:?}"
+        );
+    }
+
+    /// A store path with no usable basename (empty, or ending in `/`)
+    /// has nothing to mount the root under — a typed error, not a
+    /// silently empty name in the root directory.
+    #[test]
+    fn assemble_rejects_an_empty_root_basename() {
+        for bad in ["", "/nix/store/"] {
+            let err = InoMap::assemble(
+                &[(
+                    bad.to_string(),
+                    RootNode {
+                        node: Some(root_node::Node::Symlink(SymlinkEntry {
+                            name: vec![],
+                            target: b"x".to_vec(),
+                        })),
+                    },
+                )],
+                HashMap::new(),
+            )
+            .expect_err("empty basename");
+            assert!(
+                matches!(err, TreeError::BadStorePath(ref p) if p == bad),
+                "got {err:?} for {bad:?}"
+            );
+        }
     }
 
     /// An input root with no `node` set (the scheduler dispatched an
