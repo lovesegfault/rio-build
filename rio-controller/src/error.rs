@@ -23,10 +23,11 @@ pub enum Error {
     Finalizer(#[from] Box<kube::runtime::finalizer::Error<Error>>),
 
     /// Failed to build a K8s object (Job, PodSpec) from
-    /// the CRD spec. Usually a bad Quantity string (fuseCacheSize
-    /// that doesn't parse) or some spec field we can't translate.
-    /// These are OPERATOR errors — fix the CRD and reconcile
-    /// retries. Not transient.
+    /// the CRD spec, or the spec/object is missing something the
+    /// reconciler needs — no `metadata.namespace`, no `metadata.uid`,
+    /// a ComponentScaler `targetRef` Deployment that doesn't exist,
+    /// an unreachable `loadEndpoint`/scheduler. These are OPERATOR
+    /// errors — fix the CR and reconcile retries. Not transient.
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 }

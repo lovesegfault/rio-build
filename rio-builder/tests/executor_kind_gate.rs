@@ -178,13 +178,15 @@ async fn wrong_kind_gate_ignores_lying_scheduler_flag_builder() {
 /// duplicate "first lines" for one exec_id (bug_013).
 ///
 /// Fixture trace:
-/// `make_env` sets `fuse_mount_point == overlay_base_dir` (same
-/// tempdir) so `setup_overlay`'s `lower_dev == upper_dev` check fails
-/// deterministically with `OverlayError::SameFilesystem` — no
+/// `make_env` wires the castore options against `dead_channel()`, so
+/// the pre-daemon block fails deterministically inside the castore
+/// mount step — the Directory-DAG prefetch (the first thing
+/// `mount_castore_background` does, before any mountpoint mkdir or
+/// `mount(2)`) errors against the dead store channel — no
 /// CAP_SYS_ADMIN needed and no chance the build proceeds past the
-/// pre-daemon block. The header send is BEFORE that check
-/// (executor/mod.rs ~545); the failure happens AFTER (~575); the
-/// channel observes exactly the header-or-nothing.
+/// pre-daemon block. The banner-header send happens BEFORE the
+/// pre-daemon block in `executor/mod.rs`; the failure happens inside
+/// it; the channel observes exactly the header-or-nothing.
 // r[verify obs.log.worker-header]
 #[tokio::test]
 async fn banner_header_gated_on_first_attempt() {

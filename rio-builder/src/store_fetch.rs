@@ -1,8 +1,14 @@
 //! Store-fetch primitives for the castore-FUSE (`castore_fuse`).
 //!
-//! Anything that talks gRPC to rio-store and isn't FUSE-typed lives
-//! The FUSE-typed callers (`fetch_extract_insert`,
-//! `prefetch_path_blocking`, the `Errno`-returning streamers) stay in
+//! Everything here is FUSE-agnostic plumbing shared by the castore
+//! fetch paths: the per-build gRPC client bundle ([`StoreClients`]),
+//! the crate-internal assignment-token request wrapper
+//! (`authed_request`), the in-budget transient-retry policy for
+//! JIT/streaming fetches, and the
+//! size-aware JIT fetch-timeout helper ([`jit_fetch_timeout`]). The
+//! FUSE-typed callers (the `open()` whole-file fetch, the streaming
+//! fill task, the DAG prefetch) live in `castore_fuse::{open,stream,
+//! tree}` and call into here for every rio-store RPC.
 
 use std::time::Duration;
 
@@ -165,7 +171,8 @@ pub const JIT_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
 
 /// Per-path JIT fetch timeout: `max(base, nar_size / MIN_THROUGHPUT)`.
 ///
-/// `base` is `fuse_fetch_timeout` (60 s) so small paths are unchanged
+/// `base` is `jit_fetch_timeout` (`RIO_JIT_FETCH_TIMEOUT_SECS`, default
+/// 60 s) so small paths are unchanged
 /// from pre-I-178 behavior. Large paths get a size-proportional budget
 /// — the I-178 1.9 GB input gets ≈127 s instead of the flat 60 s that
 /// aborted it mid-stream.
