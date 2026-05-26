@@ -38,6 +38,22 @@ in
   # HMAC keys for assignment+service tokens (lib/hmac-keys.nix).
   withHmac ? false,
 
+  # Edge-JWT wiring (lib/jwt-keys.nix fixed test keypair): the gateway
+  # gets the SIGNING SEED so it resolves the SSH key's tenant comment
+  # and mints a session JWT, and the store gets the matching PUBKEY so
+  # it verifies that JWT — which is what attributes gateway-pushed
+  # paths (the seed closure) to the pushing tenant in `path_tenants`
+  # (r[store.put.tenant-attribution]); without it the seed stays
+  # tenant-less and every castore mount of it fails NotFound. The
+  # scheduler deliberately does NOT get the pubkey: that would flip it
+  # into JWT mode (`r[sched.tenant.authz]` rejects tokenless
+  # SchedulerService calls) and break the scenarios' tokenless
+  # grpcurl-direct SubmitBuild/CancelBuild helpers — the scheduler
+  # keeps resolving `tenant_name` via the permanent dual-mode fallback.
+  # Full JWT mode (scheduler+store pubkey) is exercised by the k3s
+  # lifecycle splits (`jwtEnabled`). Pair with mkBootstrap's `tenant`.
+  withJwt ? false,
+
   # opentelemetry-collector on control (OTLP gRPC :4317, file exporter
   # to /var/lib/otelcol/traces.json). Sets RIO_OTEL_ENDPOINT on all
   # services. For scenarios/observability.nix.
@@ -76,6 +92,19 @@ let
 
   gatewayHmacEnv = lib.optionalAttrs withHmac {
     RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
+  };
+
+  # ── Edge-JWT env (no-op {} when withJwt=false) ──────────────────────
+  # Same fixed test keypair the k3s `jwtEnabled` chart values use.
+  # Gateway signs with the seed; the store verifies with the pubkey
+  # (RIO_JWT__KEY_PATH on the rio-store unit only — see the withJwt
+  # option doc for why the scheduler is deliberately left out).
+  jwtKeys = import ../lib/jwt-keys.nix;
+  gatewayJwtEnv = lib.optionalAttrs withJwt {
+    RIO_JWT__KEY_PATH = "${pkgs.writeText "jwt-seed" jwtKeys.seedB64}";
+  };
+  storeJwtEnv = lib.optionalAttrs withJwt {
+    RIO_JWT__KEY_PATH = "${pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64}";
   };
 
   # Static RIO_EXECUTOR_TOKEN for standalone workers. In k8s the
@@ -191,9 +220,18 @@ let
       # conflict. mapAttrs mkForce makes the gateway env win
       # unambiguously. extraGatewayEnv merges alongside (no mkForce —
       # it's gateway-only, no conflict with extraServiceEnv's shared
-      # keys).
+      # keys). gatewayJwtEnv (withJwt) sits before extraGatewayEnv so a
+      # scenario wiring its own JWT seed still wins.
       rio-gateway.environment =
-        (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
+        (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv))
+        // gatewayJwtEnv
+        // extraGatewayEnv;
+
+      # Store-only JWT pubkey (withJwt): the verifier half of the edge
+      # JWT — store-only so the scheduler stays out of JWT mode (see the
+      # withJwt option doc). No other definition sets this key, so a
+      # plain module merge suffices.
+      rio-store.environment = storeJwtEnv;
 
       # Serialize migration runs — migration 011's CREATE INDEX
       # CONCURRENTLY deadlocks with sqlx's pg_advisory_lock when store

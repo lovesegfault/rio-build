@@ -212,6 +212,30 @@ rec {
           fixture.sshKeySetup or (lib.optionalString (gatewayHost != null) (sshKeySetup gatewayHost))
       )}
       ${lib.optionalString withSeed (seedBusybox seedHost)}
+      ${lib.optionalString (tenant != null && withSeed) ''
+        # Pin the seed-attribution half of the tenancy recipe: the
+        # gateway must have minted the tenant's session JWT for the
+        # ssh-ng push (fixture `withJwt`) and the store must have
+        # written path_tenants junction rows for the seeded closure
+        # (r[store.put.tenant-attribution]). Without them every castore
+        # mount of the seed returns NotFound and builds die at mount
+        # time — catch that here, at the recipe, instead of N infra
+        # retries later. Needs psql on ${gatewayHost} (fixture
+        # extraPackages).
+        seed_tenant_rows = int(psql(
+            ${gatewayHost},
+            "SELECT count(*) FROM path_tenants pt "
+            "JOIN tenants t USING (tenant_id) "
+            "WHERE t.tenant_name = '${tenant}'",
+        ))
+        assert seed_tenant_rows > 0, (
+            "seeded closure has no path_tenants rows for tenant "
+            "'${tenant}' — the gateway did not attach a session JWT to "
+            "the seed push (fixture missing withJwt?) or the store did "
+            "not verify it (missing JWT pubkey?)"
+        )
+        print(f"seed attributed to ${tenant}: {seed_tenant_rows} path_tenants rows")
+      ''}
     '';
 
   # Auto-import every <name>.nix in `dir` as { <name> = import <file>; }.

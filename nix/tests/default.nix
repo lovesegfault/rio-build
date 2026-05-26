@@ -138,10 +138,16 @@ let
   # store verifies them — castore-FUSE reads (GetDirectory/ReadBlob/…)
   # are tenant-scoped and only authenticate via that token, so a
   # build-dispatching fixture without HMAC cannot mount its inputs.
-  # The scenario prelude pairs this with mkBootstrap's `tenant` so the
-  # token actually carries a tenant claim.
+  # withJwt: the gateway mints the session JWT for the tenant-named
+  # client key and the store verifies it, which is what attributes the
+  # seeded busybox closure to the tenant at PutPath time
+  # (r[store.put.tenant-attribution]) — without it the seed has no
+  # path_tenants rows and every castore mount of it returns NotFound.
+  # The scenario prelude pairs both with mkBootstrap's `tenant` so the
+  # assignment token actually carries a tenant claim.
   schedulingFixture = standalone {
     withHmac = true;
+    withJwt = true;
     workers = {
       # maxSilentTime enforcement on ALL scheduling workers. Every drv
       # that lands here MUST stay non-silent for ≥10s — cancelDrv echoes
@@ -207,12 +213,17 @@ let
         base_dir = "/var/lib/rio/store/chunks"
       '';
     };
-    # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
-    # (no withHmac). ssh-ng:// doesn't surface build_id to the
+    # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001.
+    # Tokenless is fine: the scheduler is NOT in JWT mode (withJwt only
+    # wires gateway+store), so SubmitBuild takes tenant_name from the
+    # payload (the prelude's submit helper injects it) and an anonymous
+    # CancelBuild is allowed. ssh-ng:// doesn't surface build_id to the
     # client, and client-disconnect mid-wopBuildDerivation doesn't fire
     # session.rs's EOF-cancel path (handler/build.rs:462 removes the
     # build_id before bubbling). gRPC SubmitBuild + CancelBuild is the
     # only deterministic cancel-a-running-build path in this fixture.
+    # postgresql: psql for the mkBootstrap seed-attribution assert and
+    # the cgroup fragment's build_samples queries.
     extraPackages = [
       pkgs.postgresql_18
       pkgs.grpcurl
