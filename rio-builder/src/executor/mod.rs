@@ -1258,6 +1258,31 @@ async fn run_native_lifecycle(
                 "execution request rejected: {msg}"
             )))
         }
+        // A failed execve of the builder itself (missing builder path,
+        // missing `#!` interpreter, not executable, not a valid binary)
+        // is a property of the derivation, not of this worker — CppNix
+        // and the daemon-era path report it as a permanent build failure
+        // in the build log, not as something to retry. Materialization
+        // faults stay infra-transient: they surface earlier as bind-mount
+        // failures (r[builder.result.input-materialization-is-infra]) or
+        // as EIO, never as these errnos at exec time — every input bind
+        // already succeeded by the time the child execs.
+        Err(rio_exec::ExecError::Setup(se))
+            if !oom_detected
+                && se.phase == rio_exec::SetupPhase::Exec
+                && exec_errno_is_derivation_caused(se.errno) =>
+        {
+            let errno = nix::errno::Errno::from_raw(se.errno);
+            Ok(NativeBuild::Failed {
+                status: rio_proto::types::BuildResultStatus::PermanentFailure,
+                error_msg: format!(
+                    "cannot execute the builder '{}': {errno} — the builder (and any `#!` \
+                     interpreter it names) must exist inside the build's input closure and \
+                     be executable",
+                    basic_drv.builder(),
+                ),
+            })
+        }
         Err(
             e @ (rio_exec::ExecError::Skeleton(_)
             | rio_exec::ExecError::Spawn(_)
@@ -1399,6 +1424,27 @@ fn make_build_dir_writable(build_dir: &std::path::Path, uid: u32, gid: u32) -> s
         std::os::unix::fs::chown(build_dir, Some(uid), Some(gid))?;
     }
     Ok(())
+}
+
+/// Whether an errno from a failed `execve` of the builder is caused by
+/// the derivation itself (bad builder path, bad `#!` interpreter, not
+/// executable, not a valid executable image) rather than by this worker.
+/// Anything else (EIO, ENOMEM, EAGAIN, …) keeps the infra-transient
+/// classification so genuine worker faults still retry / re-dispatch.
+fn exec_errno_is_derivation_caused(errno: i32) -> bool {
+    use nix::errno::Errno;
+    matches!(
+        Errno::from_raw(errno),
+        Errno::ENOENT
+            | Errno::ENOTDIR
+            | Errno::EACCES
+            | Errno::ENOEXEC
+            | Errno::ENAMETOOLONG
+            | Errno::ELOOP
+            | Errno::EISDIR
+            | Errno::E2BIG
+            | Errno::EINVAL
+    )
 }
 
 /// What [`native_log_loop`] reports back to the lifecycle.
@@ -2106,6 +2152,37 @@ mod tests {
         if nix::unistd::geteuid().is_root() {
             assert_eq!(md.uid(), SANDBOX_BUILD_UID);
             assert_eq!(md.gid(), SANDBOX_BUILD_GID);
+        }
+    }
+
+    /// Builder execve failures that are the derivation's fault must not
+    /// be classified as transient infrastructure (they would retry
+    /// forever); worker-side faults (EIO, ENOMEM) must stay
+    /// infra-transient so the retry/re-dispatch path still applies.
+    #[test]
+    fn exec_errno_classification() {
+        use nix::errno::Errno;
+        for e in [
+            Errno::ENOENT,
+            Errno::ENOTDIR,
+            Errno::EACCES,
+            Errno::ENOEXEC,
+            Errno::ENAMETOOLONG,
+            Errno::ELOOP,
+            Errno::EISDIR,
+            Errno::E2BIG,
+            Errno::EINVAL,
+        ] {
+            assert!(
+                exec_errno_is_derivation_caused(e as i32),
+                "{e} is derivation-caused"
+            );
+        }
+        for e in [Errno::EIO, Errno::ENOMEM, Errno::EAGAIN, Errno::ETXTBSY] {
+            assert!(
+                !exec_errno_is_derivation_caused(e as i32),
+                "{e} stays infra-transient"
+            );
         }
     }
 
