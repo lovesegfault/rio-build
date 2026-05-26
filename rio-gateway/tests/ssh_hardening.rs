@@ -1328,6 +1328,249 @@ async fn test_socket_holding_authenticated_connection_is_force_closed() -> anyho
     Ok(())
 }
 
+/// Like [`spawn_ssh_server_with`], but staged for the slow-auth scenario:
+/// JWT minting is enabled with the default permissive policy (`required =
+/// false`, so a failed/slow resolve degrades to an accepted auth instead
+/// of a rejection) and TWO keys are authorized — `tenant_key` carries a
+/// tenant comment, so its `auth_publickey` goes through ResolveTenant (the
+/// only await in the SSH auth path, hence the only place auth latency can
+/// be injected), while `plain_key` has no comment and authenticates
+/// instantly (for probe/follow-up clients that must not be slowed down or
+/// pollute the resolve-call bookkeeping). Returns the [`MockScheduler`] so
+/// the test can inject ResolveTenant latency and observe when the resolve
+/// started/finished.
+async fn spawn_ssh_server_with_tenant_auth(
+    configure: impl FnOnce(GatewayServer) -> GatewayServer,
+) -> anyhow::Result<(
+    SocketAddr,
+    PrivateKey,
+    PrivateKey,
+    rio_test_support::grpc::MockScheduler,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (_store, store_addr, _sh) = spawn_mock_store().await?;
+    let (sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+
+    let tenant_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+    let mut tenant_pub = tenant_key.public_key().clone();
+    // The tenant comment is what routes auth_publickey through the
+    // ResolveTenant round-trip; an empty comment skips it entirely.
+    tenant_pub.set_comment("tenant-a");
+    let plain_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+    let plain_pub = plain_key.public_key().clone();
+
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+
+    let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = socket.local_addr()?;
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let server = configure(
+        GatewayServer::new(store_client, scheduler_client, vec![tenant_pub, plain_pub])
+            .with_jwt_signing_key(signing_key, rio_common::config::JwtConfig::default()),
+    );
+    let srv_handle = tokio::spawn(async move {
+        if let Err(e) = server
+            .run_on_listener(host_key, socket, rio_common::signal::Token::new())
+            .await
+        {
+            eprintln!("ssh server error: {e}");
+        }
+    });
+
+    Ok((addr, tenant_key, plain_key, sched, srv_handle))
+}
+
+// r[verify gw.conn.exit-status+3]
+/// Authentication that completes only AFTER the auth-timeout disconnect was
+/// queued, from a peer that then ignores that disconnect and holds its
+/// socket open. Auth processing (key check + ResolveTenant) can straddle
+/// the pre-auth deadline; the instant it completes, the wrapper's pre-auth
+/// read deadline stops applying, and russh parks in its post-disconnect
+/// drain-read loop (no timeout, no keepalives) waiting for the peer to
+/// close. Nothing that arms the transport force-close LATER can wake that
+/// parked read: the wrapper's own sleep was last set to the (now
+/// irrelevant) pre-auth instant and is spent by the time the
+/// empty-connection grace timer arms, so the next thing that touches the
+/// transport is russh's leftover keepalive/inactivity timer — ~30 s /
+/// ~1 h away, not the designed `grace + FORCE_CLOSE_SLACK`. The decision
+/// to disconnect must therefore arm the force-close itself
+/// (decide-then-enforce), exactly like the empty-connection grace timer
+/// does; with that in place the kill instant is already in the past when
+/// the late auth lands, and the transport is failed the moment russh next
+/// touches it (right after auth), bounding the connection at roughly the
+/// auth-completion instant instead of tens of minutes.
+///
+/// Staged with `max_connections = 1` like the other squatter tests: the
+/// holder's auth is made slow by injecting latency into the mock
+/// scheduler's ResolveTenant (the only await in the auth path), sized
+/// LARGER than `FORCE_CLOSE_SLACK` so the leftover pre-auth wakeup cannot
+/// accidentally deliver a late-armed force-close. The holding proxy stops
+/// relaying once the gateway is parked in that resolve, and the reap is
+/// observed from the gateway's own accounting (slot released to a real
+/// client, `connections_active` back to the follow-up client alone).
+#[tokio::test]
+async fn test_auth_completing_after_timeout_disconnect_is_force_closed() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+    // Auth latency injected into the holder's ResolveTenant. Must overshoot
+    // GRACE (so auth completes with the auth-timeout disconnect already
+    // queued) AND FORCE_CLOSE_SLACK (so the leftover pre-auth sleep — the
+    // only in-process wakeup left once russh parks — has already fired and
+    // been wasted before anything else could arm the force-close).
+    const RESOLVE_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
+    const GAUGE: &str = "rio_gateway_connections_active{}";
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (addr, tenant_key, plain_key, sched, srv) = spawn_ssh_server_with_tenant_auth(|s| {
+        s.with_empty_connection_grace(GRACE)
+            .with_max_connections(1)
+            // The mock's injected delay must be what ends the resolve, not
+            // the gateway-side RPC timeout.
+            .with_resolve_timeout(RESOLVE_DELAY * 2)
+    })
+    .await?;
+    sched.set_resolve_delay(RESOLVE_DELAY);
+
+    // The holder authenticates with the tenant key through the holding
+    // proxy. Its auth request is sent promptly (local round-trips,
+    // milliseconds), but the server-side auth takes RESOLVE_DELAY, so it
+    // completes well after the auth-timeout disconnect has been queued.
+    let (proxy_addr, hold, proxy_task) = spawn_socket_holding_proxy(addr).await?;
+    let holder_at = std::time::Instant::now();
+    let config = Arc::new(client::Config::default());
+    let mut holder = client::connect(config, proxy_addr, AcceptAllClient).await?;
+    let holder_key = tenant_key.clone();
+    let auth_task = tokio::spawn(async move {
+        // Never completes: the proxy stops relaying before the (late) auth
+        // response could reach the client. Only the gateway side matters;
+        // this just keeps the client end of the proxy alive.
+        let _ = holder
+            .authenticate_publickey(
+                "nix",
+                PrivateKeyWithHashAlg::new(Arc::new(holder_key), None),
+            )
+            .await;
+    });
+
+    // Wait until the gateway is provably parked inside the slow resolve —
+    // the signed auth request has arrived and nothing more is needed from
+    // the client — then stop relaying and hold the gateway-side socket
+    // open: from the gateway's perspective this peer now ignores everything
+    // it is sent (including the auth-timeout SSH_MSG_DISCONNECT) and never
+    // closes its end.
+    let mut resolve_started = None;
+    for _ in 0..120 {
+        if let Some(at) = sched.resolve_started.read().unwrap().first().copied() {
+            resolve_started = Some(at);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let resolve_started =
+        resolve_started.ok_or_else(|| anyhow::anyhow!("auth never reached ResolveTenant"))?;
+    anyhow::ensure!(
+        resolve_started.duration_since(holder_at) < GRACE,
+        "staging broken: the auth request must reach the gateway (and start the slow \
+         resolve) before the auth deadline, took {:?}",
+        resolve_started.duration_since(holder_at)
+    );
+    hold.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(
+        recorder.gauge_value(GAUGE),
+        Some(1.0),
+        "the holder must count toward connections_active while its auth is in flight; \
+         gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    // Precondition: the holder owns the only permit, so a real client is
+    // rejected at the connection cap. Proves the success below can't pass
+    // vacuously. Probes use the comment-less key so they never touch the
+    // (slow) resolve path.
+    let denied = connect_and_auth(addr, plain_key.clone()).await;
+    assert!(
+        denied.is_err(),
+        "while the holder owns the only permit, a second connection must be \
+         rejected at the connection cap"
+    );
+
+    // The release cannot happen before the late auth lands (russh only
+    // touches the wrapped transport again once the auth callback returns),
+    // so the budget runs from connect to RESOLVE_DELAY plus a generous
+    // scheduling margin. That is still far below the leftover ~30 s
+    // keepalive wakeup (let alone the 1 h inactivity backstop) that
+    // un-armed code would have to ride, so a pass genuinely requires the
+    // force-close to have been armed when the auth-timeout disconnect was
+    // queued.
+    let force_close_budget = RESOLVE_DELAY + std::time::Duration::from_secs(8);
+    let mut admitted = None;
+    while holder_at.elapsed() < force_close_budget {
+        match connect_and_auth(addr, plain_key.clone()).await {
+            Ok(session) => {
+                admitted = Some(session);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+        }
+    }
+    assert!(
+        admitted.is_some(),
+        "a connection whose auth completed after the auth-timeout disconnect was queued, \
+         and whose peer then holds its socket open ignoring that disconnect, must be \
+         force-closed promptly (the disconnect decision arms the transport bound), not \
+         pinned until russh's leftover keepalive/inactivity timers"
+    );
+
+    // Staging guards: the scenario only pins the regression if the holder's
+    // auth really was in flight when the auth-timeout fired and really did
+    // complete afterwards (otherwise the pre-auth deadline or the
+    // empty-connection grace timer would have produced the same observable
+    // reap and this test would prove nothing).
+    let responded = sched.resolve_responded.read().unwrap().clone();
+    assert_eq!(
+        responded.len(),
+        1,
+        "staging broken: exactly one ResolveTenant round-trip expected (the holder's)"
+    );
+    let auth_completed_after = responded[0].duration_since(holder_at);
+    assert!(
+        auth_completed_after > GRACE,
+        "staging broken: auth must complete after the auth deadline (completed \
+         {auth_completed_after:?} after connect, grace {GRACE:?})"
+    );
+
+    // The holder's accounting must be undone: with the follow-up client now
+    // the only live connection, connections_active is back to exactly one.
+    // Poll briefly; the handler drop runs as the transport task unwinds.
+    let mut active = recorder.gauge_value(GAUGE);
+    for _ in 0..40 {
+        if active == Some(1.0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        active = recorder.gauge_value(GAUGE);
+    }
+    assert_eq!(
+        active,
+        Some(1.0),
+        "connections_active must return to the follow-up client alone once the held \
+         connection is force-closed; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    drop(admitted);
+    auth_task.abort();
+    proxy_task.abort();
+    srv.abort();
+    Ok(())
+}
+
 // ===========================================================================
 // I-109 — authorized_keys hot-reload
 // ===========================================================================

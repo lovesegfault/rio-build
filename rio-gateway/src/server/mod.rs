@@ -122,14 +122,16 @@ pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::fro
 /// keepalives) forever. So every site that decides a connection must go
 /// away arms the transport-level `ConnDeadline` this far in the future:
 /// the pre-auth deadline arms it at accept (covering the
-/// never-authenticated population), and the empty-connection grace timer
-/// arms it the moment it queues its disconnect for an authenticated one.
-/// Once the deadline passes, the transport read fails, russh's session loop
-/// (or its drain loop) returns, and the handler + stream drop — releasing
-/// the permit, fd, and gauges exactly once through the normal drop path. A
-/// few seconds is plenty for any compliant peer to have closed; only one
-/// gaming the key exchange or squatting on the socket ever reaches the
-/// hard close.
+/// never-authenticated population), and the auth-timeout and
+/// empty-connection-grace disconnects arm it the moment they are queued
+/// (the former matters because an authentication that completes with that
+/// disconnect still queued takes the connection out of the pre-auth
+/// deadline's reach). Once the deadline passes, the transport read fails,
+/// russh's session loop (or its drain loop) returns, and the handler +
+/// stream drop — releasing the permit, fd, and gauges exactly once through
+/// the normal drop path. A few seconds is plenty for any compliant peer to
+/// have closed; only one gaming the key exchange or squatting on the
+/// socket ever reaches the hard close.
 pub const FORCE_CLOSE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The SSH server that accepts connections and spawns protocol sessions.
@@ -482,13 +484,14 @@ impl GatewayServer {
                 // exchanges), so after the slack the wrapper fails the
                 // read, russh's session loop returns the error, and the
                 // handler/stream drop releases the permit and fd. The same
-                // wrapper also enforces the post-auth force-close armed by
-                // any later "this connection must go away" decision (the
-                // empty-connection grace timer). See [`ConnDeadline`].
+                // wrapper also enforces the force-close armed by any
+                // "this connection must go away" decision (the auth-timeout
+                // disconnect below, the empty-connection grace timer). See
+                // [`ConnDeadline`].
                 let stream = ConnDeadline::new(
                     stream,
                     Arc::clone(&stage),
-                    force_close,
+                    Arc::clone(&force_close),
                     auth_deadline + FORCE_CLOSE_SLACK,
                 );
                 // r[impl gw.conn.exit-status+3]
@@ -533,14 +536,24 @@ impl GatewayServer {
                 // caveat: russh only drains server-queued messages
                 // between key exchanges (`!kex.active()`), so a peer
                 // that keeps a key exchange perpetually in flight never
-                // receives this polite disconnect — for that peer the
-                // [`ConnDeadline`] pre-auth read deadline (armed at
-                // accept, expiring `FORCE_CLOSE_SLACK` after this
-                // instant) force-closes the transport instead, so no
-                // extra arming is needed here. The polite path stays
-                // because for every deliverable case (rejected key,
-                // wedged ssh-agent, stalled-but-not-rekeying client) it
-                // ends the connection cleanly and promptly.
+                // receives this polite disconnect; the transport-level
+                // deadline is what actually bounds it. That deadline must
+                // be the shared force-close, armed HERE, at the decision
+                // point (decide-then-enforce, same as the empty-connection
+                // grace timer): the wrapper's pre-auth deadline stops
+                // applying the instant the connection authenticates, so an
+                // auth that completes while this disconnect is still
+                // queued — entirely possible, the key check plus the
+                // ResolveTenant round-trip can straddle the deadline —
+                // followed by a peer that ignores the disconnect and holds
+                // its socket would otherwise be bounded by nothing but
+                // russh's leftover keepalive/inactivity timers. For a
+                // connection that never authenticates the arm changes
+                // nothing: the pre-auth deadline expires at this same
+                // instant. The polite path stays because for every
+                // deliverable case (rejected key, wedged ssh-agent,
+                // stalled-but-not-rekeying client) it ends the connection
+                // cleanly and promptly.
                 tokio::select! {
                     r = &mut session => {
                         if let Err(e) = r {
@@ -558,6 +571,7 @@ impl GatewayServer {
                                 "connection did not authenticate within the deadline; \
                                  disconnecting"
                             );
+                            force_close.arm_within(FORCE_CLOSE_SLACK);
                             let _ = session
                                 .handle()
                                 .disconnect(
@@ -585,13 +599,17 @@ impl GatewayServer {
 /// `ConnectionHandler`.
 ///
 /// The contract: arm it AT THE MOMENT a `Disconnect::ByApplication` is
-/// queued for the connection (currently the empty-connection grace timer in
-/// `connection.rs`; the pre-auth polite disconnect is covered by the
-/// pre-auth deadline the wrapper already carries, which fires at the same
-/// instant this would). Arming before the handle send matters: the polite
-/// disconnect rides the russh handle queue, which a hostile peer can park
-/// (key exchange held open) — the decision to disconnect must be bounded
-/// even if the polite send itself never completes.
+/// queued for the connection — the empty-connection grace timer in
+/// `connection.rs` and the auth-timeout disconnect in
+/// [`GatewayServer::run_on_listener`] both do. The latter matters even
+/// though the pre-auth deadline expires at the same instant: that deadline
+/// stops applying the moment the connection authenticates, and an auth
+/// that completes with the disconnect still queued (the peer then ignoring
+/// it) must stay bounded by the decision that was already made. Arming
+/// before the handle send matters: the polite disconnect rides the russh
+/// handle queue, which a hostile peer can park (key exchange held open) —
+/// the decision to disconnect must be bounded even if the polite send
+/// itself never completes.
 ///
 /// Lock-free: a single `AtomicU64` of nanoseconds relative to `origin`
 /// (`NOT_ARMED` = nothing pending), so the wrapper's hot path is one

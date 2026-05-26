@@ -1189,13 +1189,16 @@ the connection must go (the pre-auth deadline or the empty-connection
 grace), then a forced transport close `FORCE_CLOSE_SLACK` (5 s) later if
 the connection is still open --- the accept-site read deadline covers the
 never-authenticated peer, and the same wrapper enforces a force-close
-deadline armed whenever a disconnect is queued for an authenticated one, so
-the failed read ends russh's session loop (or its drain loop) and releases
-the connection slot and fd through the normal drop path. That forced close
-at grace + slack is what reaps a peer that stalls or squats mid-exchange
---- long before `keepalive_max` (\~300 s) would --- leaving keepalive as
-the backstop only for connections the gateway has not (yet) decided to
-disconnect.
+deadline armed whenever the gateway queues a disconnect for the connection
+(the empty-connection grace timer, and the authentication-timeout path ---
+whose target may finish authenticating after the disconnect was queued and
+thereby leave the pre-auth deadline's reach, so the decision itself must
+arm the bound), so the failed read ends russh's session loop (or its drain
+loop) and releases the connection slot and fd through the normal drop
+path. That forced close at grace + slack is what reaps a peer that stalls
+or squats mid-exchange --- long before `keepalive_max` (\~300 s) would ---
+leaving keepalive as the backstop only for connections the gateway has not
+(yet) decided to disconnect.
 
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at

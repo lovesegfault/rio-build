@@ -119,6 +119,22 @@ pub struct MockScheduler {
     pub watch_metadata: Arc<RwLock<Vec<Option<String>>>>,
     /// `x-rio-tenant-token` value on each CancelBuild call (`None` = absent).
     pub cancel_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// Artificial latency applied to every `resolve_tenant` call before it
+    /// responds. ResolveTenant sits inside the gateway's SSH `auth_publickey`
+    /// callback — it is the only await in that path — so this is the lever
+    /// gateway tests use to stage an authentication that is still in flight
+    /// when an accept-site deadline fires. `None` (default) = respond
+    /// immediately.
+    pub resolve_delay: Arc<RwLock<Option<std::time::Duration>>>,
+    /// Instant each `resolve_tenant` call ARRIVED (before any configured
+    /// [`Self::resolve_delay`] is applied). Tests poll this to know the
+    /// caller is now parked inside the slow resolve.
+    pub resolve_started: Arc<RwLock<Vec<std::time::Instant>>>,
+    /// Instant each `resolve_tenant` call was ANSWERED (after any configured
+    /// [`Self::resolve_delay`]). Tests compare this against their own
+    /// deadlines to prove the injected latency really made the caller's
+    /// authentication straddle them.
+    pub resolve_responded: Arc<RwLock<Vec<std::time::Instant>>>,
 }
 
 /// Extract `x-rio-tenant-token` from request metadata as `Option<String>`.
@@ -140,6 +156,12 @@ impl MockScheduler {
 
     pub fn set_watch_outcome(&self, outcome: WatchOutcome) {
         *self.watch.write().unwrap() = outcome;
+    }
+
+    /// Make every subsequent `resolve_tenant` call sleep for `delay` before
+    /// responding. See [`Self::resolve_delay`].
+    pub fn set_resolve_delay(&self, delay: std::time::Duration) {
+        *self.resolve_delay.write().unwrap() = Some(delay);
     }
 }
 
@@ -353,9 +375,23 @@ impl SchedulerService for MockScheduler {
         &self,
         request: Request<rio_proto::scheduler::ResolveTenantRequest>,
     ) -> Result<Response<rio_proto::scheduler::ResolveTenantResponse>, Status> {
-        // No test exercises this (the gateway tests that need a resolved
-        // tenant talk to the real scheduler). Return the unknown-tenant
-        // response so the gateway's graceful-degrade path applies.
+        self.resolve_started
+            .write()
+            .unwrap()
+            .push(std::time::Instant::now());
+        // Copy the delay out so the lock guard is not held across the await.
+        let delay = *self.resolve_delay.read().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.resolve_responded
+            .write()
+            .unwrap()
+            .push(std::time::Instant::now());
+        // Always the unknown-tenant response: gateway tests that exercise
+        // this path rely on the graceful-degrade branch (jwt.required=false),
+        // not on a successfully minted token. Tests that need a resolved
+        // tenant talk to the real scheduler.
         Err(Status::invalid_argument(format!(
             "unknown tenant: {}",
             request.into_inner().tenant_name
