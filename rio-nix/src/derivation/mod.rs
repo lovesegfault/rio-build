@@ -16,7 +16,7 @@ mod aterm;
 mod hash;
 mod structured;
 
-pub use hash::hash_derivation_modulo;
+pub use hash::{hash_derivation_modulo, input_addressed_output_paths};
 pub use structured::StructuredEnv;
 
 /// Errors from parsing or hashing ATerm derivations.
@@ -60,6 +60,12 @@ pub enum DerivationError {
 
     #[error("computed output path is invalid: {0}")]
     InvalidOutputPath(#[from] crate::store_path::StorePathError),
+
+    #[error(
+        "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA \
+         outputs derive their paths from content, not from the derivation hash)"
+    )]
+    NotInputAddressed(String),
 }
 
 /// Maximum recursion depth for `hash_derivation_modulo` (DoS prevention).

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use sha2::{Digest, Sha256};
 
 use super::{Derivation, DerivationError, DerivationLike, MAX_HASH_RECURSION_DEPTH};
+use crate::store_path::StorePath;
 
 // ---------------------------------------------------------------------------
 // hashDerivationModulo
@@ -132,6 +133,91 @@ fn hash_derivation_modulo_inner<'c>(
         hash_cache.insert(drv_path.to_string(), hash);
     }
     Ok(hash)
+}
+
+// ---------------------------------------------------------------------------
+// Input-addressed output path derivation (validation-side)
+// ---------------------------------------------------------------------------
+
+/// Derive the input-addressed output paths of `drv` from its contents,
+/// ignoring whatever paths it declares.
+///
+/// This reproduces what Nix computes at instantiation time
+/// (`derivationStrict` → `hashDerivationModulo(…, maskOutputs=true)` →
+/// `StoreDirConfig::makeOutputPath`): every output path field and output
+/// env value is masked to `""`, every `inputDrvs` key is replaced by that
+/// input's modular hash (mask=false, exactly as the recursive arm of
+/// [`hash_derivation_modulo`] does), the resulting ATerm is SHA-256
+/// hashed, and each output's store path is
+/// `makeOutputPath(outputName, hash, drvName)` where `drvName` is the
+/// `.drv` store-path name without its extension.
+///
+/// Comparing the result against the declared paths is how a *trusted*
+/// component (gateway / store) verifies that a submitted derivation does
+/// not claim some other derivation's output path — workers are untrusted,
+/// so any check they perform is defense-in-depth only.
+///
+/// Only meaningful for plain input-addressed derivations: fixed-output
+/// derivations bind their path to the declared content hash
+/// ([`StorePath::make_fixed_output`]) and floating-CA outputs have no
+/// static path at all — both return [`DerivationError::NotInputAddressed`].
+/// Deferred input-addressed outputs (empty declared path under `ca-derivations`)
+/// are the caller's responsibility to skip: there is nothing to validate.
+///
+/// `hash_cache` memoises input modular hashes (mask=false form only) and
+/// may be shared with [`hash_derivation_modulo`] calls over the same
+/// closure.
+pub fn input_addressed_output_paths<'c>(
+    drv: &'c Derivation,
+    drv_path: &str,
+    resolve_input: &dyn Fn(&str) -> Option<&'c Derivation>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> Result<BTreeMap<String, StorePath>, DerivationError> {
+    if drv.is_fixed_output() || drv.has_ca_floating_outputs() {
+        return Err(DerivationError::NotInputAddressed(drv_path.to_string()));
+    }
+
+    // drvName: the `.drv` store path's name minus the extension — the same
+    // value Nix uses for `outputPathName` when it first computes these
+    // paths (a parsed `Derivation`'s `name` field is set from the path).
+    let drv_store_path = StorePath::parse(drv_path)?;
+    let drv_name = drv_store_path
+        .name()
+        .strip_suffix(".drv")
+        .unwrap_or(drv_store_path.name())
+        .to_owned();
+
+    // Hash every input drv exactly the way the recursive arm of
+    // `hash_derivation_modulo` does: mask=false — only the top-level
+    // subject of the path computation is masked.
+    let mut visiting = HashSet::new();
+    let mut input_rewrites: BTreeMap<String, String> = BTreeMap::new();
+    for input_drv_path in drv.input_drvs().keys() {
+        let input_drv = resolve_input(input_drv_path)
+            .ok_or_else(|| DerivationError::InputNotFound(input_drv_path.clone()))?;
+        let input_hash = hash_derivation_modulo_inner(
+            input_drv,
+            input_drv_path,
+            resolve_input,
+            hash_cache,
+            &mut visiting,
+            1,
+            false,
+        )?;
+        input_rewrites.insert(input_drv_path.clone(), hex::encode(input_hash));
+    }
+
+    // Mask the outputs (path fields AND output-named env values) the way
+    // Nix does while the paths are still unknown, then hash the ATerm.
+    let masked_aterm = drv.to_aterm_modulo(&input_rewrites, true)?;
+    let drv_hash: [u8; 32] = Sha256::digest(masked_aterm.as_bytes()).into();
+
+    let mut paths = BTreeMap::new();
+    for output in drv.outputs() {
+        let path = StorePath::make_output(output.name(), &drv_hash, &drv_name)?;
+        paths.insert(output.name().to_owned(), path);
+    }
+    Ok(paths)
 }
 
 #[cfg(test)]
