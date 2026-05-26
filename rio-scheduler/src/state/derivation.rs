@@ -526,6 +526,135 @@ impl RetryState {
     }
 }
 
+db_str_enum! {
+    /// Row kind in the durable attempt ledger (`drv_attempts.event_kind`,
+    /// migration 066): an observed attempt/charge event, or a reset event
+    /// (resubmit reset, cache-hit clear, poison clear) that starts a new
+    /// suffix for the fold.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AttemptEventKind {
+        Attempt = "attempt",
+        Reset = "reset",
+    }
+    parse_err(_s) = &'static str:
+        "invalid attempt event kind (must be 'attempt' or 'reset')";
+}
+
+db_str_enum! {
+    /// Outcome classification of one attempt-ledger row
+    /// (`drv_attempts.outcome_class`, migration 066). This is the
+    /// `classify()` alphabet: the CHECK constraint in the migration and
+    /// this enum MUST stay in lockstep — extending the alphabet is a new
+    /// migration plus a variant here, verified by the
+    /// `outcome_class_alphabet_matches_check_constraint` test.
+    ///
+    /// `substitution` is deliberately NOT in the alphabet: the
+    /// substitution-failure decider stays outside the retry collapse.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum OutcomeClass {
+        /// E1 — worker-reported `TransientFailure` (build ran, exited
+        /// non-zero) or `Unspecified`.
+        Transient = "transient",
+        /// E2 — worker-reported `InfrastructureFailure`, non-exempt.
+        Infra = "infra",
+        /// E2/E6 — infra failure exempt from the non-exempt cap
+        /// (floor-promoted CgroupOom/OOMKilled, CONCURRENT_PUTPATH).
+        ExemptInfra = "exempt_infra",
+        /// E4/E7 — worker `TimedOut` or controller `DeadlineExceeded`.
+        Timeout = "timeout",
+        /// E3 — one of the seven permanent failure statuses.
+        Permanent = "permanent",
+        /// A dependent swept to `DependencyFailed` by an ancestor's
+        /// terminal failure (no execution of its own).
+        Cascade = "cascade",
+        /// E8 — the scheduler-side backstop timer fired for a Running
+        /// build with no report.
+        Backstop = "backstop",
+        /// E5 — stream disconnect / heartbeat timeout / force-drain
+        /// released the execution; classification not yet established
+        /// (first installment of a two-installment attempt).
+        Disconnected = "disconnected",
+        /// A `disconnected` attempt whose classifying report never
+        /// arrived: established by the correlation-TTL sweep (or the
+        /// backstop) as an unreported executor crash.
+        ExecutorCrash = "executor_crash",
+        /// E9 — dispatch-time fleet-exhaust verdict marker (not a
+        /// charge; the fold treats it as a no-op event).
+        FleetExhaust = "fleet_exhaust",
+        /// Reset row: `dag::merge` resubmit reset of a retriable
+        /// terminal node (carries the new `resubmit_cycle`).
+        ResubmitReset = "resubmit_reset",
+        /// Reset row: cache-hit `RetryState::clear()` (output turned up
+        /// in the store / re-probe found it substitutable).
+        CacheHitClear = "cache_hit_clear",
+        /// Reset row: admin `ClearPoison` or the poison-TTL expiry.
+        PoisonCleared = "poison_cleared",
+    }
+    parse_err(_s) = &'static str:
+        "invalid outcome class (not in the migration-066 alphabet)";
+}
+
+db_str_enum! {
+    /// Which party observed/reported the event behind an attempt-ledger
+    /// row (`drv_attempts.reporting_party`, migration 066).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReportingParty {
+        /// Worker `CompletionReport`.
+        Worker = "worker",
+        /// Controller `ReportExecutorTermination`.
+        Controller = "controller",
+        /// Scheduler-side observation (disconnect, backstop, sweep,
+        /// dispatch-time verdict, TTL expiry).
+        Scheduler = "scheduler",
+        /// Admin RPC (ClearPoison).
+        Admin = "admin",
+    }
+    parse_err(_s) = &'static str:
+        "invalid reporting party (must be worker/controller/scheduler/admin)";
+}
+
+/// In-memory mirror of one `drv_attempts` row — the per-node attempt
+/// history entry that Phase 1b's `decide()` will fold. Field-for-field
+/// the row minus `derivation_id` (implicit from the owning node), with
+/// the timestamps as epoch seconds (the ledger is PG-authoritative; the
+/// in-memory list is a read-through cache of committed rows).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttemptRecord {
+    /// Ledger primary key (UUIDv7, minted at append).
+    pub attempt_id: Uuid,
+    /// Attempt event or reset event.
+    pub event_kind: AttemptEventKind,
+    /// Outcome classification (the `classify()` alphabet).
+    pub outcome_class: OutcomeClass,
+    /// Execution this attempt corresponds to, when one was dispatched.
+    pub exec_id: Option<Uuid>,
+    /// Executor that ran (or was assigned) the attempt.
+    pub executor_id: Option<ExecutorId>,
+    /// Second-installment classification detail (controller reason,
+    /// `unreported`, `force_drain`, …). `None` until established.
+    pub termination_reason: Option<String>,
+    /// Who observed the event.
+    pub reporting_party: ReportingParty,
+    /// E2's `exempt_from_cap` (floor-promoted or CONCURRENT_PUTPATH).
+    pub exempt: bool,
+    /// `FloorOutcome::promoted` at append time.
+    pub floor_promoted: bool,
+    /// `FloorOutcome::at_cap` at append time.
+    pub floor_at_cap: bool,
+    /// Worker/controller error message, where the path carries one.
+    pub error_msg: Option<String>,
+    /// `CompletionReport.final_line_count` for report-bearing failures.
+    pub final_line_count: Option<i64>,
+    /// Resubmit cycle index this row belongs to (reset rows carry the
+    /// new cycle).
+    pub resubmit_cycle: i32,
+    /// When the event occurred (epoch seconds, append-site clock).
+    pub occurred_at_epoch_secs: f64,
+    /// When the row was committed (epoch seconds, PG clock). `0.0` for
+    /// records appended in-memory before a load round-trip.
+    pub recorded_at_epoch_secs: f64,
+}
+
 /// Content-addressed-derivation sub-state of a [`DerivationState`].
 ///
 /// All fields except `is_ca` are **in-memory only**: recovered CA-on-CA
@@ -805,6 +934,15 @@ pub struct DerivationState {
     pub input_srcs: Vec<String>,
     /// Retry / failure-tracking state.
     pub retry: RetryState,
+    /// In-memory mirror of this derivation's `drv_attempts` suffix (the
+    /// rows since the last reset event). Append-only; entries are pushed
+    /// only AFTER the owning appending transaction commits (the ledger
+    /// is PG-authoritative, this is a read-through cache), and the
+    /// two-installment classification update mirrors `fill_termination`.
+    /// Populated from the ledger at recovery. NOT consulted by any
+    /// decision in Phase 1a — the RAM counters in [`Self::retry`] stay
+    /// authoritative until the Phase-1b collapse.
+    attempt_history: Vec<AttemptRecord>,
     /// Realized output store paths (filled on completion).
     pub output_paths: Vec<String>,
     /// Expected output paths (from the proto node at merge time).
@@ -1074,6 +1212,7 @@ impl DerivationState {
             drv_content: node.drv_content.clone(),
             input_srcs,
             retry: RetryState::default(),
+            attempt_history: Vec::new(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
             wanted_output_names: node.wanted_output_names.clone(),
@@ -1186,6 +1325,9 @@ impl DerivationState {
                 // resets to conservative defaults (see RetryState doc).
                 ..Default::default()
             },
+            // Populated from the attempt ledger by the recovery load
+            // (`load_attempt_suffix`) after construction.
+            attempt_history: Vec::new(),
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
             // Persisted with union-on-conflict (`migrations/062`,
@@ -1292,6 +1434,9 @@ impl DerivationState {
                 poisoned_at: Some(poisoned_at),
                 ..Default::default()
             },
+            // Populated from the attempt ledger by the recovery load
+            // (`load_attempt_suffix`) after construction.
+            attempt_history: Vec::new(),
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
             wanted_output_names: Vec::new(),
@@ -1538,6 +1683,36 @@ impl DerivationState {
         self.status.is_retriable_on_resubmit()
             || (self.status == DerivationStatus::Poisoned
                 && self.retry.resubmit_cycles < POISON_RESUBMIT_RETRY_LIMIT)
+    }
+
+    /// Append one committed attempt-ledger row's in-memory mirror to
+    /// this node's attempt history. Call ONLY after the owning appending
+    /// transaction has committed (the ledger is PG-authoritative; an
+    /// uncommitted row must not be visible here).
+    // TODO: callers land with the 1a append sites (worker-reported exit
+    // paths, no-report paths, reset events); dead until then.
+    #[allow(dead_code)]
+    pub(crate) fn push_attempt_record(&mut self, record: AttemptRecord) {
+        self.attempt_history.push(record);
+    }
+
+    /// Replace the in-memory attempt history wholesale. Recovery-load
+    /// only (the suffix loaded from `drv_attempts` after a failover).
+    // TODO: caller lands with the 1a recovery load; dead until then.
+    #[allow(dead_code)]
+    pub(crate) fn set_attempt_history(&mut self, history: Vec<AttemptRecord>) {
+        self.attempt_history = history;
+    }
+
+    /// The in-memory attempt history (the committed suffix mirror).
+    /// Test-only in Phase 1a — no decision consults it until the
+    /// Phase-1b collapse.
+    // TODO: first readers are the 1a append-site tests; drop the allow
+    // when they land.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn attempt_history(&self) -> &[AttemptRecord] {
+        &self.attempt_history
     }
 
     /// Test-only: directly set status bypassing state machine validation.

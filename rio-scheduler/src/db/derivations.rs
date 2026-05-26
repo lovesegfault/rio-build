@@ -1,5 +1,7 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
+use sqlx::PgConnection;
+
 use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, terminal_status_sql};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
@@ -34,19 +36,20 @@ pub(super) fn terminal_assignment_status(drv_status: DerivationStatus) -> Option
 }
 
 impl SchedulerDb {
-    /// Update a derivation's status. If the new status is terminal,
-    /// also closes the active `assignments` row (pending/acknowledged
-    /// → mapped terminal status, `completed_at = now()`) **in the
-    /// same transaction** so a crash between can't leave a permanent
-    /// un-GC-able row (terminal derivation + pending assignment).
+    /// Transaction-joining body of [`Self::update_derivation_status`]:
+    /// the status UPDATE plus, for terminal statuses, the
+    /// active-assignment close — on the caller's connection, so an
+    /// appending site can put the status persist in the same
+    /// transaction as its `drv_attempts` append (the 1a write
+    /// discipline). Same `db/batch.rs` parameter shape
+    /// (`&mut PgConnection`).
     // r[impl sched.db.assignment-terminal-on-status+2]
-    pub async fn update_derivation_status(
-        &self,
+    pub(crate) async fn update_derivation_status_in_tx(
+        tx: &mut PgConnection,
         drv_hash: &DrvHash,
         status: DerivationStatus,
         assigned_executor: Option<&ExecutorId>,
     ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
         sqlx::query!(
             r#"
             UPDATE derivations
@@ -72,8 +75,67 @@ impl SchedulerDb {
             .execute(&mut *tx)
             .await?;
         }
+        Ok(())
+    }
 
+    /// Update a derivation's status. If the new status is terminal,
+    /// also closes the active `assignments` row (pending/acknowledged
+    /// → mapped terminal status, `completed_at = now()`) **in the
+    /// same transaction** so a crash between can't leave a permanent
+    /// un-GC-able row (terminal derivation + pending assignment).
+    ///
+    /// Owns its transaction; appending sites that already hold one use
+    /// [`Self::update_derivation_status_in_tx`] instead.
+    pub async fn update_derivation_status(
+        &self,
+        drv_hash: &DrvHash,
+        status: DerivationStatus,
+        assigned_executor: Option<&ExecutorId>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::update_derivation_status_in_tx(&mut tx, drv_hash, status, assigned_executor).await?;
         tx.commit().await
+    }
+
+    /// Transaction-joining body of
+    /// [`Self::update_derivation_status_batch`] — same split as
+    /// [`Self::update_derivation_status_in_tx`]. Returns the number of
+    /// derivation rows updated.
+    // r[impl sched.db.assignment-terminal-on-status+2]
+    pub(crate) async fn update_derivation_status_batch_in_tx(
+        tx: &mut PgConnection,
+        drv_hashes: &[&str],
+        status: DerivationStatus,
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query!(
+            r#"
+            UPDATE derivations
+            SET status = $2, assigned_builder_id = NULL, updated_at = now()
+            WHERE drv_hash = ANY($1::text[])
+            "#,
+            drv_hashes as &[&str],
+            status.as_str(),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(assign_status) = terminal_assignment_status(status) {
+            sqlx::query!(
+                "UPDATE assignments
+                 SET status = $2, completed_at = now()
+                 WHERE derivation_id IN
+                       (SELECT derivation_id FROM derivations WHERE drv_hash = ANY($1::text[]))
+                   AND status IN ('pending', 'acknowledged')",
+                drv_hashes as &[&str],
+                assign_status.as_str(),
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(result.rows_affected())
     }
 
     /// Batch variant of [`update_derivation_status`]: set the same
@@ -90,6 +152,9 @@ impl SchedulerDb {
     /// If a future caller needs per-row worker IDs, add a UNNEST
     /// variant — don't make this one variadic.
     ///
+    /// Owns its transaction; appending sites that already hold one use
+    /// [`Self::update_derivation_status_batch_in_tx`] instead.
+    ///
     /// [`update_derivation_status`]: Self::update_derivation_status
     pub async fn update_derivation_status_batch(
         &self,
@@ -100,35 +165,10 @@ impl SchedulerDb {
             return Ok(0);
         }
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query!(
-            r#"
-            UPDATE derivations
-            SET status = $2, assigned_builder_id = NULL, updated_at = now()
-            WHERE drv_hash = ANY($1::text[])
-            "#,
-            drv_hashes as &[&str],
-            status.as_str(),
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        // r[impl sched.db.assignment-terminal-on-status+2]
-        if let Some(assign_status) = terminal_assignment_status(status) {
-            sqlx::query!(
-                "UPDATE assignments
-                 SET status = $2, completed_at = now()
-                 WHERE derivation_id IN
-                       (SELECT derivation_id FROM derivations WHERE drv_hash = ANY($1::text[]))
-                   AND status IN ('pending', 'acknowledged')",
-                drv_hashes as &[&str],
-                assign_status.as_str(),
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
+        let updated =
+            Self::update_derivation_status_batch_in_tx(&mut tx, drv_hashes, status).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(updated)
     }
 
     /// Increment the retry count for a derivation.
@@ -206,6 +246,37 @@ impl SchedulerDb {
     }
 
     // r[impl sched.poison.ttl-persist]
+    /// Transaction-joining body of [`Self::persist_poisoned`]: the
+    /// atomic `status='poisoned'` + `poisoned_at=now()` write plus the
+    /// active-assignment close, on the caller's connection — so a 1a
+    /// appending site can carry the poison persist in the same
+    /// transaction as its `drv_attempts` append.
+    // r[impl sched.db.assignment-terminal-on-status+2]
+    pub(crate) async fn persist_poisoned_in_tx(
+        tx: &mut PgConnection,
+        drv_hash: &DrvHash,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE derivations \
+             SET status = 'poisoned', poisoned_at = now(), \
+                 assigned_builder_id = NULL, updated_at = now() \
+             WHERE drv_hash = $1",
+            drv_hash.as_str(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "UPDATE assignments
+             SET status = 'failed', completed_at = now()
+             WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)
+               AND status IN ('pending', 'acknowledged')",
+            drv_hash.as_str(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
     /// Atomically set `status='poisoned'` AND `poisoned_at=now()`.
     ///
     /// Replaces the previous two-call sequence (`update_derivation_status`
@@ -216,27 +287,12 @@ impl SchedulerDb {
     ///
     /// `assigned_builder_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
+    ///
+    /// Owns its transaction; appending sites that already hold one use
+    /// [`Self::persist_poisoned_in_tx`] instead.
     pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query!(
-            "UPDATE derivations \
-             SET status = 'poisoned', poisoned_at = now(), \
-                 assigned_builder_id = NULL, updated_at = now() \
-             WHERE drv_hash = $1",
-            drv_hash.as_str(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        // r[impl sched.db.assignment-terminal-on-status+2]
-        sqlx::query!(
-            "UPDATE assignments
-             SET status = 'failed', completed_at = now()
-             WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)
-               AND status IN ('pending', 'acknowledged')",
-            drv_hash.as_str(),
-        )
-        .execute(&mut *tx)
-        .await?;
+        Self::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
         tx.commit().await
     }
 

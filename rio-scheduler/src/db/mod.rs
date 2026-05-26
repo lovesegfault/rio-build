@@ -19,6 +19,12 @@ use uuid::Uuid;
 use crate::state::DerivationStatus;
 
 mod assignments;
+// The durable attempt ledger (`drv_attempts`, migration 066). The write
+// helpers have no production callers until the 1a appending sites land
+// (worker-reported exits, no-report paths, reset events, recovery load)
+// — TODO: drop the allow as those sites wire in.
+#[allow(dead_code)]
+pub(crate) mod attempts;
 mod batch;
 mod builds;
 mod derivations;

@@ -968,6 +968,11 @@
       "doc": "Assignment CRUD — `assignments` table."
     },
     {
+      "path": "db/attempts.rs",
+      "depth": 1,
+      "doc": "The durable attempt ledger — `drv_attempts` table (migration 066)."
+    },
+    {
       "path": "db/batch.rs",
       "depth": 1,
       "doc": "Batch operations for `persist_merge_to_db` — build-derivation mapping +"

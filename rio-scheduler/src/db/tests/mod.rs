@@ -10,6 +10,7 @@ use super::*;
 use crate::state::{BuildState, BuildStateExt, DerivationStatus};
 
 mod assignments;
+mod attempts;
 mod batch;
 mod builds;
 mod derivations;
