@@ -1195,8 +1195,15 @@ whose target may finish authenticating after the disconnect was queued and
 thereby leave the pre-auth deadline's reach, so the decision itself must
 arm the bound), so the failed read ends russh's session loop (or its drain
 loop) and releases the connection slot and fd through the normal drop
-path. The wrapper enforces these deadlines on both the read and the write
-path of the transport: once a session is exec'd the gateway streams bulk
+path. One arming site queues no disconnect at all: a protocol session
+whose channel-data or close-out sends the connection's handle queue has
+refused to accept for `HANDLE_SEND_TIMEOUT` (\~300 s --- far beyond any
+legitimate congestion on a fully loaded multiplexed connection) treats
+the transport as wedged, releases its session capacity, and arms the
+same force-close --- a queue in that state could not have delivered a
+polite disconnect anyway. The wrapper enforces these deadlines on both
+the read and the write path of the transport: once a session is exec'd
+the gateway streams bulk
 channel data (build logs, NAR bytes) to the client through the same
 stream, and russh awaits that write inline --- a peer that simply stops
 reading at the TCP level parks the session loop in the write, where the

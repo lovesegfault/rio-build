@@ -108,9 +108,7 @@ pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::fro
 
 /// Extra time the gateway gives a peer to act on a polite
 /// `SSH_MSG_DISCONNECT` before it force-closes the transport
-/// (`r[gw.conn.exit-status+3]`), and the budget a session's response task
-/// spends trying to deliver its final `exit-status`/`eof`/`close` before
-/// abandoning them.
+/// (`r[gw.conn.exit-status+3]`).
 ///
 /// A queued disconnect is best-effort twice over: russh only drains handle
 /// messages between key exchanges — a peer that keeps a key exchange
@@ -122,11 +120,14 @@ pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::fro
 /// keepalives) forever. So every site that decides a connection must go
 /// away arms the transport-level `ConnDeadline` this far in the future:
 /// the pre-auth deadline arms it at accept (covering the
-/// never-authenticated population), and the auth-timeout and
+/// never-authenticated population), the auth-timeout and
 /// empty-connection-grace disconnects arm it the moment they are queued
 /// (the former matters because an authentication that completes with that
 /// disconnect still queued takes the connection out of the pre-auth
-/// deadline's reach). Once the deadline passes, the transport read fails,
+/// deadline's reach), and a session whose handle-queue sends have stalled
+/// past `HANDLE_SEND_TIMEOUT` (connection.rs) arms it with no disconnect
+/// at all — a queue in that state could not deliver one. Once the
+/// deadline passes, the transport read or write fails,
 /// russh's session loop (or its drain loop) returns, and the handler +
 /// stream drop — releasing the permit, fd, and gauges exactly once through
 /// the normal drop path. A few seconds is plenty for any compliant peer to
