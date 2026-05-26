@@ -452,6 +452,74 @@ impl DagActor {
         metrics::counter!("rio_scheduler_worker_disconnects_total").increment(1);
     }
 
+    /// E5's poison-threshold re-check as a `decide()` caller (Phase 1b,
+    /// T-1b.8): fold the derivation's durable attempt suffix plus the
+    /// transitional legacy mirror-column seed (P5) and report whether
+    /// the verdict is a threshold poison. Read-only — this site appends
+    /// nothing and charges nothing for the disconnect itself (the
+    /// no-report establishment charge lands at the TTL sweep / backstop,
+    /// T-1b.11, not here); the disconnect / force-drain / backstop rows
+    /// it folds over were appended by their observation sites before
+    /// this runs.
+    ///
+    /// Acts only on the threshold reason — exactly the check
+    /// `PoisonConfig::is_poisoned` performed over the RAM counters —
+    /// so the re-check stays a *threshold* re-check; every other budget
+    /// is owned by its observation site's own collapsed verdict.
+    ///
+    /// On a read failure (or an uncommitted merge with no derivations
+    /// row) the in-memory attempt history — the committed-suffix
+    /// mirror — is the fallback fold input, so the re-check never goes
+    /// silent on a PG blip (the as-built check was RAM-only and never
+    /// touched PG).
+    async fn reassign_threshold_recheck(&self, drv_hash: &DrvHash) -> bool {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return false;
+        };
+        let budget = self.decision_budget();
+        let now = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+        let decision = match state.db_id {
+            Some(derivation_id) => {
+                let read: Result<crate::retry_policy::Decision, sqlx::Error> = async {
+                    let mut conn = self.db.pool().acquire().await?;
+                    let suffix = crate::db::SchedulerDb::load_attempt_suffix_one_in_tx(
+                        &mut conn,
+                        derivation_id,
+                    )
+                    .await?;
+                    let seed =
+                        crate::db::SchedulerDb::load_retry_seed_in_tx(&mut conn, derivation_id)
+                            .await?;
+                    let history: Vec<crate::state::AttemptRecord> = suffix
+                        .iter()
+                        .map(crate::db::attempts::AttemptRow::to_record)
+                        .collect();
+                    Ok(crate::retry_policy::decide(
+                        &history,
+                        &budget,
+                        now,
+                        seed.as_ref(),
+                    ))
+                }
+                .await;
+                match read {
+                    Ok(decision) => decision,
+                    Err(e) => {
+                        warn!(drv_hash = %drv_hash, error = %e,
+                              "reassign re-check: suffix read failed; folding the in-memory \
+                               attempt history instead");
+                        crate::retry_policy::decide(state.attempt_history(), &budget, now, None)
+                    }
+                }
+            }
+            None => crate::retry_policy::decide(state.attempt_history(), &budget, now, None),
+        };
+        matches!(
+            decision.verdict,
+            crate::retry_policy::Verdict::Poison(crate::retry_policy::PoisonReason::Threshold)
+        )
+    }
+
     /// Reset a set of derivations to Ready and re-enqueue.
     ///
     /// Extracted from `handle_executor_disconnected` so `handle_drain_executor`
@@ -531,11 +599,19 @@ impl DagActor {
             // (recorded by handle_transient_failure) + this disconnect
             // → poison instead of dispatching a 4th time. Disconnect
             // itself never increments the count.
-            let should_poison = self
-                .dag
-                .node(drv_hash)
-                .map(|s| self.poison_config.is_poisoned(s))
-                .unwrap_or(false);
+            //
+            // E5, collapsed onto decide() (Phase 1b, T-1b.8): the
+            // threshold re-check folds the durable attempt suffix (plus
+            // the transitional legacy seed) instead of reading the RAM
+            // counters; verdict-identical on every single-tenure history
+            // reachable today. Kept rather than deleted (decision P2,
+            // the narrowed b09c5b312-X6 disposition): the backstop's
+            // poison verdict no longer depends on this check since the
+            // E8 collapse decides at its own site, but it remains the
+            // disconnect-time and force-drain-time re-poison path and
+            // the post-failover backstop for a lost persist_poisoned
+            // write.
+            let should_poison = self.reassign_threshold_recheck(drv_hash).await;
             if should_poison {
                 info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
                       "reassign: poison threshold reached, poisoning instead of retry");
