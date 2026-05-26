@@ -340,7 +340,11 @@ message WorkAssignment {
 
 // One closure input path with its castore root for the FUSE prefetch.
 // `root_node` is unset when the path hasn't been NAR-indexed yet
-// (P0552's indexer is async); the builder falls back to GetNarIndex.
+// (P0552's indexer is async); the builder treats an unset root as an
+// actionable infrastructure failure (no fallback fetch path exists —
+// the per-build castore mount can only serve indexed roots), so the
+// build is re-dispatched once the indexer catches up rather than
+// poisoned.
 message InputRoot {
   string store_path = 1;
   rio.castore.RootNode root_node = 2;
