@@ -9,8 +9,11 @@
 //! production simplifications it makes.
 //!
 //! Usage:
-//!   differential-driver --drv <path.drv> --work-dir <dir> \
-//!     [--sandbox-shell <path>] [--system <sys>] [--timeout-secs <n>]
+//!
+//! ```text
+//! differential-driver --drv <path.drv> --work-dir <dir> \
+//!   [--sandbox-shell <path>] [--system <sys>] [--timeout-secs <n>]
+//! ```
 
 use std::path::PathBuf;
 use std::time::Duration;

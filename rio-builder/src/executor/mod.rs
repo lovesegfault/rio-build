@@ -155,8 +155,8 @@ pub struct ExecutorEnv {
     pub sandbox: Arc<SandboxEnvConfig>,
 }
 
-/// Worker-level inputs to [`glue::SandboxOptions`], resolved once at
-/// startup from [`crate::config::Config`].
+/// Worker-level inputs to the request glue's `SandboxOptions`,
+/// resolved once at startup from [`crate::config::Config`].
 #[derive(Debug, Default)]
 pub struct SandboxEnvConfig {
     /// Static shell exposed as `/bin/sh` inside the sandbox
@@ -354,7 +354,7 @@ pub struct ExecutionResult {
 
 /// Result of [`execute_build`]: the inner result PLUS the cgroup peak
 /// samples, which survive even when `result` is `Err`. Mirrors
-/// [`NativeOutcome`] one level up so `runtime::result::err_completion`
+/// `NativeOutcome` one level up so `runtime::result::err_completion`
 /// can report the actual `memory.peak` for a `CgroupOom`'d build (the
 /// single most actionable sizing signal) instead of hardcoding 0.
 ///

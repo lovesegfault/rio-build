@@ -99,13 +99,14 @@ pub enum SetupPhase {
     MountPrivate = 6,
     /// Bind-mounting the chroot directory onto itself.
     BindRoot = 7,
-    /// A bind mount. The error's `detail` is the index into
-    /// [`SandboxPlan::binds`].
+    /// A bind mount. The error's `detail` is the index into the
+    /// sandbox plan's bind list (`SandboxPlan::binds`).
     Bind = 8,
     /// The read-only remount of a bind. `detail` is the bind index.
     BindRemount = 9,
     /// A special mount (`proc`, `devpts`, `/dev/shm`). `detail` is the
-    /// index into [`SandboxPlan::special_mounts`].
+    /// index into the sandbox plan's special-mount list
+    /// (`SandboxPlan::special_mounts`).
     MountSpecial = 10,
     /// `chdir(2)` into the chroot directory before `pivot_root`.
     ChdirRoot = 11,
@@ -227,7 +228,7 @@ impl SetupPhase {
 /// indexed phases like [`SetupPhase::Bind`]) which entry.
 ///
 /// Fixed-size and allocation-free so the child can serialize it with
-/// [`to_bytes`](Self::to_bytes) and report it with a single `write(2)`.
+/// `SetupError::to_bytes` and report it with a single `write(2)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetupError {
     /// The step that failed.
@@ -235,9 +236,10 @@ pub struct SetupError {
     /// The raw errno from the failing syscall (0 when the failure is
     /// not a syscall failure, e.g. the id-verification mismatch).
     pub errno: i32,
-    /// Phase-specific index: the failing entry in
-    /// [`SandboxPlan::binds`] or [`SandboxPlan::special_mounts`].
-    /// Zero for phases that are not indexed.
+    /// Phase-specific index: the failing entry in the sandbox plan's
+    /// bind or special-mount list (`SandboxPlan::binds` /
+    /// `SandboxPlan::special_mounts`). Zero for phases that are not
+    /// indexed.
     pub detail: u16,
 }
 

@@ -89,7 +89,7 @@ pub struct LogReport {
     pub cap_exceeded: bool,
     /// The last forwarded log lines (lossy UTF-8), so a failing corpus
     /// entry's report is self-explanatory without re-running the VM
-    /// with a debugger attached. Bounded by [`LOG_TAIL_LINES`].
+    /// with a debugger attached. Bounded by `LOG_TAIL_LINES`.
     pub tail: Vec<String>,
 }
 
