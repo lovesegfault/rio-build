@@ -18,7 +18,7 @@ use rio_store::config::{CliArgs, Config, derive_substitute_admission_cap, init_c
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let rio_common::server::Bootstrap::<Config> {
-        cfg,
+        mut cfg,
         shutdown,
         serve_shutdown,
         otel_guard: _otel_guard,
@@ -29,6 +29,16 @@ async fn main() -> anyhow::Result<()> {
         rio_store::describe_metrics,
         rio_store::HISTOGRAM_BUCKETS,
     )?;
+
+    // Per-pod Express bucket selection (P0554): when the tiered backend
+    // has no explicit express_bucket, pick this pod's bucket from the
+    // zone-keyed map using RIO_NODE_ZONE (helm renders it from the
+    // pod's topology.kubernetes.io/zone label via the downward API).
+    // Must run before init_chunk_backend AND before the express-sweep
+    // spawn below — both read the resolved express_bucket. Logs exactly
+    // one line stating the outcome (or which piece was missing).
+    cfg.resolve_express_bucket();
+    let cfg = cfg;
 
     let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
 

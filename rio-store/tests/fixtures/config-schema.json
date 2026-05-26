@@ -39,6 +39,14 @@
         ],
         "default": null
       },
+      "node_zone": {
+        "description": "Availability-zone NAME this replica's pod landed in (the value\nof the `topology.kubernetes.io/zone` label, e.g. `us-east-2a`).\nConsumed only by per-pod Express bucket selection for the\n`tiered` chunk backend ([`Config::resolve_express_bucket`]).\nIn Kubernetes, helm renders this from the POD's own\n`topology.kubernetes.io/zone` label via the downward API —\nKEP-4742's `PodTopologyLabelsAdmission` plugin (beta in\nKubernetes 1.35) copies the label from the node onto the pod at\nbinding, so no IMDS call and no `nodes/get` RBAC is needed.\nUnset or empty (label absent — admission plugin disabled) means\n\"zone unknown\": no bucket is selected and the tiered backend\nruns with `local = None`. Set via `RIO_NODE_ZONE`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
       "binary_cache_compat": {
         "description": "Stock-Nix binary-cache compatibility layer (ADR-022 §10):\nalso write `.narinfo` + `nar/*.nar.zst` objects to S3-standard\nso plain `nix` clients can substitute from the bucket without\nrio. Default ON. See [`BinaryCacheCompat`].",
         "$ref": "#/$defs/BinaryCacheCompat",
@@ -226,7 +234,7 @@
             ]
           },
           {
-            "description": "Two-tier: per-AZ S3 Express read-through cache over authoritative\nS3 standard. `express_bucket = None` (or unset) degrades to the\nplain `S3` shape — replicas in AZs without Express still\nfunction. The Express bucket is per-AZ; helm wires the right one\nvia the node's `topology.kubernetes.io/zone` label (P0554).\nSee ADR-023 (tiered chunk backend).",
+            "description": "Two-tier: per-AZ S3 Express read-through cache over authoritative\nS3 standard. `express_bucket = None` (or unset) degrades to the\nplain `S3` shape — replicas in AZs without Express still\nfunction. The Express bucket is per-AZ: either set explicitly\n(`express_bucket` — single-AZ / zone-pinned deployments, VM\ntests) or selected per pod at startup from\n`express_bucket_by_zone` keyed by this pod's zone (P0554, see\n[`Config::resolve_express_bucket`]). See ADR-023 (tiered chunk\nbackend).",
             "type": "object",
             "properties": {
               "bucket": {
@@ -238,12 +246,20 @@
                 "type": "string"
               },
               "express_bucket": {
-                "description": "Per-AZ S3 Express directory bucket (`*--x-s3` suffix).\n`None` = no cache tier in this AZ.",
+                "description": "Per-AZ S3 Express directory bucket (`*--x-s3` suffix).\n`None` = no cache tier in this AZ. Wins over\n`express_bucket_by_zone` when both are set.",
                 "type": [
                   "string",
                   "null"
                 ],
                 "default": null
+              },
+              "express_bucket_by_zone": {
+                "description": "Per-AZ Express bucket map keyed by zone NAME (the value of\nthe `topology.kubernetes.io/zone` label, e.g. `us-east-2a`),\nfor per-pod selection when `express_bucket` is unset: at\nstartup [`Config::resolve_express_bucket`] looks up\n[`Config::node_zone`] here and the matching bucket becomes\nthis replica's local cache tier. Populated by helm/xtask\nfrom the `express_bucket_by_zone` terraform output. TOML:\na `[chunk_backend.express_bucket_by_zone]` table; env: ONE\nJSON-object string —\n`RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE='{\"us-east-2a\":\"…--x-s3\"}'`\n(the `__`-nested env convention has no per-entry syntax for\nmaps, so the whole map travels as a single value). Empty\n(default) = no per-pod selection.",
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "default": {}
               },
               "express": {
                 "description": "Express cache-tier eviction sweep tuning (P0585). Only\nconsulted when `express_bucket` is set. TOML\n`[chunk_backend.express]`, env `RIO_CHUNK_BACKEND__EXPRESS__*`.",
@@ -393,6 +409,7 @@
     "metrics_addr": "[::]:9092",
     "drain_grace_secs": 6,
     "chunk_backend": null,
+    "node_zone": null,
     "binary_cache_compat": {
       "enabled": true,
       "bucket": null,

@@ -4,6 +4,7 @@
 //! [`rio_common::config::load`]. See `rio-common/src/config.rs` for the
 //! two-struct (Config + CliArgs) split rationale.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -42,27 +43,150 @@ pub enum ChunkBackendKind {
     /// (env vars, instance profile, etc) — NOT in this config. We're
     /// not putting secrets in a TOML file.
     S3 { bucket: String, prefix: String },
+    // r[impl infra.express.cache-tier]
     /// Two-tier: per-AZ S3 Express read-through cache over authoritative
     /// S3 standard. `express_bucket = None` (or unset) degrades to the
     /// plain `S3` shape — replicas in AZs without Express still
-    /// function. The Express bucket is per-AZ; helm wires the right one
-    /// via the node's `topology.kubernetes.io/zone` label (P0554).
-    /// See ADR-023 (tiered chunk backend).
+    /// function. The Express bucket is per-AZ: either set explicitly
+    /// (`express_bucket` — single-AZ / zone-pinned deployments, VM
+    /// tests) or selected per pod at startup from
+    /// `express_bucket_by_zone` keyed by this pod's zone (P0554, see
+    /// [`Config::resolve_express_bucket`]). See ADR-023 (tiered chunk
+    /// backend).
     Tiered {
         /// Authoritative S3 standard bucket.
         bucket: String,
         /// Key prefix shared by both tiers.
         prefix: String,
         /// Per-AZ S3 Express directory bucket (`*--x-s3` suffix).
-        /// `None` = no cache tier in this AZ.
+        /// `None` = no cache tier in this AZ. Wins over
+        /// `express_bucket_by_zone` when both are set.
         #[serde(default)]
         express_bucket: Option<String>,
+        /// Per-AZ Express bucket map keyed by zone NAME (the value of
+        /// the `topology.kubernetes.io/zone` label, e.g. `us-east-2a`),
+        /// for per-pod selection when `express_bucket` is unset: at
+        /// startup [`Config::resolve_express_bucket`] looks up
+        /// [`Config::node_zone`] here and the matching bucket becomes
+        /// this replica's local cache tier. Populated by helm/xtask
+        /// from the `express_bucket_by_zone` terraform output. TOML:
+        /// a `[chunk_backend.express_bucket_by_zone]` table; env: ONE
+        /// JSON-object string —
+        /// `RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE='{"us-east-2a":"…--x-s3"}'`
+        /// (the `__`-nested env convention has no per-entry syntax for
+        /// maps, so the whole map travels as a single value). Empty
+        /// (default) = no per-pod selection.
+        #[serde(default, deserialize_with = "bucket_by_zone_from_map_or_json")]
+        express_bucket_by_zone: BTreeMap<String, String>,
         /// Express cache-tier eviction sweep tuning (P0585). Only
         /// consulted when `express_bucket` is set. TOML
         /// `[chunk_backend.express]`, env `RIO_CHUNK_BACKEND__EXPRESS__*`.
         #[serde(default)]
         express: ExpressConfig,
     },
+}
+
+/// Deserialize `express_bucket_by_zone` from either a real map (TOML
+/// table, compiled-defaults layer) or a single JSON-object string (the
+/// env layer). The layered loader's `RIO_*`/`__` env convention has no
+/// syntax for individual map entries, so helm renders the whole map as
+/// one JSON value
+/// (`RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE='{"us-east-2a":"…"}'`);
+/// TOML keeps the natural table form. An empty/whitespace string is an
+/// empty map (helm omits the var instead, but a templating layer
+/// rendering `""` must not fail config load).
+fn bucket_by_zone_from_map_or_json<'de, D>(de: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MapOrJsonString {
+        Map(BTreeMap<String, String>),
+        Json(String),
+    }
+
+    match MapOrJsonString::deserialize(de)? {
+        MapOrJsonString::Map(m) => Ok(m),
+        MapOrJsonString::Json(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            serde_json::from_str(s).map_err(|e| {
+                D::Error::custom(format!(
+                    "express_bucket_by_zone: expected a JSON object of \
+                     zone→bucket pairs when given as a string \
+                     (RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE): {e}"
+                ))
+            })
+        }
+    }
+}
+
+/// Outcome of per-pod Express bucket selection — see
+/// [`select_express_bucket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressSelection {
+    /// `express_bucket` was set explicitly; the zone map was not
+    /// consulted.
+    Explicit(String),
+    /// Selected from `express_bucket_by_zone` by this pod's zone.
+    Selected { zone: String, bucket: String },
+    /// No local cache tier for this replica. `reason` names exactly
+    /// which prerequisite was missing.
+    Disabled { reason: String },
+}
+
+// r[impl infra.express.cache-tier]
+/// Per-pod Express bucket selection (P0554). Pure so the decision
+/// table is unit-testable; [`Config::resolve_express_bucket`] applies
+/// it to the loaded config and logs the outcome.
+///
+/// Precedence: a non-empty explicit `express_bucket` always wins
+/// (single-AZ / zone-pinned deployments, VM tests). Otherwise the
+/// bucket is `express_bucket_by_zone[node_zone]`; any missing piece
+/// (empty map, unknown zone, zone not in the map) selects nothing and
+/// the replica runs with `local = None` — direct S3-standard reads,
+/// degraded but never down, and never a different AZ's bucket.
+pub fn select_express_bucket(
+    express_bucket: Option<&str>,
+    by_zone: &BTreeMap<String, String>,
+    node_zone: Option<&str>,
+) -> ExpressSelection {
+    // Whitespace-only explicit bucket counts as unset so a templating
+    // layer rendering "" can't mask the zone map.
+    if let Some(b) = express_bucket.filter(|b| !b.trim().is_empty()) {
+        return ExpressSelection::Explicit(b.to_string());
+    }
+    if by_zone.is_empty() {
+        return ExpressSelection::Disabled {
+            reason: "express_bucket unset and express_bucket_by_zone is empty".into(),
+        };
+    }
+    let Some(zone) = node_zone.map(str::trim).filter(|z| !z.is_empty()) else {
+        return ExpressSelection::Disabled {
+            reason: "express_bucket_by_zone is set but the pod zone is unknown \
+                     (RIO_NODE_ZONE unset or empty — is the topology.kubernetes.io/zone \
+                     pod label present? It requires the PodTopologyLabelsAdmission \
+                     plugin, beta in Kubernetes 1.35)"
+                .into(),
+        };
+    };
+    match by_zone.get(zone) {
+        Some(bucket) => ExpressSelection::Selected {
+            zone: zone.to_string(),
+            bucket: bucket.clone(),
+        },
+        None => ExpressSelection::Disabled {
+            reason: format!(
+                "zone {zone:?} has no entry in express_bucket_by_zone (mapped zones: {})",
+                by_zone.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        },
+    }
 }
 
 /// S3 Express eviction-sweep tuning (design overview §9 / ADR-023): the
@@ -249,6 +373,19 @@ pub struct Config {
     /// `validate()` rejects `None` at startup with the list of valid
     /// kinds. See [`ChunkBackendKind`] for TOML syntax.
     pub chunk_backend: Option<ChunkBackendKind>,
+    /// Availability-zone NAME this replica's pod landed in (the value
+    /// of the `topology.kubernetes.io/zone` label, e.g. `us-east-2a`).
+    /// Consumed only by per-pod Express bucket selection for the
+    /// `tiered` chunk backend ([`Config::resolve_express_bucket`]).
+    /// In Kubernetes, helm renders this from the POD's own
+    /// `topology.kubernetes.io/zone` label via the downward API —
+    /// KEP-4742's `PodTopologyLabelsAdmission` plugin (beta in
+    /// Kubernetes 1.35) copies the label from the node onto the pod at
+    /// binding, so no IMDS call and no `nodes/get` RBAC is needed.
+    /// Unset or empty (label absent — admission plugin disabled) means
+    /// "zone unknown": no bucket is selected and the tiered backend
+    /// runs with `local = None`. Set via `RIO_NODE_ZONE`.
+    pub node_zone: Option<String>,
     /// Stock-Nix binary-cache compatibility layer (ADR-022 §10):
     /// also write `.narinfo` + `nar/*.nar.zst` objects to S3-standard
     /// so plain `nix` clients can substitute from the bucket without
@@ -372,6 +509,9 @@ impl Default for Config {
             // validate() with a clear error instead of silently picking
             // a backend.
             chunk_backend: None,
+            // Zone unknown unless the deployment provides it (helm
+            // downward-API env). Outside K8s there is nothing to read.
+            node_zone: None,
             binary_cache_compat: BinaryCacheCompat::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
             // — the constant is crate-private so duplicated here,
@@ -504,7 +644,26 @@ impl rio_common::config::ValidateConfig for Config {
         // operator only notices when the bucket blows past its budget.
         // Reject at boot. Only reachable on the tiered variant (the only
         // place the sweep config exists).
-        if let Some(ChunkBackendKind::Tiered { express, .. }) = &self.chunk_backend {
+        if let Some(ChunkBackendKind::Tiered {
+            express,
+            express_bucket_by_zone,
+            ..
+        }) = &self.chunk_backend
+        {
+            // Per-pod selection map: an empty zone key can never match a
+            // real zone label, and an empty bucket value would (when this
+            // pod's zone selects it) build an S3 client against a bucket
+            // literally named "" — both are templating-layer accidents
+            // (helm/xtask render real names or omit the entry). Reject at
+            // boot, not at the first chunk read in that one AZ.
+            anyhow::ensure!(
+                express_bucket_by_zone
+                    .iter()
+                    .all(|(zone, bucket)| !zone.trim().is_empty() && !bucket.trim().is_empty()),
+                "chunk_backend.express_bucket_by_zone must not contain empty zone keys or \
+                 empty bucket names; fix the map passed via \
+                 RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE (or drop the entry)"
+            );
             anyhow::ensure!(
                 express.target_bytes >= 1,
                 "chunk_backend.express.target_bytes must be >= 1; \
@@ -552,6 +711,56 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 rio_common::impl_has_common_config!(Config);
+
+impl Config {
+    /// Apply per-pod Express bucket selection (P0554) to the loaded
+    /// config, in place. Call once at startup, after config load /
+    /// validation and BEFORE [`init_chunk_backend`] and the
+    /// express-sweep spawn — both read the resolved `express_bucket`.
+    ///
+    /// Only the `tiered` backend is affected; other kinds are a no-op.
+    /// Exactly one log line states the outcome, and when no bucket is
+    /// selected it names the missing piece (empty map / unknown zone /
+    /// unmapped zone) so an operator can tell from the startup log why
+    /// a replica runs without its cache tier.
+    pub fn resolve_express_bucket(&mut self) {
+        let node_zone = self.node_zone.as_deref();
+        let Some(ChunkBackendKind::Tiered {
+            express_bucket,
+            express_bucket_by_zone,
+            ..
+        }) = &mut self.chunk_backend
+        else {
+            return;
+        };
+        match select_express_bucket(express_bucket.as_deref(), express_bucket_by_zone, node_zone) {
+            ExpressSelection::Explicit(bucket) => {
+                info!(
+                    %bucket,
+                    "express cache tier: using explicitly configured express_bucket"
+                );
+            }
+            ExpressSelection::Selected { zone, bucket } => {
+                info!(
+                    %zone,
+                    %bucket,
+                    "express cache tier: selected this pod's bucket from express_bucket_by_zone"
+                );
+                *express_bucket = Some(bucket);
+            }
+            ExpressSelection::Disabled { reason } => {
+                info!(
+                    %reason,
+                    "express cache tier disabled for this replica (local=None, direct \
+                     S3-standard reads)"
+                );
+                // Normalize a whitespace-only explicit value to None so
+                // init_chunk_backend never builds a client for bucket "".
+                *express_bucket = None;
+            }
+        }
+    }
+}
 
 /// Construct the chunk backend + ONE shared `ChunkCache`.
 ///
@@ -609,6 +818,10 @@ pub async fn init_chunk_backend(
             bucket,
             prefix,
             express_bucket,
+            // Already folded into `express_bucket` by
+            // `Config::resolve_express_bucket` (main.rs runs it before
+            // this) — the raw map is not consulted here.
+            express_bucket_by_zone: _,
             // Sweep tuning is consumed by `backend::express_sweep` (spawned
             // from main.rs), not by the read/write backend built here.
             express: _,
@@ -658,6 +871,10 @@ mod tests {
         assert!(d.database_url.is_empty());
         // Chunk backend is required — no default. validate() rejects None.
         assert!(d.chunk_backend.is_none());
+        // Zone unknown unless the deployment provides RIO_NODE_ZONE
+        // (helm downward-API pod label). None → no per-pod Express
+        // bucket selection.
+        assert!(d.node_zone.is_none());
         // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
         // constant changes, update this — the test catches drift.
         assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
@@ -963,6 +1180,7 @@ mod tests {
                 bucket,
                 prefix,
                 express_bucket,
+                express_bucket_by_zone,
                 express,
             }) => {
                 assert_eq!(bucket, "rio-chunks");
@@ -971,6 +1189,9 @@ mod tests {
                     express_bucket.as_deref(),
                     Some("rio-chunk-cache--use1-az4--x-s3")
                 );
+                // No [chunk_backend.express_bucket_by_zone] table →
+                // empty map (no per-pod selection).
+                assert!(express_bucket_by_zone.is_empty());
                 // No [chunk_backend.express] table → compiled defaults
                 // (8 TiB target, 1.10/0.90 watermarks, hourly sweep).
                 assert_eq!(express, ExpressConfig::default());
@@ -1033,6 +1254,7 @@ mod tests {
                 bucket: "rio-chunks".into(),
                 prefix: String::new(),
                 express_bucket: Some("rio-chunk-cache--use2-az1--x-s3".into()),
+                express_bucket_by_zone: BTreeMap::new(),
                 express: ExpressConfig {
                     evict_high_watermark: 0.8,
                     evict_low_watermark: 1.2,
@@ -1052,6 +1274,7 @@ mod tests {
                     bucket: "rio-chunks".into(),
                     prefix: String::new(),
                     express_bucket: None,
+                    express_bucket_by_zone: BTreeMap::new(),
                     express: ExpressConfig {
                         evict_high_watermark: high,
                         evict_low_watermark: low,
@@ -1071,6 +1294,51 @@ mod tests {
                 bucket: "rio-chunks".into(),
                 prefix: String::new(),
                 express_bucket: Some("rio-chunk-cache--use2-az1--x-s3".into()),
+                express_bucket_by_zone: BTreeMap::new(),
+                express: ExpressConfig::default(),
+            }),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    /// Empty zone keys / empty bucket values in the per-pod selection
+    /// map are templating accidents that would either never match or
+    /// build an S3 client against a bucket named "" — rejected at boot.
+    #[test]
+    fn validate_rejects_empty_zone_map_entries() {
+        for (zone, bucket) in [
+            ("", "rio-build-chunk-cache--use2-az1--x-s3"),
+            ("us-east-2a", " "),
+        ] {
+            let cfg = Config {
+                database_url: "postgres://x".into(),
+                chunk_backend: Some(ChunkBackendKind::Tiered {
+                    bucket: "rio-chunks".into(),
+                    prefix: String::new(),
+                    express_bucket: None,
+                    express_bucket_by_zone: BTreeMap::from([(
+                        zone.to_string(),
+                        bucket.to_string(),
+                    )]),
+                    express: ExpressConfig::default(),
+                }),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("express_bucket_by_zone"), "got: {err}");
+        }
+        // A well-formed map passes.
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Tiered {
+                bucket: "rio-chunks".into(),
+                prefix: String::new(),
+                express_bucket: None,
+                express_bucket_by_zone: BTreeMap::from([(
+                    "us-east-2a".to_string(),
+                    "rio-build-chunk-cache--use2-az1--x-s3".to_string(),
+                )]),
                 express: ExpressConfig::default(),
             }),
             ..Default::default()
@@ -1253,6 +1521,261 @@ mod tests {
         });
     }
 
+    /// `[chunk_backend.express_bucket_by_zone]` as a real TOML table:
+    /// the natural form for file-based config. Keys are zone NAMES
+    /// (`topology.kubernetes.io/zone` values), values are directory
+    /// bucket names.
+    #[test]
+    fn chunk_backend_kind_toml_tiered_zone_map() {
+        let cfg = parse_toml(
+            r#"
+            node_zone = "us-east-2a"
+
+            [chunk_backend]
+            kind = "tiered"
+            bucket = "rio-chunks"
+            prefix = ""
+
+            [chunk_backend.express_bucket_by_zone]
+            "us-east-2a" = "rio-build-chunk-cache--use2-az1--x-s3"
+            "us-east-2b" = "rio-build-chunk-cache--use2-az2--x-s3"
+            "#,
+        );
+        assert_eq!(cfg.node_zone.as_deref(), Some("us-east-2a"));
+        match cfg.chunk_backend {
+            Some(ChunkBackendKind::Tiered {
+                express_bucket,
+                express_bucket_by_zone,
+                ..
+            }) => {
+                assert!(express_bucket.is_none());
+                assert_eq!(express_bucket_by_zone.len(), 2);
+                assert_eq!(
+                    express_bucket_by_zone.get("us-east-2a").map(String::as_str),
+                    Some("rio-build-chunk-cache--use2-az1--x-s3")
+                );
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+    }
+
+    /// P0554: the env layer carries the whole map as ONE JSON-object
+    /// string (helm renders `RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE`
+    /// from the values map with `toJson`) and the pod's zone as
+    /// `RIO_NODE_ZONE` (downward-API pod label). Both must round-trip
+    /// through the real loader; the JSON string must come back as a
+    /// typed map.
+    #[test]
+    fn chunk_backend_kind_env_tiered_zone_map_json() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            jail.set_env(
+                "RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE",
+                r#"{"us-east-2a":"rio-build-chunk-cache--use2-az1--x-s3","us-east-2c":"rio-build-chunk-cache--use2-az3--x-s3"}"#,
+            );
+            jail.set_env("RIO_NODE_ZONE", "us-east-2c");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert_eq!(cfg.node_zone.as_deref(), Some("us-east-2c"));
+            match cfg.chunk_backend {
+                Some(ChunkBackendKind::Tiered {
+                    express_bucket,
+                    express_bucket_by_zone,
+                    ..
+                }) => {
+                    assert!(express_bucket.is_none());
+                    assert_eq!(express_bucket_by_zone.len(), 2);
+                    assert_eq!(
+                        express_bucket_by_zone.get("us-east-2c").map(String::as_str),
+                        Some("rio-build-chunk-cache--use2-az3--x-s3")
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// Malformed JSON in the env-var form must fail config load with an
+    /// error that names the field — not silently come back as an empty
+    /// map (which would quietly disable the cache tier fleet-wide).
+    #[test]
+    fn chunk_backend_kind_env_tiered_zone_map_bad_json_rejected() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            jail.set_env(
+                "RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE",
+                "us-east-2a=not-json",
+            );
+            let err = rio_common::config::load::<Config, _>("store", CliArgs::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("express_bucket_by_zone"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    /// Selection decision table (P0554). Pure function — no env, no
+    /// loader. Explicit bucket wins; otherwise zone+map must both be
+    /// present and matching; every other combination selects nothing
+    /// and the reason names the missing piece.
+    #[test]
+    fn express_selection_decision_table() {
+        let map = BTreeMap::from([
+            (
+                "us-east-2a".to_string(),
+                "rio-build-chunk-cache--use2-az1--x-s3".to_string(),
+            ),
+            (
+                "us-east-2b".to_string(),
+                "rio-build-chunk-cache--use2-az2--x-s3".to_string(),
+            ),
+        ]);
+        let empty = BTreeMap::new();
+
+        // Explicit bucket wins regardless of map/zone.
+        assert_eq!(
+            select_express_bucket(Some("explicit--use2-az1--x-s3"), &map, Some("us-east-2a")),
+            ExpressSelection::Explicit("explicit--use2-az1--x-s3".into())
+        );
+        // Whitespace-only explicit value does NOT mask the map.
+        assert_eq!(
+            select_express_bucket(Some("  "), &map, Some("us-east-2a")),
+            ExpressSelection::Selected {
+                zone: "us-east-2a".into(),
+                bucket: "rio-build-chunk-cache--use2-az1--x-s3".into(),
+            }
+        );
+        // Zone present + mapped → that zone's bucket (and only that one).
+        assert_eq!(
+            select_express_bucket(None, &map, Some("us-east-2b")),
+            ExpressSelection::Selected {
+                zone: "us-east-2b".into(),
+                bucket: "rio-build-chunk-cache--use2-az2--x-s3".into(),
+            }
+        );
+        // Empty map → disabled, reason names the map.
+        match select_express_bucket(None, &empty, Some("us-east-2a")) {
+            ExpressSelection::Disabled { reason } => {
+                assert!(reason.contains("express_bucket_by_zone"), "got: {reason}");
+            }
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+        // Zone unknown (env unset or label missing → empty string) →
+        // disabled, reason names RIO_NODE_ZONE / the pod label.
+        for zone in [None, Some(""), Some("   ")] {
+            match select_express_bucket(None, &map, zone) {
+                ExpressSelection::Disabled { reason } => {
+                    assert!(reason.contains("RIO_NODE_ZONE"), "got: {reason}");
+                    assert!(
+                        reason.contains("topology.kubernetes.io/zone"),
+                        "got: {reason}"
+                    );
+                }
+                other => panic!("expected Disabled, got {other:?}"),
+            }
+        }
+        // Zone present but unmapped (AZ without Express) → disabled,
+        // reason names the zone and the mapped zones.
+        match select_express_bucket(None, &map, Some("us-east-2c")) {
+            ExpressSelection::Disabled { reason } => {
+                assert!(reason.contains("us-east-2c"), "got: {reason}");
+                assert!(reason.contains("us-east-2a"), "got: {reason}");
+            }
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+    }
+
+    /// `Config::resolve_express_bucket` folds the selection into
+    /// `express_bucket` in place (main.rs runs it before the backend is
+    /// built and before the sweeper spawn — both read `express_bucket`).
+    #[test]
+    fn resolve_express_bucket_mutates_tiered_config() {
+        let map = BTreeMap::from([(
+            "us-east-2a".to_string(),
+            "rio-build-chunk-cache--use2-az1--x-s3".to_string(),
+        )]);
+
+        // Selected: zone matches the map → express_bucket populated.
+        let mut cfg = Config {
+            database_url: "postgres://x".into(),
+            node_zone: Some("us-east-2a".into()),
+            chunk_backend: Some(ChunkBackendKind::Tiered {
+                bucket: "rio-chunks".into(),
+                prefix: String::new(),
+                express_bucket: None,
+                express_bucket_by_zone: map.clone(),
+                express: ExpressConfig::default(),
+            }),
+            ..Default::default()
+        };
+        cfg.resolve_express_bucket();
+        match &cfg.chunk_backend {
+            Some(ChunkBackendKind::Tiered { express_bucket, .. }) => {
+                assert_eq!(
+                    express_bucket.as_deref(),
+                    Some("rio-build-chunk-cache--use2-az1--x-s3")
+                );
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+
+        // Unmapped zone → stays None (local=None, degraded not down).
+        let mut cfg = Config {
+            database_url: "postgres://x".into(),
+            node_zone: Some("us-east-2c".into()),
+            chunk_backend: Some(ChunkBackendKind::Tiered {
+                bucket: "rio-chunks".into(),
+                prefix: String::new(),
+                express_bucket: None,
+                express_bucket_by_zone: map.clone(),
+                express: ExpressConfig::default(),
+            }),
+            ..Default::default()
+        };
+        cfg.resolve_express_bucket();
+        match &cfg.chunk_backend {
+            Some(ChunkBackendKind::Tiered { express_bucket, .. }) => {
+                assert!(express_bucket.is_none());
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+
+        // Explicit bucket is left untouched (wins over the map).
+        let mut cfg = Config {
+            database_url: "postgres://x".into(),
+            node_zone: Some("us-east-2a".into()),
+            chunk_backend: Some(ChunkBackendKind::Tiered {
+                bucket: "rio-chunks".into(),
+                prefix: String::new(),
+                express_bucket: Some("explicit--use2-az9--x-s3".into()),
+                express_bucket_by_zone: map,
+                express: ExpressConfig::default(),
+            }),
+            ..Default::default()
+        };
+        cfg.resolve_express_bucket();
+        match &cfg.chunk_backend {
+            Some(ChunkBackendKind::Tiered { express_bucket, .. }) => {
+                assert_eq!(express_bucket.as_deref(), Some("explicit--use2-az9--x-s3"));
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+
+        // Non-tiered kinds are a no-op (no panic, no mutation).
+        let mut cfg = Config {
+            database_url: "postgres://x".into(),
+            node_zone: Some("us-east-2a".into()),
+            chunk_backend: Some(ChunkBackendKind::Memory),
+            ..Default::default()
+        };
+        cfg.resolve_express_bucket();
+        assert!(matches!(cfg.chunk_backend, Some(ChunkBackendKind::Memory)));
+    }
+
     /// Full `[binary_cache_compat]` table through the config-crate
     /// Value layer (same loader main.rs uses). The lowercase enum
     /// strings are load-bearing: `compression = "zstd"|"xz"|"none"`
@@ -1395,6 +1918,7 @@ mod tests {
         chunk_cache_capacity_bytes = 123456
         chunk_upload_max_concurrent = 64
         s3_max_attempts = 5
+        node_zone = "us-east-2a"
 
         [chunk_backend]
         kind = "filesystem"
@@ -1412,6 +1936,11 @@ mod tests {
             assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
             assert_eq!(cfg.chunk_upload_max_concurrent, 64);
             assert_eq!(cfg.s3_max_attempts, 5);
+            assert_eq!(
+                cfg.node_zone.as_deref(),
+                Some("us-east-2a"),
+                "node_zone must thread through the config layers"
+            );
             assert!(
                 matches!(cfg.chunk_backend, Some(ChunkBackendKind::Filesystem { .. })),
                 "[chunk_backend] table must thread through the config layers"
@@ -1433,6 +1962,7 @@ mod tests {
 
     rio_test_support::jail_defaults!("store", r#"listen_addr = "0.0.0.0:9002""#, |cfg: Config| {
         assert!(cfg.chunk_backend.is_none());
+        assert!(cfg.node_zone.is_none());
         assert!(cfg.nar_buffer_budget_bytes.is_none());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         // ADR-022 binary-cache compat: absent section → default ON,

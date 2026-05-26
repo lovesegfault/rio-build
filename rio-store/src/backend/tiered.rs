@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use super::{ChunkBackend, S3ChunkBackend};
 
+// r[impl infra.express.cache-tier]
 pub struct TieredChunkBackend {
     /// Per-AZ S3 Express directory bucket. `None` = pass-through.
     local: Option<S3ChunkBackend>,
