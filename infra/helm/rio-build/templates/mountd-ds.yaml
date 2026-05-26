@@ -30,6 +30,12 @@ spec:
       # close). Roll one node at a time so an upgrade never takes more
       # than one node's worth of builds down at once.
       maxUnavailable: 1
+  # There is no readiness probe (nothing routes Service traffic here;
+  # builders find the socket by host path), so this is the only thing
+  # that stops a crash-looping image from rolling across the fleet: a
+  # replacement pod must stay Running this long before the DS controller
+  # moves on to the next node. Liveness restarts do NOT pause a rollout.
+  minReadySeconds: 30
   template:
     metadata:
       labels:

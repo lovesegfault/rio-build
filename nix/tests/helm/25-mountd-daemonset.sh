@@ -92,6 +92,66 @@ if grep -qx "/run" <<<"$paths"; then
   exit 1
 fi
 
+# Builder nodes carry rio.build/builder=true:NoSchedule, fetcher nodes
+# rio.build/fetcher=true:NoSchedule, metal nodes rio.build/kvm. Some
+# rendered toleration must cover each of them (today the blanket
+# `operator: Exists` does — this guards against someone narrowing it);
+# a node class without a matching toleration gets no mountd and every
+# build scheduled onto it fails at UDS connect. Capture-then-test, not
+# a `[...] | length` collect: yq's collect emits a per-document line
+# even for documents the select filtered out.
+for key in rio.build/builder rio.build/fetcher rio.build/kvm; do
+  covered=$(yq "$ds | .spec.template.spec.tolerations[] | select((.key == \"$key\") or (.operator == \"Exists\" and (.key == null or .key == \"$key\")))" "$out")
+  test -n "$covered" || {
+    echo "FAIL: no rio-mountd toleration covers the $key taint — those nodes get no mountd and every build on them fails at UDS connect" >&2
+    exit 1
+  }
+done
+
+# A root + CAP_SYS_ADMIN pod must not also carry an API token it never
+# uses — that would turn a mountd compromise into a k8s API foothold.
+test "$(yq "$ds | .spec.template.spec.automountServiceAccountToken" "$out")" = "false" || {
+  echo "FAIL: rio-mountd automountServiceAccountToken != false — privileged pod gets an unused API token" >&2
+  exit 1
+}
+
+# No readiness probe exists, so minReadySeconds is what stops a
+# crash-looping image from rolling across the whole fleet one node at a
+# time (liveness restarts do not pause a rollout).
+test "$(yq "$ds | .spec.minReadySeconds" "$out")" = "30" || {
+  echo "FAIL: rio-mountd DaemonSet minReadySeconds != 30 — a crash-looping image rolls across the fleet unimpeded" >&2
+  exit 1
+}
+
+# The rio-builder image ships no shell or coreutils, so an exec probe
+# has nothing to execve — it would fail forever and (with
+# minReadySeconds) wedge the rollout after one node. Probes on this
+# container must be httpGet/tcpSocket/grpc.
+execprobes=$(yq "$ds | .spec.template.spec.containers[0] | (.livenessProbe.exec, .readinessProbe.exec, .startupProbe.exec) | select(. != null)" "$out")
+test -z "$execprobes" || {
+  echo "FAIL: rio-mountd has an exec probe — the image has no shell/coreutils to exec, the probe can never succeed: $execprobes" >&2
+  exit 1
+}
+
+# The most privileged pod in the cluster must not be the only one
+# without a network policy: Cilium default-allows unpoliced endpoints,
+# so losing the CNP means unrestricted egress (IMDS, apiserver, world)
+# from a root + CAP_SYS_ADMIN pod whose only legitimate network surface
+# is the :9095 metrics exporter. This is currently the only CI guard on
+# any CiliumNetworkPolicy in the chart — keep it until a dedicated CNP
+# fragment exists.
+cnp='select(.kind=="CiliumNetworkPolicy" and .metadata.name=="rio-mountd")'
+test "$(yq "$cnp | .spec.egressDeny[0].toEntities[0]" "$out")" = "all" || {
+  echo "FAIL: rio-mountd CiliumNetworkPolicy does not deny all egress — privileged pod with unrestricted network" >&2
+  exit 1
+}
+# Every ingress port across every rule, one per line: anything other
+# than the single 9095 metrics port is a widened ingress surface.
+test "$(yq "$cnp | .spec.ingress[].toPorts[].ports[].port" "$out")" = "9095" || {
+  echo "FAIL: rio-mountd CiliumNetworkPolicy ingress is not exactly the :9095 metrics port" >&2
+  exit 1
+}
+
 # mountd.enabled=false must drop the DaemonSet entirely.
 off=$TMPDIR/mountd-off.yaml
 helm template rio . \
