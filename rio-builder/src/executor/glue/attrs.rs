@@ -443,7 +443,10 @@ mod tests {
         assert_eq!(arr[1]["path"], json!(p_top));
         assert_eq!(arr[1]["narSize"], json!(200));
         assert_eq!(arr[1]["references"], json!([p_dep]));
-        assert!(arr[0]["narHash"].as_str().unwrap().starts_with("sha256-"));
+        // CppNix's pathInfoToJSON shape: colon/nixbase32 narHash (not
+        // SRI) and an explicit valid flag on every element.
+        assert!(arr[0]["narHash"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(arr[0]["valid"], json!(true));
         // closureSize = narSize + sum of references' closure sizes.
         assert_eq!(arr[1]["closureSize"], json!(300));
         // The original exportReferencesGraph key is preserved alongside.

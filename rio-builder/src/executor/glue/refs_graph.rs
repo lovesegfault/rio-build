@@ -248,15 +248,18 @@ impl<'a> ClosureIndex<'a> {
         Ok(out.into_bytes())
     }
 
-    /// The structured-attrs JSON form: an array of path-info objects
-    /// (path, narHash (SRI), narSize, references, closureSize) for the
-    /// closure of `targets`, sorted by path.
-    ///
-    /// Field set note: this matches the long-standing
-    /// `Store::pathInfoToJSON(..., includeImpureInfo = false,
-    /// showClosureSize = true)` shape. The differential harness compares
-    /// the rendered `.attrs.json` against the deployed Nix oracle and is
-    /// the authority if the deployed version's field set differs.
+    /// The structured-attrs JSON form: an array of path-info objects for
+    /// the closure of `targets`, sorted by path. Each element carries
+    /// exactly the fields CppNix's `Store::pathInfoToJSON(...,
+    /// includeImpureInfo = false, showClosureSize = true)` emits when
+    /// `writeStructuredAttrs` expands `exportReferencesGraph`:
+    /// `closureSize`, `narHash` (Nix colon format `sha256:<nixbase32>`,
+    /// NOT SRI), `narSize`, `path`, `references` (sorted, including any
+    /// self-reference recorded in the path's metadata), and
+    /// `"valid": true`. Verified against Nix 2.34.7 output and pinned
+    /// byte-for-byte by the `erg-structured` differential-corpus entry;
+    /// key order inside `.attrs.json` is normalized by `sort_json_keys`
+    /// in `attrs.rs` to match nlohmann's sorted maps.
     pub(crate) fn closure_info_json(&self, targets: &[String]) -> Result<Value, GlueError> {
         let closure = self.closure_of(targets)?;
         // Per-path closure SETS are memoized across the member loop:
@@ -276,10 +279,15 @@ impl<'a> ClosureIndex<'a> {
                     .expect("32-byte sha256 digest is always valid");
                 serde_json::json!({
                     "path": p,
-                    "narHash": nar_hash.to_sri(),
+                    // CppNix renders narHash in colon/nixbase32 form here
+                    // (pathInfoToJSON), not SRI.
+                    "narHash": nar_hash.to_colon(),
                     "narSize": info.nar_size,
                     "references": refs,
                     "closureSize": self.closure_size_memo(p, &mut memo),
+                    // pathInfoToJSON marks every existing path as valid;
+                    // every closure member here exists by construction.
+                    "valid": true,
                 })
             })
             .collect();
@@ -463,6 +471,38 @@ mod tests {
             .closure_info_json(&[format!("{B}/share/doc/readme")])
             .unwrap();
         assert_eq!(json, index.closure_info_json(&[B.to_string()]).unwrap());
+    }
+
+    /// Pins the closure-info element format byte-for-byte against what
+    /// Nix 2.34.7's `writeStructuredAttrs` produced for the
+    /// `erg-structured` differential-corpus entry (static busybox with a
+    /// recorded self-reference): colon/nixbase32 `narHash`, `valid: true`,
+    /// `closureSize`, and the self-reference kept in `references`.
+    #[test]
+    fn closure_info_matches_the_cppnix_oracle_element() {
+        const BUSYBOX: &str = "/nix/store/y7fhmxcdbfyslfgkclgf4263wy6bhp3j-busybox-static-x86_64-unknown-linux-musl-1.37.0";
+        // sha256 NAR hash of that path, as raw bytes (oracle rendered it
+        // as sha256:0azg5qlpqyf49b29ffdqabgrwhbn4k9blsanb8h7yizwwk52b9cc).
+        let digest: [u8; 32] = [
+            0x8c, 0xa5, 0x25, 0xca, 0xe4, 0xfc, 0x47, 0x7f, 0x20, 0x5a, 0x56, 0x69, 0xba, 0xd2,
+            0x24, 0x76, 0x41, 0x9e, 0xdf, 0x52, 0xb8, 0x39, 0x97, 0xc4, 0x4a, 0xc4, 0x79, 0x7c,
+            0x29, 0x2e, 0xef, 0x2b,
+        ];
+        let mut bb = info(BUSYBOX, 1_495_048, &[BUSYBOX]);
+        bb.nar_hash = digest;
+        let infos = vec![bb];
+        let paths = vec![BUSYBOX.to_string()];
+        let index = ClosureIndex::new(&infos, &paths);
+        let json = index.closure_info_json(&[BUSYBOX.to_string()]).unwrap();
+        let expected = serde_json::json!([{
+            "closureSize": 1_495_048u64,
+            "narHash": "sha256:0azg5qlpqyf49b29ffdqabgrwhbn4k9blsanb8h7yizwwk52b9cc",
+            "narSize": 1_495_048u64,
+            "path": BUSYBOX,
+            "references": [BUSYBOX],
+            "valid": true,
+        }]);
+        assert_eq!(json, expected);
     }
 
     /// …and anything not under the store dir at all is rejected the way
