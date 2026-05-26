@@ -894,6 +894,177 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     Ok(())
 }
 
+/// Top-down negative: an `explicitly_requested` NON-root (a client
+/// target folded inside another target's closure by the gateway's
+/// multi-target dedup) whose wanted output is NOT available must block
+/// the prune entirely — the demand set is roots ∪ flagged nodes, and
+/// the criterion must hold for every member.
+///
+/// app → lib → dep; app's output is substitutable upstream, lib's is
+/// missing and not substitutable, lib carries `explicitly_requested`.
+/// A roots-only criterion sees app available, prunes lib+dep, and the
+/// requested lib is silently never built. The fix falls through to the
+/// full merge: 3 derivations, lib gets a real verdict (Queued behind
+/// its dep) instead of vanishing.
+#[tokio::test]
+async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Only app's output is substitutable. lib/dep outputs are missing
+    // and NOT substitutable.
+    let app_out = test_store_path("tde-app-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(app_out.clone());
+
+    let mut app = make_node("tde-app");
+    app.expected_output_paths = vec![app_out.clone()];
+    let mut lib = make_node("tde-lib");
+    lib.expected_output_paths = vec![test_store_path("tde-lib-out")];
+    // The gateway folded the client's selector into the wanted set and
+    // marked the node as a named build target.
+    lib.wanted_output_names = vec!["out".into()];
+    lib.explicitly_requested = true;
+    let mut dep = make_node("tde-dep");
+    dep.expected_output_paths = vec![test_store_path("tde-dep-out")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![app, lib, dep],
+        vec![
+            make_test_edge("tde-app", "tde-lib"),
+            make_test_edge("tde-lib", "tde-dep"),
+        ],
+        false,
+    )
+    .await?;
+    // app is substitutable, so whichever path was taken it ends up in
+    // the detached-fetch lane; wait for that to settle before judging.
+    settle_substituting(&handle, &["tde-app"]).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.total_derivations, 3,
+        "an explicitly requested target with an unavailable wanted output \
+         must veto the prune — the full merge keeps all 3 derivations"
+    );
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "lib still has to be built from source, so the build cannot be done"
+    );
+    assert_eq!(
+        expect_drv(&handle, "tde-lib").await.status,
+        DerivationStatus::Queued,
+        "the requested target got a real verdict (queued behind its dep)"
+    );
+    assert_eq!(
+        expect_drv(&handle, "tde-dep").await.status,
+        DerivationStatus::Ready,
+        "lib's dependency closure survived the merge"
+    );
+
+    Ok(())
+}
+
+/// Top-down positive: when every demanded node — structural roots AND
+/// `explicitly_requested` non-roots — is available upstream, the prune
+/// fires and keeps the whole demand set, not just the roots.
+///
+/// app → lib → dep with app and lib substitutable, lib flagged: the
+/// pruned submission is {app, lib} (dep dropped, edges dropped), both
+/// are routed through the substitute lane and complete via the
+/// detached fetch, and the store saw lib's wanted path — the requested
+/// target is fetched, not fabricated.
+#[tokio::test]
+async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let app_out = test_store_path("tdk-app-out");
+    let lib_out = test_store_path("tdk-lib-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(app_out.clone());
+        subs.push(lib_out.clone());
+    }
+
+    let mut app = make_node("tdk-app");
+    app.expected_output_paths = vec![app_out.clone()];
+    let mut lib = make_node("tdk-lib");
+    lib.expected_output_paths = vec![lib_out.clone()];
+    lib.wanted_output_names = vec!["out".into()];
+    lib.explicitly_requested = true;
+    let mut dep = make_node("tdk-dep");
+    dep.expected_output_paths = vec![test_store_path("tdk-dep-out")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![app, lib, dep],
+        vec![
+            make_test_edge("tdk-app", "tdk-lib"),
+            make_test_edge("tdk-lib", "tdk-dep"),
+        ],
+        false,
+    )
+    .await?;
+    settle_substituting(&handle, &["tdk-app", "tdk-lib"]).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.total_derivations, 2,
+        "the pruned submission is the demand set: app (root) AND the \
+         explicitly requested lib; only dep is dropped"
+    );
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "both demanded nodes substituted → build completes"
+    );
+
+    // Both demanded nodes went through the substitute lane and were
+    // stamped by the post-commit topdown loop.
+    for hash in ["tdk-app", "tdk-lib"] {
+        let d = expect_drv(&handle, hash).await;
+        assert_eq!(
+            d.status,
+            DerivationStatus::Completed,
+            "{hash} should complete via the detached fetch"
+        );
+        assert!(d.topdown_pruned, "{hash} kept by the prune gets stamped");
+    }
+
+    // The store actually fetched lib's wanted path (no fabricated
+    // success for the requested target), and never touched the
+    // dropped dep.
+    let qpi = store.calls.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&lib_out),
+        "lib's wanted output must be eager-fetched; qpi_calls={qpi:?}"
+    );
+    assert!(
+        qpi.contains(&app_out),
+        "app's output must be eager-fetched; qpi_calls={qpi:?}"
+    );
+    let dep_out = test_store_path("tdk-dep-out");
+    assert!(
+        !qpi.contains(&dep_out),
+        "dep was pruned and must not be fetched; qpi_calls={qpi:?}"
+    );
+    assert!(
+        handle.debug_query_derivation("tdk-dep").await?.is_none(),
+        "dep should be pruned from the submission, not in the global DAG"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.merge.substitute-topdown+4]
 /// Top-down + deferred-fetch failure: when the prune commits and the
 /// detached `query_path_info` then fails, the build MUST fail with a

@@ -55,6 +55,13 @@ pub struct DerivationNode {
     /// (the BasicDerivation fallback, `^*` roots). See dag.proto
     /// field 18.
     pub wanted_output_names: Vec<String>,
+    /// Set by the gateway on every node the client named as a build
+    /// target in the originating request. A multi-target request can
+    /// fold one requested target inside another target's closure,
+    /// making it a non-root of the combined submission — the top-down
+    /// prune treats roots ∪ flagged nodes as the demand set so such
+    /// targets are still verified and retained. See dag.proto field 19.
+    pub explicitly_requested: bool,
     /// Opaque ATerm blob the scheduler only stores and forwards
     /// (`WorkAssignment.drv_content`); never parsed. `Vec<u8>` instead
     /// of prost's `Bytes` so this module doesn't pull in the `bytes`
@@ -90,6 +97,7 @@ impl From<proto::DerivationNode> for DerivationNode {
             is_fixed_output: n.is_fixed_output,
             expected_output_paths: n.expected_output_paths,
             wanted_output_names: n.wanted_output_names,
+            explicitly_requested: n.explicitly_requested,
             drv_content: n.drv_content.to_vec(),
             is_content_addressed: n.is_content_addressed,
             needs_resolve: n.needs_resolve,

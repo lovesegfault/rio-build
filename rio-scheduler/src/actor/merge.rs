@@ -244,20 +244,25 @@ impl DagActor {
             };
         }
 
-        // === Step 0: Top-down root substitution check ===============
+        // === Step 0: Top-down demand-set substitution check =========
         // r[impl sched.merge.substitute-topdown+4]
-        // Before merging the full DAG, check if the ROOT derivations'
-        // outputs are already available. If ALL roots are cached, the
-        // deps are transitively unnecessary — prune the submission to
-        // roots-only before merge. "Available" is judged against the
-        // wanted outputs of this submission UNIONed, for roots already
-        // in the DAG, with the live effective wanted set of the
-        // pre-existing node — a conservative superset of (at least as
-        // demanding as) what post-merge classification will use for
-        // the shared root — and the submission's own selector must
-        // itself resolve to a declared output (see check_roots_topdown
-        // for both criteria), so the prune cannot be more permissive
-        // than that classification.
+        // Before merging the full DAG, check if the DEMANDED
+        // derivations' outputs are already available. The demand set is
+        // the structural roots ∪ every node the gateway marked
+        // explicitly_requested (a client-named target folded inside
+        // another target's closure, hence not a structural root of the
+        // combined submission). If ALL demanded nodes are cached, the
+        // remaining deps are transitively unnecessary — prune the
+        // submission to the demand set before merge. "Available" is
+        // judged against the wanted outputs of this submission UNIONed,
+        // for demanded nodes already in the DAG, with the live
+        // effective wanted set of the pre-existing node — a
+        // conservative superset of (at least as demanding as) what
+        // post-merge classification will use for the shared node — and
+        // the submission's own selector must itself resolve to a
+        // declared output (see check_roots_topdown for both criteria),
+        // so the prune cannot be more permissive than that
+        // classification.
         //
         // This short-circuits the common case `rsb -L p#hello` where
         // hello is in cache.nixos.org: instead of eager-fetching ~700
@@ -266,25 +271,26 @@ impl DagActor {
         // build that needs them triggers its own cache-check.
         //
         // Falls through to the full DAG on any uncertainty (store
-        // unreachable, partial root cache, CA roots). The fetch
-        // itself is deferred (`r[sched.substitute.detached+5]`); on
-        // fetch failure the build fails fast (`r[sched.merge.
-        // substitute-topdown]` — resubmit re-probes). The existing
-        // check_cached_outputs at step 4 handles fall-through
-        // correctly — this is a fast-path, not a replacement.
+        // unreachable, partial demand-set cache, CA demanded nodes).
+        // The fetch itself is deferred
+        // (`r[sched.substitute.detached+5]`); on fetch failure the
+        // build fails fast (`r[sched.merge.substitute-topdown]` —
+        // resubmit re-probes). The existing check_cached_outputs at
+        // step 4 handles fall-through correctly — this is a fast-path,
+        // not a replacement.
         let (nodes, edges, topdown_fired) = match self
             .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
             .await
         {
-            Some(roots_only) => {
+            Some(demanded) => {
                 debug!(
                     original_nodes = nodes.len(),
-                    root_nodes = roots_only.len(),
-                    pruned = nodes.len() - roots_only.len(),
-                    "top-down: all roots substitutable; pruning deps from submission"
+                    kept_nodes = demanded.len(),
+                    pruned = nodes.len() - demanded.len(),
+                    "top-down: all demanded nodes substitutable; pruning deps from submission"
                 );
                 metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
-                (roots_only, Vec::new(), true)
+                (demanded, Vec::new(), true)
             }
             None => (nodes, edges, false),
         };
@@ -419,21 +425,21 @@ impl DagActor {
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         // r[impl sched.merge.substitute-topdown+4]
-        // Stamp topdown_pruned on roots only now that the merge is
-        // committed (steps 4–5 can no longer fail). The stamp is a
-        // cross-build-visible mutation of possibly PRE-EXISTING nodes
-        // that rollback_merge does not revert (it is not tracked in
-        // MergeResult, and the only clearing site requires the node to
-        // have children) — stamping before the fallible cache-check /
-        // persist steps would leak a rejected build's prune verdict
-        // onto a shared childless root, and a later routine
-        // SubstituteComplete{ok=false} for that root would take the
-        // fail-fast arm and terminally fail innocent builds. Nothing
-        // reads the flag between dag.merge and this point: its only
-        // consumer is handle_substitute_complete, and detached fetches
-        // are spawned in reconcile_merged_state, after this returns.
-        // Idempotent if a root pre-existed in the DAG.
-        // handle_substitute_complete reads this on
+        // Stamp topdown_pruned on the kept (demanded) nodes only now
+        // that the merge is committed (steps 4–5 can no longer fail).
+        // The stamp is a cross-build-visible mutation of possibly
+        // PRE-EXISTING nodes that rollback_merge does not revert (it is
+        // not tracked in MergeResult, and the only clearing site
+        // requires the node to have children) — stamping before the
+        // fallible cache-check / persist steps would leak a rejected
+        // build's prune verdict onto a shared childless node, and a
+        // later routine SubstituteComplete{ok=false} for that node
+        // would take the fail-fast arm and terminally fail innocent
+        // builds. Nothing reads the flag between dag.merge and this
+        // point: its only consumer is handle_substitute_complete, and
+        // detached fetches are spawned in reconcile_merged_state, after
+        // this returns. Idempotent if a kept node pre-existed in the
+        // DAG. handle_substitute_complete reads this on
         // SubstituteComplete{ok=false} and fails the build instead of
         // dispatching (deps were dropped — worker would ENOENT).
         if topdown_fired {
@@ -2236,47 +2242,56 @@ impl DagActor {
     }
 
     // r[impl sched.merge.substitute-topdown+4]
-    /// Top-down root substitution pre-check (step 0 of `handle_merge_dag`).
+    /// Top-down demand-set substitution pre-check (step 0 of
+    /// `handle_merge_dag`).
     ///
-    /// Returns `Some(roots)` if ALL root derivations' IA outputs are
-    /// available (present in store or upstream-substitutable). The
-    /// caller prunes the submission to roots-only, dropping the dep
-    /// subgraph before merge, and stamps `topdown_pruned=true` on the
-    /// root nodes. The actual fetch is deferred (`r[sched.substitute.
-    /// detached]`) and runs AFTER the prune commits; on
-    /// `SubstituteComplete{ok=false}` for a `topdown_pruned` root,
-    /// `handle_substitute_complete` fails every interested build
-    /// (resubmit re-probes or full-merges) — building is invalid
-    /// because the root's `inputDrvs` were dropped.
+    /// The demand set is the submission's structural roots (no parent
+    /// edge IN THIS SUBMISSION — parents from other builds don't change
+    /// what THIS build needs) ∪ every node the gateway marked
+    /// `explicitly_requested` (a client-named target that another
+    /// requested target's closure swallowed, so it is NOT a structural
+    /// root of the combined submission).
+    ///
+    /// Returns `Some(demand set)` if ALL demanded derivations' IA
+    /// outputs are available (present in store or
+    /// upstream-substitutable). The caller prunes the submission to the
+    /// demand set, dropping every other node and all edges before
+    /// merge, and stamps `topdown_pruned=true` on the kept nodes —
+    /// flagged non-roots are retained as standalone nodes (like
+    /// multiple roots today) so they get classified, routed to
+    /// substitution, and reported like any other demanded node. The
+    /// actual fetch is deferred (`r[sched.substitute.detached]`) and
+    /// runs AFTER the prune commits; on `SubstituteComplete{ok=false}`
+    /// for a `topdown_pruned` node, `handle_substitute_complete` fails
+    /// every interested build (resubmit re-probes or full-merges) —
+    /// building is invalid because the node's `inputDrvs` were dropped.
     ///
     /// Returns `None` to fall through to the full bottom-up
-    /// `check_cached_outputs`. Reasons: no store client, any root
-    /// is floating-CA (no expected path), any wanted root output
-    /// missing and not substitutable, a root whose submission
-    /// selector resolves to no declared output, store error.
+    /// `check_cached_outputs`. Reasons: no store client, any demanded
+    /// node is floating-CA (no expected path), any wanted output of a
+    /// demanded node missing and not substitutable, a demanded node
+    /// whose submission selector resolves to no declared output, store
+    /// error.
     ///
-    /// Roots are nodes with no parent edge IN THIS SUBMISSION
-    /// (parents from other builds don't change what THIS build
-    /// needs). The availability criterion, however, is NOT
-    /// submission-local for a root that already exists in the DAG:
-    /// the submission's wanted set is unioned with the pre-existing
-    /// node's LIVE effective wanted set ([`effective_wanted`] over
-    /// live interested builds, stored-union fallback) — at least as
-    /// demanding as the set post-merge classification
-    /// (`check_cached_outputs`, the dispatch-time probes) evaluates
-    /// the shared node against; with the stored-union fallback it can
-    /// be strictly wider than the post-merge live set, never
-    /// narrower. If another live build wants an output that is
-    /// missing and not substitutable, that classification keeps the
-    /// root on the from-source path; pruning THIS submission's dep
-    /// closure first would leave this build's progress hostage to the
-    /// other build's dep interest staying alive (its cancel/fail
-    /// sweep takes the sole-interest deps down and this build hangs
-    /// on a Queued root). The submission's OWN wanted set must also
-    /// resolve to a verifiable path — that guard covers the fallback
-    /// corner where no prior build is live and post-merge
-    /// classification degrades to exactly this build's (possibly
-    /// bogus) selector. Roots not yet in the DAG keep the
+    /// The availability criterion is NOT submission-local for a
+    /// demanded node that already exists in the DAG: the submission's
+    /// wanted set is unioned with the pre-existing node's LIVE
+    /// effective wanted set ([`effective_wanted`] over live interested
+    /// builds, stored-union fallback) — at least as demanding as the
+    /// set post-merge classification (`check_cached_outputs`, the
+    /// dispatch-time probes) evaluates the shared node against; with
+    /// the stored-union fallback it can be strictly wider than the
+    /// post-merge live set, never narrower. If another live build wants
+    /// an output that is missing and not substitutable, that
+    /// classification keeps the node on the from-source path; pruning
+    /// THIS submission's dep closure first would leave this build's
+    /// progress hostage to the other build's dep interest staying alive
+    /// (its cancel/fail sweep takes the sole-interest deps down and
+    /// this build hangs on a Queued node). The submission's OWN wanted
+    /// set must also resolve to a verifiable path — that guard covers
+    /// the fallback corner where no prior build is live and post-merge
+    /// classification degrades to exactly this build's (possibly bogus)
+    /// selector. Demanded nodes not yet in the DAG keep the
     /// submission-only criterion (there is nothing else to consult).
     ///
     /// # Circuit breaker interaction
@@ -2293,7 +2308,7 @@ impl DagActor {
     ) -> Option<Vec<crate::domain::DerivationNode>> {
         let store_client = self.store_client.as_ref()?;
 
-        // Skip if there's nothing to prune. Single-node and roots-only
+        // Skip if there's nothing to prune. Single-node and edge-free
         // submissions get no benefit from the pre-check (step 4 handles
         // them with the same RPC count). The threshold also avoids a
         // redundant FindMissingPaths round-trip on tiny DAGs where
@@ -2302,46 +2317,48 @@ impl DagActor {
             return None;
         }
 
-        // --- Compute roots from submission edges -------------------
-        // A root is a node that appears as no edge's child. Edges key
-        // by drv_path (proto-level), so collect child paths and filter.
+        // --- Compute the demand set ---------------------------------
+        // Structural roots (no edge names the node as a child; edges
+        // key by drv_path, proto-level) ∪ gateway-flagged explicitly
+        // requested nodes.
         let children: HashSet<&str> = edges.iter().map(|e| e.child_drv_path.as_str()).collect();
-        let roots: Vec<&crate::domain::DerivationNode> = nodes
+        let demanded: Vec<&crate::domain::DerivationNode> = nodes
             .iter()
-            .filter(|n| !children.contains(n.drv_path.as_str()))
+            .filter(|n| !children.contains(n.drv_path.as_str()) || n.explicitly_requested)
             .collect();
 
-        if roots.is_empty() || roots.len() == nodes.len() {
-            // No roots (malformed — cycle?) or all roots (no deps to
-            // prune). Either way, nothing to short-circuit.
+        if demanded.is_empty() || demanded.len() == nodes.len() {
+            // No demanded nodes (malformed — cycle?) or every node is
+            // demanded (nothing to prune). Either way, nothing to
+            // short-circuit.
             return None;
         }
 
-        // --- Bail on floating-CA roots ------------------------------
-        // CA roots have no expected_output_paths (path isn't known
+        // --- Bail on floating-CA demanded nodes ----------------------
+        // CA nodes have no expected_output_paths (path isn't known
         // until build time). The realisations-table lookup in
         // check_cached_outputs handles them; we can't pre-check here.
-        // Conservative: ANY CA root → fall through entirely.
-        if roots.iter().any(|n| n.ca_modular_hash.is_some()) {
+        // Conservative: ANY CA demanded node → fall through entirely.
+        if demanded.iter().any(|n| n.ca_modular_hash.is_some()) {
             return None;
         }
 
-        // --- Collect root output paths ------------------------------
-        let root_paths: Vec<String> = roots
+        // --- Collect demanded nodes' output paths --------------------
+        let demanded_paths: Vec<String> = demanded
             .iter()
             .flat_map(|n| n.expected_output_paths.iter())
             .filter(|p| !p.is_empty())
             .cloned()
             .collect();
 
-        if root_paths.is_empty() {
-            // Roots have no expected outputs — nothing to check.
+        if demanded_paths.is_empty() {
+            // Demanded nodes have no expected outputs — nothing to check.
             return None;
         }
 
-        // --- FindMissingPaths for roots only ------------------------
+        // --- FindMissingPaths for the demand set only ----------------
         let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: root_paths.clone(),
+            store_paths: demanded_paths.clone(),
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
         // JWT propagation — same as r[sched.merge.substitute-probe].
@@ -2383,19 +2400,19 @@ impl DagActor {
         self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
         debug!(
-            roots = root_paths.len(),
+            demanded = demanded_paths.len(),
             missing = resp.missing_paths.len(),
             substitutable = resp.substitutable_paths.len(),
             "top-down: FindMissingPaths response"
         );
 
-        // --- All-or-nothing: every WANTED root output available? ----
+        // --- All-or-nothing: every WANTED demanded output available? -
         // r[impl sched.merge.wanted-outputs+2]
         // "Available" = present in store (NOT in missing_paths) OR
-        // substitutable upstream. A single unavailable wanted root
-        // output → fall through to the full merge. Unwanted root
+        // substitutable upstream. A single unavailable wanted output of
+        // any demanded node → fall through to the full merge. Unwanted
         // outputs (declared but referenced by no consumer and not in
-        // the root's OutputsSpec) are excluded from the criterion —
+        // the request's OutputsSpec) are excluded from the criterion —
         // probing them is harmless but their absence must not defeat
         // the prune. The wanted subset degrades to all declared paths
         // for an empty wanted set.
@@ -2410,8 +2427,8 @@ impl DagActor {
             .map(String::as_str)
             .filter(|p| !substitutable.contains(p))
             .collect();
-        if roots.iter().any(|n| {
-            // The criterion set for a pre-existing root is the
+        if demanded.iter().any(|n| {
+            // The criterion set for a pre-existing demanded node is the
             // submission's wanted set UNIONed (saturating; empty =
             // all) with the node's live effective wanted set — at
             // least as demanding as what step-4/dispatch
@@ -2420,10 +2437,10 @@ impl DagActor {
             // post-merge live set, never narrower). A narrower,
             // submission-only criterion can prune this build's dep
             // closure while classification (driven by another live
-            // build's wants) still routes the root from-source,
+            // build's wants) still routes the node from-source,
             // leaving this build dependent on deps it never
-            // registered interest in. Fresh roots have nothing else
-            // to consult — submission-only criterion.
+            // registered interest in. Fresh demanded nodes have
+            // nothing else to consult — submission-only criterion.
             let mut criterion_wanted = n.wanted_output_names.clone();
             if let Some(existing) = self.dag.node(&n.drv_hash) {
                 let eff = effective_wanted(existing, &self.builds)
@@ -2432,10 +2449,10 @@ impl DagActor {
             }
             // The submission's OWN wanted set must also resolve to a
             // verifiable path: post-merge classification of a
-            // pre-existing root can degrade to exactly that
+            // pre-existing demanded node can degrade to exactly that
             // contribution (stored-union fallback above, only this
             // build live afterwards), and an unresolvable set is
-            // unclassifiable — nothing would substitute the root
+            // unclassifiable — nothing would substitute the node
             // whose deps this prune just dropped.
             verifiable_wanted_paths(
                 &n.output_names,
@@ -2446,7 +2463,7 @@ impl DagActor {
                 // A criterion set that resolves to no verifiable path
                 // must never vacuously satisfy the all-available
                 // criterion: treat it as "unavailable" so the prune
-                // doesn't fire and drop a dependency closure the root
+                // doesn't fire and drop a dependency closure the node
                 // actually needs. Falling through to the full merge
                 // is always safe.
                 || verifiable_wanted_paths(
@@ -2458,8 +2475,8 @@ impl DagActor {
         }) {
             debug!(
                 missing = truly_missing.len(),
-                "top-down: wanted root output(s) unavailable or unresolvable; \
-                 falling through to full merge"
+                "top-down: wanted output(s) of a demanded node unavailable or \
+                 unresolvable; falling through to full merge"
             );
             return None;
         }
@@ -2471,11 +2488,11 @@ impl DagActor {
         // very builds the prune helps most timed out and fell through
         // anyway, AND reintroduced the >100s MergeDag stall that
         // detached-substitute was created to fix. Instead: return the
-        // pruned root set; the caller continues into the full merge
-        // with roots-only nodes; check_cached_outputs re-probes them,
+        // pruned demand set; the caller continues into the full merge
+        // with those nodes only; check_cached_outputs re-probes them,
         // populates pending_substitute, and spawn_substitute_fetches
         // does the fetch detached under SUBSTITUTE_FETCH_TIMEOUT.
         // Prune benefit preserved; actor never blocks on QPI.
-        Some(roots.into_iter().cloned().collect())
+        Some(demanded.into_iter().cloned().collect())
     }
 }
