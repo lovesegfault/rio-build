@@ -28,6 +28,14 @@ scope: with scope; ''
   #
   # Tracey: r[verify sched.store-client.reconnect] at default.nix
   # subtests entry (P0341 convention).
+  #
+  # TODO: the post-rollout build only proves the scheduler→store channel
+  # recovered; it implicitly assumes the pre-rollout output's chunks are
+  # still servable from the (S3/Garage-backed) chunk backend after the
+  # pod cycled. Add an explicit "GetPath the pre-rollout output
+  # post-rollout" read-back (e.g. nix copy --from the gateway) to pin
+  # chunk persistence across the restart, instead of relying on it
+  # silently.
   with subtest("store-rollout: scheduler reconnects to new store pod"):
       # ── Baseline: pre-rollout build ───────────────────────────────
       # Proves the scheduler→store channel works at all. mkTrivial

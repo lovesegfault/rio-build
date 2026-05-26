@@ -836,6 +836,7 @@ in
           # r[verify store.compat.runtime-toggle]
           "compat-off-no-narinfo"
           # r[verify store.compat.reconcile+2]
+          # r[verify obs.metric.compat]
           "reconciler-backfill-on-reenable"
           # r[verify store.compat.stock-nix-substitute]
           "stock-nix-substitute"

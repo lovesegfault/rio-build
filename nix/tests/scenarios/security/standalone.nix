@@ -144,17 +144,21 @@ pkgs.testers.runNixOSTest {
         # Positive path: scheduler has HMAC signer, store has HMAC
         # verifier. A successful build proves the full token flow:
         #   1. scheduler signs Claims{worker_id, drv_hash,
-        #      expected_outputs, expiry} at dispatch
+        #      expected_outputs, expiry, role=Builder} at dispatch
         #   2. worker receives token in WorkAssignment
         #   3. worker forwards token as x-rio-assignment-token gRPC
-        #      metadata on PutPath
-        #   4. store verifies signature + expiry + output path ∈
-        #      expected_outputs
+        #      metadata on PutPathChunked (builder-role tokens are
+        #      rejected from legacy PutPath since the P0586
+        #      builder-chunked-only gate)
+        #   4. store's validate_begin verifies signature + expiry +
+        #      every output path ∈ expected_outputs
         #
-        # Negative path (PutPath without token → PERMISSION_DENIED)
-        # needs crafting a raw PutPath gRPC stream with NAR chunks —
-        # complex via grpcurl. Covered by unit tests in
-        # rio-store/src/grpc/put_path.rs hmac module.
+        # Negative path (upload without/with the wrong token →
+        # PERMISSION_DENIED) needs crafting a raw chunked gRPC stream —
+        # complex via grpcurl. Covered by the rio-store unit tests:
+        # put_path_chunked (hmac_token_gates_the_upload,
+        # reject_path_not_in_expected_outputs) and the legacy-RPC gate
+        # (hmac_builder_token_putpath_rejected in tests/grpc/hmac.rs).
         # Baseline BEFORE the build. seedBusybox (L197) already did a
         # PutPath — ≥1 here would be satisfied by the seed alone. If
         # the HMAC token were silently rejected and the build succeeded

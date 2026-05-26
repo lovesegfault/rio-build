@@ -305,8 +305,11 @@ let
         )
         # ...and it must not have failed-and-self-healed-via-the-loop:
         # an eager task that errors increments outcome=error and leaves
-        # nar_indexed FALSE for the 5s loop to repair. Both signals
-        # together prove the EAGER task (not the loop) wrote the index.
+        # nar_indexed FALSE for the 5s loop to repair. Together the two
+        # signals make it overwhelmingly likely the EAGER task wrote the
+        # index — though the loop could in principle still have won a
+        # close race; the rio-store unit/integration tests are the
+        # discriminating proof, this subtest is the wiring smoke check.
         err = metric_value(
             scrape_metrics(${gatewayHost}, 9092),
             "rio_store_nar_index_eager_total", '{outcome="error"}'
