@@ -477,11 +477,14 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
 
 // r[verify gw.opcode.query-missing]
 // r[verify store.substitute.upstream]
+// r[verify store.tenant.find-missing-attribution]
 /// wopQueryMissing: substitutable OUTPUT paths land in willSubstitute,
 /// not willBuild. The handler resolves each .drv to its output paths
 /// BEFORE querying FindMissingPaths — querying the .drv path itself
 /// (pre-P0471 behavior) always returns "present" since AddToStore
-/// just uploaded it, so substitution never fires.
+/// just uploaded it, so substitution never fires. Also pins that this
+/// opcode does NOT request attribution-scoped visibility (only the
+/// copy gate, opcode 31, does).
 #[tokio::test]
 async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -533,6 +536,18 @@ async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
     assert_eq!(will_substitute, vec![sub_out.to_string()]);
     assert_eq!(will_build, vec![build_drv.to_string()]);
     assert!(unknown.is_empty());
+
+    // wopQueryMissing keeps global-truth semantics: only the copy gate
+    // (opcode 31) asks for attribution-scoped visibility; the build-plan
+    // display mirrors the scheduler's sig-trust cache check.
+    {
+        let recorded = h.store.calls.find_missing_requests.read().unwrap();
+        assert_eq!(recorded.len(), 1, "one FindMissingPaths call expected");
+        assert!(
+            !recorded[0].require_tenant_attribution,
+            "wopQueryMissing must NOT set require_tenant_attribution"
+        );
+    }
 
     h.finish().await;
     Ok(())
@@ -617,7 +632,11 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
 //   - BuildDerivation (36): parse failure -> connection drop (wire read error)
 
 // r[verify gw.opcode.query-valid-paths]
-/// QueryValidPaths (31) happy path: returns paths present in the mock store.
+// r[verify store.tenant.find-missing-attribution]
+/// QueryValidPaths (31) happy path: returns paths present in the mock store,
+/// and the forwarded `FindMissingPaths` request asks for client-push
+/// (attribution-scoped) visibility — opcode 31 is the copy gate, so an
+/// unattributed-but-present source must be reported missing and re-pushed.
 #[tokio::test]
 async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -637,6 +656,18 @@ async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
         vec![TEST_PATH_A.to_string()],
         "only seeded path should be valid"
     );
+
+    // The forwarded gRPC request must carry client-push semantics
+    // (store.tenant.find-missing-attribution): "valid" for this opcode
+    // means "the session tenant can read it back", not "bytes exist".
+    {
+        let recorded = h.store.calls.find_missing_requests.read().unwrap();
+        assert_eq!(recorded.len(), 1, "one FindMissingPaths call expected");
+        assert!(
+            recorded[0].require_tenant_attribution,
+            "wopQueryValidPaths must set require_tenant_attribution"
+        );
+    }
 
     h.finish().await;
     Ok(())

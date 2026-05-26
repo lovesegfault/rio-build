@@ -313,7 +313,7 @@ pub(crate) async fn complete_manifest_in_conn(
     Ok(())
 }
 
-// r[impl store.put.tenant-attribution]
+// r[impl store.put.tenant-attribution+2]
 /// Attribute one store path to one tenant inside the caller's
 /// transaction: `INSERT INTO path_tenants … ON CONFLICT DO NOTHING`,
 /// FK-guarded via `SELECT … FROM tenants` so a tenant deleted mid-upload

@@ -298,6 +298,59 @@ impl StoreServiceImpl {
         Ok(visible)
     }
 
+    // r[impl store.tenant.find-missing-attribution]
+    /// Attribution-scoped visibility for client-push queries
+    /// (`FindMissingPathsRequest.require_tenant_attribution`): of the
+    /// locally-present `present` set, return the subset the calling
+    /// tenant can actually read back through the tenant-scoped castore
+    /// surface — paths with a `path_tenants` row for `tenant_id`, plus
+    /// `.drv` paths (build inputs, exempt from tenant scoping per
+    /// `r[gw.jwt.anon-drv-lookup]` and never castore-mounted). Anything
+    /// else is reported missing so the client's `nix copy` re-pushes it
+    /// and gains attribution via the content-verified re-upload
+    /// (`r[store.put.tenant-attribution+2]`).
+    ///
+    /// Strictly tighter than
+    /// [`sig_visibility_gate_batch`](Self::sig_visibility_gate_batch):
+    /// a path hidden there (built by another tenant, untrusted sig) is
+    /// also hidden here; a sig-trusted substitution-only path (visible
+    /// there) is hidden here because bytes-without-attribution are
+    /// unreadable to this tenant's builds. One PG round-trip (PK probe
+    /// on `path_tenants`).
+    pub(super) async fn attribution_visibility_batch(
+        &self,
+        tenant_id: uuid::Uuid,
+        present: &[String],
+    ) -> Result<HashSet<String>, Status> {
+        if present.is_empty() {
+            return Ok(HashSet::new());
+        }
+        use sha2::{Digest, Sha256};
+        let hashes: Vec<Vec<u8>> = present
+            .iter()
+            .map(|p| Sha256::digest(p.as_bytes()).to_vec())
+            .collect();
+        let owned: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pt.store_path_hash \
+             FROM path_tenants pt \
+             JOIN UNNEST($1::bytea[]) AS k(h) ON pt.store_path_hash = k.h \
+             WHERE pt.tenant_id = $2",
+        )
+        .bind(&hashes)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .status_internal("attribution_visibility_batch: path_tenants")?;
+        let owned: HashSet<Vec<u8>> = owned.into_iter().collect();
+
+        Ok(present
+            .iter()
+            .zip(&hashes)
+            .filter(|(p, h)| p.ends_with(".drv") || owned.contains(*h))
+            .map(|(p, _)| p.clone())
+            .collect())
+    }
+
     /// Sync signing given a pre-resolved [`Signer`]. No DB hit.
     ///
     /// Extracted so PutPathBatch can resolve once + sign N times without

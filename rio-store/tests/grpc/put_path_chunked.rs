@@ -15,7 +15,7 @@
 // r[verify store.put.chunked-ca]
 // r[verify store.chunk.has-chunks-durable]
 // r[verify store.atomic.multi-output]
-// r[verify store.put.idempotent]
+// r[verify store.put.idempotent+2]
 
 use sha2::Digest as _;
 
@@ -238,7 +238,7 @@ async fn two_outputs_commit_and_roundtrip() -> TestResult {
         );
     }
 
-    // r[verify store.put.idempotent]
+    // r[verify store.put.idempotent+2]
     // Re-drive: every output already complete → created=false, nothing
     // double-counted.
     let rc_before: Vec<(Vec<u8>, i32)> =
@@ -829,7 +829,7 @@ async fn bounds_violations_rejected_before_any_write() -> TestResult {
 /// exist in the CAS) and a second, new output rides in the same Begin.
 /// The skipped output must not poison the new one's verify — the walk
 /// must not try to fetch the skipped output's nonexistent chunks.
-// r[verify store.put.idempotent]
+// r[verify store.put.idempotent+2]
 #[tokio::test]
 async fn partial_skip_does_not_block_new_outputs() -> TestResult {
     let mut s = ChunkedSession::new().await?;

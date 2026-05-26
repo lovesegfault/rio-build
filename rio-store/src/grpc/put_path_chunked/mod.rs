@@ -166,7 +166,7 @@ impl StoreServiceImpl {
         // CA → defer the claim to post-verify
         // (r[sec.authz.ca-path-derived+2] — the path is content-derived
         // and must not be squattable before the content is proven).
-        // r[impl store.put.idempotent]
+        // r[impl store.put.idempotent+2]
         let n = validated.outputs.len();
         let mut skipped = vec![false; n];
         let mut claims: Vec<Option<uuid::Uuid>> = vec![None; n];

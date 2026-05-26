@@ -374,7 +374,7 @@ pub(crate) async fn complete_manifest_chunked(
     let mut tx = pool.begin().await?;
     super::complete_manifest_in_conn(&mut tx, info, claim).await?;
     mark_chunks_durable(&mut tx, chunk_hashes).await?;
-    // r[impl store.put.tenant-attribution]
+    // r[impl store.put.tenant-attribution+2]
     if let Some(tid) = tenant_id {
         super::upsert_path_tenant_in_conn(&mut tx, &info.store_path_hash, tid).await?;
     }

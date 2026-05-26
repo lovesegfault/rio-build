@@ -1245,8 +1245,12 @@ impl DagActor {
             .flat_map(|(_, paths)| paths.iter().cloned())
             .collect();
 
+        // Global-truth semantics (flag unset): the scheduler must keep
+        // seeing attributed-elsewhere / sig-trusted paths as present —
+        // store.tenant.find-missing-attribution is gateway-client-only.
         let mut req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: check_paths,
+            require_tenant_attribution: false,
         });
         rio_proto::interceptor::inject_current(req.metadata_mut());
         // I-202: same JWT propagation as check_cached_outputs. Without
@@ -1895,6 +1899,7 @@ impl DagActor {
             let ca_check_paths: Vec<String> = hits.values().flatten().cloned().collect();
             let mut req = tonic::Request::new(FindMissingPathsRequest {
                 store_paths: ca_check_paths,
+                require_tenant_attribution: false,
             });
             rio_proto::interceptor::inject_current(req.metadata_mut());
             let fmp_start = Instant::now();
@@ -1975,8 +1980,14 @@ impl DagActor {
         //
         // This call is ALSO the half-open probe: if the breaker is open, we
         // still make the call. Success → close; failure → stay open + reject.
+        // Global-truth semantics (flag unset): the merge-time cache check
+        // must keep seeing sig-trusted / attributed-elsewhere paths as
+        // present — re-substituting bytes the store already holds would be
+        // pure waste. store.tenant.find-missing-attribution is scoped to
+        // the gateway's client-facing wopQueryValidPaths call only.
         let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: check_paths,
+            require_tenant_attribution: false,
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
         // r[impl sched.merge.substitute-probe]
@@ -2157,6 +2168,7 @@ impl DagActor {
         // --- FindMissingPaths for roots only ------------------------
         let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: root_paths.clone(),
+            require_tenant_attribution: false,
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
         // JWT propagation — same as r[sched.merge.substitute-probe].

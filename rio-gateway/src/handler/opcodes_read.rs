@@ -227,9 +227,19 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
     // built outputs as "valid". The store-side `check_available`
     // self-bounds at 88s, so `GATEWAY_FMP_TIMEOUT` (90s) covers the
     // worst-case probe latency without a client-visible timeout.
+    //
+    // r[impl store.tenant.find-missing-attribution]
+    // `require_tenant_attribution`: this opcode answers "what must the
+    // client push?", so a path the session tenant cannot read through
+    // the tenant-scoped castore surface (no `path_tenants` row) must be
+    // reported missing even though the bytes exist — the client's
+    // re-push is the tenant's only route to attribution
+    // (store.put.tenant-attribution). Anonymous sessions are unaffected
+    // (the store ignores the flag without a tenant identity).
     let req = with_jwt(
         types::FindMissingPathsRequest {
             store_paths: path_strs.clone(),
+            require_tenant_attribution: true,
         },
         ctx.jwt.token(),
     )?;
@@ -935,9 +945,15 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         }
     }
 
+    // Flag unset: wopQueryMissing reports the *build plan*, which the
+    // scheduler computes with sig-trust visibility — mirroring its
+    // semantics here keeps "nothing to do" / "will substitute" displays
+    // consistent with what the scheduler will actually decide. Only the
+    // copy gate (wopQueryValidPaths) uses attribution-scoped visibility.
     let req = with_jwt(
         types::FindMissingPathsRequest {
             store_paths: query_paths.clone(),
+            require_tenant_attribution: false,
         },
         jwt_token,
     )?;

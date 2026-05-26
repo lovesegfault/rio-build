@@ -285,7 +285,23 @@ impl StoreServiceImpl {
             .filter(|p| !missing_set.contains(p.as_str()))
             .cloned()
             .collect();
-        let visible = self.sig_visibility_gate_batch(tenant_id, &present).await?;
+        // r[impl store.tenant.find-missing-attribution]
+        // Client-push semantics: when the gateway forwards a client's
+        // wopQueryValidPaths with `require_tenant_attribution` and the
+        // request carries a tenant identity, "present" means "this
+        // tenant can read it through the tenant-scoped castore surface"
+        // — i.e. it holds a `path_tenants` row — not merely "the bytes
+        // exist". Reporting unattributed paths as missing makes the
+        // client's normal `nix copy` re-push them, and the verified
+        // re-upload grants attribution (store.put.tenant-attribution).
+        // Without the flag (scheduler cache-check, builder pre-check,
+        // anonymous callers) the sig-trust gate semantics are unchanged.
+        let visible = match tenant_id {
+            Some(tid) if req.require_tenant_attribution => {
+                self.attribution_visibility_batch(tid, &present).await?
+            }
+            _ => self.sig_visibility_gate_batch(tenant_id, &present).await?,
+        };
         for p in present {
             if !visible.contains(&p) {
                 missing.push(p);

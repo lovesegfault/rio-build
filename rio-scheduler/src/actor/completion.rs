@@ -455,6 +455,7 @@ impl DagActor {
         // verified set (safe fallback; downstream runs normally).
         let mut req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: check_paths,
+            require_tenant_attribution: false,
         });
         rio_proto::interceptor::inject_current(req.metadata_mut());
         let fmp_start = Instant::now();

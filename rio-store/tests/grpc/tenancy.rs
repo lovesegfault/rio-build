@@ -114,7 +114,7 @@ async fn attribution_count(pool: &sqlx::PgPool, path: &str, tenant: uuid::Uuid) 
 /// tenant can read the path's Directory body and file blob back through
 /// the tenant-scoped castore RPCs; a different tenant still gets
 /// NotFound for the same digests (isolation preserved).
-// r[verify store.put.tenant-attribution]
+// r[verify store.put.tenant-attribution+2]
 // r[verify store.castore.tenant-scope]
 #[tokio::test]
 async fn put_path_with_tenant_attributes_pushing_tenant() -> TestResult {
@@ -226,7 +226,7 @@ async fn put_path_with_tenant_attributes_pushing_tenant() -> TestResult {
 /// JWT): no attribution row is written — the store never invents a
 /// default tenant. Behavior unchanged from before upload-time
 /// attribution existed.
-// r[verify store.put.tenant-attribution]
+// r[verify store.put.tenant-attribution+2]
 #[tokio::test]
 async fn put_path_without_tenant_writes_no_attribution() -> TestResult {
     let mut s = StoreSession::new().await?;
@@ -248,7 +248,7 @@ async fn put_path_without_tenant_writes_no_attribution() -> TestResult {
 /// `PutPathBatch` with a session JWT: every committed output is
 /// attributed to the pushing tenant in the same transaction as the
 /// batch commit.
-// r[verify store.put.tenant-attribution]
+// r[verify store.put.tenant-attribution+2]
 #[tokio::test]
 async fn put_path_batch_with_tenant_attributes_all_outputs() -> TestResult {
     use rio_proto::types::PutPathBatchRequest;
@@ -306,15 +306,18 @@ async fn put_path_batch_with_tenant_attributes_all_outputs() -> TestResult {
     Ok(())
 }
 
-/// Dedup re-push — the spec'd negative contract: a SECOND tenant pushing
-/// an already-complete path takes the idempotent fast path (`created =
-/// false`), gains NO `path_tenants` row (it committed nothing and proved
-/// possession of no content), and its castore reads still get NotFound.
-/// Attribution stays exactly where the original upload put it.
-// r[verify store.put.tenant-attribution]
+/// Content-verified re-upload — the amended dedup contract: a SECOND
+/// tenant re-pushing the full, identical content of an already-complete
+/// path is attributed to it (proof of possession earns the row), its
+/// castore GetDirectory/StatBlob now succeed, and the success response
+/// is indistinguishable from a fresh upload. The original pusher's
+/// attribution and visibility are untouched, and once attributed the
+/// re-pusher's next push takes the idempotent fast path again.
+// r[verify store.put.tenant-attribution+2]
+// r[verify store.put.idempotent+2]
 // r[verify store.castore.tenant-scope]
 #[tokio::test]
-async fn repush_of_complete_path_grants_no_attribution() -> TestResult {
+async fn repush_of_identical_content_grants_attribution() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let tenant_a = seed_tenant(&db.pool, "dedup-a").await;
     let tenant_b = seed_tenant(&db.pool, "dedup-b").await;
@@ -337,58 +340,365 @@ async fn repush_of_complete_path_grants_no_attribution() -> TestResult {
     let _guard_b = scopeguard::guard(server_b, |h| h.abort());
     let info_b = make_path_info(&path, &nar, nar_hash);
     assert!(
-        !put_path(&mut store_b, info_b, nar).await?,
-        "already-complete path must take the idempotent fast path (created = false)"
+        put_path(&mut store_b, info_b, nar.clone()).await?,
+        "content-verified re-upload must be indistinguishable from a fresh upload (created = true)"
     );
 
-    // Attribution: A keeps its row; B gained nothing from the re-push.
+    // Attribution: A keeps its row; B earned its own by proving possession.
     assert_eq!(attribution_count(&db.pool, &path, tenant_a).await, 1);
     assert_eq!(
         attribution_count(&db.pool, &path, tenant_b).await,
-        0,
-        "the already-complete fast path must NOT attribute the path to the re-pusher"
+        1,
+        "the content-verified re-upload must attribute the re-pushing tenant"
     );
 
-    // Castore read surface: B still NotFound on the path's root digest;
-    // A (the original pusher) still resolves it.
+    // Castore read surface: BOTH tenants resolve the root digest and the
+    // file blob now (the rows were written by A's eager index; B's new
+    // path_tenants row is what makes them reachable for B).
     let dirs = poll_scalar_until(&db.pool, "SELECT count(*) FROM directory_paths", 1i64).await;
     assert_eq!(dirs, 1, "eager index populated by the original push");
     let root_digest: Vec<u8> = sqlx::query_scalar("SELECT digest FROM directory_paths LIMIT 1")
+        .fetch_one(&db.pool)
+        .await?;
+    let file_digest: Vec<u8> = sqlx::query_scalar("SELECT digest FROM file_blobs LIMIT 1")
         .fetch_one(&db.pool)
         .await?;
 
     let (mut dir_client, dir_server) = spawn_directory_service(db.pool.clone()).await;
     let _dir_guard = scopeguard::guard(dir_server, |h| h.abort());
 
-    let err = dir_client
-        .get_directory(with_assignment_token(
-            GetDirectoryRequest {
-                by_what: Some(get_directory_request::ByWhat::Digest(root_digest.clone())),
-                recursive: false,
-                digests: vec![],
-            },
-            &assignment_token(tenant_b),
-        ))
-        .await
-        .expect_err("the re-pushing tenant must still not see the Directory body");
-    assert_eq!(err.code(), tonic::Code::NotFound);
+    for (tid, who) in [(tenant_a, "original pusher"), (tenant_b, "re-pusher")] {
+        let resp = dir_client
+            .get_directory(with_assignment_token(
+                GetDirectoryRequest {
+                    by_what: Some(get_directory_request::ByWhat::Digest(root_digest.clone())),
+                    recursive: false,
+                    digests: vec![],
+                },
+                &assignment_token(tid),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{who} must resolve the Directory body: {e}"));
+        let bodies: Vec<_> = resp.into_inner().filter_map(|r| r.ok()).collect().await;
+        assert_eq!(bodies.len(), 1, "{who} reads the Directory body");
+        dir_client
+            .stat_blob(with_assignment_token(
+                StatBlobRequest {
+                    file_digest: file_digest.clone(),
+                    send_chunks: false,
+                },
+                &assignment_token(tid),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{who} must StatBlob the pushed file: {e}"));
+    }
 
-    let resp = dir_client
-        .get_directory(with_assignment_token(
-            GetDirectoryRequest {
-                by_what: Some(get_directory_request::ByWhat::Digest(root_digest)),
-                recursive: false,
-                digests: vec![],
-            },
-            &assignment_token(tenant_a),
-        ))
-        .await?;
-    let bodies: Vec<_> = resp.into_inner().filter_map(|r| r.ok()).collect().await;
-    assert_eq!(
-        bodies.len(),
-        1,
-        "the original pusher still resolves the body"
+    // Once attributed, the re-pusher's next push short-circuits again.
+    let info_b2 = make_path_info(&path, &nar, nar_hash);
+    assert!(
+        !put_path(&mut store_b, info_b2, nar).await?,
+        "an already-attributed tenant's re-push keeps the idempotent fast path (created = false)"
     );
 
+    Ok(())
+}
+
+/// A re-push that claims an existing path but streams DIFFERENT content
+/// is rejected loudly and grants nothing: the trailer is self-consistent
+/// (declared hash matches the streamed bytes), so only the comparison
+/// against the STORED manifest can — and must — fail. The rejection
+/// names neither the stored hash nor the stored size, and the original
+/// pusher's attribution is untouched.
+// r[verify store.put.tenant-attribution+2]
+#[tokio::test]
+async fn repush_with_wrong_content_rejected_and_grants_nothing() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "mismatch-a").await;
+    let tenant_b = seed_tenant(&db.pool, "mismatch-b").await;
+
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (nar, nar_hash, path) = make_source_nar("mismatch-source", b"the real content");
+    assert!(
+        put_path(
+            &mut store_a,
+            make_path_info(&path, &nar, nar_hash),
+            nar.clone()
+        )
+        .await?,
+        "fresh push creates"
+    );
+
+    // Same store path (same name -> same test path), different payload.
+    let (wrong_nar, wrong_hash, same_path) = make_source_nar("mismatch-source", b"something else");
+    assert_eq!(same_path, path, "fixture: same path, different content");
+    assert_ne!(wrong_hash, nar_hash, "fixture: contents actually differ");
+
+    let (mut store_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+    let err = put_path(
+        &mut store_b,
+        make_path_info(&path, &wrong_nar, wrong_hash),
+        wrong_nar,
+    )
+    .await
+    .expect_err("re-push with mismatching content must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert!(
+        err.message()
+            .contains("does not match the already-stored path"),
+        "rejection should be loud and specific: {err:?}"
+    );
+    assert!(
+        !err.message().contains(&hex::encode(nar_hash)),
+        "rejection must not echo the stored hash: {err:?}"
+    );
+
+    assert_eq!(
+        attribution_count(&db.pool, &path, tenant_b).await,
+        0,
+        "a mismatching re-push must not attribute"
+    );
+    assert_eq!(attribution_count(&db.pool, &path, tenant_a).await, 1);
+    Ok(())
+}
+
+/// A metadata-only "probe" of an existing path (stream closed without
+/// chunks or trailer) still grants nothing — the spirit of the original
+/// negative contract survives: only proof of possession of the full,
+/// matching content earns attribution.
+// r[verify store.put.tenant-attribution+2]
+#[tokio::test]
+async fn metadata_only_probe_grants_no_attribution() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "probe-a").await;
+    let tenant_b = seed_tenant(&db.pool, "probe-b").await;
+
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (nar, nar_hash, path) = make_source_nar("probe-source", b"probed content");
+    assert!(
+        put_path(&mut store_a, make_path_info(&path, &nar, nar_hash), nar).await?,
+        "fresh push creates"
+    );
+
+    // B sends ONLY the metadata message and closes the stream — the
+    // shape of an existence probe that never proves possession.
+    let (mut store_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+    let mut probe_info: PathInfo = make_path_info(&path, b"", [0u8; 32]).into();
+    probe_info.nar_hash = Vec::new();
+    probe_info.nar_size = 0;
+    let (tx, rx) = mpsc::channel(4);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(probe_info),
+        })),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
+    let err = store_b
+        .put_path(ReceiverStream::new(rx))
+        .await
+        .expect_err("a probe that never streams the NAR must fail");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+    assert_eq!(
+        attribution_count(&db.pool, &path, tenant_b).await,
+        0,
+        "a metadata-only probe must not attribute"
+    );
+    Ok(())
+}
+
+/// `PutPathBatch` flavor of the content-verified re-upload: a batch from
+/// tenant B that re-streams an output already pushed by tenant A gets
+/// that output attributed to B inside the batch transaction (response
+/// indistinguishable from a fresh upload), while a batch claiming the
+/// path with different content is rejected whole and attributes nothing.
+// r[verify store.put.tenant-attribution+2]
+#[tokio::test]
+async fn put_path_batch_repush_attributes_verified_output() -> TestResult {
+    use rio_proto::types::PutPathBatchRequest;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "batch-repush-a").await;
+    let tenant_b = seed_tenant(&db.pool, "batch-repush-b").await;
+
+    // A pushes the source via plain PutPath.
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (nar, nar_hash, path) = make_source_nar("batch-repush-src", b"batch shared source");
+    assert!(
+        put_path(
+            &mut store_a,
+            make_path_info(&path, &nar, nar_hash),
+            nar.clone()
+        )
+        .await?,
+        "fresh push creates"
+    );
+
+    // Helper: send a single-output PutPathBatch for (path, nar, hash).
+    async fn send_batch(
+        store: &mut StoreServiceClient<Channel>,
+        path: &str,
+        nar: &[u8],
+        nar_hash: [u8; 32],
+    ) -> Result<rio_proto::types::PutPathBatchResponse, tonic::Status> {
+        let mut info: PathInfo = make_path_info(path, nar, nar_hash).into();
+        info.nar_hash = Vec::new();
+        let trailer = PutPathTrailer {
+            nar_hash: nar_hash.to_vec(),
+            nar_size: std::mem::take(&mut info.nar_size),
+        };
+        let (tx, rx) = mpsc::channel(8);
+        for msg in [
+            put_path_request::Msg::Metadata(PutPathMetadata { info: Some(info) }),
+            put_path_request::Msg::NarChunk(nar.to_vec()),
+            put_path_request::Msg::Trailer(trailer),
+        ] {
+            tx.send(PutPathBatchRequest {
+                output_index: 0,
+                inner: Some(PutPathRequest { msg: Some(msg) }),
+            })
+            .await
+            .expect("fresh channel");
+        }
+        drop(tx);
+        store
+            .put_path_batch(ReceiverStream::new(rx))
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    // B re-streams the identical content in a batch -> attributed.
+    let (mut store_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+    let resp = send_batch(&mut store_b, &path, &nar, nar_hash).await?;
+    assert_eq!(
+        resp.created,
+        vec![true],
+        "verified batch re-upload must look like a fresh upload"
+    );
+    assert_eq!(
+        attribution_count(&db.pool, &path, tenant_b).await,
+        1,
+        "batch content-verified re-upload must attribute the re-pushing tenant"
+    );
+    assert_eq!(attribution_count(&db.pool, &path, tenant_a).await, 1);
+
+    // A third tenant claiming the path with different content: the whole
+    // batch is rejected, nothing attributed.
+    let tenant_c = seed_tenant(&db.pool, "batch-repush-c").await;
+    let (mut store_c, server_c) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_c).await?;
+    let _guard_c = scopeguard::guard(server_c, |h| h.abort());
+    let (wrong_nar, wrong_hash, same_path) =
+        make_source_nar("batch-repush-src", b"divergent content");
+    assert_eq!(same_path, path);
+    let err = send_batch(&mut store_c, &path, &wrong_nar, wrong_hash)
+        .await
+        .expect_err("mismatching batch re-push must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert_eq!(
+        attribution_count(&db.pool, &path, tenant_c).await,
+        0,
+        "a rejected batch must not attribute"
+    );
+    Ok(())
+}
+
+/// Tenant-scoped source visibility on FindMissingPaths
+/// (`require_tenant_attribution`): an unattributed tenant is told the
+/// path is missing (so `nix copy` re-pushes it and the verified
+/// re-upload can attribute it), the attributed tenant and global-truth
+/// (anonymous / service) callers keep seeing it as present, and `.drv`
+/// paths stay exempt.
+// r[verify store.tenant.find-missing-attribution]
+#[tokio::test]
+async fn find_missing_paths_attribution_scope() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "fmp-a").await;
+    let tenant_b = seed_tenant(&db.pool, "fmp-b").await;
+
+    // A pushes a source (attributed to A only) and a .drv.
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (nar, nar_hash, path) = make_source_nar("fmp-source", b"fmp payload");
+    assert!(
+        put_path(&mut store_a, make_path_info(&path, &nar, nar_hash), nar).await?,
+        "source push creates"
+    );
+    let (drv_nar, drv_hash, drv_path) = make_source_nar("fmp-thing.drv", b"Derive([...])");
+    assert!(
+        drv_path.ends_with(".drv"),
+        "fixture: {drv_path} must be a .drv path"
+    );
+    assert!(
+        put_path(
+            &mut store_a,
+            make_path_info(&drv_path, &drv_nar, drv_hash),
+            drv_nar
+        )
+        .await?,
+        ".drv push creates"
+    );
+
+    let fmp = |paths: Vec<String>, flag: bool| FindMissingPathsRequest {
+        store_paths: paths,
+        require_tenant_attribution: flag,
+    };
+
+    // Attributed tenant + flag -> present.
+    let resp = store_a
+        .find_missing_paths(fmp(vec![path.clone()], true))
+        .await?
+        .into_inner();
+    assert!(
+        resp.missing_paths.is_empty(),
+        "attributed tenant must see its source as present, got {:?}",
+        resp.missing_paths
+    );
+
+    // Unattributed tenant + flag -> missing (the re-push trigger), but
+    // the .drv stays exempt.
+    let (mut store_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+    let resp = store_b
+        .find_missing_paths(fmp(vec![path.clone(), drv_path.clone()], true))
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.missing_paths,
+        vec![path.clone()],
+        "unattributed tenant must see the source as missing and the .drv as present"
+    );
+
+    // Anonymous / service-identity caller (no tenant): global truth,
+    // with or without the flag (no tenant identity -> flag is inert).
+    let (mut store_anon, server_anon) =
+        spawn_store_server(StoreServiceImpl::new(db.pool.clone())).await?;
+    let _guard_anon = scopeguard::guard(server_anon, |h| h.abort());
+    for flag in [false, true] {
+        let resp = store_anon
+            .find_missing_paths(fmp(vec![path.clone(), drv_path.clone()], flag))
+            .await?
+            .into_inner();
+        assert!(
+            resp.missing_paths.is_empty(),
+            "tenant-less caller must keep global-truth presence (flag={flag}), got {:?}",
+            resp.missing_paths
+        );
+    }
     Ok(())
 }

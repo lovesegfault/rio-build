@@ -4,7 +4,7 @@
 //! 1. Receive first message: PutPathMetadata with PathInfo
 //! 2. Check idempotency: if path already complete, return success
 // r[impl store.put.wal-manifest]
-// r[impl store.put.idempotent]
+// r[impl store.put.idempotent+2]
 // r[impl store.integrity.verify-on-put]
 //! 3. Insert manifest placeholder with status='uploading'
 //! 4. Accumulate NAR chunks (bounded by MAX_NAR_SIZE)
@@ -19,6 +19,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
 use rio_proto::types::{PutPathRequest, PutPathResponse};
+use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata;
 
@@ -194,8 +195,13 @@ impl StoreServiceImpl {
                     (Some(c), Some(g))
                 }
                 Ok(None) => {
-                    drain_stream(&mut stream).await;
-                    return Ok(Response::new(PutPathResponse { created: false }));
+                    // Already complete. A tenant that lacks attribution
+                    // gets the content-verified re-upload (consume +
+                    // verify + attribute, nothing re-stored); everyone
+                    // else keeps the legacy fast path.
+                    return self
+                        .finish_already_complete(&mut stream, info, auth.tenant_id)
+                        .await;
                 }
                 Err(e) => {
                     drain_stream(&mut stream).await;
@@ -244,6 +250,68 @@ impl StoreServiceImpl {
         if let Some(g) = placeholder_guard {
             g.defuse();
         }
+        Ok(Response::new(PutPathResponse { created: true }))
+    }
+
+    // r[impl store.put.tenant-attribution+2]
+    // r[impl store.put.idempotent+2]
+    /// Already-complete epilogue for the legacy buffered `PutPath`.
+    ///
+    /// - Tenant-less request, or the tenant already holds a
+    ///   `path_tenants` row → the legacy idempotent fast path: drain the
+    ///   stream, commit nothing, `created: false`.
+    /// - Tenant WITHOUT attribution → content-verified re-upload: hash
+    ///   the stream without buffering or re-storing anything, verify it
+    ///   against the already-stored manifest, and attribute the path to
+    ///   the pushing tenant on match. The success response is the same
+    ///   one a fresh upload returns (`created: true`) so the caller
+    ///   cannot tell a verified re-upload from a first upload; a
+    ///   mismatch is rejected loudly without echoing the stored
+    ///   hash/size.
+    async fn finish_already_complete(
+        &self,
+        stream: &mut Streaming<PutPathRequest>,
+        mut info: ValidatedPathInfo,
+        tenant_id: Option<uuid::Uuid>,
+    ) -> Result<Response<PutPathResponse>, Status> {
+        let store_path_hash = info.store_path_hash.clone();
+        let needs_attribution = match tenant_id {
+            None => false,
+            Some(tid) => !match self.tenant_has_attribution(&store_path_hash, tid).await {
+                Ok(has) => has,
+                Err(e) => {
+                    drain_stream(stream).await;
+                    return Err(e);
+                }
+            },
+        };
+        if !needs_attribution {
+            debug!(store_path = %info.store_path, "PutPath: path already complete");
+            drain_stream(stream).await;
+            return Ok(Response::new(PutPathResponse { created: false }));
+        }
+        let tid = tenant_id.expect("needs_attribution implies a tenant");
+
+        // Stream is fully consumed (to EOF) by the hashing pass, so the
+        // error paths below have nothing left to drain.
+        let (computed, size) = self.hash_stream_for_verification(stream, &mut info).await?;
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                rio_common::grpc::internal("PutPath: begin re-upload verification", e)
+            })?;
+        common::verify_existing_and_attribute_in_conn(
+            &mut tx,
+            info.store_path.as_str(),
+            &store_path_hash,
+            tid,
+            computed,
+            size,
+            "PutPath",
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| rio_common::grpc::internal("PutPath: commit re-upload attribution", e))?;
         Ok(Response::new(PutPathResponse { created: true }))
     }
 

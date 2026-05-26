@@ -27,7 +27,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tonic::{Request, Status, Streaming};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
@@ -604,7 +604,7 @@ impl StoreServiceImpl {
     /// (`r[store.index.putpath-eager]`). The eager gate fires only after
     /// a successful persist — an aborted upload never indexes.
     // r[impl obs.metric.transfer-volume]
-    // r[impl store.put.tenant-attribution]
+    // r[impl store.put.tenant-attribution+2]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
@@ -740,6 +740,173 @@ impl StoreServiceImpl {
             chunk_hashes: stats.chunk_hashes,
         })
     }
+
+    /// Does `tenant_id` already hold a `path_tenants` row for this path?
+    /// One PK probe; decides between the legacy already-complete fast
+    /// path (attributed → nothing to gain) and the content-verified
+    /// re-upload (`r[store.put.tenant-attribution+2]`).
+    pub(in crate::grpc) async fn tenant_has_attribution(
+        &self,
+        store_path_hash: &[u8],
+        tenant_id: uuid::Uuid,
+    ) -> Result<bool, Status> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM path_tenants \
+              WHERE store_path_hash = $1 AND tenant_id = $2)",
+        )
+        .bind(store_path_hash)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .status_internal("PutPath: path_tenants attribution probe")
+    }
+
+    /// Drain the remainder of a single-output PutPath stream for the
+    /// already-complete verified re-upload: hash every chunk (no
+    /// buffering — the bytes are never persisted), require the trailer,
+    /// reject the same protocol violations as
+    /// [`Self::ingest_nar_stream`], then [`apply_trailer`] +
+    /// [`verify_nar`] so a self-inconsistent stream fails with exactly
+    /// the errors a fresh upload would produce. Returns the
+    /// server-computed `(sha256, size)` of the received NAR.
+    ///
+    /// Deliberately does NOT touch the `nar_bytes_budget` semaphore:
+    /// nothing is accumulated, so there is nothing to bound beyond the
+    /// per-request `MAX_NAR_SIZE` check.
+    pub(in crate::grpc) async fn hash_stream_for_verification(
+        &self,
+        stream: &mut Streaming<PutPathRequest>,
+        info: &mut ValidatedPathInfo,
+    ) -> Result<([u8; 32], u64), Status> {
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        let mut trailer: Option<PutPathTrailer> = None;
+        loop {
+            let msg = match stream.message().await {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(store_path = %info.store_path, error = %e,
+                          "PutPath: stream read error during re-upload verification");
+                    return Err(e);
+                }
+            };
+            match msg.msg {
+                Some(put_path_request::Msg::NarChunk(chunk)) => {
+                    if trailer.is_some() {
+                        return Err(Status::invalid_argument(
+                            "PutPath: nar_chunk after trailer (trailer must be last)",
+                        ));
+                    }
+                    if chunk.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "PutPath: empty NarChunk (protocol violation)",
+                        ));
+                    }
+                    received = received.saturating_add(chunk.len() as u64);
+                    if received >= MAX_NAR_SIZE {
+                        return Err(Status::invalid_argument(format!(
+                            "PutPath: NAR chunks exceed size bound {MAX_NAR_SIZE} \
+                             (received {received}+ bytes)"
+                        )));
+                    }
+                    hasher.update(&chunk);
+                }
+                Some(put_path_request::Msg::Trailer(t)) => {
+                    if trailer.is_some() {
+                        return Err(Status::invalid_argument("PutPath: duplicate trailer"));
+                    }
+                    trailer = Some(t);
+                    // Don't break — keep reading to catch chunk-after-trailer.
+                }
+                Some(put_path_request::Msg::Metadata(_)) => {
+                    warn!(store_path = %info.store_path,
+                          "PutPath: duplicate metadata mid-stream, rejecting");
+                    return Err(Status::invalid_argument(
+                        "PutPath stream contained duplicate metadata (protocol violation)",
+                    ));
+                }
+                None => {}
+            }
+        }
+        let t = trailer.ok_or_else(|| {
+            Status::invalid_argument(
+                "PutPath: no trailer received \
+                 (PutPathTrailer is required as the last message)",
+            )
+        })?;
+        apply_trailer(info, &t, "PutPath")?;
+        let computed: [u8; 32] = hasher.finalize().into();
+        verify_nar(computed, received, info, "PutPath")?;
+        Ok((computed, received))
+    }
+}
+
+// r[impl store.put.tenant-attribution+2]
+/// Already-complete verified re-upload, step 2: inside the caller's
+/// transaction, compare the server-computed `(nar_hash, nar_size)` of
+/// the just-received stream against the EXISTING complete manifest's
+/// narinfo, and on match attribute the path to `tenant_id` via
+/// [`metadata::upsert_path_tenant_in_conn`]. No chunk or manifest rows
+/// are touched — the caller proved possession of the content, nothing
+/// more.
+///
+/// Errors:
+/// - `Aborted` when the path is no longer `'complete'` (GC raced the
+///   re-upload) — the client's retry takes the fresh-upload path;
+/// - `InvalidArgument` when the received content does not match the
+///   stored content. The message deliberately repeats neither the
+///   stored hash nor the stored size — the rejection itself is loud,
+///   the stored values stay private.
+pub(in crate::grpc) async fn verify_existing_and_attribute_in_conn(
+    conn: &mut sqlx::PgConnection,
+    store_path: &str,
+    store_path_hash: &[u8],
+    tenant_id: uuid::Uuid,
+    computed_hash: [u8; 32],
+    computed_size: u64,
+    ctx_label: &str,
+) -> Result<(), Status> {
+    let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT n.nar_hash, n.nar_size \
+           FROM narinfo n JOIN manifests m USING (store_path_hash) \
+          WHERE n.store_path_hash = $1 AND m.status = 'complete'",
+    )
+    .bind(store_path_hash)
+    .fetch_optional(&mut *conn)
+    .await
+    .status_internal("verified re-upload: narinfo lookup")?;
+    let Some((stored_hash, stored_size)) = existing else {
+        // The placeholder claim said complete moments ago; GC (or an
+        // abort) won the race. Retry lands on the fresh-upload path.
+        return Err(Status::aborted(format!(
+            "{ctx_label}: path state changed during re-upload; retry"
+        )));
+    };
+    if stored_hash.as_slice() != computed_hash || stored_size != computed_size as i64 {
+        warn!(
+            store_path = %store_path,
+            tenant_id = %tenant_id,
+            "{ctx_label}: re-upload of an existing path does not match its stored content; \
+             refusing to attribute"
+        );
+        metrics::counter!("rio_store_repush_attribution_total", "outcome" => "mismatch")
+            .increment(1);
+        return Err(Status::invalid_argument(format!(
+            "{ctx_label}: NAR validation failed: content does not match the \
+             already-stored path (hash or size differ)"
+        )));
+    }
+    metadata::upsert_path_tenant_in_conn(conn, store_path_hash, tenant_id)
+        .await
+        .status_internal("verified re-upload: path_tenants upsert")?;
+    debug!(
+        store_path = %store_path,
+        tenant_id = %tenant_id,
+        "{ctx_label}: content-verified re-upload attributed to pushing tenant"
+    );
+    metrics::counter!("rio_store_repush_attribution_total", "outcome" => "granted").increment(1);
+    Ok(())
 }
 
 // r[verify sec.drv.validate]

@@ -620,7 +620,10 @@ impl DagActor {
         // probe failure degrades to cache-miss (per-drv fallback
         // retries), not StoreUnavailable. The breaker is for merge-time
         // admission only — here the call IS the work.
-        let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+        let mut req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths,
+            require_tenant_attribution: false,
+        });
         Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
         let fmp_start = Instant::now();
         let resp =
@@ -1165,6 +1168,7 @@ impl DagActor {
         // failure = cache-miss → dispatch normally.
         let mut req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: paths.clone(),
+            require_tenant_attribution: false,
         });
         Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
         let fmp_start = Instant::now();

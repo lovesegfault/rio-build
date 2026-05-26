@@ -381,13 +381,18 @@ whose refcount drops to 0 become eligible for S3 deletion via
   16-minute upload over 50Mbps would be reaped at the 15-minute mark.
 ]
 
-#r("store.put.idempotent")[
+#r("store.put.idempotent+2")[
   *Idempotency:* If `PutPath` is called for a store path that already has a
-  `'complete'` manifest, the call returns success immediately without
-  re-uploading. This makes concurrent uploads of the same path safe.
+  `'complete'` manifest, the call succeeds without re-storing any content,
+  which makes concurrent uploads of the same path safe. Callers with no
+  tenant context --- and tenants that already hold attribution for the path
+  --- are short-circuited without reading the request stream; a tenant that
+  lacks attribution takes the content-verified re-upload of
+  #rref("store.put.tenant-attribution") instead (same success response, still
+  nothing re-stored, loud rejection on content mismatch).
 ]
 
-#r("store.put.tenant-attribution")[
+#r("store.put.tenant-attribution+2")[
   When `PutPath` or `PutPathBatch` commits an output and the request carries
   an authenticated tenant (the gateway-forwarded session JWT, `Claims.sub` ---
   the same identity narinfo signing uses), the store MUST upsert a
@@ -396,9 +401,17 @@ whose refcount drops to 0 become eligible for S3 deletion via
   DO NOTHING`, FK-guarded so a tenant deleted mid-upload degrades to "no row"
   rather than failing the commit). Requests with no tenant context (dev mode,
   service-token-only callers with no forwarded JWT) MUST NOT be attributed to
-  any tenant --- no row is written. The already-complete fast path
-  (#rref("store.put.idempotent")) does NOT grant attribution: it commits
-  nothing and the caller has proven possession of no content.
+  any tenant --- no row is written. When the path is already `'complete'` and
+  the authenticated tenant lacks attribution, the store MUST NOT short-circuit
+  before consuming the stream: it drains the full NAR, verifies the received
+  content's SHA-256 and size against the stored manifest, and on match upserts
+  the `path_tenants` row for the pushing tenant without rewriting chunks,
+  manifests, or narinfo; on mismatch the request is rejected and nothing is
+  attributed. A request that never streams the matching content (metadata-only
+  probe, missing trailer, early abort, wrong bytes) grants nothing. The
+  success response of a content-verified re-upload is indistinguishable from a
+  fresh upload's. Tenant-less callers and tenants that already hold
+  attribution keep the #rref("store.put.idempotent") fast path unchanged.
 ]
 
 Rationale: `path_tenants` is the read-time tenancy source of truth for the
@@ -413,12 +426,19 @@ tenant's own builds cannot mount their own sources through the tenant-scoped
 castore surface. Attribution rides the completion transaction (not a
 post-commit write) so a transient failure rolls the whole upload back and the
 client's retry re-attributes, instead of leaving a permanently
-complete-but-invisible path. Granting attribution on the already-complete
-fast path would let any tenant gain read access to any existing path by
-sending a metadata-only probe for its store path --- exactly the
-capability-by-hash-reference the castore design forbids; substituted paths
-keep their scheduler-side attribution and signature-gated visibility
-(#rref("store.substitute.tenant-sig-visibility")) for the same reason.
+complete-but-invisible path. The content-verified re-upload exists because a
+*second* tenant otherwise has no route to attribution for an already-present
+source: #rref("store.tenant.find-missing-attribution") makes its client
+re-push the path, and proof of possession of the full content --- not merely
+its store-path name --- is what earns the row. A metadata-only probe still
+gains nothing, so the capability-by-hash-reference the castore design forbids
+stays forbidden; the verification reuses the same streaming SHA-256 the fresh
+upload runs and never re-writes chunks or manifests, so the cost is one hash
+pass and one indexed row. The mismatch rejection is deliberately loud (a
+client claiming a path whose content differs is either corrupt or probing)
+but echoes neither the stored hash nor size; substituted paths keep their
+scheduler-side attribution and signature-gated visibility
+(#rref("store.substitute.tenant-sig-visibility")) exactly as before.
 
 #r("store.put.placeholder-refs")[
   The `'uploading'` placeholder narinfo MUST carry `references` from the
@@ -633,6 +653,33 @@ unique chunks.
   requests return unfiltered
   results for backward compatibility.
 ]
+
+#r("store.tenant.find-missing-attribution")[
+  When `FindMissingPathsRequest.require_tenant_attribution` is set and the
+  request carries an authenticated tenant identity (gateway-forwarded JWT
+  `Claims.sub`, or a service-asserted probe tenant), a locally-present path
+  MUST be reported as missing unless that tenant holds a `path_tenants` row
+  for it --- bytes-exist is not sufficient; `.drv` paths stay exempt
+  (#rref("gw.jwt.anon-drv-lookup")). Requests without the flag, or without a
+  tenant identity, keep the #rref("store.substitute.find-missing-gated")
+  semantics unchanged. The gateway MUST set the flag on the
+  `FindMissingPaths` call backing `wopQueryValidPaths`, and internal callers
+  (scheduler cache-check and substitution probes, builder upload pre-check,
+  delta-sync and `.drv`-inlining lookups) MUST NOT set it.
+]
+
+Rationale: `wopQueryValidPaths` decides what an ssh-ng client re-pushes, and
+the content-verified re-upload (#rref("store.put.tenant-attribution")) is an
+unattributed tenant's only route to attribution for an already-present
+source --- reporting such a path "valid" strands the tenant with bytes it
+cannot read through the tenant-scoped castore surface and poisons every
+build that mounts it. Hiding unattributed-but-present paths is the safe
+direction for the existence oracle (the answer is the same as for a truly
+absent path), and the flag can only narrow the caller's own view, never
+widen it. Internal callers must keep global-truth/sig-trust semantics: the
+scheduler's cache-check grants attribution itself on a hit (its
+`upsert_path_tenants` completion path), so flipping it would only trigger
+pointless re-substitution or re-builds of bytes the store already holds.
 
 == Key Rotation
 

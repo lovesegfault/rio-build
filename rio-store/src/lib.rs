@@ -156,6 +156,13 @@ pub fn describe_metrics() {
         "Bytes accepted via PutPath (nar_size on success)"
     );
     describe_counter!(
+        "rio_store_repush_attribution_total",
+        "Content-verified re-uploads of already-complete paths by a tenant lacking \
+         attribution, labeled by outcome: granted (content matched, path_tenants row \
+         written) | mismatch (claimed path's content differs — rejected, nothing \
+         attributed). A sustained mismatch rate is a probing or corrupt-client signal."
+    );
+    describe_counter!(
         "rio_store_get_path_bytes_total",
         "Bytes served via GetPath (nar_size on stream start)"
     );

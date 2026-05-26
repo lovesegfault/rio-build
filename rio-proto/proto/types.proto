@@ -362,6 +362,18 @@ message BatchGetManifestResponse {
 // Batch check which paths are missing from the store.
 message FindMissingPathsRequest {
   repeated string store_paths = 1;
+  // Client-push semantics (set by the gateway for wopQueryValidPaths):
+  // when true AND the request carries an authenticated tenant, a
+  // locally-present non-.drv path is reported missing unless that tenant
+  // holds a path_tenants attribution row for it — bytes-exist is not
+  // sufficient. This makes `nix copy` re-push sources the tenant cannot
+  // read through the tenant-scoped castore surface, and the verified
+  // re-upload then grants attribution (store.put.tenant-attribution).
+  // False (default) keeps the sig-trust visibility semantics
+  // (store.substitute.find-missing-gated) — the scheduler's cache-check
+  // and every other internal caller MUST NOT set this.
+  // r[store.tenant.find-missing-attribution] — wire surface
+  bool require_tenant_attribution = 2;
 }
 
 message FindMissingPathsResponse {

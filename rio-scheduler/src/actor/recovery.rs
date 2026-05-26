@@ -1231,7 +1231,10 @@ impl DagActor {
         let Some(client) = &mut self.store_client else {
             return None;
         };
-        let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+        let mut req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths,
+            require_tenant_attribution: false,
+        });
         rio_proto::interceptor::inject_current(req.metadata_mut());
         let grpc_timeout = self.grpc_timeout;
         let fmp_start = Instant::now();

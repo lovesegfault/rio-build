@@ -254,6 +254,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     let resp = client
         .find_missing_paths(FindMissingPathsRequest {
             store_paths: vec![path.clone()],
+            require_tenant_attribution: false,
         })
         .await?
         .into_inner();
@@ -332,6 +333,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     let resp = client
         .find_missing_paths(FindMissingPathsRequest {
             store_paths: vec![path.clone()],
+            require_tenant_attribution: false,
         })
         .await?
         .into_inner();

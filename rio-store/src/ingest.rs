@@ -65,7 +65,7 @@ pub struct IngestHooks {
     pub ctx_label: &'static str,
 }
 
-// r[impl store.put.idempotent]
+// r[impl store.put.idempotent+2]
 // r[impl store.put.stale-reclaim]
 /// Idempotency check + `status='uploading'` placeholder insert +
 /// hot-path stale-reclaim. The shared step-1 of the write-ahead flow.

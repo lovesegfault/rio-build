@@ -35,7 +35,9 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
-use super::put_path::common::{PlaceholderGuard, StagedOutput};
+use super::put_path::common::{
+    PlaceholderGuard, StagedOutput, verify_existing_and_attribute_in_conn,
+};
 use super::put_path::{
     PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
@@ -69,6 +71,13 @@ struct OutputAccum {
     /// we started. No placeholder, no commit for it — just
     /// `created=false` in the response.
     already_complete: bool,
+    /// Content-verified re-upload (`r[store.put.tenant-attribution+2]`):
+    /// the output was `already_complete` but the pushing tenant holds no
+    /// `path_tenants` row, and phase 1/2 verified the received NAR
+    /// against its own trailer. Phase 3 re-verifies it against the
+    /// STORED manifest inside the batch transaction and attributes the
+    /// tenant on match — no chunks or manifests are rewritten.
+    attribute_only: bool,
     /// Phase-2 staging result. `None` until phase 2 ran; carries the
     /// staged chunk set phase-3 flips durable alongside
     /// [`metadata::complete_manifest_in_conn`].
@@ -168,6 +177,21 @@ impl StoreServiceImpl {
                 Ok(PlaceholderClaim::AlreadyComplete) => {
                     accum.already_complete = true;
                     n_exists_emitted += 1;
+                    // r[impl store.put.tenant-attribution+2]
+                    // A tenant that lacks attribution for an
+                    // already-complete output gets the content-verified
+                    // re-upload: mark it for phase-3 verification +
+                    // attribution instead of silently skipping it.
+                    if let Some(tid) = auth.tenant_id {
+                        match self
+                            .tenant_has_attribution(&accum.store_path_hash, tid)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => accum.attribute_only = true,
+                            Err(e) => bail!(e),
+                        }
+                    }
                     continue;
                 }
                 Ok(PlaceholderClaim::Owned(c)) => c,
@@ -392,11 +416,14 @@ impl StoreServiceImpl {
     ///
     /// `tenant_id` (the session JWT tenant) attributes every committed
     /// output to the pushing tenant in the same transaction
-    /// (`r[store.put.tenant-attribution]`); `already_complete` outputs
-    /// are skipped — this request proved no content for them.
+    /// (`r[store.put.tenant-attribution+2]`); `already_complete` outputs
+    /// commit nothing — except the `attribute_only` subset, whose
+    /// received content is re-verified against the stored manifest and,
+    /// on match, attributed to the pushing tenant inside the same
+    /// transaction (the content-verified re-upload).
     // r[impl store.put.wal-manifest]
     // r[impl obs.metric.transfer-volume]
-    // r[impl store.put.tenant-attribution]
+    // r[impl store.put.tenant-attribution+2]
     async fn commit_batch(
         &self,
         outputs: &mut BTreeMap<u32, OutputAccum>,
@@ -413,6 +440,36 @@ impl StoreServiceImpl {
         let mut created = vec![false; max_idx + 1];
         for (idx, accum) in outputs.iter_mut() {
             if accum.already_complete {
+                // r[impl store.put.tenant-attribution+2]
+                // Content-verified re-upload: the received bytes already
+                // passed verify_nar against their own trailer in phase 2;
+                // re-verify them against the STORED manifest inside this
+                // transaction and attribute the pushing tenant. Nothing
+                // is staged or rewritten; a mismatch fails the whole
+                // batch (atomic semantics, loud rejection).
+                if accum.attribute_only
+                    && let Some(tid) = tenant_id
+                {
+                    let info = accum.info.as_ref().expect("validated in phase 2");
+                    if let Err(e) = verify_existing_and_attribute_in_conn(
+                        &mut tx,
+                        info.store_path.as_str(),
+                        &accum.store_path_hash,
+                        tid,
+                        info.nar_hash,
+                        info.nar_size,
+                        "PutPathBatch",
+                    )
+                    .await
+                    {
+                        drop(tx);
+                        return Err(e);
+                    }
+                    // Same response a fresh upload of this output would
+                    // produce — the caller cannot tell a verified
+                    // re-upload from a first upload.
+                    created[*idx as usize] = true;
+                }
                 continue;
             }
             let mut info = accum.info.clone().expect("validated in phase 2");
@@ -440,7 +497,7 @@ impl StoreServiceImpl {
                     e.into(),
                 ));
             }
-            // r[impl store.put.tenant-attribution]
+            // r[impl store.put.tenant-attribution+2]
             // Attribute the committed output to the pushing tenant in
             // the same tx as the 'complete' flip. Gateway-pushed sources
             // are not derivation outputs, so no scheduler upsert ever
@@ -478,8 +535,11 @@ impl StoreServiceImpl {
                 .expect("validated in phase 2, not taken");
             metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         }
-        for c in &created {
-            if *c {
+        for (idx, accum) in outputs.iter() {
+            // Attribute-only outputs already counted as `exists` in
+            // phase 2 — `created` is the wire response, not the
+            // freshly-stored count.
+            if created[*idx as usize] && !accum.already_complete {
                 metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
             }
         }

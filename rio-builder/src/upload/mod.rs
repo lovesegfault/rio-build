@@ -172,11 +172,11 @@ pub async fn upload_all_outputs(
     // Batch-check all outputs against the store BEFORE reading any bytes
     // from disk. Outputs with a `'complete'` manifest are skipped: the
     // fused-walk disk read, gRPC stream setup, and chunk re-reads are
-    // all wasted work when r[store.put.idempotent] would no-op
+    // all wasted work when r[store.put.idempotent+2] would no-op
     // server-side anyway.
     //
     // Best-effort: on FindMissingPaths error, log + treat ALL as missing.
-    // r[store.put.idempotent] catches the duplicates server-side — zero
+    // r[store.put.idempotent+2] catches the duplicates server-side — zero
     // behavior change from before this pre-check existed. This is an
     // optimization, not a correctness requirement.
     let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
@@ -345,7 +345,12 @@ async fn partition_by_presence(
     store_paths: Vec<String>,
 ) -> (Vec<String>, Vec<ValidatedPathInfo>) {
     let mut client = store_client.clone();
-    let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+    // Global-truth presence check (no client-push semantics): the upload
+    // pre-check only cares whether the bytes are already stored.
+    let mut req = tonic::Request::new(FindMissingPathsRequest {
+        store_paths,
+        require_tenant_attribution: false,
+    });
     rio_proto::interceptor::inject_current(req.metadata_mut());
 
     let missing: std::collections::HashSet<String> = match rio_common::grpc::with_timeout_status(
@@ -1321,7 +1326,7 @@ mod tests {
     }
 
     /// FindMissingPaths errors → fall back to upload-all. Best-effort:
-    /// store transient doesn't break the upload; r[store.put.idempotent]
+    /// store transient doesn't break the upload; r[store.put.idempotent+2]
     /// catches duplicates server-side. Zero behavior change from the
     /// pre-precheck world.
     #[tokio::test]

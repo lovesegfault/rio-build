@@ -35,6 +35,7 @@ bool dry_run = 1;
 bool executable = 4;
 bool is_complete = 4;
 bool recursive = 2;
+bool require_tenant_attribution = 2;
 bool send_chunks = 2;
 bool ultimate = 8;
 bytes bitmap = 1;

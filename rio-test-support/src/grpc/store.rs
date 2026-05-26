@@ -96,6 +96,12 @@ pub struct MockStoreCalls {
     /// proving deferred FODs use the batch pre-pass (1 RPC) and skip
     /// the per-FOD `fod_outputs_in_store` fallback (would be N+1).
     pub find_missing_calls: Arc<AtomicU32>,
+    /// Every `find_missing_paths` request received (recorded after the
+    /// fail-injection check). Lets gateway wire tests assert the
+    /// request SHAPE — e.g. that `wopQueryValidPaths` sets
+    /// `require_tenant_attribution` while other callers leave it unset
+    /// (`r[store.tenant.find-missing-attribution]`).
+    pub find_missing_requests: Arc<RwLock<Vec<types::FindMissingPathsRequest>>>,
     /// `manifest_hint` from each `get_path` call (None if unset).
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
@@ -1245,7 +1251,13 @@ impl StoreService for MockStore {
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }
-        let requested = request.into_inner().store_paths;
+        let req = request.into_inner();
+        self.calls
+            .find_missing_requests
+            .write()
+            .unwrap()
+            .push(req.clone());
+        let requested = req.store_paths;
         for p in &requested {
             let _ = rio_nix::store_path::StorePath::parse(p)
                 .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;

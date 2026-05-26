@@ -387,7 +387,7 @@ async fn test_idempotent_put_path() -> TestResult {
 /// raced after the first completed) or Aborted (if it raced into the
 /// in-progress window). Never: both created=true, or the loser's cleanup
 /// deleting the winner's placeholder.
-// r[verify store.put.idempotent]
+// r[verify store.put.idempotent+2]
 #[tokio::test]
 async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     let mut s = StoreSession::new().await?;
@@ -862,7 +862,10 @@ async fn test_find_missing_paths_rejects_oversized_batch() -> TestResult {
         .collect();
 
     let result = client
-        .find_missing_paths(FindMissingPathsRequest { store_paths: paths })
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: paths,
+            require_tenant_attribution: false,
+        })
         .await;
 
     assert!(result.is_err(), "oversized batch should be rejected");

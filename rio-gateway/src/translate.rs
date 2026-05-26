@@ -594,6 +594,7 @@ pub async fn filter_and_inline_drv(
             // content (an optimization), not tenant-scoped visibility.
             store_client.find_missing_paths(types::FindMissingPathsRequest {
                 store_paths: all_outputs,
+                require_tenant_attribution: false,
             }),
         )
         .await
