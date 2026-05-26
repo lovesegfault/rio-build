@@ -11,16 +11,538 @@ is `executor-inventory.md` (snapshot `e650f23a4`, 2026-05-25),
 re-pinned below. The methodology is the one proven on rio-lease, the
 log subsystem, retry-formal, refcount, and the controller campaign.
 
-This file is the campaign artifact. Stage 0a (this commit set) adds
-the churn pin, the inventory re-pin, the corpus pin with its
-pre-registered partition, the encodability pre-registration, and the
-open-adjudication tracking. Stage 0b adds the invariant ↔ rule map
-proper (one subsection per F1–F8 invariant), the new spec rules, the
-contradiction records, and the witness / as-built-falsification
-pre-registrations. Stage 0c adds the Stage-B model verdicts
-(`executorSession.qnt`, `executorDelivery.qnt`). Stage 0d adds the
-Stage-C calibration table against the corpus pinned here. Stage 0e
-adds the frozen replacement contract and the go/no-go record.
+This file is the campaign artifact. Stage 0a (landed) added the churn
+pin, the inventory re-pin, the corpus pin with its pre-registered
+partition, the encodability pre-registration, and the
+open-adjudication tracking. Stage 0b (this section set, directly
+below) adds the invariant ↔ rule map proper (one subsection per F1–F8
+invariant), the new spec rules, the contradiction records, and the
+witness / as-built-falsification pre-registrations. Stage 0c adds the
+Stage-B model verdicts (`executorSession.qnt`, `executorDelivery.qnt`).
+Stage 0d adds the Stage-C calibration table against the corpus pinned
+here. Stage 0e adds the frozen replacement contract and the go/no-go
+record.
+
+## The decision sites (the columns of every row below)
+
+The unit of audit is the repair mechanism / decision site, not the
+file: the rows below cite the 0a-pinned anchors of the inventory's
+mechanism tables — scheduler #1–#22, builder B1–B9, controller C1–C6
+(see "Inventory re-pin: anchor re-verification" below for the
+file:line of every one at the pin) — plus the non-repair decision
+sites of the dispatch/intake path:
+
+| Site | What decides there | At the 0a pin |
+|---|---|---|
+| connect / accept-gate | stream accept, hijack/intent rejection, epoch + `auth_intent` stamp, stale-flag clear | `grpc/executor_service.rs:208-239`, `actor/executor.rs:116-247` (#5, #6) |
+| heartbeat intake | entry-existence drop (I-048b), spoof guard, field refresh, running-build reconcile (keep / adopt / two-strike), capacity edge, registration edge | `actor/executor.rs:1444` (handler), `:1680` (reconcile), `:1860` (adopt), `:1803` (drain_phantoms) (#7–#10, #22) |
+| eligibility / placement | `rejection_reason` clause chain, `has_capacity`, `statically_eligible`, warm two-pass, intent-match | `assignment.rs:25/:136/:175`, `dispatch.rs:1631+` (#11) |
+| assignment push | 4-phase `assign_to_worker` (transition, persist + exec_id mint + pin, `try_send`, events) and its rollback | `dispatch.rs:1851+`, rollback `:2077` (#18) |
+| completion intake | slot free hoist, `last_completed`, one-shot draining, output validation, idempotency / staleness guards, retry-fold routing | `completion.rs:898-1110` (#12, #13) |
+| disconnect / reap / report | stale-epoch filter, mid-build discriminator, reassign, termination-report dedup + prefix-match, TTL sweep / establishment, backstop | `actor/executor.rs:347/:565/:676/:1168`, `housekeeping.rs:296/:314` (#1–#4, #14–#17) |
+| failover edges | `clear_persisted_state`, leader gates, 45 s reconcile sweep | `actor/mod.rs:872/:1190`, `recovery.rs:1779/:2153` (#19, #21) |
+| builder delivery / exit | send chokepoint, sink + relay swap, half-close, drain gate, idle exit, generation fence, slot claim | `runtime/result.rs:239`, `runtime/mod.rs:907-912/:1054/:985`, `runtime/drain.rs:37-120`, `runtime/slot.rs:63` (B1–B9) |
+| controller Job view | spawn / reap / ack tick, orphan + excess reaps, termination reports, disruption watcher | `pool/jobs.rs:785+`, `pool/job.rs:373/:496/:990/:1090`, `pool/disruption.rs` (C1–C6) |
+
+## The invariant ↔ rule map (Stage A)
+
+Verdict legend: **COVERS** — the rule's normative sentence states the
+invariant (or the load-bearing piece of it). **PARTIAL** — the rule
+states a piece; the missing piece is named. **GAP** — no rule stated
+it; closed by a new `#r()` rule in this audit (the new rules carry the
+design §3.1/§3.3 invariant definitions as their normative bodies).
+**CONTRADICTION** — the code does not do what the rule says it MUST;
+recorded in the contradiction table below, never fixed and never
+modeled around in Phase 0.
+
+The five new rules added by this audit (T-0b.2):
+`sched.executor.session-epoch`, `sched.executor.liveness-window`,
+`sched.executor.repair-precedence`, `sched.executor.one-shot`
+(`docs/spec/components/scheduler.typ`, Executor Registration Protocol
+section), and `builder.completion.exactly-once-or-death`
+(`docs/spec/components/builder.typ`, Stream Relay & Reconnect
+section). Existing rule text is NOT amended in Phase 0; no tracey
+bumps were needed.
+
+### F1 — Session identity (Model S)
+
+#### `AtMostOneLiveStreamPerExecutor`
+
+*At most one live `BuildExecution` stream is bound to an executor id
+at any time; an accepted reconnect replaces the binding, a rejected
+one changes nothing.*
+
+Sites: #6 (accept-gate `executor_service.rs:226-239`, actor reject
+`actor/executor.rs:148-176`), #5 (reconnect reuse). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sec.executor.identity-token+2` | **COVERS** (the reject half) | A reconnect whose token intent differs from the stored `auth_intent` *or whose existing stream is still live* MUST be rejected, and the handler MUST learn the actor's accept/reject decision before spawning the reader — the hijack and duplicate-stream arms are already normative here. |
+| `sched.executor.session-epoch` *(new)* | **COVERS** (the replace half) | An accepted reconnect replaces `stream_tx` and `stream_epoch` together, so the entry never holds two live streams; events from the replaced stream become stale by construction. Was a GAP. |
+| `sched.executor.dual-register` | PARTIAL | States the two-step registration; says nothing about second streams or replacement. The mechanism-description staleness in its prose is a near-miss (below), not load-bearing for this invariant. |
+
+#### `StaleStreamEventsAreInert`
+
+*A disconnect / flag write / session event from epoch N mutates
+nothing once the slot is at epoch M>N.*
+
+Sites: #4 (`actor/executor.rs:363-371`), #1 (reaper synthesizes at
+current epoch, `housekeeping.rs:304-310`), #5 (clear-on-reconnect
+scopes flags to the new session). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.session-epoch` *(new)* | **COVERS** | Was a GAP — the I-056a stale-disconnect filter existed only as code + incident comment. The rule states attribution (epoch carried by reader-task and reaper-synthesized disconnects) and inertness (no removal, no reassign, no gauge decrement). |
+| `sched.executor.deregister-reassign` | CONTRADICTION (C2) | Its unqualified "removed when the stream is closed" does not hold for a stale-epoch close — recorded in the contradiction table; the code is correct and the qualification is now normative in the new rule. |
+
+#### `RegistrationRequiresBothHalves`
+
+*No dispatch to a slot that lacks either the stream or a first
+heartbeat; heartbeats never create entries.*
+
+Sites: #7 (I-048b drop, `actor/executor.rs:1446-1467`),
+`is_registered` (`state/executor.rs:229`), the registration edge in
+`handle_heartbeat`. Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.dual-register` | **COVERS** (the both-halves requirement) | Dispatchable only once both the stream and the first heartbeat have landed. |
+| `sched.executor.session-epoch` *(new)* | **COVERS** (the never-create half) | "A heartbeat for an `executor_id` with no live entry MUST NOT create session state" — the I-048b zombie-prevention arm, previously code-only. |
+
+### F2 — Outcome delivery (Models S + D)
+
+#### `ClaimedSlotResolvesAtMostOnce` (S)
+
+*An accepted assignment is never counted as both a leader-observed
+completion and a repair return-to-Ready, and no second resolution is
+recorded after either.*
+
+Sites: #12 (idempotency / staleness guards `completion.rs:1059-1110`),
+#15 (termination dedup `actor/executor.rs:710-752`), #10 (phantom
+ownership check), #17 (backstop acts only on still-Running). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.completion.idempotent` | **COVERS** (the report-side half) | Already-completed, cancelled-expected, not-Assigned/Running, and stale-executor reports are accepted-and-ignored. |
+| `sched.executor.repair-precedence` *(new)* | **COVERS** (the cross-mechanism half) | After any one mechanism resolves a claim, every later observer MUST find a terminal status / non-owner mismatch and change nothing. Was a GAP as a composition statement. |
+| `sched.retry.no-double-count` | **COVERS** (the accounting projection) | Retry-campaign rule; imported, not re-stated. |
+
+#### `UnresolvedClaimHasRepairArmed` (S, armed safety)
+
+*In every state where an accepted assignment is neither completed nor
+returned to Ready, at least one repair mechanism is enabled for it.*
+
+Sites: #1/#3 (disconnect → reassign), #10 (phantom two-strike), #17
+(backstop), #19 (post-failover sweep), B1–B4 (the builder still owes
+the report). Model S (with the builder obligation discharged by Model
+D).
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.repair-precedence` *(new)* | **COVERS** (the armed-safety statement) | "While the report has not arrived, at least one repair MUST remain armed for the claim" — previously each arm was specified alone and nothing stated that the disjunction is exhaustive. Was a GAP. |
+| `sched.executor.deregister-reassign` | **COVERS** (its arm) | Stream-close / heartbeat-timeout → reassign. |
+| `sched.heartbeat.phantom-drain+2` | **COVERS** (its arm) | Two-strike phantom → reset to Ready. |
+| `sched.backstop.timeout+3` | **COVERS** (its arm) | Heartbeating-but-wedged → cancel + quarantine + requeue. |
+| `builder.completion.exactly-once-or-death` *(new)* | **COVERS** (the peer obligation) | The builder delivers the report or dies trying; pod death re-arms the scheduler-side repairs via the death channels. |
+| `sched.executor.liveness-window` *(new)* | **COVERS** (the arming bounds) | The windows after which each arm is enabled are now normative values. |
+
+#### `NoFabricatedCompletion` (S)
+
+*No mechanism invents a completion for a build the worker did not
+report; repair paths return work to Ready (or adopt store-present
+outputs) without synthesizing worker outcomes.*
+
+Sites: #19 (store-probe adopt vs reset, `recovery.rs:1779+`), #10
+(phantom drain charges nothing), the gRPC empty-result synthesis
+(`executor_service.rs:380-395` — a worker-sent report with a missing
+payload becomes InfrastructureFailure; documented bound, not
+fabrication: the worker did report). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.repair-precedence` *(new)* | **COVERS** | The post-failover class: the store probe decides adopt-as-completed vs reset-to-Ready and MUST NOT fabricate a completion or charge an attempt for a derivation it merely resets; the phantom drain MUST NOT charge. Was a GAP. |
+| `builder.completion.exactly-once-or-death` *(new)* | **COVERS** (worker side) | The builder MUST NOT fabricate a report for an assignment it did not accept. |
+
+#### `ReportSurvivesStreamChurn` (D)
+
+*A terminal outcome queued for delivery survives stream loss, leader
+failover, and relay swaps until it reaches a live leader.*
+
+Sites: B1 (`runtime/mod.rs:814+`), B2 (swap-after-Ok `:907-912`), B4
+(`completion_pending` + sink, `result.rs:227-253`,
+`drain.rs:37-120`). Model D.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `builder.relay.reconnect` | **COVERS** | Permanent sink, parked relay, biased re-resolve, in-transit message recovery. |
+| `builder.completion.pending-armed-early` | **COVERS** (the panic path) | The flag means "owed", armed before the first await. |
+| `builder.relay.graceful-exit-close` | **COVERS** (the exit edge) | Flush before stream drop. |
+| `builder.completion.exactly-once-or-death` *(new)* | **COVERS** (top-level obligation) | The end-to-end exactly-once-or-death statement Model D checks; previously implicit in the four mechanism rules. Was a GAP as a composition statement. |
+
+#### `NoExitWithReportOwed` (D)
+
+*No graceful exit path runs while a completion is owed and not yet
+flushed to a confirmed-open stream.*
+
+Sites: B3 (half-close `runtime/mod.rs:1054+`), B4 (drain gate
+`drain.rs:85-120`), the idle fast-path gate. Model D.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `builder.shutdown.idle-no-reregister+2` | **COVERS** (the drain/idle fast-path gate) | Break only when draining ∧ slot idle ∧ no completion pending; reconnect-once-to-flush otherwise. |
+| `builder.relay.graceful-exit-close` | **COVERS** (the flush) | Park + drain to server-close before dropping the stream. |
+| `builder.completion.exactly-once-or-death` *(new)* | **COVERS** | The general "no graceful exit while `completion_pending`" MUST. |
+| `builder.idle-exit+2` | adjacent | The idle exit takes the same flushed BuildComplete exit path; no separate verdict needed. |
+
+### F3 — Liveness calibration (Model S)
+
+#### `NoReapWhileFreshInWorkerTime`
+
+*A slot whose worker heartbeated within the timeout bucket (net of
+stall credit) is never reaped, never marked phantom-suspect, and never
+excluded from dispatch by bookkeeping alone.*
+
+Sites: #1 (`housekeeping.rs:296-312`), #2 (stall credit `:240-248`),
+B8 (heartbeat RPC bound `runtime/heartbeat.rs:24-36`), #10 (two-strike
+discipline). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.liveness-window` *(new)* | **COVERS** | Worker-time measurement (stall credit) + the 30 s value + the two-strike phantom window. Was a GAP (numbers and discipline were code constants + incident comments). |
+| `sched.executor.deregister-reassign` | PARTIAL | States the 30 s derivation but not the worker-time discipline. |
+| `builder.heartbeat.rpc-timeout` | **COVERS** (builder half) | One stalled RPC must not consume the whole missed-heartbeat budget (bug_044). |
+
+#### `SilentSlotReapArmed` (enabled-implies-fires)
+
+*Once a slot is past the timeout bucket measured in worker time, the
+reaper action is enabled for it, a reaper tick taken in that state
+reaps it, and no non-heartbeat action disables it.*
+
+Sites: #1, #2. Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.deregister-reassign` | **COVERS** | Timeout ⇒ deregister + reassign is already normative. |
+| `sched.executor.liveness-window` *(new)* | **COVERS** (the value + the only-credit-disables discipline) | Stall credit is the only thing that legitimately moves `last_heartbeat` forward without a heartbeat. |
+
+### F4 — Death attribution (Model S; the lifecycle the retry model takes as given)
+
+`OnePodDeathAtMostOneCharge` and `TrueReasonWins` are imported from
+`retryPolicy.qnt` (`attemptsChargedOnce`, channel invariance) and are
+NOT re-stated here; what Model S owns is the lifecycle of the dedup
+state.
+
+#### `CorrelationEntryLifecycle`
+
+*A `recently_disconnected` entry is created only by a mid-build
+disconnect, consumed by exactly one of {classifying report,
+establishment}, and swept only after the TTL.*
+
+Sites: #14 (insert `actor/executor.rs:408-440`, sweep `:1168-1290`),
+#15 (consume `:718-752`, race-ahead arm), #13 (`last_completed`
+discriminator `completion.rs:1000-1007`). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.reassign.no-promote-on-ephemeral-disconnect+4` | **COVERS** (create + TTL + controller authority) | Mid-build-only insert, 60 s TTL, controller-authoritative reason, no entry after `last_completed == running_build`. |
+| `sched.retry.no-double-count` | **COVERS** (consume-once) | Retry-campaign rule; its rationale prose names first-report-wins, race-ahead, and the non-promoting early return. |
+| `sched.executor.repair-precedence` *(new)* | **COVERS** (the winner/loser form) | First classifying observation wins; a non-promoting report MUST NOT consume the entry. |
+| `sched.executor.liveness-window` *(new)* | **COVERS** (the TTL value) | 60 s as a normative number. |
+
+#### `EstablishmentOnlyAfterWindowCloses`
+
+*An unreported executor crash is established (charged, classified
+`unreported`) only when the correlation window closes with no
+classifying report — never earlier, and a non-promoting report does
+not establish.*
+
+Sites: #14's sweep (`actor/executor.rs:1168-1290`,
+`TERMINATION_REPORT_TTL`), #15's non-promoting gate (`:692-708`).
+Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.liveness-window` *(new)* | **COVERS** | "Establishment … MUST fire only when the window closes with no classifying report, never earlier." Was a GAP. |
+| `sched.retry.per-executor-budget+2` | PARTIAL | Names the establishment vehicle and that established crashes count toward the threshold; does not state the window discipline. |
+| `sched.executor.repair-precedence` *(new)* | **COVERS** (the non-promoting clause) | A non-promoting report neither consumes the entry nor establishes. |
+
+### F5 — Eligibility coherence (Model S)
+
+#### `NeverOfferUnrunnableWork`
+
+*No assignment is pushed to a slot that is draining, degraded, at
+capacity, closed-stream, kind/system/feature-mismatched, or in the
+drv's exclusion set.*
+
+Sites: the `rejection_reason` chain (`assignment.rs:25-113`),
+`has_capacity` (`state/executor.rs:240-249`, incl. the I-095
+`is_closed` arm, #11), `statically_eligible` (`assignment.rs:136`),
+B6 (builder-side reject). Model S (the clause *content* — the
+kind/system/feature arithmetic — is pre-registered NOT-ENCODED; the
+model carries the flags).
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.dispatch.fod-to-fetcher` | **COVERS** (kind clause) | FODs only to fetchers, non-FODs only to builders. |
+| `sched.assign.resource-fit` | **COVERS** (resource clause) | Solved memory must fit the worker's cgroup limit. |
+| `sched.executor.dual-register` | **COVERS** (registered clause) | No dispatch before both registration halves. |
+| `sched.ephemeral.no-redispatch-after-completion` / `sched.executor.one-shot` *(new)* | **COVERS** (draining-after-completion clause) | The freed slot is never re-offered. |
+| `builder.heartbeat.store-degraded` | **COVERS** (degraded clause) | Degraded executor excluded from assignment. |
+| `sched.retry.per-executor-budget+2` | **COVERS** (exclusion-set clause) | `failed_builders` membership excludes; retry-owned. |
+| `sched.dispatch.fleet-exhaust+3` | **COVERS** (the statically-eligible fleet definition + draining exclusion) | |
+| — | named gap (deliberate) | The closed-stream (I-095) and at-capacity clauses are code-defined (`has_capacity`) with no rule of their own; Model S encodes them as the HalfDead stream state and the running_build slot, and the design adds no new rule for them in Phase 0. Recorded so the omission is explicit. |
+
+#### `EligibleWorkOfferedWithinBound` (bounded safety)
+
+*If a Ready drv has had ≥1 eligible registered slot with free capacity
+continuously for STARVE_BOUND dispatch ticks, an offer or an explicit
+rejection_reason has been recorded for it.*
+
+Sites: dispatch pacing (`dispatch.rs:113/268/354`,
+`actor/mod.rs:1148+`), the became-idle carve-out, the freeze/
+unroutable observables. Model S (STARVE_BOUND is a model constant,
+not a spec number — recorded as a model-side bound).
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.dispatch.became-idle-immediate` | **COVERS** (the 0→1 edge) | Inline dispatch on capacity appearance, capped. |
+| `sched.actor.dispatch-decoupled` | **COVERS** (the trigger discipline) | Heartbeats coalesce to ≤1 dispatch pass per Tick — the deferral is bounded by one tick. |
+| `sched.dispatch.unroutable-system+2` | **COVERS** (the no-pool observable) | |
+| `sched.dispatch.fleet-exhaust+3` | **COVERS** (empty-fleet defers, never poisons) | |
+| `sched.freeze-detector` | **COVERS** (the queue-with-no-stream observable) | |
+
+#### `RollbackRestoresExactly`
+
+*A failed push leaves no half-recorded assignment.*
+
+Sites: #18 (`dispatch.rs:2077+`). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.executor.repair-precedence` *(new)* | **COVERS** | The failed-push class: same-actor-turn rollback of status, rows, pins, `running_build`; no attempt charged. Was a GAP (rollback was code-only). |
+
+### F6 — Failover convergence (Model S)
+
+#### `DeposedLeaderSessionEventsAreInert`
+
+*A deposed leader's session events mutate nothing durable; non-vacuity
+(the deposed-believer window stays reachable) is pinned by an
+expect-violation witness in the fault-leader regime.*
+
+Sites: #21 (`actor/mod.rs:872/:1190` + per-handler gates),
+`reassign_derivations`' leader gate (`actor/executor.rs:565+`), the
+gRPC reader fence, B5 (worker-side generation latch). Model S
+(fault-leader regime; lease guarantees imported per the 0c checklist,
+not re-modeled).
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.lease.standby-drops-writes` | **COVERS** | The PG-write ban, the generation-fenced reader, the gated actor arms (ProcessCompletion, ReportExecutorTermination, ReconcileAssignments, Tick, …) and the individually-gated sub-calls (reassign, drain_phantoms, dispatch). |
+| `sched.reconcile.leader-gate` | **COVERS** (the reconcile arm) | The 45 s timer early-returns when not leader. |
+| `sched.lease.generation-fence+2` | **COVERS** (the executor-side fence) | Workers reject assignments from older generations. |
+| `sched.lease.claim-before-advertise` | **COVERS** (the advertise gate) | No generation advertised before recovery completes. |
+| `sched.recovery.gate-dispatch` | **COVERS** (the dispatch gate) | No dispatch from a partially-recovered DAG. |
+
+#### `ConvergenceToGroundTruth` (per-action form)
+
+*Every recovery/reconcile action on a PG-Assigned/Running drv either
+adopts it or resets it to Ready; no drv is both adopted and reset; no
+attempt is fabricated; after the sweep no such drv remains
+unresolved.*
+
+Sites: #19 (`recovery.rs:1779+`, RECONCILE_DELAY `:2153`), #9 (adopt
+`actor/executor.rs:1860+`), #8 (TOCTOU keep). Model S.
+
+| Rule | Verdict | Audit finding |
+|---|---|---|
+| `sched.heartbeat.adopt` | **COVERS** (the adopt half) | Worker-authoritative re-learn into both the slot and the DAG. |
+| `sched.executor.repair-precedence` *(new)* | **COVERS** (the arbitration) | Live reconnection + adopt win over the timed sweep; deferral of stream-but-no-heartbeat workers; store probe decides; never fabricate. Was a GAP. |
+| `sched.executor.liveness-window` *(new)* | **COVERS** (the 45 s) | |
+| `sched.retry.recovery-projection+2` | adjacent (imported) | The ledger/counter projection on recovery is the retry campaign's rule; not re-stated. |
+
+### F7 — Fleet supply coherence (NOT re-modeled)
+
+`spawnCoherence.qnt` (controller campaign, Stage B all-HOLD) owns the
+controller half; Model S states the scheduler-side obligations it
+imports as guarantees, carried by existing rules — no new rule needed:
+
+| Obligation (imported by Model J/N) | Carried by | Verdict |
+|---|---|---|
+| `ListExecutors` busy-accuracy + freshness caveat the orphan-reap gate consumes | `sched.admin.list-executors`, `sched.admin.list-executors-leader-age` | **COVERS** |
+| Ack / ICE arming on the registration edge (`dispatched_cells` lifecycle, #22) | `sched.sla.hw-class.ice-mask` (scheduler-side ICE state), `ctrl.pool.ack-spawned-soundness` (controller half, that campaign's map) | **COVERS** (split across the two maps) |
+| Termination-report idempotency | `sched.completion.idempotent`, `sched.retry.no-double-count`, the `drv_attempts` fill guard (retry campaign) | **COVERS** |
+| `dead_nodes` hung-node signal for Model N's health reap | `sched.admin.hung-node-detector+3` | **COVERS** (its successor is OA2) |
+
+The G7 scheduler-side in-family rows (ICE arm/clear semantics) are
+calibrated at 0d against these guarantees; the controller half is
+cross-referenced to the controller campaign's calibration table, not
+re-run.
+
+### F8 — Input hardening (NOT-ENCODED by design)
+
+Bounds and binding gates at the gRPC boundary; no protocol state.
+Verification stays with the existing unit tests and bounds checks.
+
+| Rule | Verdict |
+|---|---|
+| `sched.executor.input-bounds+2` | **COVERS** |
+| `sched.completion.output-membership` | **COVERS** |
+| `sched.log.phase-binding`, `sched.log.path-length+2` | **COVERS** |
+| `sec.executor.identity-token+2` | **COVERS** (also load-bearing for F1) |
+
+## Contradiction records (Stage A)
+
+The code does not do what a rule (or another spec source) says it
+MUST. Recorded with their adjudication; production code and existing
+rule text are unchanged in Phase 0 (amendments are Phase-1 spec
+consequences). **None of the four looks like a live production
+defect** — in every row the as-built behavior is the deliberate,
+correct one and the spec text is stale, over-broad, or pending an
+already-tracked adjudication.
+
+| # | Spec source(s) | What the spec says | What the code does | Adjudication |
+|---|---|---|---|---|
+| C1 | `sla-sizing.typ` `@alg-pool` ("create pods for placed ∧ eta=0", annotated *bind-ready only*) and its §13b prose ("Builder pods are created only for Ready intents that the FFD sim placed on a Registered node") vs `ctrl.nodeclaim.placeable-gate+5` | Pod/Job creation is gated on the intent being Ready (eta=0) at placement time. | The placeable gate publishes every FFD-placed-on-Registered Builder intent with **no ready filter** (`pool/jobs.rs:353-397`), so forecast (ready=false) intents reach the Job spawner; such a pod registers, has its reservation downgraded, and idles to the I-116 exit if its drv never becomes Ready (the OA6 bookkeeping note in the 0a section). | Spec-vs-spec-vs-code tension already tracked as OA6 (0e-blocking, jointly owned with the controller campaign). Recorded here regardless of which OA6 option 0e takes; neither source is amended in Phase 0. Cost today is forecast-pod churn (idle exits), not a correctness defect. |
+| C2 | `sched.executor.deregister-reassign` | "An executor is removed from the scheduler's state when: the `BuildExecution` stream is closed …" — unqualified. | A stale-epoch stream close (the I-056a late-disconnect half) removes nothing: `handle_executor_disconnected` drops events whose epoch differs from the entry's current `stream_epoch` (`actor/executor.rs:363-371`). | Code is correct (removing on the stale close evicts a freshly-reconnected worker). The epoch qualification is now normative in `sched.executor.session-epoch`, which composes with this rule by cross-reference; amending the deregister rule's own sentence is a Phase-1 consequence, deliberately not done now. |
+| C3 | `controller.typ` Executor Lifecycle prose (the SIGTERM-drain step list: "Send `AdminService.DrainExecutor` (best-effort exit deregister) and exit 0") vs `builder.ephemeral.exit-aborts-heartbeat+2` | The builder calls `DrainExecutor` on its way out. | The builder does NOT call `DrainExecutor` — the service-token gate allowlists controller and rio-cli only, and the builder is intentionally excluded (the rule states this; the as-built deregistration is stream-close → `ExecutorDisconnected`). | Two spec sources contradict; the builder rule + code are authoritative, the controller-side prose is stale (it predates the service-token gating). Prose amendment deferred (it is narrative text outside any rule body); recorded so the staleness is on the record. |
+| C4 | `sla-sizing.typ` `@alg-pool` `dead_nodes` annotation ("≥ max(3, ⌈0.5·occupancy⌉) executors … reset when all live executors on n heartbeat") vs `sched.admin.hung-node-detector+3` | Hung-node floor of 3 stale executors; signal reset when the node's executors heartbeat again. | Floor is `max(2, ⌈0.5·occupancy⌉)` (the rule's deliberate `2`-floor recalibration for busy-only occupancy) and the repeat signal is retained by TTL only (`HUNG_NODE_REPEAT_TTL`, mb_001a) — recovered nodes age out rather than being reset by heartbeats. | The rule (+3) and the code agree; the `@alg-pool` annotation is stale on both counts. Spec-vs-spec, no behavior question; amendment of the sla-sizing annotation deferred to its next substantive edit (Phase 1 at the latest). |
+
+Near-misses recorded for a later prose pass, not classified as
+contradictions of a MUST:
+
+- `sched.executor.dual-register`'s mechanism description: the entry is
+  created at stream-connect (`handle_worker_connected`), not at the
+  first heartbeat, and `executor_id` is the pod *name* (downward API),
+  not "derived from pod UID". The normative content (dispatchable only
+  after both halves) is unaffected.
+- `sched.executor.deregister-reassign`'s "all derivations in
+  `assigned` state … transitioned back to `ready`": the as-built
+  reassign also covers Running, re-checks the poison threshold, and
+  may poison instead of requeue (the retry fold's verdict); the
+  sentence under-describes rather than contradicts.
+- `ctrl.pool.ephemeral+1`'s ClusterStatus-polling sentence — already
+  recorded as a near-miss in `controller-invariant-map.md`; not
+  repeated here.
+
+## Expected as-built falsifications (pre-registered): none
+
+The design (§3.1) expects no §3.3 invariant to falsify against the
+as-built code at the §3.2 bounds — the known defect classes in this
+subsystem were fixed as they were found (the 50-commit in-family
+corpus is the evidence), and the four contradictions above are
+spec-text findings whose adjudication keeps the code as-is. The list
+is therefore **empty**, which makes any Stage-B (0c) falsification a
+stop-and-report by definition: work pauses, the counterexample is
+written up (the `phase2-falsification-*` format), and the campaign
+owner adjudicates "model encoding bug" vs "real as-built defect"
+before Stage B resumes. A real defect found that way is recorded here
+as a known-defect row and handed to the normal fix process — never
+fixed inside Phase 0 and never modeled around.
+
+## Witness pre-registration (the §3.5 non-vacuity obligations)
+
+Every contended precondition gets an expect-violation witness at 0c;
+a witness that stops violating after any later bound change is a red
+check by construction. Pre-registered now so 0c wires exactly this
+list:
+
+Model S (`executorSession.qnt`):
+
+1. a phantom is constructible (assignment accepted, report never
+   arrives, two heartbeat misses);
+2. a half-dead stream is reachable (stream open, sends fail);
+3. a stale-epoch disconnect arrives after a reconnect;
+4. an adopt happens (worker reports a build the scheduler lost);
+5. a reap fires only after stall credit (scheduler stall alone never
+   reaps);
+6. one pod death is observed by ≥2 channels;
+7. a failover occurs with an in-flight build;
+8. a drain coexists with a pending completion;
+9. the deposed-believer window is reachable (F6 non-vacuity, pinned in
+   the fault-leader regime).
+
+Model D (`executorDelivery.qnt`):
+
+10. a relay swap happens while a report is owed;
+11. an in-flight cell is dropped by a stream that fails to confirm;
+12. the half-close flush path is reachable;
+13. exit is blocked while the sink is non-empty.
+
+## Corpus partition counts (T-0b.4 fold)
+
+The per-bucket and per-family counts pre-registered at 0a (50
+in-family / 21 retry-owned / 43 controller-owned / 56 out-of-scope of
+170, and the per-family G1–G8 split) stand unchanged as the Stage-A
+record and remain the 0d denominators; see "Stage-C corpus pin: the
+calibration denominators" below. No re-partitioning was needed during
+the audit.
+
+## Rules in the neighborhood not load-bearing for any invariant above
+
+Grouped, with the reason they stay outside the Stage-B models:
+
+- **Placement preference / SLA content** (abstracted to opaque
+  eligibility in Model S; the static-eligibility *content* is
+  pre-registered NOT-ENCODED): `sched.assign.warm-gate`,
+  `sched.sla.intent-match`, `sched.dispatch.fod-builtin-any-arch`,
+  `sched.dispatch.soft-features`, `sched.dispatch.fod-substitute+2`,
+  `sched.dispatch.substitute-complete-inline`.
+- **Cancel / preemption delivery** (best-effort optimization today —
+  correctness never depends on `CancelSignal` delivery; becomes
+  AD5's subject only in the replacement): `builder.cancel.cgroup-kill`,
+  `builder.cancel.pre-cgroup-deferred`, `ctrl.pool.disruption`,
+  `ctrl.drain.disruption-target`, `ctrl.drain.sigterm`,
+  `ctrl.pod.tgps-default`.
+- **Exit mechanics that are not protocol state**:
+  `builder.shutdown.sigint+2`, `builder.shutdown.fuse-abort`,
+  `builder.ephemeral.exit-aborts-heartbeat+2` (zombie hygiene; the
+  protocol-visible half is already carried by F1's entry-existence
+  rules), `builder.timeout.no-reassign` (retry-classification content,
+  retry campaign).
+- **Admin/observability surfaces**: `sched.admin.debug-list-executors`,
+  `sched.admin.snapshot-cached`, `sched.admin.list-builds`,
+  `sched.admin.clear-poison`, `sched.admin.list-poisoned`,
+  `sched.admin.spawn-intents` (supply-side bookkeeping; Model J's
+  input, not a session invariant), `sched.backstop.orphan-watcher`
+  (gateway-client orphan, different protocol).
+- **Controller fleet rules** (`ctrl.pool.*`, `ctrl.ephemeral.*`,
+  `ctrl.terminated.*`): owned by the controller campaign's map; only
+  the graces named in `sched.executor.liveness-window` and the F7
+  obligations table touch them here.
+- **Lease machinery beyond the five rules cited under F6**
+  (`sched.lease.{k8s-lease,at-most-one-leader,self-fence,
+  generation-claim,graceful-release,rebound,deletion-cost,
+  non-blocking-acquire,standby-tick-noop,hook-order}`,
+  `sched.recovery.{fetch-max-seed,bump-confirm,…}`): the rio-lease
+  campaign's subject; Model S imports the lease guarantees through the
+  0c assume-guarantee checklist instead of mapping them.
+
+## Verify-marker status (Stage-A snapshot)
+
+The five new rules carry `r[impl]` markers at the decision sites named
+above (23 markers: 4 session-epoch, 7 liveness-window, 6
+repair-precedence, 3 one-shot, 3 exactly-once-or-death) and **no
+`r[verify]` markers**: their verification is deliberately deferred to
+the Stage-B models, so they appear in `tracey query untested` until 0c
+wires the checks — the marker-first signal working as intended, not a
+debt to silence.
+
+Planned verification (recorded now, wired at 0c — markers go at the
+`nix/quint.nix` wiring points, never in `.qnt` files or scenario
+headers; VM-test markers stay at the `nix/tests/default.nix` subtests
+entries):
+
+| Rule | Planned check |
+|---|---|
+| `sched.executor.session-epoch` | `quint-executor-session-*` (F1 invariants; fault-stream regime) |
+| `sched.executor.liveness-window` | `quint-executor-session-*` (F3/F4 invariants; the window composition) — the numeric values themselves stay code-reviewed constants |
+| `sched.executor.repair-precedence` | `quint-executor-session-*` (F2/F4/F6 invariants: at-most-once, armed-safety, convergence) |
+| `sched.executor.one-shot` | `quint-executor-session-*` (the one-shot flag semantics in Model S) plus the existing `ephemeral-pool` VM scenario already covering the I-188 behavior (no marker moved in 0b) |
+| `builder.completion.exactly-once-or-death` | `quint-executor-delivery-*` (Model D: `ReportSurvivesStreamChurn`, `NoExitWithReportOwed`) |
+
+Existing rules mapped above keep their existing verification
+unchanged; nothing was re-pointed and no rule text was amended, so
+`tracey query stale` has nothing to show for this audit.
 
 ## Phase 0a — churn pin and re-pin protocol
 
