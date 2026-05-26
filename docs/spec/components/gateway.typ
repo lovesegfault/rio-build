@@ -113,17 +113,17 @@ store/builder.
 ]
 
 #r("gw.build.per-tenant-policy")[
-  The gateway MUST populate `SubmitBuildRequest` build-behavior fields
-  (`keep_going`, `force_build_roots`) from a per-tenant build-policy map in
-  gateway configuration (`build_policy`, keyed by tenant name), resolved once
-  per SSH session from the authenticated tenant; tenants absent from the map
-  MUST get the all-false default, preserving prior behavior.
+  The gateway MUST populate `SubmitBuildRequest.keep_going` from a per-tenant
+  build-policy map in gateway configuration (`build_policy`, keyed by tenant
+  name), resolved once per channel from the authenticated tenant; tenants
+  absent from the map MUST get the default (`keep_going = false`), preserving
+  prior behavior.
 ]
 
 Because `wopSetOptions` never arrives over ssh-ng (see
 #rref("gw.opcode.set-options.propagation") --- and the gateway discards
 `keepGoing` even when it does arrive), gateway configuration is the only place
-these per-submission behaviors can be set for ssh-ng clients. The map is
+this per-submission behavior can be set for ssh-ng clients. The map is
 deployed as `/etc/rio/gateway.toml` (helm `gateway.buildPolicy`); entries for
 tenants that do not yet exist are inert.
 
