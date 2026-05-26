@@ -71,6 +71,7 @@ scope: with scope; ''
 
       # ── Phase C: the in-flight build completes across the restart ───
       wait_drv_status(drv_mr, ["completed"], timeout=420, ctx="mountd-restart in-flight build")
+      release_watch(build_mr)
       wait_no_running_builders()
 
       # ── Phase D: a fresh miss → fetch → Promote on the new daemon ───

@@ -1674,8 +1674,9 @@ in
       "integrity-fail"
       # r[verify builder.fs.fetch-circuit]
       #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
-      #   never-cached opens all fail fast (bounded EIO, not hangs) and
-      #   the fetch breaker opens after 5 consecutive failures.
+      #   never-cached opens all fail within their per-open fetch budget
+      #   (bounded EIO, not hangs) and the fetch breaker opens after 5
+      #   consecutive failures so everything after fails fast.
       "eio-circuit-breaker"
       # r[verify builder.result.input-eio-is-infra]
       #   eio-infra-retry: with the store's chunk objects offline, the
