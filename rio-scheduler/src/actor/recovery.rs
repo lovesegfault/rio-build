@@ -1940,6 +1940,7 @@ impl DagActor {
     /// Workers ARE in self.executors (survived): they'll send
     /// CompletionReport or heartbeat showing the build still
     /// running — normal handling resumes.
+    // r[impl sched.executor.repair-precedence]
     #[instrument(skip(self))]
     pub(super) async fn handle_reconcile_assignments(&mut self) {
         // r[impl sched.reconcile.leader-gate]
@@ -2306,6 +2307,7 @@ struct OrphanedAssignment {
     wanted_output_names: Vec<String>,
 }
 
+// r[impl sched.executor.liveness-window]
 /// Delay before post-recovery worker reconciliation. Workers have
 /// this long to reconnect after scheduler restart; after that, any
 /// Assigned/Running derivation with an unknown worker is reconciled

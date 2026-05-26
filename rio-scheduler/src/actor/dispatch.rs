@@ -2312,6 +2312,7 @@ impl DagActor {
     /// the PG assignments row, emits progress so the dashboard sees the
     /// rollback. Do NOT re-queue here — channel is still full; caller's
     /// `ctx.deferred` handles that next pass.
+    // r[impl sched.executor.repair-precedence]
     async fn rollback_assignment(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
         // Worker tracking (set in record_assignment). Without this the
         // worker appears busy → phantom capacity leak.

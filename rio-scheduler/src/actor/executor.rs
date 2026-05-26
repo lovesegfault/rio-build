@@ -21,6 +21,7 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId, ExecutorState};
 /// [`on_worker_registered`]: DagActor::on_worker_registered
 use super::{DagActor, DrainResult, HeartbeatPayload, MAX_PREFETCH_PATHS};
 
+// r[impl sched.executor.liveness-window]
 /// How long a `recently_disconnected` entry waits for the controller's
 /// `ReportExecutorTermination` before being swept. The controller
 /// observes Pod-status + reconciles ~1-3s after the gRPC stream drops;
@@ -352,6 +353,7 @@ impl DagActor {
         let Some(worker) = self.executors.get(executor_id) else {
             return; // unknown worker, no-op (and no gauge decrement)
         };
+        // r[impl sched.executor.session-epoch]
         // I-056a late-disconnect half: connect-before-disconnect
         // ordering happens in production (old reader task still in
         // TCP/h2 close handshake when the new stream's connect
@@ -408,6 +410,7 @@ impl DagActor {
         let lost_last_completed = worker.last_completed.clone();
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
         // r[impl sched.retry.no-double-count]
+        // r[impl sched.executor.repair-precedence]
         // Record for the controller's follow-up report. Only when the
         // worker died MID-BUILD (last_completed != running_build) — an
         // expected one-shot exit needs no entry, and a promoting report
@@ -689,6 +692,7 @@ impl DagActor {
             return self.handle_deadline_exceeded(executor_id).await;
         }
 
+        // r[impl sched.executor.repair-precedence]
         // Non-promoting reason → return BEFORE touching
         // `recently_disconnected` or the race-ahead `executors`
         // lookup. Without this gate a `Completed`/`Error`/
@@ -1443,6 +1447,7 @@ impl DagActor {
     /// `dispatch_ready`.
     pub(super) fn handle_heartbeat(&mut self, hb: HeartbeatPayload) -> (Vec<DrvHash>, bool) {
         let executor_id = &hb.executor_id;
+        // r[impl sched.executor.session-epoch]
         // I-048b: heartbeat for an executor without a stream entry is
         // dropped. Only `handle_worker_connected` (BuildExecution
         // stream open) creates entries. Allowing heartbeat to create
@@ -1677,6 +1682,7 @@ impl DagActor {
     /// confirmed_phantoms_to_drain)`.
     // r[impl sched.heartbeat.adopt]
     // r[impl sched.heartbeat.phantom-drain+2]
+    // r[impl sched.executor.repair-precedence]
     fn reconcile_running_build(
         &mut self,
         executor_id: &ExecutorId,

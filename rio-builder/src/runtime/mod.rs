@@ -898,6 +898,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         };
         info!("BuildExecution stream open");
 
+        // r[impl builder.completion.exactly-once-or-death]
         // Swap in the new gRPC target only NOW that the stream is
         // confirmed open. merged_bug_020: previously swapped before
         // build_execution.await — relay drained sink_rx into grpc_tx
@@ -1050,6 +1051,10 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         };
 
         match stream_end {
+            // r[impl sched.executor.one-shot]
+            // Single-shot exit: the build-done arm leaves the reconnect
+            // loop for good — the process never returns to the
+            // assignment-accepting select state after its one build.
             StreamEnd::BuildComplete => {
                 // r[impl builder.relay.graceful-exit-close]
                 // bug_117: park relay → relay's local `grpc_tx` clone

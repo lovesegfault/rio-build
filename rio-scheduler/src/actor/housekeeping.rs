@@ -237,6 +237,7 @@ impl DagActor {
     /// reaps the fleet. Shifting unconditionally is O(N_workers), already
     /// `.min(now)`-capped, and per-call shifts compound to the same
     /// result a single cumulative credit would.
+    // r[impl sched.executor.liveness-window]
     pub(super) fn credit_heartbeats_for_stall(&mut self, stall: std::time::Duration) {
         if stall.is_zero() {
             return;
@@ -287,6 +288,7 @@ impl DagActor {
             .retain(|_, last| now.duration_since(*last) < HUNG_NODE_REPEAT_TTL);
     }
 
+    // r[impl sched.executor.liveness-window]
     /// Scan workers for heartbeat timeouts; disconnect any that have
     /// been silent past `HEARTBEAT_TIMEOUT_SECS`. The constant is
     /// `MAX_MISSED_HEARTBEATS × HEARTBEAT_INTERVAL_SECS` (limits.rs:63)
@@ -304,6 +306,7 @@ impl DagActor {
         for (executor_id, stream_epoch) in timed_out {
             warn!(executor_id = %executor_id, silence_secs = HEARTBEAT_TIMEOUT_SECS,
                   "worker heartbeat timeout; disconnecting");
+            // r[impl sched.executor.session-epoch]
             // Current epoch — this is the actor itself deciding the
             // worker is dead, not a late reader-task signal.
             self.handle_executor_disconnected(&executor_id, stream_epoch)

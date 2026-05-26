@@ -19,6 +19,7 @@ use crate::actor::{ActorCommand, HeartbeatPayload};
 
 use super::SchedulerGrpc;
 
+// r[impl sched.executor.session-epoch]
 /// Monotonic per-stream epoch source. Each `BuildExecution` stream gets
 /// a fresh epoch on open; the reader task echoes it on
 /// `ExecutorDisconnected`. The actor compares against

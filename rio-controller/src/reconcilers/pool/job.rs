@@ -253,6 +253,7 @@ pub(super) fn is_running_job(j: &Job) -> bool {
 /// well before this fires. The reap targets pods that CANNOT
 /// self-exit (I-165: D-state FUSE wait, OOM-loop) and would otherwise
 /// burn `activeDeadlineSeconds` (default 1h) holding a node.
+// r[impl sched.executor.liveness-window]
 pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 
 /// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
@@ -267,6 +268,7 @@ pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 /// NOTE: this is age-from-**creation**. A cold-start Job that takes
 /// 50s for Karpenter to provision a node is past this grace the moment
 /// its pod starts — that's the case [`any_live_running_pod`] covers.
+// r[impl sched.executor.liveness-window]
 pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 
 /// Live (non-informer) check: any pod of `job_name` in `phase==Running`?

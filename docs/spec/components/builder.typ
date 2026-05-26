@@ -1276,6 +1276,36 @@ is stable (post Phase 3).
 
 = Stream Relay & Reconnect
 
+#r("builder.completion.exactly-once-or-death")[
+  Every assignment the builder accepts MUST produce exactly one
+  `CompletionReport` delivered to the scheduler (whichever replica is leader
+  when delivery succeeds), or the process MUST die without having delivered
+  one --- never neither, and never two reports with different outcomes for
+  the same build. Every terminal path (success, failure, cancellation,
+  panic) funnels through the single `send_completion` chokepoint into the
+  permanent sink; the queued report survives stream churn and scheduler
+  failover via the parked-relay machinery (#rref("builder.relay.reconnect"))
+  and is flushed before the stream is dropped on exit
+  (#rref("builder.relay.graceful-exit-close")); and no graceful exit path
+  (drain, idle fast-path, build-complete) may run while `completion_pending`
+  is set (#rref("builder.completion.pending-armed-early"),
+  #rref("builder.shutdown.idle-no-reregister")). The builder MUST NOT
+  fabricate a report for an assignment it did not accept. A pod that dies
+  before delivery is the accepted residual: its death is observed and
+  classified by the controller/scheduler side
+  (#rref("sched.reassign.no-promote-on-ephemeral-disconnect")), never by a
+  second worker-side report.
+]
+
+This is the delivery obligation the reconnect loop, permanent sink,
+half-close flush, drain gate, generation fence, and slot rejection jointly
+implement, and the assumption the scheduler-side session machinery makes
+about its peer: a started build's report is eventually delivered to some
+leader unless the pod dies first, and is never delivered twice as two
+different outcomes. Stating it as one rule gives the builder's delivery
+choreography a top-level normative anchor rather than leaving the property
+implicit in six cooperating mechanisms.
+
 #r("builder.completion.pending-armed-early")[
   `completion_pending` MUST be armed `true` at the start of `executor_future`,
   before the first `.await`. The flag means "completion owed, not yet flushed"

@@ -236,6 +236,7 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
 ///   future caller outside `executor_future`. `relay_loop` clears the
 ///   flag only after a successful `grpc_tx.send()` into a confirmed-
 ///   open stream.
+// r[impl builder.completion.exactly-once-or-death]
 pub(super) async fn send_completion(
     stream_tx: &mpsc::Sender<ExecutorMessage>,
     completion_pending: &AtomicBool,

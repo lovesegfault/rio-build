@@ -121,6 +121,7 @@ pub const MAX_DAG_NODES: usize = 1_048_576;
 /// pathological submission (1M nodes = 10^12 edges).
 pub const MAX_DAG_EDGES: usize = 5_242_880;
 
+// r[impl sched.executor.liveness-window]
 /// Worker heartbeat interval. The worker sends a HeartbeatRequest to the
 /// scheduler at this cadence; the scheduler's staleness check uses the
 /// derived timeout below. Changing this one constant moves both sides

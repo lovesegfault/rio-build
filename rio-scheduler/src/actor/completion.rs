@@ -1069,6 +1069,7 @@ impl DagActor {
             // cancelled — the build is no longer "in flight" either way.
             worker.last_completed = Some(drv_hash.clone());
             // r[impl sched.ephemeral.no-redispatch-after-completion]
+            // r[impl sched.executor.one-shot]
             // I-188: every executor is one-shot — it exits after this
             // completion. Mark it draining NOW, before dispatch_ready
             // below, so the freed slot isn't re-assigned a dependent
@@ -1121,6 +1122,7 @@ impl DagActor {
         });
         let current_status = state.status();
 
+        // r[impl sched.executor.repair-precedence]
         // Idempotency: completed -> completed is a no-op
         if current_status == DerivationStatus::Completed {
             debug!(drv_hash = %drv_hash, "duplicate completion report, ignoring");

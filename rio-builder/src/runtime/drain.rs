@@ -34,6 +34,7 @@ use super::slot::BuildSlot;
 ///
 /// Same `enable()`-before-check pattern as `BuildSlot::wait_idle` —
 /// see tokio::sync::Notify docs §"Avoiding missed notifications".
+// r[impl builder.completion.exactly-once-or-death]
 pub(super) async fn wait_build_flushed(
     slot: &BuildSlot,
     completion_pending: &AtomicBool,

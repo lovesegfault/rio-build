@@ -2029,6 +2029,39 @@ exponential backoff until the scheduler accepts it.
   + Scheduler begins sending `WorkAssignment` messages on the stream.
 ]
 
+#r("sched.executor.session-epoch")[
+  Every executor-session event is attributed to exactly the stream that
+  produced it, and events from a superseded stream are inert. Each accepted
+  `BuildExecution` stream is assigned a process-monotonic `stream_epoch`,
+  recorded on the executor entry when the actor accepts the stream (the
+  accept-gated path of #rref("sec.executor.identity-token")); an accepted
+  reconnect replaces `stream_tx` and `stream_epoch` together. An
+  `ExecutorDisconnected` event MUST carry the epoch of the stream that ended
+  --- the reader task sends the epoch it was spawned with, and the
+  heartbeat-timeout reaper synthesizes its disconnect at the entry's
+  *current* epoch (the actor itself declaring the worker dead, not a late
+  stream signal). The scheduler MUST treat a disconnect whose epoch differs
+  from the entry's current `stream_epoch` as inert: it removes no entry,
+  reassigns nothing, and decrements no gauge. A heartbeat for an
+  `executor_id` with no live entry MUST NOT create session state --- only an
+  accepted `BuildExecution` stream creates entries, so no session event ever
+  lacks a stream to be attributed to.
+]
+
+The I-056 family is why attribution is normative rather than best-effort:
+connect-before-disconnect ordering happens in production (the old reader
+task is still in its TCP/h2 close handshake when the new stream's connect
+arrives), and without the epoch comparison the late disconnect from the old
+stream evicts the freshly-reconnected executor --- its `running_build` is
+spuriously reassigned and the disconnect counter over-counts. The same
+attribution discipline is what keeps a heartbeat-only zombie (I-048b) from
+existing: an entry created by a heartbeat would sit with `stream_tx: None`,
+permanently undispatchable, absorbing the executor's identity until the real
+stream lands. Heartbeats themselves are not epoch-stamped --- they are bound
+to the entry by the token-attested `auth_intent`
+(#rref("sec.executor.identity-token")) and by entry existence, which this
+rule makes a precondition.
+
 #r("sched.dispatch.fod-to-fetcher")[
   Per ADR-019, `hard_filter()` rejects any derivation-executor pairing where
   `drv.is_fixed_output != (executor.kind == Fetcher)`. Fixed-output derivations
@@ -2139,6 +2172,30 @@ produces a terminal state (never "no action at the cap").
   Assigned-never-Running reassign.
 ]
 
+#r("sched.executor.one-shot")[
+  Executor pods are single-build: an executor MUST run at most one build over
+  its process lifetime. The builder accepts at most one assignment --- the
+  single `BuildSlot` rejects a second assignment while one is claimed, and
+  the run loop's build-done arm exits the process once the completion is
+  flushed (#rref("builder.relay.graceful-exit-close")) instead of returning
+  to accept further work. The scheduler MUST stop offering work to an
+  executor that has produced a completion --- the executor is marked draining
+  in the same actor turn, before any dispatch
+  (#rref("sched.ephemeral.no-redispatch-after-completion")). A surplus pod
+  that never receives an assignment exits on the idle timeout
+  (#rref("builder.idle-exit")) rather than lingering until the Job deadline.
+]
+
+One-shot is what makes the pod the natural attempt boundary: fresh identity
+per attempt and zero cross-build state on the executor
+(#rref("ctrl.pool.ephemeral")), and the I-188 race class --- re-dispatching
+into a freed slot whose process is about to exit --- can only ever produce an
+Assigned-never-Running reassign, which the draining mark closes at the
+source. Until this rule the property existed as the I-188 comment at the
+completion handler plus the builder's exit choreography; stating it makes
+the single-build assumption checkable wherever capacity, placement, or
+attempt accounting relies on it.
+
 #r("sched.assign.resource-fit")[
   `hard_filter()` rejects any executor whose `memory_total_bytes <
   drv.sched.last_intent.mem_bytes` as a hard filter, same position as
@@ -2181,6 +2238,107 @@ produces a terminal state (never "no action at the cap").
   On deregistration, all derivations in `assigned` state for that executor are
   transitioned back to `ready` for reassignment.
 ]
+
+#r("sched.executor.liveness-window")[
+  The session's liveness and repair windows are normative values, and worker
+  silence is measured in *worker time*:
+  - *Heartbeat timeout:* an executor is reaped (synthetic disconnect at its
+    current epoch) when its last accepted heartbeat is older than
+    `HEARTBEAT_TIMEOUT_SECS` = `MAX_MISSED_HEARTBEATS` (3) ×
+    `HEARTBEAT_INTERVAL_SECS` (10s) = 30s. The reaper MUST measure worker
+    silence, not scheduler congestion: when the actor itself stalls (the
+    inline `FindMissingPaths` await sites), every executor's `last_heartbeat`
+    is credited by the stall duration before the comparison, so a
+    scheduler-side stall never reaps a live fleet. The builder bounds each
+    heartbeat RPC strictly below the interval
+    (#rref("builder.heartbeat.rpc-timeout")) so one slow RPC cannot consume
+    the whole missed-heartbeat budget.
+  - *Phantom confirmation is two-strike:* a scheduler-known running build
+    missing from the executor's heartbeat report MUST be observed missing
+    across two consecutive heartbeats (clearing the \~10s assignment race
+    window) before #rref("sched.heartbeat.phantom-drain") drains it.
+  - *Termination-report correlation window:* a mid-build disconnect's
+    `recently_disconnected` entry is retained for `TERMINATION_REPORT_TTL` =
+    60s --- long enough to cover the controller's 10s reconcile cadence plus
+    report latency. The controller's classifying report consumes the entry
+    inside the window; establishment of an unreported executor crash
+    (#rref("sched.retry.per-executor-budget")) MUST fire only when the window
+    closes with no classifying report, never earlier.
+  - *Post-failover reconcile delay:* the new leader's assignment reconcile
+    sweep (#rref("sched.reconcile.leader-gate")) runs 45s after acquisition
+    (3 × heartbeat interval + slack), giving live workers the
+    reconnect-and-heartbeat window before any Assigned/Running derivation is
+    adopted or reset.
+  - *Controller reap graces:* a Pending Job is reapable only after a 10s
+    creation-age grace (#rref("ctrl.ephemeral.reap-excess-pending")); a
+    Running Job is orphan-reapable only after a 300s grace that exceeds the
+    builder's 120s idle exit (#rref("ctrl.ephemeral.reap-orphan-running")),
+    so the process-level exit always gets first chance.
+]
+
+These numbers were previously code constants cited by incident comments
+(reap-at-30s-not-60s, the eight-site stall credit, bug_044's heartbeat RPC
+bound); what makes them spec-worthy is the composition --- the heartbeat
+timeout sits below the backstop, the correlation TTL covers the controller's
+re-poll, the reconcile delay covers the post-failover reconnect spread, the
+orphan grace covers the idle exit --- which is exactly what the session
+model checks. Phase 0 makes the values normative without renegotiating any
+of them; changing one is a spec change, not a tuning knob.
+
+#r("sched.executor.repair-precedence")[
+  When several repair mechanisms can observe the same divergence between the
+  scheduler's session model and reality, exactly one resolves it and every
+  other observer MUST be a no-op. Per divergence class:
+  - *Unresolved claim* (an accepted assignment that is neither completed nor
+    returned to Ready): the worker's own `CompletionReport` on a live or
+    reconnected stream is the preferred resolution; while it has not
+    arrived, at least one repair MUST remain armed for the claim --- the
+    builder still owes the report
+    (#rref("builder.completion.exactly-once-or-death")), or the slot is
+    heartbeat-monitored (#rref("sched.heartbeat.phantom-drain")), or the
+    disconnect path (#rref("sched.executor.deregister-reassign")) or the
+    backstop (#rref("sched.backstop.timeout")) is armed for it. Whichever
+    fires first resolves the claim exactly once; afterwards a late report or
+    a second repair MUST find a terminal status, a non-Assigned/Running
+    state, or a stale-executor mismatch and change nothing
+    (#rref("sched.completion.idempotent")).
+  - *One pod death observed by several channels* (stream close, heartbeat
+    timeout, controller pod report, controller Job report, backstop): the
+    first *classifying* observation wins --- it consumes the
+    `recently_disconnected` entry or fills the released attempt row's
+    termination columns --- and every later observation of the same death
+    MUST be a no-op (#rref("sched.retry.no-double-count")). A non-promoting
+    report MUST NOT consume the dedup entry the real classification needs,
+    and the establishment sweep fires only after the correlation window
+    closes (#rref("sched.executor.liveness-window")).
+  - *Scheduler/worker view divergence at heartbeat:* the scheduler keeps its
+    assignment over a one-heartbeat-stale report (the TOCTOU keep); a
+    worker-reported build the scheduler does not know is adopted
+    (#rref("sched.heartbeat.adopt")); only a build missing from two
+    consecutive heartbeats is drained as a phantom, and the phantom drain
+    MUST NOT charge the worker's failure budget.
+  - *Failed push:* a `WorkAssignment` whose stream send fails MUST be rolled
+    back in the same actor turn --- status back to Ready, the assignment and
+    execution rows deleted, pins released, `running_build` cleared ---
+    leaving no half-recorded assignment and charging no attempt.
+  - *Post-failover unknowns* (PG says Assigned/Running, worker state
+    unknown): live reconnection plus heartbeat adopt win over the timed
+    reconcile; the 45s sweep defers workers that have a stream but no
+    heartbeat yet, and the store probe then decides adopt-as-completed
+    versus reset-to-Ready --- it MUST NOT fabricate a completion or charge
+    an attempt for a derivation it merely resets.
+  Stale-epoch and deposed-leader observers are inert losers in every class
+  (#rref("sched.executor.session-epoch"),
+  #rref("sched.lease.standby-drops-writes")).
+]
+
+This is the table the incident comments encode one cell at a time (I-032,
+I-035, I-042, I-056, I-066, I-188, I-197): each repair mechanism exists
+because its divergence class once had no winner or had two. Stating the
+precedence makes the conjunction checkable --- a claimed slot resolves at
+most once, a pod death charges at most once, an unresolved claim always has
+a repair armed --- instead of each mechanism's correctness being argued in
+isolation.
 
 #r("sched.backstop.timeout+3")[
   *Backstop timeout:* Separately from executor deregistration, `handle_tick`
