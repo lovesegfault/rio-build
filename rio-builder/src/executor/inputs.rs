@@ -43,6 +43,38 @@ pub(super) fn castore_roots(
         .collect()
 }
 
+/// Guard against the "scheduler sent no castore roots but the derivation
+/// declares inputs" mismatch.
+///
+/// The per-build castore lower serves exactly `input_roots` — there is no
+/// fallback fetch path. An assignment with empty roots for a derivation
+/// that declares `inputSrcs`/`inputDrvs` means the scheduler could not
+/// compute the input closure (node submitted without `drv_content`, PG
+/// blip, narinfo not yet populated): letting it run would mount an empty
+/// `/nix/store` and surface as a nix-daemon ENOENT that reads like a
+/// missing dependency. Fail *before* mounting with an actionable,
+/// infrastructure-classified error so the scheduler re-dispatches instead
+/// of poisoning the derivation. A derivation with no declared inputs
+/// legitimately mounts an empty tree and proceeds.
+pub(super) fn check_roots_cover_declared_inputs(
+    assignment: &WorkAssignment,
+    drv: &Derivation,
+) -> Result<(), ExecutorError> {
+    if assignment.input_roots.is_empty()
+        && !(drv.input_srcs().is_empty() && drv.input_drvs().is_empty())
+    {
+        return Err(ExecutorError::CastoreRoots(format!(
+            "assignment carries no castore input roots but the derivation declares {} \
+             inputSrcs and {} inputDrvs — the scheduler could not compute the input closure \
+             (was the node submitted without drv_content, or is the store's narinfo/nar_index \
+             behind?); the per-build castore mount would serve an empty /nix/store",
+            drv.input_srcs().len(),
+            drv.input_drvs().len()
+        )));
+    }
+    Ok(())
+}
+
 /// Hash algorithm for FOD output verification. Maps from Nix's
 /// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
 /// prefixed "r:").
@@ -1069,6 +1101,53 @@ mod tests {
             "an unindexed input is an infrastructure condition (retry once indexed), \
              not a poisoned derivation"
         );
+    }
+
+    /// Empty `input_roots` on a derivation that DECLARES inputs must be
+    /// rejected before the mount as an actionable infrastructure error
+    /// (the scheduler failed to describe the closure); a derivation with
+    /// no declared inputs legitimately proceeds with an empty tree, and
+    /// any non-empty roots list passes regardless.
+    #[test]
+    fn test_check_roots_cover_declared_inputs() {
+        use rio_proto::castore::{RootNode, root_node};
+        use rio_proto::types::InputRoot;
+
+        let src = tp("busybox-static");
+        let with_inputs = drv_with_srcs(std::slice::from_ref(&src));
+        let no_inputs = drv_with_srcs(&[]);
+        let empty_assignment = WorkAssignment::default();
+
+        // Declared inputs + empty roots → loud, infra-classified, actionable.
+        let err = check_roots_cover_declared_inputs(&empty_assignment, &with_inputs)
+            .expect_err("declared inputs with no roots must fail");
+        assert!(matches!(err, ExecutorError::CastoreRoots(_)), "got {err:?}");
+        assert!(
+            !err.is_permanent(),
+            "scheduler-side closure gap is an infrastructure condition, not a poison"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1 inputSrcs") && msg.contains("drv_content"),
+            "error must say what is missing and hint at the cause: {msg}"
+        );
+
+        // No declared inputs → empty roots are legal (empty tree mount).
+        check_roots_cover_declared_inputs(&empty_assignment, &no_inputs)
+            .expect("input-less derivation may mount an empty tree");
+
+        // Roots present → fine even with declared inputs.
+        let assignment = WorkAssignment {
+            input_roots: vec![InputRoot {
+                store_path: src,
+                root_node: Some(RootNode {
+                    node: Some(root_node::Node::DirDigest(vec![0xAB; 32])),
+                }),
+            }],
+            ..Default::default()
+        };
+        check_roots_cover_declared_inputs(&assignment, &with_inputs)
+            .expect("roots covering declared inputs pass");
     }
 
     #[tokio::test]

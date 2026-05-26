@@ -155,9 +155,12 @@ pub enum ExecutorError {
     Overlay(#[from] overlay::OverlayError),
     #[error("overlay setup task panicked: {0}")]
     OverlayTaskPanic(tokio::task::JoinError),
-    /// The assignment's `input_roots` cannot seed a castore mount (an
-    /// entry has no `root_node` — the store has not indexed it yet).
-    /// Infrastructure: re-dispatch succeeds once the indexer catches up.
+    /// The assignment's `input_roots` cannot seed a castore mount: an
+    /// entry has no `root_node` (the store has not indexed it yet), or
+    /// the list is empty while the derivation declares inputs (the
+    /// scheduler could not compute the closure — sparse submit, PG
+    /// blip). Infrastructure: re-dispatch succeeds once the indexer /
+    /// closure compute catches up.
     #[error("castore input roots unusable: {0}")]
     CastoreRoots(String),
     /// Mounting the per-build castore-FUSE lower failed (DAG prefetch,
@@ -623,6 +626,13 @@ pub async fn execute_build(
         // dir ({overlay_base}/{build_id}.castore — build_ids cannot
         // contain '.') so teardown_overlay's remove_dir_all of the
         // build dir never walks into a live FUSE mount.
+        //
+        // Empty-roots guard FIRST: an assignment with no input_roots
+        // for a derivation that declares inputs would mount an empty
+        // lower and die later as a misleading nix-daemon ENOENT.
+        // Reject it here, infrastructure-classified and actionable
+        // (see check_roots_cover_declared_inputs).
+        inputs::check_roots_cover_declared_inputs(assignment, &drv)?;
         let roots = castore_roots(assignment)?;
         let castore_build_id = mountd_build_id(&build_id);
         let castore_mp = env.overlay_base_dir.join(format!("{build_id}.castore"));
