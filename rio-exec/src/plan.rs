@@ -135,8 +135,11 @@ pub(crate) struct PlannedBind {
     /// Skip silently if `source` does not exist (resolved by the
     /// skeleton builder, which performs the only `stat`).
     pub optional: bool,
-    /// Set by the skeleton builder when an `optional` bind's source was
-    /// absent. The child ignores skipped binds.
+    /// Set by the skeleton builder when the bind must not be applied:
+    /// an `optional` bind whose source was absent, or a nested bind
+    /// whose source root is a symlink (the enclosing mount's source
+    /// already carries the symlink, and `mount(2)` would resolve it
+    /// against the host namespace). The child ignores skipped binds.
     pub skipped: bool,
     /// True when this bind's target is strictly inside another planned
     /// bind's target. The skeleton builder does NOT create targets for

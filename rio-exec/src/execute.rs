@@ -868,7 +868,10 @@ const MAX_PENDING_LINE_BYTES: usize = 1 << 20;
 /// [`ExecEvent::Log`]s. Lines are split on `\n`; a trailing `\r` (pty
 /// raw mode passes through the `\r\n` the line discipline would have
 /// produced) is stripped. A line that reaches [`MAX_PENDING_LINE_BYTES`]
-/// without a terminator is emitted in chunks of that size.
+/// without a terminator is emitted in chunks of that size; a single
+/// control frame longer than that (e.g. a >1 MiB `@nix` line) is
+/// therefore split and dropped as malformed by the downstream filter —
+/// pathological input, accepted trade-off.
 #[derive(Default)]
 struct LineSplitter {
     pending: Vec<(LogStream, Vec<u8>)>,

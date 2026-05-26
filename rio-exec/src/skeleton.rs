@@ -80,13 +80,14 @@ pub(crate) fn build(plan: &mut SandboxPlan) -> io::Result<()> {
     // resolves into its enclosing mount's *source* once that mount is
     // applied, so a placeholder created here would be shadowed and the
     // real target must already exist in the enclosing source (see
-    // `PlannedBind::nested`). The stat on the source is the single
-    // point that resolves optional binds and file-vs-directory targets.
+    // `PlannedBind::nested`). The lstat (and, for symlink roots, the
+    // following stat) on the source is the single point that resolves
+    // optional binds, file-vs-directory targets, and symlink-rooted
+    // sources.
     for bind in &mut plan.binds {
         // lstat, not stat: a source whose root is itself a symlink must
-        // be detected as such rather than resolved against the *host*
-        // namespace — its target is typically a sandbox-absolute
-        // /nix/store path that does not exist on the host at all.
+        // be detected as such, not resolved against the *host*
+        // namespace.
         let meta = match fs::symlink_metadata(&bind.source) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound && bind.optional => {
@@ -101,74 +102,35 @@ pub(crate) fn build(plan: &mut SandboxPlan) -> io::Result<()> {
             }
         };
         // A source whose root is itself a symlink cannot be carried in
-        // as one by `mount(2)` — the kernel resolves the source path,
-        // and it resolves it against the *host* namespace.
+        // as one by `mount(2)` — the kernel resolves the source path
+        // against the *host* namespace. The discriminator below is the
+        // planned mount topology, never what the host happens to
+        // resolve, so the same request produces the same
+        // sandbox-visible result on every machine:
         //
-        // - Host-resolvable symlink (e.g. a sandbox shell `sh ->
-        //   busybox` living next to its target in the image): keep the
-        //   established behavior — placeholder from the resolved
-        //   target, bind mount resolves identically.
-        // - Host-unresolvable symlink (a store path whose target only
-        //   exists inside the sandbox store: the linkFarm /
-        //   `ln -s ${dep} $out` shape): CppNix `doBind` parity —
-        //   recreate an identical symlink inside the chroot and skip
-        //   the mount. The link target is part of the input closure,
-        //   so it resolves inside the sandbox even though it never
-        //   resolves on the host. Nested ones need nothing at all —
-        //   the enclosing mount's source already contains them.
+        // - Nested binds (artifacts living inside an enclosing mount's
+        //   source — the store-path-input shape): the enclosing
+        //   mount's source already contains the symlink itself, so the
+        //   sandbox sees it as-is, valid or dangling alike, exactly
+        //   like CppNix's `doBind` symlink handling. Re-binding it
+        //   here would resolve it against the host (or fail outright
+        //   when the target only exists inside the sandbox), so the
+        //   bind is skipped: no placeholder, no mount.
+        // - Non-nested binds (explicitly planned host paths such as
+        //   the sandbox shell, whose `sh -> busybox` target lives next
+        //   to it on the host): keep the established behavior — the
+        //   followed stat decides optional/file-vs-directory and the
+        //   bind mount resolves the same way.
         if meta.file_type().is_symlink() {
-            match fs::metadata(&bind.source) {
-                Ok(resolved) => {
-                    if !bind.nested {
-                        let target = root.join(
-                            bind.target
-                                .strip_prefix("/")
-                                .expect("bind targets are validated absolute"),
-                        );
-                        if resolved.is_dir() {
-                            ensure_dir(&target, 0o755)?;
-                        } else {
-                            ensure_file(&target, &[], 0o444)?;
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    if !bind.nested {
-                        let link_target = fs::read_link(&bind.source).map_err(|e| {
-                            annotate(
-                                e,
-                                format_args!("readlink bind source {}", bind.source.display()),
-                            )
-                        })?;
-                        let target = root.join(
-                            bind.target
-                                .strip_prefix("/")
-                                .expect("bind targets are validated absolute"),
-                        );
-                        match fs::symlink_metadata(&target) {
-                            Ok(_) => fs::remove_file(&target).map_err(|e| {
-                                annotate(e, format_args!("remove stale {}", target.display()))
-                            })?,
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                return Err(annotate(
-                                    e,
-                                    format_args!("lstat {}", target.display()),
-                                ));
-                            }
-                        }
-                        std::os::unix::fs::symlink(&link_target, &target).map_err(|e| {
-                            annotate(
-                                e,
-                                format_args!(
-                                    "symlink {} -> {}",
-                                    target.display(),
-                                    link_target.display()
-                                ),
-                            )
-                        })?;
-                    }
+            if bind.nested {
+                bind.skipped = true;
+                continue;
+            }
+            let resolved = match fs::metadata(&bind.source) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound && bind.optional => {
                     bind.skipped = true;
+                    continue;
                 }
                 Err(e) => {
                     return Err(annotate(
@@ -176,6 +138,16 @@ pub(crate) fn build(plan: &mut SandboxPlan) -> io::Result<()> {
                         format_args!("stat bind source {}", bind.source.display()),
                     ));
                 }
+            };
+            let target = root.join(
+                bind.target
+                    .strip_prefix("/")
+                    .expect("bind targets are validated absolute"),
+            );
+            if resolved.is_dir() {
+                ensure_dir(&target, 0o755)?;
+            } else {
+                ensure_file(&target, &[], 0o444)?;
             }
             continue;
         }
@@ -477,20 +449,22 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_symlink_source_is_recreated_as_a_symlink_and_not_mounted() {
+    fn nested_symlink_source_is_left_to_the_enclosing_mount() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let src_root = tmp.path().join("sources");
         fs::create_dir_all(src_root.join("build")).expect("mkdir build source");
         fs::write(src_root.join("tool"), b"#!/bin/sh\n").expect("write tool source");
-        // A store-path-shaped input whose root is a symlink to a
-        // sandbox-absolute path that does not exist on the host (the
-        // linkFarm / `ln -s ${dep} $out` shape).
+        // A store-path-input shape: the bind's target sits inside the
+        // enclosing writable /build mount, and its source root is a
+        // symlink to a sandbox-absolute path that does not exist on the
+        // host (linkFarm / `ln -s ${dep} $out`). The enclosing mount's
+        // source carries the symlink; the bind itself must do nothing.
         let dep = "/nix/store/00000000000000000000000000000000-dep";
-        std::os::unix::fs::symlink(dep, src_root.join("link")).expect("symlink source");
+        std::os::unix::fs::symlink(dep, src_root.join("build/link")).expect("symlink source");
         let mut req = request(&src_root);
         req.mounts.push(Mount {
-            source: src_root.join("link"),
-            target: PathBuf::from("/opt/link"),
+            source: src_root.join("build/link"),
+            target: PathBuf::from("/build/link"),
             writable: false,
             optional: false,
         });
@@ -506,14 +480,22 @@ mod tests {
         let bind = plan
             .binds
             .iter()
-            .find(|b| b.target == Path::new("/opt/link"))
+            .find(|b| b.target == Path::new("/build/link"))
             .expect("bind planned");
+        assert!(bind.nested, "the layout makes this a nested bind");
         assert!(
             bind.skipped,
-            "host-unresolvable symlink sources are not mounted"
+            "nested symlink sources are not re-bound over the enclosing mount"
         );
+        assert!(
+            !chroot.join("build/link").exists()
+                && fs::symlink_metadata(chroot.join("build/link")).is_err(),
+            "no placeholder is created for it in the skeleton"
+        );
+        // The enclosing mount's source still carries the symlink the
+        // sandbox will actually see.
         assert_eq!(
-            fs::read_link(chroot.join("opt/link")).expect("recreated as a symlink"),
+            fs::read_link(src_root.join("build/link")).expect("symlink intact"),
             Path::new(dep)
         );
     }

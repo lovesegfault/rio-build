@@ -373,7 +373,7 @@ async fn isolation_properties_are_observed_inside_the_sandbox() {
     // /etc/passwd is exactly the synthesized database.
     assert!(
         probe.contains(&format!(
-            "builder:x:{SANDBOX_UID}:{SANDBOX_GID}:build user:/work:/noshell"
+            "nixbld:x:{SANDBOX_UID}:{SANDBOX_GID}:Nix build user:/work:/noshell"
         )),
         "{probe}"
     );
