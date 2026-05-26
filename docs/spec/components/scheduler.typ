@@ -858,27 +858,68 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+4")[
+#r("sched.merge.substitute-topdown+5")[
   Before merging a submission's full DAG, the scheduler MUST first check
-  whether the root derivations' outputs are already available (present in store
-  or upstream-substitutable). If ALL roots are available, the submission MUST
-  be pruned to roots-only before the merge --- the dependency subgraph is
-  transitively unnecessary and never enters the global DAG. This short-circuits
-  the common case where a requested package is already cached upstream: instead
-  of eager-fetching hundreds of dependency NARs (stdenv bootstrap chain), only
-  the roots enter the DAG. The roots' upstream fetch then proceeds via
-  #rref("sched.substitute.detached") (no inline `QueryPathInfo` --- the closure
-  walk for ghc-sized roots takes minutes and would stall the actor). Roots are
-  nodes with no parent edge in the submission. On any uncertainty (store
-  unreachable, partial root availability, floating-CA root), fall through to
-  the full merge and the bottom-up `check_cached_outputs` --- the existing flow
-  remains correct, just slower. The pruning is all-or-nothing at the root
-  level. If the deferred fetch for a pruned root fails
-  (`SubstituteComplete{ok=false}`), the scheduler MUST fail every interested
-  build with a resubmit-directing error rather than dispatching the root as a
-  build --- the dependency subgraph was dropped, so the worker cannot resolve
-  `inputDrvs`.
+  whether the submission's *demand set* --- its structural roots (nodes with
+  no parent edge in the submission) ∪ every node the client explicitly
+  requested, as marked by the gateway --- is already available (present in
+  store or upstream-substitutable), and if so prune the submission to the
+  demand set before the merge --- the dependency subgraph is transitively
+  unnecessary and never enters the global DAG. Availability MUST be judged
+  over *wanted* outputs only: a demanded node's criterion set is the
+  submission node's own wanted set, saturating-unioned (empty = all declared)
+  with the pre-existing node's live effective wanted set
+  (#rref("sched.merge.wanted-outputs")) when the node already exists in the
+  DAG. The prune is all-or-nothing over the demand set; when it fires, the
+  kept submission is the demand set: kept nodes are merged dep-less, routed
+  to the deferred upstream fetch (#rref("sched.substitute.detached"), no
+  inline `QueryPathInfo`), and marked `topdown_pruned` --- a mark that MUST
+  be applied only after the merge has committed, MUST be persisted and
+  restored at leader-failover recovery, and MUST be cleared (in PG and in
+  memory) when a later merge gives the node children. The scheduler MUST
+  fall through to the full merge and the bottom-up `check_cached_outputs`
+  when any demanded node's criterion set contains a wanted output that is
+  missing and not substitutable, when a demanded node's own selector
+  resolves to no declared output, when a criterion set resolves to no
+  verifiable path, or on any other uncertainty (store unreachable,
+  floating-CA demanded node). A childless `topdown_pruned` node MUST NOT be
+  dispatched as a from-source build: when its deferred fetch fails
+  (`SubstituteComplete{ok=false}`), or its wanted outputs can neither be
+  completed inline nor routed to substitution at dispatch time, the
+  scheduler MUST fail every interested build with a resubmit-directing error
+  --- the dependency subgraph was dropped, so the worker cannot resolve
+  `inputDrvs` --- and this MUST hold across leader failover.
 ]
+The prune short-circuits the common case where a requested package is already
+cached upstream: instead of eager-fetching hundreds of dependency NARs (the
+stdenv bootstrap chain), only the demanded nodes enter the DAG --- and their
+fetch runs detached because the closure walk for a ghc-sized node takes
+minutes and would stall the actor inline. Explicitly requested nodes count as
+demand because the gateway folds a multi-target request into ONE submission:
+a requested target that lies inside another target's `inputDrvs` closure is
+not a structural root of the combined DAG, and a roots-only criterion would
+silently drop it --- never merged, classified, substituted, or dispatched.
+The criterion is wanted-scoped and unioned with the live effective wanted set
+so the prune can never be more permissive than the post-merge classification
+of a shared node: a submission-only criterion could prune this build's
+dependency closure while another live build's wants keep the node on the
+from-source path, leaving this build hostage to that interest staying alive.
+The own-selector resolvability guard covers the fallback corner where no
+prior interested build is live and post-merge classification degrades to
+exactly this submission's (possibly bogus) selector. The `topdown_pruned`
+stamp waits for the committed merge because merge rollback does not revert
+it: stamping before the fallible cache-check and persist steps would leak a
+rejected build's prune verdict onto a shared pre-existing childless node, and
+a later routine fetch failure would terminally fail innocent builds through
+the fail-fast arm. The flag is persisted (migration 063, OR-on-conflict on
+upsert, cleared in the same transaction that inserts the edges giving the
+node children) because the post-failover shape is exactly where the
+from-source hazard bites: the recovered node is childless and re-probed
+against the stored wanted union (migration 062, empty = all declared) ---
+routinely wider than the prune-time criterion --- so an output the prune
+never vouched for can be definitively missing at dispatch time; without the
+restored flag the node would be left Ready and handed a doomed from-source
+dispatch whose `inputDrvs` were never merged.
 
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the

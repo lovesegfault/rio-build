@@ -732,7 +732,7 @@ impl DagActor {
             } else if self.dag.node(&drv_hash).is_some_and(|s| s.topdown_pruned)
                 && self.dag.get_children(&drv_hash).is_empty()
             {
-                // r[impl sched.merge.substitute-topdown+4]
+                // r[impl sched.merge.substitute-topdown+5]
                 // Truly missing (a wanted output is missing upstream and
                 // not substitutable): every other node is left Ready and
                 // dispatches from source. A CHILDLESS topdown-pruned
@@ -1173,7 +1173,7 @@ impl DagActor {
             }
             return;
         }
-        // r[impl sched.merge.substitute-topdown+4]
+        // r[impl sched.merge.substitute-topdown+5]
         // Topdown-pruned root: the dep subgraph was dropped from this
         // submission, so a build dispatch cannot succeed (worker
         // ENOENTs on inputDrvs). Fail every interested build with a
@@ -1366,7 +1366,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.merge.substitute-topdown+4]
+    // r[impl sched.merge.substitute-topdown+5]
     /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
     /// from its submission, so a from-source build dispatch cannot
     /// succeed (the worker ENOENTs on inputDrvs that were never
@@ -1581,7 +1581,7 @@ impl DagActor {
                         .await;
                     return true;
                 }
-                // r[impl sched.merge.substitute-topdown+4]
+                // r[impl sched.merge.substitute-topdown+5]
                 // Truly missing → the caller dispatches from source. A
                 // childless topdown-pruned root must not be (its dep
                 // closure was never merged) — same fail-fast as the

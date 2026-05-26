@@ -4682,7 +4682,7 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.merge.substitute-topdown+5]
 // r[verify sched.substitute.detached+5]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// topdown-pruned CHILDLESS root: the dependency closure was dropped

@@ -3630,7 +3630,7 @@ async fn test_recovery_rearms_prefix_state_for_spared_ready_entry() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.merge.substitute-topdown+5]
 /// `topdown_pruned` must survive leader failover: a derivations row
 /// persisted with the flag set is restored with the flag set (not
 /// reset to false) so the new leader keeps honoring the "must complete
@@ -3675,7 +3675,7 @@ async fn test_recovery_restores_topdown_pruned_flag() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.merge.substitute-topdown+5]
 /// Failover regression (the doomed dispatch): a roots-only-pruned root
 /// persisted as `substituting` is recovered CHILDLESS by the new
 /// leader, comes back Ready (no deps in the DAG), and is re-probed

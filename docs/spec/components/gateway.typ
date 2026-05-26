@@ -944,6 +944,14 @@ the handshake before the client will send any opcodes.
   gateway holds the SSH connection open and converts the `BuildEvent` response
   stream into STDERR messages for the Nix client.
 
+Alongside `wanted_output_names`, the gateway also marks every node the client
+named as a build target (`explicitly_requested`: the BFS root of each
+requested target's sub-DAG, the `wopBuildDerivation` single-node fallback,
+OR-merged across duplicate copies when multi-target sub-DAGs are deduped into
+one submission), so the scheduler's top-down prune
+(#rref("sched.merge.substitute-topdown")) retains and verifies a requested
+target even when another target's closure swallows it as a non-root.
+
 #r("gw.reject.nochroot")[
   The gateway MUST reject any derivation (at SubmitBuild time) whose env
   contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build
