@@ -205,6 +205,43 @@ scope: with scope; ''
           "EOF"
       )
 
+      # The second tenant's own source push — the client flow the
+      # store.tenant.find-missing-attribution + store.put.
+      # tenant-attribution(+2) contract covers. The seed closure is
+      # already complete on the store (prelude pushed it under
+      # vm-lifecycle), and the build below references it via
+      # builtins.storePath, which nix-build never copies itself
+      # (wopEnsurePath acks without materializing) — so this explicit
+      # `nix copy` is gc-tenant-test's only content-proof, exactly as
+      # the prelude's seed push is for the first tenant. It only
+      # results in a readable path because of the new contract:
+      # wopQueryValidPaths reports the unattributed path as missing
+      # (so nix actually re-streams the bytes) and the store verifies
+      # the re-upload against the stored manifest and grants the
+      # path_tenants row. Pre-contract this copy was a silent no-op
+      # (already-complete fast path) and the build below poisoned at
+      # castore mount with "store returned no Directory body".
+      client.succeed(
+          "nix copy --no-check-sigs --to 'ssh-ng://k3s-server-tenant' "
+          "$(cat /etc/rio/busybox-closure/store-paths)"
+      )
+      # The copy must have ATTRIBUTED, not just no-op'd: the junction
+      # rows for (seed closure, gc-tenant-test) are what the castore
+      # mount of the build below depends on.
+      seed_rows_tenant = int(psql_k8s(k3s_server,
+          "SELECT count(*) FROM path_tenants pt "
+          "JOIN tenants t USING (tenant_id) "
+          "WHERE t.tenant_name = 'gc-tenant-test'"
+      ))
+      assert seed_rows_tenant > 0, (
+          "tenant-key nix copy of the seed closure must attribute the "
+          "already-complete paths to gc-tenant-test (attribution-scoped "
+          "FindMissingPaths + content-verified re-upload); got 0 rows — "
+          "either the session JWT was not minted for the gc-tenant key "
+          "or the store-side re-upload attribution is broken"
+      )
+      print(f"second-tenant seed copy attributed {seed_rows_tenant} path(s) to gc-tenant-test")
+
       # Build tenantDrv via the tenant-key alias. Fresh marker →
       # fresh derivation → fresh build (no DAG-dedup). Completion
       # sees tenant_id=Some(uuid) → upsert fires. store_url routes

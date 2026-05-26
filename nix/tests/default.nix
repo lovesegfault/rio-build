@@ -1044,6 +1044,13 @@ in
     subtests = [
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
+      # r[verify store.tenant.find-missing-attribution]
+      # r[verify store.put.tenant-attribution+2]
+      #   gc-sweep second-tenant tail: gc-tenant-test's `nix copy` of the
+      #   already-complete seed closure must be told the paths are missing
+      #   (attribution-scoped wopQueryValidPaths), re-stream the bytes, and
+      #   earn path_tenants rows (content-verified re-upload) — otherwise
+      #   the tenant build that follows poisons at castore mount.
       "gc-sweep"
       # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
