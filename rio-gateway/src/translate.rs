@@ -514,18 +514,27 @@ pub fn validate_dag(
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
         let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
         for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
-            // No drv-level skip for empty-path outputs: a crafted drv
-            // could pair one deferred (empty-path) output with a
-            // squatted well-formed one. Genuinely deferred derivations
-            // (ALL paths empty) fall out at the any-parseable filter
-            // below; individual empty paths are skipped per-output.
-            if drv.is_fixed_output() || drv.has_ca_floating_outputs() {
+            // Per-output classification: only plain input-addressed
+            // outputs (empty hash_algo) with a parseable declared path
+            // are bound by the derivation hash; content-bound outputs
+            // (fixed-output / floating-CA) are governed by the
+            // content-hash rules and deferred (empty) paths have
+            // nothing to validate. The derivation-level fast path
+            // therefore applies only when EVERY output is
+            // content-bound — neither a deferred output nor a
+            // floating-CA output may exempt a sibling static path
+            // from validation. Mixed shapes (which Nix itself never
+            // produces: "can't mix derivation output types") fall
+            // through to input_addressed_output_paths(), which
+            // refuses them, and the submission is rejected
+            // fail-closed rather than half-validated.
+            if drv.outputs().iter().all(|o| !o.hash_algo().is_empty()) {
                 continue;
             }
             if !drv
                 .outputs()
                 .iter()
-                .any(|o| StorePath::parse(o.path()).is_ok())
+                .any(|o| o.hash_algo().is_empty() && StorePath::parse(o.path()).is_ok())
             {
                 continue;
             }
@@ -543,6 +552,10 @@ pub fn validate_dag(
                 )
             })?;
             for output in drv.outputs() {
+                // Content-bound outputs are not derivation-path-derived.
+                if !output.hash_algo().is_empty() {
+                    continue;
+                }
                 if StorePath::parse(output.path()).is_err() {
                     continue;
                 }
@@ -1175,6 +1188,59 @@ mod tests {
         assert!(
             validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
             "malformed declared paths are not this gate's concern"
+        );
+    }
+
+    /// A crafted derivation pairing a floating-CA output with a squatted
+    /// well-formed static path must not dodge the gate via the
+    /// content-bound fast path; genuinely all-content-bound derivations
+    /// (all-floating-CA, single-output FOD) keep their fast path.
+    #[test]
+    fn validate_dag_rejects_squatted_path_next_to_floating_ca() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-camix.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+        // Mixed floating-CA + squatted static path → rejected fail-closed.
+        let mixed = Derivation::parse(&format!(
+            r#"Derive([("ca","","r:sha256",""),("evil","{victim}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("ca",""),("evil","{victim}")])"#
+        ))
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), mixed);
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("cannot derive output paths"),
+            "mixed CA + static shape must be rejected fail-closed: {err}"
+        );
+
+        // All-floating-CA → still accepted (content-bound fast path).
+        let all_ca = Derivation::parse(
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#,
+        )
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), all_ca);
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "all-floating-CA derivations keep the fast path"
+        );
+
+        // Single-output FOD → unchanged, accepted.
+        let fod = Derivation::parse(
+            r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src","sha256","abababababababababababababababababababababababababababababababab")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src")])"#,
+        )
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key, fod);
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "fixed-output derivations are unchanged"
         );
     }
 
