@@ -513,6 +513,7 @@ const NAME_PREFIX: &str = "rio";
 
 /// Job name. `rio-{role}-{pool_name}-{6-char-suffix}` — logs/metrics
 /// group naturally by role+pool prefix.
+// r[impl ctrl.pool.spawn-once]
 pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
     format!("{NAME_PREFIX}-{}-{pool_name}-{suffix}", role.as_str())
 }

@@ -712,6 +712,7 @@ pub(super) enum SpawnOutcome {
 /// to match spec," the Job is immutable after create (K8s rejects
 /// most spec edits). A 409 means the intent's Job already exists
 /// (deterministic naming) — `spawn_for_each` skips it next tick.
+// r[impl ctrl.pool.spawn-once]
 pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
     match jobs_api.create(&PostParams::default(), job).await {
         Ok(_) => SpawnOutcome::Spawned,

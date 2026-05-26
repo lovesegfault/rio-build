@@ -201,7 +201,7 @@ impl PlaceableGate {
     /// fail-closed (a standby replica whose lease-gated reconciler never
     /// publishes would otherwise see `queued=0` and reap the leader's
     /// Pending Jobs).
-    // r[impl ctrl.nodeclaim.placeable-gate+4]
+    // r[impl ctrl.nodeclaim.placeable-gate+5]
     pub fn retain(&self, intents: &mut Vec<SpawnIntent>) -> bool {
         match self.0.borrow().clone() {
             Some(set) => {
@@ -747,6 +747,7 @@ pub struct NodeClaimPoolReconciler {
     ///    `delete()`d; both callers `remove()` them BEFORE
     ///    `detect_vanished` so the controller's own reaps aren't
     ///    misread as Karpenter GC.
+    // r[impl ctrl.nodeclaim.inflight-conservation]
     inflight_created: HashMap<String, Cell>,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
@@ -918,6 +919,7 @@ impl NodeClaimPoolReconciler {
             // set doesn't drive `reap_excess_pending` against the new
             // leader's Jobs. Checked BEFORE `is_leader()` so it fires
             // on the same tick as the loss.
+            // r[impl ctrl.nodeclaim.placeable-gate+5]
             if self
                 .hooks
                 .lose
@@ -955,6 +957,7 @@ impl NodeClaimPoolReconciler {
             // pre-lapse timestamp over-reaps. Clearing here makes the
             // `Err` arm under-reap by one cycle (the documented SAFE
             // direction) instead of unboundedly over-reaping.
+            // r[impl ctrl.nodeclaim.lease-edge-polarity]
             if self.reload_pending() {
                 self.prev_idle.clear();
                 let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
@@ -1105,6 +1108,7 @@ impl NodeClaimPoolReconciler {
 
         let Some(mut intents) = intents else {
             self.consecutive_bot_ticks = self.consecutive_bot_ticks.saturating_add(1);
+            // r[impl ctrl.nodeclaim.consolidate-only-degraded]
             if self.consecutive_bot_ticks >= BOT_TICKS_BEFORE_CONSOLIDATE_ONLY {
                 return self.consolidate_only().await;
             }
@@ -1241,7 +1245,7 @@ impl NodeClaimPoolReconciler {
         // `consolidate_threshold_seconds` after it drains.
         let prev_extras_for_reap = self.prev_extra_cells.clone();
         self.emit_tick_gauges(&live, &placeable, &unplaced, now);
-        // r[impl ctrl.nodeclaim.placeable-gate+4]
+        // r[impl ctrl.nodeclaim.placeable-gate+5]
         // Publish `intent_id`s FFD-placed on a `Registered=True` node
         // (`in_flight == false`). The `pool/jobs` reconciler retains
         // only these — Jobs are NOT created for intents placed on
@@ -1273,6 +1277,7 @@ impl NodeClaimPoolReconciler {
             now,
         )
         .await?;
+        // r[impl ctrl.nodeclaim.inflight-conservation]
         // r40 bug_020: drop the controller's own reaps from inflight_created
         // BEFORE detect_vanished scans, so they're not misread as Karpenter
         // GC on the next tick. (reap_idle only reaps registered claims —
@@ -1397,6 +1402,8 @@ impl NodeClaimPoolReconciler {
         let (_, reaped) =
             health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
                 .await?;
+        // r[impl ctrl.nodeclaim.inflight-conservation]
+        // r[impl ctrl.nodeclaim.consolidate-only-degraded]
         // r40 bug_012: prune inflight_created against this tick's `live`
         // so the controller's own reaps below aren't later misread by
         // reconcile_once's detect_vanished as Karpenter GC. The
@@ -1782,6 +1789,7 @@ impl NodeClaimPoolReconciler {
                         )
                         .increment(1);
                         created.push((name, cell.clone()));
+                        // r[impl ctrl.nodeclaim.budget.per-class+2]
                         // r40 bug_015: budget counters track cores MINTED this
                         // tick (`class_budget` doc, cover.rs:339). A failed
                         // create is neither Registered nor in-flight; counting
@@ -1859,6 +1867,7 @@ impl NodeClaimPoolReconciler {
         {
             return Ok(());
         }
+        // r[impl ctrl.nodeclaim.ice-mark-clear]
         // BTreeSet dedup: `health::reap_unhealthy`/`detect_vanished`
         // push one entry per ICE'd CLAIM (up to 8/cell/tick); the
         // scheduler loops `mark()` per entry so duplicates would jump

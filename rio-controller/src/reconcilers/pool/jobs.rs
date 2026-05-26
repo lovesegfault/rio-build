@@ -350,7 +350,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-    // r[impl ctrl.nodeclaim.placeable-gate+4]
+    // r[impl ctrl.nodeclaim.placeable-gate+5]
     // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
     // the nodeclaim_pool reconciler's last FFD sim placed on a
     // `Registered=True` NodeClaim — structurally closes the spawn-
@@ -412,6 +412,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         HwSampledCache::fetch(ctx, intents.iter().flat_map(hw_classes_in).collect()).await;
 
     // ---- Count active Jobs for this pool ----
+    // r[impl ctrl.pool.tick-ordering]
     // ORDERING (I-183): list AFTER the queued poll. The reap step
     // compares `pending` against `queued`. Polling first keeps the
     // comparison coherent.
@@ -562,6 +563,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         },
     )
     .await;
+    // r[impl ctrl.pool.ack-spawned-soundness]
     // Ack to the scheduler so it records `dispatched_cells` for intents
     // that have a Pending Job — both newly spawned AND already-Pending-
     // before-this-tick. The latter covers scheduler restart:
@@ -626,6 +628,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     }
 
     // ---- Reap excess Pending ----
+    // r[impl ctrl.pool.degraded-polarity]
     // I-183: spawn-only is half a control loop. `None` when scheduler
     // unreachable OR placeable-gate unarmed: reap is fail-CLOSED (spawn
     // is fail-open).
@@ -1968,7 +1971,7 @@ mod tests {
         assert_eq!(pod.priority_class_name, None);
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate+4]
+    // r[verify ctrl.nodeclaim.placeable-gate+5]
     /// `PlaceableGate::retain` filters to the FFD-placed-on-Registered
     /// set; unarmed gate clears + returns `false` so `queued_known =
     /// None` (fail-closed reap).
@@ -1991,7 +1994,7 @@ mod tests {
         assert!(v.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.placeable-gate+4]
+    // r[verify ctrl.nodeclaim.placeable-gate+5]
     /// The spawn-intent fan-out close in unit-test form: 1226 Ready
     /// intents, FFD placed 9 on Registered nodes → only 9 survive the
     /// gate. Pre-B12 (`ready` retain) all 1226 would mint Pending Jobs;

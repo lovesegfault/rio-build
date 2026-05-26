@@ -822,7 +822,7 @@ in
   # r[verify ctrl.nodeclaim.shim-nodepool]
   # r[verify ctrl.nodeclaim.anchor-bulk+5]
   # r[verify ctrl.nodeclaim.priority-bucket]
-  # r[verify ctrl.nodeclaim.placeable-gate+4]
+  # r[verify ctrl.nodeclaim.placeable-gate+5]
   vm-sla-sizing-kwok = forecast-provisioning {
     inherit pkgs common;
     fixture = k3sFull {

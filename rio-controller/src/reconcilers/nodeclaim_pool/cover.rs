@@ -370,7 +370,7 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     (vec![(chunk, mem, disk); n as usize], min_eta)
 }
 
-// r[impl ctrl.nodeclaim.budget.per-class]
+// r[impl ctrl.nodeclaim.budget.per-class+2]
 /// §13c per-hw-class fleet-core sub-budget for `cover_deficit`'s
 /// per-Cell loop. `min(global_remaining, class_cap − class_live −
 /// class_created)` where:
@@ -1604,7 +1604,7 @@ mod tests {
     /// tick for ANY cell of the class (so spot's spend subtracts from
     /// od's budget — per-hwClass not per-Cell, D4). `None` cap ⇒
     /// global-only.
-    // r[verify ctrl.nodeclaim.budget.per-class]
+    // r[verify ctrl.nodeclaim.budget.per-class+2]
     #[test]
     fn class_budget_sub_caps_per_hwclass() {
         use super::super::ffd::LiveNode;

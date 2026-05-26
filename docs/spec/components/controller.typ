@@ -236,6 +236,74 @@ gone.
   ownerRef GC handles Job cleanup on Pool delete.
 ]
 
+#r("ctrl.pool.tick-ordering")[
+  Within one Pool reconcile tick the controller MUST (1) poll
+  `GetSpawnIntents` BEFORE listing Jobs, so `queued` and the Job census the
+  reap arms compare against come from the same tick; (2) run
+  `reap_stale_for_intents` over the FULL intent set (not the
+  headroom-truncated spawn slice) before the spawn pass, exclude the names it
+  reaped from the existing-name skip set so the post-reap respawn attempt
+  goes out the same tick, and subtract reaped active Jobs from the active
+  count before the headroom clamp so freed slots are spendable the same tick
+  without overshooting the ceiling; and (3) judge every destructive arm
+  against state no older than this tick's intent poll --- the excess-pending
+  delete additionally re-checks the live pod phase at delete time
+  (#rref("ctrl.ephemeral.reap-excess-pending")), and spawn, ack, and reap
+  within one tick all act on that tick's poll, never the previous tick's.
+]
+
+The ordering constraints above are the I-183 lesson: spawn-only is half a
+control loop, and a reap that compares this tick's Job census against last
+tick's queue (or vice versa) deletes Jobs for work that arrived between the
+two reads.
+
+#r("ctrl.pool.degraded-polarity")[
+  A failed or distrusted input degrades each consumer in that consumer's
+  pre-registered direction --- per consumer, not per RPC. For a tick whose
+  `GetSpawnIntents` poll failed: spawn MUST treat the queue as empty
+  (fail-open: spawn nothing new), the excess-pending and stale-intent reaps
+  MUST treat `queued` as unknown and skip
+  (#rref("ctrl.ephemeral.reap-excess-pending")), and the orphan-running reap
+  MUST NOT trust `ListExecutors` output that is errored, empty, or from a
+  leader younger than the orphan grace
+  (#rref("ctrl.ephemeral.reap-orphan-running")). The placeable gate's
+  unarmed and CRD-absent postures are per
+  #rref("ctrl.nodeclaim.placeable-gate"). In the NodeClaim-pool reconciler:
+  the Pool-coverage filter fails open (a transient Pool LIST error skips the
+  filter for one tick rather than dropping every intent), `cover_deficit`
+  fails closed when the global ceilings are not yet loaded
+  (#rref("ctrl.nodeclaim.anchor-bulk")) and MUST drop --- never cover ---
+  intents whose cell is absent from the loaded hw-class config, and after
+  `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` (5) consecutive failed polls the
+  reconciler MUST switch to consolidate-only mode
+  (#rref("ctrl.nodeclaim.consolidate-only-degraded")). A new consumer of a
+  shared input MUST pick its degraded direction explicitly; the same RPC
+  error is fail-open for some consumers and fail-closed for others by
+  design.
+]
+
+#r("ctrl.pool.spawn-once")[
+  Job identity is the deterministic name `job_name(pool, kind,
+  intent_suffix(intent_id))` --- one intent maps to one Job name per Pool,
+  and respawn is idempotent: a create that returns 409 AlreadyExists MUST be
+  treated as "this intent's Job already exists" (skip; do not error, do not
+  ack), never retried under a different name. Jobs are create-once; a
+  re-queued derivation re-creates the SAME name, so the terminal-collision
+  arm of `reap_stale_for_intents` is what unblocks a respawn, not a name
+  change. A spawn error MUST NOT abort the remainder of the tick.
+]
+
+#r("ctrl.pool.ack-spawned-soundness")[
+  The Pool reconciler MUST ack `AckSpawnedIntents{spawned}` only for intents
+  that have a Job behind them at ack time: intents whose create succeeded
+  this tick, plus intents whose Job is already Pending from a prior tick
+  (the re-ack that re-arms a restarted scheduler's `dispatched_cells`).
+  Intents whose create failed, name-collided, or was skipped MUST NOT be
+  acked --- acking a Job-less intent arms the scheduler's heartbeat-edge ICE
+  clear for a pod that will never heartbeat. Names reaped this tick MUST be
+  excluded from the already-Pending re-ack set in the same tick.
+]
+
 #r("ctrl.pool.fetcher-hardening+2")[
   For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless
   of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost
@@ -875,16 +943,18 @@ from helm's apply manager).
   taint.
 ]
 
-#r("ctrl.nodeclaim.budget.per-class")[
+#r("ctrl.nodeclaim.budget.per-class+2")[
   `cover_deficit` clamps each cell's per-tick mint at `min(global_remaining,
   hwClasses[cell.0].max_fleet_cores − class_live − class_created_this_tick)`
   where `class_live` and `class_created_this_tick` are summed across
   capacity-types (per-hwClass, NOT per-Cell --- a per-Cell cap would let
   spot+od each hit it independently → 2× \$/hr exposure). `max_fleet_cores=None`
-  ⇒ global budget only.
+  ⇒ global budget only. The per-tick created-core accounting (global and
+  per-class) MUST count only successful creates --- a failed NodeClaim
+  create consumes no budget.
 ]
 
-#r("ctrl.nodeclaim.placeable-gate+4")[
+#r("ctrl.nodeclaim.placeable-gate+5")[
   For Builder pools, the Pool reconciler creates Jobs only for intents the
   nodeclaim_pool reconciler's last FFD simulation placed on a `Registered=True`
   NodeClaim. The §13a `ready` retain is replaced; Job count is bounded by
@@ -900,7 +970,97 @@ from helm's apply manager).
   the NodeClaim budget, not the Job count.) Extending the retain to Fetcher
   pools is a follow-up. The gate also does NOT apply when the NodeClaim CRD is
   absent (the controller probes at startup; absent ⇒ static-node cluster, gate
-  is pass-through).
+  is pass-through). Producer-side guarantee: the published set MUST come from
+  the producer's last successful FFD tick over `Registered=True` claims ---
+  it is not republished on a failed-poll tick or in consolidate-only mode,
+  and on lease loss the producer MUST unarm the gate (publish nothing) before
+  the next consumer tick, so an ex-leader's stale set never drives spawn or
+  reap against the new leader's Jobs. Consumer-side postures by
+  configuration: the unarmed-gate fail-closed sentence above applies to
+  Builder pools; when the NodeClaim CRD is absent the spawn side passes
+  through unfiltered (fail-open) but the excess-pending reap stays
+  fail-closed --- an ungated `queued` count is not authoritative against the
+  post-completion Job-status lag; and a Fetcher pool's excess reap is keyed
+  only on scheduler reachability when the CRD is present, since its `queued`
+  is the raw scheduler count and needs no FFD gate to be authoritative.
+]
+
+#r("ctrl.nodeclaim.lease-edge-polarity")[
+  Every cross-tick in-memory field of the NodeClaim-pool reconciler is
+  classified by its stale-state polarity, and its clear-or-keep MUST sit on
+  the matching lease edge. The classes and the per-field classification:
+  *suppress* (a stale entry suppresses a later observation or signal) ---
+  `recorded_boot` and `inflight_created`, cleared on the lease-acquire edge
+  in the reload `Ok` arm only; *amplify* (a stale entry amplifies a
+  destructive action) --- `prev_idle`, cleared unconditionally on the
+  lease-acquire edge BEFORE the PG reload attempt, so even a failed reload
+  cannot leave a pre-acquire idle timestamp in place and the idle basis is
+  never earlier than the current tenure's first idle observation;
+  *cleanup-pending* (a stale entry owes exactly one trailing cleanup write)
+  --- `prev_extra_cells` and `prev_unplaced_extras`, never cleared on
+  acquire; *reload-latch* --- `sketches`, reloaded from PG on acquire with
+  the latch cleared only on a successful load and `persist()` gated off
+  while the reload is pending, so a stale in-memory copy cannot overwrite
+  the previous leader's rows. On the lease-loss edge the reconciler MUST
+  unarm the placeable gate (#rref("ctrl.nodeclaim.placeable-gate")) and,
+  while not leader, MUST take no create, delete, ack, or publish effect.
+  Any new cross-tick field MUST be classified into one of these classes and
+  its clear (or deliberate not-clear) placed on the matching edge.
+]
+
+The polarity classes are the distilled lesson of the lease-edge fix history:
+a suppress-class field left stale costs one lost observation or one spurious
+ICE mask; an amplify-class field left stale deletes a healthy node; a
+cleanup-class field cleared too eagerly orphans a paging gauge series at its
+last value; a stale sketch persisted over the previous leader's rows resets
+fleet-wide learning.
+
+#r("ctrl.nodeclaim.inflight-conservation")[
+  `inflight_created` tracks every NodeClaim `cover_deficit` created until it
+  is observed `Registered`, observed terminating, deleted by this
+  controller, or detected vanished --- and each tracked claim MUST resolve
+  to exactly one of those outcomes. Its mutators are exactly: extending with
+  the names created this tick; clearing on config reload; `detect_vanished`'s
+  retain rules (drop registered/terminating/absent, KEEP still-in-flight),
+  which MUST run on consolidate-only ticks as well as full ticks; and
+  removal of the names this controller itself reaped, which MUST happen
+  BEFORE `detect_vanished` scans in both modes so the controller's own
+  deletes are never misread as Karpenter GC (a spurious ICE mark on a
+  healthy cell). A code path that deletes or forgets a tracked claim without
+  updating the map violates this rule.
+]
+
+#r("ctrl.nodeclaim.ice-mark-clear")[
+  ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
+  `unfulfillable_cells` (marks) are deduplicated to at most one entry per
+  cell per tick (the scheduler's backoff ladder steps once per entry,
+  #rref("sched.sla.hw-class.ice-mask")), and a mark is emitted only for a
+  cell whose claim launch-failed, timed out unregistered, or vanished to
+  Karpenter GC --- never for a claim this controller itself reaped
+  (#rref("ctrl.nodeclaim.inflight-conservation")). `registered_cells`
+  (clears) are emitted only for `Registered=True` edges that pass the
+  recency gate in `observe_registered`: a registration older than the gate
+  is recorded without emitting a clear, so a restart or lease acquire ---
+  both of which empty the edge-detector state --- MUST NOT mass-clear the
+  scheduler's accumulated backoff from old registrations. Cells ICE-marked
+  this tick MUST be masked from the same tick's `cover_deficit` (mark before
+  cover). The clear-side ladder, the heartbeat clear, and TTL expiry are
+  scheduler-side (#rref("sched.sla.hw-class.ice-mask")) and are not restated
+  here.
+]
+
+#r("ctrl.nodeclaim.consolidate-only-degraded")[
+  After `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` (5) consecutive failed
+  `GetSpawnIntents` polls the NodeClaim-pool reconciler MUST run in
+  consolidate-only mode until a poll succeeds. A consolidate-only tick MAY
+  list NodeClaims, record kube-only observations, reap idle and unhealthy
+  claims, prune `inflight_created`, and persist sketches (subject to the
+  reload latch); it MUST NOT create NodeClaims, MUST NOT republish the
+  placeable set (the consumer's own failed poll keeps it fail-closed,
+  #rref("ctrl.nodeclaim.placeable-gate")), and MUST NOT send ICE marks or
+  clears (locally detected ICE cells are dropped, not queued). Idle reaping
+  in this mode treats the placeable set as empty --- no FFD reservation is
+  honored during the outage.
 ]
 
 = Build CRD (removed)
