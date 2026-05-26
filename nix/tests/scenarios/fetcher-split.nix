@@ -133,7 +133,8 @@ pkgs.testers.runNixOSTest {
         "mkdir -p /srv/sha256 && "
         "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox && "
         "echo ok > /srv/ok && "
-        "printf 'rio-hashed-mirror-probe\\n' > /srv/sha256/${drvs.hashedMirrorProbeHex}"
+        "printf 'rio-hashed-mirror-probe\\n' > /srv/sha256/${drvs.hashedMirrorProbeHex} && "
+        "printf 'rio-bad-hash-actual\\n' > /srv/bad-hash"
     )
     # /busybox is delayed 30s so the one-shot fetcher pod stays Running
     # long enough for the netns probe below. /ok and / serve immediately
@@ -477,6 +478,45 @@ pkgs.testers.runNixOSTest {
             )
         assert "rio-mirror-probe" in out, f"unexpected output {out!r}"
         print(f"fod-dead-origin PASS: {out.strip().splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fod-bad-hash — wrong origin content is rejected BEFORE upload
+    # ══════════════════════════════════════════════════════════════════
+    # /bad-hash serves 200 with a body whose sha256 differs from the
+    # FOD's declared outputHash, and no /sha256/{hex} mirror entry
+    # exists for that hash. builtin:fetchurl does no content
+    # verification (builtin_fetchurl.rs); the FOD gate in the result
+    # path (verify_fod_hashes, executor/outputs.rs) must reject the
+    # output before any upload. Two observable halves: the client sees
+    # a hash-mismatch failure, and the output path never appears in the
+    # rio store — that absence is the integrity boundary that makes the
+    # egress-open fetcher NetworkPolicy safe.
+    with subtest("fod-bad-hash: mismatched FOD is rejected, never stored"):
+        bad_drv = client.succeed(
+            "nix-instantiate ${drvs.fodBadHash}"
+        ).strip()
+        bad_out = client.succeed(f"nix-store -q --outputs {bad_drv}").strip()
+        rc, out = client.execute(
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodBadHash} 2>&1"
+        )
+        assert rc != 0, (
+            f"fod-bad-hash unexpectedly SUCCEEDED — /bad-hash serves a body "
+            f"that cannot match the declared outputHash:\n{out}"
+        )
+        lowered = out.lower()
+        assert "hash mismatch" in lowered or "hash verification failed" in lowered, (
+            f"fod-bad-hash failed for a reason other than the FOD hash gate "
+            f"(expected a hash-mismatch rejection):\n{out}"
+        )
+        rc_info, info_out = client.execute(
+            f"nix path-info --store ssh-ng://k3s-server {bad_out} 2>&1"
+        )
+        assert rc_info != 0, (
+            f"fod-bad-hash: rejected output {bad_out} IS PRESENT in the rio "
+            f"store — the FOD hash gate must reject before upload.\n{info_out}"
+        )
+        print(f"fod-bad-hash PASS: rejected (rc={rc}), {bad_out} absent from store")
 
     # ══════════════════════════════════════════════════════════════════
     # fod-dir — recursive-hash FOD with directory output

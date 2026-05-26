@@ -1134,6 +1134,12 @@ in
   #   fod-fail subtest: failing FOD propagates within 60s. Daemon's
   #   post-fail stat($out) hits FUSE; NotInput → ENOENT without
   #   store contact. P0308 hang would push elapsed past timeout 90.
+  # r[verify fetcher.upload.hash-verify-before]
+  #   fod-bad-hash subtest: the origin serves 200 with content that
+  #   cannot match the declared outputHash. The FOD hash gate rejects
+  #   before upload — the client sees a hash-mismatch failure and the
+  #   output path stays absent from the rio store (path-info via
+  #   ssh-ng://k3s-server must fail).
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {

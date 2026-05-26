@@ -81,6 +81,11 @@ rec {
   # fetcher-split fod-fail.
   fodFail = "${dir}/fod-fail.nix";
 
+  # Flat-hash FOD whose origin serves wrong content (200, body ≠
+  # declared hash). The FOD hash gate must reject it before upload and
+  # the output may never reach the store. fetcher-split fod-bad-hash.
+  fodBadHash = "${dir}/fod-bad-hash.nix";
+
   # sha256 hex of the body fod-dead-origin.nix expects. Computed from
   # the same literal so the served path and the FOD's outputHash agree.
   hashedMirrorProbeHex = builtins.hashString "sha256" "rio-hashed-mirror-probe\n";
