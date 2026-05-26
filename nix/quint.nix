@@ -1330,6 +1330,346 @@ in
       witness = "noFailoverOnPoisonedRow";
     };
 
+    # ------------------------------------------------------------------
+    # rio-store's chunk reference-counting subsystem, AS BUILT: the exact
+    # chunks.refcount counter and the claim/heartbeat/drop-guard/token/
+    # reaper machinery that maintains it (chunkLiveness.qnt — the
+    # refcount-formal campaign's Phase-0 Stage-B model; the invariant ↔
+    # rule map is docs/spec/models/refcount-invariant-map.md). Four
+    # exhaustive regimes mirror design §3.2: base (one writer, no
+    # faults), crash (process death between transactions, the drain's
+    # mid-commit crash), contend (two writers sharing chunks against the
+    # GC pipeline and drain), corrupt (an unparseable chunk_list at
+    # deletion time — the C12 skip). The corrupt regime checks the
+    # CARVED forms of CR-2/CR-3 (the rules' sanctioned-deviation
+    # clauses); the unconditional forms falsifying there is the
+    # pre-registered as-built deviation, wired below as expect-violation
+    # checks so the leak class stays demonstrated, not assumed. State
+    # counts, depths and wall-clocks live in the introducing commits'
+    # messages and the checks' transcripts.
+    #
+    # Marker scope: the chunk-liveness rules added by the Stage-A spec
+    # audit (no-live-collect, bounded-garbage-retention, refcount-meaning,
+    # refcount-decrement, liveness-not-presence) get their first verify
+    # markers here, on the regime that makes each load-bearing;
+    # the pre-existing mechanism rules (refcount-txn, grace-ttl,
+    # upsert-inserted, chunk-upload-committed, pending-deletes,
+    # placeholder-claim, orphan-heartbeat) gain the model-checked form on
+    # top of their existing unit-test markers. Witness checks carry no
+    # markers (same policy as the other models).
+    # ------------------------------------------------------------------
+
+    # The base regime: one writer over two paths and three hashes with
+    # the full chunk-list alphabet, the explicit abort/rollback paths,
+    # the path sweep, the orphan-chunk sweep and the drain — no faults.
+    # The counter must equal the manifest fold at every state, garbage
+    # must stay reclaimable, and no referenced chunk's object may be
+    # deleted.
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    # r[verify store.chunk.refcount-meaning]
+    # r[verify store.chunk.refcount-decrement]
+    # r[verify store.chunk.refcount-txn]
+    quint-chunk-liveness-base = mkQuintCheck {
+      name = "chunk-liveness-base";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+      invariants = [
+        "boundsOK"
+        "m023NonNegative"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr3CounterRefinesFold"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+      ];
+    };
+
+    # The crash regime: two writers with process death enabled at every
+    # in-flight phase (C1/C2/C5/C6/C7), the drain's S3-delete-then-
+    # commit-fails window (C10), and the stale-reclaim repair pair (the
+    # 300 s hot-path reclaim and the 15-minute scanner). The counter
+    # stays exactly equal to the fold through every crash window (the
+    # abandoned rows keep their manifests, so the garbage is accounted
+    # garbage), a reclaimed chunk's cleared uploaded_at forces the next
+    # writer to re-PUT instead of trusting the counter, and a live
+    # heartbeating owner is never reaped.
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    # r[verify store.chunk.refcount-meaning]
+    # r[verify store.chunk.liveness-not-presence]
+    # r[verify store.cas.upsert-inserted+2]
+    # r[verify store.cas.chunk-upload-committed]
+    # r[verify store.gc.orphan-heartbeat]
+    # r[verify store.put.placeholder-claim+2]
+    quint-chunk-liveness-crash = mkQuintCheck {
+      name = "chunk-liveness-crash";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      invariants = [
+        "boundsOK"
+        "m023NonNegative"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr3CounterRefinesFold"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+      ];
+    };
+
+    # The contend regime: two live writers sharing a chunk against the
+    # GC pipeline and the drain — the G4a collect-vs-re-reference TOCTOU
+    # family, the orphan-chunk sweep's select-vs-update race (C11), the
+    # by-count batch sweep, and the late-cleanup no-op contention. No
+    # process death: every interleaving is a healthy-process schedule.
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    # r[verify store.chunk.refcount-meaning]
+    # r[verify store.chunk.refcount-decrement]
+    # r[verify store.chunk.liveness-not-presence]
+    # r[verify store.gc.pending-deletes]
+    # r[verify store.chunk.grace-ttl]
+    quint-chunk-liveness-contend = mkQuintCheck {
+      name = "chunk-liveness-contend";
+      spec = "chunkLiveness";
+      main = "chunkLivenessContend";
+      invariants = [
+        "boundsOK"
+        "m023NonNegative"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr3CounterRefinesFold"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+      ];
+    };
+
+    # The corrupt regime: an existing manifest_data.chunk_list can rot
+    # and every deletion path that parses it at delete time skips the
+    # decrement while still deleting the manifest (C12). The CARVED
+    # invariant forms hold: the counter equals the fold plus exactly the
+    # observably-skipped decrements, stranded garbage is exactly the
+    # skipped amount, and the data-loss invariant is untouched (the skip
+    # errs toward retention). The unconditional forms are the
+    # pre-registered falsifications below, never invariants here.
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    # r[verify store.chunk.refcount-meaning]
+    quint-chunk-liveness-corrupt = mkQuintCheck {
+      name = "chunk-liveness-corrupt";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCorrupt";
+      invariants = [
+        "boundsOK"
+        "m023NonNegative"
+        "cr1NoLiveChunkCollected"
+        "cr2CarvedCorrupt"
+        "cr3CarvedCorrupt"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+      ];
+    };
+
+    # The deterministic reproducer runs, one check per regime: the
+    # happy-path walkthrough, the own-heartbeat token no-op (C4), the
+    # crash-then-hot-path-reclaim-then-re-upload shape (I-040/I-207),
+    # the shared-chunk by-count batch sweep, and the corrupt-skip
+    # permanent leak are replayed step by step with their expectations
+    # re-asserted.
+    quint-chunk-liveness-runs-base = mkQuintRunCheck {
+      name = "chunk-liveness-runs-base";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+    };
+    quint-chunk-liveness-runs-crash = mkQuintRunCheck {
+      name = "chunk-liveness-runs-crash";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+    };
+    quint-chunk-liveness-runs-contend = mkQuintRunCheck {
+      name = "chunk-liveness-runs-contend";
+      spec = "chunkLiveness";
+      main = "chunkLivenessContend";
+    };
+    quint-chunk-liveness-runs-corrupt = mkQuintRunCheck {
+      name = "chunk-liveness-runs-corrupt";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCorrupt";
+    };
+
+    # Non-vacuity witnesses for the chunkLiveness regimes. Each check
+    # passes only when the checker violates its witness — machine-checked
+    # evidence that the scenario a regime's invariants constrain is
+    # actually reachable in that regime's explored space. Deliberately no
+    # tracey markers here (same policy as the other models' witnesses).
+
+    # The base regime's headline states: a complete chunked upload
+    # exists, a backend delete actually fires, a referenced chunk whose
+    # presence is not yet confirmed exists (the M_033 precondition), the
+    # own-heartbeat token no-op (C4) is reachable, and the heartbeat
+    # actually resets staleness.
+    quint-chunk-liveness-witness-complete-upload = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-complete-upload";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+      witness = "noCompleteUpload";
+    };
+    quint-chunk-liveness-witness-backend-delete = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-backend-delete";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+      witness = "noBackendDelete";
+    };
+    quint-chunk-liveness-witness-m033-precondition = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-m033-precondition";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+      witness = "noUnconfirmedReferencedChunk";
+    };
+    quint-chunk-liveness-witness-stale-token = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-stale-token";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+      witness = "noStaleTokenRollbackNoop";
+    };
+    quint-chunk-liveness-witness-heartbeat-reset = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-heartbeat-reset";
+      spec = "chunkLiveness";
+      main = "chunkLivenessBase";
+      witness = "noHeartbeatReset";
+    };
+
+    # The crash regime's fault alphabet is reachable: the C1 (claimed),
+    # C2 (upgraded) and C5 (cleanup-pending — the state C3/C7 collapse
+    # onto) crash windows, the two-writers-staged-then-crashed C6 shape,
+    # the abandoned-but-accounted leak state those windows leave behind,
+    # and both stale-reclaim repair paths (hot-path and scanner)
+    # actually firing.
+    quint-chunk-liveness-witness-crash-claimed = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-crash-claimed";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noCrashAtClaimed";
+    };
+    quint-chunk-liveness-witness-crash-upgraded = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-crash-upgraded";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noCrashAfterUpgrade";
+    };
+    quint-chunk-liveness-witness-crash-pending-reap = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-crash-pending-reap";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noCrashBeforeReap";
+    };
+    quint-chunk-liveness-witness-double-crash-staged = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-double-crash-staged";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noDoubleCrashStaged";
+    };
+    quint-chunk-liveness-witness-abandoned-accounting = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-abandoned-accounting";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noAbandonedAccounting";
+    };
+    quint-chunk-liveness-witness-hotpath-reclaim = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-hotpath-reclaim";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noHotpathReclaim";
+    };
+    quint-chunk-liveness-witness-scanner-reap = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-scanner-reap";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCrash";
+      witness = "noScannerReap";
+    };
+
+    # The contend regime's contended states: a shared chunk decremented
+    # by count in one batch transaction, the drain re-check skipping a
+    # resurrected chunk, the orphan-chunk sweep's inner re-check
+    # excluding a candidate resurrected after the outer SELECT (C11),
+    # and an owner-side cleanup no-opping against a foreign or missing
+    # row.
+    quint-chunk-liveness-witness-shared-by-count = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-shared-by-count";
+      spec = "chunkLiveness";
+      main = "chunkLivenessContend";
+      witness = "noSharedByCountDecrement";
+    };
+    quint-chunk-liveness-witness-drain-resurrect = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-drain-resurrect";
+      spec = "chunkLiveness";
+      main = "chunkLivenessContend";
+      witness = "noDrainResurrectSkip";
+    };
+    quint-chunk-liveness-witness-orphan-recheck = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-orphan-recheck";
+      spec = "chunkLiveness";
+      main = "chunkLivenessContend";
+      witness = "noOrphanRecheckSave";
+    };
+    quint-chunk-liveness-witness-late-cleanup-noop = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-late-cleanup-noop";
+      spec = "chunkLiveness";
+      main = "chunkLivenessContend";
+      witness = "noLateCleanupNoop";
+    };
+
+    # The pre-registered as-built deviations of the corrupt regime
+    # (refcount-invariant-map.md, CR-2/CR-3 rows): with a corrupt
+    # chunk_list skip, the exact counter-equals-fold form and the
+    # unconditional no-stranded-garbage form MUST falsify — the C12
+    # permanent leak the design's replacement exists to dissolve. These
+    # are reproducer checks for documented defects, not regressions: if
+    # either stops falsifying, the model has stopped reaching the leak
+    # (or the code stopped leaking) and the invariant map's Stage-B
+    # section must be revisited. The third check pins the literal leak
+    # shape (refcount above zero with no referencing manifest).
+    quint-chunk-liveness-corrupt-c12-overcount = mkQuintWitnessCheck {
+      name = "chunk-liveness-corrupt-c12-overcount";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCorrupt";
+      witness = "cr3CounterRefinesFold";
+    };
+    quint-chunk-liveness-corrupt-c12-stranded = mkQuintWitnessCheck {
+      name = "chunk-liveness-corrupt-c12-stranded";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCorrupt";
+      witness = "cr2NoStrandedGarbage";
+    };
+    quint-chunk-liveness-witness-corrupt-leak = mkQuintWitnessCheck {
+      name = "chunk-liveness-witness-corrupt-leak";
+      spec = "chunkLiveness";
+      main = "chunkLivenessCorrupt";
+      witness = "noCorruptLeak";
+    };
+
+    # The threshold-ordering inversion: with the hot-path reclaim
+    # threshold lowered to the heartbeat deadline (production:
+    # 30 s heartbeat vs 300 s hot-path vs 900 s scanner), reaping a
+    # live, progressing owner becomes reachable and S5 falsifies — the
+    # machine-checked evidence that the scaled clock constants preserve
+    # the ordering the heartbeat/reclaim design depends on, and that S5
+    # does not hold vacuously in the well-ordered regimes.
+    quint-chunk-liveness-threshold-order = mkQuintWitnessCheck {
+      name = "chunk-liveness-threshold-order";
+      spec = "chunkLiveness";
+      main = "chunkLivenessThresholdOrder";
+      witness = "s5LiveOwnerNeverReaped";
+    };
+
     # Implementation conformance (model-based testing). The regime checks
     # above prove the PROTOCOL; this one proves rio-lease implements
     # that protocol: rio-lease/src/mbt_tests.rs replays traces generated
