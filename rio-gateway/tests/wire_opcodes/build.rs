@@ -603,6 +603,116 @@ async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// wopBuildDerivation (36): an inline input-addressed derivation whose
+/// full .drv is NOT in the store is rejected fail-closed when it declares
+/// a real (parseable) store path — with only the inline BasicDerivation
+/// there is nothing binding that declared path to the derivation, which
+/// is exactly the path-squatting shape the validate_dag gate closes for
+/// cached derivations. Mirrors CppNix's daemon, which refuses
+/// buildDerivation for input-addressed derivations from untrusted
+/// clients.
+#[tokio::test]
+async fn test_build_derivation_inline_ia_unresolvable_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000004-inline-ia.drv";
+    let squatted = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: squatted,                        // parseable, not ours to claim
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: squatted,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("input-addressed"),
+        "error should say why inline IA is refused: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("upload the .drv") || err.message.contains("not in the store"),
+        "error should tell the client what to do: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "inline IA rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the single-node fallback stays available for
+/// content-bound derivations — an inline FIXED-OUTPUT derivation with no
+/// uploaded .drv is accepted and submitted (its output path is governed by
+/// the content-hash rules, not by trust in the declared path).
+#[tokio::test]
+async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000005-inline-fod.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        string: "sha256",                        // hash_algo → fixed-output
+        string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "inline FOD must still build (Built=0), got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.is_empty(),
+        "no error for the content-bound fallback"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "the content-bound inline fallback is submitted"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// BuildPathsWithResults (46) with an invalid build mode should still return
 /// results (not STDERR_ERROR) — the handler treats unknown modes as Normal.
 /// But invalid DerivedPath strings DO cause per-entry failures.

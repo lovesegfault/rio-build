@@ -1238,6 +1238,48 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             }
         }
         Err(e) => {
+            // r[impl gw.reject.nochroot] is the precedent for inline
+            // checks; this one closes the same bypass for output paths.
+            //
+            // CppNix's daemon refuses wopBuildDerivation for
+            // input-addressed derivations from untrusted clients
+            // outright ("you are not privileged to build
+            // input-addressed derivations"): with only an inline
+            // BasicDerivation there is nothing binding declared
+            // input-addressed output paths to the derivation, so
+            // accepting them here would let a client squat any
+            // not-yet-built store path by never uploading the .drv
+            // (the validate_dag path-binding gate only sees cached
+            // full derivations). Mirror that posture fail-closed: the
+            // single-node fallback is acceptable only when every
+            // statically-declared output is content-bound
+            // (fixed-output / floating-CA — their paths are governed
+            // by the content-hash rules). Declared paths that are not
+            // store paths cannot alias a real store object and keep
+            // failing later exactly as before.
+            if let Some(out) = basic_drv
+                .outputs()
+                .iter()
+                .find(|o| o.hash_algo().is_empty() && StorePath::parse(o.path()).is_ok())
+            {
+                warn!(
+                    drv_path = %drv_path_str,
+                    output = out.name(),
+                    declared = out.path(),
+                    "rejecting inline input-addressed derivation: full .drv unavailable, \
+                     declared output path cannot be validated"
+                );
+                stderr_err!(
+                    stderr,
+                    "cannot build '{}': the full derivation is not in the store ({}) and \
+                     inline input-addressed derivations cannot be validated — upload the \
+                     .drv first (output '{}' declares '{}')",
+                    drv_path_str,
+                    e,
+                    out.name(),
+                    out.path()
+                );
+            }
             debug!(error = %e, "full derivation not available, using single-node DAG");
             // Single-node fallback skips reconstruct_dag (which is
             // where the BFS root gets flagged), so mark the requested

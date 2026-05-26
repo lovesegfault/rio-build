@@ -514,10 +514,12 @@ pub fn validate_dag(
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
         let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
         for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
-            if drv.is_fixed_output()
-                || drv.has_ca_floating_outputs()
-                || drv.has_unknown_output_paths()
-            {
+            // No drv-level skip for empty-path outputs: a crafted drv
+            // could pair one deferred (empty-path) output with a
+            // squatted well-formed one. Genuinely deferred derivations
+            // (ALL paths empty) fall out at the any-parseable filter
+            // below; individual empty paths are skipped per-output.
+            if drv.is_fixed_output() || drv.has_ca_floating_outputs() {
                 continue;
             }
             if !drv
@@ -1173,6 +1175,34 @@ mod tests {
         assert!(
             validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
             "malformed declared paths are not this gate's concern"
+        );
+    }
+
+    /// A crafted derivation pairing a deferred (empty-path) output with a
+    /// squatted well-formed one must not dodge the path gate via any
+    /// drv-level skip.
+    #[test]
+    fn validate_dag_rejects_squatted_path_next_to_deferred_output() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mixed.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let aterm = format!(
+            r#"Derive([("evil","{victim}","",""),("out","","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("evil","{victim}"),("out","")])"#
+        );
+        let drv = Derivation::parse(&aterm).expect("test ATerm parses");
+
+        let mut cache = HashMap::new();
+        cache.insert(key, drv);
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation") || err.contains("derive"),
+            "mixed deferred+squatted shape must be rejected: {err}"
         );
     }
 
