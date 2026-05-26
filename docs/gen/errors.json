@@ -344,6 +344,13 @@
       "doc": "The `GetDirectory` RPC failed."
     },
     {
+      "enum": "TreeError",
+      "name": "UnsortedDirectory",
+      "crate": "rio-builder",
+      "msg": "Directory body {digest} has unsorted child lists (non-canonical encoding)",
+      "doc": "A `Directory` body's child lists are not strictly name-sorted. `lookup` binary-searches them, so accepting the body would mis-resolve names (spurious ENOENT mid-build) instead of failing the mount; the store enforces the canonical sorted encoding at upload time, so this means a corrupt or non-conforming server."
+    },
+    {
       "enum": "UploadError",
       "name": "InvalidReference",
       "crate": "rio-builder",

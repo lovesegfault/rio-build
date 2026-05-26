@@ -543,7 +543,9 @@ Hoist `StoreClients` + the FUSE-independent fetch primitives (`JIT_MIN_THROUGHPU
 > txn). The gate lives in `nar_index::maybe_spawn_eager`, called from
 > `finalize_single` (PutPath) and post-commit in `put_path_batch_impl`;
 > `persist_nar`/`stage_nar_for_batch` now borrow the NAR so the buffer survives
-> the commit as an `Arc<Vec<u8>>`. Observability:
+> the commit as a refcounted `Bytes` (which keeps the accumulation Vec's whole
+> allocation alive — the retained-RSS bound is 4 × buffer capacity, ~2× NAR
+> length worst case, not 4 × NAR size). Observability:
 > `rio_store_nar_index_eager_total{outcome=spawned|skipped|error}` (not in the
 > original file table — it is the only way to distinguish "eager path fired"
 > from "indexer_loop got there first", which the VM subtest needs).
@@ -732,7 +734,7 @@ Visualizes what the branch already emits (metric names verified against `docs/ge
 
 **Metric gaps found vs the original sketch / spec §14 (handoffs, not fixed here):**
 
-- `rio_builder_objects_cache_{bytes,hit_total}` (sketched "objects_cache_bytes per node" panel) do not exist — they land with P0571's mountd-owned cache; add the per-node cache panel then. Same for `rio_mountd_cache_free_bytes` (spec §14).
+- ~~`rio_builder_objects_cache_{bytes,hit_total}` (sketched "objects_cache_bytes per node" panel) do not exist — they land with P0571's mountd-owned cache; add the per-node cache panel then. Same for `rio_mountd_cache_free_bytes` (spec §14).~~ *Resolved post-integration (deferred-cleanup sweep): P0571 landed the metrics and `castore-fuse.json` now carries the two node-cache panels (objects-cache hits + sweep activity; bytes served / free / reclaimed), with the sweep `tier` label pairs added to the `10-dashboard-labels.sh` allowlist.*
 - `rio_store_nar_index_pending` (sketched `RioStoreNarIndexBacklog` alert) does not exist; the landed warn keys on `nar_index_eager_total{outcome="error"}` instead. A queue-depth gauge sampled from `list_nar_index_pending` would make the backlog alert possible — P0557/P0552 follow-up.
 - The sketched `RioBuilderDigestFuseStall` expr (`open_seconds_count` flat while `_sum` rises) is structurally impossible — a Prometheus histogram's `_sum`/`_count` move together at observation time (reply), never mid-open. A real stall detector needs an in-flight-opens gauge (or upcall-vs-completion rate comparison once `op="open"` upcalls and completions are both high-rate); deferred.
 - `rio_store_express_{bytes,evicted_total}` are described but not emitted until P0585's eviction sweeper — no panels yet.
@@ -992,7 +994,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.fs.passthrough-stack-depth` | decisions/022 §2.9 | castore_fuse/mod.rs init (P0559) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
 | `builder.fs.file-digest-integrity` | decisions/022 §2.7 | castore_fuse/open.rs (P0559) | vm-castore-e2e `integrity-fail` (P0560§B) |
 | `builder.fs.fetch-circuit` | components/builder.md | castore_fuse/circuit.rs (P0559) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
-| `builder.fs.node-digest-cache` | components/builder.md | bin/rio-mountd.rs (P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
+| `builder.fs.node-digest-cache` | components/builder.md | castore_fuse/sweep.rs (P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
 | `builder.fs.node-chunk-cache` | decisions/022 §2.6 | castore_fuse/open.rs (P0575) + bin/rio-mountd.rs (P0567) | vm-castore-e2e `cross-build-dedup-streaming` (P0560§B) |
 | `builder.fs.shared-backing-cache` | decisions/022 §2.6 | castore_fuse/open.rs (P0559+P0571) | vm-castore-e2e `cross-build-dedup` (P0560§B) |
 | `builder.fs.streaming-open` | components/builder.md | castore_fuse/open.rs (P0575) | vm-castore-e2e `cold-read` <50ms (P0560§B) |
@@ -1008,7 +1010,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `store.compat.nar-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
 | `store.compat.narinfo-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
 | `store.compat.write-after-commit` | components/store.md | grpc/put_path/ (P0566) | unit (P0566) |
-| `store.compat.stock-nix-substitute` | components/store.md | (verify-only) | vm-store-compat `stock-nix-substitute` (P0580) |
+| `store.compat.stock-nix-substitute` | components/store.md | rio-store/src/compat/mod.rs (P0580) | vm-store-compat `stock-nix-substitute` (P0580) |
 | `store.compat.gc-coupled` | components/store.md | gc/sweep.rs (P0581) | rio-store/tests/gc.rs (P0581) |
 | `obs.metric.compat` | observability.md | rio-store/lib.rs (P0566) | vm-store-compat (P0580) |
 | `obs.metric.chunk-backend-tiered` | observability.md | rio-store/lib.rs (P0548) | vm-store-tiered (P0555) |

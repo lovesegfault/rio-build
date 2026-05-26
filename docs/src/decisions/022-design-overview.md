@@ -357,6 +357,12 @@ r[obs.metric.express-eviction]
 | `rio_mountd_promote_inflight` (gauge) | current `Promote` copy tasks |
 | `rio_mountd_connections_current` (gauge) | live UDS connections (== builds on this node) |
 | `rio_mountd_cache_free_bytes` (gauge) | `statvfs(cache_dir)` free, sampled at LRU-sweep interval |
+| `rio_builder_objects_cache_hit_total` | castore-FUSE `open()`s served straight from the node-shared backing cache (no fetch) |
+| `rio_builder_objects_cache_bytes` | bytes served from the node-shared backing cache on `open()` hits (re-fetch traffic avoided) |
+| `rio_mountd_sweep_low_space_total` | disk-pressure sweep activations (`min(free%)` dropped below the low-water mark) |
+| `rio_mountd_sweep_removed_total` | entries removed by the disk-pressure sweep, labeled `{tier="staging"\|"chunks"\|"cache"}` |
+| `rio_mountd_sweep_bytes_freed_total` | bytes reclaimed by the disk-pressure sweep, labeled `{tier}` |
+| `rio_mountd_sweep_seconds` (histogram) | wall-clock of one triggered disk-pressure sweep pass |
 
 The mount stack's hot path is page cache + overlayfs; kernel-side latency is observable via the upstream `tracepoint:{overlayfs,fuse}:*` events without rio-specific instrumentation.
 

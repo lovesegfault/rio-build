@@ -1399,7 +1399,7 @@
       {
         "name": "rio_store_nar_index_compute_seconds",
         "kind": "histogram",
-        "help": "Per-path NAR reassemble + nar_ls + persist (indexer_loop + eager PutPath)"
+        "help": "Per-path nar_ls + persist duration, labeled by source: `loop` (indexer_loop — chunk fetch + reassemble + nar_ls + persist) vs `eager` (PutPath's in-RAM buffer — nar_ls + persist only, no fetch)"
       },
       {
         "name": "rio_store_nar_index_compute_total",
