@@ -140,6 +140,19 @@ pub fn validate_build_id(id: &str) -> bool {
 const FUSE_DEV_MAJOR: u64 = 10;
 const FUSE_DEV_MINOR: u64 = 229;
 
+/// Pure predicate behind [`validate_fuse_fd`]: is `(st_mode, st_rdev)`
+/// the `/dev/fuse` character device (char major 10, minor 229)?
+///
+/// Split from the `fstat` so the ACCEPT path is unit-testable with
+/// synthetic stat values — the environments the unit tests run in (nix
+/// build sandbox, most CI runners) have no `/dev/fuse` to open, so an
+/// fd-level test can only exercise rejections there.
+fn is_fuse_chardev(st_mode: libc::mode_t, st_rdev: libc::dev_t) -> bool {
+    let is_char = (st_mode & libc::S_IFMT) == libc::S_IFCHR;
+    let (major, minor) = (libc::major(st_rdev), libc::minor(st_rdev));
+    is_char && u64::from(major) == FUSE_DEV_MAJOR && u64::from(minor) == FUSE_DEV_MINOR
+}
+
 /// Gate the fd a `Mount{}` frame carries: it must be an open fd for the
 /// `/dev/fuse` character device. The daemon holds this fd for the
 /// connection's lifetime and issues `FUSE_DEV_IOC_BACKING_*` ioctls
@@ -154,13 +167,12 @@ fn validate_fuse_fd(fd: BorrowedFd<'_>) -> Result<(), ErrKind> {
         warn!(error = %e, "Mount fd fstat failed");
         ErrKind::BadFuseFd
     })?;
-    let is_char = (st.st_mode & libc::S_IFMT) == libc::S_IFCHR;
-    let rdev = st.st_rdev;
-    let (major, minor) = (libc::major(rdev), libc::minor(rdev));
-    if !is_char || u64::from(major) != FUSE_DEV_MAJOR || u64::from(minor) != FUSE_DEV_MINOR {
+    if !is_fuse_chardev(st.st_mode, st.st_rdev) {
         warn!(
-            is_char,
-            major, minor, "Mount fd is not the /dev/fuse character device"
+            is_char = (st.st_mode & libc::S_IFMT) == libc::S_IFCHR,
+            major = libc::major(st.st_rdev),
+            minor = libc::minor(st.st_rdev),
+            "Mount fd is not the /dev/fuse character device"
         );
         return Err(ErrKind::BadFuseFd);
     }
@@ -1398,6 +1410,37 @@ mod tests {
         }
     }
 
+    /// The pure (mode, rdev) predicate behind the Mount fd gate, with
+    /// SYNTHETIC stat values: the real /dev/fuse numbers pass; a wrong
+    /// major, wrong minor, the wrong device entirely, or a
+    /// non-character file format are all rejected. This is the
+    /// accept-path coverage the fd-level test below cannot provide in
+    /// environments without /dev/fuse (the nix build sandbox).
+    #[test]
+    fn is_fuse_chardev_accepts_only_the_fuse_device() {
+        let fuse_rdev = libc::makedev(
+            FUSE_DEV_MAJOR as libc::c_uint,
+            FUSE_DEV_MINOR as libc::c_uint,
+        );
+
+        // Accept: the fuse char device, with or without permission bits.
+        assert!(is_fuse_chardev(libc::S_IFCHR, fuse_rdev));
+        assert!(is_fuse_chardev(libc::S_IFCHR | 0o666, fuse_rdev));
+
+        // Reject: right format, wrong device (/dev/null is char 1:3).
+        assert!(!is_fuse_chardev(libc::S_IFCHR, libc::makedev(1, 3)));
+        // Reject: one of major/minor off by one.
+        assert!(!is_fuse_chardev(libc::S_IFCHR, libc::makedev(11, 229)));
+        assert!(!is_fuse_chardev(libc::S_IFCHR, libc::makedev(10, 228)));
+        // Reject: right device numbers but not a character device.
+        for mode in [libc::S_IFREG, libc::S_IFDIR, libc::S_IFIFO, libc::S_IFBLK] {
+            assert!(
+                !is_fuse_chardev(mode, fuse_rdev),
+                "format {mode:o} must not pass the fuse chardev gate"
+            );
+        }
+    }
+
     /// The Mount fd gate: only the /dev/fuse character device passes.
     /// Regular files, directories, and pipes are exactly the things a
     /// confused client would send — all rejected as the build-fatal
@@ -1424,13 +1467,19 @@ mod tests {
         }
 
         // The real thing passes, where the environment provides it
-        // (not in the nix build sandbox).
-        if let Ok(fuse) = std::fs::OpenOptions::new()
+        // (not in the nix build sandbox). The accept path is still
+        // covered everywhere via the synthetic-stat predicate test
+        // above; this is the end-to-end fstat confirmation.
+        match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/fuse")
         {
-            assert_eq!(validate_fuse_fd(fuse.as_fd()), Ok(()));
+            Ok(fuse) => assert_eq!(validate_fuse_fd(fuse.as_fd()), Ok(())),
+            Err(e) => eprintln!(
+                "skipping the /dev/fuse accept check (cannot open /dev/fuse: {e}); \
+                 the synthetic-stat predicate test still covers the accept path"
+            ),
         }
     }
 
@@ -1467,19 +1516,25 @@ mod tests {
 
         // The id rejected above is still claimable once a real fuse fd
         // arrives (where the environment provides /dev/fuse).
-        if let Ok(fuse) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/fuse")
         {
-            let mut state = test_conn_state();
-            let resp = handle_mount(&shared, &mut state, "b-nofd".into(), &[fuse.into()]);
-            assert!(
-                matches!(resp, Resp::Mounted { .. }),
-                "well-formed Mount after a rejected one must succeed, got {resp:?}"
-            );
-            assert!(state.kept.is_some());
-            assert!(tmp.path().join("staging/b-nofd").exists());
+            Ok(fuse) => {
+                let mut state = test_conn_state();
+                let resp = handle_mount(&shared, &mut state, "b-nofd".into(), &[fuse.into()]);
+                assert!(
+                    matches!(resp, Resp::Mounted { .. }),
+                    "well-formed Mount after a rejected one must succeed, got {resp:?}"
+                );
+                assert!(state.kept.is_some());
+                assert!(tmp.path().join("staging/b-nofd").exists());
+            }
+            Err(e) => eprintln!(
+                "skipping the rejected-id-reclaim-with-real-fd check \
+                 (cannot open /dev/fuse: {e})"
+            ),
         }
     }
 

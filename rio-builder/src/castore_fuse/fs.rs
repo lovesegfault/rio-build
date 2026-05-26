@@ -774,18 +774,12 @@ impl Filesystem for CastoreFs {
 
     // r[impl builder.fs.listxattr-size-branch]
     fn listxattr(&self, _: &Request, _: INodeNo, size: u32, reply: ReplyXattr) {
-        // The two branches are NOT interchangeable. size==0 is the
-        // size-probe: the caller wants the buffer length, and
-        // `reply.size(0)` answers "no xattrs". size>0 wants the actual
-        // (empty) name list: `reply.size(0)` there serializes an
-        // 8-byte `fuse_getxattr_out` struct as the *data*, which the
-        // kernel's `fuse_verify_xattr_list` reads as a corrupt
-        // zero-length name and rejects with EIO — this broke
-        // `shutil.copy2` from store paths once already.
-        if size == 0 {
-            reply.size(0);
-        } else {
-            reply.data(&[]);
+        // The size==0 / size>0 dispatch is the load-bearing part — see
+        // [`empty_listxattr_reply`] for why the two replies are NOT
+        // interchangeable (kernel rejects the wrong one with EIO).
+        match empty_listxattr_reply(size) {
+            EmptyXattrReply::SizeProbe => reply.size(0),
+            EmptyXattrReply::EmptyList => reply.data(&[]),
         }
     }
 
@@ -812,6 +806,33 @@ impl Filesystem for CastoreFs {
     }
 }
 
+/// How an empty-xattr `listxattr` must answer a request of `size`
+/// bytes. The two branches are NOT interchangeable: `size == 0` is the
+/// size-probe — the caller wants the buffer length, and `reply.size(0)`
+/// answers "no xattrs" — while `size > 0` wants the actual (empty) name
+/// list as DATA. Replying `size(0)` to a sized request serializes an
+/// 8-byte `fuse_getxattr_out` struct as the list payload, which the
+/// kernel's `fuse_verify_xattr_list` reads as a corrupt zero-length
+/// name and rejects with `EIO` — this broke `shutil.copy2` from store
+/// paths once already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmptyXattrReply {
+    /// `reply.size(0)`: "an empty list needs 0 bytes".
+    SizeProbe,
+    /// `reply.data(&[])`: the (empty) name list itself.
+    EmptyList,
+}
+
+/// The `listxattr` size-branch dispatch for a filesystem with no
+/// xattrs. See [`EmptyXattrReply`] for why the distinction matters.
+pub(super) fn empty_listxattr_reply(size: u32) -> EmptyXattrReply {
+    if size == 0 {
+        EmptyXattrReply::SizeProbe
+    } else {
+        EmptyXattrReply::EmptyList
+    }
+}
+
 /// `pread` exactly `buf.len()` bytes at `offset`, stopping early at
 /// EOF. Returns the number of bytes read. Stateless (no seek), so
 /// concurrent reads on the same fh are safe. Shared with the P0575
@@ -833,6 +854,27 @@ pub(super) fn read_at_full(file: &File, buf: &mut [u8], offset: u64) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel contract for an empty xattr set: the size-probe
+    /// (`size == 0`) is answered with the required length, and any
+    /// sized request (`size > 0`) gets the empty name-list DATA.
+    /// Answering the sized request with `size(0)` serializes a
+    /// `fuse_getxattr_out` struct as data, which the kernel's
+    /// `fuse_verify_xattr_list` rejects with EIO (the `shutil.copy2`
+    /// break). The end-to-end `shutil.copy2` exercise stays with the
+    /// vm-castore-e2e scenario (P0560 §B).
+    // r[verify builder.fs.listxattr-size-branch]
+    #[test]
+    fn listxattr_size_branch_dispatch() {
+        assert_eq!(empty_listxattr_reply(0), EmptyXattrReply::SizeProbe);
+        for size in [1u32, 8, 4096, u32::MAX] {
+            assert_eq!(
+                empty_listxattr_reply(size),
+                EmptyXattrReply::EmptyList,
+                "size={size} must get the empty name list as data, not a size reply"
+            );
+        }
+    }
 
     /// The tree is immutable for the mount's lifetime, so every
     /// `reply.entry`/`reply.attr`/`readdirplus` reply MUST carry an
