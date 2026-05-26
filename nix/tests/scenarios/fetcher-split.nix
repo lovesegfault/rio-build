@@ -241,7 +241,22 @@ pkgs.testers.runNixOSTest {
     # FOD (held to ~30s by the slow /busybox handler); the builder pod
     # won't exist until the FOD completes, so waiting for it first
     # guarantees the fetcher is already gone.
-    fetcher_vm, fetcher_pid = netns_handle(fetcher_pod, "${nsFetchers}")
+    try:
+        fetcher_vm, fetcher_pid = netns_handle(fetcher_pod, "${nsFetchers}")
+    except Exception:
+        # "no running container" here means the one-shot fetcher exited
+        # almost immediately — the slow /busybox origin holds a HEALTHY
+        # fetch open for ~30s, so a fast exit means the FOD attempt
+        # failed (or never reached the origin). Surface the pod state,
+        # its log, and the client-side build log before re-raising.
+        print("=== fetcher pod exited early: diagnostic dump ===")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${nsFetchers} get job,pod -o wide 2>&1; "
+            f"k3s kubectl -n ${nsFetchers} logs {fetcher_pod} --tail=150 2>&1"
+        )[1])
+        print("=== /tmp/split-build.log (background nix-build) ===")
+        print(client.execute("cat /tmp/split-build.log 2>&1")[1])
+        raise
     # Snapshot pod spec NOW for fetcher-node-dedicated below — the
     # one-shot pod is reaped (ttlSecondsAfterFinished) before that
     # subtest runs.
@@ -309,7 +324,19 @@ pkgs.testers.runNixOSTest {
     # consumer drv keeps it alive for these probes. Positive control
     # first: scheduler ClusterIP MUST connect (builder-egress explicitly
     # allows it). Then the origin probe.
-    builder_pod = wait_worker_pod()
+    try:
+        builder_pod = wait_worker_pod()
+    except Exception:
+        # The builder pod only ever exists if the consumer drv is
+        # dispatched, and the consumer is only dispatched once its FOD
+        # dependency succeeds. When this wait times out, the usual root
+        # cause is the FOD build failing on the fetcher pod — and the
+        # only artifact that names that error from the client's side is
+        # the background nix-build log. Print it before re-raising so
+        # the failure is diagnosable from the driver log alone.
+        print("=== /tmp/split-build.log (background nix-build) ===")
+        print(client.execute("cat /tmp/split-build.log 2>&1")[1])
+        raise
     builder_vm, builder_pid = netns_handle(builder_pod, "${nsBuilders}")
     # Snapshot for fetcher-isolation below — the one-shot pod is reaped
     # before that subtest runs.

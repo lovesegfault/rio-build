@@ -867,6 +867,20 @@ rec {
                 " | grep -E '\"level\":\"(WARN|ERROR)\"' | tail -40",
             )
             _dump("fetcher ns", "k3s kubectl -n ${nsFetchers} get job,pod -o wide")
+            # A consumer build that never dispatches usually means its FOD
+            # dependency failed on the fetcher pod — the fetcher Job still
+            # shows Complete (the agent exits 0 after reporting a failed
+            # build), so the only place the actual fetch error surfaces is
+            # the fetcher container log. Dump every Job's log in both
+            # worker namespaces while the pod objects still exist
+            # (ttlSecondsAfterFinished reaps them shortly after).
+            for jns in ("${nsFetchers}", ns):
+                _dump(
+                    f"job logs ({jns})",
+                    f"for j in $(k3s kubectl -n {jns} get jobs -o name); do "
+                    'echo "== $j =="; '
+                    f"k3s kubectl -n {jns} logs $j --tail=150; done",
+                )
             raise
         # Race: the pod can transition out of Running (build finished)
         # between the wait above and a second `succeed()` re-query —
