@@ -192,6 +192,63 @@ rec {
     } > $out
   '' { };
 
+  # Sandbox identity probe: one entry that dumps the builder-observable
+  # sandbox ABI facts that must be byte-identical between the CppNix
+  # oracle and rio-exec, so any executor refactor that perturbs the
+  # environment shows up as a one-line diff here instead of an opaque
+  # NAR mismatch in some unrelated package later. Every fact below was
+  # verified against a real sandboxed CppNix build (uid/gid 1000/100
+  # via the user-namespace mapping, hostname "localhost", domainname
+  # "(none)", umask 0022, the nixbld passwd/group lines, NoNewPrivs=1,
+  # writable store root, loopback up with 127.0.0.1 + ::1, nested user
+  # namespaces allowed, setuid chmod denied while plain chmod works,
+  # /bin/sh a regular file).
+  #
+  # Deliberately NOT probed (would diverge or is delivery-path
+  # dependent): full /etc/passwd and /etc/group (CppNix's root/nobody
+  # GECOS fields differ from rio's — accepted cosmetic deviation),
+  # /etc/hosts (CppNix writes localhost entries for every sandboxed
+  # build; rio only provides resolver files to network-enabled builds),
+  # ulimits (inherited from nix-daemon vs the worker service — not a
+  # sandbox property), and xattr probes (busybox carries no setfattr).
+  sandbox-identity = mkDrv "rio-diff-sandbox-identity" ''
+    {
+      echo "id=$(id -u) $(id -g) $(id -un) $(id -gn)"
+      read h < /proc/sys/kernel/hostname; echo "hostname=$h"
+      read d < /proc/sys/kernel/domainname; echo "domainname=$d"
+      echo "umask=$(umask)"
+      echo "passwd-nixbld=$(grep '^nixbld:' /etc/passwd)"
+      echo "group-nixbld=$(grep '^nixbld:' /etc/group)"
+      echo "no-new-privs=$(grep NoNewPrivs /proc/self/status)"
+      if [ -L /bin/sh ]; then echo "bin-sh=symlink"
+      elif [ -f /bin/sh ]; then echo "bin-sh=regular"
+      else echo "bin-sh=missing"; fi
+      if touch /nix/store/.rio-diff-identity-write-probe 2>/dev/null; then
+        rm -f /nix/store/.rio-diff-identity-write-probe
+        echo "store-root=writable"
+      else
+        echo "store-root=read-only"
+      fi
+      if command -v ip > /dev/null; then
+        echo "lo-inet=$(ip -o -4 addr show lo | grep -c '127.0.0.1/8')"
+        echo "lo-inet6=$(ip -o -6 addr show lo | grep -c '::1/128')"
+      else
+        echo "lo-inet=skipped"
+        echo "lo-inet6=skipped"
+      fi
+      if ! command -v unshare > /dev/null; then
+        echo "nested-userns=skipped"
+      elif unshare -r true 2>/dev/null; then
+        echo "nested-userns=ok"
+      else
+        echo "nested-userns=denied"
+      fi
+      touch scratch-file
+      if chmod 0755 scratch-file 2>/dev/null; then echo "plain-chmod=ok"; else echo "plain-chmod=denied"; fi
+      if chmod u+s scratch-file 2>/dev/null; then echo "suid-chmod=ok"; else echo "suid-chmod=denied"; fi
+    } > $out
+  '' { };
+
   # Hard-linked pair inside one output: canonicalisation chowns the
   # first name to root, then must accept the second name of the same
   # inode (CppNix's inodesSeen escape) instead of rejecting it as

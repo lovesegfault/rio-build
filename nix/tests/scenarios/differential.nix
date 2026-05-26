@@ -95,6 +95,9 @@ let
     build-user = {
       expect = "parity";
     };
+    sandbox-identity = {
+      expect = "parity";
+    };
     hard-link-pair = {
       expect = "parity";
     };
