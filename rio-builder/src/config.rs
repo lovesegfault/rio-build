@@ -109,6 +109,22 @@ pub struct Config {
     pub fuse_fetch_timeout: std::time::Duration,
     /// Base directory for per-build overlay upper/work layers.
     pub overlay_base_dir: PathBuf,
+    /// rio-mountd UDS socket path. The DaemonSet listens on a dedicated
+    /// hostPath-mounted directory (`/run/rio-mountd`) so builder pods
+    /// mount one directory, not the host's entire `/run`.
+    pub mountd_socket: PathBuf,
+    /// Shared node-SSD backing cache root (mountd-owned, builder
+    /// read-only). Castore-FUSE `open()` hits serve straight from here;
+    /// misses are fetched and `Promote`d into it.
+    pub castore_cache_dir: PathBuf,
+    /// Shared node-SSD chunk cache root (mountd-owned, builder
+    /// read-only). The P0575 streaming fill sources chunks from here
+    /// before any remote fetch.
+    pub castore_chunks_dir: PathBuf,
+    /// Per-build staging root. mountd creates `{root}/{build_id}`
+    /// (0700, owned by this builder's uid) at `Mount` time and reaps it
+    /// when the connection closes.
+    pub castore_staging_dir: PathBuf,
     /// Timeout (seconds) for every rio-mountd UDS round-trip
     /// (`Mount`/`BackingOpen`/`BackingClose`/`Promote`). `BackingOpen`
     /// and `BackingClose` are sub-millisecond ioctls; `Promote` of a
@@ -267,6 +283,13 @@ impl Default for Config {
             fuse_passthrough: true,
             fuse_fetch_timeout: std::time::Duration::from_secs(60),
             overlay_base_dir: "/var/rio/overlays".into(),
+            // Match the rio-mountd DaemonSet defaults (mountd-ds.yaml /
+            // bin/rio-mountd.rs) — builder pods hostPath-mount the same
+            // host directories at the same paths.
+            mountd_socket: "/run/rio-mountd/mountd.sock".into(),
+            castore_cache_dir: "/var/rio/cache".into(),
+            castore_chunks_dir: "/var/rio/chunks".into(),
+            castore_staging_dir: "/var/rio/staging".into(),
             mountd_request_timeout: std::time::Duration::from_secs(30),
             jit_fetch_timeout: std::time::Duration::from_secs(60),
             dag_prefetch_timeout: std::time::Duration::from_secs(30),
@@ -458,6 +481,14 @@ mod tests {
         );
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
         assert_eq!(
+            d.mountd_socket,
+            PathBuf::from("/run/rio-mountd/mountd.sock"),
+            "must match the rio-mountd DaemonSet socket hostPath"
+        );
+        assert_eq!(d.castore_cache_dir, PathBuf::from("/var/rio/cache"));
+        assert_eq!(d.castore_chunks_dir, PathBuf::from("/var/rio/chunks"));
+        assert_eq!(d.castore_staging_dir, PathBuf::from("/var/rio/staging"));
+        assert_eq!(
             d.mountd_request_timeout,
             std::time::Duration::from_secs(30),
             "mountd round-trips are bounded by a multi-GiB Promote verify-copy"
@@ -553,6 +584,13 @@ mod tests {
             cfg.mountd_request_timeout,
             std::time::Duration::from_secs(30)
         );
+        assert_eq!(
+            cfg.mountd_socket,
+            PathBuf::from("/run/rio-mountd/mountd.sock")
+        );
+        assert_eq!(cfg.castore_cache_dir, PathBuf::from("/var/rio/cache"));
+        assert_eq!(cfg.castore_chunks_dir, PathBuf::from("/var/rio/chunks"));
+        assert_eq!(cfg.castore_staging_dir, PathBuf::from("/var/rio/staging"));
         assert_eq!(cfg.jit_fetch_timeout, std::time::Duration::from_secs(60));
         assert_eq!(cfg.dag_prefetch_timeout, std::time::Duration::from_secs(30));
         assert_eq!(cfg.max_backing_ids, 4096);

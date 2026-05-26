@@ -353,131 +353,12 @@ impl Drop for FuseMount {
     }
 }
 
-/// Directory where the kernel exposes per-connection FUSE control files
-/// (`abort`, `waiting`, `max_background`, …). One subdirectory per live
-/// connection, named by the connection's kernel `dev_t` (== minor for
-/// FUSE's anonymous superblocks). Populated only when the `fusectl`
-/// pseudo-filesystem is mounted there — sysfs creates the directory
-/// regardless, so an empty dir is the "not mounted" signal.
-const FUSECTL_ROOT: &str = "/sys/fs/fuse/connections";
-
-/// Ensure `fusectl` is mounted at [`FUSECTL_ROOT`]. Best-effort.
-///
-/// I-165b: in Bottlerocket + `hostUsers:false` containers, the host's
-/// systemd-mounted fusectl is NOT propagated into the container's mount
-/// namespace — `/sys/fs/fuse/connections/` exists (sysfs creates the
-/// stub directory) but is empty. [`fusectl_abort_path`]'s existence
-/// check then returns `None`, [`FuseMount`]'s `Drop` skips the abort,
-/// and the I-165 D-state deadlock recurs (observed: 7/8 sampled prod
-/// pods stuck, tid=1 zombie + 4× D-state `wchan=request_wait_answer`).
-///
-/// We have `CAP_SYS_ADMIN` (the FUSE mount itself requires it), so
-/// mount fusectl ourselves. `EBUSY` (already mounted — systemd-hosted
-/// dev box, or our heuristic raced) is fine; anything else is logged at
-/// warn and the abort path degrades exactly as pre-I-165b.
-///
-/// Called AFTER `spawn_mount` so the "is anything in the dir?"
-/// heuristic can use our own freshly-created connection as the witness
-/// — avoids a spurious mount attempt → EBUSY on hosts where fusectl is
-/// already mounted but no other FUSE connections exist yet.
-///
-/// Why fusectl at all — doesn't dropping `BackgroundSession` close
-/// `/dev/fuse`? No: fuser holds the fd as `Arc<DevFuse>` shared
-/// between `BackgroundSession.sender` and the detached bg thread's
-/// `Session.ch`. Dropping `BackgroundSession` drops one ref; the fd
-/// stays open until the bg thread's read loop returns. And
-/// `Mount::Drop` → `AutoUnmount` socket close → `fusermount -u` is
-/// lazy `MNT_DETACH`, which does NOT abort pending requests. So the
-/// fusectl abort is the only thing that wakes the D-state waiters.
+// The fusectl plumbing (`ensure_fusectl_mounted`, `fusectl_abort_path`)
+// moved to `crate::castore_fuse::mount` at the P0560 §A cutover — the
+// per-build castore mount now owns the I-165 abort discipline. This
+// module re-uses the ported helpers (see `mount_fuse_background`) until
+// its §A deletion.
 // r[impl builder.shutdown.fuse-abort]
-fn ensure_fusectl_mounted() {
-    // fusectl is a virtual fs that enumerates live connections at
-    // readdir time. If our just-opened connection (spawn_mount ran
-    // already) shows up, fusectl is mounted. If the dir is empty or
-    // unreadable, it isn't — try to mount.
-    let already = std::fs::read_dir(FUSECTL_ROOT)
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false);
-    if already {
-        tracing::debug!(root = FUSECTL_ROOT, "fusectl already mounted");
-        return;
-    }
-    match nix::mount::mount(
-        Some("fusectl"),
-        FUSECTL_ROOT,
-        Some("fusectl"),
-        nix::mount::MsFlags::empty(),
-        None::<&str>,
-    ) {
-        Ok(()) => tracing::info!(
-            root = FUSECTL_ROOT,
-            "mounted fusectl for FUSE abort-on-shutdown (I-165b)"
-        ),
-        // Already mounted (heuristic false-negative). Fine.
-        Err(nix::errno::Errno::EBUSY) => {
-            tracing::debug!(root = FUSECTL_ROOT, "fusectl mount EBUSY (already mounted)");
-        }
-        Err(e) => tracing::warn!(
-            root = FUSECTL_ROOT,
-            error = %e,
-            "fusectl mount failed; FUSE abort-on-shutdown will no-op (I-165b). \
-             D-state warm-stat threads may delay process exit; \
-             pod activeDeadlineSeconds is the backstop"
-        ),
-    }
-}
-
-/// Compute the fusectl `abort` control-file path for `mount_point`.
-///
-/// `/sys/fs/fuse/connections/<N>/abort` where `<N>` is the kernel's
-/// `dev_t` for the mount's anonymous superblock. FUSE uses anonymous
-/// block devices (major 0), so kernel `dev_t = MKDEV(0, minor) = minor`;
-/// the directory name as printed by `fs/fuse/control.c`'s
-/// `sprintf("%u", fc->dev)` is therefore the userspace minor number.
-///
-/// `None` if stat fails or fusectl isn't mounted (no
-/// `/sys/fs/fuse/connections`). Called once at mount time, NOT at abort
-/// time — see the `Drop` impl on [`FuseMount`].
-fn fusectl_abort_path(mount_point: &Path) -> Option<PathBuf> {
-    fusectl_abort_path_at(mount_point, Path::new(FUSECTL_ROOT))
-}
-
-/// [`fusectl_abort_path`] with an explicit connections-root. Split out
-/// so unit tests can point at a tempdir instead of `/sys`.
-fn fusectl_abort_path_at(mount_point: &Path, connections_root: &Path) -> Option<PathBuf> {
-    let st_dev = match nix::sys::stat::stat(mount_point) {
-        Ok(s) => s.st_dev,
-        Err(e) => {
-            tracing::warn!(
-                mount_point = %mount_point.display(),
-                error = %e,
-                "stat(mount_point) failed; FUSE abort path unavailable"
-            );
-            return None;
-        }
-    };
-    // glibc-compatible `gnu_dev_minor()`. `nix` 0.31 doesn't expose
-    // major/minor and `libc` isn't a direct dep; the encoding is stable
-    // ABI (sys/sysmacros.h).
-    let minor = (st_dev & 0xff) | ((st_dev >> 12) & 0xff_ff_ff_00);
-    let abort = connections_root.join(minor.to_string()).join("abort");
-    // Existence check: fusectl may not be mounted (it's a separate
-    // `mount -t fusectl`). systemd auto-mounts it; bare containers may
-    // not — [`ensure_fusectl_mounted`] mounts it best-effort. If the
-    // path is STILL absent here, the abort defense is disabled — that's
-    // a warn, not a debug (I-165b: was debug; the silent no-op masked
-    // the prod regression for days).
-    if abort.exists() {
-        Some(abort)
-    } else {
-        tracing::warn!(
-            path = %abort.display(),
-            "fusectl abort path not present (fusectl not mounted?); \
-             FUSE abort-on-shutdown disabled — see I-165b"
-        );
-        None
-    }
-}
 
 /// Mount the FUSE filesystem in a background thread.
 ///
@@ -515,11 +396,11 @@ pub fn mount_fuse_background(
     // mount it ourselves so the abort-path lookup below can succeed.
     // After spawn_mount so our own connection serves as the "is it
     // already mounted?" witness.
-    ensure_fusectl_mounted();
+    crate::castore_fuse::mount::ensure_fusectl_mounted();
 
     // Capture the fusectl abort path NOW, while the fuser threads are
     // healthy. At abort time they may all be parked.
-    let abort_path = fusectl_abort_path(mount_point);
+    let abort_path = crate::castore_fuse::mount::fusectl_abort_path(mount_point);
 
     tracing::info!(
         mount_point = %mount_point.display(),
@@ -538,64 +419,5 @@ pub fn mount_fuse_background(
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // r[verify builder.shutdown.fuse-abort]
-    //
-    // I-165b: fusectl_abort_path must return Some when the connections
-    // root is populated (i.e., after ensure_fusectl_mounted succeeds).
-    // The original I-165 fix silently no-oped in production because the
-    // existence check returned None against an empty
-    // /sys/fs/fuse/connections/ — fusectl wasn't mounted in the
-    // container. This test pins the path-computation contract by
-    // pointing at a tempdir-backed fake connections root; the actual
-    // mount(2) of fusectl needs CAP_SYS_ADMIN and is exercised by the
-    // VM test (TODO from I-165).
-    #[test]
-    fn fusectl_abort_path_resolves_when_connections_root_populated() {
-        // Use the tempdir itself as both mount_point (statted for
-        // st_dev) and connections_root parent. The minor we compute is
-        // whatever device the test fs lives on — we don't care what
-        // number, only that the path round-trips.
-        let tmp = tempfile::tempdir().unwrap();
-        let mount_point = tmp.path();
-        let connections_root = tmp.path().join("connections");
-
-        // Precondition: empty root → None (with a warn, not debug —
-        // the I-165b severity bump).
-        std::fs::create_dir(&connections_root).unwrap();
-        assert_eq!(
-            fusectl_abort_path_at(mount_point, &connections_root),
-            None,
-            "empty connections root must yield None"
-        );
-
-        // Compute the minor the same way the impl does, then
-        // materialize the abort file as ensure_fusectl_mounted +
-        // kernel would.
-        let st_dev = nix::sys::stat::stat(mount_point).unwrap().st_dev;
-        let minor = (st_dev & 0xff) | ((st_dev >> 12) & 0xff_ff_ff_00);
-        let conn_dir = connections_root.join(minor.to_string());
-        std::fs::create_dir(&conn_dir).unwrap();
-        let abort = conn_dir.join("abort");
-        std::fs::write(&abort, "").unwrap();
-
-        // Postcondition: populated root → Some(exact path).
-        assert_eq!(
-            fusectl_abort_path_at(mount_point, &connections_root),
-            Some(abort),
-            "populated connections root must yield the abort path"
-        );
-    }
-
-    #[test]
-    fn fusectl_abort_path_none_on_stat_failure() {
-        // Nonexistent mount_point → stat fails → None (warn-logged).
-        // Guards the early-return arm.
-        let nonexistent = Path::new("/nonexistent/rio-i165b-test-mount-point");
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(fusectl_abort_path_at(nonexistent, tmp.path()), None);
-    }
-}
+// The fusectl path-computation tests moved to
+// `crate::castore_fuse::mount::tests` along with the helpers.

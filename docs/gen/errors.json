@@ -71,6 +71,48 @@
       "doc": "Signing key → PKCS#8 DER encoding. Only reachable from [`sign`] (verify uses raw pubkey bytes). Never fails for a valid ed25519 key — it's a fixed-format serialization — so this variant firing means the key itself is corrupt. Kept as a variant rather than `.expect()` because key material comes from outside (K8s Secret) and a corrupt mount should error cleanly, not panic the gateway."
     },
     {
+      "enum": "CastoreMountError",
+      "name": "Mount",
+      "crate": "rio-builder",
+      "msg": "mount(fuse.rio-castore) at {path} failed: {source}",
+      "doc": "The `mount(2)` of the handed-off fd failed."
+    },
+    {
+      "enum": "CastoreMountError",
+      "name": "MountPoint",
+      "crate": "rio-builder",
+      "msg": "cannot create castore mountpoint {path}: {source}",
+      "doc": "Creating the builder-owned mountpoint directory failed."
+    },
+    {
+      "enum": "CastoreMountError",
+      "name": "Mountd",
+      "crate": "rio-builder",
+      "msg": "rio-mountd Mount{{{build_id}}} failed: {source}",
+      "doc": "The `Mount{build_id}` request failed."
+    },
+    {
+      "enum": "CastoreMountError",
+      "name": "MountdConnect",
+      "crate": "rio-builder",
+      "msg": "cannot connect to rio-mountd at {socket}: {source} — rio-mountd not running on this node — is the DaemonSet deployed?",
+      "doc": "`connect(2)` to the mountd socket failed."
+    },
+    {
+      "enum": "CastoreMountError",
+      "name": "Serve",
+      "crate": "rio-builder",
+      "msg": "castore-FUSE session over the handed-off fd failed: {0}",
+      "doc": "Creating or spawning the fuser session over the handed-off fd failed (the `FUSE_INIT` handshake is part of session creation)."
+    },
+    {
+      "enum": "CastoreMountError",
+      "name": "Tree",
+      "crate": "rio-builder",
+      "msg": "castore DAG prefetch failed: {0} — is rio-store healthy and has its NAR indexer processed every input path?",
+      "doc": "The DAG prefetch failed: the store has not indexed an input, the stream returned no Directory bodies for a root, the prefetch timed out, or the assignment carried an unindexed root."
+    },
+    {
       "enum": "ExecutorError",
       "name": "BuildFailed",
       "crate": "rio-builder",
@@ -83,6 +125,20 @@
       "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
       "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
+    },
+    {
+      "enum": "ExecutorError",
+      "name": "CastoreMount",
+      "crate": "rio-builder",
+      "msg": "castore mount failed: {0}",
+      "doc": "Mounting the per-build castore-FUSE lower failed (DAG prefetch, mountd handshake, the builder-side `mount(2)`, or the serve session). Infrastructure: another pod / a later attempt plausibly succeeds — the messages name the unhealthy component."
+    },
+    {
+      "enum": "ExecutorError",
+      "name": "CastoreRoots",
+      "crate": "rio-builder",
+      "msg": "castore input roots unusable: {0}",
+      "doc": "The assignment's `input_roots` cannot seed a castore mount (an entry has no `root_node` — the store has not indexed it yet). Infrastructure: re-dispatch succeeds once the indexer catches up."
     },
     {
       "enum": "ExecutorError",
@@ -1495,6 +1551,11 @@
       "name": "JwtError",
       "crate": "rio-auth",
       "doc": ""
+    },
+    {
+      "name": "CastoreMountError",
+      "crate": "rio-builder",
+      "doc": "Why a castore mount could not be assembled. Every variant is an infrastructure failure (the build never started, no partial state); the messages name the unhealthy component so the on-call signal is actionable."
     },
     {
       "name": "ExecutorError",

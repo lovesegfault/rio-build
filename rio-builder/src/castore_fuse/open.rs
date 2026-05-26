@@ -179,7 +179,9 @@ pub struct OpenPath {
     /// finishes.
     streams: Arc<Mutex<HashMap<[u8; 32], Arc<StreamFill>>>>,
     /// Breaker around the remote fetch. Checked before every `ReadBlob`
-    /// attempt; recorded after.
+    /// attempt; recorded after. Shared with the heartbeat loop (which
+    /// reports `store_degraded` from it), so it is passed in rather
+    /// than constructed here.
     pub circuit: Arc<CircuitBreaker>,
     clients: StoreClients,
     /// Tokio runtime handle for bridging the sync FUSE callback into
@@ -206,6 +208,7 @@ pub struct OpenPath {
 }
 
 impl OpenPath {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache_dir: PathBuf,
         staging_dir: PathBuf,
@@ -213,6 +216,7 @@ impl OpenPath {
         clients: StoreClients,
         runtime: Handle,
         mountd: MountdClient,
+        circuit: Arc<CircuitBreaker>,
         cfg: OpenConfig,
     ) -> Self {
         Self {
@@ -221,7 +225,7 @@ impl OpenPath {
             chunks_dir,
             fills: Mutex::new(HashMap::new()),
             streams: Arc::new(Mutex::new(HashMap::new())),
-            circuit: Arc::new(CircuitBreaker::default()),
+            circuit,
             clients,
             runtime,
             mountd,

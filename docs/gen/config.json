@@ -578,6 +578,30 @@
         "description": "Base directory for per-build overlay upper/work layers."
       },
       {
+        "key": "mountd_socket",
+        "type": "string",
+        "default": "/run/rio-mountd/mountd.sock",
+        "description": "rio-mountd UDS socket path."
+      },
+      {
+        "key": "castore_cache_dir",
+        "type": "string",
+        "default": "/var/rio/cache",
+        "description": "Shared node-SSD backing cache root (mountd-owned, builder read-only)."
+      },
+      {
+        "key": "castore_chunks_dir",
+        "type": "string",
+        "default": "/var/rio/chunks",
+        "description": "Shared node-SSD chunk cache root (mountd-owned, builder read-only)."
+      },
+      {
+        "key": "castore_staging_dir",
+        "type": "string",
+        "default": "/var/rio/staging",
+        "description": "Per-build staging root. mountd creates `{root}/{build_id}` (0700, owned by this builder's uid) at `Mount` time and reaps it when the connection closes."
+      },
+      {
         "key": "mountd_request_timeout_secs",
         "type": "uint64",
         "default": "30",

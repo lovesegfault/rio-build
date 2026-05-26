@@ -1,21 +1,24 @@
 //! Cold-start wiring: identity, host-arch validation, cgroup init,
-//! upstream connect, FUSE mount, relay/heartbeat spawn, build context.
+//! upstream connect, relay/heartbeat spawn, build context.
 //!
 //! Everything `main()` did before the `'reconnect` loop. Produces a
-//! [`BuilderRuntime`] consumed by [`run`](super::run).
+//! [`BuilderRuntime`] consumed by [`run`](super::run). Since the P0560
+//! castore cutover there is no process-wide FUSE mount here — each
+//! build mounts its own castore lower inside `execute_build`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::{info, warn};
 
 use rio_proto::types::{ExecutorKind, ExecutorMessage};
 
 use super::heartbeat::{HeartbeatCtx, spawn_heartbeat};
-use super::prefetch::PrefetchDeps;
 use super::slot::BuildSlot;
 use super::{BuildSpawnContext, BuilderRuntime, relay_loop};
+use crate::castore_fuse::circuit::CircuitBreaker;
+use crate::castore_fuse::mount::CastoreOptions;
 use crate::config::{Config, detect_system};
 use crate::store_fetch::StoreClients;
 
@@ -109,19 +112,12 @@ pub async fn setup(
         (hw_class, factor)
     });
 
-    // Set up FUSE cache and mount. Arc so we can clone for the
-    // prefetch handler before moving into mount_fuse_background.
-    let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir)?);
-    // Clone for prefetch. Cache methods use runtime.block_on
-    // internally (sync, designed for FUSE callbacks on dedicated
-    // threads). The prefetch handler will call them via
-    // spawn_blocking — async → nested-runtime panic.
-    let prefetch_cache = Arc::clone(&cache);
-    let runtime = tokio::runtime::Handle::current();
-    // FUSE fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT (300s).
-    // FUSE is the build-critical path; a stalled fetch blocks a fuser
-    // thread. See config.rs fuse_fetch_timeout for the full rationale.
-    let fuse_fetch_timeout = cfg.fuse_fetch_timeout;
+    // Castore-FUSE wiring: per-build mounts happen inside
+    // `execute_build` (P0560 §A); setup only derives the static options
+    // and the process-wide fetch circuit breaker the heartbeat reports
+    // `store_degraded` from.
+    let castore = CastoreOptions::from_config(&cfg);
+    let castore_circuit = Arc::new(CircuitBreaker::default());
 
     // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
     //
@@ -132,20 +128,18 @@ pub async fn setup(
     //
     //   path                        | covering mount (sts.rs)
     //   ──────────────────────────────────────────────────────────
-    //   cfg.fuse_mount_point        | `fuse-store` emptyDir
-    //     (/var/rio/fuse-store)     |   (readOnlyRoot only)
     //   cfg.overlay_base_dir        | `overlays` emptyDir
-    //     (/var/rio/overlays)       |   (always)
+    //     (/var/rio/overlays;       |   (always)
+    //      per-build castore mount- |
+    //      points live here too)    |
     //   /nix/var/{nix,log}/**       | `nix-var` emptyDir
     //                               |   (readOnlyRoot only)
     //   /tmp (tempfile crate)       | `tmp` emptyDir, 64Mi tmpfs
     //                               |   (readOnlyRoot only)
-    //   cfg.fuse_cache_dir          | `fuse-cache` emptyDir
-    //     (/var/rio/fuse-cache in   |   (always)
-    //      pods — Cache::new above; |
-    //      /var/rio/cache is the    |
-    //      mountd-owned shared      |
-    //      cache, RO hostPath)      |
+    //   cfg.castore_staging_dir     | `staging` hostPath (RW;
+    //     (/var/rio/staging — the   |   mountd creates + chowns the
+    //      per-build subdir is      |   per-build subdir)
+    //      written by the JIT path) |
     //   /sys/fs/cgroup/**           | cgroupfs, not rootfs —
     //     (cgroup.rs)               |   remounted rw at cgroup.rs
     //                               |   ns-root-remount
@@ -153,7 +147,6 @@ pub async fn setup(
     // Adding a new startup write? Extend BOTH this table AND the
     // `if p.read_only_root_fs` blocks in common/sts.rs (Volume +
     // VolumeMount pair). vm-fetcher-split-k3s catches misses.
-    std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
     // nix's `LocalStore` (chroot-store via `--store local?root=X`)
     // refuses to open if any ancestor of X is world-writable. The k8s
@@ -175,19 +168,10 @@ pub async fn setup(
         }
     }
 
-    let (fuse_session, fuse_circuit) = crate::fuse::mount_fuse_background(
-        &cfg.fuse_mount_point,
-        cache,
-        store_clients.clone(),
-        runtime.clone(),
-        cfg.fuse_passthrough,
-        cfg.fuse_threads,
-        fuse_fetch_timeout,
-    )?;
-
     info!(
-        mount_point = %cfg.fuse_mount_point.display(),
-        "FUSE store mounted"
+        mountd_socket = %castore.mountd_socket.display(),
+        cache_dir = %castore.cache_dir.display(),
+        "castore-FUSE configured (per-build mounts happen at assignment time)"
     );
 
     // ---- BuildExecution stream with reconnect ----
@@ -280,9 +264,10 @@ pub async fn setup(
         slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),
         resources: Arc::clone(&resource_snapshot),
-        // FUSE circuit breaker: polled each tick. Shared with PrefetchDeps
-        // (prefetch is a singleflight owner and feeds the breaker).
-        circuit: Arc::clone(&fuse_circuit),
+        // Castore-FUSE fetch circuit breaker: polled each tick. The same
+        // Arc is threaded into every build's OpenPath (via
+        // BuildSpawnContext below) so fetch failures feed it.
+        circuit: Arc::clone(&castore_circuit),
         draining: Arc::clone(&draining),
         generation: Arc::clone(&latest_generation),
         client: scheduler_client.clone(),
@@ -293,7 +278,6 @@ pub async fn setup(
     let build_ctx = BuildSpawnContext {
         store_clients: store_clients.clone(),
         executor_id,
-        fuse_mount_point: cfg.fuse_mount_point,
         overlay_base_dir: cfg.overlay_base_dir,
         // The permanent sink, NOT a per-connection gRPC channel.
         // Build tasks' sends never fail on scheduler failover.
@@ -308,13 +292,10 @@ pub async fn setup(
         cgroup_parent,
         executor_kind: cfg.executor_kind,
         systems,
-        // I-110c: same Arc as prefetch_cache / the FUSE mount —
-        // executor primes manifest hints + JIT allowlist, FUSE threads
-        // consume them.
-        fuse_cache: Arc::clone(&prefetch_cache),
-        // Base per-path fetch timeout; JIT lookup scales it with
-        // nar_size (I-178). Same value the PrefetchHint handler uses.
-        fuse_fetch_timeout,
+        // Per-build castore mount wiring + the shared fetch breaker
+        // (same Arc the heartbeat polls).
+        castore,
+        castore_circuit,
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
         node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
@@ -333,7 +314,6 @@ pub async fn setup(
     Ok(Some(BuilderRuntime {
         scheduler_client,
         shutdown,
-        fuse_session,
         relay_target_tx,
         slot,
         draining,
@@ -345,19 +325,6 @@ pub async fn setup(
         heartbeat_handle,
         build_ctx,
         executor_token: cfg.executor_token,
-        prefetch: PrefetchDeps {
-            cache: prefetch_cache,
-            clients: store_clients,
-            runtime,
-            // Prefetch concurrency limit. 8 is conservative: each holds a
-            // tokio blocking-pool thread (default pool is 512, so no
-            // starvation concern) AND pins an in-flight gRPC stream to the
-            // store (which is what we're bounding — don't DDoS the store with
-            // 100 parallel NARs when the scheduler sends a big hint list).
-            sem: Arc::new(Semaphore::new(8)),
-            fetch_timeout: fuse_fetch_timeout,
-            circuit: fuse_circuit,
-        },
         idle_timeout: cfg.idle_timeout,
         _balance_guard,
     }))

@@ -24,7 +24,12 @@ const FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/abc-fixed","sha256","abcde
 
 fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
     ExecutorEnv {
-        fuse_mount_point: dir.to_path_buf(),
+        // The kind gate fires before any castore mount, so the wiring
+        // only needs to exist, not to point at a live mountd.
+        castore: rio_builder::castore_fuse::mount::CastoreOptions::from_config(
+            &rio_builder::config::Config::default(),
+        ),
+        castore_circuit: Arc::new(rio_builder::castore_fuse::circuit::CircuitBreaker::default()),
         overlay_base_dir: dir.to_path_buf(),
         executor_id: "test-executor".into(),
         log_limits: LogLimits::UNLIMITED,
@@ -34,8 +39,6 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         executor_kind: kind,
         systems: Arc::from(["x86_64-linux".into()]),
         hw_class: None,
-        fuse_cache: None,
-        fuse_fetch_timeout: std::time::Duration::from_secs(60),
         cancelled: Arc::new(AtomicBool::new(false)),
     }
 }

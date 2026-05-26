@@ -192,6 +192,26 @@ impl Drop for OverlayMount {
     }
 }
 
+/// Set up the per-build overlayfs with the build's castore-FUSE mount
+/// as its single read-only lower (ADR-022 §2.1: the overlay's lowerdir
+/// IS the castore mountpoint; upper/work stay on local SSD; build
+/// outputs land in the upper).
+///
+/// Thin typed wrapper over [`setup_overlay`]: taking the
+/// [`CastoreMount`](crate::castore_fuse::mount::CastoreMount) makes the
+/// "the lower must already be mounted AND served" ordering a
+/// compile-time property of the call site — a `CastoreMount` only
+/// exists once `mount_castore_background` has returned with its FUSE
+/// session live.
+// r[impl builder.overlay.castore-lower]
+pub fn setup_overlay_castore(
+    lower: &crate::castore_fuse::mount::CastoreMount,
+    base_dir: &Path,
+    build_id: &str,
+) -> Result<OverlayMount, OverlayError> {
+    setup_overlay(lower.mount_point(), base_dir, build_id)
+}
+
 /// Set up an overlayfs mount for a single build.
 ///
 /// Creates upper, work, and merged directories under `base_dir/{build_id}/`,
@@ -201,8 +221,10 @@ impl Drop for OverlayMount {
 ///
 /// # Single lower layer
 ///
-/// The overlay's lower is the FUSE mount only — lazy-fetched build inputs
-/// from rio-store. The host `/nix/store` is NOT in the lowerdir (I-060):
+/// The overlay's lower is the per-build castore-FUSE mount only — the
+/// closure's content-addressed Directory DAG served lazily from
+/// rio-store (production callers go through [`setup_overlay_castore`]).
+/// The host `/nix/store` is NOT in the lowerdir (I-060):
 /// nix-daemon runs in the builder's namespace with `--store
 /// local?root={build_dir}`, so its binary + libs come from the host
 /// store directly. The per-build store contains exactly `{inputs} ∪

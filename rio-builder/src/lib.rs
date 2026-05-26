@@ -32,6 +32,11 @@ pub mod config;
 pub mod executor;
 #[cfg(feature = "test-fixtures")]
 pub mod fixture;
+// Old whole-store-path JIT FUSE. Unwired since the P0560 §A castore
+// cutover (nothing constructs it any more); removed in the next commit
+// (P0560 §A deletion). dead_code allowed so the orphaned internals keep
+// the crate clippy-clean until then.
+#[allow(dead_code)]
 pub mod fuse;
 pub mod health;
 pub mod hw_bench;

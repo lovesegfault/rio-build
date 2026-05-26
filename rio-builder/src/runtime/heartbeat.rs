@@ -105,7 +105,9 @@ pub(super) struct HeartbeatCtx {
     pub(super) slot: Arc<BuildSlot>,
     pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
     pub(super) resources: crate::cgroup::ResourceSnapshotHandle,
-    pub(super) circuit: Arc<crate::fuse::circuit::CircuitBreaker>,
+    /// Castore-FUSE fetch breaker (the same `Arc` every build's
+    /// `OpenPath` records into); `is_open()` feeds `store_degraded`.
+    pub(super) circuit: Arc<crate::castore_fuse::circuit::CircuitBreaker>,
     pub(super) draining: Arc<std::sync::atomic::AtomicBool>,
     pub(super) generation: Arc<std::sync::atomic::AtomicU64>,
     pub(super) client: WorkerClient,

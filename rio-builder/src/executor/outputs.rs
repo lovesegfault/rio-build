@@ -324,6 +324,16 @@ pub(super) async fn collect_outputs(
 /// matched: ENOENT (`No such file or directory`) and EIO (`Input/output
 /// error`, see I-179) are both worker-local materialization failures.
 ///
+/// P0560 (castore-FUSE lower): every `EIO` the castore lower surfaces on
+/// an input read — JIT fetch timeout, chunk/whole-file integrity
+/// mismatch, mountd round-trip failure, fetch circuit breaker open —
+/// reaches nix-daemon through exactly the same `lstat`/`stat`/
+/// `opendir`/`open` call sites and therefore the same message shapes, so
+/// the matcher below classifies them as infrastructure without caring
+/// which FUSE implementation served the lower. The closure-membership
+/// check stays the load-bearing guard either way.
+///
+// r[impl builder.result.input-eio-is-infra]
 // r[impl builder.result.input-enoent-is-infra+2]
 pub(crate) fn is_input_materialization_failure(
     nix_status: rio_nix::protocol::build::BuildStatus,
@@ -390,6 +400,12 @@ mod tests {
     ///
     /// I-178b: the live cluster message is ANSI-colored and reports the
     /// OVERLAY path, not the store path. Strip ANSI; match by basename.
+    ///
+    /// The EIO cases below are exactly what the castore-FUSE lower
+    /// surfaces on a fetch failure / integrity mismatch / open breaker
+    /// (P0560) — they MUST classify as infrastructure, never as a
+    /// derivation failure.
+    // r[verify builder.result.input-eio-is-infra]
     // r[verify builder.result.input-enoent-is-infra+2]
     #[test]
     fn test_is_input_materialization_failure() {

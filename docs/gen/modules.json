@@ -83,6 +83,11 @@
       "doc": "`fuser::Filesystem` impl for the castore-FUSE (ADR-022 §2.4–§2.6)."
     },
     {
+      "path": "castore_fuse/mount.rs",
+      "depth": 1,
+      "doc": "The per-build castore-FUSE mount sequence (ADR-022 §2.5, P0560 §A)."
+    },
+    {
       "path": "castore_fuse/mountd.rs",
       "depth": 1,
       "doc": "`rio-mountd` — the privileged per-node broker for castore-FUSE."
@@ -270,7 +275,7 @@
     {
       "path": "runtime/prefetch.rs",
       "depth": 1,
-      "doc": "PrefetchHint handling: warm the FUSE cache and ACK the scheduler."
+      "doc": "PrefetchHint handling: ACK the scheduler's warm-gate."
     },
     {
       "path": "runtime/result.rs",

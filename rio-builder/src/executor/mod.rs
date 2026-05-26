@@ -45,10 +45,14 @@ mod outputs;
 mod sandbox;
 
 use daemon::{DaemonBuildOpts, run_daemon_build, spawn_daemon_in_namespace};
-use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests};
+use inputs::{castore_roots, compute_input_closure, fetch_drv_from_store};
 use monitors::{drain_build_cgroup, spawn_cgroup_monitors};
 use outputs::{BuildOutputs, collect_outputs};
 use sandbox::prepare_sandbox;
+
+use crate::castore_fuse::mount::{
+    CastoreMount, CastoreMountError, CastoreOptions, mount_castore_background, mountd_build_id,
+};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -67,7 +71,15 @@ const MAX_PARALLEL_FETCHES: usize = 16;
 /// holds `Copy`/cheap-to-copy config that can just be passed by value.
 #[derive(Clone)]
 pub struct ExecutorEnv {
-    pub fuse_mount_point: std::path::PathBuf,
+    /// Castore-FUSE / rio-mountd wiring (socket path, shared cache
+    /// roots, timeouts, stream threshold). Each build mounts its own
+    /// castore lower from these.
+    pub castore: CastoreOptions,
+    /// Castore-FUSE fetch circuit breaker, shared with the heartbeat
+    /// loop (which reports `store_degraded` from it). Passed into every
+    /// build's `OpenPath` so consecutive fetch failures across builds
+    /// accumulate in one place.
+    pub castore_circuit: std::sync::Arc<crate::castore_fuse::circuit::CircuitBreaker>,
     pub overlay_base_dir: std::path::PathBuf,
     pub executor_id: String,
     pub log_limits: LogLimits,
@@ -116,18 +128,6 @@ pub struct ExecutorEnv {
     /// the system without the `/{hw_class}` suffix in all of these
     /// cases.
     pub hw_class: Option<String>,
-    /// Handle to the FUSE local cache. The executor calls
-    /// `register_inputs` (JIT allowlist, I-043 redesign) and
-    /// `prefetch_manifests` (I-110c PG-skip hints) on it after
-    /// `compute_input_closure` and before daemon spawn. `None` in
-    /// tests that don't mount FUSE — both calls are skipped.
-    pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
-    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
-    /// (`builder.toml fuse_fetch_timeout_secs`, default 60s). JIT
-    /// `lookup` uses `jit_fetch_timeout(this, nar_size)` per path so
-    /// large inputs get a size-proportional budget (I-178). Same
-    /// value passed to the `PrefetchHint` handler.
-    pub fuse_fetch_timeout: Duration,
     /// Cancel flag for THIS build. Set by [`crate::runtime::try_cancel_build`]
     /// before it writes `cgroup.kill`. I-166: threaded into the executor
     /// so the pre-cgroup phase (overlay → resolve → prefetch → warm) can
@@ -154,6 +154,17 @@ pub enum ExecutorError {
     Overlay(#[from] overlay::OverlayError),
     #[error("overlay setup task panicked: {0}")]
     OverlayTaskPanic(tokio::task::JoinError),
+    /// The assignment's `input_roots` cannot seed a castore mount (an
+    /// entry has no `root_node` — the store has not indexed it yet).
+    /// Infrastructure: re-dispatch succeeds once the indexer catches up.
+    #[error("castore input roots unusable: {0}")]
+    CastoreRoots(String),
+    /// Mounting the per-build castore-FUSE lower failed (DAG prefetch,
+    /// mountd handshake, the builder-side `mount(2)`, or the serve
+    /// session). Infrastructure: another pod / a later attempt
+    /// plausibly succeeds — the messages name the unhealthy component.
+    #[error("castore mount failed: {0}")]
+    CastoreMount(#[from] CastoreMountError),
     #[error("synthetic DB generation failed: {0}")]
     SynthDb(#[from] sqlx::Error),
     #[error("failed to write nix.conf: {0}")]
@@ -400,6 +411,9 @@ enum PreDaemon {
     Fixture(ExecutionResult),
     /// Daemon ran; carry locals needed for the post-daemon section.
     Ran {
+        /// The per-build castore-FUSE lower. Torn down AFTER the
+        /// overlay stacked on it.
+        castore_mount: CastoreMount,
         overlay_mount: overlay::OverlayMount,
         input_paths: Vec<String>,
         outcome: DaemonOutcome,
@@ -586,149 +600,162 @@ pub async fn execute_build(
     // "returns Err only for setup failures BEFORE the cgroup kill-guard
     // is in place"). Converted to `ExecuteOutcome::pre_cgroup` once at
     // the match below — no per-site churn.
-    let pre: Result<PreDaemon, ExecutorError> =
-        async {
-            // 2. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
-            // overlayfs mount syscall); run on the blocking pool so a slow mount
-            // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
-            // worker thread and block the heartbeat loop.
-            let fuse_mp = env.fuse_mount_point.clone();
-            let overlay_base = env.overlay_base_dir.clone();
-            let build_id_owned = build_id.clone();
-            let overlay_mount = tokio::task::spawn_blocking(move || {
-                overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
-            })
-            .await
-            .map_err(ExecutorError::OverlayTaskPanic)??;
+    let pre: Result<PreDaemon, ExecutorError> = async {
+        // 2. Mount this build's /nix/store stack: the per-build
+        // castore-FUSE lower (DAG prefetch → mountd fd handoff →
+        // builder-side mount(2) → serve), then the overlay with that
+        // mountpoint as its only lowerdir. One spawn_blocking task for
+        // both so the ordering is structural: the overlay mount(2) —
+        // which probes its lowers — cannot start until
+        // `mount_castore_background` has returned with the FUSE
+        // session live (the P0541 deadlock gotcha). Blocking pool
+        // because both are mount syscalls plus a (bounded) DAG
+        // prefetch — they must not starve the Tokio workers or the
+        // heartbeat loop.
+        //
+        // The castore mountpoint is a SIBLING of the overlay build
+        // dir ({overlay_base}/{build_id}.castore — build_ids cannot
+        // contain '.') so teardown_overlay's remove_dir_all of the
+        // build dir never walks into a live FUSE mount.
+        let roots = castore_roots(assignment)?;
+        let castore_build_id = mountd_build_id(&build_id);
+        let castore_mp = env.overlay_base_dir.join(format!("{build_id}.castore"));
+        let castore_opts = env.castore.clone();
+        let castore_circuit = Arc::clone(&env.castore_circuit);
+        let castore_clients = store_clients.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let overlay_base = env.overlay_base_dir.clone();
+        let build_id_owned = build_id.clone();
+        let (castore_mount, overlay_mount) = tokio::task::spawn_blocking(move || {
+            let castore = mount_castore_background(
+                &castore_mp,
+                &castore_build_id,
+                &roots,
+                castore_clients,
+                runtime,
+                castore_circuit,
+                &castore_opts,
+            )?;
+            // r[impl builder.fs.fd-handoff-ordering]
+            // The castore session is serving (mount_castore_background
+            // returned), so the overlay's lower probe gets answered.
+            let overlay = overlay::setup_overlay_castore(&castore, &overlay_base, &build_id_owned)?;
+            Ok::<_, ExecutorError>((castore, overlay))
+        })
+        .await
+        .map_err(ExecutorError::OverlayTaskPanic)??;
 
-            // 3. Resolve inputDrvs → BasicDerivation + full input closure.
-            let ResolvedInputs {
-                basic_drv,
-                input_paths,
-                input_sized,
-                input_metadata,
-            } = resolve_inputs(&*store_client, &drv, drv_path).await?;
+        // 3. Resolve inputDrvs → BasicDerivation + full input closure.
+        let ResolvedInputs {
+            basic_drv,
+            input_paths,
+            input_metadata,
+        } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
-            // r[impl builder.cores.cgroup-clamp+2]
-            // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
-            // and wopSetOptions build_cores below. I-196/I-197 rationale at
-            // crate::cgroup::effective_cores.
-            let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
+        // r[impl builder.cores.cgroup-clamp+2]
+        // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
+        // and wopSetOptions build_cores below. I-196/I-197 rationale at
+        // crate::cgroup::effective_cores.
+        let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
 
-            // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
-            // short-circuit the daemon lifecycle and report scripted telemetry
-            // so the explore ladder can be driven without wall-clock minutes
-            // per probe. After overlay+input setup so the FUSE/JIT paths still
-            // exercise; before sandbox prep so no nix-daemon spawns.
-            #[cfg(feature = "test-fixtures")]
-            if let Some(pname) = drv.env().get("pname")
-                && let Some(o) = crate::fixture::lookup(pname, effective_cores)
-            {
-                tracing::info!(%pname, effective_cores, wall_secs = o.wall_secs,
+        // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
+        // short-circuit the daemon lifecycle and report scripted telemetry
+        // so the explore ladder can be driven without wall-clock minutes
+        // per probe. After overlay+input setup so the castore mount path
+        // still exercises; before sandbox prep so no nix-daemon spawns.
+        #[cfg(feature = "test-fixtures")]
+        if let Some(pname) = drv.env().get("pname")
+            && let Some(o) = crate::fixture::lookup(pname, effective_cores)
+        {
+            tracing::info!(%pname, effective_cores, wall_secs = o.wall_secs,
             "RIO_BUILDER_SCRIPT: short-circuiting build with scripted telemetry");
-                let r = crate::fixture::scripted_result(
-                    drv_path,
-                    &assignment.assignment_token,
-                    effective_cores,
-                    o,
-                );
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || overlay::teardown_overlay(overlay_mount))
-                        .await
-                        .map_err(ExecutorError::OverlayTaskPanic)?
-                {
-                    tracing::warn!(error = %e, "fixture-path overlay teardown failed");
-                }
-                return Ok(PreDaemon::Fixture(r));
-            }
-
-            // 4. Populate sandbox: synth DB, nix.conf.
-            prepare_sandbox(
-                &overlay_mount,
-                &drv,
+            let r = crate::fixture::scripted_result(
                 drv_path,
-                input_metadata,
+                &assignment.assignment_token,
                 effective_cores,
-                &env.systems,
-            )
-            .await?;
-
-            // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
-            // closure as the FUSE `lookup()` allowlist. The daemon's first
-            // overlay→FUSE `lstat` of each input now blocks-and-fetches in
-            // FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
-            // ENOENT — overlay would negative-cache it). Names NOT in the
-            // allowlist (`.lock`, `.chroot`, output-path probes) get fast
-            // ENOENT without contacting the store.
-            //
-            // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
-            // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
-            // lazy fetch for builds that touch a fraction of their closure.
-            // The I-165 47-min hang window is gone with it: register +
-            // prefetch_manifests together are <100 ms (one HashMap extend +
-            // one BatchGetManifest RPC).
-            //
-            // r[impl builder.cancel.pre-cgroup-deferred]
-            // I-166: the cgroup doesn't exist yet (created post-spawn below),
-            // so a Cancel that arrived during overlay/resolve/prepare landed
-            // as ENOENT in `try_cancel_build` — which now LEAVES the flag
-            // set. Check it here. The pre-cgroup window is now overlay →
-            // resolve → prepare_sandbox → register + prefetch (sub-second);
-            // the cancel_poll select that covered the warm hang is no longer
-            // needed.
-            if env.cancelled.load(Ordering::Acquire) {
-                tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
-                return Err(ExecutorError::Cancelled);
+                o,
+            );
+            // Overlay first, then the castore lower it stacked on.
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || overlay::teardown_overlay(overlay_mount))
+                    .await
+                    .map_err(ExecutorError::OverlayTaskPanic)?
+            {
+                tracing::warn!(error = %e, "fixture-path overlay teardown failed");
             }
-            if let Some(cache) = &env.fuse_cache {
-                // r[impl builder.fuse.jit-register]
-                cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
-                    Some((rio_nix::store_path::basename(p)?.to_owned(), *sz))
-                }));
-                metrics::gauge!("rio_builder_jit_inputs_registered")
-                    .set(cache.known_inputs_len() as f64);
-                // I-110c: prime manifest hints so each JIT fetch's `GetPath`
-                // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
-                // Unimplemented (old store) or any error, the per-path
-                // `GetPath` queries PG as before.
-                prefetch_manifests(store_client, cache, &input_paths).await;
-            }
-
-            // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
-            //
-            // The daemon reads/writes the chroot store at the per-build dir:
-            //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
-            //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
-            //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
-            //
-            // Its OWN binary + libs come from host `/nix/store` (the builder's
-            // namespace) — structurally separate from the per-build store, so a
-            // build whose `$out` collides with the daemon's runtime closure
-            // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
-            // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
-            // canonical `/nix/store/...`.
-            let opts = resolve_build_opts(assignment, env, effective_cores, batcher_seed);
-
-            let outcome = run_daemon_lifecycle(
-                &overlay_mount,
-                env,
-                &build_id,
-                drv_path,
-                &basic_drv,
-                opts,
-                log_tx,
-            )
-            .await?;
-
-            Ok(PreDaemon::Ran {
-                overlay_mount,
-                input_paths,
-                outcome,
-            })
+            tokio::task::spawn_blocking(move || castore_mount.teardown())
+                .await
+                .map_err(ExecutorError::OverlayTaskPanic)?;
+            return Ok(PreDaemon::Fixture(r));
         }
-        .await;
+
+        // 4. Populate sandbox: synth DB, nix.conf.
+        prepare_sandbox(
+            &overlay_mount,
+            &drv,
+            drv_path,
+            input_metadata,
+            effective_cores,
+            &env.systems,
+        )
+        .await?;
+
+        // The declared-input allowlist is structural now: the castore
+        // mount serves exactly the closure's Directory DAG, so a name
+        // outside it gets a cached negative dentry without any per-build
+        // registration step (the old JIT `register_inputs` +
+        // `prefetch_manifests` block lived here until the P0560 §A
+        // cutover).
+        //
+        // r[impl builder.cancel.pre-cgroup-deferred]
+        // I-166: the cgroup doesn't exist yet (created post-spawn below),
+        // so a Cancel that arrived during mount/resolve/prepare landed
+        // as ENOENT in `try_cancel_build` — which now LEAVES the flag
+        // set. Check it here. The pre-cgroup window is castore mount →
+        // overlay → resolve → prepare_sandbox (bounded by
+        // dag_prefetch_timeout + a few RPCs).
+        if env.cancelled.load(Ordering::Acquire) {
+            tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
+            return Err(ExecutorError::Cancelled);
+        }
+
+        // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
+        //
+        // The daemon reads/writes the chroot store at the per-build dir:
+        //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
+        //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
+        //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
+        //
+        // Its OWN binary + libs come from host `/nix/store` (the builder's
+        // namespace) — structurally separate from the per-build store, so a
+        // build whose `$out` collides with the daemon's runtime closure
+        // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
+        // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
+        // canonical `/nix/store/...`.
+        let opts = resolve_build_opts(assignment, env, effective_cores, batcher_seed);
+
+        let outcome = run_daemon_lifecycle(
+            &overlay_mount,
+            env,
+            &build_id,
+            drv_path,
+            &basic_drv,
+            opts,
+            log_tx,
+        )
+        .await?;
+
+        Ok(PreDaemon::Ran {
+            castore_mount,
+            overlay_mount,
+            input_paths,
+            outcome,
+        })
+    }
+    .await;
 
     let (
+        castore_mount,
         overlay_mount,
         input_paths,
         build_result,
@@ -740,6 +767,7 @@ pub async fn execute_build(
         #[cfg(feature = "test-fixtures")]
         Ok(PreDaemon::Fixture(r)) => return ExecuteOutcome::fixture(r, batcher_seed),
         Ok(PreDaemon::Ran {
+            castore_mount,
             overlay_mount,
             input_paths,
             outcome:
@@ -750,6 +778,7 @@ pub async fn execute_build(
                     final_line_count,
                 },
         }) => (
+            castore_mount,
             overlay_mount,
             input_paths,
             build_result,
@@ -851,6 +880,18 @@ pub async fn execute_build(
             // Metric incremented in Drop (see overlay.rs).
         }
         Ok(Ok(())) => {}
+    }
+
+    // 11b. Tear down the castore lower AFTER the overlay that stacked on
+    // it: detach the mountpoint, drop the mountd connection (the daemon
+    // reaps staging and releases the build's claims), abort the FUSE
+    // connection so nothing stays parked on it. Light work (no
+    // remove_dir_all), but it is still mount syscalls + an fd-handoff
+    // teardown — keep it off the async worker. A JoinError here is
+    // logged, not returned: the build result is already decided and
+    // CastoreMount::drop already ran inside the panicked task.
+    if let Err(join_err) = tokio::task::spawn_blocking(move || castore_mount.teardown()).await {
+        tracing::error!(error = %join_err, "castore teardown task panicked");
     }
 
     // Propagate any daemon/collect error AFTER teardown ran — WITH peaks
@@ -1176,14 +1217,10 @@ struct ResolvedInputs {
     basic_drv: rio_nix::derivation::BasicDerivation,
     /// Full transitive input closure (BFS over QueryPathInfo references,
     /// seeded from input_srcs + resolved inputDrv outputs). Used for
-    /// `prefetch_manifests` and the output reference-scan candidate
-    /// set. Derived from `input_metadata` (each entry's `.path`).
+    /// the input-materialization-failure classification and the output
+    /// reference-scan candidate set. Derived from `input_metadata`
+    /// (each entry's `.path`).
     input_paths: Vec<String>,
-    /// `(path, nar_size)` for every closure path. Used for the FUSE
-    /// warm — I-178: per-path timeout and overall deadline scale with
-    /// NAR size so a 1.9 GB input isn't aborted at the flat 60 s.
-    /// Derived from `input_metadata` alongside `input_paths`.
-    input_sized: Vec<(String, u64)>,
     /// PathInfo for every closure path, captured during the BFS so the
     /// synth DB ValidPaths table can be built without a second
     /// QueryPathInfo pass (I-106).
@@ -1327,21 +1364,10 @@ async fn resolve_inputs(
         .iter()
         .map(|m| m.store_path.to_string())
         .collect();
-    // I-178: project (path, nar_size) for the JIT FUSE allowlist
-    // (`register_inputs`). ValidatedPathInfo already has nar_size from
-    // BatchQueryPathInfo (authoritative; the ManifestHint.info.nar_size
-    // is best-effort). Two projections from input_metadata is cheaper
-    // than passing &input_metadata around — the other consumers
-    // (prefetch_manifests, ref-scan) want plain &[String].
-    let input_sized: Vec<(String, u64)> = input_metadata
-        .iter()
-        .map(|m| (m.store_path.to_string(), m.nar_size))
-        .collect();
 
     Ok(ResolvedInputs {
         basic_drv,
         input_paths,
-        input_sized,
         input_metadata,
     })
 }
@@ -1682,7 +1708,8 @@ mod tests {
 
     fn test_env() -> ExecutorEnv {
         ExecutorEnv {
-            fuse_mount_point: "/tmp".into(),
+            castore: CastoreOptions::from_config(&crate::config::Config::default()),
+            castore_circuit: Arc::new(crate::castore_fuse::circuit::CircuitBreaker::default()),
             overlay_base_dir: "/tmp".into(),
             executor_id: "t".into(),
             log_limits: crate::log_stream::LogLimits::UNLIMITED,
@@ -1692,8 +1719,6 @@ mod tests {
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             systems: Arc::from(["x86_64-linux".to_string()]),
             hw_class: None,
-            fuse_cache: None,
-            fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }

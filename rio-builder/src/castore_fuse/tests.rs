@@ -589,6 +589,7 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
         clients,
         tokio::runtime::Handle::current(),
         mountd,
+        Arc::new(super::circuit::CircuitBreaker::default()),
         cfg,
     ));
     Harness {
@@ -1042,6 +1043,7 @@ async fn cache_path_matches_the_mountd_shard_layout() {
         StoreClients::from_channel(rio_test_support::grpc::dead_channel()),
         tokio::runtime::Handle::current(),
         mountd,
+        Arc::new(super::circuit::CircuitBreaker::default()),
         OpenConfig {
             jit_fetch_timeout: FAST,
             mountd_request_timeout: FAST,

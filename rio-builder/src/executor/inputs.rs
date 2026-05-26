@@ -8,9 +8,40 @@ use tracing::instrument;
 
 use rio_nix::derivation::Derivation;
 use rio_proto::StoreServiceClient;
+use rio_proto::castore::RootNode;
+use rio_proto::types::WorkAssignment;
 use rio_proto::validated::ValidatedPathInfo;
 
 use super::ExecutorError;
+
+/// Project `WorkAssignment.input_roots` (P0588) into the
+/// `(store_path, RootNode)` pairs the castore mount sequence
+/// ([`crate::castore_fuse::mount::mount_castore_background`]) prefetches
+/// the Directory DAG from.
+///
+/// The scheduler populates one `InputRoot` per closure path from the
+/// store's `nar_index`; `WorkAssignment.input_closure` is the same row
+/// set projected to bare path strings (it feeds the upload attestation,
+/// not the mount). An entry whose `root_node` is unset means the store
+/// has not indexed that path yet — surfaced as a typed error here so
+/// the build fails with an actionable infrastructure error instead of a
+/// mid-build ENOENT on a silently missing input.
+pub(super) fn castore_roots(
+    assignment: &WorkAssignment,
+) -> Result<Vec<(String, RootNode)>, ExecutorError> {
+    assignment
+        .input_roots
+        .iter()
+        .map(|root| match &root.root_node {
+            Some(node) => Ok((root.store_path.clone(), node.clone())),
+            None => Err(ExecutorError::CastoreRoots(format!(
+                "input root {} has no castore root_node — the store has not indexed it yet \
+                 (is the NAR indexer running and caught up?)",
+                root.store_path
+            ))),
+        })
+        .collect()
+}
 
 /// Hash algorithm for FOD output verification. Maps from Nix's
 /// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
@@ -180,7 +211,12 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// Any error degrades to a no-op — each per-path `GetPath` then
 /// queries PG as before. Prefetch is an optimization; it never fails
 /// the build.
+///
+/// Old-FUSE only: nothing calls this since the P0560 §A castore
+/// cutover (the castore mount prefetches the Directory DAG instead).
+/// Deleted together with `crate::fuse` in the §A deletion commit.
 // r[impl builder.warmgate.manifest-prime]
+#[allow(dead_code)]
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
 pub(super) async fn prefetch_manifests(
     store_client: &StoreServiceClient<Channel>,
@@ -1059,6 +1095,86 @@ mod tests {
         ));
         assert!(err.to_string().contains("nonexistent.drv"));
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // castore_roots: WorkAssignment.input_roots → mount roots (P0560 §A)
+    // -----------------------------------------------------------------------
+
+    /// `input_roots` entries with a `root_node` map 1:1 (order
+    /// preserved) into the `(store_path, RootNode)` pairs the castore
+    /// mount prefetches; an empty list is an empty mount, not an error
+    /// (closure-less derivations are legal).
+    #[test]
+    fn test_castore_roots_extraction() {
+        use rio_proto::castore::{FileEntry, RootNode, root_node};
+        use rio_proto::types::InputRoot;
+
+        let dir_digest = vec![0xAB; 32];
+        let assignment = WorkAssignment {
+            input_roots: vec![
+                InputRoot {
+                    store_path: "/nix/store/aaaa-dir".into(),
+                    root_node: Some(RootNode {
+                        node: Some(root_node::Node::DirDigest(dir_digest.clone())),
+                    }),
+                },
+                InputRoot {
+                    store_path: "/nix/store/bbbb-file".into(),
+                    root_node: Some(RootNode {
+                        node: Some(root_node::Node::File(FileEntry {
+                            name: vec![],
+                            digest: vec![0xCD; 32],
+                            size: 7,
+                            executable: true,
+                        })),
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let roots = castore_roots(&assignment).expect("both roots indexed");
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].0, "/nix/store/aaaa-dir");
+        assert!(matches!(
+            roots[0].1.node,
+            Some(root_node::Node::DirDigest(ref d)) if *d == dir_digest
+        ));
+        assert_eq!(roots[1].0, "/nix/store/bbbb-file");
+
+        // No roots at all → empty mount, not an error.
+        let empty = WorkAssignment::default();
+        assert!(castore_roots(&empty).expect("empty is legal").is_empty());
+    }
+
+    /// An `InputRoot` without a `root_node` (the store has not indexed
+    /// the path) is a typed, actionable error naming the path — the
+    /// build must fail as an infrastructure error before mounting, not
+    /// mid-build with a bare ENOENT.
+    #[test]
+    fn test_castore_roots_unindexed_path_is_actionable() {
+        use rio_proto::types::InputRoot;
+
+        let assignment = WorkAssignment {
+            input_roots: vec![InputRoot {
+                store_path: "/nix/store/cccc-unindexed".into(),
+                root_node: None,
+            }],
+            ..Default::default()
+        };
+        let err = castore_roots(&assignment).expect_err("unindexed root must fail");
+        assert!(matches!(err, ExecutorError::CastoreRoots(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cccc-unindexed") && msg.contains("indexer"),
+            "error must name the path and the indexer: {msg}"
+        );
+        assert!(
+            !err.is_permanent(),
+            "an unindexed input is an infrastructure condition (retry once indexed), \
+             not a poisoned derivation"
+        );
     }
 
     #[tokio::test]

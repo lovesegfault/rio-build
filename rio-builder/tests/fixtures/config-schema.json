@@ -83,6 +83,26 @@
         "type": "string",
         "default": "/var/rio/overlays"
       },
+      "mountd_socket": {
+        "description": "rio-mountd UDS socket path. The DaemonSet listens on a dedicated\nhostPath-mounted directory (`/run/rio-mountd`) so builder pods\nmount one directory, not the host's entire `/run`.",
+        "type": "string",
+        "default": "/run/rio-mountd/mountd.sock"
+      },
+      "castore_cache_dir": {
+        "description": "Shared node-SSD backing cache root (mountd-owned, builder\nread-only). Castore-FUSE `open()` hits serve straight from here;\nmisses are fetched and `Promote`d into it.",
+        "type": "string",
+        "default": "/var/rio/cache"
+      },
+      "castore_chunks_dir": {
+        "description": "Shared node-SSD chunk cache root (mountd-owned, builder\nread-only). The P0575 streaming fill sources chunks from here\nbefore any remote fetch.",
+        "type": "string",
+        "default": "/var/rio/chunks"
+      },
+      "castore_staging_dir": {
+        "description": "Per-build staging root. mountd creates `{root}/{build_id}`\n(0700, owned by this builder's uid) at `Mount` time and reaps it\nwhen the connection closes.",
+        "type": "string",
+        "default": "/var/rio/staging"
+      },
       "mountd_request_timeout_secs": {
         "description": "Timeout (seconds) for every rio-mountd UDS round-trip\n(`Mount`/`BackingOpen`/`BackingClose`/`Promote`). `BackingOpen`\nand `BackingClose` are sub-millisecond ioctls; `Promote` of a\nlarge staged file is a verify-copy bounded by disk bandwidth —\n30 s covers a multi-GiB promote on a contended node SSD.\nEnv: `RIO_MOUNTD_REQUEST_TIMEOUT_SECS`.",
         "type": "integer",
@@ -252,6 +272,10 @@
     "fuse_passthrough": true,
     "fuse_fetch_timeout_secs": 60,
     "overlay_base_dir": "/var/rio/overlays",
+    "mountd_socket": "/run/rio-mountd/mountd.sock",
+    "castore_cache_dir": "/var/rio/cache",
+    "castore_chunks_dir": "/var/rio/chunks",
+    "castore_staging_dir": "/var/rio/staging",
     "mountd_request_timeout_secs": 30,
     "jit_fetch_timeout_secs": 60,
     "dag_prefetch_timeout_secs": 30,
