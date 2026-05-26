@@ -1,0 +1,21 @@
+# Castore-e2e VM fixture variant. Used ONLY by vm-castore-e2e-{core,faults}
+# (nix/tests/scenarios/castore-e2e.nix). Layered via
+# `helm template -f vmtest-full.yaml -f vmtest-castore.yaml` (last wins).
+#
+# Pin every executor pod to the k3s agent node. The castore node caches
+# (/var/rio/{cache,chunks,staging}) are per-node, and the scenario's
+# warm-read / cross-build-dedup / chunk-cache-stream assertions are
+# "the SECOND build reuses what the FIRST build promoted" — that is only
+# true when both builds land on the same node. rio.build/vmtest=true is
+# the label only k3s-agent carries (k3s-full.nix --node-label), the same
+# key the [sla.hw_classes.vmtest] block already matches, so the pin also
+# keeps the store (k3s-server, see vmtest-full.yaml store.nodeSelector)
+# and the builders on different nodes — the eio-on-fetch-fail store
+# outage cannot take the builder-side caches with it.
+#
+# A values file rather than --set: the dotted label key would need
+# escaping ("rio\.build/vmtest"), which is exactly the kind of quoting
+# bug a reviewer cannot see. Precedent: vmtest-full-nonpriv.yaml.
+poolDefaults:
+  nodeSelector:
+    rio.build/vmtest: "true"

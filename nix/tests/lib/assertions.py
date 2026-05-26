@@ -55,6 +55,24 @@ def scrape_metrics(node, port, host="localhost"):
     )
 
 
+def proxy_metrics(kube_node, pod, port, ns="rio-system"):
+    """Scrape a pod's /metrics through the apiserver pods/proxy
+    subresource and parse it.
+
+    The k3s twin of scrape_metrics(): rio pods are minimal images (no
+    shell, no curl) and ephemeral builder Jobs have no stable Service,
+    so `kubectl get --raw` via the apiserver is the only scrape path
+    that needs neither a port-forward nor a pod exec. NUMERIC port
+    required — k3s's apiserver nil-derefs on named-port proxy URLs
+    (see lifecycle.nix proxy_url). Third scenario needing this
+    (build-timeout, toxiproxy, castore-e2e), hence hoisted here."""
+    raw = kube_node.succeed(
+        f"k3s kubectl get --raw "
+        f"'/api/v1/namespaces/{ns}/pods/{pod}:{port}/proxy/metrics'"
+    )
+    return parse_prometheus(raw)
+
+
 def journal_builds_succeeded(node, unit="rio-builder", since=None):
     """Count successful builds from journald. Per-process Prometheus
     counters reset on every one-shot exit; journald survives restarts.

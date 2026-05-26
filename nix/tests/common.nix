@@ -775,7 +775,7 @@ rec {
         assert build_id, f"first BuildEvent missing buildId; got: {first_ev!r}"
         return build_id
 
-    def submit_single_drv(drv_file, max_time=5, **req):
+    def submit_single_drv(drv_file, max_time=5, extra_args="", **req):
         """Instantiate drv_file on client, copy .drv to ssh-ng://${gatewayHost},
         SubmitBuild a single-node DAG. Returns (drv_path, build_id).
 
@@ -790,11 +790,14 @@ rec {
         per-build castore mount then serves an empty /nix/store and
         the build fails before it ever runs (the cancel-cgroup-kill /
         build-timeout / cancel-timing failure mode).
+        `extra_args` is spliced into nix-instantiate for drvs that take
+        more than the busybox arg (castore-e2e passes its generated
+        seed paths via additional --arg flags).
         **req merges into SubmitBuildRequest (e.g. buildTimeout)."""
         drv_path = client.succeed(
             "nix-instantiate "
             "--arg busybox '(builtins.storePath ${busybox})' "
-            f"{drv_file!r} 2>/dev/null"
+            f"{extra_args} {drv_file!r} 2>/dev/null"
         ).strip()
         client.succeed(
             f"nix copy --derivation --to 'ssh-ng://${gatewayHost}' {drv_path}"
