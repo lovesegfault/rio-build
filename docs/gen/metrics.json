@@ -8,6 +8,7 @@
     "rio_builder_castore_fuse_circuit_open",
     "rio_builder_castore_fuse_eio_total",
     "rio_builder_castore_fuse_fetch_bytes_total",
+    "rio_builder_castore_fuse_fetch_retries_total",
     "rio_builder_castore_fuse_integrity_fail_total",
     "rio_builder_castore_fuse_open_case_total",
     "rio_builder_castore_fuse_open_mode_total",
@@ -228,6 +229,7 @@
     "rio_store_putpath_stale_reclaimed_total",
     "rio_store_putpath_verify_unavailable_total",
     "rio_store_refs_mismatch_total",
+    "rio_store_repush_attribution_total",
     "rio_store_s3_deletes_pending",
     "rio_store_s3_deletes_stuck",
     "rio_store_s3_requests_total",
@@ -290,6 +292,11 @@
         "name": "rio_builder_castore_fuse_fetch_bytes_total",
         "kind": "counter",
         "help": "Bytes fetched on behalf of castore-FUSE open(), labeled by hit (remote = from rio-store; node_ssd = from the shared node chunk cache)."
+      },
+      {
+        "name": "rio_builder_castore_fuse_fetch_retries_total",
+        "kind": "counter",
+        "help": "Transient (Unavailable/Unknown) castore fetch failures that were retried in-budget, labeled by op (read_blob/stat_blob/read_blob_connect/ get_chunks_connect). A low background rate is normal during store rolling restarts; a sustained rate means the store is flapping — the fetch circuit breaker still owns the fail-fast decision."
       },
       {
         "name": "rio_builder_castore_fuse_integrity_fail_total",
@@ -1400,6 +1407,11 @@
         "name": "rio_store_refs_mismatch_total",
         "kind": "counter",
         "help": "PutPathChunked uploads whose server-rescanned reference set disagreed with the builder's claimed refs. Same alert posture as narhash_mismatch: a scanner bug or a lying builder."
+      },
+      {
+        "name": "rio_store_repush_attribution_total",
+        "kind": "counter",
+        "help": "Content-verified re-uploads of already-complete paths by a tenant lacking attribution, labeled by outcome: granted (content matched, path_tenants row written) | mismatch (claimed path's content differs — rejected, nothing attributed). A sustained mismatch rate is a probing or corrupt-client signal."
       },
       {
         "name": "rio_store_s3_deletes_pending",

@@ -120,6 +120,13 @@
       "doc": "The DAG prefetch failed: the store has not indexed an input, the stream returned no Directory bodies for a root, the prefetch timed out, or the assignment carried an unindexed root."
     },
     {
+      "enum": "CastoreMountError",
+      "name": "Unauthenticated",
+      "crate": "rio-builder",
+      "msg": "rio-store rejected the castore DAG prefetch as unauthenticated: {source} — the builder sends the build's HMAC assignment token (x-rio-assignment-token) on every castore RPC; check that the scheduler signs assignment tokens with a tenant claim (hmac key + tenanted submission) and that rio-store is configured with the matching HMAC verifier",
+      "doc": "rio-store rejected a castore RPC as unauthenticated. The builder attaches the build's HMAC assignment token to every castore RPC; this firing means the token is missing/invalid, carries no tenant claim, or the store has no matching HMAC verifier."
+    },
+    {
       "enum": "ExecutorError",
       "name": "BuildFailed",
       "crate": "rio-builder",
@@ -145,7 +152,7 @@
       "name": "CastoreRoots",
       "crate": "rio-builder",
       "msg": "castore input roots unusable: {0}",
-      "doc": "The assignment's `input_roots` cannot seed a castore mount (an entry has no `root_node` — the store has not indexed it yet). Infrastructure: re-dispatch succeeds once the indexer catches up."
+      "doc": "The assignment's `input_roots` cannot seed a castore mount: an entry has no `root_node` (the store has not indexed it yet), or the list is empty while the derivation declares inputs (the scheduler could not compute the closure — sparse submit, PG blip). Infrastructure: re-dispatch succeeds once the indexer / closure compute catches up."
     },
     {
       "enum": "ExecutorError",
@@ -474,7 +481,7 @@
       "name": "InvalidSpec",
       "crate": "rio-controller",
       "msg": "invalid spec: {0}",
-      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a bad Quantity string (fuseCacheSize that doesn't parse) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient."
+      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec, or the spec/object is missing something the reconciler needs — no `metadata.namespace`, no `metadata.uid`, a ComponentScaler `targetRef` Deployment that doesn't exist, an unreachable `loadEndpoint`/scheduler. These are OPERATOR errors — fix the CR and reconcile retries. Not transient."
     },
     {
       "enum": "Error",
