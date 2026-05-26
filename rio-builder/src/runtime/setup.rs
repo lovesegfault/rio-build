@@ -261,9 +261,16 @@ pub async fn setup(
     // this is a fence against a DIFFERENT process's stale writes, not a
     // within-process happens-before. The value itself is the signal.
     let latest_generation = Arc::new(AtomicU64::new(0));
-    // Shared with BuildSpawnContext below so the per-build daemon's
-    // `extra-platforms` matches what the heartbeat advertises.
+    // Shared with BuildSpawnContext below so the sandbox's personality
+    // decision and the heartbeat advertise the same system list.
     let systems: std::sync::Arc<[String]> = systems.into();
+    // The host system for the sandbox personality decision comes from the
+    // RESOLVED list — `cfg.systems` was drained by
+    // `resolve_executor_identity` at startup, so reading `cfg.systems`
+    // here would always see an empty vec, silently fall back to
+    // x86_64-linux, and 32-bit guests on non-x86 hosts would never get
+    // PER_LINUX32.
+    let host_system = host_system_of(&systems);
     let heartbeat_handle = spawn_heartbeat(HeartbeatCtx {
         executor_id: executor_id.clone(),
         executor_kind: cfg.executor_kind,
@@ -323,7 +330,8 @@ pub async fn setup(
         resources: resource_snapshot,
         // Native-executor sandbox knobs, resolved once from config. The
         // host system for the personality decision is the first
-        // advertised system (the native platform by convention).
+        // advertised system (the native platform by convention), taken
+        // from the resolved list above.
         sandbox: Arc::new(crate::executor::SandboxEnvConfig {
             sandbox_shell: cfg.sandbox_shell.clone(),
             ca_bundle: cfg.ca_bundle.clone(),
@@ -333,11 +341,7 @@ pub async fn setup(
                 .map(std::path::PathBuf::from)
                 .collect(),
             hashed_mirrors: cfg.hashed_mirrors.clone(),
-            host_system: cfg
-                .systems
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "x86_64-linux".to_string()),
+            host_system,
         }),
         hw_bench: Arc::new(std::sync::Mutex::new(Some(hw_bench))),
         completion_pending: Arc::clone(&completion_pending),
@@ -374,6 +378,18 @@ pub async fn setup(
         idle_timeout: cfg.idle_timeout,
         _balance_guard,
     }))
+}
+
+/// The host system for the sandbox personality decision: the first
+/// advertised system (the native platform by convention), falling back
+/// to the detected host when the resolved list is empty (it never is
+/// after `resolve_executor_identity`, which defaults to the detected
+/// system).
+///
+/// Takes the *resolved* systems list, never `cfg.systems` — that field
+/// is drained by `resolve_executor_identity` at startup.
+fn host_system_of(systems: &[String]) -> String {
+    systems.first().cloned().unwrap_or_else(detect_system)
 }
 
 /// Resolve executor_id / systems / features from config + environment.
@@ -596,4 +612,23 @@ async fn connect_upstreams(
         anyhow::Ok((store, sched, (store_guard, sched_guard)))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the sandbox personality plumbing: the host
+    /// system must come from the RESOLVED systems list (RIO_SYSTEMS /
+    /// the Pool's `spec.systems`), not from the drained `cfg.systems`,
+    /// and an empty list must fall back to the detected host rather
+    /// than assuming x86_64-linux.
+    #[test]
+    fn host_system_comes_from_the_resolved_systems_list() {
+        assert_eq!(
+            host_system_of(&["aarch64-linux".to_string(), "armv7l-linux".to_string()]),
+            "aarch64-linux"
+        );
+        assert_eq!(host_system_of(&[]), detect_system());
+    }
 }

@@ -119,10 +119,13 @@ pub struct BuildSpawnContext {
     /// Builder or Fetcher (from `Config.executor_kind`). Threaded into
     /// each spawned task's `ExecutorEnv` for the wrong-kind gate.
     pub executor_kind: rio_proto::types::ExecutorKind,
-    /// Advertised target systems (resolved `RIO_SYSTEMS`). Threaded to
-    /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
-    /// matches what the heartbeat told the scheduler — a drv routed for
-    /// `i686-linux` is then accepted by the x86_64 daemon.
+    /// Advertised target systems (resolved `RIO_SYSTEMS` / the Pool's
+    /// `spec.systems`) — the same list the heartbeat advertises to the
+    /// scheduler. Threaded into each spawned build's `ExecutorEnv` so the
+    /// executor accepts exactly the systems this worker advertised; the
+    /// first entry also seeds `SandboxEnvConfig::host_system` (in
+    /// `setup()`), which drives the `PER_LINUX32` personality decision
+    /// for 32-bit guests.
     pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
     /// the executor can `register_inputs` (JIT allowlist) and
