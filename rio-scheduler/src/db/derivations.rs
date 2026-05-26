@@ -328,13 +328,13 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
-    /// zero `retry_count`, zero `resubmit_cycles`, status='created'. Used
-    /// by ClearPoison admin RPC + TTL expiry in `handle_tick` — admin
-    /// override and TTL expiry are full resets (unlike
-    /// [`Self::clear_poison_batch`], which preserves+increments
-    /// `resubmit_cycles` for the resubmit-bound).
-    pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+    /// Transaction-joining body of [`Self::clear_poison`] — so a reset
+    /// site can carry the poison clear in the same transaction as its
+    /// `drv_attempts` reset row (the 1a write discipline).
+    pub(crate) async fn clear_poison_in_tx(
+        tx: &mut PgConnection,
+        drv_hash: &DrvHash,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
              SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
@@ -342,9 +342,24 @@ impl SchedulerDb {
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map(|_| ())
+    }
+
+    /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
+    /// zero `retry_count`, zero `resubmit_cycles`, status='created'. Used
+    /// by ClearPoison admin RPC + TTL expiry in `handle_tick` — admin
+    /// override and TTL expiry are full resets (unlike
+    /// [`Self::clear_poison_batch`], which preserves+increments
+    /// `resubmit_cycles` for the resubmit-bound).
+    ///
+    /// Owns its connection; reset sites that already hold a transaction
+    /// use [`Self::clear_poison_in_tx`] instead.
+    pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::clear_poison_in_tx(&mut tx, drv_hash).await?;
+        tx.commit().await
     }
 
     // r[impl sched.db.clear-poison-batch]
@@ -371,6 +386,22 @@ impl SchedulerDb {
         if drv_hashes.is_empty() {
             return Ok(0);
         }
+        let mut tx = self.pool.begin().await?;
+        let cleared = Self::clear_poison_batch_in_tx(&mut tx, drv_hashes).await?;
+        tx.commit().await?;
+        Ok(cleared)
+    }
+
+    /// Transaction-joining body of [`Self::clear_poison_batch`] — the
+    /// resubmit-reset site carries this clear in the same transaction
+    /// as its `drv_attempts` reset rows.
+    pub(crate) async fn clear_poison_batch_in_tx(
+        tx: &mut PgConnection,
+        drv_hashes: &[DrvHash],
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
         let hashes: Vec<&str> = drv_hashes.iter().map(DrvHash::as_str).collect();
         let result = sqlx::query!(
             "UPDATE derivations
@@ -380,7 +411,7 @@ impl SchedulerDb {
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         Ok(result.rows_affected())
     }

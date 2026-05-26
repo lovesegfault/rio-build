@@ -690,11 +690,16 @@ impl DagActor {
         // consistent for the NEXT poison cycle. resubmit_cycles is
         // INCREMENTED in PG here so the bound survives leader failover.
         // Best-effort.
+        //
+        // 1a: each reset node's `resubmit_reset` ledger row (carrying
+        // the NEW cycle index) is appended in the same transaction as
+        // this batched clear, so the suffix cut and the per-cycle reset
+        // commit together.
         // r[impl sched.db.clear-poison-batch]
-        if let Err(e) = self
-            .db
-            .clear_poison_batch(&merge_result.reset_on_resubmit)
-            .await
+        if !merge_result.reset_on_resubmit.is_empty()
+            && let Err(e) = self
+                .record_resubmit_resets(&merge_result.reset_on_resubmit)
+                .await
         {
             warn!(
                 count = merge_result.reset_on_resubmit.len(),
@@ -1064,14 +1069,24 @@ impl DagActor {
                 // I-094: PG-side poison clear (status='created', NULLs
                 // poisoned_at/retry_count/failed_builders) so recovery
                 // doesn't resurrect the poison. Best-effort like the
-                // status update below.
+                // status update below. 1a: the `cache_hit_clear` reset
+                // row joins the clear in one transaction.
                 if matches!(
                     from_status,
                     DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-                ) && let Err(e) = self.db.clear_poison(drv_hash).await
-                {
-                    warn!(drv_hash = %drv_hash, error = %e,
-                      "failed to clear poison in PG after re-probe cache hit");
+                ) {
+                    let reset_row = self.reset_row_for(
+                        drv_hash,
+                        crate::state::OutcomeClass::CacheHitClear,
+                        crate::state::ReportingParty::Scheduler,
+                    );
+                    if let Err(e) = self
+                        .record_reset_with_clear_poison(drv_hash, reset_row)
+                        .await
+                    {
+                        warn!(drv_hash = %drv_hash, error = %e,
+                          "failed to clear poison in PG after re-probe cache hit");
+                    }
                 }
                 completed_batch.push(drv_hash.clone());
 
@@ -1156,10 +1171,18 @@ impl DagActor {
             if matches!(
                 from,
                 DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(h).await
-            {
-                warn!(drv_hash = %h, error = %e,
-                      "failed to clear poison in PG after deferred re-probe reset");
+            ) {
+                // 1a: `cache_hit_clear` reset row + poison clear in one
+                // transaction (same shape as apply_cached_hits above).
+                let reset_row = self.reset_row_for(
+                    h,
+                    crate::state::OutcomeClass::CacheHitClear,
+                    crate::state::ReportingParty::Scheduler,
+                );
+                if let Err(e) = self.record_reset_with_clear_poison(h, reset_row).await {
+                    warn!(drv_hash = %h, error = %e,
+                          "failed to clear poison in PG after deferred re-probe reset");
+                }
             }
             if let Err(e) = self
                 .db

@@ -658,7 +658,25 @@ impl DagActor {
         let mut holed_parents: Vec<DrvHash> = Vec::new();
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
-            if let Err(e) = self.db.clear_poison(&drv_hash).await {
+            // 1a: the TTL expiry's `poison_cleared` reset row joins the
+            // PG-first clear in one transaction (the clear ordering —
+            // pinned by `clearedPoisonClearsDurably` in the model — is
+            // unchanged; this only adds the row). `resubmit_cycle = 0`
+            // mirrors the full PG reset.
+            let reset_row = self
+                .reset_row_for(
+                    &drv_hash,
+                    crate::state::OutcomeClass::PoisonCleared,
+                    crate::state::ReportingParty::Scheduler,
+                )
+                .map(|mut r| {
+                    r.resubmit_cycle = 0;
+                    r
+                });
+            if let Err(e) = self
+                .record_reset_with_clear_poison(&drv_hash, reset_row)
+                .await
+            {
                 error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;
             }

@@ -272,6 +272,86 @@ impl DagActor {
         }
     }
 
+    /// Build a reset-event ledger row for `drv_hash`. `resubmit_cycle`
+    /// is read from the node's CURRENT in-memory value (already
+    /// incremented for a resubmit reset; already cleared for a
+    /// cache-hit clear); the poison-clear sites override it to 0 to
+    /// match the PG-side full reset. `None` when the node is unknown or
+    /// its merge has not committed.
+    pub(super) fn reset_row_for(
+        &self,
+        drv_hash: &DrvHash,
+        outcome_class: OutcomeClass,
+        reporting_party: ReportingParty,
+    ) -> Option<AttemptRow> {
+        let state = self.dag.node(drv_hash)?;
+        let db_id = state.db_id?;
+        Some(AttemptRow::new_reset(
+            db_id,
+            outcome_class,
+            reporting_party,
+            i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX),
+        ))
+    }
+
+    /// 1a appending transaction for a single-derivation poison-clear /
+    /// cache-hit reset: append the reset row (when there is one) and
+    /// run [`SchedulerDb::clear_poison_in_tx`] on the same connection.
+    /// Returns the transaction's result so call sites keep their
+    /// existing PG-first error contracts (admin clear returns false on
+    /// failure; the TTL/cache-hit sites log and continue). The
+    /// in-memory mirror is pushed only after a successful commit.
+    pub(super) async fn record_reset_with_clear_poison(
+        &mut self,
+        drv_hash: &DrvHash,
+        row: Option<AttemptRow>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.db.pool().begin().await?;
+        if let Some(row) = &row {
+            crate::db::SchedulerDb::append_attempt(&mut tx, row).await?;
+        }
+        crate::db::SchedulerDb::clear_poison_in_tx(&mut tx, drv_hash).await?;
+        tx.commit().await?;
+        if let Some(row) = row
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.push_attempt_record(row.to_record());
+        }
+        Ok(())
+    }
+
+    /// 1a appending transaction for the resubmit reset: one
+    /// `resubmit_reset` row per reset node (carrying its NEW cycle
+    /// index, already incremented in `dag.merge`) plus the existing
+    /// batched poison clear, committed together. Returns the
+    /// transaction's result so the merge persist keeps its existing
+    /// best-effort warn.
+    pub(super) async fn record_resubmit_resets(
+        &mut self,
+        reset_on_resubmit: &[DrvHash],
+    ) -> Result<(), sqlx::Error> {
+        let rows: Vec<(DrvHash, AttemptRow)> = reset_on_resubmit
+            .iter()
+            .filter_map(|h| {
+                Some((
+                    h.clone(),
+                    self.reset_row_for(h, OutcomeClass::ResubmitReset, ReportingParty::Scheduler)?,
+                ))
+            })
+            .collect();
+        let batch: Vec<AttemptRow> = rows.iter().map(|(_, r)| r.clone()).collect();
+        let mut tx = self.db.pool().begin().await?;
+        crate::db::SchedulerDb::append_attempts_batch(&mut tx, &batch).await?;
+        crate::db::SchedulerDb::clear_poison_batch_in_tx(&mut tx, reset_on_resubmit).await?;
+        tx.commit().await?;
+        for (hash, row) in rows {
+            if let Some(state) = self.dag.node_mut(&hash) {
+                state.push_attempt_record(row.to_record());
+            }
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Best-effort persist helpers (13 call sites across actor/*)
     // -----------------------------------------------------------------------
@@ -2404,7 +2484,22 @@ impl DagActor {
             Some(s) if s != DerivationStatus::Poisoned => return false,
             Some(_) => {}
         }
-        if let Err(e) = self.db.clear_poison(drv_hash).await {
+        // 1a: the admin clear's `poison_cleared` reset row joins the
+        // PG-first clear in one transaction. The clear discipline
+        // itself (PG-first, scrubs the durable exclusion set) is pinned
+        // by `clearedPoisonClearsDurably` / `clearedPoisonScrubsExclusions`
+        // in the model — this only ADDS a row; it must not reorder the
+        // clear. `resubmit_cycle = 0` mirrors the full PG reset.
+        let reset_row = self
+            .reset_row_for(drv_hash, OutcomeClass::PoisonCleared, ReportingParty::Admin)
+            .map(|mut r| {
+                r.resubmit_cycle = 0;
+                r
+            });
+        if let Err(e) = self
+            .record_reset_with_clear_poison(drv_hash, reset_row)
+            .await
+        {
             error!(drv_hash = %drv_hash, error = %e,
                    "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
             return false;

@@ -991,10 +991,22 @@ impl DagActor {
             if matches!(
                 from,
                 DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(&drv_hash).await
-            {
-                warn!(%drv_hash, error = %e,
-                      "failed to clear poison in PG after re-probe substitutable hit");
+            ) {
+                // 1a: `cache_hit_clear` reset row + poison clear in one
+                // transaction (same shape as the merge-time cache-hit
+                // clears).
+                let reset_row = self.reset_row_for(
+                    &drv_hash,
+                    crate::state::OutcomeClass::CacheHitClear,
+                    crate::state::ReportingParty::Scheduler,
+                );
+                if let Err(e) = self
+                    .record_reset_with_clear_poison(&drv_hash, reset_row)
+                    .await
+                {
+                    warn!(%drv_hash, error = %e,
+                          "failed to clear poison in PG after re-probe substitutable hit");
+                }
             }
             let output_paths = paths.clone();
             let store = store.clone();

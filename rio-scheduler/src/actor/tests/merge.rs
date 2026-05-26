@@ -8780,3 +8780,186 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
     store.faults.query_path_info_gate.notify_waiters();
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Attempt ledger (drv_attempts, Phase 1a): reset events are durable rows
+// and the suffix loader cuts at them.
+// ---------------------------------------------------------------------------
+
+/// Suffix classes for one derivation via the production loader
+/// (`load_attempt_suffix`) — what the Phase-1b fold will actually see.
+async fn suffix_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<&'static str> {
+    let derivation_id: Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_hash)
+            .fetch_one(pool)
+            .await
+            .expect("derivation row");
+    let sdb = crate::db::SchedulerDb::new(pool.clone());
+    let suffix = sdb
+        .load_attempt_suffix(&[derivation_id])
+        .await
+        .expect("suffix load");
+    suffix
+        .get(&derivation_id)
+        .map(|rows| rows.iter().map(|r| r.outcome_class.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// A resubmit of a retriable Poisoned node writes a `resubmit_reset`
+/// row carrying the incremented cycle, and the suffix loader cuts the
+/// pre-reset history at it.
+#[tokio::test]
+async fn attempt_ledger_resubmit_reset_row_cuts_suffix() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("rsr-w", "x86_64-linux").await?;
+    let drv_hash = "rsr-d";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _a = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "rsr-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "header missing",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned
+    );
+    assert_eq!(ledger_classes(&db.pool, drv_hash).await, vec!["permanent"]);
+
+    // Resubmit: a new build referencing the same node resets it
+    // (poisoned + under the resubmit limit → retriable) and the reset
+    // itself becomes a durable row.
+    let _ev2 =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    let classes: Vec<&str> = rows.iter().map(|r| r.outcome_class.as_str()).collect();
+    assert_eq!(classes, vec!["permanent", "resubmit_reset"], "{rows:?}");
+    let reset = rows.last().expect("reset row");
+    assert_eq!(reset.event_kind, "reset");
+    assert_eq!(
+        reset.resubmit_cycle, 1,
+        "the reset row carries the incremented cycle"
+    );
+
+    assert_eq!(
+        suffix_classes(&db.pool, drv_hash).await,
+        vec!["resubmit_reset"],
+        "the suffix loader cuts the pre-reset history"
+    );
+    Ok(())
+}
+
+/// An admin ClearPoison writes a `poison_cleared` reset row in the same
+/// transaction as the PG-first clear; the suffix starts at it.
+#[tokio::test]
+async fn attempt_ledger_admin_clear_poison_reset_row() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("acp-w", "x86_64-linux").await?;
+    let drv_hash = "acp-d";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _a = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "acp-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "header missing",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ClearPoison {
+            drv_hash: drv_hash.into(),
+            reply: reply_tx,
+        })
+        .await?;
+    assert!(reply_rx.await?, "ClearPoison must succeed");
+    barrier(&handle).await;
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    let classes: Vec<&str> = rows.iter().map(|r| r.outcome_class.as_str()).collect();
+    assert_eq!(classes, vec!["permanent", "poison_cleared"], "{rows:?}");
+    assert_eq!(rows.last().expect("reset row").event_kind, "reset");
+    assert_eq!(
+        suffix_classes(&db.pool, drv_hash).await,
+        vec!["poison_cleared"],
+        "the suffix loader cuts the pre-clear history"
+    );
+    Ok(())
+}
+
+/// A re-probe cache hit on a still-poisoned node (at the resubmit
+/// limit, so the resubmit reset cannot fire first) writes a
+/// `cache_hit_clear` reset row in the same transaction as the poison
+/// clear; the suffix starts at it.
+#[tokio::test]
+async fn attempt_ledger_cache_hit_clear_reset_row() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut worker_rx = connect_executor(&handle, "chc-w", "x86_64-linux").await?;
+    let drv_hash = "chc-d";
+    let out = test_store_path("chc-d-out");
+    let mut node = make_node(drv_hash);
+    node.expected_output_paths = vec![out.clone()];
+    // Not in the store yet: build #1 must dispatch and fail.
+    store.state.paths.write().unwrap().remove(&out);
+
+    let build1 = Uuid::new_v4();
+    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
+    let _ = worker_rx.recv().await.expect("assignment");
+    complete_failure(
+        &handle,
+        "chc-w",
+        &test_drv_path(drv_hash),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "permanent",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned
+    );
+
+    // Pin at the resubmit limit so the next merge does NOT reset it
+    // (that would be the resubmit_reset kind); the re-probe cache hit
+    // is then what clears the poison.
+    assert!(handle.debug_force_poisoned(drv_hash, 2).await?);
+    // The output now exists in the store.
+    store
+        .state
+        .paths
+        .write()
+        .unwrap()
+        .insert(out.clone(), Default::default());
+
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Completed,
+        "re-probe cache hit completes the still-poisoned node"
+    );
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    let classes: Vec<&str> = rows.iter().map(|r| r.outcome_class.as_str()).collect();
+    assert_eq!(classes, vec!["permanent", "cache_hit_clear"], "{rows:?}");
+    assert_eq!(rows.last().expect("reset row").event_kind, "reset");
+    assert_eq!(
+        suffix_classes(&db.pool, drv_hash).await,
+        vec!["cache_hit_clear"],
+        "the suffix loader cuts the pre-clear history"
+    );
+    Ok(())
+}

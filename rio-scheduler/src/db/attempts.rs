@@ -134,8 +134,6 @@ impl AttemptRow {
     /// must be one of the reset classes (`resubmit_reset`,
     /// `cache_hit_clear`, `poison_cleared`); `resubmit_cycle` carries
     /// the cycle index the reset starts.
-    // TODO: callers land with the reset-event sites (T-1a.6).
-    #[allow(dead_code)]
     pub(crate) fn new_reset(
         derivation_id: Uuid,
         outcome_class: OutcomeClass,
