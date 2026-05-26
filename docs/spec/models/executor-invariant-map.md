@@ -287,3 +287,239 @@ marker-only commits, test-only commits, spec prose outside the rules
 this campaign adds at 0b, and peer-file changes outside the named
 checklists (they move the peer table at the next re-pin but not the
 audit).
+
+## Stage-C corpus pin: the calibration denominators (pre-registered at 0a)
+
+Pinned 2026-05-26 at `277618342`, before any model or override
+exists, per design §3.5 ("partitioned commit-by-commit, with counts,
+before any reverting"). These counts are the denominators the 0d
+gate is audited against.
+
+### The corpus query
+
+The corpus file set is exactly inventory §5's nine paths — scheduler
+`state/executor.rs`, `actor/executor.rs`, `actor/housekeeping.rs`,
+`grpc/executor_service.rs`, `assignment.rs`; builder `runtime/`,
+`main.rs`, `health.rs`; controller `reconcilers/pool/` — and the
+query is, verbatim (one row per distinct commit; a multi-file commit
+gets one row):
+
+```
+git log --format='%h %s' 277618342 -- \
+  rio-scheduler/src/state/executor.rs rio-scheduler/src/actor/executor.rs \
+  rio-scheduler/src/actor/housekeeping.rs rio-scheduler/src/grpc/executor_service.rs \
+  rio-scheduler/src/assignment.rs rio-builder/src/runtime rio-builder/src/main.rs \
+  rio-builder/src/health.rs rio-controller/src/reconcilers/pool \
+  | awk '$2 ~ /^fix[(:]/'
+```
+
+Query-shape verification: the same query evaluated at the
+inventory's snapshot commit (`git log e650f23a4 -- …`) reproduces
+the inventory §5 headline figures exactly (334 commits touching the
+set, 168 `fix`, 64 `feat`), so the denominators below are continuous
+with the figures the design's §3.5 partition was sized against. Two
+recorded properties of this query shape, kept deliberately:
+
+- **No `--follow`.** The five shared actor files are excluded by
+  design (below), and pre-rename history (`rio-worker/`,
+  `reconcilers/{worker,builder,fetcher}pool/`, `worker.rs`-era
+  scheduler files, all before 2026-04-06) is NOT part of the corpus
+  — the inventory's 334/168 basis did not include it either (the
+  `--follow` phrase in inventory §5's method line applied to its
+  per-file deep-dives, not the headline count, as the reproduction
+  above shows). Widening to the renamed-path union would add ~130
+  worker-era fix commits that the design's denominators were never
+  built on; if a later stage wants that history it is a recorded
+  corpus change, not a silent widening.
+- **The five shared actor files** (`actor/{mod,dispatch,completion,
+  recovery,snapshot}.rs`) are NOT in the corpus query —
+  "session-relevant slices" is not a git-expressible filter, and
+  including the whole files would roughly double the corpus with
+  retry-/log-/SLA-owned fixes. Lifecycle-owned fixes that live only
+  in those files (the establishment-window and dedup-lifecycle
+  halves the retry close-out hands over) enter the 0d calibration
+  table as the explicitly-listed hand-off rows (T-0d.4), never by
+  widening the query.
+
+### The denominator
+
+At the pin the query returns **170 fix commits** (the design 0a
+row's "re-pinned fix count"; the snapshot's was 168). Every one of
+the 170 is assigned exactly one bucket below; the bucket counts sum
+to 170.
+
+| Bucket | Count |
+|---|---|
+| in-family (owned by this campaign, G1–G8) | **50** |
+| cross-campaign-owned — retry table / retry campaign artifacts | **21** |
+| cross-campaign-owned — controller Stage-C table | **43** |
+| out-of-scope (adjacent subsystems on shared files) | **56** |
+| **Total** | **170** |
+
+Per-family in-family counts (the 0d denominators per family):
+
+| Family | n | Notes |
+|---|---|---|
+| G1 session identity (→ F1) | 8 | |
+| G2 outcome delivery (→ F2, scheduler + builder halves) | 11 | |
+| G3 liveness calibration (→ F3) | 12 | 6 per-executor + 6 hung-node/node-aggregation sub-family |
+| G4 death attribution (→ F4) | 0 | no standalone in-family commit: the charging halves are all retry-owned (cross-campaign rows below); F4's in-family content enters 0d as the hand-off halves (the `db457374f` heartbeat-binding/stream-epoch halves counted under G1, the dedup-entry lifecycle, the late-disconnect-vs-reconnect race) per T-0d.4 |
+| G5 eligibility coherence (→ F5) | 7 | |
+| G6 failover convergence (→ F6) | 3 | |
+| G7 fleet-supply scheduler-side obligations (→ F7) | 3 | the controller half of G7 is cross-campaign (43 rows) |
+| G8 input hardening (→ F8) | 6 | |
+| **In-family total** | **50** | |
+
+### In-family rows (50)
+
+| Hash | Family | Note |
+|---|---|---|
+| `db457374f` | G1 | design F1 representative (stream_epoch atomicity + heartbeat auth_intent binding); split row: the deadline/backstop accounting halves are retry-table G1 rows (cross-referenced at 0d) |
+| `a6697c6b0` | G1 | design F1 representative (reconnect hijack accept-gate, ExecutorClaims kind binding); split: also a controller G-F row (auth/identity halves) and log-relay halves |
+| `ea10e1d74` | G1 | identity chain (ExecutorClaims HMAC) + per-stream caps; split: also a controller G-F row; build-events-bridge half is log-relay |
+| `4f8f68ff8` | G1 | adopt-conflict + stream_epoch (I-056 family) |
+| `3082598a3` | G1 | clear draining/degraded on reconnect (I-056a) |
+| `451f2dc80` | G1 | I-048 zombie guards |
+| `9a2dbc873` | G1 | skip re-register on SIGTERM-reconnect when slot idle |
+| `83e0b338f` | G1 | dup-Register handling; split: LogBuffers bound + step_down halves are log/lease content |
+| `0127cf854` | G2 | design F2 representative (phantom two-strike drain) |
+| `be3ad068e` | G2 | design F2 representative (heartbeat adopt of reconnecting worker's build) |
+| `6b6cfcf10` | G2 | design F2(D) representative (relay swap-after-Ok) |
+| `8201db59b` | G2 | design F2(D) representative (completion_pending before first await + graceful half-close) |
+| `1353d3224` | G2 | design F2(D) representative (drain gated on completion-delivered) |
+| `29222884e` | G2 | design F2(D) representative (relay watches target change) |
+| `aaa08721d` | G2 | decouple dispatch from heartbeat (lost-assignment prevention); split: FUSE-warm bound + build_id sanitize halves |
+| `41bc8dd97` | G2 | unsolicited-Cancelled completion left drv stuck after slot freed (C3 half); split: batch-persist/event-emission halves out of model |
+| `cc1ca02a7` | G2 | BuildSlot state under one mutex (single-build occupancy coherence); split: upload-scan half store-owned |
+| `d653222cf` | G2 | early graceful-drain (builder half); split: gateway drain + FUSE xattr halves |
+| `e4ed7b6a9` | G2 | builder DrainExecutor retry on not-leader (exit choreography; mechanism since deleted by `fb3ea232d`) |
+| `5971778f8` | G3 | design F3 representative (reap at 30 s + handle_tick leader gate) |
+| `1757790f2` | G3 | design F3 representative (stall credit at all 8 FMP sites) |
+| `44a55a224` | G3 | stall-credit early-return removal |
+| `e7b8ee91a` | G3 | heartbeat RPC timeout < interval (bug_044) |
+| `d12b31027` | G3 | abort heartbeat + DrainExecutor timeout on ephemeral exit (I-142) |
+| `f9c89bb92` | G3 | ephemeral idle-timeout exit (I-116) |
+| `99a17cd2f` | G3 (hung-node) | authoritative_binding map for detect_hung_nodes; controller table carries it as a Remainder (out-of-its-model) row |
+| `468900350` | G3 (hung-node) | tenant_of keyed on auth_intent |
+| `9699ac8b2` | G3 (hung-node) | key on auth_intent, floor 2, TTL-only retain |
+| `6b152ee22` | G3 (hung-node) | repeats across ticks; clear_persisted_state exhaustive half noted |
+| `b9a131ded` | G3 (hung-node) | group by controller-authoritative node binding |
+| `b6d26c001` | G3 (hung-node) | computed before stale-reap in handle_tick |
+| `a62631c90` | G5 | design F5 representative (fleet-exhaust system/feature-aware); split: retry-table G7 row records it NOT-ENC there and hands the eligibility half to this campaign |
+| `20afe5154` | G5 | design F5 representative (intent-matched pod resource-fit self-rejection); split: IceBackoff/solve_full halves are SLA/ICE content |
+| `96d8092b8` | G5 | design F5 representative (skip closed-stream executors in dispatch); inventory listed it under G3 — re-grouped to match the design's F5 row |
+| `9ce1bcf1b` | G5 | PrefetchComplete routed through became_idle inline cap |
+| `c9382fd63` | G5 | became_idle inline dispatch cap per tick |
+| `a52c3ec80` | G5 | builder-side features derivation from executor_kind (eligibility input) |
+| `6fb244337` | G5 | PrefetchHint contents (inputSrcs) — warm-path correctness |
+| `c5c5ccd17` | G6 | design F6 representative (leader-gate reassign_derivations); retry-table G5 row records it NOT-ENC there |
+| `0ea9bd701` | G6 | design F6 representative (advertise only post-recovery generation); old hash `5c47af5ad` |
+| `374280877` | G6 | leader gates on ProcessCompletion/ReportExecutorTermination/Tick + clear_persisted_state per-generation maps; split: breaker/gc-roots/log-seq halves out of scope |
+| `445928288` | G7 | scheduler-side ICE/ack arming (arm-on-ack + dag sweep + single edge-reload owner) |
+| `461f6c661` | G7 | scheduler-side ICE clear semantics (registered_cells/heartbeat, not pending ack) |
+| `2c8abc9b6` | G7 | scheduler-side ICE-attempt orphan reap keyed on dag state |
+| `9917c384d` | G8 | bound every worker-supplied string at the boundary |
+| `2143845d6` | G8 | bound derivation_path length at ingestion |
+| `d40b3ee86` | G8 | worker-supplied float validation |
+| `6b0de6e4e` | G8 | worker log line-number ordering + span totality |
+| `7ffbf1415` | G8 | BuildPhase ingestion gated on (executor, drv) binding |
+| `496e6fb14` | G8 | (executor, drv) binding check in recv task |
+
+### Cross-campaign-owned rows: retry (21)
+
+Each row links the owning retry artifact it will be cross-referenced
+against at 0d (no re-run here).
+
+| Hash | Owning retry row / artifact |
+|---|---|
+| `ee9302b86` | retry calibration table G5 (race-ahead report keeps pending entry; permanent witness `quint-retry-calib-g5-race-ahead`) |
+| `e872b2b49` | retry calibration table G5 (non-promoting report preserves the correlation entry) |
+| `dc094dd0c` | retry calibration table G1 (assigned-only disconnects; covered by `retryCalibG1DisconnectCharges`) |
+| `8d38cb999` | retry calibration table G1 (I-213 disconnect-path exemption) |
+| `c13f6a277` | retry calibration table G1 (I-213 max_retries exemption; NOT-ENC there, P4 vehicle) |
+| `8283d4362` | retry calibration table G1 (window-reset gate + controller-OOM cap-check, two falsifying rows) |
+| `172776b1b` | retry divergence catalog C1/C4 + controller Stage-C G-E row (deadline-exceeded ownership) |
+| `2acd1b327` | retry calibration table G6 (floor-ladder family, NOT-ENC) + controller Stage-C G-G row |
+| `c55467cbc` | retry calibration table G6 (floor-ladder family) |
+| `37c21bb7b` | retry calibration table G6 (floor-ladder family) |
+| `1184d1bb8` | retry calibration table G6 (floor-ladder family) |
+| `12b86c285` | retry calibration table G6 (deadline alignment) + controller Stage-C G-G row |
+| `a76589e37` | retry calibration table G6 (configuration plumbing) |
+| `8a016a393` | retry calibration table G1 (at-cap OOM single-count) |
+| `a60d58a32` | retry calibration table G1 (PutPath exemption / window) |
+| `699ad52e1` | retry calibration table G1 (exempt-cap) + G7 (draining-exclusion); the output-membership half stays with completion-intake unit tests |
+| `d91df7e9f` | retry calibration table G3 (NOT-ENC build-level keep_going) |
+| `3973a4f54` | retry calibration table G3 (recovery re-cascade half) |
+| `5b4543c3a` | retry calibration table G3/G8 (recovery halves); non-retry halves are observability bookkeeping |
+| `7d5646105` | retry campaign Phase-1b/2 implementation fix (floor outcome on controller-classified attempt rows) — owned by the retry close-out, post-dates its calibration corpus |
+| `001cf0eeb` | retry campaign Stage-A self-review corrections — owned by the retry Stage-A record |
+
+### Cross-campaign-owned rows: controller Stage-C table (43)
+
+All 43 are members of the controller campaign's pinned 95-commit
+corpus; each links its family row there (the G7 fleet-reconciliation
+family of inventory §5 is owned by that table, per design §3.5).
+
+| Controller family row | Hashes (this corpus ∩ that table) |
+|---|---|
+| G-A spawn↔reap↔queued coherence | `7f04c9d88`, `6a9ba0ef0`, `fb0953870`, `fba9086dc`, `6c4f4983d`, `9123e72d4`, `fd5d7c988`, `5e01a9ff1`, `8b0128f5a`, `004956eeb` |
+| G-B ack/ICE protocol | `cdc78f839`, `5815a7544`, `485e736a2`, `af1383c0e`, `e8bd76451`, `d6bc376d3`, `408a48bcb` |
+| G-C resource-accounting parity | `a415a9a8b`, `286566a57`, `d5602b3aa`, `073170dfb`, `5250a4b9a`, `b25836ef1`, `5c2a83761`, `bcfdc2262` |
+| G-D placement derivation | `80cfcd65c`, `039861b56`, `3f416e02e`, `2f9a3769c`, `9fd4b6e59`, `b570cdd8d`, `015667efa`, `f97644a53` |
+| G-E deadline coupling | `f73b98b1f` (and `172776b1b`, `12b86c285`, `2acd1b327` listed under retry above — one row each, the retry link is primary, the controller link noted) |
+| G-F identity/security plumbing | `acf6d476b` (`a6697c6b0`, `ea10e1d74` are in-family G1 rows above with the G-F cross-reference noted) |
+| FFD/cover ⇄ scheduler-config parity | `f333ebed5`, `c5320b40e`, `e013b2044` |
+| Remainder | `2ad753db9`, `416895e3e`, `3c3062760`, `c8ca42a91`, `dbc7f7cb2` |
+
+### Out-of-scope rows (56)
+
+Fixes on the corpus files whose repaired behavior belongs to an
+adjacent subsystem; each names the subsystem (the 0d table carries
+these as OUTSIDE rows, not dispositioned here).
+
+| Subsystem | n | Hashes |
+|---|---|---|
+| log relay / banner / LogService data plane (incl. the since-deleted in-scheduler log subsystem) | 13 | `44d4235b8`, `8f6190df7`, `849fce331`, `2c301438d`, `c04b5e2a4`, `77a08ec14`, `649b89b81`, `32cd79bec`, `7868d46f2`, `c638fe449`, `7beb1ca00`, `1d51bc845`, `5be205ebc` (gateway log rendering); log halves of split in-family rows are noted in-row above |
+| SLA solver / hw-class sampling / estimator | 14 | `bce30573b`, `82f0e9fde`, `20bfb3bee`, `054e8083c`, `90fbf5b52`, `bd41e23ea`, `93ce060f0`, `c6163485a`, `13acff94f`, `b81da271f`, `a9a2e6fc1`, `827b56255`, `077854387`, `c967d75d6` |
+| FUSE / overlay / store / FMP probe | 7 | `d5b99450d`, `9c85bcfe5`, `bf7e516e4`, `96056b318`, `8f917db2c`, `77f628ddb`, `702b9ea00` |
+| controller pod-spec construction (pool/pod.rs and friends; excluded from the controller corpus by its definition, G-D-disposition coverage there) | 4 | `cda4ad612`, `5b4db724d`, `54ec6d079`, `3ec9120af` |
+| auth / service-token gating | 3 | `e36a645cc`, `a92c03ddf`, `fb3ea232d` |
+| build/DAG bookkeeping (build-level transitions, client-orphan sweep, cancel bookkeeping) | 3 | `71a7c8a9b`, `a54ac4650`, `1dd32cc10` |
+| builder execute-loop / cgroup resources | 2 | `34a4c40be`, `a6b72bf94` |
+| controller pool status/census + ComponentScaler (outside both pinned corpora) | 2 | `b19164959`, `e89b89110` |
+| observability / tracing | 2 | `475b79eee`, `81963379a` |
+| test / spec-annotation hygiene | 3 | `785288a3b`, `0dbd5f2af`, `f005fa55c` |
+| CA-derivation dispatch chain | 1 | `6434a2f45` |
+| retry-policy configuration validation | 1 | `002effbab` |
+| lease / leader-election machinery (rio-lease campaign) | 1 | `125feb450` |
+| **Total** | **56** | |
+
+Three rows in this partition re-disposition an
+inventory §5 grouping, recorded here so the deviation is explicit:
+`849fce331`/`2c301438d` (inventory G6) are out-of-scope log-relay
+content — the gated object is log-buffer state owned by the log
+campaign and since deleted from the scheduler; `96d8092b8`
+(inventory G3) is in-family G5 to match the design's F5
+representative row; `f1902fe63` → `125feb450` (inventory G6) is
+out-of-scope lease machinery — the hook-ordering forwarder belongs
+to the rio-lease campaign's model, not Model S.
+
+### Per-family encodability pre-registration (design §3.5, carried into the partition)
+
+Pre-registered now so every 0d verdict is a checked prediction; an
+encodability prediction that fails at 0d is a stop-and-report, never
+a silent re-disposition.
+
+| Family (in-family bucket) | Pre-registered encodability |
+|---|---|
+| F1 (G1) | Model S |
+| F2 scheduler half (G2: phantom drain, adopt, dispatch-decouple, unsolicited-Cancelled, slot coherence) | Model S |
+| F2 builder half (G2: swap-after-Ok `6b6cfcf10`, half-close `8201db59b`/bug_117, drain-on-delivery `1353d3224`, relay-watch `29222884e`, exit choreography rows) | Model D at await-point granularity |
+| F3 per-executor liveness (G3: reap bound, stall credit, RPC timeout, idle/ephemeral exit) | Model S |
+| F3 hung-node / node-aggregation sub-family (G3: the six hung-node rows) | node-regime cfg only (2 slots, 1 node, 2 tenants); else NOT-ENCODED with `chaos.nix` and `lifecycle/recovery.nix` named as the coverage |
+| F4 lifecycle half (no standalone commits; the hand-off halves of T-0d.4) | Model S (needs the exec_id-carrying `recently_disconnected` map and the establishment action) |
+| F5 (G5) | Model S; the static-eligibility *content* (kind/system/features arithmetic, warm/prefetch internals) is expected NOT-ENCODED with the dispatch/assignment unit tests named |
+| F6 (G6) | Model S (fault-leader regime; deposed-believer window kept reachable) |
+| F7 (G7 scheduler-side rows) | NOT re-modeled — covered by `spawnCoherence.qnt` (controller campaign) plus Model S's stated guarantees (busy-accuracy, ack arming, report idempotency); expected NOT-ENCODED rows naming that coverage |
+| F8 (G8) | NOT-ENCODED by design (bounds checks + existing unit tests at the gRPC boundary) |
+| G7 controller half (cross-campaign bucket) | controller campaign's table (already calibrated there) |
