@@ -59,6 +59,7 @@ cd fuzz/rio-nix && cargo fuzz run wire_primitives
 | `/nixbuild --checks` | Full CI gate (wraps `nix-fast-build --flake .#checks.x86_64-linux`): per-member clippy/doc/nextest, pre-commit, 2min fuzz per target, all VM tests, cov-smoke (Linux+KVM only). Streams eval→build. |
 | `/nixbuild` (= `--quick`) | Edit-loop slice of the gate: clippy/docs/drift/policy for all crates, **no test execution** (vm/nextest/fuzz/golden/mutants/cov-smoke excluded). Untouched crates are cache hits. |
 | `nix flake check` | Runs all `checks.*` (same set as `/nixbuild --checks`, but serial eval) |
+| `/nixbuild .#ci` | Everything the GHA pipeline builds (checks/fuzz/vm-test/coverage matrix kinds) as one target — exact CI replication. Per-kind/per-entry via passthru: `.#ci.vm-test`, `.#ci.checks.clippy-rio-nix`. Needs KVM; cached entries substitute. |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `/nixbuild .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
@@ -72,7 +73,9 @@ cd fuzz/rio-nix && cargo fuzz run wire_primitives
 
 `checks.*` is flat and granular: a per-member clippy/clippy-test/doc/nextest matrix for every workspace crate, plus fuzz runs, VM tests, and misc policy checks — each its own derivation. `nix-fast-build` (what `/nixbuild --checks` runs) streams evaluation into builds via nix-eval-jobs — VM tests start evaluating in parallel with rust checks instead of after, and individual check failures surface immediately without waiting for the whole graph.
 
-`packages.*` is the minimal set of deployable artifacts (workspace binaries, docker images, AMIs, tfvars). Debug/manual targets (per-test coverage, fuzz builds, helm subcharts) hang off `packages.{coverage,helm,dockerImages,mutants}` as passthru attrs — reachable by attr path, not enumerated by `nix flake show`.
+`packages.*` is the minimal set of deployable artifacts (workspace binaries, docker images, AMIs, tfvars). Debug/manual targets (per-test coverage, fuzz builds, helm subcharts) hang off `packages.{ci,coverage,helm,dockerImages,mutants}` as passthru attrs — reachable by attr path, not enumerated by `nix flake show`.
+
+`packages.ci` aggregates everything the GHA matrices build — `nix build .#ci` is the exact CI build set on one host (needs KVM), with per-kind (`.#ci.vm-test`) and per-entry (`.#ci.checks.clippy-rio-nix`) targets via passthru.
 
 ### Coverage
 

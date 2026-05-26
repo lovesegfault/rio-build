@@ -915,7 +915,7 @@
               # --------------------------------------------------------------
               # Per-member check derivations live in `checks` (granular,
               # for nix-fast-build streaming). Debug/manual targets are
-              # passthru on packages.{coverage,helm,dockerImages,mutants}
+              # passthru on packages.{ci,coverage,helm,dockerImages,mutants}
               # (reachable by attr path, not enumerated by `nix flake show`).
               packages = {
                 default = rio-workspace;
@@ -1074,6 +1074,47 @@
                   mkdir -p $out
                   ${crateBuild.memberBins.rio-crds}/bin/crdgen $out
                 '';
+
+                # ──────────────────────────────────────────────────────────
+                # CI aggregate (manual — `nix build .#ci`)
+                # ──────────────────────────────────────────────────────────
+                #
+                # Everything the GHA pipeline (.github/workflows/ci.yml)
+                # builds, as one local target: the union of the four
+                # ciMatrix kinds. Built FROM ciMatrix — the same value
+                # gen-matrix evaluates — so it cannot drift from what CI
+                # runs (the drift that retired the old hand-curated .#ci,
+                # P0525). Not covered: CI steps that aren't nix builds
+                # (gen-matrix eval, codecov upload, docs.yml Pages
+                # deploy). cov-smoke is absent here exactly as it is in
+                # CI: its assertion lives inside the coverage entry for
+                # the smoke scenario, which IS built.
+                #
+                # Needs KVM (vm-test and coverage vm-* constituents). On
+                # a cold cache this is the entire CI workload on one
+                # host; anything already in the binary cache substitutes.
+                # Pass --keep-going to surface every failure like CI's
+                # per-cluster `nix build --keep-going` does.
+                #
+                #   nix build .#ci                        # the full CI build set
+                #   nix build .#ci.vm-test                # one matrix kind
+                #   nix build .#ci.checks.clippy-rio-nix  # one entry
+                #
+                # $out symlinks one dir per kind, so colliding entry
+                # names stay distinct (vm-test/vm-X vs coverage/vm-X).
+                # Same linkFarm+overrideAttrs passthru idiom as helm /
+                # dockerImages above.
+                ci =
+                  let
+                    aggregate =
+                      farmName: entries:
+                      (pkgs.linkFarm farmName (pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) entries))
+                      .overrideAttrs
+                        (old: {
+                          passthru = (old.passthru or { }) // entries;
+                        });
+                  in
+                  aggregate "rio-ci" (pkgs.lib.mapAttrs (kind: aggregate "rio-ci-${kind}") ciMatrix);
 
                 # ──────────────────────────────────────────────────────────
                 # Coverage (manual — NOT a check)
