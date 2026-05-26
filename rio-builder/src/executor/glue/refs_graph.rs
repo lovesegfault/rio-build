@@ -255,11 +255,14 @@ impl<'a> ClosureIndex<'a> {
     /// `writeStructuredAttrs` expands `exportReferencesGraph`:
     /// `closureSize`, `narHash` (Nix colon format `sha256:<nixbase32>`,
     /// NOT SRI), `narSize`, `path`, `references` (sorted, including any
-    /// self-reference recorded in the path's metadata), and
-    /// `"valid": true`. Verified against Nix 2.34.7 output and pinned
-    /// byte-for-byte by the `erg-structured` differential-corpus entry;
-    /// key order inside `.attrs.json` is normalized by `sort_json_keys`
-    /// in `attrs.rs` to match nlohmann's sorted maps.
+    /// self-reference recorded in the path's metadata), `"valid": true`,
+    /// and — only for content-addressed paths — `ca` with the
+    /// renderContentAddress string carried by the path's metadata
+    /// (non-CA paths omit the key). Verified against Nix 2.34.7 output
+    /// and pinned byte-for-byte by the `erg-structured`
+    /// differential-corpus entry; key order inside `.attrs.json` is
+    /// normalized by `sort_json_keys` in `attrs.rs` to match nlohmann's
+    /// sorted maps.
     pub(crate) fn closure_info_json(&self, targets: &[String]) -> Result<Value, GlueError> {
         let closure = self.closure_of(targets)?;
         // Per-path closure SETS are memoized across the member loop:
@@ -277,7 +280,7 @@ impl<'a> ClosureIndex<'a> {
                 refs.sort_unstable();
                 let nar_hash = NixHash::new(HashAlgo::SHA256, info.nar_hash.to_vec())
                     .expect("32-byte sha256 digest is always valid");
-                serde_json::json!({
+                let mut el = serde_json::json!({
                     "path": p,
                     // CppNix renders narHash in colon/nixbase32 form here
                     // (pathInfoToJSON), not SRI.
@@ -288,7 +291,19 @@ impl<'a> ClosureIndex<'a> {
                     // pathInfoToJSON marks every existing path as valid;
                     // every closure member here exists by construction.
                     "valid": true,
-                })
+                });
+                // pathInfoToJSON adds the optional `ca` key only when the
+                // path is content-addressed, with the renderContentAddress
+                // string (`fixed:[r:]<algo>:<nixbase32>` / `text:…`) —
+                // exactly the descriptor the store metadata already
+                // carries, so it passes through verbatim. Non-CA paths
+                // omit the key entirely (verified against Nix 2.34.7
+                // `.attrs.json` output for a flat-added file alongside an
+                // input-addressed path).
+                if let Some(ca) = &info.content_address {
+                    el["ca"] = Value::String(ca.clone());
+                }
+                el
             })
             .collect();
         Ok(Value::Array(arr))
@@ -503,6 +518,35 @@ mod tests {
             "valid": true,
         }]);
         assert_eq!(json, expected);
+    }
+
+    /// pathInfoToJSON adds the optional `ca` key only for
+    /// content-addressed paths, passing the renderContentAddress string
+    /// through verbatim; non-CA paths omit the key entirely (not
+    /// `null`). Verified against Nix 2.34.7 `.attrs.json` output for a
+    /// flat-added file alongside an input-addressed path.
+    #[test]
+    fn closure_info_emits_ca_only_for_content_addressed_paths() {
+        const CA_DESC: &str = "fixed:sha256:08b59by0b0ga7j2yfhl64hx6alsd7cvcwkllvxixhj3fws5kx1zw";
+        let mut ca_info = info(A, 144, &[]);
+        ca_info.content_address = Some(CA_DESC.to_string());
+        let plain = info(B, 10, &[]);
+        let infos = vec![ca_info, plain];
+        let paths = vec![A.to_string(), B.to_string()];
+        let index = ClosureIndex::new(&infos, &paths);
+        let json = index
+            .closure_info_json(&[A.to_string(), B.to_string()])
+            .unwrap();
+        let arr = json.as_array().unwrap();
+        let by_path: std::collections::HashMap<&str, &Value> = arr
+            .iter()
+            .map(|el| (el["path"].as_str().unwrap(), el))
+            .collect();
+        assert_eq!(by_path[A]["ca"], Value::String(CA_DESC.to_string()));
+        assert!(
+            by_path[B].as_object().unwrap().get("ca").is_none(),
+            "non-CA path must omit the ca key entirely (not null)"
+        );
     }
 
     /// …and anything not under the store dir at all is rejected the way
