@@ -111,6 +111,7 @@ impl FloatingCaSpec {
 ///
 /// On success the on-disk scratch trees have been replaced by trees at
 /// the final store paths' basenames in the same parent directory.
+// r[impl builder.exec.ca-finalize]
 pub(crate) fn finalize_floating_ca(
     outputs: &mut [ProcessedOutput],
     spec: &FloatingCaSpec,

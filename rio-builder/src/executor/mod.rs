@@ -1208,6 +1208,7 @@ async fn run_native_lifecycle(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // r[impl builder.exec.sandbox]
     let exec_result = rio_exec::execute(&prepared.request, &host, event_tx).await;
     let stop_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

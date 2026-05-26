@@ -371,11 +371,11 @@ mod tests {
         .unwrap()
     }
 
-    /// Roundtrip the decomposed wopBuildDerivation client primitives the
-    /// way rio-builder's `run_daemon_build` drives them:
-    /// `client_send_build_derivation` → `read_stderr_message`* →
-    /// `read_build_result`.
-    // r[verify builder.daemon.stdio-client]
+    /// Roundtrip the decomposed wopBuildDerivation client primitives
+    /// (`client_send_build_derivation` → `read_stderr_message`* →
+    /// `read_build_result`) --- the gateway's golden protocol tests use
+    /// this client side against real daemons; nothing in production
+    /// drives it anymore.
     #[tokio::test]
     async fn client_build_derivation_roundtrip() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(8192);

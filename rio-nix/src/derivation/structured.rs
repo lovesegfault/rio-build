@@ -58,6 +58,7 @@ impl<'a> StructuredEnv<'a> {
     /// `self.json`): a present-but-malformed `__json` must still route
     /// the derivation down the structured path so materialization can
     /// fail loudly instead of silently building with a flat env.
+    // r[impl builder.exec.structured-attrs]
     pub fn is_structured_attrs(&self) -> bool {
         self.env.contains_key("__json")
     }

@@ -15,7 +15,8 @@ boundary. See @fetcher-rationale-split for the full rationale.
 
 - Receive FOD build assignments from the scheduler via gRPC (the scheduler
   routes FODs here per #rref("sched.dispatch.fod-to-fetcher"))
-- Execute the FOD fetch via `nix-daemon --stdio` with network access enabled in
+- Execute the FOD fetch natively (rio-exec sandbox / `builtin:fetchurl`
+  re-exec) with network access enabled in
   the sandbox
 - Verify the output hash before upload (#rref("builder.fod.verify-hash"))
 - Upload the verified output @nar to rio-store
@@ -67,17 +68,32 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
 `is_fod` from the `.drv` itself and cross-checks
 (#rref("builder.executor.kind-gate")).
 
+= builtin:fetchurl
+
+#r("fetcher.fetchurl.sandboxed")[
+  `builtin:fetchurl` derivations are executed by re-exec'ing the rio-builder
+  binary inside a network-enabled rio-exec sandbox (`__builtin-fetchurl`
+  subcommand): the fetch runs as the unprivileged build user, attached to the
+  per-build cgroup, subject to the same timeout/cancellation machinery as any
+  other build. The host `/nix/store` is exposed read-only inside that sandbox
+  (the re-exec'd binary needs its own runtime closure); the fetched output is
+  written to a dedicated writable mount and is still subject to the FOD hash
+  gate (#rref("fetcher.upload.hash-verify-before")) before anything reaches
+  the store. The sandbox's CA bundle comes from `RIO_CA_BUNDLE`; HTTPS fetches
+  without a usable bundle fail with an actionable error rather than
+  downgrading verification.
+]
+
 = Hashed mirrors
 
-#r("fetcher.nixconf.hashed-mirrors")[
-  The fetcher's `nix.conf` MUST set `hashed-mirrors` (default
-  `http://tarballs.nixos.org/`). When a flat-hash FOD's origin URL is dead,
-  `nix-daemon`'s `builtin:fetchurl` tries `{mirror}/{algo}/{hexlower-digest}`
-  first and only falls back to the origin on miss. Only `outputHashMode =
-  "flat"` derivations qualify --- recursive (NAR-hash) FODs skip the mirror
-  because the on-the-wire bytes don't correspond to the declared hash. The Helm
-  chart exposes this as `.Values.nixConf.hashedMirrors` so operators can point
-  at an internal mirror; an empty value disables the lookup.
+#r("fetcher.mirrors.hashed")[
+  When a flat-hash FOD's origin URL is dead, `builtin:fetchurl` tries
+  `{mirror}/{algo}/{hexlower-digest}` for each configured hashed mirror first
+  and only falls back to the origin on miss. Only `outputHashMode = "flat"`
+  derivations qualify --- recursive (NAR-hash) FODs skip the mirror because
+  the on-the-wire bytes don't correspond to the declared hash. Mirrors are
+  configured per pool (`Pool.spec.hashedMirrors` / `poolDefaults`) and reach
+  the worker as `RIO_HASHED_MIRRORS`; an empty list disables the lookup.
 ]
 
 = Network isolation

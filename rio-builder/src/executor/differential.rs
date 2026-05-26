@@ -474,7 +474,7 @@ fn check_fod_hash(drv: &Derivation, store_dir: &Path) -> String {
     // Delegate to the production fail-closed gate (sha1/sha256/sha512,
     // unknown algorithms rejected) instead of reimplementing it: the
     // harness must exercise the same decision the activation will make,
-    // and the r[verify builder.fod.verify-hash] marker on this scenario
+    // and the r[verify builder.fod.verify-hash+2] marker on this scenario
     // depends on the production code path being the thing exercised.
     match super::inputs::verify_fod_hashes(drv, store_dir) {
         Ok(()) => "ok".to_string(),

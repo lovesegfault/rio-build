@@ -319,6 +319,7 @@ pub(crate) fn derivation_into_request(
             optional: false,
         },
     ];
+    // r[impl builder.exec.input-closure-binds]
     // Input closure: read-only binds nested inside the writable store
     // mount, so a build cannot modify (its view of) its inputs.
     for p in input_paths {

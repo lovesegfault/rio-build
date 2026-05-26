@@ -82,7 +82,7 @@
       "name": "Cancelled",
       "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
-      "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
+      "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → the sandboxed build is killed and the executor reports the cancellation) so `is_infra_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
     },
     {
       "enum": "ExecutorError",
@@ -100,20 +100,6 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "DaemonSetup",
-      "crate": "rio-builder",
-      "msg": "daemon setup failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "DaemonSpawn",
-      "crate": "rio-builder",
-      "msg": "daemon spawn failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
       "name": "Glue",
       "crate": "rio-builder",
       "msg": "derivation rejected by the request glue: {0}",
@@ -128,13 +114,6 @@
     },
     {
       "enum": "ExecutorError",
-      "name": "Handshake",
-      "crate": "rio-builder",
-      "msg": "daemon handshake failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
       "name": "InvalidDerivation",
       "crate": "rio-builder",
       "msg": "invalid derivation: {0}",
@@ -145,13 +124,6 @@
       "name": "MetadataFetch",
       "crate": "rio-builder",
       "msg": "input metadata fetch failed for {path}: {source}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "NixConf",
-      "crate": "rio-builder",
-      "msg": "failed to write nix.conf: {0}",
       "doc": ""
     },
     {
@@ -173,27 +145,13 @@
       "name": "SandboxSetup",
       "crate": "rio-builder",
       "msg": "native sandbox setup failed: {0}",
-      "doc": "The native sandbox failed to set up (host-side skeleton build, fork/pipe plumbing, or an in-child setup phase reported over the status pipe). The build itself never ran. Worker-local and usually transient (FS race, FUSE hiccup while bind-mounting an input) — retried locally like the daemon-era spawn failures."
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "SynthDb",
-      "crate": "rio-builder",
-      "msg": "synthetic DB generation failed: {0}",
-      "doc": ""
+      "doc": "The native sandbox failed to set up (host-side skeleton build, fork/pipe plumbing, or an in-child setup phase reported over the status pipe). The build itself never ran. Worker-local and usually transient (FS race, FUSE hiccup while bind-mounting an input) — retried locally a bounded number of times before the failure escalates to the scheduler."
     },
     {
       "enum": "ExecutorError",
       "name": "Upload",
       "crate": "rio-builder",
       "msg": "upload failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "Wire",
-      "crate": "rio-builder",
-      "msg": "wire protocol error: {0}",
       "doc": ""
     },
     {

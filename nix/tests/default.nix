@@ -265,7 +265,7 @@ in
   #   phase-reporter entry: the @nix setPhase frames are consumed by the
   #   native log filter (none may reach the forwarded log) and surface
   #   as ordered phases in the driver report.
-  # r[verify builder.fod.verify-hash]
+  # r[verify builder.fod.verify-hash+2]
   #   fod-flat / fod-recursive / fod-mismatch / fod-unknown-algo entries:
   #   the declared fixed-output hash is verified fail-closed by the
   #   native result path (mismatch and unverifiable algorithms are
@@ -539,7 +539,7 @@ in
       {
         name = "disrupt";
         subtests = [
-          # r[verify builder.silence.timeout-kill]
+          # r[verify builder.silence.timeout-kill+2]
           # r[verify sched.timeout.promote-on-exceed+2]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]
@@ -1126,7 +1126,7 @@ in
   #   `hashedMirrors` (Pool spec → RIO_HASHED_MIRRORS) points at the
   #   in-VM upstream-v4 node (reached via DNS64+NAT64 from the v6-only
   #   fetcher pod).
-  # r[verify builder.fod.verify-hash]
+  # r[verify builder.fod.verify-hash+2]
   #   fod-dir subtest: recursive-hash FOD with directory output
   #   (`mkdir $out`). Regression: a whiteout at the output path
   #   makes overlayfs mkdir return EIO.

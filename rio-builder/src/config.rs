@@ -213,6 +213,7 @@ pub struct Config {
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     #[schemars(with = "Vec<String>")]
     pub extra_sandbox_paths: Vec<String>,
+    // r[impl builder.sandbox.shell]
     /// Host path of a static POSIX shell exposed as `/bin/sh` inside
     /// every build sandbox. nixpkgs builds assume `/bin/sh` exists (the
     /// daemon-era sandbox provided busybox baked into the Nix binary;

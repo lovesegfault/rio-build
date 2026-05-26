@@ -58,21 +58,6 @@
       "doc": "Build executor: receives WorkAssignment from scheduler, runs builds."
     },
     {
-      "path": "executor/daemon/",
-      "depth": 1,
-      "doc": "nix-daemon subprocess management."
-    },
-    {
-      "path": "executor/daemon/spawn.rs",
-      "depth": 2,
-      "doc": "Spawn `nix-daemon --stdio` for a chroot store at the per-build dir."
-    },
-    {
-      "path": "executor/daemon/stderr_loop.rs",
-      "depth": 2,
-      "doc": "Daemon I/O after spawn: handshake, wopBuildDerivation, STDERR loop, log batching."
-    },
-    {
       "path": "executor/differential.rs",
       "depth": 1,
       "doc": "Differential-harness driver: build one derivation with the native"
@@ -140,12 +125,7 @@
     {
       "path": "executor/outputs.rs",
       "depth": 1,
-      "doc": "Output collection: FOD verify, upload, daemon→proto BuildResult mapping."
-    },
-    {
-      "path": "executor/sandbox.rs",
-      "depth": 1,
-      "doc": "Sandbox setup: synthetic SQLite DB, nix.conf."
+      "doc": "Output collection: FOD verify, upload, proto BuildResult mapping."
     },
     {
       "path": "fixture.rs",
@@ -271,11 +251,6 @@
       "path": "runtime/slot.rs",
       "depth": 1,
       "doc": "Single-build occupancy tracking and cancellation."
-    },
-    {
-      "path": "synth_db.rs",
-      "depth": 0,
-      "doc": "Synthetic Nix store SQLite database generation."
     },
     {
       "path": "upload/",

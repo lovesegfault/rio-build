@@ -61,6 +61,13 @@ The inline/chunked decision is made at `PutPath` time based on @nar size; see th
 - Stored in PostgreSQL (shared with scheduler for query efficiency, separate
   schema)
 
+*Startup ordering note:* rio-store requires PostgreSQL at startup and exits
+if it cannot connect; under Kubernetes this surfaces as a few crash-loop
+restarts while the database becomes reachable (observed in the k3s VM
+fixtures), after which the deployment converges without intervention. A
+startup connect-retry with backoff would remove the restart noise --- tracked
+as a follow-up, not a correctness issue.
+
 = Hash Domain Separation
 
 #r("store.hash.domain-sep")[

@@ -1,5 +1,5 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
-// r[impl builder.fod.verify-hash]
+// r[impl builder.fod.verify-hash+2]
 
 use std::path::Path;
 
@@ -416,7 +416,7 @@ async fn query_layer(
     }
 }
 
-// r[verify builder.fod.verify-hash]
+// r[verify builder.fod.verify-hash+2]
 #[cfg(test)]
 mod tests {
     use super::*;
