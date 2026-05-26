@@ -299,26 +299,76 @@ fn process_outputs_inner(
     input_closure: &[ValidatedPathInfo],
 ) -> Result<ProcessedOutputs, OutputRejection> {
     let policy = OutputPolicy::parse(drv.env());
-    let is_fod = drv.is_fixed_output();
     let ca_spec = ca::FloatingCaSpec::from_outputs(drv.outputs())?;
+    let candidates = reference_candidates(outputs, input_closure);
 
-    // Candidate set for the reference scan: the transitive input closure
-    // plus every output of this derivation (self- and cross-output
-    // references are legal and must be detected).
+    // Pass 1: canonicalise + scan each output (one NAR read per output).
+    let processed = canonicalise_and_scan_outputs(outputs, build_uid, &candidates, &policy)?;
+
+    // The FOD no-references rule applies before any reordering: a
+    // fixed-output derivation's output must not reference the store at
+    // all (it must be reproducible from its declared hash alone).
+    if drv.is_fixed_output() {
+        enforce_fod_has_no_references(&processed)?;
+    }
+
+    // Pass 2: inter-output cycle detection + topological order
+    // (dependencies first), then floating-CA finalization in that order —
+    // apply accumulated sibling rewrites, hash-modulo, compute the final
+    // store path, rewrite content on disk, and update
+    // `store_path`/`references`/`content_address` before the policy
+    // checks below see them.
+    let order = topo_order(&processed)?;
+    let mut processed: Vec<ProcessedOutput> =
+        order.into_iter().map(|i| processed[i].clone()).collect();
+    ca::finalize_floating_ca(&mut processed, &ca_spec)?;
+    let processed = processed;
+
+    // Pass 3: output policy checks (both sources) against the final,
+    // content-derived paths and reference sets.
+    check_output_policies(&processed, &policy, input_closure)?;
+
+    Ok(ProcessedOutputs { outputs: processed })
+}
+
+/// Candidate set for the reference scan: the transitive input closure
+/// plus every output of this derivation (self- and cross-output
+/// references are legal and must be detected).
+fn reference_candidates(
+    outputs: &[OutputToProcess],
+    input_closure: &[ValidatedPathInfo],
+) -> CandidateSet {
     let mut candidate_paths: Vec<String> = input_closure
         .iter()
         .map(|p| p.store_path.to_string())
         .collect();
     candidate_paths.extend(outputs.iter().map(|o| o.store_path.clone()));
-    let candidates = CandidateSet::from_paths(&candidate_paths);
+    CandidateSet::from_paths(&candidate_paths)
+}
 
-    // Pass 1: canonicalise + scan each output (one NAR read per output).
+/// Pass 1 of the output pipeline: canonicalise each output on disk
+/// (ownership, permissions, timestamps, setuid stripping — see
+/// [`canonicalise_output`]) and scan it in a single NAR pass for its
+/// SHA-256 NAR hash, NAR size, and references against `candidates`.
+///
+/// `unsafeDiscardReferences` is applied here so everything downstream
+/// (cycle detection, CA finalization, policy checks, upload metadata)
+/// sees the recorded — not the raw scanned — reference set, exactly as
+/// Nix registers it.
+fn canonicalise_and_scan_outputs(
+    outputs: &[OutputToProcess],
+    build_uid: u32,
+    candidates: &CandidateSet,
+    policy: &OutputPolicy,
+) -> Result<Vec<ProcessedOutput>, OutputRejection> {
+    // Hard-link dedup state is shared across the whole output set: a
+    // file hard-linked between two outputs must only be rewritten once.
     let mut inodes_seen: HashSet<canonicalise::InodeId> = HashSet::new();
     let mut processed: Vec<ProcessedOutput> = Vec::with_capacity(outputs.len());
     for out in outputs {
         canonicalise_output(&out.host_path, build_uid, &mut inodes_seen)?;
 
-        let (nar_hash, nar_size, mut references) = scan_and_hash(&out.host_path, &candidates)
+        let (nar_hash, nar_size, mut references) = scan_and_hash(&out.host_path, candidates)
             .map_err(|e| OutputRejection::Scan {
                 output: out.name.clone(),
                 message: e.to_string(),
@@ -349,37 +399,33 @@ fn process_outputs_inner(
             content_address: None,
         });
     }
+    Ok(processed)
+}
 
-    // The FOD no-references rule: a fixed-output derivation's output must
-    // not reference the store at all (it must be reproducible from its
-    // declared hash alone). Self-references are equally disallowed.
-    if is_fod {
-        for out in &processed {
-            if !out.references.is_empty() {
-                return Err(OutputRejection::FodHasReferences {
-                    output: out.name.clone(),
-                    references: out.references.clone(),
-                });
-            }
+/// The FOD no-references rule: a fixed-output derivation's output must
+/// not reference the store at all. Self-references are equally
+/// disallowed.
+fn enforce_fod_has_no_references(processed: &[ProcessedOutput]) -> Result<(), OutputRejection> {
+    for out in processed {
+        if !out.references.is_empty() {
+            return Err(OutputRejection::FodHasReferences {
+                output: out.name.clone(),
+                references: out.references.clone(),
+            });
         }
     }
+    Ok(())
+}
 
-    // Pass 2: inter-output cycle detection + topological order
-    // (dependencies first). Kahn's algorithm over the sibling-reference
-    // edges.
-    let order = topo_order(&processed)?;
-    let mut processed: Vec<ProcessedOutput> =
-        order.into_iter().map(|i| processed[i].clone()).collect();
-
-    // Pass 2b: floating-CA finalization, in that topological order —
-    // apply accumulated sibling rewrites, hash-modulo, compute the final
-    // store path, rewrite content on disk, and update
-    // `store_path`/`references`/`content_address` before the policy
-    // checks below see them.
-    ca::finalize_floating_ca(&mut processed, &ca_spec)?;
-    let processed = processed;
-
-    // Pass 3: output policy checks (both sources).
+/// Pass 3 of the output pipeline: the output policy checks
+/// (`allowedReferences` family and structuredAttrs `outputChecks`),
+/// evaluated against the final store paths and reference sets with the
+/// input closure's metadata available for closure-size rules.
+fn check_output_policies(
+    processed: &[ProcessedOutput],
+    policy: &OutputPolicy,
+    input_closure: &[ValidatedPathInfo],
+) -> Result<(), OutputRejection> {
     let closure_info: HashMap<String, (Vec<String>, u64)> = input_closure
         .iter()
         .map(|p| {
@@ -401,9 +447,8 @@ fn process_outputs_inner(
             nar_size: o.nar_size,
         })
         .collect();
-    policy::check_outputs(&for_policy, &policy, &closure_info)?;
-
-    Ok(ProcessedOutputs { outputs: processed })
+    policy::check_outputs(&for_policy, policy, &closure_info)?;
+    Ok(())
 }
 
 /// One streaming NAR pass over `path`: SHA-256 NAR hash, NAR size, and
