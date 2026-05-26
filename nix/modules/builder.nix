@@ -33,7 +33,7 @@ in
       description = ''
         FUSE mount point for the lazy-fetch store view (`RIO_FUSE_MOUNT_POINT`).
 
-        Do NOT use `/nix/store`: the per-build nix-daemon gets its own mount
+        Do NOT use `/nix/store`: the per-build sandbox gets its own mount
         namespace with the overlay bind-mounted at `/nix/store` (executor
         `pre_exec`), so the FUSE mount location is arbitrary and should not
         shadow the host store.
@@ -61,10 +61,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Worker spawns `nix-daemon --stdio` per build; need nix binary + nixbld users.
-    nix.enable = lib.mkDefault true;
-    nix.settings.sandbox = lib.mkDefault true;
-
     # FUSE + overlayfs kernel support.
     boot.kernelModules = [
       "fuse"
@@ -93,21 +89,19 @@ in
         };
         serviceConfig = {
           # The worker runs as root (no User=), so CAP_SYS_ADMIN is already
-          # available for FUSE mount, overlayfs, and CLONE_NEWNS in pre_exec.
-          # We do NOT narrow CapabilityBoundingSet: the spawned `nix-daemon
-          # --stdio` child inherits the bounding set, and its sandbox setup
-          # needs CAP_SETUID/SETGID (nixbld users), CAP_CHOWN (output ownership),
-          # CAP_SYS_CHROOT (sandbox chroot), CAP_MKNOD (/dev nodes), etc.
+          # available for FUSE mount, overlayfs, and the build sandbox's
+          # mount namespace. We do NOT narrow CapabilityBoundingSet: the
+          # sandbox child needs CAP_SETUID/SETGID (drop to the build
+          # user), CAP_CHOWN (output ownership), CAP_SYS_CHROOT
+          # (pivot_root/chroot), CAP_NET_ADMIN (loopback in the netns).
           # Allow opening /dev/fuse (device cgroup allowlist; DevicePolicy=auto
           # so pseudo-devices like /dev/null are always allowed).
           DeviceAllow = [ "/dev/fuse rw" ];
 
           # cgroup v2 per-build resource tracking. The worker creates a
-          # sub-cgroup per build and moves the spawned nix-daemon into
-          # it. memory.peak + polled cpu.stat give tree-wide peak memory
-          # and CPU. Per-PID VmHWM would only capture nix-daemon's own
-          # RSS (~10MB) — the builder is a fork()ed child whose footprint
-          # never appears there.
+          # sub-cgroup per build and moves the sandboxed build process
+          # into it. memory.peak + polled cpu.stat give tree-wide peak
+          # memory and CPU across every child the build forks.
           #
           # Delegate=yes: grants the service ownership of its cgroup
           # subtree. Without this, cgroup.subtree_control writes fail
@@ -131,7 +125,7 @@ in
           # /sys/fs/cgroup/system.slice/rio-builder.service/:
           #   cgroup.subtree_control  ← worker writes "+memory +cpu" (EMPTY cgroup: no EBUSY)
           #   builds/                 ← DelegateSubgroup; worker PID lives here
-          #   <drv-hash>/             ← per-build SIBLING (nix-daemon PID → forks builder)
+          #   <drv-hash>/             ← per-build SIBLING (the sandboxed build's process tree)
           #     memory.peak           ← tree-wide peak, read at build end
           #     cpu.stat              ← tree-wide cumulative, polled 1Hz
           Delegate = "yes";
@@ -155,31 +149,28 @@ in
         # in [Service] is silently ignored since systemd 230.
         startLimitIntervalSec = 0;
 
-        # nix-daemon --stdio must be on PATH. fuse3 provides fusermount3,
-        # required by the fuser crate's MountOption::AutoUnmount.
+        # fuse3 provides fusermount3, required by the fuser crate's
+        # MountOption::AutoUnmount. mount/umount come from util-linux in
+        # the systemd unit's default PATH.
         path = [
-          config.nix.package
           pkgs.fuse3
         ];
+
+        environment = {
+          # Static /bin/sh exposed inside every build sandbox.
+          RIO_SANDBOX_SHELL = "${pkgs.pkgsStatic.busybox}/bin/sh";
+          # CA bundle mounted into network (fixed-output) sandboxes.
+          RIO_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        };
       };
 
     # Ensure /var/rio/* directories exist (worker creates them too, but this
-    # runs earlier and sets correct permissions). Also create the bind-mount
-    # TARGETS that executor pre_exec mounts onto: `/nix/var/nix/db` is created
-    # by nix-daemon on first local use, but the worker never runs local
-    # nix-daemon (only the namespaced --stdio child), so that path may not exist.
+    # runs earlier and sets correct permissions).
     systemd.tmpfiles.rules = [
       "d /var/rio 0755 root root -"
       "d ${cfg.fuseCacheDir} 0755 root root -"
       "d ${cfg.overlayBaseDir} 0755 root root -"
       "d ${cfg.fuseMountPoint} 0755 root root -"
-      # Bind-mount targets for executor pre_exec (spawn_daemon_in_namespace).
-      # /nix/store and /etc/nix are created by NixOS activation, but
-      # /nix/var/nix/db is lazy-created by the local nix-daemon. tmpfiles `d`
-      # does NOT create parents, so list the full chain explicitly.
-      "d /nix/var 0755 root root -"
-      "d /nix/var/nix 0755 root root -"
-      "d /nix/var/nix/db 0755 root root -"
     ];
   };
 }

@@ -12,10 +12,10 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, DownwardAPIVolumeFile,
-    DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource,
-    NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
+    Capabilities, Container, ContainerPort, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
+    EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource, NodeSelectorRequirement,
+    NodeSelectorTerm, ObjectFieldSelector, PodSecurityContext, PodSpec, SeccompProfile,
+    SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
@@ -70,11 +70,6 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     // hit EROFS without a mount. Actual store contents go via the
     // kernel FUSE layer — this is just the mountpoint directory.
     ("fuse-store", "/var/rio/fuse-store", None, None),
-    // nix-daemon writes /nix/var/nix/{profiles,temproots,gcroots,...}
-    // AND /nix/var/log/nix/drvs/. Mounted at /nix/var (not
-    // /nix/var/nix) to cover both. main.rs chmods nix/ to 0755 and
-    // creates nix/db/ at startup.
-    ("nix-var", "/nix/var", None, None),
 ];
 
 /// Default FUSE cache emptyDir sizeLimit for builder pods. Kubelet
@@ -694,18 +689,6 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 });
             }
-            // nix.conf ConfigMap. `optional: true` so a missing
-            // ConfigMap mounts an empty dir → setup_nix_conf falls
-            // back to WORKER_NIX_CONF.
-            v.push(Volume {
-                name: "nix-conf".into(),
-                config_map: Some(ConfigMapVolumeSource {
-                    name: "rio-nix-conf".into(),
-                    optional: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
             // Coverage propagation: test-only hostPath when the
             // controller is running under -Cinstrument-coverage.
             if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
@@ -1002,12 +985,6 @@ fn build_executor_container(
                     ..Default::default()
                 });
             }
-            m.push(VolumeMount {
-                name: "nix-conf".into(),
-                mount_path: "/etc/rio/nix-conf".into(),
-                read_only: Some(true),
-                ..Default::default()
-            });
             if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
                 m.push(VolumeMount {
                     name: "cov".into(),

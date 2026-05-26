@@ -1120,11 +1120,12 @@ in
   #   builder pod. fetcher-isolation asserts the pod-level partition the
   #   chokepoint produces: fetcher pod tolerates rio.build/fetcher and
   #   NOT rio.build/kvm; builder pod tolerates NEITHER.
-  # r[verify fetcher.nixconf.hashed-mirrors]
+  # r[verify fetcher.mirrors.hashed]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
-  #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
-  #   points the rio-nix-conf ConfigMap at the in-VM upstream-v4 node
-  #   (reached via DNS64+NAT64 from the v6-only fetcher pod).
+  #   builds via {mirror}/sha256/{hex}. The fetcher pool's
+  #   `hashedMirrors` (Pool spec → RIO_HASHED_MIRRORS) points at the
+  #   in-VM upstream-v4 node (reached via DNS64+NAT64 from the v6-only
+  #   fetcher pod).
   # r[verify builder.fod.verify-hash]
   #   fod-dir subtest: recursive-hash FOD with directory output
   #   (`mkdir $out`). Regression: a whiteout at the output path
@@ -1139,7 +1140,6 @@ in
       withV4Nodes = true;
       extraValues = {
         "networkPolicy.enabled" = "true";
-        "nixConf.hashedMirrors" = "http://upstream-v4/";
       };
       # pools via values file (not --set-string) so types stay correct.
       extraValuesFiles = [
@@ -1161,10 +1161,8 @@ in
               # containerd cgroup-chown gap; vmtest-full-nonpriv.yaml).
               privileged: null
               seccompProfile: null
-              # The native executor reads RIO_HASHED_MIRRORS from the
-              # Pool spec (controller env injection); the legacy
-              # nixConf.hashedMirrors ConfigMap above only fed the
-              # removed nix-daemon path and goes away with it.
+              # builtin:fetchurl reads RIO_HASHED_MIRRORS, injected by
+              # the controller from the Pool spec.
               hashedMirrors:
                 - http://upstream-v4/
         '')

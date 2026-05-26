@@ -455,13 +455,12 @@ pkgs.testers.runNixOSTest {
     # fod-dead-origin — hashed-mirrors fallback for flat-hash FODs
     # ══════════════════════════════════════════════════════════════════
     # Origin URL is a 404 path on upstream-v4; the ONLY way this build
-    # succeeds is via {mirror}/sha256/{hex}. CppNix builtin:fetchurl
-    # tries hashed-mirrors first for FileIngestionMethod::Flat, then
-    # falls back to mainUrl. nixConf.hashedMirrors = http://upstream-v4/
-    # via extraValues (default.nix) → rio-nix-conf ConfigMap → fetcher
-    # pod's nix.conf. A regression (typo'd setting, ConfigMap not
-    # mounted, wrong URL format) → mirror not tried → origin 404 →
-    # build fails here.
+    # succeeds is via {mirror}/sha256/{hex}. rio's builtin:fetchurl
+    # tries hashed mirrors first for flat-hash FODs, then falls back to
+    # the origin. The fetcher pool's `hashedMirrors` (Pool spec, see
+    # default.nix) reaches the pod as RIO_HASHED_MIRRORS. A regression
+    # (typo'd setting, env not injected, wrong URL format) → mirror not
+    # tried → origin 404 → build fails here.
     with subtest("fod-dead-origin: flat FOD succeeds via hashed-mirrors"):
         rc, out = client.execute(
             "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "

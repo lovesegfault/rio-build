@@ -288,17 +288,15 @@ pub fn setup_overlay(
     // refuses redirect_dir=on (`mount -o redirect_dir=on` → EPERM).
     // Without redirect_dir, overlayfs returns EXDEV for any rename(2)
     // of a DIRECTORY whose target parent is a merge-type dir. The
-    // overlay root (= realStoreDir) is always merge-type — its dentry
-    // stack carries both upper-root and lower-root by construction —
-    // so nix-daemon's post-build movePath(chroot/{out} → merged/{out})
-    // EXDEVs for every directory output. nix's moveFile() temp-then-
-    // rename fallback ALSO targets the overlay root → same EXDEV. The
-    // builder image ships a patched nix whose movePath() falls back to
-    // a recursive copy on EXDEV (nix/docker.nix `nixForBuilder`,
-    // nix/patches/nix-movepath-exdev-fallback.patch). Don't pass
-    // redirect_dir here: it's auto-selected (on in init-userns, forced
-    // nofollow in non-init), and an explicit `=on` would EPERM the
-    // mount under hostUsers:false.
+    // overlay root (= the merged store view) is always merge-type — its
+    // dentry stack carries both upper-root and lower-root by
+    // construction. The native executor never rename(2)s outputs across
+    // it (builds write through the merged view and copy-up lands them
+    // in the upper layer), so the historical EXDEV-on-directory-rename
+    // problem the daemon-era movePath patch worked around no longer
+    // applies. Don't pass redirect_dir here: it's auto-selected (on in
+    // init-userns, forced nofollow in non-init), and an explicit `=on`
+    // would EPERM the mount under hostUsers:false.
     let mount_data = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),
