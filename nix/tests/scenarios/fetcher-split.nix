@@ -267,6 +267,54 @@ pkgs.testers.runNixOSTest {
     def fetcher_exec(cmd):
         return fetcher_vm.execute(f"nsenter -t {fetcher_pid} -n -- {cmd}")
 
+    # ══════════════════════════════════════════════════════════════════
+    # fetch-runs-unprivileged — the __builtin-fetchurl re-exec is the
+    # build user, not root
+    # ══════════════════════════════════════════════════════════════════
+    # The slow /busybox origin holds the fetch open ~30s; during that
+    # window the re-exec'd `rio-builder __builtin-fetchurl` process is
+    # alive on the fetcher node and its credentials are visible from
+    # the host at /proc/<pid>/status. rio-exec's child setgid/setuid()s
+    # to the build user before execve (no userns remapping), so every
+    # Uid/Gid field must be non-zero. Probe FIRST in the window — the
+    # child exists strictly within the pod's lifetime the netns probes
+    # below also rely on. The pgrep pattern uses [-] so the probe's own
+    # sh -c cmdline never matches itself.
+    with subtest("fetch-runs-unprivileged: builtin:fetchurl re-exec is the build user"):
+        probe_cmd = (
+            "for p in $(pgrep -f '__builtin[-]fetchurl'); do "
+            "echo PID=$p; "
+            "grep -E '^(Uid|Gid|CapEff):' /proc/$p/status 2>/dev/null; "
+            "done"
+        )
+        status_out = ""
+        for _ in range(20):
+            rc, status_out = fetcher_vm.execute(probe_cmd)
+            if rc == 0 and "Uid:" in status_out:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(
+                "never observed a __builtin-fetchurl process on the fetcher "
+                "node within 20s — either the re-exec never spawned or the "
+                "slow /busybox window was already over (check the fetcher "
+                f"pod log and /tmp/split-build.log).\nlast probe output:\n{status_out}"
+            )
+        print(f"fetch process credentials:\n{status_out}")
+        ids = [
+            (line.split()[0].rstrip(":"), line.split()[1:])
+            for line in status_out.splitlines()
+            if line.startswith(("Uid:", "Gid:"))
+        ]
+        assert ids, f"no Uid/Gid lines parsed from:\n{status_out}"
+        for kind, fields in ids:
+            assert all(f != "0" for f in fields), (
+                f"{kind} of the __builtin-fetchurl process contains root "
+                f"({kind} {' '.join(fields)}) — the fetch must run as the "
+                f"unprivileged build user.\n{status_out}"
+            )
+        print("fetch-runs-unprivileged PASS: all Uid/Gid fields non-root")
+
     sched_ip = kubectl(
         "get svc rio-scheduler -o jsonpath='{.spec.clusterIP}'"
     ).strip()

@@ -1140,6 +1140,11 @@ in
   #   before upload — the client sees a hash-mismatch failure and the
   #   output path stays absent from the rio store (path-info via
   #   ssh-ng://k3s-server must fail).
+  # r[verify fetcher.fetchurl.sandboxed]
+  #   fetch-runs-unprivileged subtest: during the slow /busybox fetch,
+  #   /proc/<pid>/status of the __builtin-fetchurl re-exec on the
+  #   fetcher node shows non-root Uid/Gid in every field (rio-exec
+  #   setuid/setgids to the build user before execve).
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {

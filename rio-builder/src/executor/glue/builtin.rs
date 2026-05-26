@@ -188,6 +188,7 @@ pub(crate) fn prepare_fetchurl(
     }
 
     // ---- request -----------------------------------------------------------
+    // r[impl fetcher.fetchurl.sandboxed]
     let request = ExecutionRequest {
         program: PathBuf::from(SANDBOX_BUILDER_BIN),
         args: vec![
