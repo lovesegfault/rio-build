@@ -1076,16 +1076,18 @@ karpenter:
   # fills with cache/staging blocks they come out of this volume, and
   # a root volume that actually fills force-shuts-down the XFS on the
   # next metadata write, EIO-ing every build on the node):
-  # pod_ephemeral_request(sla.maxDisk, headroom(n_eff=1), poolDefaults.fuseCacheBytes)
-  #   = maxDisk × 1.95 + fuseCacheBytes + 1Gi   (worst-case headroom; jobs.rs::pod_ephemeral_request)
-  #   = 200×1.95 + 50 + 1 = 441Gi
+  # pod_ephemeral_request(sla.maxDisk, headroom(n_eff=1))
+  #   = maxDisk × 1.95 + 1Gi   (worst-case headroom; jobs.rs::pod_ephemeral_request —
+  #     the castore input closure is served from the node-level /var/rio caches,
+  #     so there is no per-pod fuse-cache addend since P0560)
+  #   = 200×1.95 + 1 = 391Gi
   # `max_node_disk` is dataVolumeSize × 0.9 (kubelet eviction/image-cache
   # reserve), so the binding inequality is
-  #   dataVolumeSize×0.9 − varRioSize = 610×0.9 − 100 = 449 ≥ 441
-  # — only ~8Gi of slack. Bumping `maxDisk`, `fuseCacheBytes`, or
-  # `varRioSize` will trip 14-disk-ceiling.sh; raise `dataVolumeSize`
-  # first. nvme hw-classes ignore the pod-ephemeral half (instance-store
-  # provides ephemeral-storage) but still pay for the /var/rio half.
+  #   dataVolumeSize×0.9 − varRioSize = 610×0.9 − 100 = 449 ≥ 391
+  # — ~58Gi of slack. Bumping `maxDisk` or `varRioSize` will trip
+  # 14-disk-ceiling.sh; raise `dataVolumeSize` first. nvme hw-classes
+  # ignore the pod-ephemeral half (instance-store provides
+  # ephemeral-storage) but still pay for the /var/rio half.
   dataVolumeSize: 610Gi
   # gp3 provisioned IOPS+throughput (max for gp3). Build workloads are
   # IOPS-bound; baseline 3000 throttles -j32+. gp3 has no separate
@@ -1277,17 +1279,6 @@ poolDefaults:
   enabled: false
   features: []
   image: rio-builder
-  # 50Gi. Reconciler adds this verbatim to every worker pod's (Builder
-  # AND Fetcher) ephemeral-storage request/limit AND the fuse-cache
-  # emptyDir sizeLimit. Single-sourced through controller.toml
-  # `[nodeclaim_pool].fuse_cache_bytes` — NOT the per-Pool CRD spec
-  # (CEL-rejected for BOTH kinds since r35; see
-  # docs/spec/components/controller.typ). Controller fallback when unset
-  # is 8Gi (`BUILDER_FUSE_CACHE_BYTES`) — the safe minimum so non-helm
-  # Pools schedule on small-disk nodes; prod overrides UP here. Raising
-  # this grows EVERY worker pod's ephemeral-storage request — check
-  # node capacity headroom before bumping.
-  fuseCacheBytes: 53687091200
   # privileged:true is an ESCAPE HATCH for clusters whose containerd
   # lacks base_runtime_spec device injection. It disables seccomp
   # entirely (ADR-012) and is unacceptable for multi-tenant.

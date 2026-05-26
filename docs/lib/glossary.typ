@@ -344,9 +344,9 @@
     short: [DAG actor],
     description: [The single-owner Tokio task in the scheduler that owns the in-memory global DAG. All DAG mutations (merges, completions, cancellations) are processed sequentially via an `mpsc` channel, eliminating lock contention.],
   ),
-  // rio-fuse: removed — never appears as a concept name in prose (only as
-  // the `/var/rio/fuse-store` mount path); the `fuse` key covers the
-  // filesystem concept and builder.typ §FUSE describes the module.
+  // rio-fuse: removed — never appears as a concept name in prose; the
+  // `fuse` key covers the filesystem concept and builder.typ describes
+  // the castore-FUSE module.
   (
     key: "temp-root",
     short: [temp root],
@@ -446,7 +446,7 @@
     key: "fuse",
     short: "FUSE",
     long: "Filesystem in Userspace",
-    description: [A Linux kernel interface that allows implementing filesystems in user-space programs. rio-build uses FUSE (via the `fuser` crate) to present a lazy-fetching store view at `/var/rio/fuse-store`, backed by remote content from rio-store.],
+    description: [A Linux kernel interface that allows implementing filesystems in user-space programs. rio-build uses FUSE (via the `fuser` crate) to present each build's input closure as a per-build castore-FUSE mount (the overlay's lower layer), backed by remote content from rio-store.],
   ),
   (
     key: "mtls",

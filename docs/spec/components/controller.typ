@@ -26,15 +26,13 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
       - { key: rio.build/builder, operator: Equal, value: "true", effect: NoSchedule }
     features: [big-parallel, kvm]                # list<string>, default [] — maps to requiredSystemFeatures (Builder-only)
     imagePullPolicy: IfNotPresent                # string?, optional — K8s default if omitted
-    fuseThreads: 4                               # u32?, optional — Builder-only, CEL-forbidden for Fetcher
-    fusePassthrough: true                        # bool?, optional — Builder-only, CEL-forbidden for Fetcher
+    fuseThreads: 4                               # u32?, optional — Builder-only, CEL-forbidden for Fetcher (castore-FUSE serve threads per build mount)
     terminationGracePeriodSeconds: 7200          # i64?, optional — K8s grace; defaults per-kind (r[ctrl.pod.tgps-default])
     privileged: false                            # bool?, optional — CEL-forbidden for Fetcher
     hostNetwork: false                           # bool?, optional — true requires privileged:true; CEL-forbidden for Fetcher
     seccompProfile:                              # SeccompProfileKind?, optional — CEL-forbidden for Fetcher
       type: Localhost                            #   RuntimeDefault | Localhost | Unconfined
       localhostProfile: operator/rio-builder.json#   required iff type=Localhost (r[ctrl.crd.seccomp-cel])
-    # fuseCacheBytes: <bytes>                    # u64?, REJECTED by CEL for BOTH kinds since r35 (merged_bug_024) — all pools read `[nodeclaim_pool].fuse_cache_bytes` (helm `poolDefaults.fuseCacheBytes`, 50Gi prod / 8Gi default). See r[ctrl.event.spec-degrade].
     # NOT CRD fields: resources (per-pod cpu/mem/disk come from the
     # scheduler's per-drv SpawnIntent — ADR-023); securityContext (caps
     # hardcoded in build_executor_pod_spec()); topologySpread (one-shot
@@ -1034,15 +1032,12 @@ constraints:
   field, the spec value, and the remediation.
 ]
 
-The FUSE cache emptyDir `sizeLimit` for *all* pool kinds is single-sourced from
-`[nodeclaim_pool].fuse_cache_bytes` (controller.toml; helm
-`poolDefaults.fuseCacheBytes`, 50Gi in prod) so FFD/cover/stamp agree ---
-`PoolSpec.fuseCacheBytes` is rejected for both Builder and Fetcher kind.
-(Pre-§13e, Fetcher pools could set a per-pool value because they didn't route
-through `nodeclaim_pool`; §13e routed them through, and r35 closed the
-resulting accounting drift.) The same value is added to the container's
-`ephemeral-storage` request/limit so the two cannot drift. Pods are one-shot so
-the cache never outlives one build's input closure.
+There is no per-pod FUSE cache since the ADR-022 castore cutover: the build's
+input closure is served from the node-level `/var/rio/{cache,chunks}` trees
+owned by `rio-mountd` (sized by `services.rio.eksNode.varRioSize`, not by any
+pod request), so the executor pod's `ephemeral-storage` budget is overlay
+writes plus the log budget only. FFD, `cover_deficit`, and the stamped pod
+request all read the same `intent_pod_footprint` so they cannot drift.
 
 = Pool Finalizer
 

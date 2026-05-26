@@ -1,9 +1,9 @@
 # checksum/controller-toml MUST change when ANY input that lands in the
 # rendered controller.toml changes — not just `.scheduler.sla` /
-# `.karpenter.nodeclaimPool`. bug_022: `poolDefaults.fuseCacheBytes` and
-# `karpenter.metalSizes` are read into the TOML body but were not in the
-# hashed key-list, so a fuse-cache or metal-partition bump updated the
-# ConfigMap without rolling the (subPath-mounted) pod. Fix: hash the
+# `.karpenter.nodeclaimPool`. bug_022: `karpenter.metalSizes` (and the
+# since-removed poolDefaults.fuseCacheBytes) are read into the TOML body
+# but were not in the hashed key-list, so a metal-partition bump updated
+# the ConfigMap without rolling the (subPath-mounted) pod. Fix: hash the
 # rendered body via a named template, like kube-build-scheduler.yaml does.
 
 render_checksum() {
@@ -25,10 +25,10 @@ test -n "$base" || { echo "FAIL: checksum/controller-toml absent" >&2; exit 1; }
 # Each axis below maps to one TOML key; changing it MUST change the hash.
 # r40 bug_018: `kube_build_scheduler_enabled` reads `buildScheduler.enabled`.
 for axis in \
-  "poolDefaults.fuseCacheBytes=99999999999" \
   'karpenter.metalSizes={metal,metal-zz}' \
   "scheduler.sla.maxFleetCores=12345" \
   "karpenter.nodeclaimPool.leaseName=other-lease" \
+  "karpenter.dataVolumeSize=999Gi" \
   "buildScheduler.enabled=false"
 do
   got=$(render_checksum --set "$axis")

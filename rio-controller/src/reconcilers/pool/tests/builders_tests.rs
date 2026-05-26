@@ -473,11 +473,14 @@ fn job_pod_overlays_volume_mounted() {
     assert_eq!(mount.mount_path, "/var/rio/overlays");
 }
 
-/// P0571: every executor pod mounts the four mountd-owned /var/rio
-/// trees — cache and chunks read-only (only rio-mountd's verified
-/// Promote writes the node-shared caches), staging and castore
-/// read-write — and the legacy per-pod FUSE cache moves out of the way
-/// to /var/rio/fuse-cache so the shared cache can own /var/rio/cache.
+/// P0567/P0571: every executor pod mounts the mountd-owned node-level
+/// hostPaths — cache and chunks read-only (only rio-mountd's verified
+/// Promote writes the node-shared caches), staging read-write, and the
+/// /run/rio-mountd socket dir read-only (connect(2) on a socket inode
+/// under a read-only mount is allowed). The castore-FUSE wiring env
+/// must agree with those mount paths. No per-pod fuse-cache emptyDir
+/// and no /var/rio/castore hostPath exist anymore (P0560: the builder
+/// mounts its per-build castore lower under its own overlay_base_dir).
 #[test]
 fn job_pod_mounts_mountd_owned_node_trees() {
     let wp = test_wp();
@@ -489,7 +492,7 @@ fn job_pod_mounts_mountd_owned_node_trees() {
         ("var-rio-cache", "/var/rio/cache", true),
         ("var-rio-chunks", "/var/rio/chunks", true),
         ("var-rio-staging", "/var/rio/staging", false),
-        ("var-rio-castore", "/var/rio/castore", false),
+        ("run-rio-mountd", "/run/rio-mountd", true),
     ] {
         let vol = volumes
             .iter()
@@ -513,30 +516,47 @@ fn job_pod_mounts_mountd_owned_node_trees() {
         assert_eq!(
             mount.read_only,
             read_only.then_some(true),
-            "{name}: cache/chunks are mountd-owned read-only, staging/castore read-write"
+            "{name}: cache/chunks/socket-dir are mountd-owned read-only, staging read-write"
         );
     }
 
-    // The old per-pod FUSE cache emptyDir must NOT shadow the shared
-    // /var/rio/cache hostPath: it lives at /var/rio/fuse-cache (and the
-    // env var follows) until P0560 deletes the old FUSE module.
-    let fuse_cache = mounts
-        .iter()
-        .find(|m| m.name == "fuse-cache")
-        .expect("fuse-cache volumeMount");
-    assert_eq!(fuse_cache.mount_path, "/var/rio/fuse-cache");
+    // The castore env wiring points the builder at exactly those
+    // mounts (defaults match, but the pod spec is self-describing).
     let env = pod.containers[0].env.as_ref().unwrap();
-    let cache_dir = env
-        .iter()
-        .find(|e| e.name == "RIO_FUSE_CACHE_DIR")
-        .and_then(|e| e.value.as_deref())
-        .expect("RIO_FUSE_CACHE_DIR env");
-    assert_eq!(cache_dir, "/var/rio/fuse-cache");
+    let env_val = |name: &str| {
+        env.iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value.as_deref())
+            .unwrap_or_else(|| panic!("{name} env must be set"))
+    };
+    assert_eq!(env_val("RIO_MOUNTD_SOCKET"), "/run/rio-mountd/mountd.sock");
+    assert_eq!(env_val("RIO_CASTORE_CACHE_DIR"), "/var/rio/cache");
+    assert_eq!(env_val("RIO_CASTORE_CHUNKS_DIR"), "/var/rio/chunks");
+    assert_eq!(env_val("RIO_CASTORE_STAGING_DIR"), "/var/rio/staging");
+
+    // The old per-pod FUSE cache emptyDir is gone (P0560) — nothing
+    // may shadow the node-shared /var/rio/cache hostPath, and no
+    // fuse-cache volume/mount/env may resurface.
     assert!(
         !mounts
             .iter()
             .any(|m| m.name != "var-rio-cache" && m.mount_path == "/var/rio/cache"),
         "nothing else may claim /var/rio/cache"
+    );
+    assert!(
+        !volumes.iter().any(|v| v.name == "fuse-cache")
+            && !mounts.iter().any(|m| m.name == "fuse-cache"),
+        "per-pod fuse-cache emptyDir deleted at the P0560 cutover"
+    );
+    assert!(
+        !volumes.iter().any(|v| v.name == "var-rio-castore"),
+        "/var/rio/castore hostPath deleted — per-build castore mountpoints \
+         live under the builder's overlay_base_dir"
+    );
+    assert!(
+        !env.iter()
+            .any(|e| e.name.starts_with("RIO_FUSE_") && e.name != "RIO_FUSE_THREADS"),
+        "old-FUSE env (RIO_FUSE_MOUNT_POINT/CACHE_DIR/PASSTHROUGH) deleted"
     );
 }
 
@@ -1092,17 +1112,11 @@ fn job_pod_env_vars() {
 fn job_pod_worker_knobs_injected_when_set() {
     let mut wp = test_wp();
     wp.spec.fuse_threads = Some(8);
-    wp.spec.fuse_passthrough = Some(false);
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
     let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
 
     assert_eq!(envs.get("RIO_FUSE_THREADS"), Some(&"8"));
-    assert_eq!(
-        envs.get("RIO_FUSE_PASSTHROUGH"),
-        Some(&"false"),
-        "the env layer's bool parse accepts true/false (rio-common config.rs test)"
-    );
 }
 
 #[test]

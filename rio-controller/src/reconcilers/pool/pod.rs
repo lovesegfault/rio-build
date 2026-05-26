@@ -1,7 +1,7 @@
 //! Job pod-spec builder for executor pods (builders + fetchers).
 //!
-//! The 600-line pod-spec — FUSE volumes, pod-level seccomp, TLS
-//! mounts, capability set, probes, coverage propagation — is
+//! The 600-line pod-spec — castore hostPath mounts, pod-level seccomp,
+//! TLS mounts, capability set, probes, coverage propagation — is
 //! role-agnostic and reads `&Pool` directly. `spec.kind == Fetcher`
 //! gates the ADR-019 hardening overrides (read-only rootfs, forced
 //! Localhost seccomp, never-privileged, dedicated node selector). CEL
@@ -66,10 +66,6 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     // don't stage large artifacts here (NAR streams via upload.rs,
     // overlays use /var/rio/overlays).
     ("tmp", "/tmp", Some("Memory"), Some("64Mi")),
-    // RIO_FUSE_MOUNT_POINT points here; main.rs create_dir_all would
-    // hit EROFS without a mount. Actual store contents go via the
-    // kernel FUSE layer — this is just the mountpoint directory.
-    ("fuse-store", "/var/rio/fuse-store", None, None),
     // nix-daemon writes /nix/var/nix/{profiles,temproots,gcroots,...}
     // AND /nix/var/log/nix/drvs/. Mounted at /nix/var (not
     // /nix/var/nix) to cover both. main.rs chmods nix/ to 0755 and
@@ -77,20 +73,24 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     ("nix-var", "/nix/var", None, None),
 ];
 
-/// The four mountd-owned `/var/rio` hostPath trees mounted into every
-/// executor pod (P0571). Container path == host path; volume names
-/// match `mountd-ds.yaml` so the two sides of the contract grep alike.
+/// The mountd-owned node-level hostPaths mounted into every executor
+/// pod (P0567/P0571): the three `/var/rio` cache/staging trees plus the
+/// `/run/rio-mountd` socket directory. Container path == host path;
+/// volume names match `mountd-ds.yaml` so the two sides of the contract
+/// grep alike.
 ///
 /// Cache and chunks are READ-ONLY: only rio-mountd's verified
 /// `Promote`/`PromoteChunks` may write the node-shared caches (the
 /// integrity boundary that keeps them trustworthy against a compromised
 /// builder). Staging is the builder-writable half (per-build
 /// `staging/{build_id}` is created and quota'd by mountd at `Mount`
-/// time); castore is where the per-build FUSE mountpoints appear —
-/// whether the mount is propagated host→container or performed by the
-/// builder in its own namespace is the P0560 mount-propagation
-/// decision (see the TODO in `mountd-ds.yaml`), and either way the pod
-/// needs the directory.
+/// time). The socket dir is read-only — `connect(2)` on a socket inode
+/// under a read-only mount is allowed, and the builder has no business
+/// creating anything next to the daemon's socket. The per-build castore
+/// FUSE mountpoints live under the builder's own `overlay_base_dir`
+/// emptyDir (the builder mounts its own `/dev/fuse` fd inside its own
+/// mount namespace — P0560 option (b)), so no `/var/rio/castore`
+/// hostPath exists anymore.
 ///
 /// `DirectoryOrCreate`, unlike the DaemonSet's `type: Directory`: the
 /// mountd pod is the integrity/quota owner and must fail loudly when
@@ -104,64 +104,8 @@ const CASTORE_NODE_MOUNTS: &[(&str, &str, bool)] = &[
     ("var-rio-cache", "/var/rio/cache", true),
     ("var-rio-chunks", "/var/rio/chunks", true),
     ("var-rio-staging", "/var/rio/staging", false),
-    ("var-rio-castore", "/var/rio/castore", false),
+    ("run-rio-mountd", "/run/rio-mountd", true),
 ];
-
-/// Default FUSE cache emptyDir sizeLimit for builder pods. Kubelet
-/// evicts on overshoot. Pods are one-shot so the cache never outlives
-/// one build's input closure.
-///
-/// Also added verbatim to the container's `ephemeral-storage`
-/// request/limit by [`super::jobs`]. Kubelet sums disk-backed
-/// emptyDirs against that limit, so a sizeLimit larger than the budget
-/// evicts large-closure builds (chromium/LLVM-class) on the pod-level
-/// limit before the volume-level one fires.
-///
-/// SAFE-MINIMUM fallback when [`BUILDER_FUSE_CACHE`] is unset (fits
-/// ~21Gi-allocatable k3s nodes). Prod sets 50Gi via controller.toml
-/// `[nodeclaim_pool].fuse_cache_bytes`; the CRD field is CEL-rejected
-/// for Builder kind.
-pub(crate) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
-
-/// Set once at boot from `[nodeclaim_pool].fuse_cache_bytes` so
-/// `fuse_cache_bytes()` for Builder pools, `intent_pod_footprint`'s
-/// callers in `nodeclaim_pool` (FFD,
-/// `cover_deficit`), and `apply_intent_resources` all read the SAME
-/// value (§Simulator-shares-accounting). A per-Pool override would
-/// make FFD predict a different ephemeral-storage footprint than the
-/// pod actually stamps.
-pub static BUILDER_FUSE_CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-/// Per-pool FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
-/// sizeLimit and the `ephemeral-storage` budget addend so they cannot
-/// drift. ALL pools single-source from [`BUILDER_FUSE_CACHE`]
-/// (= `[nodeclaim_pool].fuse_cache_bytes`) so FFD/cover/stamp agree
-/// (§Simulator-shares-accounting). `PoolSpec.fuse_cache_bytes` is
-/// CEL-rejected for both kinds; pre-CEL CRs are ignored here with a
-/// Warning event (`DEGRADE_CHECKS::*FuseCacheBytesIgnored`).
-///
-/// r35 merged_bug_024: §13e routed Fetcher Pools through
-/// `nodeclaim_pool` — FFD/cover read `cfg.fuse_cache_bytes` for
-/// fetcher cells too, so a per-Pool Fetcher override would diverge the
-/// FFD fit-check from the stamped pod request (the same drift mb_035
-/// closed for Builder).
-//
-// TODO: per-kind `FETCHER_FUSE_CACHE` OnceLock fed from a new
-// `[nodeclaim_pool].fetcher_fuse_cache_bytes` (default 4 GiB) +
-// `intent_pod_footprint(i, kind, ...)`. With the OnceLock set in prod,
-// fetcher pods reserve `BUILDER_FUSE_CACHE` (50 GiB) instead of the
-// ~4 GiB FODs actually need, ~12× over-allocating ephemeral-storage —
-// safe direction (under-packs nodes, doesn't break builds) but
-// expensive at chromium-scale fan-out. Add once
-// `rio_controller_nodeclaim_idle_cores` shows the bin-packing
-// regression in prod.
-pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
-    match pool.spec.kind {
-        ExecutorKind::Builder | ExecutorKind::Fetcher => *BUILDER_FUSE_CACHE
-            .get()
-            .unwrap_or(&BUILDER_FUSE_CACHE_BYTES),
-    }
-}
 
 /// Upstream gRPC addresses injected into executor pod env: a
 /// ClusterIP `addr` for single-channel mode plus an optional
@@ -628,20 +572,11 @@ pub fn build_executor_pod_spec(
 
         volumes: Some({
             let mut v = vec![
-                // FUSE cache. emptyDir = local ephemeral storage,
-                // wiped on pod restart. sizeLimit enforced by
-                // kubelet.
-                Volume {
-                    name: "fuse-cache".into(),
-                    empty_dir: Some(EmptyDirVolumeSource {
-                        size_limit: Some(Quantity(fuse_cache_bytes(pool).to_string())),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                // Overlay upperdir/workdir. MUST be a real
-                // filesystem (not the container's overlayfs root).
-                // emptyDir gives us the kubelet's local disk.
+                // Overlay upperdir/workdir + per-build castore-FUSE
+                // mountpoints (`{overlay_base_dir}/{build_id}.castore`).
+                // MUST be a real filesystem (not the container's
+                // overlayfs root). emptyDir gives us the kubelet's
+                // local disk.
                 //
                 // When `read_only_root_fs` is true (fetchers), this
                 // is the ONLY writable path — overlay writes still
@@ -701,9 +636,10 @@ pub fn build_executor_pod_spec(
                     });
                 }
             }
-            // The mountd-owned node trees (P0571): hostPath, shared
-            // with the rio-mountd DaemonSet. RO/RW split and the
-            // DirectoryOrCreate rationale live on CASTORE_NODE_MOUNTS.
+            // The mountd-owned node trees + socket dir (P0567/P0571):
+            // hostPath, shared with the rio-mountd DaemonSet. RO/RW
+            // split and the DirectoryOrCreate rationale live on
+            // CASTORE_NODE_MOUNTS.
             for (name, path, _) in CASTORE_NODE_MOUNTS {
                 v.push(Volume {
                     name: (*name).into(),
@@ -910,14 +846,17 @@ fn build_executor_container(
             let mut e = vec![
                 env("RIO_SCHEDULER__ADDR", &scheduler.addr),
                 env("RIO_STORE__ADDR", &store.addr),
-                env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
-                // /var/rio/fuse-cache, NOT /var/rio/cache: the latter is
-                // the node-shared mountd-owned backing cache (P0571's
-                // read-only hostPath below); the old per-pod FUSE cache
-                // keeps its emptyDir under a non-colliding path until
-                // P0560 deletes the old FUSE module entirely.
-                env("RIO_FUSE_CACHE_DIR", "/var/rio/fuse-cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
+                // Castore-FUSE wiring (P0560): the rio-mountd UDS plus
+                // the three node-shared trees. Values match the
+                // builder-config defaults AND the CASTORE_NODE_MOUNTS
+                // hostPaths above; set explicitly so the pod spec is
+                // self-describing and a future mount-path change cannot
+                // silently diverge from what the builder reads.
+                env("RIO_MOUNTD_SOCKET", "/run/rio-mountd/mountd.sock"),
+                env("RIO_CASTORE_CACHE_DIR", "/var/rio/cache"),
+                env("RIO_CASTORE_CHUNKS_DIR", "/var/rio/chunks"),
+                env("RIO_CASTORE_STAGING_DIR", "/var/rio/staging"),
                 env("RIO_LOG_FORMAT", "json"),
                 env("RIO_SYSTEMS", &pool.spec.systems.join(",")),
                 // Single source: `effective_features` (Fetcher → [fetcher]).
@@ -967,16 +906,8 @@ fn build_executor_container(
                 ));
             }
             // Builder-only tuning knobs. Fetchers leave all unset.
-            if !fetcher {
-                if let Some(n) = pool.spec.fuse_threads {
-                    e.push(env("RIO_FUSE_THREADS", &n.to_string()));
-                }
-                if let Some(p) = pool.spec.fuse_passthrough {
-                    e.push(env(
-                        "RIO_FUSE_PASSTHROUGH",
-                        if p { "true" } else { "false" },
-                    ));
-                }
+            if !fetcher && let Some(n) = pool.spec.fuse_threads {
+                e.push(env("RIO_FUSE_THREADS", &n.to_string()));
             }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively). `$(RIO_EXECUTOR_ID)` (downward-API
@@ -1001,11 +932,6 @@ fn build_executor_container(
         volume_mounts: Some({
             let mut m = vec![
                 VolumeMount {
-                    name: "fuse-cache".into(),
-                    mount_path: "/var/rio/fuse-cache".into(),
-                    ..Default::default()
-                },
-                VolumeMount {
                     name: "overlays".into(),
                     mount_path: "/var/rio/overlays".into(),
                     ..Default::default()
@@ -1017,8 +943,8 @@ fn build_executor_container(
                     ..Default::default()
                 },
             ];
-            // The four mountd-owned /var/rio trees (P0571) — see
-            // CASTORE_NODE_MOUNTS for the RO/RW rationale.
+            // The mountd-owned /var/rio trees + socket dir (P0567/
+            // P0571) — see CASTORE_NODE_MOUNTS for the RO/RW rationale.
             for (name, path, read_only) in CASTORE_NODE_MOUNTS {
                 m.push(VolumeMount {
                     name: (*name).into(),

@@ -148,7 +148,7 @@ impl ExecutorKind {
 )]
 #[x_kube(
     validation = Rule::new(
-        "self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))"
+        "self.kind != 'Fetcher' || !has(self.fuseThreads)"
     ).message(
         "kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not FUSE-bound"
     )
@@ -166,20 +166,6 @@ impl ExecutorKind {
         "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0"
     ).message(
         "kind=Fetcher forbids spec.features — the controller derives [fetcher] from kind (§13e)"
-    )
-)]
-#[x_kube(
-    validation = Rule::new(
-        "self.kind != 'Builder' || !has(self.fuseCacheBytes)"
-    ).message(
-        "kind=Builder forbids fuseCacheBytes — Builder pools single-source from controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree (mb_035)"
-    )
-)]
-#[x_kube(
-    validation = Rule::new(
-        "self.kind != 'Fetcher' || !has(self.fuseCacheBytes)"
-    ).message(
-        "kind=Fetcher forbids fuseCacheBytes — §13e routes Fetcher Pools through nodeclaim_pool; per-pool override would diverge FFD from the stamped pod request (r35 merged_bug_024)"
     )
 )]
 // r35 bug_044: the merge-not-replace fix in `effective_node_selector`
@@ -248,31 +234,12 @@ pub struct PoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
 
-    /// FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
-    /// `None` = worker default (4). Tune up for NAR-heavy build
-    /// profiles where FUSE readahead is the bottleneck. Builder-only.
+    /// Castore-FUSE serve-thread count per build mount. Maps to
+    /// `RIO_FUSE_THREADS`. `None` = worker default (4). Bounds how many
+    /// FUSE callbacks (lookups, JIT `open()` fetches) run concurrently
+    /// per build. Builder-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_threads: Option<u32>,
-
-    /// FUSE passthrough mode (kernel handles reads directly, no
-    /// userspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =
-    /// worker default (`true`). Set `false` only as a diagnostic
-    /// escape hatch — disabling adds ~2x per-build latency.
-    /// Requires kernel >= 6.9 + `CAP_SYS_ADMIN`. Builder-only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuse_passthrough: Option<bool>,
-
-    /// `fuse-cache` emptyDir sizeLimit AND the matching addend to the
-    /// container's `ephemeral-storage` request/limit (kubelet sums
-    /// disk-backed emptyDirs against that limit, so the two MUST agree).
-    /// CEL-rejected for BOTH kinds — all pools single-source from
-    /// controller `[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp
-    /// agree (§Simulator-shares-accounting). Builder: mb_035. Fetcher:
-    /// r35 merged_bug_024, after §13e routed Fetcher Pools through the
-    /// same NodeClaim accounting path. Pre-CEL CRs setting it are
-    /// ignored with a Warning event (`*FuseCacheBytesIgnored`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuse_cache_bytes: Option<u64>,
 
     /// requiredSystemFeatures this pool advertises (e.g., "kvm",
     /// "big-parallel"). Worker's Nix config `system-features`.
@@ -468,22 +435,13 @@ mod tests {
                 "kind=Fetcher forbids seccompProfile",
             ),
             (
-                "self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))",
+                "self.kind != 'Fetcher' || !has(self.fuseThreads)",
                 "kind=Fetcher forbids FUSE tuning knobs",
             ),
             // r[verify ctrl.crd.fetcher-no-features+2]
             (
                 "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0",
                 "kind=Fetcher forbids spec.features",
-            ),
-            // r35 merged_bug_024: Fetcher fuseCacheBytes single-sourced
-            // from BUILDER_FUSE_CACHE — §13e routes Fetcher Pools through
-            // nodeclaim_pool, so a per-Pool override would diverge FFD
-            // from the stamped pod request (the same drift mb_035 closed
-            // for Builder).
-            (
-                "self.kind != 'Fetcher' || !has(self.fuseCacheBytes)",
-                "kind=Fetcher forbids fuseCacheBytes",
             ),
             // r35 bug_044: the merge in `effective_node_selector`
             // silently overwrites an operator-set
@@ -508,15 +466,12 @@ mod tests {
             assert!(json.contains(rule), "fetcher CEL rule missing: {rule}");
             assert!(json.contains(msg), "fetcher CEL rule has no message: {msg}");
         }
-        // mb_022: Builder fuseCacheBytes single-sourced from
-        // controller.toml so FFD/cover/stamp agree (mb_035).
+        // P0560 castore cutover: the per-pod fuse cache is gone, so the
+        // mb_035/merged_bug_024 fuseCacheBytes CEL rules must NOT
+        // resurface (the field no longer exists to single-source).
         assert!(
-            json.contains("self.kind != 'Builder' || !has(self.fuseCacheBytes)"),
-            "Builder fuseCacheBytes CEL rule missing"
-        );
-        assert!(
-            json.contains("kind=Builder forbids fuseCacheBytes"),
-            "Builder fuseCacheBytes CEL rule has no message"
+            !json.contains("fuseCacheBytes"),
+            "fuseCacheBytes resurfaced in the CRD schema"
         );
         // r35 bug_044: a Builder Pool setting nodeSelector{rio.build/fetcher}
         // fails safe (taint repels, pod permanently Pending) — but the
@@ -552,8 +507,12 @@ mod tests {
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("localhostProfile"));
         assert!(json.contains("fuseThreads"));
-        assert!(json.contains("fusePassthrough"));
-        assert!(json.contains("fuseCacheBytes"));
+        // Old-FUSE pool knobs deleted at the P0560 castore cutover —
+        // the per-pod fuse cache and the passthrough toggle have no
+        // castore equivalent (passthrough is a builder-config debug
+        // escape hatch, not a pool field).
+        assert!(!json.contains("fusePassthrough"));
+        assert!(!json.contains("fuseCacheBytes"));
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("readyReplicas"));
         assert!(json.contains("desiredReplicas"));

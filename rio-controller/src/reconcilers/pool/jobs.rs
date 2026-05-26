@@ -100,33 +100,31 @@ pub(crate) fn intent_headroom(i: &SpawnIntent) -> f64 {
         .unwrap_or(OVERLAY_HEADROOM_FALLBACK)
 }
 
-/// Pod `ephemeral-storage` request/limit for an intent's `disk_bytes`
-/// plus a per-pool FUSE-cache budget.
+/// Pod `ephemeral-storage` request/limit for an intent's `disk_bytes`.
 ///
 /// = `disk_bytes × headroom` (overlay emptyDir, prjquota fit × the
 /// scheduler's variance-aware `headroom(n_eff)` cushion) +
-/// `fuse_cache_bytes` (input closure, the `fuse-cache` emptyDir
-/// sizeLimit) + [`LOG_BUDGET_BYTES`] (stdout/stderr capture + daemon
-/// state outside the overlay).
+/// [`LOG_BUDGET_BYTES`] (stdout/stderr capture + daemon state outside
+/// the overlay). The castore-FUSE input closure is served from the
+/// node-level `/var/rio` caches (mountd-owned hostPaths, sized by
+/// `services.rio.eksNode.varRioSize`) — there is no per-pod fuse-cache
+/// addend since the P0560 cutover deleted the per-pod cache emptyDir.
 ///
 /// Single source for FOUR callers that must agree (all via
 /// [`intent_pod_footprint`] or this fn directly):
 /// - [`apply_intent_resources`] — the actual pod request/limit;
 /// - [`crate::reconcilers::nodeclaim_pool::ffd::simulate`] — the FFD
 ///   sim's fit-check decrement (raw `disk_bytes` here while the pod
-///   requests 1.5× + 50Gi + 1Gi meant FFD over-places ~50× on the
-///   disk axis);
+///   requests 1.5× + 1Gi meant FFD over-places on the disk axis);
 /// - [`crate::reconcilers::nodeclaim_pool`]'s `cover_deficit` — the
 ///   NodeClaim `resources.requests.ephemeral-storage` floor (B8 live:
 ///   a 100Gi-intent pod asked 201Gi on a 189Gi-allocatable node);
 /// - helm-lint `14-disk-ceiling.sh` — `karpenter.dataVolumeSize` ≥
-///   `pod_ephemeral_request(sla.maxDisk, worst-case headroom,
-///   poolDefaults.fuseCacheBytes)` + kubelet reserve.
+///   `pod_ephemeral_request(sla.maxDisk, worst-case headroom)` +
+///   /var/rio loopback + kubelet reserve.
 // r[impl sched.sla.disk-reaches-ephemeral-storage]
-pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_bytes: u64) -> u64 {
-    ((disk_bytes as f64 * headroom) as u64)
-        .saturating_add(fuse_cache_bytes)
-        .saturating_add(LOG_BUDGET_BYTES)
+pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64) -> u64 {
+    ((disk_bytes as f64 * headroom) as u64).saturating_add(LOG_BUDGET_BYTES)
 }
 
 /// `(cores, mem, ephemeral-storage)` triple a pod for `i` will
@@ -135,11 +133,11 @@ pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_b
 /// fit-checks. FFD's contract is "predicts what kube-scheduler will
 /// do"; the only way that holds is for both sides to compute the same
 /// triple from the same fn (§Simulator-shares-accounting).
-pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> (u32, u64, u64) {
+pub(crate) fn intent_pod_footprint(i: &SpawnIntent) -> (u32, u64, u64) {
     (
         i.cores,
         i.mem_bytes,
-        pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse_cache_bytes),
+        pod_ephemeral_request(i.disk_bytes, intent_headroom(i)),
     )
 }
 
@@ -870,7 +868,7 @@ pub(super) fn build_job(
     let suffix = intent_suffix(&intent.intent_id);
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store, hw_config);
-    apply_intent_resources(&mut pod_spec, pool, intent, hw_config);
+    apply_intent_resources(&mut pod_spec, intent, hw_config);
     // r[impl ctrl.nodeclaim.priority-bucket]
     // §13b: route via the second kube-scheduler so MostAllocated bin-
     // packing matches `ffd::simulate`'s prediction, and bucket by
@@ -962,23 +960,17 @@ pub(super) fn build_job(
 ///
 /// `ephemeral-storage` = `disk_bytes × headroom` (overlay writes, from
 /// the SLA model's prjquota fit, plus the scheduler-computed
-/// variance-aware cushion) + the per-pool FUSE cache budget (input
-/// closure, NOT captured by `disk_p90`) + log/scratch headroom. BOTH
-/// addends are the SAME values that set the `overlays` / `fuse-cache`
-/// emptyDir sizeLimits, so kubelet's pod-level sum (writable-layer +
-/// logs + disk-backed emptyDirs) cannot exceed the limit before a
-/// volume-level limit fires. Budgeting bare `disk_bytes` (1.0×) here
-/// while the overlay sizeLimit is `headroom×` made the headroom
-/// unreachable — pods evicted at ≈p90 instead of `headroom×p90`.
-fn apply_intent_resources(
-    pod_spec: &mut PodSpec,
-    pool: &Pool,
-    i: &SpawnIntent,
-    hw: &HwClassConfig,
-) {
+/// variance-aware cushion) + log/scratch headroom. The overlay addend
+/// is the SAME value that sets the `overlays` emptyDir sizeLimit, so
+/// kubelet's pod-level sum (writable-layer + logs + disk-backed
+/// emptyDirs) cannot exceed the limit before a volume-level limit
+/// fires. Budgeting bare `disk_bytes` (1.0×) here while the overlay
+/// sizeLimit is `headroom×` made the headroom unreachable — pods
+/// evicted at ≈p90 instead of `headroom×p90`.
+fn apply_intent_resources(pod_spec: &mut PodSpec, i: &SpawnIntent, hw: &HwClassConfig) {
     let headroom = intent_headroom(i);
     let overlay_limit = (i.disk_bytes as f64 * headroom) as u64;
-    let ephemeral = pod_ephemeral_request(i.disk_bytes, headroom, pod::fuse_cache_bytes(pool));
+    let ephemeral = pod_ephemeral_request(i.disk_bytes, headroom);
     let map: BTreeMap<String, Quantity> = BTreeMap::from([
         ("cpu".into(), Quantity(i.cores.to_string())),
         ("memory".into(), Quantity(i.mem_bytes.to_string())),
@@ -1247,7 +1239,7 @@ mod tests {
 
     /// §Simulator-shares-accounting: the `(c,m,d)` triple
     /// `apply_intent_resources` stamps on `pod.resources.requests`
-    /// MUST equal `intent_pod_footprint(i, fuse)` — the same triple
+    /// MUST equal `intent_pod_footprint(i)` — the same triple
     /// FFD fit-checks against. A 5th FFD-divergence (raw disk_bytes,
     /// missing headroom, …) would surface here as the executable
     /// guarantee, not as accounting drift in production.
@@ -1274,21 +1266,7 @@ mod tests {
             .and_then(|r| r.requests.as_ref())
             .unwrap();
         let q = |k: &str| req[k].0.parse::<u64>().unwrap();
-        // mb_035: the production input source for FFD/cover_deficit is
-        // `cfg.fuse_cache_bytes` (= `BUILDER_FUSE_CACHE`), NOT
-        // `pod::fuse_cache_bytes(&pool)` directly. Passing the latter to
-        // both sides was vacuous — it couldn't catch the two values
-        // diverging. With Builder pools single-sourced, both ARE the
-        // OnceLock; assert that's what the stamp side also reads.
-        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
-            .get()
-            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
-        assert_eq!(
-            pod::fuse_cache_bytes(&pool),
-            cfg_fuse,
-            "Builder pool fuse_cache_bytes single-sourced from BUILDER_FUSE_CACHE"
-        );
-        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
+        let (fc, fm, fd) = intent_pod_footprint(&i);
         assert_eq!(q("cpu"), u64::from(fc));
         assert_eq!(q("memory"), fm);
         assert_eq!(q("ephemeral-storage"), fd);
@@ -1296,19 +1274,12 @@ mod tests {
 
     /// r35 merged_bug_024 (§Simulator-shares-accounting): the SAME
     /// guarantee for Fetcher Pools. §13e routed Fetcher Pools through
-    /// `nodeclaim_pool` — FFD/cover read `[nodeclaim_pool].fuse_cache_
-    /// bytes` (the global), while a Fetcher Pool's `spec.fuseCacheBytes`
-    /// override fed the stamp side directly. The two diverge → FFD
-    /// fit-checks against a different ephemeral-storage triple than the
-    /// pod actually requests. Single-source from `BUILDER_FUSE_CACHE`
-    /// (the same OnceLock Builder pools use) closes the gap.
+    /// `nodeclaim_pool`, so the FFD fit-check and the stamped pod
+    /// request must compute the same triple for fetcher cells too.
     #[test]
     fn footprint_matches_stamped_requests_fetcher() {
         const GI: u64 = 1 << 30;
-        let mut pool = test_pool("p", ExecutorKind::Fetcher);
-        // Pre-CEL CR sets a per-pool override. Post-r35 this is silently
-        // ignored — `pod::fuse_cache_bytes` reads the global OnceLock.
-        pool.spec.fuse_cache_bytes = Some(6 * GI);
+        let pool = test_pool("p", ExecutorKind::Fetcher);
         let i = SpawnIntent {
             intent_id: "x".into(),
             cores: 1,
@@ -1329,55 +1300,10 @@ mod tests {
             .and_then(|r| r.requests.as_ref())
             .unwrap();
         let q = |k: &str| req[k].0.parse::<u64>().unwrap();
-        // The production input source for FFD/cover_deficit is
-        // `cfg.fuse_cache_bytes` (= `BUILDER_FUSE_CACHE`). The stamp
-        // side MUST read the same — a per-pool override would make the
-        // pod request a different ephemeral-storage triple than FFD
-        // fit-checked.
-        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
-            .get()
-            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
-        assert_eq!(
-            pod::fuse_cache_bytes(&pool),
-            cfg_fuse,
-            "Fetcher pool fuse_cache_bytes single-sourced from BUILDER_FUSE_CACHE              (per-Pool override defeats §Simulator-shares-accounting)"
-        );
-        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
+        let (fc, fm, fd) = intent_pod_footprint(&i);
         assert_eq!(q("cpu"), u64::from(fc));
         assert_eq!(q("memory"), fm);
         assert_eq!(q("ephemeral-storage"), fd);
-    }
-
-    /// mb_022: a Builder Pool that sets `fuseCacheBytes` (pre-CEL CR)
-    /// is silently ignored at the value-read site — `fuse_cache_bytes`
-    /// reads `BUILDER_FUSE_CACHE` regardless. The Warning event is
-    /// `DEGRADE_CHECKS::BuilderFuseCacheBytesIgnored` (covered in
-    /// `disruption_tests::degrade_builder_fuse_cache_ignored`); this
-    /// asserts the silent-ignore half.
-    #[test]
-    fn builder_pool_ignores_fuse_cache_override() {
-        let mut p = test_pool("p", ExecutorKind::Builder);
-        p.spec.fuse_cache_bytes = Some(100 * (1 << 30));
-        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
-            .get()
-            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
-        assert_eq!(
-            pod::fuse_cache_bytes(&p),
-            cfg_fuse,
-            "Builder ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
-        );
-        // r35 merged_bug_024: Fetcher Pool ALSO ignores spec.fuseCacheBytes
-        // — single-sourced from BUILDER_FUSE_CACHE. §13e routed Fetcher
-        // Pools through nodeclaim_pool, so a per-Pool override would
-        // make FFD/cover predict a different ephemeral-storage footprint
-        // than the pod actually stamps.
-        let mut f = test_pool("f", ExecutorKind::Fetcher);
-        f.spec.fuse_cache_bytes = Some(100 * (1 << 30));
-        assert_eq!(
-            pod::fuse_cache_bytes(&f),
-            cfg_fuse,
-            "Fetcher ignores spec.fuseCacheBytes — single-sourced from BUILDER_FUSE_CACHE"
-        );
     }
 
     /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =
@@ -1599,8 +1525,8 @@ mod tests {
         assert_eq!(req["memory"], Quantity((16 * GI).to_string()));
         assert_eq!(
             req["ephemeral-storage"],
-            Quantity(((60 + 8 + 1) * GI).to_string()),
-            "disk_bytes×OVERLAY_HEADROOM_FALLBACK + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
+            Quantity(((60 + 1) * GI).to_string()),
+            "disk_bytes×OVERLAY_HEADROOM_FALLBACK + LOG_BUDGET_BYTES"
         );
         assert_eq!(
             res.limits.as_ref(),
@@ -1673,73 +1599,6 @@ mod tests {
         let (eph_fb, _) = mk(Some(OVERLAY_HEADROOM_FALLBACK));
         assert_eq!(eph_none, eph_fb, "None → fallback");
         assert_eq!(eph_zero, eph_fb, "0.0 → fallback");
-    }
-
-    /// The `fuse-cache` emptyDir sizeLimit and the FUSE-cache addend in
-    /// the container's `ephemeral-storage` limit MUST come from the
-    /// same per-pool value. Kubelet sums disk-backed emptyDirs against
-    /// the container limit, so a sizeLimit larger than the budget
-    /// evicts on the pod-level limit before the volume cap — and
-    /// `disk_p90` (overlay prjquota only) never learns the input-
-    /// closure size, so every fresh drv_hash re-climbs the floor.
-    ///
-    /// r35 merged_bug_024: `PoolSpec.fuse_cache_bytes` is IGNORED for
-    /// both kinds — single-sourced from `BUILDER_FUSE_CACHE` so
-    /// FFD/cover/stamp agree (§Simulator-shares-accounting). The
-    /// emptyDir sizeLimit and the `ephemeral-storage` addend both read
-    /// the same value so they cannot drift even within one kind.
-    #[test]
-    fn fuse_cache_budget_matches_sizelimit() {
-        const GI: u64 = 1 << 30;
-        let cfg_fuse = *pod::BUILDER_FUSE_CACHE
-            .get()
-            .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
-        for (kind, override_, expect) in [
-            (ExecutorKind::Builder, None, cfg_fuse),
-            (ExecutorKind::Fetcher, None, cfg_fuse),
-            // mb_035: Builder ignores PoolSpec override (single-sourced).
-            (ExecutorKind::Builder, Some(4 * GI), cfg_fuse),
-            // r35 merged_bug_024: Fetcher ALSO ignores PoolSpec override —
-            // §13e routes Fetcher Pools through nodeclaim_pool, so the
-            // override would make FFD predict a different footprint than
-            // the pod stamps.
-            (ExecutorKind::Fetcher, Some(6 * GI), cfg_fuse),
-        ] {
-            let mut pool = test_pool("p", kind);
-            pool.spec.fuse_cache_bytes = override_;
-            let i = SpawnIntent {
-                intent_id: "abc".into(),
-                disk_bytes: 5 * GI,
-                ..Default::default()
-            };
-            let job = job(&pool, &i);
-            let pod_spec = job
-                .spec
-                .as_ref()
-                .and_then(|s| s.template.spec.as_ref())
-                .unwrap();
-            let fuse = pod_spec
-                .volumes
-                .as_ref()
-                .and_then(|v| v.iter().find(|v| v.name == "fuse-cache"))
-                .and_then(|v| v.empty_dir.as_ref())
-                .and_then(|e| e.size_limit.as_ref())
-                .expect("fuse-cache emptyDir has sizeLimit");
-            assert_eq!(fuse, &Quantity(expect.to_string()), "{kind:?} sizeLimit");
-            let eph = pod_spec.containers[0]
-                .resources
-                .as_ref()
-                .and_then(|r| r.limits.as_ref())
-                .map(|l| l["ephemeral-storage"].clone())
-                .unwrap();
-            let overlay_limit = ((5 * GI) as f64 * OVERLAY_HEADROOM_FALLBACK) as u64;
-            assert_eq!(
-                eph,
-                Quantity((overlay_limit + expect + LOG_BUDGET_BYTES).to_string()),
-                "{kind:?} ephemeral-storage budget must include the SAME \
-                 fuse-cache bytes as the emptyDir sizeLimit"
-            );
-        }
     }
 
     /// Structural invariant: container `ephemeral-storage` limit ≥
@@ -2054,7 +1913,7 @@ mod tests {
             hw_class_names: vec!["metal-x86".into()],
             ..Default::default()
         };
-        apply_intent_resources(&mut spec, &pool, &i, &hw);
+        apply_intent_resources(&mut spec, &i, &hw);
         let tols = spec.tolerations.as_ref().expect("tolerations set");
         let kvm = tols
             .iter()
@@ -2067,7 +1926,7 @@ mod tests {
         // Idempotent: re-applying must not duplicate the toleration
         // (or the pool-static one, if both sources fire — `wants_metal`
         // and the intent path).
-        apply_intent_resources(&mut spec, &pool, &i, &hw);
+        apply_intent_resources(&mut spec, &i, &hw);
         let n_kvm = spec
             .tolerations
             .as_ref()
@@ -2086,7 +1945,7 @@ mod tests {
             hw_class_names: vec!["mid-ebs-x86".into()],
             ..Default::default()
         };
-        apply_intent_resources(&mut spec2, &pool, &i2, &hw);
+        apply_intent_resources(&mut spec2, &i2, &hw);
         assert_eq!(
             spec2.tolerations, before,
             "untainted hwClass → no per-intent toleration"

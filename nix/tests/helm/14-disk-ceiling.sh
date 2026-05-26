@@ -1,6 +1,6 @@
 # max_node_disk (controller.toml — `cover::sizing`'s per-claim
 # ephemeral-storage cap) MUST cover the largest single-pod request:
-#   disk_bytes × OVERLAY_HEADROOM + fuse_cache_bytes + LOG_BUDGET_BYTES
+#   disk_bytes × OVERLAY_HEADROOM + LOG_BUDGET_BYTES
 # clamped at sla.maxDisk. kube-scheduler's NodeResourcesFit SUMS
 # ephemeral-storage across bound pods (same as cpu/mem); this check
 # guards only that ONE max-disk pod fits (the runtime 3-axis chunking
@@ -22,6 +22,10 @@
 # write — every build on the node EIOs until remount — so the headroom
 # inequality must hold with /var/rio fully consumed:
 #   dataVolumeSize × 0.9 − varRioSize ≥ need
+#
+# P0560: there is no per-pod fuse-cache addend anymore — the castore
+# input closure is served from the node-level /var/rio caches, which the
+# varRioSize term above already accounts for.
 
 # Mirror jobs.rs constants. headroom(n_eff) is bounded above by
 # headroom(1.0) = 1.25 + 0.7 = 1.95.
@@ -36,10 +40,9 @@ LOG_BUDGET_BYTES=$((1 << 30))
 VAR_RIO_SIZE_BYTES=$((100 << 30))
 
 max_disk=$(yq '.scheduler.sla.maxDisk' values.yaml)
-fuse=$(yq '.poolDefaults.fuseCacheBytes' values.yaml)
 
-# Render controller.toml — single source for both fuse_cache_bytes and
-# max_node_disk (the values cover::sizing actually reads).
+# Render controller.toml — single source for max_node_disk (the value
+# cover::sizing actually reads).
 toml=$TMPDIR/ctrl.toml
 helm template rio . \
   --set karpenter.enabled=true \
@@ -51,20 +54,22 @@ helm template rio . \
   | yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-controller-config")
            | .data."controller.toml"' >"$toml"
 
-got_fuse=$(grep -E '^fuse_cache_bytes = ' "$toml" | grep -oE '[0-9]+')
-test "$got_fuse" = "$fuse" || {
-  echo "FAIL: controller.toml fuse_cache_bytes=$got_fuse != poolDefaults.fuseCacheBytes=$fuse" >&2
+# The per-pod fuse-cache key must not resurface in the rendered TOML —
+# the controller config no longer has the field and an unknown key is
+# silently ignored (the value would be a no-op lying in the chart).
+if grep -qE '^fuse_cache_bytes = ' "$toml"; then
+  echo "FAIL: controller.toml still renders fuse_cache_bytes — removed at the P0560 castore cutover" >&2
   exit 1
-}
+fi
 
 max_node_disk=$(grep -E '^max_node_disk = ' "$toml" | grep -oE '[0-9]+')
-need=$(( max_disk * OVERLAY_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
+need=$(( max_disk * OVERLAY_HEADROOM_PCT / 100 + LOG_BUDGET_BYTES ))
 avail=$(( max_node_disk - VAR_RIO_SIZE_BYTES ))
 
 test "$avail" -ge "$need" || {
   echo "FAIL: max_node_disk − varRioSize = $max_node_disk − $VAR_RIO_SIZE_BYTES = $avail B < required $need B" >&2
-  echo "  required = sla.maxDisk × 1.95 + poolDefaults.fuseCacheBytes + 1Gi" >&2
-  echo "           = $max_disk × 1.95 + $fuse + $LOG_BUDGET_BYTES" >&2
+  echo "  required = sla.maxDisk × 1.95 + 1Gi" >&2
+  echo "           = $max_disk × 1.95 + $LOG_BUDGET_BYTES" >&2
   echo "  raise karpenter.dataVolumeSize (max_node_disk = dataVolumeSize × 0.9)" >&2
   echo "  or shrink services.rio.eksNode.varRioSize (then update VAR_RIO_SIZE_BYTES here)" >&2
   exit 1
