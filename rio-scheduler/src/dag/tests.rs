@@ -271,6 +271,77 @@ fn test_merge_rollback_duplicate_drv_restores_wanted_union() -> anyhow::Result<(
     Ok(())
 }
 
+/// Duplicate-drv failed merge where the pre-existing node is ALSO
+/// retriable-on-resubmit: occurrence 1 takes the resubmit-reset path
+/// (old node moved aside, fresh replacement inserted with the
+/// carried-over union), occurrence 2 then grows the FRESH node's union
+/// and records a contribution. Rollback restores the old node
+/// wholesale from `removed_retriable`; the `wanted_grown` /
+/// `contributions_recorded` entries describe the discarded replacement
+/// and must NOT be replayed onto the restored node — otherwise the
+/// rejected build's wanted names leak into the stored union and a
+/// stray `wanted_by_build` entry appears for a build that is not in
+/// `interested_builds`.
+#[test]
+fn test_merge_rollback_duplicate_drv_on_retriable_node_restores_exactly() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+
+    // Pre-existing node wanting {out} with build_a's contribution,
+    // then left retriable (a cancelled build's leftover).
+    let mut node = make_node("hashRW", "x86_64-linux");
+    node.wanted_output_names = vec!["out".into()];
+    dag.merge(build_a, &[node.clone()], &[], "")?;
+    dag.nodes
+        .get_mut("hashRW")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    // build_b's FAILED merge (cycle) carries the drv twice with wanted
+    // sets that grow the union; occurrence 1 resubmit-resets the node,
+    // occurrence 2 mutates the fresh replacement.
+    let mut occ1 = node.clone();
+    occ1.wanted_output_names = vec!["dev".into()];
+    let mut occ2 = node.clone();
+    occ2.wanted_output_names = vec!["man".into()];
+    let nodes = vec![
+        occ1,
+        occ2,
+        make_node("hashRWy", "x86_64-linux"),
+        make_node("hashRWz", "x86_64-linux"),
+    ];
+    let cycle = vec![
+        make_edge("hashRWy", "hashRWz"),
+        make_edge("hashRWz", "hashRWy"),
+    ];
+    assert!(dag.merge(build_b, &nodes, &cycle, "").is_err());
+
+    let n = &dag.nodes["hashRW"];
+    assert_eq!(
+        n.wanted_output_names,
+        vec!["out"],
+        "the wholesale-restored node must keep its pre-merge wanted set; \
+         the rejected merge's union must not leak into the stored fallback"
+    );
+    assert!(
+        !n.wanted_by_build.contains_key(&build_b),
+        "no contribution may appear for the rejected build on the restored \
+         node (entries follow interested_builds membership)"
+    );
+    assert_eq!(
+        n.wanted_by_build.get(&build_a),
+        Some(&vec!["out".to_string()]),
+        "the prior build's contribution survives the restore untouched"
+    );
+    assert_eq!(
+        n.interested_builds,
+        HashSet::from([build_a]),
+        "interest must be exactly the pre-merge set"
+    );
+    Ok(())
+}
+
 /// The resubmit-reset path destructively removes a retriable node and
 /// re-inserts fresh state; prior interest AND prior per-build
 /// contributions are carried over so the other still-interested builds'

@@ -678,7 +678,10 @@ impl DerivationDag {
         // entries are pre-existing (the resubmit-reset path removed only
         // nodes[X], never edges) and must NOT be scrubbed. The new_edges
         // loop above already reverted any edges THIS merge added to them.
-        let restoring: HashSet<&DrvHash> = removed_retriable.iter().map(|(h, _)| h).collect();
+        // Owned (not borrowed) because the per-field restore loops at the
+        // bottom also consult it, after `removed_retriable` is consumed.
+        let restoring: HashSet<DrvHash> =
+            removed_retriable.iter().map(|(h, _)| h.clone()).collect();
 
         // Remove newly-inserted nodes (and their path index entries)
         for hash in newly_inserted {
@@ -730,6 +733,12 @@ impl DerivationDag {
         // pre-merge) value is the one that sticks — mirroring the
         // `contributions_recorded` restore below.
         for (hash, prior) in wanted_grown.iter().rev() {
+            // Entries for resubmit-reset hashes describe the discarded
+            // fresh replacement; the wholesale restore above already
+            // carries the exact pre-merge state.
+            if restoring.contains(hash) {
+                continue;
+            }
             if let Some(state) = self.nodes.get_mut(hash) {
                 state.wanted_output_names = prior.clone();
             }
@@ -743,6 +752,12 @@ impl DerivationDag {
         // carrying the same drv twice), the oldest (true pre-merge)
         // prior is the one that sticks.
         for (hash, prior) in contributions_recorded.iter().rev() {
+            // Entries for resubmit-reset hashes describe the discarded
+            // fresh replacement; the wholesale restore above already
+            // carries the exact pre-merge state.
+            if restoring.contains(hash) {
+                continue;
+            }
             if let Some(state) = self.nodes.get_mut(hash) {
                 match prior {
                     Some(w) => {
