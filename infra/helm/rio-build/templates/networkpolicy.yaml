@@ -74,12 +74,6 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
-    {{- with .Values.networkPolicy.builderS3Cidr }}
-    # S3 VPC endpoint CIDR — builder reads chunks via presigned URL.
-    # toCIDR (not toEndpoints) — S3 endpoint is outside the cluster.
-    - toCIDR: [{{ . | quote }}]
-      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
-    {{- end }}
   # Explicit IMDS deny — second independent control alongside
   # httpPutResponseHopLimit: 1 (karpenter.yaml). Cilium deny rules take
   # precedence over allow at the same L3/L4 scope. Builders have no

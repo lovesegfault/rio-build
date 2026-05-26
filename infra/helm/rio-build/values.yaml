@@ -951,11 +951,13 @@ gateway:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-mountd — privileged per-node castore broker (DaemonSet)
 # ──────────────────────────────────────────────────────────────────────────
-# One pod per builder/fetcher node. Brokers the three things the
-# unprivileged builder pod cannot do itself: open /dev/fuse,
-# FUSE_DEV_IOC_BACKING_OPEN (init-ns CAP_SYS_ADMIN), and writes into the
-# shared node-local cache (integrity boundary — content is re-hashed
-# before publication). Talks to builder pods over
+# One pod per builder/fetcher node. Brokers the two things the
+# unprivileged builder pod cannot do itself:
+# FUSE_DEV_IOC_BACKING_OPEN/_CLOSE (init-ns CAP_SYS_ADMIN) and writes
+# into the shared node-local cache (integrity boundary — content is
+# re-hashed before publication). The builder opens and mounts its own
+# /dev/fuse (containerd base_runtime_spec injects the node) and hands
+# the daemon a dup in Mount{}. Talks to builder pods over
 # /run/rio-mountd/mountd.sock (hostPath); needs no cluster networking
 # beyond the Prometheus scrape of :9095.
 mountd:

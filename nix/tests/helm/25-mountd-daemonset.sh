@@ -6,7 +6,8 @@
 # load-bearing —
 #   - `privileged: false` + `capabilities.add: [SYS_ADMIN]`: privileged
 #     would disable seccomp and expose every host device; anything less
-#     than SYS_ADMIN cannot mount(2)/FUSE_DEV_IOC_BACKING_OPEN/quotactl.
+#     than SYS_ADMIN cannot FUSE_DEV_IOC_BACKING_OPEN/quotactl (or
+#     umount2 pre-cutover orphan mounts in the startup scan).
 #   - seccomp RuntimeDefault at the pod level.
 #   - node affinity restricted to builder/fetcher node-roles: a mountd
 #     pod on a general (control-plane) node is attack surface with no
