@@ -422,6 +422,66 @@ async fn a_corrupt_chunk_fails_the_fill_and_the_next_open_retries() {
     );
 }
 
+/// A fill that dies before its first chunk (StatBlob NotFound, or the
+/// `GetChunks` stream erroring on the very first chunk) fails the
+/// `open()` itself with EIO promptly — the failure propagates through
+/// the first-chunk barrier instead of the open waiting out its budget.
+// r[verify builder.fs.streaming-open]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_that_fails_before_the_first_chunk_fails_the_open() {
+    // A long first-chunk budget so "failed fast" and "waited out the
+    // budget" are unmistakably different outcomes; the slack below is
+    // generous because the failure path is two local RPC round-trips.
+    let h = harness_with(OpenConfig {
+        jit_fetch_timeout: Duration::from_secs(30),
+        mountd_request_timeout: FAST,
+        stream_threshold: 1024,
+    })
+    .await;
+
+    // (a) StatBlob answers NotFound: nothing about the digest is known.
+    let unknown = *blake3::hash(b"never seeded for streaming").as_bytes();
+    let started = std::time::Instant::now();
+    let err = ensure_readable_blocking(&h.open_path, unknown, 4096)
+        .await
+        .expect_err("the open fails when the chunk window cannot be resolved");
+    assert_eq!(err.code(), fuser::Errno::EIO.code());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the failed open must return promptly, not wait out the 30s first-chunk budget \
+         (took {:?})",
+        started.elapsed()
+    );
+    assert!(
+        !h.staging
+            .join(format!("{}.partial", hex::encode(unknown)))
+            .exists(),
+        "the dead fill cleans up its .partial"
+    );
+
+    // (b) StatBlob succeeds but the very first GetChunks fetch aborts
+    // (chunk bodies missing store-side): same outcome.
+    let content = patterned(4096);
+    let (digest, chunk_digests) = h.mock.seed_chunked_blob(&content, 1000, 8);
+    for chunk in &chunk_digests {
+        h.mock.state.chunks.lock().unwrap().remove(chunk);
+    }
+    let started = std::time::Instant::now();
+    let err = ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect_err("the open fails when the first chunk cannot be fetched");
+    assert_eq!(err.code(), fuser::Errno::EIO.code());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the failed open must return promptly (took {:?})",
+        started.elapsed()
+    );
+    assert!(
+        !h.open_path.cache_path(&digest).exists(),
+        "nothing is promoted by a fill that never produced a verified byte"
+    );
+}
+
 /// Individually-valid chunks that do not assemble to the claimed
 /// `file_digest` are caught by the whole-file verification at fill
 /// completion: nothing is renamed, nothing is promoted, and later reads

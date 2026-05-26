@@ -140,6 +140,18 @@ pub enum Readable {
     },
 }
 
+impl std::fmt::Debug for Readable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Readable::Backing(case) => f.debug_tuple("Backing").field(case).finish(),
+            Readable::Streaming { case, .. } => f
+                .debug_struct("Streaming")
+                .field("case", case)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// The `open()` data path: cache lookup, JIT fetch, promote.
 ///
 /// Shared across all fuser threads behind `&self`; interior mutability

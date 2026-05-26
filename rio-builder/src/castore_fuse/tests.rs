@@ -275,11 +275,11 @@ impl DirectoryService for MockCastore {
             .file_digest
             .try_into()
             .map_err(|_| Status::invalid_argument("file_digest must be 32 bytes"))?;
+        // Deliberately a generic message: the client must key its
+        // inline-manifest fallback on the gRPC code (the documented
+        // contract), never on message text.
         if let Some(code) = self.state.stat_errors.lock().unwrap().get(&digest) {
-            return Err(Status::new(
-                *code,
-                "MockCastore: seeded StatBlob error (use ReadBlob)",
-            ));
+            return Err(Status::new(*code, "MockCastore: seeded StatBlob error"));
         }
         if !req.send_chunks {
             return Err(Status::unimplemented(

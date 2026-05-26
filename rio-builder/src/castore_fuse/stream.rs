@@ -436,19 +436,19 @@ fn remaining(deadline: Instant) -> Result<Duration, FillError> {
 /// The fill body: resolve the chunk window, assemble the `.partial`
 /// chunk by chunk, verify, rename, promote.
 fn fill_blob(ctx: &FillContext, fill: &StreamFill, deadline: Instant) -> Result<(), FillError> {
-    let resp = match stat_blob(ctx, deadline) {
-        Ok(resp) => resp,
-        // An inline manifest has no chunk list (the store signals
-        // FailedPrecondition). Reachable only when stream_threshold is
-        // configured below the store's inline ceiling — fall back to
-        // the whole-file stream rather than failing the open.
-        Err(FillError::Store(msg)) if msg.contains("use ReadBlob") => {
+    let resp = match stat_blob(ctx, deadline)? {
+        StatOutcome::Chunked(resp) => resp,
+        // An inline manifest has no chunk list (`FailedPrecondition`
+        // per the StatBlob contract in store.proto). Reachable only
+        // when stream_threshold is configured below the store's inline
+        // ceiling — fall back to the whole-file stream rather than
+        // failing the open.
+        StatOutcome::Inline => {
             tracing::debug!(
                 "castore-fuse: StatBlob says inline manifest; streaming via ReadBlob instead"
             );
             return fill_from_read_blob(ctx, fill, deadline);
         }
-        Err(e) => return Err(e),
     };
     let plan = plan_chunks(&resp, ctx.size).map_err(FillError::Integrity)?;
 
@@ -503,9 +503,18 @@ fn finish_and_promote(ctx: &FillContext) -> Result<(), FillError> {
     }
 }
 
+/// What `StatBlob` said about the blob's layout.
+enum StatOutcome {
+    /// A chunk window the fill can assemble from.
+    Chunked(StatBlobResponse),
+    /// The manifest is inline (no chunk list): the store answers
+    /// `FailedPrecondition` and the caller must use `ReadBlob`.
+    Inline,
+}
+
 /// `StatBlob(file_digest, send_chunks=true)` bounded by the fill
 /// deadline.
-fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatBlobResponse, FillError> {
+fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatOutcome, FillError> {
     let left = remaining(deadline)?;
     let mut directory = ctx.clients.directory.clone();
     let file_digest = ctx.file_digest.to_vec();
@@ -521,8 +530,13 @@ fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatBlobResponse, F
     });
     match resp {
         Err(_elapsed) => Err(FillError::Timeout),
+        // The documented "no chunk list — use ReadBlob" signal
+        // (store.proto StatBlob): an inline manifest, not a failure.
+        Ok(Err(status)) if status.code() == tonic::Code::FailedPrecondition => {
+            Ok(StatOutcome::Inline)
+        }
         Ok(Err(status)) => Err(FillError::Store(format!("StatBlob: {status}"))),
-        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Ok(resp)) => Ok(StatOutcome::Chunked(resp.into_inner())),
     }
 }
 
