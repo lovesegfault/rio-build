@@ -1268,7 +1268,7 @@ Like #rref("gw.conn.keepalive+2") (I-161), this was an SSH-hardening limit
 calibrated to an assumption about stock-client behavior that stock clients
 violate.
 
-#r("gw.conn.session-cap")[
+#r("gw.conn.session-cap+2")[
   The gateway MUST bound the total number of concurrently active protocol
   sessions across all connections on the instance (`max_sessions`, default
   4096). The bound MUST be enforced at `exec_request` time, before the
@@ -1277,13 +1277,23 @@ violate.
   exec-time `channel_failure` is a clean `ssh` exit for a `ControlMaster` mux
   client (the master has already reported `MUX_S_SESSION_OPENED` to its
   client by the time the exec reply arrives), while a channel-open refusal
-  triggers OpenSSH's silent fallback to a corrupted direct connection. Each
-  session costs \~550 KiB of duplex buffers, so the default bounds session
-  memory at \~2.2 GiB --- the instance's OOM backstop. The cap is per
-  instance: horizontal scaling adds aggregate capacity for additional client
-  connections, but a `ControlMaster` pins all of its channels to one
-  instance's TCP connection, so the cap must accommodate the largest single
-  multiplexed client on its own.
+  triggers OpenSSH's silent fallback to a corrupted direct connection. The
+  cap bounds the per-session steady-state cost (\~550 KiB of duplex buffers,
+  \~2.2 GiB at the default), and it is only an effective memory backstop
+  because each session's egress is itself flow-controlled: the gateway MUST
+  NOT hand russh more channel data than the client has granted SSH window
+  for (response sends go through the channel's window-aware writer and
+  block until window is available, bounded by the wedged-send timeout), so
+  per-session buffering inside russh stays at roughly one client-advertised
+  window plus the bounded per-connection handle queue rather than growing
+  with the response stream. The remaining large per-session allocation ---
+  the transient fully-buffered NAR (≤ `MAX_NAR_SIZE`) a `wopNarFromPath`
+  holds while in flight, required because the protocol cannot signal an
+  error after raw NAR bytes start --- is deliberate and sits outside both
+  bounds. The cap is per instance: horizontal scaling adds aggregate
+  capacity for additional client connections, but a `ControlMaster` pins
+  all of its channels to one instance's TCP connection, so the cap must
+  accommodate the largest single multiplexed client on its own.
 ]
 
 #r("gw.conn.keepalive+2")[

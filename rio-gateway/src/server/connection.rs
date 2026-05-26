@@ -289,7 +289,7 @@ impl EmptyConnectionTimer {
     }
 }
 
-// r[impl gw.conn.session-cap]
+// r[impl gw.conn.session-cap+2]
 /// Owns one protocol session's capacity accounting: the global
 /// session-cap permit, the `rio_gateway_channels_active` increment, and
 /// the connection's live-session count. Held by the session's response
@@ -315,7 +315,7 @@ impl EmptyConnectionTimer {
 /// park, and capacity release must never depend on the peer's transport
 /// cooperation.
 struct SessionGuard {
-    /// Global session-cap permit (`r[gw.conn.session-cap]`), acquired in
+    /// Global session-cap permit (`r[gw.conn.session-cap+2]`), acquired in
     /// `exec_request` before the duplex buffers are allocated.
     /// Underscore-prefixed: never read, only dropped.
     _permit: OwnedSemaphorePermit,
@@ -484,7 +484,7 @@ trait SessionSink {
     async fn send(&self, data: Vec<u8>) -> Result<(), ()>;
 }
 
-// r[impl gw.conn.session-cap]
+// r[impl gw.conn.session-cap+2]
 /// Production sink: the window-aware write half of the session's SSH
 /// channel, retained at `channel_open_session` and handed over at exec.
 ///
@@ -718,14 +718,17 @@ pub struct ConnectionHandler {
     /// cancelling the server-wide parent reaches every proto_task
     /// regardless of which connection/channel owns it.
     pub(super) sessions_shutdown: CancellationToken,
-    /// Global active-session semaphore (`r[gw.conn.session-cap]`),
+    /// Global active-session semaphore (`r[gw.conn.session-cap+2]`),
     /// shared with `GatewayServer` and every other connection.
     /// `exec_request` does `try_acquire_owned()`; the permit is owned by
     /// the session's [`SessionGuard`] (held by its response task), so it
     /// is released when the protocol session actually ends rather than
     /// when the client deigns to close the channel. This — not the
-    /// per-connection channel bound — is the resource limit that
-    /// protects pod memory.
+    /// per-connection channel bound — is the limit on per-pod session
+    /// count and its steady-state buffers; what each session may buffer
+    /// inside russh on top of that is bounded by the client-granted SSH
+    /// window, because the response pump only sends through the
+    /// channel's window-aware write half ([`SessionSink`]).
     pub(super) session_sem: Arc<Semaphore>,
     /// Per-connection SSH channel absurdity bound
     /// (`r[gw.conn.channel-limit+3]`). See
@@ -1373,7 +1376,7 @@ impl Handler for ConnectionHandler {
             return reject_exec(session, channel_id);
         }
 
-        // r[impl gw.conn.session-cap]
+        // r[impl gw.conn.session-cap+2]
         // Global admission control: one permit per spawned protocol
         // session, across ALL connections on this pod. Acquired BEFORE
         // `channel_success` and before the ~550 KiB of duplex buffers
@@ -1385,9 +1388,12 @@ impl Handler for ConnectionHandler {
         // produces a clean `ssh` exit — no fallback to a direct
         // connection, no LocalCommand corruption (contrast with
         // refusing the channel OPEN, see gw.conn.channel-limit+3).
-        // At the default cap (4096 ≈ 2.2 GiB of buffers) this only
-        // fires when the pod is genuinely at its memory ceiling, where
-        // a visible rejection beats an OOMKill of every other session.
+        // At the default cap (4096 ≈ 2.2 GiB of steady-state buffers;
+        // russh-side buffering on top of that is paced per session by
+        // the client-granted window via the write half taken below)
+        // this only fires when the pod is genuinely at its memory
+        // ceiling, where a visible rejection beats an OOMKill of every
+        // other session.
         let Ok(session_permit) = Arc::clone(&self.session_sem).try_acquire_owned() else {
             warn!(
                 peer = ?self.peer_addr,
@@ -1846,7 +1852,7 @@ mod tests {
         }
     }
 
-    // r[verify gw.conn.session-cap]
+    // r[verify gw.conn.session-cap+2]
     /// The session permit (and gauge/live-count, all owned by the
     /// [`SessionGuard`]) MUST be released before — and independently of —
     /// the exit-status/eof/close sends: those ride the per-connection
@@ -1941,7 +1947,7 @@ mod tests {
         }
     }
 
-    // r[verify gw.conn.session-cap]
+    // r[verify gw.conn.session-cap+2]
     /// A peer that parks the handle queue must not be able to pin session
     /// capacity through the response pump: each send is bounded by
     /// [`HANDLE_SEND_TIMEOUT`], and when that bound expires the
@@ -2039,7 +2045,7 @@ mod tests {
         }
     }
 
-    // r[verify gw.conn.session-cap]
+    // r[verify gw.conn.session-cap+2]
     /// A client that keeps the transport healthy but never grants channel
     /// window must not be able to pin session capacity through the
     /// response pump: the data send parks on the never-granted window, and

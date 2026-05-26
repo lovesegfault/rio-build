@@ -99,13 +99,15 @@ pub struct Config {
     /// [`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000). Set via
     /// `RIO_MAX_CONNECTIONS`.
     pub max_connections: usize,
-    /// Global active-session cap (`r[gw.conn.session-cap]`) — the pod's
-    /// OOM backstop. Each exec'd protocol session costs ~550 KiB of
-    /// buffers, so the default 4096 ≈ 2.2 GiB of the 4 GiB pod limit.
-    /// At cap, additional `exec` requests are rejected cleanly (the SSH
-    /// channel opens, the exec gets `channel_failure` + exit-status 1)
-    /// — never with a channel-open refusal, which corrupts stock nix
-    /// clients behind `ControlMaster`. Default
+    /// Global active-session cap (`r[gw.conn.session-cap+2]`). Each
+    /// exec'd protocol session costs ~550 KiB of buffers steady-state,
+    /// so the default 4096 ≈ 2.2 GiB of the 4 GiB pod limit; per-session
+    /// egress is additionally paced by the SSH channel window the client
+    /// grants, and a `wopNarFromPath` transiently buffers up to one NAR
+    /// on top of that. At cap, additional `exec` requests are rejected
+    /// cleanly (the SSH channel opens, the exec gets `channel_failure` +
+    /// exit-status 1) — never with a channel-open refusal, which
+    /// corrupts stock nix clients behind `ControlMaster`. Default
     /// [`crate::server::DEFAULT_MAX_SESSIONS`]. Set via
     /// `RIO_MAX_SESSIONS`.
     pub max_sessions: usize,

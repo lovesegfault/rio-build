@@ -47,14 +47,25 @@ use crate::ratelimit::TenantLimiter;
 /// max_connections`.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 
-/// Default global active-session cap (`r[gw.conn.session-cap]`) — the
-/// pod-level OOM backstop. Each exec'd protocol session allocates
-/// 2×256 KiB duplex buffers + a 64-slot mpsc + 3 task stacks (~550 KiB
-/// worst case), so 4096 sessions ≈ 2.2 GiB of the pod's 4 GiB limit.
-/// Sized to ~2× the largest plausible legitimate burst (a few CI
-/// machines × 64–128 nix-fast-build workers each) so it only fires
-/// under genuine overload, where a clean per-exec rejection beats an
-/// OOMKill of every other session.
+/// Default global active-session cap (`r[gw.conn.session-cap+2]`). Each
+/// exec'd protocol session allocates 2×256 KiB duplex buffers + a
+/// 64-slot mpsc + 3 task stacks (~550 KiB worst case), so 4096 sessions
+/// ≈ 2.2 GiB of the pod's 4 GiB limit. Sized to ~2× the largest
+/// plausible legitimate burst (a few CI machines × 64–128
+/// nix-fast-build workers each) so it only fires under genuine
+/// overload, where a clean per-exec rejection beats an OOMKill of every
+/// other session.
+///
+/// The cap is the pod's memory backstop only because per-session egress
+/// is separately flow-controlled: the response pump hands russh nothing
+/// the client has not granted SSH channel window for (the window-aware
+/// write half blocks otherwise, bounded by `HANDLE_SEND_TIMEOUT`), so
+/// russh-side buffering per session stays around one client-advertised
+/// window plus the bounded handle queue instead of growing with the
+/// response stream. The one large per-session allocation outside both
+/// bounds is the transient NAR buffer a `wopNarFromPath` holds while in
+/// flight (≤ `MAX_NAR_SIZE`; the protocol cannot signal an error once
+/// raw NAR bytes start, so the fetch must complete before streaming).
 ///
 /// Checked in `exec_request`, NOT `channel_open_session`: an exec-time
 /// `channel_failure` is a clean `ssh` exit for a ControlMaster mux
@@ -205,7 +216,7 @@ pub struct GatewayServer {
     /// Default [`DEFAULT_MAX_CONNECTIONS`] = 1000; override via
     /// `with_max_connections()`.
     conn_sem: Arc<Semaphore>,
-    // r[impl gw.conn.session-cap]
+    // r[impl gw.conn.session-cap+2]
     /// Global active-session semaphore. One permit per spawned protocol
     /// session across all connections; acquired in `exec_request` and
     /// owned by the session's `SessionGuard` (held by its response

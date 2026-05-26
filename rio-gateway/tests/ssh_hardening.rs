@@ -319,7 +319,7 @@ async fn test_auth_publickey_offered_rejects_unknown_key() -> anyhow::Result<()>
     Ok(())
 }
 
-// r[verify gw.conn.session-cap]
+// r[verify gw.conn.session-cap+2]
 /// The global session cap rejects the over-limit EXEC (clean
 /// `channel_failure`), never the channel OPEN (which would corrupt a
 /// ControlMaster client), and the cap is shared across connections:
@@ -400,7 +400,7 @@ async fn test_global_session_cap_rejects_exec_cleanly() -> anyhow::Result<()> {
 }
 
 // r[verify gw.conn.channel-limit+3]
-// r[verify gw.conn.session-cap]
+// r[verify gw.conn.session-cap+2]
 /// The headline regression test for the ControlMaster incident: 32
 /// concurrent `nix-daemon --stdio` sessions multiplexed onto ONE SSH
 /// connection must ALL be admitted under the default limits. Under the
@@ -857,7 +857,7 @@ async fn spawn_blockable_proxy(
     Ok((addr, block, task))
 }
 
-// r[verify gw.conn.session-cap]
+// r[verify gw.conn.session-cap+2]
 // r[verify gw.conn.exit-status+3]
 /// bug_001: a protocol session that ends SERVER-side (handshake timeout
 /// here; opcode-idle timeout and protocol errors exit through the same
