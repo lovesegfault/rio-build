@@ -158,7 +158,7 @@ pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
 /// `try_substitute` may block on — a single ghc-9.8.4 (1.9 GB) fetch
 /// legitimately takes minutes. The fetch runs OUTSIDE the actor loop,
 /// so a long timeout here doesn't head-of-line block.
-/// r[sched.substitute.detached+4]
+/// r[sched.substitute.detached+5]
 pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Re-mint cadence for `dispatch::SubstituteAuth` inside

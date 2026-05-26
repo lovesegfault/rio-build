@@ -185,7 +185,7 @@ db_str_enum! {
         /// `QueryPathInfo` (which triggers store-side `try_substitute`)
         /// for this derivation's outputs. Dependents stay gated (NOT
         /// Completed/Skipped); the spawned task posts `SubstituteComplete`
-        /// when done. r[sched.substitute.detached+4]
+        /// when done. r[sched.substitute.detached+5]
         Substituting = "substituting",
         Completed = "completed",
         Failed = "failed",
@@ -392,7 +392,7 @@ impl DerivationStatus {
             // race a prior Queued→Ready promotion — matches
             // DependencyFailed precedent at completion.rs).
             (Self::Queued | Self::Ready, Self::Skipped) => true,
-            // r[impl sched.substitute.detached+4]
+            // r[impl sched.substitute.detached+5]
             // Detached upstream fetch: spawned from any pre-dispatch
             // state (merge-time) or Ready (dispatch-time). Completed →
             // fetch landed; Ready/Queued → fetch failed, fall through
@@ -898,20 +898,28 @@ pub struct DerivationState {
     pub topdown_pruned: bool,
     /// Output paths that have already triggered a forgiven-seed-became-
     /// wanted DOWNGRADE of a substitute completion for this node
-    /// (`handle_substitute_complete`). A path in this set is NEVER
-    /// included in a later walk's forgivable set for this node, no
-    /// matter how the live effective wanted set shrinks (a build goes
-    /// terminal) or re-grows (a new build merges) between walks. This
-    /// is what keeps the downgrade → re-spawn chain monotone and
-    /// terminating: each downgrade permanently consumes at least one of
-    /// the node's finitely many declared outputs, so a node can take at
-    /// most |declared outputs| downgrades per substitution chain.
+    /// (`handle_substitute_complete`) **within the current substitution
+    /// chain**. A path in this set is never included in a later walk's
+    /// forgivable set for the rest of that chain, no matter how the
+    /// live effective wanted set shrinks (a build goes terminal) or
+    /// re-grows (a new build merges) between walks. This is what keeps
+    /// the downgrade → re-spawn chain monotone and terminating: each
+    /// downgrade permanently consumes at least one of the node's
+    /// finitely many declared outputs, so a chain can take at most
+    /// |declared outputs| downgrades.
     ///
-    /// Cleared when a chain ends in success (the ok=true arm of
-    /// `handle_substitute_complete` — no re-spawn follows, so clearing
-    /// cannot re-open a loop); a resubmit-reset rebuilds the node state
-    /// from scratch (fresh empty set) and `rollback_merge` restores the
-    /// removed node wholesale, so the set never outlives the node
+    /// The set's lifetime is the chain's, not the node's: it survives
+    /// only the chain's own re-spawns (the immediate downgrade
+    /// re-spawn and the deferred next-pass delta re-walk) and is
+    /// cleared whenever the chain ends — the ok=true completion, the
+    /// genuine-failure (ok=false) revert, the topdown fail-fast, an
+    /// accepted worker-build verdict after a from-source routing, and
+    /// the inline store-batch completion. A stale entry surviving into
+    /// a LATER chain would veto forgiving a path no live build wants
+    /// any more and demote a fully-substitutable node to a from-source
+    /// build. A resubmit-reset rebuilds the node state from scratch
+    /// (fresh empty set) and `rollback_merge` restores the removed
+    /// node wholesale, so the set also never outlives the node
     /// lifetime it was accumulated in. In-mem only — never persisted;
     /// recovery resets `Substituting` nodes through the dep-walk anyway
     /// (same recovery semantics as `substitute_tried`).
@@ -2285,7 +2293,7 @@ mod tests {
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),
-            // Detached upstream fetch (r[sched.substitute.detached+4])
+            // Detached upstream fetch (r[sched.substitute.detached+5])
             (Created, Substituting),
             (Queued, Substituting),
             (Ready, Substituting),

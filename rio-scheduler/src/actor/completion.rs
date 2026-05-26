@@ -806,6 +806,20 @@ impl DagActor {
             return;
         }
 
+        // Any accepted worker verdict ends whatever substitution chain
+        // preceded this dispatch: the node can only be Assigned/Running
+        // here, so no walk is in flight and no deferred delta re-walk is
+        // pending. The chain that left it dispatchable from source (the
+        // forgiven-now-wanted downgrade whose newly-wanted path probed as
+        // not substitutable, so no further walk ever ran) is over — clear
+        // the chain-scoped spent-forgiveness set so a LATER substitution
+        // chain for this node (a stale-Completed reset after GC, an
+        // I-094 reprobe) starts with a clean slate instead of vetoing
+        // forgiveness of a path no live build wants any more.
+        if let Some(s) = self.dag.node_mut(drv_hash) {
+            s.never_forgive_paths.clear();
+        }
+
         match status {
             rio_proto::types::BuildResultStatus::Built
             | rio_proto::types::BuildResultStatus::Substituted

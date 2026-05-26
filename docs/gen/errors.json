@@ -1090,7 +1090,7 @@
       "name": "Saturated",
       "crate": "rio-store",
       "msg": "substitute admission saturated; retry (transient)",
-      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — caller retries per `r[sched.substitute.detached+4]`."
+      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — caller retries per `r[sched.substitute.detached+5]`."
     },
     {
       "enum": "ChunkError",

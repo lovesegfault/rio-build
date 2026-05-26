@@ -931,7 +931,7 @@ submitted after the failover record contributions as usual).
   compile-time caught, not silently-zero.
 ]
 
-#r("sched.substitute.detached+4")[
+#r("sched.substitute.detached+5")[
   The upstream-substitute fetch MUST run outside the actor event loop. Awaiting
   it inline blocks `MergeDag`/dispatch for the duration of the slowest closure
   walk --- a single ghc-sized NAR (1.9 GB) exceeds the 30s `grpc_timeout` and
@@ -956,7 +956,11 @@ submitted after the failover record contributions as usual).
   without consuming the retry budget: logged, not counted as a fetch
   failure. A path recorded in the node's never-forgive set --- one whose
   forgiveness already triggered a forgiven-now-wanted downgrade of a
-  completed walk --- MUST NOT be forgiven in later walks of that node.
+  completed walk --- MUST NOT be forgiven in later walks of the
+  substitution chain that recorded it; the set is cleared when that chain
+  ends in any way (success, the genuine-failure demotion to a from-source
+  build, or completion through a non-substitution path), so a walk of a
+  later chain MAY forgive the path again once no live build wants it.
   The store substitutes ONE path per
   call (no recursion), so this BFS is the only place the runtime closure can be
   completed. `Substituting` is NOT terminal (`all_deps_completed` returns false

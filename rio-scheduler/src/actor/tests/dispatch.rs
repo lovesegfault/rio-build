@@ -2995,7 +2995,7 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// `SubstituteComplete{ok=false}` sets `substitute_tried` so the next
 /// dispatch pass falls through to a worker instead of re-spawning the
 /// fetch every Tick (~1/s livelock when FMP HEAD says substitutable
@@ -3052,7 +3052,7 @@ async fn substitute_ok_false_suppresses_respawn() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// `walk_substitute_closure` may ingest the seed (output) then fail on
 /// a ref → `ok=false` → `substitute_tried=true`. The seed is now in
 /// PG. Next-tick FMP probes OUTPUT paths only, sees present, and
@@ -3671,7 +3671,7 @@ fn seed_with_refs(store: &rio_test_support::grpc::MockStore, path: &str, refs: &
     store.seed(info, nar);
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// `walk_substitute_closure` MUST walk transitively. Diamond:
 /// A → [B, C]; B → [D]; C → [D]. All four end up in `state.paths`
 /// (warm) so the layer-batched `BatchQueryPathInfo` fast-path covers
@@ -3723,7 +3723,7 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// A reference miss MUST set ok=false (not silently truncate). A is
 /// seeded substitutable (per-path QPI returns it with refs=[B]); B is
 /// nowhere → batch returns None for B AND per-path QPI returns
@@ -3888,7 +3888,7 @@ fn counter_series(
     (total, labels)
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// A wanted seed whose `SubstitutePath` returns `NotFound` twice and
 /// then succeeds must be FETCHED, not demoted: every path in the walk
 /// was HEAD-probed as available minutes earlier or named in a narinfo
@@ -3960,7 +3960,7 @@ async fn walk_retries_not_found_then_succeeds() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// A wanted seed that returns `NotFound` on EVERY attempt exhausts the
 /// retry ladder and only then demotes: ok=false, exactly
 /// `SUBSTITUTE_FETCH_MAX_ATTEMPTS` attempts, and ONE
@@ -4233,7 +4233,7 @@ async fn walk_forgiveness_does_not_extend_to_references() -> TestResult {
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// End-to-end forgiveness: a derivation classified as
 /// pending-substitute whose UNWANTED seed fails the upstream GET must
 /// still complete (the walk forgives the unwanted seed); the same
@@ -4316,7 +4316,7 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// The substitute walk's forgivable-seed set × the LIVE effective wanted
 /// set: a declared output path is forgivable only when NO LIVE build
 /// wants it. Build A wants ALL outputs (the empty sentinel) and saturates
@@ -4423,7 +4423,7 @@ async fn substitute_forgivable_set_follows_live_builds_effective_wanted(
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// An UNRESOLVABLE wanted set (non-empty but matching no declared
 /// output name — a `drv^bogus` root the gateway didn't validate) must
 /// not invert the forgiveness gate. The wanted subset resolves to
@@ -4479,7 +4479,7 @@ async fn substitute_walk_unresolvable_wanted_set_forgives_nothing() -> TestResul
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// The forgivable set is snapshotted at spawn time, but a detached
 /// fetch can run for minutes — a second build merging during that
 /// window can grow the node's wanted union to include an output the
@@ -4548,7 +4548,7 @@ async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> Test
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// Once a forgiven seed has triggered a downgrade (it became wanted
 /// mid-fetch), it must NEVER be treated as forgivable again for that
 /// node — even if the build that wanted it later goes terminal. Without
@@ -4680,7 +4680,7 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
 
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.merge.substitute-topdown+4]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// topdown-pruned CHILDLESS root: the dependency closure was dropped
 /// from the submission, so the generic revert (childless ⇒ vacuously
@@ -4805,7 +4805,7 @@ async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// node whose dependency is Poisoned (the I-094 reprobe lane):
 /// `revert_target_for` says DependencyFailed and the generic revert's
@@ -4927,7 +4927,271 @@ async fn substitute_downgrade_with_poisoned_dep_reattempts_delta_before_failing_
     Ok(())
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.substitute.detached+5]
+/// Spent forgiveness is scoped to the substitution chain that spent it,
+/// not to the node's DAG lifetime. A downgrade-bearing chain that ends
+/// in a from-source build must NOT leave its trigger path vetoed for a
+/// LATER, unrelated substitution chain of the same node: once the
+/// outputs are GC'd and a stale-Completed reset spawns a fresh walk,
+/// no live build wants the path any more, so the new walk must forgive
+/// its absence and complete the node by substitution — not burn the
+/// failure and demote to a from-source dispatch even though every
+/// output a live build wants was just substituted.
+///
+/// Staging: build B wants {out}; walk 1 forgives P_debug; build C
+/// (wanting {debug}) merges mid-fetch → the completion is downgraded
+/// and P_debug's forgiveness is spent (chain 1). The next pass re-walks
+/// with the corrected forgivable set; P_debug is genuinely absent → the
+/// walk fails → the node demotes and is built from source (chain 1 is
+/// over). The outputs are then GC'd, B/C are terminal, and build D
+/// (wanting only {out}) merges: the stale-Completed verify resets the
+/// node and spawns a NEW chain. P_out is substitutable; P_debug is
+/// absent and unwanted — the new walk must forgive it.
+#[tokio::test]
+async fn substitute_spent_forgiveness_is_chain_scoped_not_node_scoped() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("nfg-cs-out");
+    let dbg = test_store_path("nfg-cs-debug");
+    // P_out: substitutable (probe + GET agree). P_debug: indeterminate
+    // at probe time (so re-walks keep being spawned optimistically);
+    // its GET always fails with a non-retryable Internal — genuinely
+    // absent upstream for the whole test.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store.state.indeterminate.write().unwrap().push(dbg.clone());
+    store
+        .faults
+        .fail_qpi_internal_paths
+        .write()
+        .unwrap()
+        .insert(dbg.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("nfg-cs-drv");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // One x86_64 worker: drives dispatch passes and (later) takes the
+    // from-source build that ends chain 1.
+    let mut wrx = connect_executor(&handle, "nfg-cs-w", "x86_64-linux").await?;
+
+    // Chain 1, walk 1: build B wants only {out} → forgivable={P_debug},
+    // parked at the QPI gate. (Keep the event receivers alive — the
+    // orphan-watcher cancels unwatched Active builds in tests.)
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    wait_for_status(&handle, "nfg-cs-drv", DerivationStatus::Substituting).await;
+
+    // Build C merges mid-fetch and wants {debug}.
+    let build_c = Uuid::new_v4();
+    let _ev_c = merge_dag(&handle, build_c, vec![mk(&["debug"])], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Release walk 1: P_out substitutes, P_debug fails and is forgiven
+    // against the spawn-time forgivable set → ok=true forgiven=[P_debug]
+    // → the handler downgrades (C wants it now) and spends P_debug's
+    // forgiveness for this chain.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    settle_substituting(&handle, &["nfg-cs-drv"]).await;
+    assert_eq!(
+        expect_drv(&handle, "nfg-cs-drv").await.status,
+        DerivationStatus::Ready,
+        "precondition: the downgraded completion reverts to Ready for \
+         re-substitution of the delta"
+    );
+
+    // Chain 1, walk 2: the next pass re-walks with the corrected
+    // forgivable set; P_debug (now wanted by C, and unforgivable) is
+    // genuinely absent → the walk fails → demote for a from-source
+    // dispatch. Chain 1's substitution attempts end here.
+    send_heartbeat(&handle, "nfg-cs-w", "x86_64-linux").await?;
+    settle_substituting(&handle, &["nfg-cs-drv"]).await;
+    assert!(
+        expect_drv(&handle, "nfg-cs-drv").await.substitute_tried,
+        "precondition: the corrected re-walk must have run and failed \
+         (one-shot from-source fall-through set)"
+    );
+
+    // Chain 1 ends from source: the node dispatches to the worker,
+    // which builds and reports both outputs; B and C complete.
+    send_heartbeat(&handle, "nfg-cs-w", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut wrx).await;
+    assert!(
+        assignment.drv_path.ends_with("nfg-cs-drv.drv"),
+        "from-source dispatch should target the staged drv, got {}",
+        assignment.drv_path
+    );
+    complete_ca(
+        &handle,
+        "nfg-cs-w",
+        "nfg-cs-drv",
+        &[
+            ("out", out.as_str(), vec![0u8; 32]),
+            ("debug", dbg.as_str(), vec![0u8; 32]),
+        ],
+    )
+    .await?;
+    assert_eq!(
+        expect_drv(&handle, "nfg-cs-drv").await.status,
+        DerivationStatus::Completed,
+        "precondition: the node completed from source"
+    );
+
+    // Later: the outputs are GC'd from the store (P_out stays
+    // substitutable upstream) and a NEW build D — wanting only {out} —
+    // merges the same drv. The stale-Completed verify resets the node
+    // and spawns a fresh substitution chain. No live build wants
+    // P_debug (B and C are terminal), so the new walk must forgive its
+    // absence: P_out is re-substituted and the node completes.
+    store.state.paths.write().unwrap().remove(&out);
+    let build_d = Uuid::new_v4();
+    let _ev_d = merge_dag(&handle, build_d, vec![mk(&["out"])], vec![], false).await?;
+    settle_substituting(&handle, &["nfg-cs-drv"]).await;
+
+    assert_eq!(
+        expect_drv(&handle, "nfg-cs-drv").await.status,
+        DerivationStatus::Completed,
+        "a path whose forgiveness was spent in an EARLIER, finished \
+         substitution chain must be forgivable again in a later chain: \
+         nothing live wants P_debug, P_out was substituted, so the node \
+         must complete by substitution — not demote to a from-source \
+         dispatch"
+    );
+    assert_eq!(
+        query_status(&handle, build_d).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build D's wanted output was substituted; it must complete"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.substitute.detached+5]
+/// Same chain-scoping property as the test above, but chain 1 ends
+/// through the OTHER non-substitution completion path: after the
+/// downgrade, the build that wanted the trigger path is cancelled, so
+/// the next pass finds every live-wanted output already present and
+/// completes the node inline from the store — the delta re-walk never
+/// runs. The spent-forgiveness bookkeeping must not survive that
+/// completion into a later substitution chain.
+#[tokio::test]
+async fn substitute_inline_store_completion_clears_spent_forgiveness() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("nfg-ic-out");
+    let dbg = test_store_path("nfg-ic-debug");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store.state.indeterminate.write().unwrap().push(dbg.clone());
+    store
+        .faults
+        .fail_qpi_internal_paths
+        .write()
+        .unwrap()
+        .insert(dbg.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("nfg-ic-drv");
+        // aarch64 with only an x86_64 worker connected: the node can
+        // never dispatch from source, so the final state isolates the
+        // walk verdict (mirrors the oscillation test).
+        n.system = "aarch64-linux".into();
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // x86_64 worker: heartbeat-driven dispatch passes only.
+    let _wrx = connect_executor(&handle, "nfg-ic-w", "x86_64-linux").await?;
+
+    // Chain 1: B wants {out} → walk 1 (forgivable={P_debug}) parks at
+    // the gate; C (wanting {debug}) merges mid-fetch; release → the
+    // completion is downgraded and P_debug's forgiveness is spent.
+    // (Keep the event receivers alive — the orphan-watcher cancels
+    // unwatched Active builds in tests.)
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    wait_for_status(&handle, "nfg-ic-drv", DerivationStatus::Substituting).await;
+    let build_c = Uuid::new_v4();
+    let _ev_c = merge_dag(&handle, build_c, vec![mk(&["debug"])], vec![], false).await?;
+    barrier(&handle).await;
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    settle_substituting(&handle, &["nfg-ic-drv"]).await;
+    assert_eq!(
+        expect_drv(&handle, "nfg-ic-drv").await.status,
+        DerivationStatus::Ready,
+        "precondition: the downgraded completion reverts to Ready"
+    );
+
+    // C goes terminal before any re-walk: the only live demand is B's
+    // {out}, which walk 1 already fetched — the next pass completes the
+    // node inline from the store; the delta re-walk never runs.
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: build_c,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: cancel_tx,
+        })
+        .await?;
+    assert!(cancel_rx.await??, "cancel C");
+    send_heartbeat(&handle, "nfg-ic-w", "x86_64-linux").await?;
+    assert_eq!(
+        expect_drv(&handle, "nfg-ic-drv").await.status,
+        DerivationStatus::Completed,
+        "precondition: every live-wanted output is present locally — the \
+         node completes inline from the store (chain 1 is over)"
+    );
+
+    // Later: P_out is GC'd and build D (wanting only {out}) merges. The
+    // stale-Completed verify spawns a NEW chain; nothing live wants
+    // P_debug, so it must be forgiven and the node must complete by
+    // substitution.
+    store.state.paths.write().unwrap().remove(&out);
+    let build_d = Uuid::new_v4();
+    let _ev_d = merge_dag(&handle, build_d, vec![mk(&["out"])], vec![], false).await?;
+    settle_substituting(&handle, &["nfg-ic-drv"]).await;
+
+    assert_eq!(
+        expect_drv(&handle, "nfg-ic-drv").await.status,
+        DerivationStatus::Completed,
+        "spent forgiveness must not survive an inline store completion \
+         into a later substitution chain: P_debug is unwanted now, its \
+         absence must be forgiven, and the node must complete by \
+         substitution instead of demoting to a from-source dispatch"
+    );
+    assert_eq!(
+        query_status(&handle, build_d).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build D's wanted output was substituted; it must complete"
+    );
+    Ok(())
+}
+
+// r[verify sched.substitute.detached+5]
 /// Cold path: A is NOT in `state.paths` (batch returns None) but IS
 /// in `state.substitutable` (per-path QPI materializes it with
 /// refs=[B]); B is seeded warm. Asserts the absent→QPI→push-refs arm
@@ -5033,7 +5297,7 @@ async fn walk_substitute_closure_progress_monotone_and_bounded() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached+4]
+// r[verify sched.substitute.detached+5]
 /// merged_001: a hostile upstream returning > `MAX_SUBSTITUTE_CLOSURE`
 /// references on a SINGLE path must trip the per-path cap check
 /// immediately — not after the next BFS layer. Without the per-insert-

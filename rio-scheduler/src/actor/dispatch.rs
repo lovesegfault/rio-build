@@ -657,7 +657,7 @@ impl DagActor {
         // queued Tick doesn't reap the fleet on a slow store.
         self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
-        // r[impl sched.substitute.detached+4]
+        // r[impl sched.substitute.detached+5]
         // Partition: locally-present (not in missing_paths) → complete
         // inline; substitutable → spawn detached fetch; truly-missing →
         // leave Ready (dispatches normally). The detached fetch runs
@@ -775,7 +775,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+4]
+    // r[impl sched.substitute.detached+5]
     /// Transition each candidate to `Substituting` and spawn a
     /// background task that triggers store-side `try_substitute` (via
     /// `QueryPathInfo`) for its output paths AND their transitive
@@ -1017,7 +1017,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+4]
+    // r[impl sched.substitute.detached+5]
     /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
     /// detached fetch task. `ok=true` → output now in rio-store with
     /// its full reference closure ([`walk_substitute_closure`] walked
@@ -1194,6 +1194,11 @@ impl DagActor {
             // node is reaped on the next sweep.
             if let Some(s) = self.dag.node_mut(drv_hash) {
                 s.substitute_tried = true;
+                // The chain ends here (terminal fail-fast): drop the
+                // chain-scoped spent-forgiveness bookkeeping so it
+                // cannot leak into a later substitution chain for this
+                // node (e.g. after a resubmit re-probes it).
+                s.never_forgive_paths.clear();
                 if let Err(e) = s.transition(DerivationStatus::Queued) {
                     warn!(%drv_hash, %e, "topdown-fail: Substituting→Queued rejected");
                 }
@@ -1255,15 +1260,23 @@ impl DagActor {
         // (fail-fast / epilogue). Terminates: every downgrade first
         // adds its trigger paths to `never_forgive_paths` (above), and
         // a path in that set is excluded from every later walk's
-        // forgivable set for this node — so it can never be reported
-        // forgiven (and trigger another downgrade) again, regardless of
-        // how the live effective wanted set shrinks (a build goes
-        // terminal) and re-grows (a new build merges) between walks.
-        // The trigger paths were forgivable, hence not yet in the set,
-        // so each downgrade strictly grows it — the walk chain takes at
-        // most |declared outputs| downgrades, and the set only resets
-        // when the chain itself ends (successful completion, or the
-        // node is reset/removed by a resubmit-reset or rollback).
+        // forgivable set within this chain — so it can never be
+        // reported forgiven (and trigger another downgrade) again,
+        // regardless of how the live effective wanted set shrinks (a
+        // build goes terminal) and re-grows (a new build merges)
+        // between walks. The trigger paths were forgivable, hence not
+        // yet in the set, so within one chain the set only grows
+        // between re-spawns and the chain takes at most |declared
+        // outputs| downgrades. The set does NOT persist past the
+        // chain: it is cleared at every chain ending (the ok=true
+        // completion, the genuine-failure revert below, the topdown
+        // fail-fast above, a worker-build verdict after a from-source
+        // routing, an inline store completion, or the node being
+        // reset/removed) — only this re-spawn and the deferred
+        // next-pass delta re-walk retain it. A NEW chain requires an
+        // external event (a later dispatch-pass or merge-time
+        // classification spawning a fresh walk), which re-establishes
+        // the same per-chain bound rather than re-opening this one.
         //
         // The in-memory revert to `to` only satisfies the transition
         // table (there is no Substituting→Substituting); PG keeps
@@ -1313,6 +1326,23 @@ impl DagActor {
         // above.)
         if !forgiven_now_wanted {
             state.substitute_tried = true;
+        }
+        // Chain-scope bookkeeping: the only way this chain continues
+        // past this arm is that deferred delta re-substitution — the
+        // downgrade reverting to Ready/Queued WITHOUT the one-shot
+        // flag, so the next pass re-walks and `never_forgive_paths`
+        // must survive into that walk. Every other way out ends the
+        // chain (a genuine failure routes to a from-source build via
+        // the one-shot flag; DependencyFailed is terminal), so the
+        // spent-forgiveness set is cleared: leaking it into a LATER
+        // substitution chain for this node (a stale-Completed reset, a
+        // resubmit re-probe) would veto forgiving a path no live build
+        // wants any more and turn a fully-substitutable node into a
+        // from-source dispatch.
+        if !(forgiven_now_wanted
+            && matches!(to, DerivationStatus::Ready | DerivationStatus::Queued))
+        {
+            state.never_forgive_paths.clear();
         }
         if let Err(e) = state.transition(to) {
             warn!(%drv_hash, %e, "SubstituteComplete fail: revert rejected");
@@ -1478,7 +1508,7 @@ impl DagActor {
                     self.complete_ready_from_store(drv_hash).await;
                     return true;
                 }
-                // r[impl sched.substitute.detached+4] — spawn instead of
+                // r[impl sched.substitute.detached+5] — spawn instead of
                 // awaiting eager_substitute_fetch in the actor loop.
                 // r[impl sched.merge.substitute-probe-indeterminate]
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
@@ -1553,6 +1583,16 @@ impl DagActor {
                       "store-hit Ready→Completed rejected; dispatching instead");
                 continue;
             }
+            // An inline store completion ends any substitution chain
+            // that left this node Ready (the forgiven-now-wanted
+            // downgrade reverts to Ready for a delta re-walk; if the
+            // wanting build goes terminal first, the next pass lands
+            // here instead of re-walking). The spent-forgiveness set is
+            // chain-scoped — clear it so a LATER chain (e.g. a stale-
+            // Completed reset after GC) starts with a clean slate
+            // instead of vetoing forgiveness of a path no live build
+            // wants any more.
+            state.never_forgive_paths.clear();
             // IA-only convenience: `expected_output_paths` IS the
             // realised path. Non-destructive when a path is already
             // known — the floating-CA reprobe→re-substitute lane
@@ -2678,7 +2718,7 @@ impl DagActor {
     }
 }
 
-// r[impl sched.substitute.detached+4]
+// r[impl sched.substitute.detached+5]
 /// Auth source for the detached substitute closure walk.
 ///
 /// `Service` holds `(signer, tenant_id)` and re-mints a fresh
