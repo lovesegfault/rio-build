@@ -354,19 +354,25 @@ pub(crate) fn is_input_materialization_failure(
     let stripped = ANSI.replace_all(error_msg, "");
     // nix-daemon's input-stat path emits one of several phrasings
     // depending on which libutil helper failed (`lstat`/`stat`/
-    // `getFileType`/`readDirectory`):
+    // `getFileType`/`readDirectory`/`execve`):
     //   • "getting attributes of path '<p>': <strerror>"  (lstat)
     //   • "getting status of '<p>': <strerror>"            (stat)
     //   • "reading directory '<p>': <strerror>"            (readdir)
     //   • "opening file '<p>': <strerror>"                 (open)
+    //   • "executing '<p>': <strerror>"                    (execve)
     // I-189: matching only the first missed `getting status of`. All
-    // four indicate the same materialization failure when `<p>` is a
-    // closure input. Closure ≤ ~2k entries; linear scan is fine.
+    // of these indicate the same materialization failure when `<p>` is a
+    // closure input. The execve phrasing is what the live P0560 canary
+    // produced when the castore lower returned EIO on the builder
+    // binary's very first read — the sandbox had already bind-mounted
+    // the inputs (no stat failed), so the first failing syscall was the
+    // exec itself. Closure ≤ ~2k entries; linear scan is fine.
     const MARKERS: &[&str] = &[
         "getting attributes of path '",
         "getting status of '",
         "reading directory '",
         "opening file '",
+        "executing '",
     ];
     let Some(rest) = MARKERS.iter().find_map(|m| stripped.split(m).nth(1)) else {
         return false;
@@ -374,17 +380,23 @@ pub(crate) fn is_input_materialization_failure(
     let Some(path) = rest.split('\'').next() else {
         return false;
     };
-    // Basename match: the daemon reports the overlay path (I-178b); the
-    // closure has store paths. Both end in `<hash>-<name>`. An empty
-    // basename (trailing slash — shouldn't happen, but defensive) must
-    // not vacuously match every closure entry.
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    if basename.is_empty() {
+    // Membership by path COMPONENT: the daemon may quote the store path
+    // itself, the overlay-mounted copy of it (I-178b:
+    // `/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), or a file
+    // INSIDE the input (the execve phrasing quotes
+    // `<hash>-<name>/bin/sh`). In every form the closure entry's
+    // `<hash>-<name>` basename appears as one path component, and the
+    // nixbase32 hash makes a coincidental match practically impossible.
+    // An empty component list (shouldn't happen, but defensive) must not
+    // vacuously match every closure entry.
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if components.is_empty() {
         return false;
     }
-    input_paths
-        .iter()
-        .any(|p| p.rsplit('/').next().unwrap_or(p) == basename)
+    input_paths.iter().any(|p| {
+        let basename = p.rsplit('/').next().unwrap_or(p);
+        !basename.is_empty() && components.contains(&basename)
+    })
 }
 
 #[cfg(test)]
@@ -466,6 +478,27 @@ mod tests {
                 "marker {marker:?} must reclassify"
             );
         }
+
+        // P0560 canary phrasing (literal shape): the castore lower EIO'd
+        // on the builder binary's first read, so the first failing
+        // syscall was the daemon's execve of the (closure-input) builder
+        // — no stat phrasing in sight, and the quoted path is a file
+        // INSIDE the input (`<input>/bin/sh`), so the component-based
+        // membership check is what catches it. Must reclassify; a
+        // transient FUSE/store blip at exec time would otherwise poison
+        // the derivation.
+        let exec_eio = format!("error: executing '{input}/bin/sh': Input/output error");
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, &exec_eio, &closure),
+            "execve EIO on a file inside a closure input must reclassify"
+        );
+        // ...but an exec failure of a non-closure path (the build's own
+        // script interpreter missing, exit-127 style) stays permanent.
+        let exec_foreign = "error: executing '/usr/bin/python3': No such file or directory";
+        assert!(
+            !is_input_materialization_failure(Nix::MiscFailure, exec_foreign, &closure),
+            "execve failure outside the closure must NOT reclassify"
+        );
 
         // MiscFailure + path NOT in closure → false (genuine missing
         // dep — leave as PermanentFailure).
