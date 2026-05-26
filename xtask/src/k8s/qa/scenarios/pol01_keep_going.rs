@@ -37,9 +37,11 @@ use crate::k8s::shared;
 /// (`infra/helm/rio-build/values.yaml` → `gateway.buildPolicy.qa-keep-going`).
 const TENANT: &str = "qa-keep-going";
 
-/// Derivation statuses that end the PG poll. Mirrors the scheduler's
-/// terminal set; 'cancelled' is what the fail-fast sweep leaves behind
-/// when keep_going is NOT applied.
+/// Derivation statuses that end the PG poll. A deliberate SUPERSET of
+/// the scheduler's terminal set: 'failed' is retryable server-side, but
+/// a failed row won't progress without a resubmit, so waiting it out
+/// gains nothing here. 'cancelled' is what the fail-fast sweep leaves
+/// behind when keep_going is NOT applied.
 const TERMINAL: &[&str] = &[
     "completed",
     "failed",
@@ -146,16 +148,21 @@ impl Scenario for KeepGoingPolicy {
         let build = smoke::build_expr(&expr, &store).await;
         match &build {
             Ok(()) => tracing::warn!("pol01: nix build succeeded — fail leaf did not fail?"),
-            Err(e) => tracing::info!("pol01: nix build failed as expected: {e:#}"),
+            Err(e) => tracing::info!(
+                "pol01: nix build returned an error (non-zero exit is expected once the fail \
+                 leaf fails): {e:#}"
+            ),
         }
 
-        // 5. PG: the slow leaf must have been allowed to finish. Poll
-        //    briefly — with keep_going applied the build only returns
-        //    once every drv is terminal, but a fail-fast return (or a
-        //    status-persist lag) can hand control back while the row is
-        //    still moving.
+        // 5. PG: the slow leaf must have been allowed to finish. Poll —
+        //    with keep_going applied the build only returns once every
+        //    drv is terminal, but a fail-fast return (or a status-persist
+        //    lag) can hand control back while the row is still moving.
         let slow_pat = format!("%rio-qa-pol01-slow-{nonce}%");
-        let deadline = Instant::now() + Duration::from_secs(90);
+        // 180s: a cold builder spawn can take 40-90s before the ~30s slow
+        // leaf even starts, plus status-persist headroom — budget for the
+        // tail, not the typical case (the 420s scenario budget has room).
+        let deadline = Instant::now() + Duration::from_secs(180);
         let slow_status: Option<String> = loop {
             let row = sqlx::query(
                 "SELECT status FROM derivations WHERE drv_path LIKE $1 \
