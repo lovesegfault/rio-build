@@ -220,16 +220,21 @@ let
   # them. Worker is the only component that needs fuse/mount at
   # runtime, but the aggregate must be a superset of every component.
   #
-  # sandboxShell: a static busybox `sh` exposed at /bin/sh inside every
-  # build sandbox (RIO_SANDBOX_SHELL). nixpkgs builds assume /bin/sh
-  # exists; the native executor bind-mounts this store path read-only
-  # into each sandbox.
-  sandboxShell = "${pkgs.pkgsStatic.busybox}/bin/sh";
+  # sandboxShell: the minimal static ash (`busybox-sandbox-shell`) exposed
+  # at /bin/sh inside every build sandbox (RIO_SANDBOX_SHELL). nixpkgs
+  # builds assume /bin/sh exists; the native executor bind-mounts this
+  # store path read-only into each sandbox. This is the same shell CppNix
+  # uses for its sandbox and the one the differential parity gate runs
+  # both arms with — keeping production identical to what the gate
+  # validates (and avoiding the full multi-call busybox's extra applets
+  # being reachable through /bin/sh argv[0] dispatch).
+  sandboxShell = "${pkgs.busybox-sandbox-shell}/bin/busybox";
 
   builderExtraContents = [
     pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
     pkgs.util-linuxMinimal # mount, umount for overlay teardown
-    pkgs.pkgsStatic.busybox # static /bin/sh for the build sandbox (RIO_SANDBOX_SHELL)
+    pkgs.busybox-sandbox-shell # minimal static ash for the build sandbox (RIO_SANDBOX_SHELL)
+    pkgs.pkgsStatic.busybox # in-image /bin/sh + utilities (debugging/exec); NOT the sandbox shell
 
     # The worker process runs as root and the sandbox writes its own
     # /etc/passwd inside each chroot; the image-level stubs only serve

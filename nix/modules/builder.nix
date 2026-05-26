@@ -83,8 +83,10 @@ in
           RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
           RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;
           RIO_METRICS_ADDR = cfg.metricsAddr;
-          # Static /bin/sh exposed inside every build sandbox.
-          RIO_SANDBOX_SHELL = "${pkgs.pkgsStatic.busybox}/bin/sh";
+          # Minimal static ash exposed as /bin/sh inside every build sandbox —
+          # the same busybox-sandbox-shell CppNix uses and the differential
+          # parity gate validates.
+          RIO_SANDBOX_SHELL = "${pkgs.busybox-sandbox-shell}/bin/busybox";
           # CA bundle mounted into network (fixed-output) sandboxes.
           RIO_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         }
