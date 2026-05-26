@@ -1146,8 +1146,13 @@ async fn run_native_lifecycle(
         max_silent: (opts.max_silent_time > 0).then(|| Duration::from_secs(opts.max_silent_time)),
         // Log-volume limits stay with the LogBatcher (bytes) and the
         // NixLogFilter (lines) so the native path keeps the daemon-era
-        // semantics exactly; rio-exec's own byte cap stays off.
-        max_log_bytes: None,
+        // semantics exactly. rio-exec's raw-byte cap is a backstop set
+        // well above the batcher cap: it can only fire for output the
+        // line pipeline never sees (a newline-free flood), which would
+        // otherwise accumulate in worker memory outside the build
+        // cgroup. 0 (= unlimited) keeps the backstop off too.
+        max_log_bytes: (env.log_limits.total_bytes > 0)
+            .then(|| env.log_limits.total_bytes.saturating_mul(2)),
         cgroup: Some(cgroup_kill_path.clone()),
         hashed_mirrors: sandbox_cfg.hashed_mirrors.clone(),
         builder_binary: std::env::current_exe().ok(),

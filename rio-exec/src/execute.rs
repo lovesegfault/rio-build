@@ -559,29 +559,27 @@ impl Drop for KillGuard {
 
 /// Kill the sandbox process tree, once.
 ///
-/// Prefers `cgroup.kill` (kills every process in the cgroup, including
-/// fork bombs the parent has never heard of). Without a cgroup, SIGKILL
-/// the intermediate: its death SIGKILLs the sandbox child through
+/// Writes `cgroup.kill` when a cgroup was given (kills every process in
+/// the cgroup, including fork bombs the parent has never heard of) and
+/// then always SIGKILLs the intermediate directly: the tree may not be
+/// in the cgroup at all — the `cgroup.procs` attach is itself a step
+/// that can fail, and its abort path runs through here — and a cgroup
+/// the executor cannot write to must not leak the tree either. The
+/// intermediate's death SIGKILLs the sandbox child through
 /// `PR_SET_PDEATHSIG`, and the sandbox child is pid 1 of the PID
-/// namespace, so the kernel then kills everything else in it. The
-/// no-cgroup path is meant for tests; production callers pass a cgroup.
+/// namespace, so the kernel then kills everything else in it.
 fn kill_tree(cgroup: Option<&Path>, pid: nix::unistd::Pid, armed: &AtomicBool) {
     // swap(false): only the first caller acts, and never after the
     // waitpid task has reaped the pid (it clears the flag).
     if !armed.swap(false, Ordering::AcqRel) {
         return;
     }
-    // Fall through to the pid kill when the cgroup write fails: a
-    // cgroup the caller passed but the executor cannot write to is an
-    // infrastructure problem, but leaking the tree would be worse than
-    // the imprecise pid kill.
-    if let Some(cgroup) = cgroup
-        && std::fs::write(cgroup.join("cgroup.kill"), "1").is_ok()
-    {
-        return;
+    if let Some(cgroup) = cgroup {
+        let _ = std::fs::write(cgroup.join("cgroup.kill"), "1");
     }
     // SAFETY: SIGKILL to a pid this executor forked and has not reaped
-    // (the armed flag guards the reaped case).
+    // (the armed flag above guards the reaped/recycled-pid case); a pid
+    // already dying from the cgroup kill ignores the extra signal.
     unsafe {
         libc::kill(pid.as_raw(), libc::SIGKILL);
     }
@@ -855,10 +853,22 @@ fn read_status_pipe(fd: OwnedFd) -> StatusReport {
     }
 }
 
+/// Cap on a single un-terminated line accumulating in [`LineSplitter`].
+///
+/// A program that streams bytes without ever emitting `\n` (`base64
+/// -w0`, a binary dumped to stdout, a deliberate flood) would otherwise
+/// grow the pending buffer without bound — memory charged to the
+/// executor process, outside the build cgroup's accounting. When the
+/// cap is reached the accumulated bytes are emitted as a (partial) line
+/// so they flow through the normal event pipeline and whatever
+/// log-volume limits the caller enforces there.
+const MAX_PENDING_LINE_BYTES: usize = 1 << 20;
+
 /// Accumulates raw chunks per stream and emits complete lines as
 /// [`ExecEvent::Log`]s. Lines are split on `\n`; a trailing `\r` (pty
 /// raw mode passes through the `\r\n` the line discipline would have
-/// produced) is stripped.
+/// produced) is stripped. A line that reaches [`MAX_PENDING_LINE_BYTES`]
+/// without a terminator is emitted in chunks of that size.
 #[derive(Default)]
 struct LineSplitter {
     pending: Vec<(LogStream, Vec<u8>)>,
@@ -885,6 +895,12 @@ impl LineSplitter {
                 });
             } else {
                 buf.push(*byte);
+                if buf.len() >= MAX_PENDING_LINE_BYTES {
+                    events.push(ExecEvent::Log {
+                        stream,
+                        line: std::mem::take(buf),
+                    });
+                }
             }
         }
         events
@@ -1029,6 +1045,43 @@ mod tests {
         assert_eq!(output_host_path(&req, Path::new("/elsewhere")), None);
     }
 
+    // -- kill_tree -----------------------------------------------------------
+
+    #[test]
+    fn kill_tree_kills_the_pid_even_when_the_cgroup_write_succeeds() {
+        // A plain tempdir stands in for a cgroup directory whose
+        // `cgroup.kill` write succeeds without killing anything — the
+        // exact shape of the failed-attach abort path, where the tree
+        // was never attached to the cgroup. The pid kill must still
+        // happen or the caller deadlocks awaiting the reap.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        let armed = AtomicBool::new(true);
+        kill_tree(Some(tmp.path()), pid, &armed);
+        assert_eq!(
+            std::fs::read(tmp.path().join("cgroup.kill")).expect("cgroup.kill written"),
+            b"1",
+            "the cgroup write itself happened (and succeeded)"
+        );
+        let start = Instant::now();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "child survived kill_tree despite the successful cgroup write"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
     // -- LineSplitter --------------------------------------------------------
 
     fn lines(events: Vec<ExecEvent>) -> Vec<(LogStream, Vec<u8>)> {
@@ -1039,6 +1092,30 @@ mod tests {
                 ExecEvent::Started { .. } => panic!("unexpected Started"),
             })
             .collect()
+    }
+
+    #[test]
+    fn line_splitter_bounds_unterminated_lines() {
+        let mut s = LineSplitter::default();
+        // 2.5 caps worth of newline-free output: the splitter must emit
+        // two full chunks and keep only the remainder pending.
+        let blob = vec![b'a'; MAX_PENDING_LINE_BYTES * 2 + MAX_PENDING_LINE_BYTES / 2];
+        let events = s.push(LogStream::Merged, &blob);
+        let emitted = lines(events);
+        assert_eq!(emitted.len(), 2, "two forced flushes at the cap");
+        assert!(
+            emitted
+                .iter()
+                .all(|(_, l)| l.len() == MAX_PENDING_LINE_BYTES)
+        );
+        let (_, pending) = s
+            .pending
+            .iter()
+            .find(|(stream, _)| *stream == LogStream::Merged)
+            .expect("pending entry");
+        assert_eq!(pending.len(), MAX_PENDING_LINE_BYTES / 2);
+        // The remainder still flushes at EOF.
+        assert!(s.flush().is_some());
     }
 
     #[test]
