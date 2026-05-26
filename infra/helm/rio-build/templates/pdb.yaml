@@ -28,8 +28,11 @@ spec:
 
 {{- $g := .Values.gateway }}
 {{- /* Gate on the effective floor — minReplicas under autoscaling, the
-       static replicas otherwise — the same expression as gateway.yaml's
-       anti-affinity gate. Keying on the static `replicas` would skip
+       static replicas otherwise. Deliberately NOT the ceiling that
+       gateway.yaml's anti-affinity gate keys on: a minAvailable-1 PDB
+       against a 1-pod floor would block every node drain, while
+       anti-affinity costs nothing at 1 pod and must hold whenever KEDA
+       may scale past it. Keying on the static `replicas` would skip
        the PDB for replicas=1 + autoscaling-on (≥2 KEDA-managed pods
        left unprotected) and render a drain-blocking PDB for replicas=2
        + minReplicas=1 (minAvailable=1 against a single pod). */}}

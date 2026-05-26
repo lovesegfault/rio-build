@@ -111,7 +111,7 @@ pub struct Config {
     /// [`crate::server::DEFAULT_MAX_SESSIONS`]. Set via
     /// `RIO_MAX_SESSIONS`.
     pub max_sessions: usize,
-    /// Per-connection SSH channel bound (`r[gw.conn.channel-limit+3]`).
+    /// Per-connection SSH channel bound (`r[gw.conn.channel-limit+4]`).
     /// An absurdity detector for channel-leaking or hostile clients,
     /// not a resource bound — that is `max_sessions`. Default
     /// [`crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION`] (512 —

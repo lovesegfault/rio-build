@@ -112,7 +112,7 @@
         "default": 4096
       },
       "max_channels_per_connection": {
-        "description": "Per-connection SSH channel bound (`r[gw.conn.channel-limit+3]`).\nAn absurdity detector for channel-leaking or hostile clients,\nnot a resource bound — that is `max_sessions`. Default\n[`crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION`] (512 —\na 128-core CI machine running nix-fast-build behind one\nControlMaster with 4× headroom). Set via\n`RIO_MAX_CHANNELS_PER_CONNECTION`.",
+        "description": "Per-connection SSH channel bound (`r[gw.conn.channel-limit+4]`).\nAn absurdity detector for channel-leaking or hostile clients,\nnot a resource bound — that is `max_sessions`. Default\n[`crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION`] (512 —\na 128-core CI machine running nix-fast-build behind one\nControlMaster with 4× headroom). Set via\n`RIO_MAX_CHANNELS_PER_CONNECTION`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0,

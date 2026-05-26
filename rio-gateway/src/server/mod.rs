@@ -80,14 +80,15 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 
 /// Default per-connection SSH channel bound
-/// (`r[gw.conn.channel-limit+3]`). An absurdity detector, not a
+/// (`r[gw.conn.channel-limit+4]`). An absurdity detector, not a
 /// resource bound: an attacker distributes sessions across the
 /// [`DEFAULT_MAX_CONNECTIONS`] allowed connections, so only the global
 /// [`DEFAULT_MAX_SESSIONS`] semaphore bounds pod memory. 512 covers a
 /// 128-core CI machine running nix-fast-build behind one ControlMaster
 /// with 4× headroom; its real job is stopping a burst of CHANNEL_OPENs
 /// with no exec (each allocates a russh channel-table entry but no
-/// ChannelSession) from growing without bound. Configurable via
+/// ChannelSession) from growing without bound — a connection that
+/// tries to exceed it is terminated. Configurable via
 /// `gateway.toml max_channels_per_connection`.
 pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 
