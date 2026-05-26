@@ -454,11 +454,17 @@ impl SandboxPlan {
         let uid = req.isolation.uid;
         let gid = req.isolation.gid;
         let cwd_str = req.cwd.display();
+        // The build user/group are named `nixbld`, matching the entries
+        // CppNix synthesizes inside its sandbox: the name is observable
+        // via `whoami` / `id -un` / `id -gn` / getpwuid and gets baked
+        // into some outputs ("built by" banners, perl's Config.pm), so
+        // it is part of the de-facto sandbox ABI rather than a free
+        // choice.
         files.push(PlannedFile {
             host_path: layout.chroot_dir.join("etc/passwd"),
             contents: format!(
                 "root:x:0:0:root:{cwd_str}:/noshell\n\
-                 builder:x:{uid}:{gid}:build user:{cwd_str}:/noshell\n\
+                 nixbld:x:{uid}:{gid}:Nix build user:{cwd_str}:/noshell\n\
                  nobody:x:65534:65534:nobody:/:/noshell\n"
             )
             .into_bytes(),
@@ -469,7 +475,7 @@ impl SandboxPlan {
             host_path: layout.chroot_dir.join("etc/group"),
             contents: format!(
                 "root:x:0:\n\
-                 builder:x:{gid}:\n\
+                 nixbld:!:{gid}:\n\
                  nogroup:x:65534:\n"
             )
             .into_bytes(),
@@ -821,7 +827,7 @@ mod tests {
             .find(|f| f.host_path.ends_with("etc/passwd"))
             .expect("passwd planned");
         let text = String::from_utf8(passwd.contents.clone()).expect("passwd is utf8");
-        assert!(text.contains("builder:x:1000:100:build user:/build:/noshell\n"));
+        assert!(text.contains("nixbld:x:1000:100:Nix build user:/build:/noshell\n"));
         assert!(text.contains("root:x:0:0:"));
         assert!(text.contains("nobody:x:65534:65534:"));
         assert_eq!(passwd.mode, 0o444);
@@ -833,7 +839,7 @@ mod tests {
             .find(|f| f.host_path.ends_with("etc/group"))
             .expect("group planned");
         let text = String::from_utf8(group.contents.clone()).expect("group is utf8");
-        assert!(text.contains("builder:x:100:\n"));
+        assert!(text.contains("nixbld:!:100:\n"));
         assert!(text.contains("nogroup:x:65534:\n"));
     }
 

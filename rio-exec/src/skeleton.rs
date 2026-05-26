@@ -83,7 +83,11 @@ pub(crate) fn build(plan: &mut SandboxPlan) -> io::Result<()> {
     // `PlannedBind::nested`). The stat on the source is the single
     // point that resolves optional binds and file-vs-directory targets.
     for bind in &mut plan.binds {
-        let meta = match fs::metadata(&bind.source) {
+        // lstat, not stat: a source whose root is itself a symlink must
+        // be detected as such rather than resolved against the *host*
+        // namespace — its target is typically a sandbox-absolute
+        // /nix/store path that does not exist on the host at all.
+        let meta = match fs::symlink_metadata(&bind.source) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound && bind.optional => {
                 bind.skipped = true;
@@ -96,6 +100,85 @@ pub(crate) fn build(plan: &mut SandboxPlan) -> io::Result<()> {
                 ));
             }
         };
+        // A source whose root is itself a symlink cannot be carried in
+        // as one by `mount(2)` — the kernel resolves the source path,
+        // and it resolves it against the *host* namespace.
+        //
+        // - Host-resolvable symlink (e.g. a sandbox shell `sh ->
+        //   busybox` living next to its target in the image): keep the
+        //   established behavior — placeholder from the resolved
+        //   target, bind mount resolves identically.
+        // - Host-unresolvable symlink (a store path whose target only
+        //   exists inside the sandbox store: the linkFarm /
+        //   `ln -s ${dep} $out` shape): CppNix `doBind` parity —
+        //   recreate an identical symlink inside the chroot and skip
+        //   the mount. The link target is part of the input closure,
+        //   so it resolves inside the sandbox even though it never
+        //   resolves on the host. Nested ones need nothing at all —
+        //   the enclosing mount's source already contains them.
+        if meta.file_type().is_symlink() {
+            match fs::metadata(&bind.source) {
+                Ok(resolved) => {
+                    if !bind.nested {
+                        let target = root.join(
+                            bind.target
+                                .strip_prefix("/")
+                                .expect("bind targets are validated absolute"),
+                        );
+                        if resolved.is_dir() {
+                            ensure_dir(&target, 0o755)?;
+                        } else {
+                            ensure_file(&target, &[], 0o444)?;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if !bind.nested {
+                        let link_target = fs::read_link(&bind.source).map_err(|e| {
+                            annotate(
+                                e,
+                                format_args!("readlink bind source {}", bind.source.display()),
+                            )
+                        })?;
+                        let target = root.join(
+                            bind.target
+                                .strip_prefix("/")
+                                .expect("bind targets are validated absolute"),
+                        );
+                        match fs::symlink_metadata(&target) {
+                            Ok(_) => fs::remove_file(&target).map_err(|e| {
+                                annotate(e, format_args!("remove stale {}", target.display()))
+                            })?,
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                return Err(annotate(
+                                    e,
+                                    format_args!("lstat {}", target.display()),
+                                ));
+                            }
+                        }
+                        std::os::unix::fs::symlink(&link_target, &target).map_err(|e| {
+                            annotate(
+                                e,
+                                format_args!(
+                                    "symlink {} -> {}",
+                                    target.display(),
+                                    link_target.display()
+                                ),
+                            )
+                        })?;
+                    }
+                    bind.skipped = true;
+                }
+                Err(e) => {
+                    return Err(annotate(
+                        e,
+                        format_args!("stat bind source {}", bind.source.display()),
+                    ));
+                }
+            }
+            continue;
+        }
         if bind.nested {
             continue;
         }
@@ -332,7 +415,7 @@ mod tests {
     fn writes_the_etc_files_and_locks_etc() {
         let (_tmp, chroot, _plan) = build_in_tempdir(&["tool"]);
         let passwd = fs::read_to_string(chroot.join("etc/passwd")).expect("passwd");
-        assert!(passwd.contains("builder:x:"));
+        assert!(passwd.contains("nixbld:x:"));
         let hosts = fs::read_to_string(chroot.join("etc/hosts")).expect("hosts");
         assert!(hosts.contains("127.0.0.1 localhost"));
         assert_eq!(mode_of(&chroot.join("etc")), 0o555, "etc locked last");
@@ -394,6 +477,89 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_symlink_source_is_recreated_as_a_symlink_and_not_mounted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src_root = tmp.path().join("sources");
+        fs::create_dir_all(src_root.join("build")).expect("mkdir build source");
+        fs::write(src_root.join("tool"), b"#!/bin/sh\n").expect("write tool source");
+        // A store-path-shaped input whose root is a symlink to a
+        // sandbox-absolute path that does not exist on the host (the
+        // linkFarm / `ln -s ${dep} $out` shape).
+        let dep = "/nix/store/00000000000000000000000000000000-dep";
+        std::os::unix::fs::symlink(dep, src_root.join("link")).expect("symlink source");
+        let mut req = request(&src_root);
+        req.mounts.push(Mount {
+            source: src_root.join("link"),
+            target: PathBuf::from("/opt/link"),
+            writable: false,
+            optional: false,
+        });
+        let chroot = tmp.path().join("chroot");
+        let mut plan = SandboxPlan::compile(
+            &req,
+            &HostLayout {
+                chroot_dir: chroot.clone(),
+            },
+        )
+        .expect("plan compiles");
+        build(&mut plan).expect("skeleton builds despite the host-unresolvable symlink");
+        let bind = plan
+            .binds
+            .iter()
+            .find(|b| b.target == Path::new("/opt/link"))
+            .expect("bind planned");
+        assert!(
+            bind.skipped,
+            "host-unresolvable symlink sources are not mounted"
+        );
+        assert_eq!(
+            fs::read_link(chroot.join("opt/link")).expect("recreated as a symlink"),
+            Path::new(dep)
+        );
+    }
+
+    #[test]
+    fn resolvable_symlink_source_keeps_the_bind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src_root = tmp.path().join("sources");
+        fs::create_dir_all(src_root.join("build")).expect("mkdir build source");
+        fs::write(src_root.join("tool"), b"#!/bin/sh\n").expect("write tool source");
+        // `sh -> tool` next to its target, like a busybox-style sandbox
+        // shell: the host resolves it, so the established resolve+bind
+        // behavior must be preserved for it.
+        std::os::unix::fs::symlink(src_root.join("tool"), src_root.join("sh")).expect("symlink");
+        let mut req = request(&src_root);
+        req.mounts.push(Mount {
+            source: src_root.join("sh"),
+            target: PathBuf::from("/opt/sh"),
+            writable: false,
+            optional: false,
+        });
+        let chroot = tmp.path().join("chroot");
+        let mut plan = SandboxPlan::compile(
+            &req,
+            &HostLayout {
+                chroot_dir: chroot.clone(),
+            },
+        )
+        .expect("plan compiles");
+        build(&mut plan).expect("skeleton builds");
+        let bind = plan
+            .binds
+            .iter()
+            .find(|b| b.target == Path::new("/opt/sh"))
+            .expect("bind planned");
+        assert!(
+            !bind.skipped,
+            "resolvable symlink sources still get bind-mounted"
+        );
+        assert!(
+            chroot.join("opt/sh").is_file(),
+            "placeholder is a regular file from the resolved target"
+        );
+    }
+
+    #[test]
     fn required_bind_with_missing_source_is_an_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let src_root = tmp.path().join("sources");
@@ -431,7 +597,7 @@ mod tests {
         build(&mut plan).expect("second build converges");
         assert_eq!(mode_of(&chroot.join("etc")), 0o555);
         let passwd = fs::read_to_string(chroot.join("etc/passwd")).expect("passwd");
-        assert!(passwd.contains("builder:x:"));
+        assert!(passwd.contains("nixbld:x:"));
     }
 
     #[test]
@@ -468,6 +634,6 @@ mod tests {
             "the planted link is replaced by a regular file"
         );
         let passwd = fs::read_to_string(etc.join("passwd")).expect("passwd");
-        assert!(passwd.contains("builder:x:"));
+        assert!(passwd.contains("nixbld:x:"));
     }
 }
