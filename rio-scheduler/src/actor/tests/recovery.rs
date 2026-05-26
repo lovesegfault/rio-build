@@ -3781,3 +3781,115 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
     );
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+5]
+/// The fail-fast must CONSUME the `topdown_pruned` marker (clear it in
+/// memory and in PG) when it parks a node: the flag can be stale (a
+/// committed merge whose activation failed, a node stamped while its
+/// children were invisible to a recovered DAG, a genuinely pruned leaf
+/// that no children-adding merge ever clears), and a stale persisted
+/// flag re-arms the fail-fast after EVERY failover — wrongfully
+/// terminal-failing builds for a node that could build from source.
+///
+/// Chain: failover #1 fires the fail-fast for build1 (pre-staged
+/// pruned shape, `debug` unsatisfiable) → the marker must now be false
+/// in memory and in PG → build2 resubmits the same drv (fresh
+/// single-node merge) → failover #2 recovers it childless again → the
+/// node must NOT be fail-fasted a second time: build2 stays alive and
+/// the node dispatches from source to the connected worker.
+#[tokio::test]
+async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_source() -> TestResult {
+    let out = test_store_path("ffc-root-out");
+    let dbg = test_store_path("ffc-root-debug");
+    let mk_node = || {
+        let mut n = make_node("ffc-root");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = vec![];
+        n
+    };
+
+    let db = TestDb::new(&MIGRATOR).await;
+    // `out` substitutable upstream; `debug` missing and not
+    // substitutable for the whole test — the all-declared wanted union
+    // is never satisfiable by substitution, so the node is exactly the
+    // "could build from source" case the stale flag would wrongly kill.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    // Phase 1: stage the post-prune persisted shape for build1.
+    let build1 = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        merge_dag(&handle, build1, vec![mk_node()], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    sqlx::query(
+        "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+         WHERE drv_hash = 'ffc-root'",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // Phase 2 (failover #1): the dispatch-time probe finds `debug`
+    // definitively missing → fail-fast fires for build1.
+    let (handle2, task2) = setup_actor_with_store(db.pool.clone(), Some(store_client.clone()));
+    handle2.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle2).await;
+    tick(&handle2).await?;
+    assert_eq!(
+        query_status(&handle2, build1).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "fixture premise: failover #1 fail-fasts build1"
+    );
+    // The marker is consumed by the fail-fast — in memory and in PG.
+    assert!(
+        !expect_drv(&handle2, "ffc-root").await.topdown_pruned,
+        "fail-fast must clear the in-memory topdown_pruned marker when it parks the node"
+    );
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'ffc-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg_pruned,
+        "fail-fast must clear the persisted topdown_pruned marker (a stale row \
+         re-arms the fail-fast after every failover)"
+    );
+
+    // build2 resubmits the same drv (fresh single-node merge).
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle2, build2, vec![mk_node()], vec![], false).await?;
+    barrier(&handle2).await;
+    drop(handle2);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task2).await;
+
+    // Phase 3 (failover #2): the node recovers childless again. It must
+    // NOT be fail-fasted a second time — build2 must survive and the
+    // node must dispatch from source.
+    let (handle3, _task3) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+    handle3.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle3).await;
+    let mut rx = connect_executor(&handle3, "ffc-w", "x86_64-linux").await?;
+    tick(&handle3).await?;
+
+    let s2 = query_status(&handle3, build2).await?;
+    assert_ne!(
+        s2.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "resubmitted build must not be fail-fasted again after the next failover \
+         (stale topdown_pruned re-armed the guard); error={:?}",
+        s2.error_summary
+    );
+    let a = recv_assignment(&mut rx).await;
+    assert_eq!(
+        a.drv_path,
+        test_drv_path("ffc-root"),
+        "the resubmitted node builds from source (its closure was never pruned \
+         for build2)"
+    );
+    Ok(())
+}

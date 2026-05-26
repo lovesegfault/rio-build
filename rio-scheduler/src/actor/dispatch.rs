@@ -320,6 +320,28 @@ impl DagActor {
             return true;
         }
 
+        // r[impl sched.merge.substitute-topdown+5]
+        // Fail-open carve-out: a CHILDLESS topdown-pruned node must
+        // never be handed to a worker — its dep closure was never
+        // merged, so a from-source build is doomed (ENOENT on
+        // inputDrvs). Reaching this point still Ready means the
+        // dispatch-time probes produced no definitive verdict for it
+        // this pass (store RPC failed / timed out — every definitive
+        // outcome completes it inline, routes it to substitution, or
+        // fail-fasts it). Defer it for this pass instead of letting
+        // the generic fail-open dispatch pick it up; the next pass
+        // re-probes. All other nodes keep the existing fail-open
+        // behaviour.
+        if self.dag.node(&drv_hash).is_some_and(|s| s.topdown_pruned)
+            && self.dag.get_children(&drv_hash).is_empty()
+        {
+            debug!(%drv_hash,
+                   "childless topdown-pruned node has no store verdict this pass; \
+                    deferring instead of dispatching from source");
+            ctx.deferred.push(drv_hash);
+            return false;
+        }
+
         // Intent-match (worker spawned FOR this drv) first, else
         // best_executor over the kind-matching pool.
         match self.find_executor(&drv_hash) {
@@ -1408,12 +1430,34 @@ impl DagActor {
             // cannot leak into a later substitution chain for this
             // node (e.g. after a resubmit re-probes it).
             s.never_forgive_paths.clear();
+            // The fail-fast CONSUMES the pruned marker (here and, best-
+            // effort, in PG below). The flag can be stale: a merge
+            // transaction that committed but whose build activation
+            // failed leaves it on shared rows; a node stamped while its
+            // existing children were invisible (recovery drops edges to
+            // completed children) reads as "childless" again after the
+            // next failover; and a genuinely pruned leaf is never
+            // cleared by a children-adding merge. Left in place, a
+            // stale flag re-arms this fail-fast after EVERY failover
+            // and wrongfully terminal-fails builds for a node that
+            // could build from source. Clearing loses nothing: after
+            // the park there is no surviving interest, and a
+            // resubmitted genuinely-pruned root either re-prunes
+            // (re-stamped) or full-merges (children ⇒ cleared).
+            s.topdown_pruned = false;
             if let Err(e) = s.transition(DerivationStatus::Queued) {
                 warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
             }
         }
         self.persist_status(drv_hash, DerivationStatus::Queued, None)
             .await;
+        // Best-effort PG counterpart of the in-memory clear above. A
+        // failure costs at most one more wrongful fail-fast cycle after
+        // a later failover — never fail the actor command over it.
+        if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
+            warn!(%drv_hash, error = %e,
+                  "failed to clear persisted topdown_pruned after fail-fast (continuing)");
+        }
         for build_id in self.get_interested_builds(drv_hash) {
             if let Some(build) = self.builds.get_mut(&build_id) {
                 build.error_summary.get_or_insert_with(|| msg.clone());

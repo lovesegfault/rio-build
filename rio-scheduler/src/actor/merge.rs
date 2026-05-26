@@ -429,24 +429,46 @@ impl DagActor {
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
         // PRE-EXISTING nodes that rollback_merge does not revert (it is
-        // not tracked in MergeResult, and the only clearing site
-        // requires the node to have children) — stamping before the
-        // fallible cache-check / persist steps would leak a rejected
-        // build's prune verdict onto a shared childless node, and a
-        // later routine SubstituteComplete{ok=false} for that node
-        // would take the fail-fast arm and terminally fail innocent
-        // builds. Nothing reads the flag between dag.merge and this
-        // point: its only consumer is handle_substitute_complete, and
-        // detached fetches are spawned in reconcile_merged_state, after
-        // this returns. Idempotent if a kept node pre-existed in the
-        // DAG. handle_substitute_complete reads this on
-        // SubstituteComplete{ok=false} and fails the build instead of
-        // dispatching (deps were dropped — worker would ENOENT).
+        // not tracked in MergeResult, and no clearing site runs between
+        // a rejected merge's rollback and a later fetch failure) —
+        // stamping before the fallible cache-check / persist steps
+        // would leak a rejected build's prune verdict onto a shared
+        // childless node, and a later routine SubstituteComplete{ok=
+        // false} for that node would take the fail-fast arm and
+        // terminally fail innocent builds. Nothing reads the flag
+        // between dag.merge and this point: its consumers are
+        // handle_substitute_complete and the dispatch-time probes,
+        // neither of which can run inside this handler — detached
+        // fetches are spawned in reconcile_merged_state and dispatch
+        // passes run on later commands, both after this returns.
+        //
+        // Only nodes that are CHILDLESS in the global DAG right now are
+        // stamped: a kept node that already has children from an
+        // earlier full merge has its deps in the DAG, does not need the
+        // "must complete via substitution" guard, and stamping it would
+        // only manufacture the stale flag the fail-fast clear has to
+        // mop up. Mirrors the row-level bind in persist_merge_to_db.
         if topdown_fired {
             for n in &nodes {
-                if let Some(s) = self.dag.node_mut(&n.drv_hash) {
+                if self.dag.get_children(&n.drv_hash).is_empty()
+                    && let Some(s) = self.dag.node_mut(&n.drv_hash)
+                {
                     s.topdown_pruned = true;
                 }
+            }
+        }
+        // The inverse: any node that gained children in THIS merge no
+        // longer carries the childless-pruned invariant — its deps are
+        // in the DAG now. Clear the in-memory flag to mirror the PG
+        // clear that ran in the edge-insert transaction
+        // (clear_topdown_pruned_for_parents); the lazy children-gated
+        // clear in handle_substitute_complete stays as a backstop. A
+        // pruned merge has no edges, so this is a no-op there.
+        for e in &edges {
+            if let Some(hash) = self.dag.hash_for_path(&e.parent_drv_path).cloned()
+                && let Some(s) = self.dag.node_mut(&hash)
+            {
+                s.topdown_pruned = false;
             }
         }
 
@@ -475,7 +497,14 @@ impl DagActor {
     /// every persisted node is a kept node — its row gets
     /// `topdown_pruned = true` inside the persist transaction (the
     /// failover-safe counterpart of the post-commit in-memory stamp in
-    /// `validate_and_ingest`).
+    /// `validate_and_ingest`), gated on the node being childless in the
+    /// DAG.
+    ///
+    /// Known window: if the derivations transaction commits but the
+    /// Pending→Active write below fails, the rolled-back build's prune
+    /// marker stays persisted on (possibly shared) childless rows; the
+    /// topdown fail-fast clears the marker it consumes, which is the
+    /// recovery path for such stale flags.
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
@@ -1672,10 +1701,16 @@ impl DagActor {
                     wanted_output_names: node.wanted_output_names.clone(),
                     // On a pruned merge every persisted node is a kept
                     // (demanded) node whose dep closure was dropped —
-                    // mark it so the guard survives leader failover.
+                    // mark it so the guard survives leader failover,
+                    // but only when it is CHILDLESS in the global DAG
+                    // right now: a kept node with children from an
+                    // earlier full merge has its deps in the DAG and
+                    // must not carry the marker (mirrors the in-memory
+                    // stamp gate in validate_and_ingest).
                     // OR-on-conflict upsert: a later non-pruned merge
                     // of the same drv (false here) never clears it.
-                    topdown_pruned: topdown_fired,
+                    topdown_pruned: topdown_fired
+                        && self.dag.get_children(&node.drv_hash).is_empty(),
                 }
             })
             .collect();
@@ -1732,12 +1767,17 @@ impl DagActor {
         // Batch 3b: any node that just gained children (it is the
         // parent of an edge inserted above) no longer needs the
         // topdown_pruned guard — its deps are now in the DAG, so a
-        // from-source dispatch is no longer doomed. Clear the persisted
-        // marker in the SAME transaction as the edges so PG can never
-        // hold "pruned" + "has children" across a failover (the
-        // in-memory analogue is the children-gate clear in
-        // `handle_substitute_complete`). A pruned merge has no edges,
-        // so this is a no-op there.
+        // from-source dispatch is no longer doomed. Clearing in the
+        // SAME transaction as the edges guarantees a failover never
+        // observes THIS merge's edges without its clear. It does NOT
+        // make "pruned ∧ has-children" impossible in PG outright —
+        // edges written by other merges (e.g. to children that have
+        // since completed and dropped out of recovery's edge loading)
+        // can coexist with a stale flag, which the fail-fast clear
+        // mops up. In-memory analogues: the post-commit edge-parent
+        // clear in `validate_and_ingest` and the children-gate clear
+        // in `handle_substitute_complete`. A pruned merge has no
+        // edges, so this is a no-op there.
         let mut edge_parents: Vec<Uuid> = edge_rows.iter().map(|(p, _)| *p).collect();
         edge_parents.sort_unstable();
         edge_parents.dedup();

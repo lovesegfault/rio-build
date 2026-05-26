@@ -4807,6 +4807,68 @@ async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+5]
+/// Fail-open carve-out: when the dispatch-time store probe errors out
+/// (RPC failure / timeout), every other Ready node keeps the existing
+/// fail-open behaviour and dispatches — but a CHILDLESS topdown-pruned
+/// node must not: without a definitive verdict it can neither be
+/// completed inline, routed to substitution, nor fail-fasted, and a
+/// from-source dispatch is the known-likely-doomed case the guard
+/// exists to prevent. It must be deferred for this pass (left
+/// Ready/Queued for the next probe), with no WorkAssignment sent.
+#[tokio::test]
+async fn topdown_pruned_childless_node_not_dispatched_when_probe_fails_open() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Merge while the store is healthy (nothing substitutable) so the
+    // node simply seeds Ready; no worker yet, so nothing dispatches.
+    let mut node = make_node("tdfo-r");
+    node.expected_output_paths = vec![test_store_path("tdfo-r-out")];
+    let build_id = Uuid::new_v4();
+    // Hold the event receiver: the test-build orphan watcher (zero
+    // grace) auto-cancels an unwatched Active build on the second Tick.
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Stage the post-prune / post-failover shape (childless + flagged),
+    // then break the probe: FindMissingPaths now returns Unavailable.
+    assert!(handle.debug_set_topdown_pruned("tdfo-r", true).await?);
+    store
+        .faults
+        .fail_find_missing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // A builder is available — the fail-open dispatch has somewhere to
+    // go if the carve-out is missing.
+    let mut rx = connect_executor(&handle, "tdfo-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+    tick(&handle).await?;
+
+    // No WorkAssignment for the flagged childless node on a fail-open
+    // pass.
+    while let Ok(m) = rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a childless topdown-pruned node must not be dispatched from source \
+             on a fail-open (probe error) pass"
+        );
+    }
+    // The node is merely deferred — still schedulable once the store
+    // answers again — and the build is still alive.
+    let d = expect_drv(&handle, "tdfo-r").await;
+    assert!(
+        matches!(d.status, DerivationStatus::Ready | DerivationStatus::Queued),
+        "deferred node should stay Ready/Queued for the next probe; got {:?}",
+        d.status
+    );
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "fail-open deferral must not fail the build"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+5]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a

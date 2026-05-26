@@ -262,10 +262,14 @@ impl SchedulerDb {
     /// transaction). A node with children no longer needs the
     /// "must complete via substitution" guard — its deps are in the
     /// DAG, so a from-source dispatch is no longer doomed. Run in the
-    /// SAME transaction as `batch_insert_edges` so the flag and the
-    /// edges can never disagree across a failover (mirrors the
-    /// in-memory clear in `handle_substitute_complete`, which is gated
-    /// on `get_children().is_empty()`).
+    /// SAME transaction as `batch_insert_edges`, so a failover can
+    /// never observe THIS merge's edges without its clear. (That is
+    /// the whole guarantee: a row may still carry the flag alongside
+    /// edges written by other merges — e.g. edges to already-completed
+    /// children that recovery no longer loads — which is why the
+    /// fail-fast also clears the flag it consumed.) Mirrors the
+    /// in-memory clear at merge time and the lazy children-gated clear
+    /// in `handle_substitute_complete`.
     pub(crate) async fn clear_topdown_pruned_for_parents(
         tx: &mut PgConnection,
         derivation_ids: &[Uuid],
@@ -281,6 +285,30 @@ impl SchedulerDb {
         )
         .bind(derivation_ids)
         .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Best-effort single-row `topdown_pruned` clear, keyed by
+    /// `drv_hash`, outside any transaction. Used by the topdown
+    /// fail-fast when it parks a node: the marker it just consumed must
+    /// not survive in PG, or the next leader restores it onto a
+    /// childless node and the fail-fast re-arms after every failover.
+    /// Callers treat an error as warn-and-continue — the in-memory
+    /// clear already happened and the build verdict must not depend on
+    /// this write.
+    pub(crate) async fn clear_topdown_pruned_by_hash(
+        &self,
+        drv_hash: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE derivations SET topdown_pruned = false, updated_at = now()
+            WHERE drv_hash = $1 AND topdown_pruned
+            "#,
+        )
+        .bind(drv_hash)
+        .execute(&self.pool)
         .await?;
         Ok(())
     }
