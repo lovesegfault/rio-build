@@ -68,8 +68,10 @@ pkgs.testers.runNixOSTest {
   # Boot + worker registration (~60s) + ~9 builds (~30s each: hmac +
   # tenant-resolve×3 + jwt-dual-mode×2 + rate-limit×3) + 3 gateway
   # restarts (tenant keys, rate-limit config, rate-limit teardown) +
-  # metric scrapes. Margin for CI jitter.
-  globalTimeout = 900 + common.covTimeoutHeadroom;
+  # metric scrapes, plus the anon-submission negative case which only
+  # fails after the scheduler exhausts max_infra_retries on the
+  # tenant-less castore mount (~1-2 min). Margin for CI jitter.
+  globalTimeout = 1080 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -91,21 +93,34 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # SSH + tenant key setup
     # ══════════════════════════════════════════════════════════════════
-    # sshKeySetup creates id_ed25519 with -C "" (empty comment =
-    # single-tenant mode, tenant_id NULL — no rejection). seedBusybox
-    # and the HMAC build use this default key via ~/.ssh/config.
+    # The DEFAULT id_ed25519 key carries the 'team-test' comment: under
+    # the castore tenancy model every build that should SUCCEED must run
+    # as a real tenant (the assignment token's tenant claim is what the
+    # tenant-scoped castore reads authenticate with), and the seed must
+    # be attributed to that same tenant via the gateway's session JWT
+    # (store.put.tenant-attribution). The tenant row is created first —
+    # the gateway resolves the comment at SSH auth (mint) and the
+    # scheduler at SubmitBuild, and both reject unknown names.
+    tenant_uuid = psql(
+        ${gatewayHost},
+        "INSERT INTO tenants (tenant_name) VALUES ('team-test') RETURNING tenant_id",
+    )
+    ${gatewayHost}.log(f"seeded tenant team-test = {tenant_uuid}")
 
-    ${common.sshKeySetup gatewayHost}
+    ${common.sshKeySetupFor gatewayHost "team-test"}
 
     # ── THREE additional SSH keys with different comments ─────────────
     # For tenant resolution. Gateway matches by key_data, reads the
-    # MATCHED entry's comment as tenant name. All three + the default
-    # id_ed25519 go in authorized_keys.
+    # MATCHED entry's comment as tenant name. id_team_test shares the
+    # default key's tenant; id_unknown names a tenant that does not
+    # exist; id_anon has an empty comment (anonymous / single-tenant
+    # submission). All three + the default id_ed25519 go in
+    # authorized_keys.
     client.succeed("ssh-keygen -t ed25519 -N ''' -C 'team-test' -f /root/.ssh/id_team_test")
     client.succeed("ssh-keygen -t ed25519 -N ''' -C 'unknown-team' -f /root/.ssh/id_unknown")
     client.succeed("ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_anon")
 
-    # id_ed25519 already in authorized_keys from sshKeySetup; append
+    # id_ed25519 already in authorized_keys from sshKeySetupFor; append
     # the three tenant keys. Gateway reads the file at startup →
     # restart required.
     tenant_keys = client.succeed(
@@ -117,7 +132,22 @@ pkgs.testers.runNixOSTest {
     ${gatewayHost}.wait_for_open_port(2222)
 
     # ── Seed busybox (exercises gateway PutPath → HMAC bypass) ────────
+    # Pushed under the team-test session → the store writes
+    # path_tenants rows for it (store.put.tenant-attribution), which is
+    # what lets every team-test build below mount it. Pin that here.
     ${common.seedBusybox gatewayHost}
+    seed_tenant_rows = int(psql(
+        ${gatewayHost},
+        "SELECT count(*) FROM path_tenants pt "
+        "JOIN tenants t USING (tenant_id) "
+        "WHERE t.tenant_name = 'team-test'",
+    ))
+    assert seed_tenant_rows > 0, (
+        "seeded closure has no path_tenants rows for team-test — the "
+        "gateway did not attach a session JWT to the seed push (fixture "
+        "missing withJwt?) or the store did not verify it"
+    )
+    print(f"seed attributed to team-test: {seed_tenant_rows} path_tenants rows")
 
     # ══════════════════════════════════════════════════════════════════
     # Section: HMAC
@@ -238,7 +268,10 @@ pkgs.testers.runNixOSTest {
     # SSH key comment → gateway captures tenant NAME → scheduler
     # resolves to UUID via `tenants` table → `builds.tenant_id` row
     # has the resolved UUID. Unknown tenant → InvalidArgument.
-    # Empty comment → single-tenant mode (tenant_id IS NULL).
+    # Empty comment → accepted as a tenant-less submission (tenant_id
+    # IS NULL) but the BUILD fails: castore reads are tenant-scoped, so
+    # an anonymous build cannot mount its inputs — the negative test
+    # for the real-tenancy model.
 
     def build_drv(identity_file, drv_path, expect_fail=False):
         """Build via ssh-ng using the given identity file (selects the
@@ -257,19 +290,14 @@ pkgs.testers.runNixOSTest {
     def build_count():
         return int(psql(${gatewayHost}, "SELECT COUNT(*) FROM builds"))
 
-    with subtest("tenant-resolve: known / unknown / empty-comment"):
-        # ── Pre-seed the tenants table ────────────────────────────────
-        # INSERT…RETURNING via psql() helper (-qtA: suppress status,
-        # tuples-only, unaligned).
-        tenant_uuid = psql(
-            ${gatewayHost},
-            "INSERT INTO tenants (tenant_name) VALUES ('team-test') RETURNING tenant_id",
-        )
-        ${gatewayHost}.log(f"seeded tenant team-test = {tenant_uuid}")
-
+    with subtest("tenant-resolve: known / unknown / anonymous"):
+        # team-test was created (and its UUID captured) before the key
+        # setup — the gateway needs the row to exist at SSH-auth/mint
+        # time, not just at SubmitBuild time.
+        #
         # hmac-positive above ran one build via the default id_ed25519
-        # (empty comment → NULL tenant). Capture the count NOW so case
-        # deltas are relative to this baseline.
+        # (comment 'team-test'). Capture the count NOW so case deltas
+        # are relative to this baseline.
         initial_count = build_count()
         ${gatewayHost}.log(f"initial builds count: {initial_count}")
 
@@ -305,16 +333,21 @@ pkgs.testers.runNixOSTest {
         )
         print("tenant case 2 PASS: unknown tenant rejected pre-insert")
 
-        # ── Case 3: empty comment → tenant_id IS NULL ─────────────────
-        out = build_drv("/root/.ssh/id_anon", "${tenantAnonDrv}")
-        assert out.startswith("/nix/store/"), (
-            f"anon build should succeed: {out!r}"
-        )
-        assert "rio-test-sec-tenant-anon" in out, (
-            f"output path should contain drv marker: {out!r}"
-        )
+        # ── Case 3: empty comment → accepted as tenant-less, build fails
+        # at the castore mount ──────────────────────────────────────────
+        # The anonymous submission is still ACCEPTED (builds row with
+        # tenant_id IS NULL — the wire/API behavior is unchanged), but
+        # the dispatched assignment token carries no tenant claim, so
+        # the tenant-scoped castore reads reject the mount and the build
+        # fails after the scheduler exhausts its infra retries. This is
+        # the negative test for the real-tenancy model: a build that is
+        # not attributable to a tenant cannot read store content, and it
+        # fails loudly with the actionable mount error rather than
+        # silently reading another tenant's paths.
+        anon_mark = worker.succeed("date +%s").strip()
+        out = build_drv("/root/.ssh/id_anon", "${tenantAnonDrv}", expect_fail=True)
         assert build_count() == initial_count + 2, (
-            "case 3 should insert one more build"
+            "case 3 submission must still be accepted (one more builds row)"
         )
         db_tenant = psql(
             ${gatewayHost},
@@ -324,7 +357,23 @@ pkgs.testers.runNixOSTest {
         assert db_tenant == "NULL", (
             f"empty-comment key → tenant_id IS NULL, got {db_tenant!r}"
         )
-        print("tenant case 3 PASS: empty comment = single-tenant mode (NULL)")
+        # The failure is the infra-classified, actionable castore-auth
+        # error on the worker (not a derivation failure): the builder
+        # names the missing tenant claim and the scheduler retries it as
+        # an infrastructure failure until the cap poisons the drv.
+        worker.succeed(
+            f"journalctl -u rio-builder --since=@{anon_mark} | "
+            "grep -q 'rejected the castore DAG prefetch as unauthenticated'"
+        )
+        ${gatewayHost}.succeed(
+            f"journalctl -u rio-scheduler --since=@{anon_mark} | "
+            "grep -q 'infrastructure failure'"
+        )
+        print(
+            "tenant case 3 PASS: anonymous submission accepted "
+            "(tenant_id NULL) but its build fails at the tenant-scoped "
+            "castore mount with the actionable infra error"
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # Section: gateway validation
@@ -479,51 +528,44 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # Section: jwt-dual-mode (TAIL — serial after P0255's quota fragment)
     # ══════════════════════════════════════════════════════════════════
-    # Dual-mode PERMANENT. The gateway's signing_key is None in this
-    # fixture (no RIO_JWT__KEY_PATH set → JwtConfig::default() →
-    # server.rs auth_publickey takes the signing_key=None arm →
-    # jwt_token stays None → handler/build.rs skips the
-    # x-rio-tenant-token header → scheduler reads
-    # SubmitBuildRequest.tenant_name). This is the SSH-comment
-    # fallback branch. That it WORKS is what tenant-resolve above
-    # already proved; this subtest pins it SPECIFICALLY as the
-    # dual-mode fallback (not just "tenant resolution works").
+    # Dual-mode PERMANENT. This fixture now runs the MINT branch: the
+    # gateway has a signing key (withJwt — required since the castore
+    # cutover so the seed push is attributed to the tenant), so SSH auth
+    # with a tenant-named key resolves the tenant via ResolveTenant and
+    # mints a session JWT that rides every outbound call; the scheduler
+    # ALSO receives tenant_name in the SubmitBuild body, which is the
+    # permanent fallback the wire keeps for JWT-less deployments. This
+    # subtest pins that the attested identity and the body fallback
+    # cannot diverge: two builds under the same key land on the same
+    # tenant UUID — the same UUID tenant-resolve case 1 proved for the
+    # body-resolution path.
     #
-    # The JWT-issue branch (signing_key=Some → ResolveTenant RPC →
-    # mint → header inject) is covered unit-side by:
+    # The fallback-branch end-to-end (gateway WITHOUT a signing key)
+    # previously lived here; under the castore tenancy model a JWT-less
+    # gateway cannot attribute uploads, so its builds cannot mount
+    # client-pushed sources — that configuration is exercised by the
+    # k3s prod-parity lifecycle split (jwtEnabled=false, no executor
+    # builds) and by the scheduler-side unit tests:
     #   - scheduler/grpc/tests.rs::test_resolve_tenant_rpc (the RPC)
     #   - server.rs::jwt_issuance_tests (mint + token contents)
     #   - jwt_interceptor.rs tests (verify + hot-swap)
-    # WONTFIX(P0349): extending the standalone fixture with
-    # RIO_JWT__KEY_PATH was descoped — the JWT-issue branch is now
-    # covered by the k3s jwt-mount-present subtest (lifecycle.nix,
-    # P0357) + the rust unit tests above. The FALLBACK branch is the
-    # PERMANENT path that must never break — proving it here under
-    # a real gateway+scheduler+PG is the load-bearing half.
 
-    with subtest("jwt-dual-mode: fallback branch reachable, same tenant both builds"):
-        # Precondition: gateway has NO JWT config. Verify by checking
-        # the new metric stays at 0 (describe_metrics registered it,
-        # but no mint-degrade ever fires because the signing_key=None
-        # arm never attempts a mint). If this ever bumps, the fixture
-        # grew JWT config and this subtest's premise is wrong.
-        degraded = metric_value(
-            scrape_metrics(${gatewayHost}, 9090),
-            "rio_gateway_jwt_mint_degraded_total",
-        )
-        assert degraded is None or degraded == 0.0, (
-            f"precondition: fixture has no JWT config, mint-degrade "
-            f"should never fire. Got {degraded} — did fixture grow "
-            f"RIO_JWT__KEY_PATH?"
-        )
+    with subtest("jwt-dual-mode: mint branch live, same tenant both builds"):
+        # Mint-branch precondition is already pinned structurally by the
+        # prelude's seed-attribution assert: path_tenants rows for
+        # team-test can only exist when the gateway minted the session
+        # JWT and the store verified it on the seed push — there is no
+        # other writer for gateway-pushed paths. (No journal/metric
+        # check here: the mint log is debug-level and the only counter
+        # is the degrade one, which the unknown-team case legitimately
+        # bumps.)
 
         count_before = build_count()
 
         # Two builds, SAME SSH key (id_team_test, comment 'team-test'),
-        # different drvs. Both go through the fallback branch → both
-        # get SubmitBuildRequest.tenant_name='team-test' → both
-        # resolve to the SAME tenant UUID (team-test was seeded at
-        # tenant-resolve case 1 above — tenant_uuid holds it).
+        # different drvs. Both carry the minted x-rio-tenant-token AND
+        # the tenant_name body field → both resolve to the SAME tenant
+        # UUID (team-test, created before key setup — tenant_uuid).
         out_ssh = build_drv("/root/.ssh/id_team_test", "${dualSshDrv}")
         assert "rio-test-sec-dual-ssh" in out_ssh, f"wrong drv: {out_ssh!r}"
         out_jwt = build_drv("/root/.ssh/id_team_test", "${dualJwtDrv}")
@@ -547,15 +589,12 @@ pkgs.testers.runNixOSTest {
         assert both.strip("{}") == tenant_uuid, (
             f"both dual-mode builds should resolve to team-test's "
             f"UUID {tenant_uuid}; got array {both!r} (distinct values "
-            f"would mean the two branches diverge)"
+            f"would mean the attested identity and the tenant_name "
+            f"fallback diverge)"
         )
 
-        # And it's the SAME UUID as tenant-resolve case 1's build —
-        # proving the fallback path produces the same attribution
-        # whether JWT is disabled-by-config or would-be-disabled-by-
-        # mint-failure (both land in builds.tenant_id via tenant_name).
         print(
-            f"jwt-dual-mode PASS: fallback branch → both builds "
+            f"jwt-dual-mode PASS: mint branch → both builds "
             f"resolved to {tenant_uuid} (same as tenant-resolve case 1)"
         )
 
