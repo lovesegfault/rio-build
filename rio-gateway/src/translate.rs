@@ -414,9 +414,10 @@ fn populate_wanted_outputs(
 /// Checks:
 /// - `__noChroot=1` in any node's env → reject (sandbox escape)
 /// - `nodes.len() > MAX_DAG_NODES` → reject (early, before gRPC)
-/// - any output with a declared hash whose `outputHashAlgo` the builder
-///   cannot verify → reject (the FOD hash gate is fail-closed; the build
-///   could only ever fail after burning a fetcher pod)
+/// - any output declaring an `outputHash` and/or `outputHashAlgo` the
+///   builder cannot verify → reject (both the FOD hash gate and
+///   floating-CA finalization are fail-closed; the build could only
+///   ever fail after burning a pod)
 ///
 /// The scheduler ALSO enforces MAX_DAG_NODES (grpc/mod.rs:298);
 /// this is an early reject to save the gRPC round-trip for obvious
@@ -462,20 +463,22 @@ pub fn validate_dag(
         ));
     }
 
-    // Fixed-output outputs whose declared hash uses an algorithm the
-    // builder cannot verify are rejected at submission. The builder's
-    // `verify_fod_hashes` is fail-closed (it is the sole content check
-    // between an egress-open fetcher and the signed cache), so such a
-    // build can only ever fail — rejecting it here lands the error on
-    // the submitting client instead of burning a fetcher pod first.
-    // Floating-CA outputs (hash_algo set, hash empty) are not affected:
-    // they have no declared hash to verify.
+    // Outputs whose declared hash algorithm the builder cannot verify
+    // are rejected at submission. For fixed-output derivations the
+    // builder's `verify_fod_hashes` is fail-closed (it is the sole
+    // content check between an egress-open fetcher and the signed
+    // cache); for floating-CA outputs (hash_algo set, hash empty)
+    // `FloatingCaSpec::from_outputs` is equally fail-closed
+    // (`CaUnsupportedAlgo`) — but only after the build has run to
+    // completion on a builder pod. Either way the build can only ever
+    // fail, so rejecting it here lands the error on the submitting
+    // client instead of burning a pod first. Input-addressed outputs
+    // (no hash, no algo) are untouched.
     for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
-        if let Some(out) = drv
-            .outputs()
-            .iter()
-            .find(|o| !o.hash().is_empty() && !fod_algo_verifiable(o.hash_algo()))
-        {
+        if let Some(out) = drv.outputs().iter().find(|o| {
+            (!o.hash().is_empty() || !o.hash_algo().is_empty())
+                && !fod_algo_verifiable(o.hash_algo())
+        }) {
             return Err(format!(
                 "derivation {} output '{}' declares unsupported outputHashAlgo '{}' \
                  (supported: sha1, sha256, sha512, optionally 'r:'-prefixed)",
@@ -490,9 +493,11 @@ pub fn validate_dag(
 }
 
 /// True iff `algo` (`"sha256"`, `"r:sha512"`, …) is an outputHashAlgo
-/// the builder's FOD verifier can check. Mirrors rio-builder's
-/// `FodHashAlgo::from_nix_str` — the two must stay in sync, which is
-/// cheap because Nix's supported set has been fixed for years.
+/// the builder can verify/finalize. Mirrors rio-builder's
+/// `FodHashAlgo::from_nix_str` (FOD verification) and
+/// `FloatingCaSpec::from_outputs` (floating-CA finalization), which
+/// accept the same set — the three must stay in sync, which is cheap
+/// because Nix's supported set has been fixed for years.
 pub(crate) fn fod_algo_verifiable(algo: &str) -> bool {
     matches!(
         algo.strip_prefix("r:").unwrap_or(algo),
@@ -1028,10 +1033,12 @@ mod tests {
     // populates drv_cache, then drive opcodes 36 + 46 and assert
     // the failure BuildResult carries the "sandbox escape" message).
 
-    /// A FOD whose declared hash uses an algorithm the builder cannot
-    /// verify (md5) is rejected at submission; verifiable algorithms
-    /// (sha256, r:sha512) and floating-CA outputs (algo set, hash empty)
-    /// pass.
+    /// Any output declaring a hash algorithm the builder cannot handle
+    /// is rejected at submission: a FOD with an md5 hash and a
+    /// floating-CA output (algo set, hash empty) with an unsupported
+    /// algo alike. Verifiable algorithms (sha256, r:sha512) pass in
+    /// both shapes, and input-addressed outputs (no hash, no algo) are
+    /// never checked.
     #[test]
     fn validate_dag_rejects_unverifiable_fod_algo() {
         let fod_drv = |algo: &str, hash: &str| -> Derivation {
@@ -1064,10 +1071,28 @@ mod tests {
             );
         }
 
-        // Floating-CA (algo set, hash EMPTY) → accepted; there is no
-        // declared hash to verify.
+        // Floating-CA (algo set, hash EMPTY) with a supported algo →
+        // accepted.
         let mut cache = HashMap::new();
         cache.insert(key.clone(), fod_drv("r:sha256", ""));
+        assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
+
+        // Floating-CA with an algo the builder's CA finalization cannot
+        // produce (md5, blake3) → rejected at submission instead of
+        // after a full build (`CaUnsupportedAlgo` post-build otherwise).
+        for algo in ["md5", "blake3"] {
+            let mut cache = HashMap::new();
+            cache.insert(key.clone(), fod_drv(algo, ""));
+            let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+            assert!(
+                err.contains(&format!("outputHashAlgo '{algo}'")),
+                "{algo}: {err}"
+            );
+        }
+
+        // Input-addressed output (no hash, no algo) → never checked.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_drv("", ""));
         assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
     }
 

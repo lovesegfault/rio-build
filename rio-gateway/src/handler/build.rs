@@ -1188,16 +1188,17 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         );
     }
 
-    // Same early rejection for unverifiable FOD hash algorithms as
+    // Same early rejection for unverifiable hash algorithms as
     // validate_dag performs on the cached DAG: the builder's FOD hash
-    // gate is fail-closed, so an `outputHashAlgo` it cannot verify can
-    // only ever fail the build after burning a fetcher pod. The inline
-    // BasicDerivation is all we have on the single-node fallback path.
-    if let Some(out) = basic_drv
-        .outputs()
-        .iter()
-        .find(|o| !o.hash().is_empty() && !translate::fod_algo_verifiable(o.hash_algo()))
-    {
+    // gate and floating-CA finalization are both fail-closed, so an
+    // `outputHashAlgo` they cannot handle — declared with a hash (FOD)
+    // or without one (floating-CA) — can only ever fail the build after
+    // burning a pod. The inline BasicDerivation is all we have on the
+    // single-node fallback path.
+    if let Some(out) = basic_drv.outputs().iter().find(|o| {
+        (!o.hash().is_empty() || !o.hash_algo().is_empty())
+            && !translate::fod_algo_verifiable(o.hash_algo())
+    }) {
         warn!(
             drv_path = %drv_path_str,
             output = out.name(),
