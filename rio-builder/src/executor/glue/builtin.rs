@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use rio_exec::{
     ExecutionRequest, InlineFile, Isolation, Limits, Mount, OutputCapture, Personality,
 };
-use rio_nix::derivation::BasicDerivation;
+use rio_nix::derivation::{BasicDerivation, DerivationLike as _};
 
 use crate::builtin_fetchurl::env_vars;
 
@@ -53,6 +53,17 @@ pub(crate) fn prepare_fetchurl(
     paths: &SandboxPaths,
     opts: &SandboxOptions,
 ) -> Result<PreparedBuild, GlueError> {
+    // The request constructed below is the only one that grants network
+    // access, so the fixed-output requirement is enforced HERE, next to
+    // the grant, rather than in the dispatch: any future caller of this
+    // function inherits the gate. CppNix has the same requirement
+    // (builtins/fetchurl.cc rejects non-fixed-output derivations), and
+    // without it a hash-less builtin:fetchurl would run on a Builder pod
+    // with that pod's network identity and no FOD hash gate over the
+    // downloaded bytes.
+    if !drv.is_fixed_output() {
+        return Err(GlueError::BuiltinFetchurlNotFixedOutput);
+    }
     let url = drv
         .env()
         .get("url")
@@ -412,5 +423,25 @@ mod tests {
         o.builder_binary = None;
         let err = prepare_fetchurl("/nix/store/x.drv", &drv, &paths(), &o).unwrap_err();
         assert!(matches!(err, GlueError::FetchurlBuilderBinaryUnknown));
+    }
+
+    /// The fixed-output gate sits on the function that grants network:
+    /// a hash-less fetchurl derivation never produces a request at all.
+    #[test]
+    fn non_fixed_output_is_rejected_before_request_construction() {
+        let drv = BasicDerivation::new(
+            vec![DerivationOutput::new("out", OUT, "", "").unwrap()],
+            BTreeSet::new(),
+            "builtin".into(),
+            "builtin:fetchurl".into(),
+            vec![],
+            [("url", "https://example.org/src.tar.xz"), ("out", OUT)]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+        .unwrap();
+        let err = prepare_fetchurl("/nix/store/x.drv", &drv, &paths(), &opts()).unwrap_err();
+        assert!(matches!(err, GlueError::BuiltinFetchurlNotFixedOutput));
     }
 }

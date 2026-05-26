@@ -114,6 +114,21 @@ pub(crate) enum GlueError {
     #[error("builtin:fetchurl derivation has no (non-empty) `url` attribute")]
     FetchurlMissingUrl,
 
+    /// CppNix refuses to run `builtin:fetchurl` for anything but a
+    /// fixed-output derivation (`builtins/fetchurl.cc`: "'builtin:fetchurl'
+    /// must be a fixed-output derivation"). Mirroring that is also a
+    /// security boundary: the fetchurl request is the only build path that
+    /// sets `Isolation { network: true }`, and that grant must stay tied to
+    /// fixed-output-ness — otherwise a tenant could submit a hash-less
+    /// `builtin:fetchurl` derivation and use the Builder pod's network
+    /// identity for SSRF/exfiltration, with no FOD hash gate over what it
+    /// downloads.
+    #[error(
+        "builtin:fetchurl requires a fixed-output derivation \
+         (a single `out` output with outputHash/outputHashAlgo set)"
+    )]
+    BuiltinFetchurlNotFixedOutput,
+
     #[error(
         "builtin:fetchurl requires the rio-builder binary path (SandboxOptions::builder_binary) \
          to re-exec inside the sandbox"
@@ -758,6 +773,33 @@ mod tests {
             derivation_into_request(DRV, &other, &input_paths, &input_meta, &paths(), &opts())
                 .unwrap_err();
         assert!(matches!(err, GlueError::UnsupportedBuiltin { .. }));
+    }
+
+    /// A `builtin:fetchurl` derivation WITHOUT an output hash must be
+    /// rejected before any network-enabled request is constructed
+    /// (CppNix: "'builtin:fetchurl' must be a fixed-output derivation").
+    /// The network grant stays tied to fixed-output-ness.
+    #[test]
+    fn non_fixed_output_builtin_fetchurl_is_rejected() {
+        let drv = BasicDerivation::new(
+            vec![DerivationOutput::new("out", OUT, "", "").unwrap()],
+            BTreeSet::new(),
+            "builtin".into(),
+            "builtin:fetchurl".into(),
+            vec![],
+            [("url", "https://internal.metadata.host/latest")]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+        .unwrap();
+        let (input_paths, input_meta) = closure();
+        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+            .unwrap_err();
+        assert!(
+            matches!(err, GlueError::BuiltinFetchurlNotFixedOutput),
+            "expected the fixed-output gate, got: {err}"
+        );
     }
 
     #[test]
