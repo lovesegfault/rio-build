@@ -1471,6 +1471,12 @@
                   # verifies the protocol over a bounded line domain;
                   # these harnesses verify the per-decision arithmetic
                   # over the full u64 domain.
+                  #
+                  # kani-rio-retry-kernel (the scheduler's retry/poison
+                  # decision kernels) is deliberately NOT in this set: it
+                  # stays a manual target — see the entry in nix/kani.nix
+                  # for the measured CBMC cost and what still blocks
+                  # gating it.
                   inherit (kaniChecks) kani-rio-lease kani-rio-store;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.

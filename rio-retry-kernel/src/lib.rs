@@ -1743,17 +1743,17 @@ mod proofs {
         }
     }
 
-    /// A bounded arbitrary suffix: up to `max_len` rows.
-    fn any_history(max_len: usize) -> Vec<LedgerRow<u8>> {
+    /// A bounded arbitrary suffix: `MAX` arbitrary rows plus a symbolic
+    /// length `n <= MAX`; harnesses fold `&rows[..n]`. A fixed array +
+    /// symbolic-length slice keeps the suffix construction free of heap
+    /// allocation and growth loops (the same shape rio-store's
+    /// manifest-coverage harness uses), which keeps the goto model
+    /// smaller than a `Vec` push loop would.
+    fn any_history<const MAX: usize>() -> ([LedgerRow<u8>; MAX], usize) {
+        let rows = [(); MAX].map(|_| any_row(8));
         let n: usize = kani::any();
-        kani::assume(n <= max_len);
-        let mut h = Vec::new();
-        let mut i = 0;
-        while i < n {
-            h.push(any_row(8));
-            i += 1;
-        }
-        h
+        kani::assume(n <= MAX);
+        (rows, n)
     }
 
     /// Budgets scaled so every terminal is reachable within the history
@@ -1822,12 +1822,13 @@ mod proofs {
     #[kani::proof_for_contract(decide)]
     #[kani::unwind(9)]
     fn check_decide_contract() {
-        let history = any_history(4);
+        let (rows, n) = any_history::<4>();
+        let history = &rows[..n];
         let budget = any_small_budget();
         let now: AbsTime = kani::any();
         kani::assume(now <= 16);
         let seed = if kani::any() { Some(any_seed()) } else { None };
-        let _ = decide(&history, &budget, now, seed.as_ref());
+        let _ = decide(history, &budget, now, seed.as_ref());
     }
 
     /// The verdict partition is deterministic: two calls on the same
@@ -1837,13 +1838,14 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(9)]
     fn check_decide_deterministic() {
-        let history = any_history(2);
+        let (rows, n) = any_history::<2>();
+        let history = &rows[..n];
         let budget = any_small_budget();
         let now: AbsTime = kani::any();
         kani::assume(now <= 16);
         let seed = if kani::any() { Some(any_seed()) } else { None };
-        let a = decide(&history, &budget, now, seed.as_ref());
-        let b = decide(&history, &budget, now, seed.as_ref());
+        let a = decide(history, &budget, now, seed.as_ref());
+        let b = decide(history, &budget, now, seed.as_ref());
         assert_eq!(a, b);
     }
 
@@ -1867,13 +1869,14 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(9)]
     fn check_legacy_seed_merge_monotone() {
-        let history = any_history(3);
+        let (rows, n) = any_history::<3>();
+        let history = &rows[..n];
         let budget = any_small_budget();
         let now: AbsTime = kani::any();
         kani::assume(now <= 16);
         let seed = any_seed();
-        let seeded = decide(&history, &budget, now, Some(&seed));
-        let unseeded = decide(&history, &budget, now, None);
+        let seeded = decide(history, &budget, now, Some(&seed));
+        let unseeded = decide(history, &budget, now, None);
         let has_reset = history
             .iter()
             .any(|r| r.event_kind == AttemptEventKind::Reset);
@@ -1913,7 +1916,13 @@ mod proofs {
     /// representative error messages (empty, unrelated, the
     /// CONCURRENT_PUTPATH marker verbatim, the marker embedded
     /// mid-string) — the shapes the substring predicate distinguishes.
+    ///
+    /// The unwind bound covers the substring search over the longest of
+    /// the four messages (52 bytes) plus the 28-byte marker; without an
+    /// explicit bound CBMC keeps unwinding the search/compare loops far
+    /// past anything the concrete messages can reach.
     #[kani::proof_for_contract(classify)]
+    #[kani::unwind(64)]
     fn check_classify_contract() {
         let floor = FloorOutcomeView {
             promoted: kani::any(),
@@ -1981,14 +1990,12 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(5)]
     fn check_fold_fleet_exhaust_arm() {
-        let n: usize = kani::any();
-        kani::assume(n <= 3);
-        let mut history = Vec::new();
-        let mut i = 0;
-        while i < n {
+        // Three arbitrary worker-reported events plus a symbolic length,
+        // array-backed for the same reason as `any_history`.
+        let events = [(); 3].map(|_| {
             let at: u64 = kani::any();
             kani::assume(at <= 8);
-            let ev = if kani::any() {
+            if kani::any() {
                 AttemptEvent::Transient {
                     at,
                     executor: any_executor(),
@@ -2000,10 +2007,11 @@ mod proofs {
                     exempt: kani::any(),
                     at_cap: kani::any(),
                 }
-            };
-            history.push(ev);
-            i += 1;
-        }
+            }
+        });
+        let n: usize = kani::any();
+        kani::assume(n <= 3);
+        let history = &events[..n];
         let mut fleet = FleetView::default();
         if kani::any() {
             fleet.eligible.insert(1u8);
@@ -2013,7 +2021,7 @@ mod proofs {
         }
         let now: AbsTime = kani::any();
         kani::assume(now <= 16);
-        let (counters, verdict) = reference_fold(&history, now, &Budget::default(), &fleet);
+        let (counters, verdict) = reference_fold(history, now, &Budget::default(), &fleet);
         if verdict == Verdict::Poison(PoisonReason::FleetExhausted) {
             assert!(!fleet.eligible.is_empty());
             for w in fleet.eligible.iter() {

@@ -166,22 +166,29 @@ in
   # rio-retry-kernel: the scheduler's retry/poison decision kernels
   # (decide()/classify()/placeable() and the reference fold's counter
   # arithmetic), extracted from rio-scheduler/src/retry_policy.rs into a
-  # dependency-free crate exactly so this check fits a merge-gate CBMC
-  # budget — inside rio-scheduler's artifact context the same harnesses
-  # inherited the crate's full reachable code, Arc-backed identifiers
-  # and f64 timestamp conversions and did not converge (>18 min per
-  # harness; numbers in the harness-introducing commit's message). The
-  # extraction is the remediation the retry campaign's Phase-2 deferral
-  # recorded in docs/spec/models/retry-invariant-map.md.
+  # dependency-free crate so the harnesses' goto model closes over the
+  # kernel alone — the extraction the retry campaign's Phase-2 deferral
+  # recorded in docs/spec/models/retry-invariant-map.md as the
+  # precondition for gating this check.
   #
-  # MANUAL TARGET for the moment — run with
+  # STILL A MANUAL TARGET — run with
   #   nix build .#kani-toolchain.kani-checks.kani-rio-retry-kernel
-  # The follow-up gating change promotes it into checks.*, adds the
-  # verify markers for the covered sched.retry.* rules at this wiring
-  # point, and records the measured per-harness CBMC wall-clocks
-  # (markers stay absent until the check actually runs in CI — the
-  # rules keep their existing unit-test / model-check verify sites
-  # meanwhile).
+  # The extraction turned out to be necessary but not sufficient: the
+  # dominant CBMC cost is not the host crate's reachable code but the
+  # symbolic execution of the std BTreeSet/Vec machinery inside the fold
+  # and the contract instrumentation around it, which travels with the
+  # code into any crate (measured numbers and the per-harness diagnosis
+  # in the kernel-extraction follow-up's commit messages). The classify
+  # harness additionally needed an explicit unwind bound — without one
+  # CBMC unwinds a memcmp in the substring search without limit. Until
+  # the set-folding harnesses fit a merge-gate budget (candidate
+  # follow-ups: a CBMC-friendlier exclusion-set representation inside
+  # the kernel — the same verifier-affordability tactic as the
+  # HashSet-to-BTreeSet switch that preceded the contracts — or a
+  # bounded bitset projection proven equivalent to the BTreeSet fold),
+  # this stays out of checks.* and carries no verify markers: the
+  # affected rules keep their unit-test and model-check verify sites,
+  # and a marker here would claim CI coverage the gate does not run.
   #
   # Six harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
   #   - check_decide_contract: #[kani::proof_for_contract] over bounded
