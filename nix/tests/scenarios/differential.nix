@@ -187,7 +187,11 @@ let
     fod-unknown-algo = {
       expect = "diverge";
       nix = "succeeds";
-      rio_status = "OutputRejected";
+      # Since the declared-hash validation moved into the request glue,
+      # the unverifiable algo is rejected before execution (closer to
+      # CppNix, which refuses the algo when parsing the drv) — so the
+      # native side reports a glue error, not a build classification.
+      rio_glue_error = "unsupported outputHashAlgo";
       note = "rio is fail-closed on unverifiable outputHashAlgo by design";
     };
     fod-builder-fails = {
