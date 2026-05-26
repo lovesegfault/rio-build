@@ -495,6 +495,17 @@ mod tests {
     }
 
     #[test]
+    fn illegal_requisite_specifier_rejects() {
+        // Same validation on the closure-side lists.
+        let env = legacy_env(&[("allowedRequisites", "totally-bogus")]);
+        let policy = OutputPolicy::parse(&env);
+        let outs = [output("out", &out_path(), &[], 10)];
+        let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
+        assert_eq!(err.rule, "allowedRequisites");
+        assert!(err.detail.contains("illegal reference specifier"), "{err}");
+    }
+
+    #[test]
     fn legacy_allowed_references_rejects_unlisted() {
         let env = legacy_env(&[("allowedReferences", "")]);
         let policy = OutputPolicy::parse(&env);

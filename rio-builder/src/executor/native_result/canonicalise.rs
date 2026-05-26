@@ -155,6 +155,14 @@ fn canonicalise_entry(
                 expected_uid: build_uid,
             });
         }
+        // CppNix invariant: an already-seen inode must look canonical —
+        // its modes were normalized when its first name was processed.
+        debug_assert!(
+            is_symlink || matches!(st.st_mode & 0o7777, 0o444 | 0o555),
+            "already-seen inode {} has non-canonical mode {:o}",
+            path.display(),
+            st.st_mode & 0o7777
+        );
         return Ok(());
     }
 

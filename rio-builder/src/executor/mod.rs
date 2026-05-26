@@ -1433,6 +1433,10 @@ fn make_build_dir_writable(build_dir: &std::path::Path, uid: u32, gid: u32) -> s
 /// classification so genuine worker faults still retry / re-dispatch.
 fn exec_errno_is_derivation_caused(errno: i32) -> bool {
     use nix::errno::Errno;
+    // EPERM is deliberately NOT in this list: a derivation cannot make
+    // execve return EPERM by itself (a non-executable file is EACCES) —
+    // it means a worker-side mount flag or security policy blocked the
+    // exec, which is the operator's fault and should retry elsewhere.
     matches!(
         Errno::from_raw(errno),
         Errno::ENOENT
@@ -1444,6 +1448,7 @@ fn exec_errno_is_derivation_caused(errno: i32) -> bool {
             | Errno::EISDIR
             | Errno::E2BIG
             | Errno::EINVAL
+            | Errno::ELIBBAD
     )
 }
 
@@ -2175,13 +2180,22 @@ mod tests {
             Errno::EISDIR,
             Errno::E2BIG,
             Errno::EINVAL,
+            Errno::ELIBBAD,
         ] {
             assert!(
                 exec_errno_is_derivation_caused(e as i32),
                 "{e} is derivation-caused"
             );
         }
-        for e in [Errno::EIO, Errno::ENOMEM, Errno::EAGAIN, Errno::ETXTBSY] {
+        // EPERM stays infra by design: only worker-side mount flags or
+        // security policy produce it, never the derivation's own content.
+        for e in [
+            Errno::EIO,
+            Errno::ENOMEM,
+            Errno::EAGAIN,
+            Errno::ETXTBSY,
+            Errno::EPERM,
+        ] {
             assert!(
                 !exec_errno_is_derivation_caused(e as i32),
                 "{e} stays infra-transient"
