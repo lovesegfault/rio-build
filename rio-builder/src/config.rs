@@ -166,14 +166,9 @@ pub struct Config {
     /// default) — some builds genuinely take that long; this is a bound
     /// on blast radius of a truly stuck build, not an expected build
     /// time.
-    // TODO: rename `daemon_timeout_secs` / `RIO_DAEMON_TIMEOUT_SECS` to
-    // `build_timeout_secs` / `RIO_BUILD_TIMEOUT_SECS` in a dedicated
-    // change — the env var is operator-visible (controller env
-    // injection, Pool CRD, helm values, docs), so the rename needs its
-    // own coordinated rollout.
-    #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
+    #[serde(rename = "build_timeout_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
-    pub daemon_timeout: std::time::Duration,
+    pub build_timeout: std::time::Duration,
     /// Silence timeout (seconds): kill the build if no output for N seconds.
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
     /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
@@ -278,7 +273,7 @@ impl Default for Config {
             hw_bench_needed: false,
             intent_id: String::new(),
             executor_token: String::new(),
-            daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
+            build_timeout: crate::executor::DEFAULT_BUILD_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
             hashed_mirrors: Vec::new(),
@@ -383,10 +378,10 @@ pub struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     log_size_limit: Option<u64>,
 
-    /// Daemon build timeout seconds (default: 7200)
+    /// Build timeout seconds (default: 7200)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    daemon_timeout_secs: Option<u64>,
+    build_timeout_secs: Option<u64>,
 }
 
 /// Detect the system architecture (e.g. "x86_64-linux").

@@ -28,22 +28,22 @@ use super::{DagActor, snapshot};
 /// entry won't be re-detected — this TTL is the repeat window.
 pub(super) const HUNG_NODE_REPEAT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
+/// Backstop timeout floor: DEFAULT_BUILD_TIMEOUT (the worker-side
 /// timeout). A build can't legitimately run longer than this — the
 /// worker would have killed the daemon already. The scheduler-side
 /// check at this floor is belt-and-suspenders for "worker heartbeating
 /// but not enforcing its own timeout" (worker bug or clock skew).
 ///
 /// Same cfg(test) shadow pattern as POISON_TTL: 7200s in prod (matches
-/// worker's daemon_timeout default), short in tests so backstop can be
+/// worker's build_timeout default), short in tests so backstop can be
 /// observed without waiting 2h.
 #[cfg(not(test))]
-const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 7200;
+const BACKSTOP_BUILD_TIMEOUT_SECS: u64 = 7200;
 #[cfg(test)]
-const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 0; // tests control via est_duration
+const BACKSTOP_BUILD_TIMEOUT_SECS: u64 = 0; // tests control via est_duration
 
-/// Slack on top of BACKSTOP_DAEMON_TIMEOUT_SECS. The worker's timeout
-/// fires → daemon killed → CompletionReport sent → scheduler receives
+/// Slack on top of BACKSTOP_BUILD_TIMEOUT_SECS. The worker's timeout
+/// fires → build killed → CompletionReport sent → scheduler receives
 /// → completion handler runs. 10 minutes covers that round-trip plus
 /// gRPC retry/reconnect slack.
 #[cfg(not(test))]
@@ -321,7 +321,7 @@ impl DagActor {
     ///
     /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
     /// `(drv_hash, drv_path, executor_id)`.
-    // r[impl sched.backstop.timeout+3]
+    // r[impl sched.backstop.timeout+4]
     fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, ExecutorId)>) {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         // (drv_hash, drv_path, executor_id) for backstop-timed-out builds
@@ -359,11 +359,11 @@ impl DagActor {
             //
             // Threshold: max(est_duration × 3, 7200s + 600s). The
             // first term catches builds that exceed their estimate
-            // by 3×; the second is a floor at daemon_timeout + 10
+            // by 3×; the second is a floor at build_timeout + 10
             // minutes slack (even with no estimate, a build can't
             // legitimately run longer than the daemon timeout
             // plus some grace for reporting). 7200 = DEFAULT_
-            // DAEMON_TIMEOUT; 600 = arbitrary slack.
+            // BUILD_TIMEOUT; 600 = arbitrary slack.
             if state.status() == DerivationStatus::Running
                 && let Some(running_since) = state.running_since
             {
@@ -383,7 +383,7 @@ impl DagActor {
                     } else {
                         0.0
                     };
-                let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
+                let floor_secs = (BACKSTOP_BUILD_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
                 let backstop_secs = est_3x_secs.max(floor_secs);
 
                 if elapsed.as_secs_f64() > backstop_secs
@@ -460,7 +460,7 @@ impl DagActor {
                 // post-completion drain.
                 worker.draining = true;
             }
-            // r[impl sched.backstop.timeout+3]
+            // r[impl sched.backstop.timeout+4]
             // Backstop is the no-CompletionReport path — completion.rs
             // will never account this attempt. Record it here so
             // `is_poisoned()` in `reassign_derivations` caps the loop

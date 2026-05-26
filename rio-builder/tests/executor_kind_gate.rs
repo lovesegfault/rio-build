@@ -3,12 +3,12 @@
 //! The scheduler's `hard_filter` should never misroute, but a bug or
 //! stale-generation race must not grant a builder internet access. The
 //! gate re-derives `is_fod` from the `.drv` itself and refuses
-//! cross-kind assignments BEFORE overlay setup or daemon spawn.
+//! cross-kind assignments BEFORE overlay setup or build execution.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
+use rio_builder::executor::{DEFAULT_BUILD_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::ExecutorKind;
@@ -28,7 +28,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         overlay_base_dir: dir.to_path_buf(),
         executor_id: "test-executor".into(),
         log_limits: LogLimits::UNLIMITED,
-        daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+        build_timeout: DEFAULT_BUILD_TIMEOUT,
         max_silent_time: 0,
         cgroup_parent: dir.to_path_buf(),
         executor_kind: kind,

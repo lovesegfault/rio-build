@@ -103,8 +103,8 @@ pub struct BuildSpawnContext {
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
-    /// Per-build execution timeout (from `Config.daemon_timeout_secs`).
-    pub daemon_timeout: std::time::Duration,
+    /// Per-build execution timeout (from `Config.build_timeout_secs`).
+    pub build_timeout: std::time::Duration,
     /// Silence timeout default (from `Config.max_silent_time`).
     /// Used when WorkAssignment's BuildOptions.max_silent_time is 0.
     /// 0 = disabled.
@@ -223,7 +223,7 @@ impl BuildSpawnContext {
             overlay_base_dir: self.overlay_base_dir.clone(),
             executor_id: self.executor_id.clone(),
             log_limits: self.log_limits,
-            daemon_timeout: self.daemon_timeout,
+            build_timeout: self.build_timeout,
             max_silent_time: self.max_silent_time,
             cgroup_parent: self.cgroup_parent.clone(),
             executor_kind: self.executor_kind,

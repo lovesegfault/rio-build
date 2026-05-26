@@ -1068,8 +1068,8 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 
 /// Report each `DeadlineExceeded` Job to the scheduler so the
 /// `activeDeadlineSeconds` backstop still climbs the resource_floor
-/// ladder when the worker is too wedged to fire its own `daemon_timeout`
-/// (`r[ctrl.terminated.deadline-exceeded+2]`). Defense-in-depth behind
+/// ladder when the worker is too wedged to fire its own `build_timeout`
+/// (`r[ctrl.terminated.deadline-exceeded+3]`). Defense-in-depth behind
 /// the worker-side `BuildResultStatus::TimedOut` primary path.
 ///
 /// Iterates the already-listed `jobs` (no extra apiserver call). For
@@ -1082,7 +1082,7 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 /// Idempotent per the same dedup as [`report_terminated_pods`]. Best-
 /// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
 /// keeps the Job observable for ~60 reconcile ticks.
-// r[impl ctrl.terminated.deadline-exceeded+2]
+// r[impl ctrl.terminated.deadline-exceeded+3]
 pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
     let mut admin = ctx.admin.clone();
     for job in jobs {
@@ -1276,7 +1276,7 @@ mod tests {
     /// `activeDeadlineSeconds` fires (live: `kubectl get job -o
     /// jsonpath` showed `cond=FailureTarget Failed/DeadlineExceeded
     /// DeadlineExceeded`).
-    // r[verify ctrl.terminated.deadline-exceeded+2]
+    // r[verify ctrl.terminated.deadline-exceeded+3]
     #[test]
     fn job_deadline_exceeded_condition() {
         use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};

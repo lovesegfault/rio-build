@@ -82,11 +82,7 @@ pub struct ExecutorEnv {
     /// didn't specify `BuildOptions.build_timeout`. Intentionally long
     /// (default 2h) — some builds genuinely take that long; the purpose
     /// is to bound the blast radius of a truly stuck build.
-    // TODO: rename to `build_timeout` (operator-visible as
-    // RIO_DAEMON_TIMEOUT_SECS via the controller and Pool spec) in a
-    // dedicated change — the env-var rename needs CRD/helm/docs churn
-    // that is out of scope for the teardown commit.
-    pub daemon_timeout: Duration,
+    pub build_timeout: Duration,
     /// Silence timeout default (seconds). Used when the assignment's
     /// `BuildOptions.max_silent_time` is 0. 0 = disabled.
     ///
@@ -174,8 +170,8 @@ pub struct SandboxEnvConfig {
     pub host_system: String,
 }
 
-/// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
-pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
+/// Default build timeout: 2 hours. See `ExecutorEnv.build_timeout`.
+pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// Error type for executor operations.
 ///
@@ -968,7 +964,7 @@ fn resolve_build_opts(
     let opts = assignment.build_options.as_ref();
     let timeout = opts
         .and_then(|o| (o.build_timeout > 0).then(|| Duration::from_secs(o.build_timeout)))
-        .unwrap_or(env.daemon_timeout);
+        .unwrap_or(env.build_timeout);
     // Assignment's max_silent_time wins if nonzero; else the worker
     // config default. Same 0-means-unset semantics as build_timeout above.
     // Config default exists because Nix ssh-ng clients don't send
@@ -1846,7 +1842,7 @@ mod tests {
             overlay_base_dir: "/tmp".into(),
             executor_id: "t".into(),
             log_limits: crate::log_stream::LogLimits::UNLIMITED,
-            daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+            build_timeout: DEFAULT_BUILD_TIMEOUT,
             max_silent_time: 0,
             cgroup_parent: "/tmp".into(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,

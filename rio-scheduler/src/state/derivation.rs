@@ -859,9 +859,9 @@ pub struct DerivationState {
     pub(crate) ready_at: Option<Instant>,
     /// When the derivation entered Running state. For the backstop
     /// timeout: handle_tick checks this + est_duration × 3 (clamped
-    /// to daemon_timeout + slack). A build that's been Running far
+    /// to build_timeout + slack). A build that's been Running far
     /// longer than expected is likely stuck (worker heartbeating
-    /// but daemon wedged, or the worker's clock jumped).
+    /// but the build wedged, or the worker's clock jumped).
     pub(crate) running_since: Option<Instant>,
     /// W3C traceparent of the submitting gRPC handler's span, captured
     /// at DAG-merge time. Embedded into `WorkAssignment.traceparent` at

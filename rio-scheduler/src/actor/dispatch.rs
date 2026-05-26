@@ -2390,15 +2390,16 @@ impl DagActor {
         // from a compromised worker). Unsigned tokens are
         // accepted by a store with hmac_verifier=None (dev).
         //
-        // Expiry: 2× build_timeout (or 2× daemon_timeout
-        // default if timeout=0). A worker legitimately
+        // Expiry: 2× the effective build timeout (the
+        // assignment's BuildOptions.build_timeout, or the
+        // worker's default when unset). A worker legitimately
         // uploading after completion is well within that
         // window. Prevents replay from a leaked token later.
         let assignment_token = if let Some(signer) = &self.hmac_signer {
             let timeout_secs = if build_opts.build_timeout > 0 {
                 build_opts.build_timeout
             } else {
-                // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
+                // Match rio-builder's DEFAULT_BUILD_TIMEOUT.
                 // Can't reference the const cross-crate, so
                 // duplicate the value. 7200s = 2h.
                 7200

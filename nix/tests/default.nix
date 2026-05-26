@@ -540,7 +540,7 @@ in
         name = "disrupt";
         subtests = [
           # r[verify builder.silence.timeout-kill+2]
-          # r[verify sched.timeout.promote-on-exceed+2]
+          # r[verify sched.timeout.promote-on-exceed+3]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]
           # setoptions-unreachable greps ALL gateway journal history —

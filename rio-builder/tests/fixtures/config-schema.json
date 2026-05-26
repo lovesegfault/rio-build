@@ -139,7 +139,7 @@
         "type": "string",
         "default": ""
       },
-      "daemon_timeout_secs": {
+      "build_timeout_secs": {
         "description": "Timeout (seconds) for the sandboxed build when the client didn't\nspecify BuildOptions.build_timeout. Intentionally long (2h\ndefault) — some builds genuinely take that long; this is a bound\non blast radius of a truly stuck build, not an expected build\ntime.",
         "type": "integer",
         "format": "uint64",
@@ -254,7 +254,7 @@
     "hw_bench_needed": false,
     "intent_id": "",
     "executor_token": "",
-    "daemon_timeout_secs": 7200,
+    "build_timeout_secs": 7200,
     "max_silent_time_secs": 0,
     "idle_secs": 120,
     "hashed_mirrors": [],

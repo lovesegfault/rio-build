@@ -1574,12 +1574,12 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     Ok(())
 }
 
-// r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.timeout.promote-on-exceed+3]
 /// I-200: `TimedOut` promotes `resource_floor` AND resets to Ready
 /// (bounded by `max_timeout_retries`), then goes terminal `Cancelled`.
 ///
 /// Before I-200, `TimedOut` went straight to Cancelled without
-/// promoting — so a worker-side `daemon_timeout_secs` hit on a small
+/// promoting — so a worker-side `build_timeout_secs` hit on a small
 /// pod gave up immediately instead of retrying with more resources
 /// and a longer deadline. Mutation check: revert
 /// `handle_timeout_failure` to the pre-I-200 terminal-only path →
@@ -1621,7 +1621,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "to-tiny",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
 
@@ -1670,7 +1670,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "to-small",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;
@@ -1698,7 +1698,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "to-medium",
         &drv_path,
         rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        "build exceeded build_timeout_secs",
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;

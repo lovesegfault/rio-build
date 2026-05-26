@@ -176,7 +176,7 @@ impl BuildCgroup {
     /// `io::Result`: can fail if the cgroup was already removed
     /// (race with Drop) or the kernel is too old for cgroup.kill
     /// (Linux 5.14+). The caller logs and the build lingers —
-    /// worst case is the 2h daemon_timeout still applies.
+    /// worst case is the 2h build_timeout still applies.
     pub fn kill(&self) -> io::Result<()> {
         fs::write(self.path.join("cgroup.kill"), "1")
     }

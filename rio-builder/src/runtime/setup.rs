@@ -298,7 +298,7 @@ pub async fn setup(
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
-        daemon_timeout: cfg.daemon_timeout,
+        build_timeout: cfg.build_timeout,
         max_silent_time: cfg.max_silent_time.as_secs(),
         cgroup_parent,
         executor_kind: cfg.executor_kind,

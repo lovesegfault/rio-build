@@ -602,7 +602,7 @@
         "description": "HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the controller's `RIO_EXECUTOR_TOKEN` env var (passed through from `SpawnIntent.executor_token`)."
       },
       {
-        "key": "daemon_timeout_secs",
+        "key": "build_timeout_secs",
         "type": "uint64",
         "default": "7200",
         "description": "Timeout (seconds) for the sandboxed build when the client didn't specify BuildOptions.build_timeout."

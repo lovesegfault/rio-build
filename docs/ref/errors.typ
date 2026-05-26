@@ -249,10 +249,10 @@ separately. A derivation is only globally poisoned if it fails on
   table.header([Level], [Enforced By], [Mechanism], [Status]),
   [Per-derivation wall-clock timeout],
   [Builder],
-  [`tokio::time::timeout` wrapping the nix-daemon build. Duration is
+  [`tokio::time::timeout` wrapping the sandboxed build. Duration is
     `WorkAssignment.build_options.build_timeout` if nonzero, else
-    `DEFAULT_DAEMON_TIMEOUT` (7200s / 2h). Configurable via
-    `RIO_DAEMON_TIMEOUT_SECS`, `--daemon-timeout-secs`, or `builder.toml`.],
+    `DEFAULT_BUILD_TIMEOUT` (7200s / 2h). Configurable via
+    `RIO_BUILD_TIMEOUT_SECS`, `--build-timeout-secs`, or `builder.toml`.],
   [*Implemented*],
 
   [Per-derivation silence timeout],
@@ -277,7 +277,7 @@ separately. A derivation is only globally poisoned if it fails on
   [Scheduler backstop timeout],
   [`handle_tick`],
   [When a Running derivation's `running_since.elapsed()` exceeds
-    `max(est_duration × 3, daemon_timeout + 10min)`, scheduler sends
+    `max(est_duration × 3, build_timeout + 10min)`, scheduler sends
     CancelSignal + resets to Ready + increments retry_count + adds executor to
     failed_builders. Catches "executor heartbeating but daemon wedged."],
   [Implemented (Phase 3b)],

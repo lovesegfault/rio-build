@@ -1687,7 +1687,7 @@ to a builder under pressure. A queued FOD is preferable to a builder with
 internet access. The #(refs.metric)("rio_scheduler_queue_depth")`{kind}` gauge
 tracks queued derivations per kind.
 
-#r("sched.timeout.promote-on-exceed+2")[
+#r("sched.timeout.promote-on-exceed+3")[
   A `BuildResultStatus::TimedOut` completion MUST double
   `resource_floor.deadline_secs` (#rref("sched.sla.reactive-floor")) and reset
   the derivation to `Ready` for re-dispatch, NOT terminal-cancel. The next
@@ -1701,7 +1701,7 @@ tracks queued derivations per kind.
   masked by the infra time-window reset. I-200: before this, `TimedOut` went
   straight to `Cancelled` and the I-199/I-197 promotion only fired on the
   K8s-deadline-kill → disconnect path, not on the executor-side
-  `daemon_timeout_secs` → clean `TimedOut` report path.
+  `build_timeout_secs` → clean `TimedOut` report path.
 ]
 
 #r("sched.reassign.no-promote-on-ephemeral-disconnect+4")[
@@ -1722,7 +1722,7 @@ tracks queued derivations per kind.
   I-188 race at the source.
 ]
 
-#r("sched.termination.deadline-exceeded+2")[
+#r("sched.termination.deadline-exceeded+3")[
   A `ReportExecutorTermination(DeadlineExceeded)` MUST double
   `resource_floor.deadline_secs` (or increment `timeout_retry_count` if already
   at the 24h cap, #rref("sched.sla.reactive-floor")) for the derivation that
@@ -1731,7 +1731,7 @@ tracks queued derivations per kind.
   so the controller observes the Job condition `Failed/DeadlineExceeded`
   instead, #rref("ctrl.terminated.deadline-exceeded")); the scheduler
   prefix-matches `recently_disconnected` keys (pod name = `{job}-{5char}`).
-  This is defense-in-depth behind the worker-side `daemon_timeout` →
+  This is defense-in-depth behind the worker-side `build_timeout` →
   `BuildResultStatus::TimedOut` primary path
   (#rref("sched.timeout.promote-on-exceed")): with
   #rref("ctrl.ephemeral.intent-deadline") the scheduler-computed
@@ -1795,10 +1795,10 @@ tracks queued derivations per kind.
   transitioned back to `ready` for reassignment.
 ]
 
-#r("sched.backstop.timeout+3")[
+#r("sched.backstop.timeout+4")[
   *Backstop timeout:* Separately from executor deregistration, `handle_tick`
   checks each `running` derivation's `running_since` timestamp. If elapsed time
-  exceeds `max(est_duration × 3, daemon_timeout + 10min)` --- where
+  exceeds `max(est_duration × 3, build_timeout + 10min)` --- where
   `est_duration` is reference-seconds denormalized to wall-clock via the
   slowest fleet `hw_factor` per #rref("sched.sla.hw-ref-seconds") --- the
   scheduler sends a CancelSignal to the executor, marks the executor draining

@@ -2560,7 +2560,7 @@ impl DagActor {
     /// cascade/events/build-fail side-effects as
     /// `handle_permanent_failure` — the build still fails THIS time,
     /// just without the 24h resubmit lockout.
-    // r[impl sched.timeout.promote-on-exceed+2]
+    // r[impl sched.timeout.promote-on-exceed+3]
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,

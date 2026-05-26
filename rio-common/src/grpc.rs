@@ -484,10 +484,9 @@ mod tests {
             DEFAULT_GRPC_TIMEOUT < GRPC_STREAM_TIMEOUT,
             "metadata timeout should be shorter than stream timeout"
         );
-        // Stream timeout (300s) is shorter than any sane daemon build
-        // timeout (rio-builder Config.daemon_timeout_secs, default
-        // 7200s). The ordering invariant is enforced at
-        // rio-builder/src/executor/daemon.rs test_timeout_ordering.
+        // Stream timeout (300s) is shorter than any sane build
+        // timeout (rio-builder Config.build_timeout_secs, default
+        // 7200s).
     }
 
     #[test]

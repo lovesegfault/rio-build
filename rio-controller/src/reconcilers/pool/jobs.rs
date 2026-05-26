@@ -160,7 +160,7 @@ pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> (u
     )
 }
 
-/// Margin between the worker's `daemon_timeout` and K8s
+/// Margin between the worker's `build_timeout` and K8s
 /// `activeDeadlineSeconds`, so the worker's `tokio::time::timeout`
 /// fires first and emits `CompletionReport{TimedOut}` (telemetry +
 /// `handle_timeout_failure` cap-check) before K8s SIGKILLs.
@@ -199,7 +199,7 @@ pub(super) fn priority_bucket(cores: u32) -> u32 {
 /// always `>= 180`. No controller-side multiplier or per-kind
 /// fallback. `.max(180)` is defensive only — proto default is 0; a
 /// 0s deadline would fail the Job at creation, and `< 180` would tie
-/// the worker's `daemon_timeout = deadline − 90` against this timer.
+/// the worker's `build_timeout = deadline − 90` against this timer.
 // r[impl ctrl.ephemeral.intent-deadline]
 pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
     i64::from(intent.deadline_secs).max(180)
@@ -1011,18 +1011,18 @@ fn apply_intent_resources(
         ..Default::default()
     });
 
-    // Couple the worker's `daemon_timeout` to the per-intent K8s
+    // Couple the worker's `build_timeout` to the per-intent K8s
     // `activeDeadlineSeconds`: worker fires `WORKER_DEADLINE_SLACK_SECS`
     // BEFORE K8s SIGKILLs, so `CompletionReport{TimedOut}` (primary
     // path) carries telemetry and reaches `handle_timeout_failure`'s
     // cap-check; `DeadlineExceeded` stays the wedged-worker backstop
-    // per `r[sched.termination.deadline-exceeded+2]`.
+    // per `r[sched.termination.deadline-exceeded+3]`.
     // `ephemeral_deadline` floors at 180 so `− 90` never underflows
     // the `.max(60)` clamp into a tie.
     let worker_timeout = (ephemeral_deadline(i) - WORKER_DEADLINE_SLACK_SECS).max(60);
     let env = container.env.get_or_insert_with(Vec::new);
     env.push(pod::env(
-        "RIO_DAEMON_TIMEOUT_SECS",
+        "RIO_BUILD_TIMEOUT_SECS",
         &worker_timeout.to_string(),
     ));
     // r[impl ctrl.pool.hw-bench-needed+2]
@@ -1453,13 +1453,13 @@ mod tests {
         );
     }
 
-    /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =
+    /// `apply_intent_resources` injects `RIO_BUILD_TIMEOUT_SECS =
     /// activeDeadlineSeconds − 90` so the worker times out before K8s
     /// SIGKILLs. Regression: a fitted `deadline_secs=15000` build with
     /// the old decoupled 7200s static default looped `TimedOut` at
     /// 7200s while only the K8s side doubled.
     #[test]
-    fn build_job_daemon_timeout_couples_to_intent_deadline() {
+    fn build_job_build_timeout_couples_to_intent_deadline() {
         let pool = test_pool("p", ExecutorKind::Builder);
         for (deadline, want) in [(15000, "14910"), (240, "150"), (0, "90"), (120, "90")] {
             let i = SpawnIntent {
@@ -1477,15 +1477,15 @@ mod tests {
                 .unwrap();
             let envs = crate::fixtures::env_map(env);
             assert_eq!(
-                envs.get("RIO_DAEMON_TIMEOUT_SECS"),
+                envs.get("RIO_BUILD_TIMEOUT_SECS"),
                 Some(&want),
-                "deadline_secs={deadline} → daemon_timeout={want} \
+                "deadline_secs={deadline} → build_timeout={want} \
                  (activeDeadlineSeconds − {WORKER_DEADLINE_SLACK_SECS}; \
                  ephemeral_deadline floored at 180)"
             );
             assert_eq!(
                 env.iter()
-                    .filter(|e| e.name == "RIO_DAEMON_TIMEOUT_SECS")
+                    .filter(|e| e.name == "RIO_BUILD_TIMEOUT_SECS")
                     .count(),
                 1,
                 "exactly one entry"

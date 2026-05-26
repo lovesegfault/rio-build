@@ -989,10 +989,10 @@ fn job_pod_env_vars() {
         "unset in spec → not injected → worker default"
     );
     assert!(!envs.contains_key("RIO_FUSE_PASSTHROUGH"));
-    // RIO_DAEMON_TIMEOUT_SECS is NOT set here — it's intent-derived,
+    // RIO_BUILD_TIMEOUT_SECS is NOT set here — it's intent-derived,
     // injected by `apply_intent_resources` per Job, not by the base
     // pod-spec builder.
-    assert!(!envs.contains_key("RIO_DAEMON_TIMEOUT_SECS"));
+    assert!(!envs.contains_key("RIO_BUILD_TIMEOUT_SECS"));
 
     // RIO_EXECUTOR_ID uses fieldRef, not value — check separately.
     // The RIO_ env layer reads `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
