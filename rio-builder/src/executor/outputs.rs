@@ -49,15 +49,13 @@ impl BuildOutputs {
 ///
 /// Differences from the daemon-era output collection:
 /// - the per-output reference sets, NAR hashes, and realized (post
-///   floating-CA-finalization) paths come from [`ProcessedOutputs`]
-///   instead of the daemon's `BuildResult`, so the stray-file check is
-///   "uploaded path ∉ processed outputs" rather than a name lookup;
-/// - the upload still re-streams each output from disk (the store needs
-///   the NAR bytes regardless); the scan pass inside `prepare_output`
-///   is redundant with the pipeline's scan and is kept for now —
-///   TODO: pass the precomputed reference sets into the upload module
-///   and drop its rescan (it re-scans every output NAR for store-path
-///   references the result pipeline has already extracted).
+///   floating-CA-finalization) paths come from [`ProcessedOutputs`] and
+///   are exactly what the upload registers — the upload neither
+///   rediscovers outputs by scanning the overlay upper layer nor
+///   re-scans references, so `unsafeDiscardReferences` decisions
+///   survive to registration and a stray store path the build left
+///   behind is never uploaded (CppNix discards such paths with the
+///   chroot; strays are logged for observability, not fatal);
 /// - `content_address` is threaded through so floating-CA narinfos
 ///   carry their `CA:` field.
 #[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
@@ -69,7 +67,10 @@ pub(super) async fn collect_native_outputs(
     drv: &Derivation,
     drv_path: &str,
     is_fod: bool,
-    input_paths: &[String],
+    // Retained for call-site signature stability; the upload no longer
+    // needs the input closure (each output's references come
+    // precomputed from the result pipeline).
+    _input_paths: &[String],
     assignment_token: &str,
     start_time: u64,
     stop_time: u64,
@@ -107,38 +108,56 @@ pub(super) async fn collect_native_outputs(
 
     tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
 
-    // Reference-scan candidate set: the input closure ∪ every realized
-    // output path (final CA paths included — self/sibling references in
-    // floating-CA outputs resolve against these).
-    let mut ref_candidates: Vec<String> = input_paths.to_vec();
-    ref_candidates.extend(processed.outputs.iter().map(|o| o.store_path.clone()));
-
-    // store path → content-address descriptor for floating-CA outputs.
-    let content_addresses: HashMap<String, String> = processed
+    // Upload exactly the pipeline's processed outputs: realized (post
+    // floating-CA-finalization) store paths with their recorded
+    // (post-`unsafeDiscardReferences`) reference sets and CA
+    // descriptors.
+    let to_upload: Vec<upload::OutputToUpload> = processed
         .outputs
         .iter()
-        .filter_map(|o| {
-            o.content_address
-                .clone()
-                .map(|ca| (o.store_path.clone(), ca))
+        .map(|o| upload::OutputToUpload {
+            store_path: o.store_path.clone(),
+            references: o.references.clone(),
+            content_address: o.content_address.clone(),
         })
         .collect();
+
+    // Observability for stray store paths the build left behind: CppNix
+    // silently discards anything in the chroot store that is not a
+    // declared output, and so do we (they are simply never uploaded) —
+    // but a build writing them is unusual enough to be worth a warning.
+    if let Ok(found) = upload::scan_new_outputs(&overlay_mount.upper_store()) {
+        let expected: std::collections::HashSet<&str> = processed
+            .outputs
+            .iter()
+            .filter_map(|o| o.store_path.strip_prefix("/nix/store/"))
+            .collect();
+        for name in found {
+            if !expected.contains(name.as_str()) {
+                tracing::warn!(
+                    drv_path = %drv_path,
+                    stray = %name,
+                    "build left a stray store path in the overlay upper layer; not uploading it"
+                );
+            }
+        }
+    }
 
     match upload::upload_all_outputs(
         store_client,
         &overlay_mount.upper_store(),
         assignment_token,
         drv_path,
-        &ref_candidates,
-        &content_addresses,
+        &to_upload,
     )
     .await
     {
         Ok(upload_results) => {
-            // Stray-file gate (wkr-scan-unfiltered): every uploaded path
-            // must be one of the pipeline's processed outputs. The
-            // realized paths are authoritative here — the .drv's static
-            // outputs don't know floating-CA final paths.
+            // Defensive map back to the pipeline's processed outputs (the
+            // upload set is constructed from them, so a miss here is an
+            // internal error, not a build failure mode). The realized
+            // paths are authoritative — the .drv's static outputs don't
+            // know floating-CA final paths.
             let processed_by_path: HashMap<&str, &super::native_result::ProcessedOutput> =
                 processed
                     .outputs
@@ -149,13 +168,13 @@ pub(super) async fn collect_native_outputs(
             for result in &upload_results {
                 let store_path = result.store_path.as_str();
                 let Some(out) = processed_by_path.get(store_path) else {
-                    tracing::warn!(
+                    tracing::error!(
                         store_path = %store_path,
-                        "uploaded path not in processed outputs — rejecting build"
+                        "upload result does not correspond to any processed output"
                     );
                     return Err(ExecutorError::BuildFailed(format!(
-                        "uploaded path {store_path} not in processed outputs \
-                         (stray file in overlay upper /nix/store?)"
+                        "internal error: upload result {store_path} does not correspond to \
+                         any processed output"
                     )));
                 };
                 built_outputs.push(BuiltOutput {
