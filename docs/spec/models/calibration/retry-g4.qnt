@@ -220,3 +220,71 @@ module retryCalibG4DisconnectThresholdProbe {
   /// probe's scope.
   val noDisconnectThresholdPoison = not(last.kind == OE5 and last.terminal)
 }
+
+// =========================================================================
+// CALIBRATION -- pre-b09c5b312 (the X13 half): the poison-TTL clear reset
+// the in-memory state but PG only got the status update -- failed_workers
+// (and retry_count) stayed behind in the durable row, so a crash after
+// the clear recovered a stale exclusion set that immediately excluded the
+// previously-failed workers from placement in the fresh cycle.
+// PREDICTED: clearedPoisonScrubsExclusions falsifies in the state right
+// after a TTL clear whose durable row kept failed_builders, worker
+// alphabet with enough clock for the TTL to elapse.
+// =========================================================================
+module retryCalibG4TtlClearKeepsExclusions {
+  import retryPolicy(
+    EXECUTORS = Set("w1"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 2,
+    ATTEMPT_BOUND = 2,
+    MAX_FAILOVERS = 0,
+    PG_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = false,
+    ENABLE_CRASH = false,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = true
+  ).* from "../retryPolicy"
+
+  /// PRE-FIX poison-TTL expiry: the durable clear updates only the
+  /// status/timestamp; the failed_builders exclusion set and the retry
+  /// count stay behind in the row (the in-memory reset and the durable
+  /// row disagree about the next cycle's starting state).
+  action poisonTtlExpiresKeepsExclusions = all {
+    ENABLE_RESETS,
+    dStatus == DPoisoned,
+    poisonTtlElapsed,
+    val applied = specApply(spec, FPoisonCleared(now), eligibleFleet)
+    all {
+      dStatus' = DAbsent,
+      poisonSrc' = NoPoison,
+      live' = zeroCounters,
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      // PRE-FIX: only status/poisoned_at are cleared durably.
+      pg' = { ...freshPg, failedBuilders: pg.failedBuilders, retryCount: pg.retryCount },
+      last' = { ...noObs, kind: OTtlExpire },
+    },
+    depStatus' = depStatus,
+    everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt, execs' = execs,
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, pgFaultsLeft' = pgFaultsLeft,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  action buildEndsPermanentAny = { nondet w = EXECUTORS.oneOf() buildEndsReported(w, RcPermanent, false) }
+  action processPermanentAny = {
+    nondet w = EXECUTORS.oneOf()
+    processReport(w, RcPermanent, false, false, false, false)
+  }
+
+  action calibStep = any {
+    tick,
+    dispatchToAny,
+    buildEndsPermanentAny,
+    processPermanentAny,
+    poisonTtlExpiresKeepsExclusions,
+  }
+}

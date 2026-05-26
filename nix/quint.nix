@@ -985,6 +985,7 @@ in
         "durableMirrorsCharges"
         "placementSound"
         "clearedPoisonClearsDurably"
+        "clearedPoisonScrubsExclusions"
       ];
     };
 
@@ -1012,6 +1013,7 @@ in
         "recoveryNeverFabricatesFailures"
         "placementSound"
         "clearedPoisonClearsDurably"
+        "clearedPoisonScrubsExclusions"
       ];
     };
 
@@ -1061,6 +1063,7 @@ in
         "recoveryNeverFabricatesFailures"
         "placementSound"
         "clearedPoisonClearsDurably"
+        "clearedPoisonScrubsExclusions"
         "recoveryPreservesPoisonStatus"
       ];
     };

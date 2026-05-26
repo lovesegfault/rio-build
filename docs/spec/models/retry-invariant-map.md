@@ -700,10 +700,13 @@ results (violation runs stop at the first counterexample); depths and
 state counts are from the recorded transcripts; wall-clocks live in the
 introducing commit's message.
 
-Two invariants were added to the main model as part of the calibration:
-`clearedPoisonClearsDurably` (the PG-first clear discipline; G4) — a
-genuine **unstated property** (no design-§3 invariant or spec rule stated
-the clear's durability discipline before the calibration) — and
+Three invariants were added to the main model as part of the calibration
+(the third by the Phase-0 exit review's correction pass):
+`clearedPoisonClearsDurably` (the PG-first clear discipline; G4) and
+`clearedPoisonScrubsExclusions` (the TTL/admin clear scrubs the durable
+exclusion set; G4, the b09c5b312-X13 half) — both genuine **unstated
+properties** (no design-§3 invariant or spec rule stated the clear's
+durability or scrub discipline before the calibration) — and
 `recoveryPreservesPoisonStatus` (the poison set survives failover minus
 TTL expiry; G8) — a **Stage-B encoding gap**, not an unstated property:
 design §3's `RecoveryIsTheDocumentedProjection` already states "the
@@ -713,13 +716,15 @@ encoding (`recoveryIsTheDocumentedProjection`) conditions on the
 post-recovery `dStatus` and so structurally cannot see a dropped poison
 row; Stage C re-introduced the missing clause as its own invariant (see
 the footnote on the Stage-B verdict table and the clause-coverage audit
-below). Both were confirmed to HOLD on the unmodified as-built model
+below). All three were confirmed to HOLD on the unmodified as-built model
 before any override was run — worker / dual / failover regimes re-checked
 exhaustively with bit-identical distinct-state counts
-(376,318 / 3,112,250 / 9,228,949) — so neither is a new as-built
+(376,318 / 3,112,250 / 9,228,949) — so none is a new as-built
 falsification. They are wired into the corresponding
-`quint-retry-policy-*` regime checks; their non-vacuity is guarded by the
-two wired calibration witnesses that falsify them.
+`quint-retry-policy-*` regime checks; non-vacuity is guarded by the two
+wired calibration witnesses that falsify the first and third, and by the
+wired TTL-expiry witness plus the evidence-module override
+(`retryCalibG4TtlClearKeepsExclusions`) for the second.
 
 **Hash relocation after the harden-subst rebase.** The rebase replayed
 only the formal-sprint commits; the corpus commits that predate the
@@ -785,7 +790,7 @@ distinct).
 | `f9adf3c76` (unchanged) | poison expired during downtime reloaded anyway, with poisoned_at re-stamped to now (fresh 24 h TTL) | ENC | `retryCalibG4ReloadExpiredPoison` | recoveryIsTheDocumentedProjection | **FALSIFIES** recoveryIsTheDocumentedProjection @ calibStep (depth 10, 166/123) |
 | `7078da256` (unchanged) | poisoned nodes reset in place on clear/TTL → recovered stub fields (empty outputs/features) wedged the resubmit | NOT-ENC | — (derivation metadata fields are not modeled; the post-fix removal IS the modeled behavior) | — | n/a |
 | `b09c5b312` (unchanged), X6 half | reassign_derivations had no threshold check (3 disconnects → deferred forever, pre-2f07ea909-era accounting) | ENC | probe `retryCalibG4DisconnectThresholdProbe` (as-built step, two slots, worker+pod-death+crash+wedge alphabet, no failover, no PG faults) | expected HOLDS | **HOLDS** noDisconnectThresholdPoison @ as-built step (exhaustive, 38,980,303/12,146,371, depth 26). Disposition (narrowed in the Phase-0 exit review): the **disconnect/force-drain-triggered arm never fires as-built** — the worker-reported charging sites poison at record time (record-then-check) and post-I-213 disconnects charge nothing — but the same `should_poison` block in `reassign_derivations` is the ONLY threshold gate on the backstop (E8) path (`tick_process_backstop_timeouts` records `failed_builders`/`failure_count` and explicitly delegates the poison decision to `reassign_derivations`) and also serves the force-drain path; the model encodes that delegated check inside `backstopFires` under OE8, so the OE5-scoped probe is structurally blind to it, and the probe ran with MAX_FAILOVERS=0 / PG_FAULTS=0 (no failover, no lost-PG-write histories). HOLDS therefore means "the disconnect-triggered arm is unreachable in today's structure", not "the code-level check is dead". Deletion is licensed only if the Phase-1 collapse routes the E8 exit verdict through `decide()` (or an equivalent threshold check at the E8 charging site) AND the lost-`persist_poisoned`-then-failover history class is explicitly dispositioned; settling C2 only determines whether the disconnect arm becomes load-bearing again. See the Phase-1 input list. |
-| `b09c5b312` (unchanged), X13 half | poison-TTL clear left PG failed_workers behind | NOT-ENC | — (the harm needs a re-merge after the TTL clear; DAbsent is a sink in the model) | — | n/a |
+| `b09c5b312` (unchanged), X13 half | poison-TTL clear left PG failed_workers (and retry_count) behind — the in-memory reset and the durable row disagreed about the next cycle's starting exclusion set, and a post-clear crash recovered the stale set | ENC | `retryCalibG4TtlClearKeepsExclusions` | clearedPoisonScrubsExclusions (new) | **FALSIFIES** clearedPoisonScrubsExclusions @ calibStep (depth 8, 29/23). Disposition of the prior gap: unstated property → invariant added to the main model as a sibling of `clearedPoisonClearsDurably`, HOLDS on the unmodified worker/dual/failover regimes (state counts unchanged), wired into those checks; the override stays an evidence module (G4's wired representative remains the clear-ordering check; the antecedent's reachability is already pinned by the wired TTL-expiry witness). Re-dispositioned from NOT-ENC in the Phase-0 exit review: the mechanism was representable all along (`pg.failedBuilders` exists and the as-built TTL clear writes a fresh row); only the invariant clause was missing — the same treatment `b874e5120` received — and the previously cited dimension (the post-clear re-merge; DAbsent is a sink) is the harm's downstream reader, not the mechanism. |
 | `84a692492` (unchanged) | transient retry persisted Failed instead of Ready → post-recovery hang in the backoff window | NOT-ENC | — (a model-encoding collapse, not a design scope-out: the durable status column exists (`PgRow.status`) and `persist_status` is one of the fault-able mirror writes, but `PgNonTerminal` and `DStatus` both merge the Ready/Failed taxonomy inside non-terminal rows, and the recovery queue-push distinction is not modeled; the harm is also liveness-shaped (a hang, not a wrong charge). Covered by the Phase-1a ledger-schema work — see the recovered-node-metadata bullet in the NOT-ENCODED dimensions list) | — | n/a |
 | `cbda4119a` (unchanged) | poison_and_cascade on an unexpected state still wrote Poisoned to PG and cascaded | NOT-ENC | — (the in-mem transition-guard failure mode is not modeled; the fix itself was defense-in-depth for a state all callers already excluded) | — | n/a |
 | `ea36f98f2` (unchanged) | poison persistence wrote bytes not text | NOT-ENC | — (SQL/serialization encoding) | — | n/a |
@@ -885,7 +890,9 @@ not in CI.
 
 **Met.** Every one of the eight families either falsifies at least one
 invariant through a representative override (G1: 8 overrides falsify; G2:
-1; G3: 2; G4: 2; G5: 2; G7: 1; G8: 3 — all as predicted), or carries an
+1; G3: 2; G4: 3; G5: 2; G7: 1; G8: 3 — all as predicted; the G4 count
+includes the X13 override added by the exit review's correction pass), or
+carries an
 explicit disposition for every commit: G6 is NOT-ENCODED exactly as
 pre-registered in design §3 (the floor ladder is priced out of this model;
 coverage stays with floor.rs's unit tests), and the per-commit NOT-ENCODED
@@ -897,7 +904,8 @@ load-bearing for the backstop (E8) and force-drain paths — with
 machine-checked evidence for the disconnect-arm claim only.
 The invariant list that survives calibration — the eight design
 invariants plus `durableMirrorsCharges`, `clearedPoisonClearsDurably`,
-`recoveryPreservesPoisonStatus`, and the per-event charge discipline — is
+`clearedPoisonScrubsExclusions`, `recoveryPreservesPoisonStatus`, and the
+per-event charge discipline — is
 the replacement's contract going into Phase 1.
 
 ### Phase-1 input list
@@ -947,7 +955,8 @@ dispositions already recorded above (D1–D4, C1–C4, A5–A10):
     other becomes reachable; `decide()` should state one behavior
     deliberately).
 - **Invariants added during calibration** (now part of the contract):
-  `clearedPoisonClearsDurably`, `recoveryPreservesPoisonStatus`; plus two
+  `clearedPoisonClearsDurably`, `clearedPoisonScrubsExclusions`,
+  `recoveryPreservesPoisonStatus`; plus two
   calibration-local properties worth carrying into the post-refactor
   model: `pendingReportKeepsItsEntry` (the correlation-state conservation
   e872b2b49 protects — subsumed in Phase 1 by the two-installment exec_id

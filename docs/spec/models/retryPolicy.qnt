@@ -93,6 +93,14 @@
 //     names. The placement consequence (failed_builders excludes the
 //     slot forever) is faithful to hard_filter; the poison threshold is
 //     scaled to the slot count so every threshold path stays reachable.
+//   - Static eligibility (kind/system/features) is uniform across the
+//     executor slots: eligibleFleet implements only the
+//     registered/non-draining half of the design's eligibility/draining
+//     predicate. A model-time narrowing of design §3's pre-registered G7
+//     encoding -- the heterogeneous-fleet exhaust mis-fire class
+//     (a62631c90) is not representable and is dispositioned NOT-ENC in
+//     the calibration table; revisit if placement work adds
+//     heterogeneous eligibility.
 //   - Stream epochs (the I-056a stale-disconnect guard), heartbeat
 //     bookkeeping, the SLA estimator, and the backstop's wall-clock
 //     threshold (the backstop fires whenever an attempt is wedged; its
@@ -773,6 +781,20 @@ module retryPolicy {
   val clearedPoisonClearsDurably =
     (last.kind == OTtlExpire or last.kind == OPoisonClear) implies
       pg.status != PgPoisoned
+
+  /// The TTL/admin clear scrubs the durable exclusion set too:
+  /// db::clear_poison resets failed_builders (and the per-cycle retry
+  /// count) in the same UPDATE that clears the status, so in the state
+  /// right after a clear observation the durable row carries no
+  /// failed-builder exclusions for the next cycle to inherit at
+  /// recovery. Same antecedent scoping as clearedPoisonClearsDurably
+  /// (the cache-hit clear is best-effort by design, so OCacheHit is not
+  /// in the antecedent). Stage-C calibration invariant: the
+  /// pre-b09c5b312 (X13) TTL clear -- which left PG failed_workers
+  /// behind -- falsifies it.
+  val clearedPoisonScrubsExclusions =
+    (last.kind == OTtlExpire or last.kind == OPoisonClear) implies
+      pg.failedBuilders == Set()
 
   /// Failover preserves the poison set: a durable row that still says
   /// Poisoned (and is not TTL-expired) is reloaded as Poisoned -- the
