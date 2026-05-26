@@ -97,15 +97,19 @@ pub(crate) fn canonicalise_output(
         }
         Err(e) => return Err(CanonicaliseError::io("lstat", root, e)),
     };
-    canonicalise_entry(root, &st, build_uid, inodes_seen)
+    canonicalise_entry(root, &st, build_uid, inodes_seen, true)
 }
 
 /// Recursive worker. `st` is the already-fetched lstat of `path`.
+/// `is_root` is true only for the output path itself — the
+/// group/world-writability rejection applies there alone (CppNix
+/// parity); inner entries are normalized instead.
 fn canonicalise_entry(
     path: &Path,
     st: &nix::sys::stat::FileStat,
     build_uid: u32,
     inodes_seen: &mut HashSet<InodeId>,
+    is_root: bool,
 ) -> Result<(), CanonicaliseError> {
     let kind = SFlag::from_bits_truncate(st.st_mode & SFlag::S_IFMT.bits());
     let is_symlink = kind == SFlag::S_IFLNK;
@@ -129,23 +133,38 @@ fn canonicalise_entry(
         });
     }
 
+    // Inode identity is needed by the ownership check (hard-link second
+    // names) as well as by the already-seen skip further down.
+    let inode: InodeId = (st.st_dev, st.st_ino);
+
     // 2. Ownership: every inode must belong to the build user. This is
     //    also the hard-link defence — a link to a foreign-owned file
     //    (host /etc/shadow, another tenant's scratch) shares the inode
     //    and therefore the owner, and is rejected here regardless of
-    //    which name we reached it by.
+    //    which name we reached it by. One exception, mirroring CppNix's
+    //    `canonicalisePathMetaData_`: a non-directory inode this build
+    //    has already canonicalised. Production chowns processed inodes
+    //    to root (step 8), so the second name of a legitimate hard link
+    //    lstats as root-owned — it was verified builder-owned when first
+    //    visited, so accept it and skip re-processing.
     if st.st_uid != build_uid {
-        return Err(CanonicaliseError::WrongOwner {
-            path: path.display().to_string(),
-            found_uid: st.st_uid,
-            expected_uid: build_uid,
-        });
+        if is_dir || !inodes_seen.contains(&inode) {
+            return Err(CanonicaliseError::WrongOwner {
+                path: path.display().to_string(),
+                found_uid: st.st_uid,
+                expected_uid: build_uid,
+            });
+        }
+        return Ok(());
     }
 
-    // 3. Permission gate: group- or world-writable non-symlink entries
-    //    are rejected (CppNix: "suspicious ownership or permission").
+    // 3. Permission gate: a group- or world-writable output ROOT is
+    //    rejected (CppNix `registerOutputs` checks "suspicious ownership
+    //    or permission" on the output path itself). Inner entries are
+    //    NOT rejected — CppNix silently normalizes them during
+    //    canonicalisation, and step 5 below does the same here.
     //    Symlink modes are meaningless on Linux (always 0777) — exempt.
-    if !is_symlink && (st.st_mode & 0o022) != 0 {
+    if is_root && !is_symlink && (st.st_mode & 0o022) != 0 {
         return Err(CanonicaliseError::Writable {
             path: path.display().to_string(),
             mode: st.st_mode & 0o7777,
@@ -155,7 +174,6 @@ fn canonicalise_entry(
     // Hard-link / already-seen handling: an inode reached through a
     // second name (inter-output hard link, or a link within one output)
     // has already been fully canonicalised — skip it.
-    let inode: InodeId = (st.st_dev, st.st_ino);
     if st.st_nlink > 1 && !inodes_seen.insert(inode) {
         return Ok(());
     }
@@ -206,7 +224,7 @@ fn canonicalise_entry(
             })?;
             let child = entry.path();
             let child_st = lstat(&child).map_err(|e| CanonicaliseError::io("lstat", &child, e))?;
-            canonicalise_entry(&child, &child_st, build_uid, inodes_seen)?;
+            canonicalise_entry(&child, &child_st, build_uid, inodes_seen, false)?;
         }
     }
 
@@ -365,21 +383,75 @@ mod tests {
         );
     }
 
-    /// Group/world-writable files are "suspicious permissions".
+    /// A group/world-writable output ROOT is "suspicious permissions"
+    /// (CppNix `registerOutputs` checks the output path itself).
     #[test]
-    fn rejects_world_writable() {
+    fn rejects_group_writable_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("out");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("loose"), b"x").unwrap();
-        std::fs::set_permissions(root.join("loose"), std::fs::Permissions::from_mode(0o666))
-            .unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).unwrap();
 
         let err = canonicalise_output(&root, my_uid(), &mut HashSet::new()).unwrap_err();
         assert!(
             matches!(err, CanonicaliseError::Writable { .. }),
             "got {err}"
         );
+    }
+
+    /// Group/world-writable INNER entries are accepted and normalized to
+    /// 0444/0555 — CppNix does not reject them, it canonicalises them
+    /// (only the output root is subject to the rejection above).
+    #[test]
+    fn inner_writable_entries_are_normalized_not_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("loose"), b"x").unwrap();
+        std::fs::set_permissions(root.join("loose"), std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        std::fs::write(root.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o775))
+            .unwrap();
+
+        canonicalise_output(&root, my_uid(), &mut HashSet::new()).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("loose")).unwrap().mode() & 0o7777,
+            0o444
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("tool")).unwrap().mode() & 0o7777,
+            0o555
+        );
+    }
+
+    /// The second name of an inode this build already canonicalised is
+    /// accepted even when it no longer lstats as builder-owned —
+    /// production chowns processed inodes to root (step 8), so without
+    /// this escape every hard-linked file would be rejected as
+    /// foreign-owned via its second name (CppNix accepts already-seen
+    /// inodes for exactly this reason). A foreign-owned inode that was
+    /// NOT processed by this build stays rejected.
+    #[test]
+    fn already_seen_hard_link_passes_ownership_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("first-name");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let second = tmp.path().join("second-name");
+        std::fs::hard_link(&file, &second).unwrap();
+        let st = lstat(&second).unwrap();
+        let not_us = my_uid().wrapping_add(1);
+
+        // Not seen before → the foreign-owner rejection applies.
+        let mut seen = HashSet::new();
+        let err = canonicalise_entry(&second, &st, not_us, &mut seen, false).unwrap_err();
+        assert!(matches!(err, CanonicaliseError::WrongOwner { .. }));
+
+        // Seen before (first name already canonicalised) → accepted.
+        let mut seen = HashSet::new();
+        seen.insert((st.st_dev, st.st_ino));
+        canonicalise_entry(&second, &st, not_us, &mut seen, false).unwrap();
     }
 
     /// A file owned by a different uid than the build user is rejected —
