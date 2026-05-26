@@ -799,3 +799,76 @@ with the Phase-2 Kani work (the `decide_collect` kernel), where a
 dependency-free kernel extraction is the candidate shape. Measured
 non-convergence figures are in the introducing commit message
 (`feat(rio-store): add a fallible chunk_list parse...`).
+
+### Phase 1a measurements and adjudications
+
+#### T-1a.1 — mark-scan cost: NO-GO; the §5a junction fallback is triggered
+
+The §5a go/no-go measurement (plan T-1a.1, sign-off item 5) was run
+against the prescribed collector mark shape — one connection, keyset
+pages over `manifest_data JOIN manifests`, the fallible per-manifest
+parse, batched `INSERT … ON CONFLICT DO NOTHING` into
+`TEMP TABLE live_chunks(blake3_hash BYTEA PRIMARY KEY)` — using the
+`#[ignore]`d, env-tunable harness at
+`rio-store/src/gc/mark_scan_bench.rs` (the entry-count mix and sharing
+model are documented in its module doc: median a few dozen entries, a
+tail at the 10 GB-NAR / ~160 k-entry class, cross-manifest dedup factor
+≈ 2.4×), at three scale points — 15 k, 150 k, and the production-scale
+1.5 M chunked paths — on the most production-like hardware available to
+the campaign (a 192-core EPYC dev box, ephemeral PostgreSQL 18 with
+fsync off and tmpfs-backed storage; faster than the production database
+class on both I/O and clock, so the measurement is a lower bound on
+production cost). Raw figures live in the introducing commit's message
+and the run transcripts; the verdict-relevant magnitudes are below.
+
+**Verdict: NO-GO** against the sign-off item 5 threshold (full mark scan
+≤ 5 minutes at the ~1.5 M-path scale; linear-or-better growth;
+temp-table-bounded memory):
+
+- the production-scale scan takes roughly seven to eight times the
+  five-minute budget (tens of minutes, not minutes);
+- growth is super-linear — each 10× increase in path count costs
+  roughly fourteen to fifteen times the scan wall-clock, because
+  per-reference throughput degrades as the mark-set btree grows far
+  past the session's local buffer pool — so the growth clause fails
+  independently of the absolute-time clause;
+- only the memory clause holds: the working set is bounded by the temp
+  table (the client holds one page of manifests and one bounded insert
+  buffer).
+
+The dominant cost is the per-reference `ON CONFLICT` probe into a
+temp-table btree that is orders of magnitude larger than PostgreSQL's
+session-local `temp_buffers`. That cost is intrinsic to the prescribed
+stream-parse-insert shape on a single backend — not an artifact of batch
+size, page size, hardware, or the synthetic mix: at the measured
+throughput, fitting the five-minute budget would require the store's
+total reference volume to be several times smaller than any mix
+consistent with the inventory's §3.3 shape (the known 10 GB-NAR-class
+paths alone rule that out), and throughput keeps degrading as the mark
+set grows.
+
+**Consequences (design §5a; plan T-1a.1 step 4).** The junction fallback
+— `chunk_refs(store_path_hash, blake3_hash)` maintained in the upgrade
+transaction with `ON DELETE CASCADE`, mark as an indexed anti-join — is
+triggered, NOT built: §5a requires re-deriving §4.1 and re-entering
+design review to price the write-amplification and blob-vs-junction
+drift obligations before any collector code exists. The collector tasks
+of the Phase-1 plan (T-1a.3 onward) are void pending that re-entry.
+Migration 068 / the upsert touch (T-1a.2) was also deliberately not
+shipped ahead of the re-entry: whether `last_referenced_at` survives the
+junction design, and in what shape, is a re-entry question, and shipped
+migrations are frozen. The implied cadence/GC-lock-hold budget for the
+as-designed shape — a scan of tens of minutes holding `GC_LOCK_ID` in
+every `run_gc` invocation and every backstop run — is far outside what
+phase-3-of-run_gc or a daily backstop can absorb, which is the same
+no-go stated as an operational cost rather than a threshold breach.
+
+The other two still-open Phase-0 items absorbed into Wave A1 — the
+collect-soundness enforcement choice (T-1a.4's histogram + alert) and
+the replacement `#r()` rule drafts with `chunkCollect.qnt` (T-1a.5) —
+remain open: both are shaped by the mark mechanism the re-entry
+chooses (the soundness condition's form and the model's mark action
+both change under a junction-maintained mark), so recording a choice
+now would prejudge the re-entry. The Wave A1 stop-and-report record is
+`refcount-a1-blocker-T-1a.1.md` (campaign working notes, alongside the
+design and plan documents).

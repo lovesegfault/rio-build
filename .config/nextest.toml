@@ -92,6 +92,17 @@ test-group = 'postgres'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# The gc::mark_scan_bench measurement seeds up to ~1.5M synthetic
+# manifests and times the collector's mark fold — minutes-long by
+# design at measurement scale. It is #[ignore]d (only runs via
+# --run-ignored) and PG-backed, so it needs the postgres group plus a
+# timeout far above the regular PG-test budget. Listed before the
+# generic rio-store override so the longer timeout wins.
+filter = 'package(rio-store) and test(/mark_scan_bench/)'
+test-group = 'postgres'
+slow-timeout = { period = "900s", terminate-after = 8 }
+
+[[profile.default.overrides]]
 # binary(grpc) alone missed ~109 lib unit tests (gc::, metadata::,
 # cache_server::, signing::, content_index::, realisations::,
 # grpc::put_path::, grpc::admin::) that also use TestDb. Those ran in

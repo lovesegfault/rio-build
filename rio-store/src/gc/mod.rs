@@ -39,6 +39,8 @@
 
 pub mod drain;
 mod mark;
+#[cfg(test)]
+mod mark_scan_bench;
 pub mod orphan;
 pub mod sweep;
 pub mod tenant;
