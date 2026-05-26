@@ -453,10 +453,31 @@ pub(in crate::grpc) fn verify_ca_store_path(
                 "{ctx_label}: flat content length does not fit this platform"
             ))
         })?;
+        let file_bytes = &nar_data[off..off + len];
         let mut w = rio_nix::ca::HashWriter::new(algo);
-        w.write_all(&nar_data[off..off + len])
+        w.write_all(file_bytes)
             .map_err(|e| Status::internal(format!("{ctx_label}: flat hash ({algo}): {e}")))?;
-        w.finish()
+        let plain = w.finish();
+        // Same descriptor-gated fallback as the recursive branch:
+        // structured-attrs `unsafeDiscardReferences` flat outputs whose
+        // bytes embed their own path are minted (by CppNix and the
+        // native builder alike) from the hash *modulo* those
+        // occurrences, with no self-reference declared. If the
+        // descriptor disagrees with the plain flat hash, re-hash the
+        // file bytes modulo the claimed path's own hash part before
+        // concluding anything — still self-certifying (the modulus is
+        // the claimed path itself), and only paid when the plain hash
+        // already failed to match.
+        match &descriptor {
+            Some(d) if d.hash != plain => {
+                let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
+                sink.write_all(file_bytes).map_err(|e| {
+                    Status::internal(format!("{ctx_label}: flat hash-modulo fallback: {e}"))
+                })?;
+                sink.finish().0
+            }
+            _ => plain,
+        }
     };
 
     // The descriptor is persisted and served to substituting clients
@@ -1125,6 +1146,98 @@ mod verify_nar_tests {
             rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, other_digest.to_vec())
                 .unwrap();
         info.content_address = Some(format!("fixed:r:{}", other_hash.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+        assert!(
+            e.message().contains("descriptor does not match"),
+            "rejection must name the descriptor mismatch, got: {}",
+            e.message()
+        );
+    }
+
+    /// Flat-mode discarded self-reference: the file bytes embed the
+    /// claimed path, `references` is empty, and the flat `fixed:`
+    /// descriptor carries the modulo hash — the shape the builder's
+    /// flat floating-CA finalization produces under structured-attrs
+    /// `unsafeDiscardReferences`. The gate must accept it via the same
+    /// fallback as the recursive branch, and still reject the same
+    /// upload claimed under a different path.
+    #[test]
+    fn ca_flat_discarded_self_reference_with_descriptor_accepted() {
+        use std::io::Write as _;
+        let drv =
+            rio_nix::store_path::StorePath::parse(&test_drv_path("flat-self-discarded")).unwrap();
+        let scratch =
+            rio_nix::store_path::StorePath::make_scratch_output_path(&drv, "out").unwrap();
+        let content_at_scratch = format!("I live at {}\n", scratch.as_str()).into_bytes();
+        let mut sink =
+            rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &scratch.hash_part());
+        sink.write_all(&content_at_scratch).unwrap();
+        let (modulo, _) = sink.finish();
+        // Self flag OFF and method = flat: the references were discarded.
+        let final_path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "flat-self-discarded",
+            &modulo,
+            false,
+            &[],
+            false,
+        )
+        .unwrap();
+        let final_content = String::from_utf8(content_at_scratch)
+            .unwrap()
+            .replace(&scratch.hash_part(), &final_path.hash_part())
+            .into_bytes();
+        let nar = nar_of_file(&final_content);
+
+        let mut info = ca_info(&final_path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", modulo.to_colon()));
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("flat discarded-self upload with a modulo descriptor must pass");
+
+        // Same NAR + descriptor claimed under a different path: the
+        // fallback modulus changes, nothing matches, still rejected.
+        let other =
+            rio_nix::store_path::StorePath::parse(&test_store_path("flat-imposter")).unwrap();
+        let mut info = ca_info(&other, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", modulo.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+    }
+
+    /// Flat self-embedding content with a LYING flat descriptor: neither
+    /// the plain nor the modulo recompute matches, so the gate must
+    /// reject for the descriptor mismatch.
+    #[test]
+    fn ca_flat_discarded_self_descriptor_lie_rejected() {
+        use std::io::Write as _;
+        let drv = rio_nix::store_path::StorePath::parse(&test_drv_path("flat-desc-lie")).unwrap();
+        let scratch =
+            rio_nix::store_path::StorePath::make_scratch_output_path(&drv, "out").unwrap();
+        let content_at_scratch = format!("I live at {}\n", scratch.as_str()).into_bytes();
+        let mut sink =
+            rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &scratch.hash_part());
+        sink.write_all(&content_at_scratch).unwrap();
+        let (modulo, _) = sink.finish();
+        let final_path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "flat-desc-lie",
+            &modulo,
+            false,
+            &[],
+            false,
+        )
+        .unwrap();
+        let final_content = String::from_utf8(content_at_scratch)
+            .unwrap()
+            .replace(&scratch.hash_part(), &final_path.hash_part())
+            .into_bytes();
+        let nar = nar_of_file(&final_content);
+
+        let other_digest: [u8; 32] = Sha256::digest(b"not the uploaded bytes").into();
+        let other_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, other_digest.to_vec())
+                .unwrap();
+        let mut info = ca_info(&final_path, &[], &nar);
+        info.content_address = Some(format!("fixed:{}", other_hash.to_colon()));
         let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
         assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
         assert!(
