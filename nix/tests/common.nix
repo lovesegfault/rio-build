@@ -781,9 +781,16 @@ rec {
 
         DerivationNode: drvHash=drvPath (input-addressed; gateway
         translate.rs:361 does the same), system = VM platform,
-        outputNames=["out"] (mkTrivial single output). The gateway
-        normally parses the .drv for these; gRPC-direct bypasses
-        that. **req merges into SubmitBuildRequest (e.g. buildTimeout)."""
+        outputNames=["out"] (mkTrivial single output), drvContent =
+        base64 of the ATerm (proto bytes are base64 in grpcurl JSON).
+        The gateway normally parses the .drv and inlines its content
+        for will-dispatch nodes (filter_and_inline_drv); gRPC-direct
+        bypasses that, and WITHOUT drvContent the scheduler has no
+        inputSrcs to derive WorkAssignment.input_roots from — the
+        per-build castore mount then serves an empty /nix/store and
+        the build fails before it ever runs (the cancel-cgroup-kill /
+        build-timeout / cancel-timing failure mode).
+        **req merges into SubmitBuildRequest (e.g. buildTimeout)."""
         drv_path = client.succeed(
             "nix-instantiate "
             "--arg busybox '(builtins.storePath ${busybox})' "
@@ -792,12 +799,14 @@ rec {
         client.succeed(
             f"nix copy --derivation --to 'ssh-ng://${gatewayHost}' {drv_path}"
         )
+        drv_b64 = client.succeed(f"base64 -w0 {drv_path}").strip()
         build_id = submit_build_grpc({
             "nodes": [{
                 "drvPath": drv_path,
                 "drvHash": drv_path,
                 "system": "${pkgs.stdenv.hostPlatform.system}",
                 "outputNames": ["out"],
+                "drvContent": drv_b64,
             }],
             "edges": [],
             **req,
