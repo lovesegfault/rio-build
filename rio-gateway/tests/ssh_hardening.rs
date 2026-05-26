@@ -158,6 +158,12 @@ async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::ta
 /// limits (`with_max_sessions(4)`, `with_max_channels_per_connection(8)`,
 /// `with_empty_connection_grace(200ms)`) instead of opening 4096
 /// channels to reach the production defaults.
+///
+/// Runs the PRODUCTION accept loop ([`GatewayServer::run_on_listener`]),
+/// not russh's `run_on_socket`, so the per-connection spawn site — and
+/// the pre-auth deadline that lives there — is what these tests
+/// exercise. The shutdown token is never fired; tests abort the returned
+/// `JoinHandle` instead (per-connection tasks die with the test runtime).
 async fn spawn_ssh_server_with(
     configure: impl FnOnce(GatewayServer) -> GatewayServer,
 ) -> anyhow::Result<(SocketAddr, PrivateKey, tokio::task::JoinHandle<()>)> {
@@ -170,18 +176,20 @@ async fn spawn_ssh_server_with(
     let client_pub = client_key.public_key().clone();
 
     let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
-    let config = Arc::new(build_ssh_config(host_key));
 
     let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = socket.local_addr()?;
 
-    let mut server = configure(GatewayServer::new(
+    let server = configure(GatewayServer::new(
         store_client,
         scheduler_client,
         vec![client_pub],
     ));
     let srv_handle = tokio::spawn(async move {
-        if let Err(e) = server.run_on_socket(config, &socket).await {
+        if let Err(e) = server
+            .run_on_listener(host_key, socket, rio_common::signal::Token::new())
+            .await
+        {
             eprintln!("ssh server error: {e}");
         }
     });
@@ -429,7 +437,7 @@ async fn test_many_multiplexed_sessions_all_succeed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+1]
+// r[verify gw.conn.exit-status+2]
 /// A connection whose channel count transits through zero must survive
 /// for the grace period (a ControlMaster between builds), and must
 /// still be reaped once the grace period expires without a new channel
@@ -479,7 +487,7 @@ async fn test_connection_survives_channel_count_touching_zero() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+1]
+// r[verify gw.conn.exit-status+2]
 /// An authenticated connection that NEVER opens a channel (`ssh -N`, a
 /// ControlMaster held open with no commands, a client wedged before
 /// exec) has had zero open channels continuously since establishment,
@@ -555,38 +563,153 @@ async fn test_authenticated_connection_without_channels_is_reaped() -> anyhow::R
     Ok(())
 }
 
-// r[verify gw.conn.exit-status+1]
-/// Converse guard for the never-opened-a-channel reap: a connection that
-/// DOES open a channel within the grace window is NOT disconnected —
-/// the channel open disarms the establishment-time grace timer exactly
-/// like it disarms the last-channel-closed timer.
+// r[verify gw.conn.exit-status+2]
+/// Converse guard for the reap tests: a client that proceeds normally —
+/// authenticates, opens a channel, and execs `nix-daemon --stdio` inside
+/// the grace window — is NOT disconnected. The admitted exec (a live
+/// protocol session) is what disarms the establishment-time grace timer;
+/// a bare channel open no longer counts as activity, which is exactly
+/// what `test_open_channel_without_exec_is_reaped` pins from the other
+/// side.
 #[tokio::test]
-async fn test_connection_opening_channel_within_grace_survives() -> anyhow::Result<()> {
+async fn test_connection_execing_within_grace_survives() -> anyhow::Result<()> {
     common::init_test_logging();
     const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
     let (addr, client_key, srv) =
         spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE)).await?;
     let session = connect_and_auth(addr, client_key).await?;
 
-    // Open (and keep open) a channel inside the grace window. The open
-    // is confirmed by the server before `channel_open_session` returns,
-    // so the disarm has happened by the time we start waiting.
+    // Open a channel and exec on it (like a real nix client) inside the
+    // grace window, then keep the session open. The exec request is
+    // processed by the server within milliseconds of being sent, well
+    // inside the grace.
     tokio::time::sleep(GRACE / 4).await;
-    let ch = session.channel_open_session().await?;
+    let mut ch = session.channel_open_session().await?;
     ch.exec(true, "nix-daemon --stdio").await?;
+    let msg = ch.wait().await.expect("server reply");
+    assert!(
+        matches!(msg, russh::ChannelMsg::Success),
+        "exec must be admitted (this is the disarm event): {msg:?}"
+    );
 
     // Well past the point where the establishment-time timer would have
-    // fired: the connection must still be alive because the open
-    // disarmed it and the channel is still open.
+    // fired: the connection must still be alive because the admitted
+    // exec disarmed it and the session is still active.
     tokio::time::sleep(GRACE * 3).await;
     let again = session.channel_open_session().await;
     assert!(
         again.is_ok(),
-        "a connection with an open channel must not be reaped by the \
-         empty-connection grace timer: {again:?}"
+        "a connection with an active protocol session must not be reaped by \
+         the empty-connection grace timer: {again:?}"
     );
 
     drop(ch);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.exit-status+2]
+/// A connection that attempts authentication but never succeeds (rejected
+/// key, wedged ssh-agent) must be disconnected once the grace period
+/// expires, releasing its `max_connections` slot
+/// (`rio_gateway_connections_active` returns to its prior value).
+///
+/// Regression: russh 0.61 has no login-grace deadline of its own
+/// (`Config` has no such field and `max_auth_attempts` is never
+/// enforced), the auth callbacks have no `&mut Session` to arm the
+/// empty-connection timer with, and an answering-but-idle client resets
+/// both `alive_timeouts` and `inactivity_timeout` on every keepalive
+/// reply — so a never-authenticated connection used to hold its permit,
+/// fd, and gauge slot forever.
+#[tokio::test]
+async fn test_unauthenticated_connection_is_reaped() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    const GAUGE: &str = "rio_gateway_connections_active{}";
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (addr, _client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE)).await?;
+
+    // Connect and offer a key the server does not know: rejected at
+    // `auth_publickey_offered`, never authenticated. The client then
+    // sits on the open transport (a real client would keep answering
+    // keepalives, which reset russh's inactivity/keepalive timers).
+    let unknown = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+    let config = Arc::new(client::Config::default());
+    let mut session = client::connect(config, addr, AcceptAllClient).await?;
+    let auth = session
+        .authenticate_publickey("nix", PrivateKeyWithHashAlg::new(Arc::new(unknown), None))
+        .await?;
+    anyhow::ensure!(!auth.success(), "unknown key must be rejected");
+
+    // The failed attempt fired `mark_real_connection`: the connection is
+    // holding a permit and counts toward the gauge. This also proves the
+    // recorder is wired, so the ==0 assertion below can't pass vacuously.
+    assert_eq!(
+        recorder.gauge_value(GAUGE),
+        Some(1.0),
+        "a connection that attempted auth must be counted while it is held; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    // Past the deadline the gateway must have disconnected it and
+    // released the slot. Poll: ConnectionHandler::Drop runs when the
+    // server-side session task finishes tearing down, strictly after the
+    // disconnect is sent, so don't assert instantly.
+    let mut reaped = false;
+    for _ in 0..40 {
+        if recorder.gauge_value(GAUGE) == Some(0.0) && session.is_closed() {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        reaped,
+        "a connection that never authenticates must be disconnected within the \
+         pre-auth deadline and release its slot; gauge={:?} closed={}",
+        recorder.gauge_value(GAUGE),
+        session.is_closed(),
+    );
+
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.exit-status+2]
+/// A connection that authenticates and opens a channel but never sends
+/// an exec request has zero active protocol sessions — no
+/// `ChannelSession`, no session-semaphore permit, no protocol task (the
+/// handshake/idle timeouts only exist after exec) — so it must be
+/// disconnected once the grace period expires. An open-but-never-exec'd
+/// channel must NOT count as activity.
+#[tokio::test]
+async fn test_open_channel_without_exec_is_reaped() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // Open a channel but never exec on it: no protocol session is ever
+    // created, so the connection never leaves the "empty" state.
+    let _ch = session.channel_open_session().await?;
+
+    // Well past the grace: the gateway must have disconnected the
+    // connection. 3× the grace mirrors the other reap tests.
+    tokio::time::sleep(GRACE * 3).await;
+    let after = session.channel_open_session().await;
+    assert!(
+        after.is_err(),
+        "a connection whose only channel never exec'd must be reaped after \
+         the grace period, got a successful open: {after:?}"
+    );
+
     drop(session);
     srv.abort();
     Ok(())

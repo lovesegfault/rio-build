@@ -1144,24 +1144,31 @@ argument (`ends_with("nix-daemon")`) and requires the last argument to be
 exactly `--stdio`. This allows clients that send a full store path (e.g.,
 `/nix/store/...-nix-2.20.0/bin/nix-daemon --stdio`) to connect successfully.
 
-#r("gw.conn.exit-status+1")[
+#r("gw.conn.exit-status+2")[
   When the protocol handler returns, the gateway MUST send `exit-status` (RFC
   4254 §6.10) on the channel before `eof`/`close`; openssh under
   `ControlMaster` waits for `exit-status` before its foreground process returns
   to the parent (nix), so omitting it leaves `nom build` hung until
   `ControlPersist` expires. A rejected `exec_request` MUST send
   `channel_failure` followed by `exit-status 1` + `eof` + `close` for the same
-  reason. When a connection has had zero open channels continuously for
-  `EMPTY_CONNECTION_GRACE` (60 s), the gateway MUST send `SSH_MSG_DISCONNECT`
-  so an abandoned TCP socket closes promptly instead of waiting for
-  `inactivity_timeout` (which an idle-but-keepalive-answering client never
-  trips). The gateway MUST NOT disconnect the instant the last channel closes:
-  a `ControlMaster` mux's in-flight session count transits through zero
-  between builds, and killing its transport there makes the master exit,
-  OpenSSH unlink the "stale" control socket, and every remaining nix process
-  in the batch silently fall back to a direct connection whose handshake is
-  corrupted by Nix's `LocalCommand` --- one touch-zero event poisons the rest
-  of a 64-worker run.
+  reason. When a connection has had zero active protocol sessions (admitted
+  `nix-daemon --stdio` execs) continuously for `EMPTY_CONNECTION_GRACE`
+  (60 s), the gateway MUST send `SSH_MSG_DISCONNECT` so an abandoned TCP
+  socket closes promptly instead of waiting for `inactivity_timeout` (which an
+  idle-but-keepalive-answering client never trips). Emptiness is measured on
+  exec'd sessions, not open SSH channels: a channel that is opened but never
+  exec'd has no protocol task and therefore no handshake/idle deadline of its
+  own, so it MUST NOT count as activity. A connection that has not completed
+  authentication within the same grace period MUST likewise be disconnected
+  (russh provides no login-grace deadline, and the pre-auth phase has no
+  channels or sessions for the empty-connection clock to key on). The gateway
+  MUST NOT disconnect the instant the last session ends: a `ControlMaster`
+  mux's in-flight session count transits through zero between builds, and
+  killing its transport there makes the master exit, OpenSSH unlink the
+  "stale" control socket, and every remaining nix process in the batch
+  silently fall back to a direct connection whose handshake is corrupted by
+  Nix's `LocalCommand` --- one touch-zero event poisons the rest of a
+  64-worker run.
 ]
 
 #r("gw.conn.session-error-visible")[
@@ -1218,7 +1225,7 @@ violate.
   sessions across all connections on the instance (`max_sessions`, default
   4096). The bound MUST be enforced at `exec_request` time, before the
   session's buffers are allocated, by rejecting the exec per
-  #rref("gw.conn.exit-status+1") --- never by refusing the channel open. An
+  #rref("gw.conn.exit-status+2") --- never by refusing the channel open. An
   exec-time `channel_failure` is a clean `ssh` exit for a `ControlMaster` mux
   client (the master has already reported `MUX_S_SESSION_OPENED` to its
   client by the time the exec reply arrives), while a channel-open refusal

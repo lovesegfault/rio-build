@@ -27,7 +27,7 @@ use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Server as _, run_stream};
-use russh::{MethodKind, MethodSet};
+use russh::{Disconnect, MethodKind, MethodSet};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tonic::transport::Channel;
@@ -77,18 +77,28 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 /// `gateway.toml max_channels_per_connection`.
 pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 
-/// Grace period a connection may have zero open channels — measured
-/// from authentication (established, nothing opened yet) or from the
-/// last SSH channel closing — before the gateway disconnects it
-/// (`r[gw.conn.exit-status+1]`). A ControlMaster mux whose in-flight
-/// session count transits through zero between builds must NOT lose its
-/// transport — the master would exit and every remaining nix process in
-/// the batch would fall back to a corrupted direct connection. 60 s
-/// comfortably covers inter-build gaps and the auth-to-first-exec delay
-/// of any real nix client (milliseconds); a genuinely abandoned or
-/// never-used connection is still reaped 60× sooner than
-/// `inactivity_timeout`, which an idle-but-keepalive-answering client
-/// never trips. Overridable for tests via `with_empty_connection_grace`.
+/// Grace period a connection may have zero active protocol sessions —
+/// measured from authentication (established, nothing exec'd yet) or
+/// from the last session ending — before the gateway disconnects it
+/// (`r[gw.conn.exit-status+2]`). Keyed on exec'd sessions, not open SSH
+/// channels: a channel that is opened but never exec'd has no protocol
+/// task and no deadline of its own, so it must not count as activity.
+/// The same duration also bounds the pre-auth phase: a connection that
+/// has not authenticated within it is disconnected by the accept-site
+/// deadline in [`GatewayServer::run_on_listener`] (russh has no
+/// login-grace of its own, and an answering-but-idle client never trips
+/// `inactivity_timeout`/`keepalive_max`).
+///
+/// A ControlMaster mux whose in-flight session count transits through
+/// zero between builds must NOT lose its transport — the master would
+/// exit and every remaining nix process in the batch would fall back to
+/// a corrupted direct connection. 60 s comfortably covers inter-build
+/// gaps, the auth-to-first-exec delay of any real nix client
+/// (milliseconds), and any legitimate auth handshake (OpenSSH's own
+/// LoginGraceTime default is 120 s); a genuinely abandoned or never-used
+/// connection is still reaped 60× sooner than `inactivity_timeout`,
+/// which an idle-but-keepalive-answering client never trips.
+/// Overridable for tests via `with_empty_connection_grace`.
 pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The SSH server that accepts connections and spawns protocol sessions.
@@ -330,20 +340,34 @@ impl GatewayServer {
     /// (or a `bind()` failure before the loop starts). A `?` here would
     /// reproduce the I-064 outcome via process-exit: main.rs `?`s past
     /// `wait_for_session_drain` and every detached session aborts.
-    // r[impl gw.conn.session-drain]
     pub async fn run(
-        mut self,
+        self,
         host_key: PrivateKey,
         addr: SocketAddr,
         serve_shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
-        let config = Arc::new(build_ssh_config(host_key));
-
         info!(addr = %addr, "starting SSH server");
 
         let socket = TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind SSH server to {addr}"))?;
+
+        self.run_on_listener(host_key, socket, serve_shutdown).await
+    }
+
+    /// The accept loop behind [`Self::run`], on an already-bound
+    /// listener. Split out so integration tests can exercise the REAL
+    /// production accept path (including the pre-auth deadline below)
+    /// against an ephemeral `127.0.0.1:0` listener whose port they know.
+    /// See [`Self::run`] for the lifecycle/decoupling contract.
+    // r[impl gw.conn.session-drain]
+    pub async fn run_on_listener(
+        mut self,
+        host_key: PrivateKey,
+        socket: TcpListener,
+        serve_shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let config = Arc::new(build_ssh_config(host_key));
 
         loop {
             let (stream, peer) = tokio::select! {
@@ -370,6 +394,7 @@ impl GatewayServer {
             let handler = self.new_client(Some(peer));
             let stage = Arc::clone(&handler.stage);
             let config = Arc::clone(&config);
+            let auth_deadline = self.empty_connection_grace;
             // Detached: NOT coupled to accept-loop lifetime. The handler
             // holds `active_conns` (via `mark_real_connection`/`Drop`),
             // so main.rs's drain poll observes natural session end.
@@ -382,13 +407,59 @@ impl GatewayServer {
                 {
                     warn!(%peer, error = %e, "set_nodelay failed");
                 }
-                let session = match run_stream(config, stream, handler).await {
+                let mut session = match run_stream(config, stream, handler).await {
                     Ok(s) => s,
                     Err(e) => {
                         log_session_end(peer, &stage, &e);
                         return;
                     }
                 };
+                // r[impl gw.conn.exit-status+2]
+                // Pre-auth deadline: a connection that has not completed
+                // authentication within the grace is disconnected here.
+                // It has to live at the accept site because nothing
+                // post-accept bounds it: the auth callbacks have no
+                // `&mut Session` to arm the empty-connection timer with,
+                // russh 0.61 has no login-grace config (and never
+                // enforces `max_auth_attempts`), and a client that
+                // answers keepalives resets both `alive_timeouts` and
+                // `inactivity_timeout` on every reply — so a rejected
+                // key or a wedged ssh-agent would otherwise hold its
+                // `conn_permit`, fd, and `connections_active` slot
+                // forever. The `stage` check immediately before acting
+                // keeps a connection that authenticated at the last
+                // moment alive; an auth that lands in the instant
+                // between that check and the disconnect being processed
+                // is still torn down — the same inherent boundary race
+                // as any idle timeout, and the client just reconnects.
+                tokio::select! {
+                    r = &mut session => {
+                        if let Err(e) = r {
+                            log_session_end(peer, &stage, &e);
+                        }
+                        return;
+                    }
+                    () = tokio::time::sleep(auth_deadline) => {
+                        if stage.load(Ordering::Relaxed)
+                            < connection::ConnStage::Authenticated as u8
+                        {
+                            debug!(
+                                %peer,
+                                deadline_secs = auth_deadline.as_secs(),
+                                "connection did not authenticate within the deadline; \
+                                 disconnecting"
+                            );
+                            let _ = session
+                                .handle()
+                                .disconnect(
+                                    Disconnect::ByApplication,
+                                    "authentication timeout".to_owned(),
+                                    String::new(),
+                                )
+                                .await;
+                        }
+                    }
+                }
                 if let Err(e) = session.await {
                     log_session_end(peer, &stage, &e);
                 }
