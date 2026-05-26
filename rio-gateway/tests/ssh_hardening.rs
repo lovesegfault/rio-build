@@ -479,6 +479,119 @@ async fn test_connection_survives_channel_count_touching_zero() -> anyhow::Resul
     Ok(())
 }
 
+// r[verify gw.conn.exit-status+1]
+/// An authenticated connection that NEVER opens a channel (`ssh -N`, a
+/// ControlMaster held open with no commands, a client wedged before
+/// exec) has had zero open channels continuously since establishment,
+/// so it must be disconnected once the grace period expires — and its
+/// `max_connections` slot must be released (`rio_gateway_connections_active`
+/// returns to its prior value).
+///
+/// Regression: the grace timer used to be armed only in `channel_close`,
+/// so a connection that authenticated and never opened a channel never
+/// armed it, answered the 30s keepalives forever (any received data
+/// resets russh's `alive_timeouts`), never tripped `inactivity_timeout`
+/// (each keepalive reply resets it), and was held indefinitely.
+///
+/// The recorder is the thread-local default (`set_default_local_recorder`);
+/// `#[tokio::test]` is a current-thread runtime, so the spawned server
+/// task emits into it.
+#[tokio::test]
+async fn test_authenticated_connection_without_channels_is_reaped() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    const GAUGE: &str = "rio_gateway_connections_active{}";
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // Sanity: the authenticated connection is counted. This also proves
+    // the recorder is actually wired, so the ==0 assertion at the end
+    // can't pass vacuously.
+    assert_eq!(
+        recorder.gauge_value(GAUGE),
+        Some(1.0),
+        "authenticated connection must count toward connections_active; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    // Never open a channel. Well past the grace period the server must
+    // have sent SSH_MSG_DISCONNECT — a new channel open fails. 3× the
+    // grace mirrors test_connection_survives_channel_count_touching_zero.
+    tokio::time::sleep(GRACE * 3).await;
+    let after = session.channel_open_session().await;
+    assert!(
+        after.is_err(),
+        "a connection that never opened a channel must be disconnected after \
+         the grace period, got a successful open: {after:?}"
+    );
+
+    // The reap must release the slot: ConnectionHandler::Drop decrements
+    // the gauge. Drop runs when the server-side session task finishes
+    // tearing down — strictly after the client observes the disconnect —
+    // so poll briefly instead of asserting instantly.
+    let mut active = recorder.gauge_value(GAUGE);
+    for _ in 0..40 {
+        if active == Some(0.0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        active = recorder.gauge_value(GAUGE);
+    }
+    assert_eq!(
+        active,
+        Some(0.0),
+        "connections_active must return to its prior value once the idle \
+         connection is reaped; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.exit-status+1]
+/// Converse guard for the never-opened-a-channel reap: a connection that
+/// DOES open a channel within the grace window is NOT disconnected —
+/// the channel open disarms the establishment-time grace timer exactly
+/// like it disarms the last-channel-closed timer.
+#[tokio::test]
+async fn test_connection_opening_channel_within_grace_survives() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE)).await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    // Open (and keep open) a channel inside the grace window. The open
+    // is confirmed by the server before `channel_open_session` returns,
+    // so the disarm has happened by the time we start waiting.
+    tokio::time::sleep(GRACE / 4).await;
+    let ch = session.channel_open_session().await?;
+    ch.exec(true, "nix-daemon --stdio").await?;
+
+    // Well past the point where the establishment-time timer would have
+    // fired: the connection must still be alive because the open
+    // disarmed it and the channel is still open.
+    tokio::time::sleep(GRACE * 3).await;
+    let again = session.channel_open_session().await;
+    assert!(
+        again.is_ok(),
+        "a connection with an open channel must not be reaped by the \
+         empty-connection grace timer: {again:?}"
+    );
+
+    drop(ch);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
 // ===========================================================================
 // I-109 — authorized_keys hot-reload
 // ===========================================================================

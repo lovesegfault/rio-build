@@ -236,8 +236,9 @@ pub struct ConnectionHandler {
     /// yet exec'd is counted here and invisible there, so a burst of
     /// opens with no execs is still bounded.
     pub(super) open_channels: usize,
-    /// Grace period between the last channel closing and the idle
-    /// connection being disconnected. See
+    /// Grace period a connection may sit with zero open channels —
+    /// from authentication (nothing opened yet) or from the last
+    /// channel closing — before it is disconnected. See
     /// [`super::EMPTY_CONNECTION_GRACE`].
     pub(super) empty_connection_grace: std::time::Duration,
     /// The armed idle-disconnect timer, if the connection currently has
@@ -365,6 +366,48 @@ impl ConnectionHandler {
             return Err(anyhow::anyhow!("connection cap reached"));
         }
         Ok(())
+    }
+
+    // r[impl gw.conn.exit-status+1]
+    /// Arm (or re-arm) the empty-connection grace timer: after
+    /// `empty_connection_grace` with zero open channels, disconnect the
+    /// connection. Called from the two places a connection enters the
+    /// zero-open-channels state — `auth_succeeded` (established, nothing
+    /// opened yet) and `channel_close` (last channel gone).
+    /// `channel_open_session` and `Drop` abort it.
+    ///
+    /// Race at the boundary: a channel open that arrives in the same
+    /// instant the timer fires may lose (the abort in
+    /// `channel_open_session` lands after `disconnect` was already
+    /// queued). That is the inherent boundary condition of any idle
+    /// timeout; the client retries on a fresh connection.
+    fn arm_empty_connection_timer(&mut self, session: &Session) {
+        if let Some(prev) = self.pending_idle_disconnect.take() {
+            prev.abort();
+        }
+        let handle = session.handle();
+        let grace = self.empty_connection_grace;
+        let peer = self.peer_addr;
+        self.pending_idle_disconnect = Some(rio_common::task::spawn_monitored(
+            "idle-disconnect",
+            async move {
+                tokio::time::sleep(grace).await;
+                debug!(
+                    peer = ?peer,
+                    grace_secs = grace.as_secs(),
+                    "no open channels for the grace period; disconnecting"
+                );
+                // Err = the connection already ended for another
+                // reason — nothing left to disconnect.
+                let _ = handle
+                    .disconnect(
+                        Disconnect::ByApplication,
+                        "no open channels".to_owned(),
+                        String::new(),
+                    )
+                    .await;
+            },
+        ));
     }
 }
 
@@ -662,6 +705,25 @@ impl Handler for ConnectionHandler {
         }
     }
 
+    // r[impl gw.conn.exit-status+1]
+    /// The connection is established (counted against `r[gw.conn.cap]`,
+    /// `connections_active` already incremented by the auth callbacks)
+    /// but has zero open channels — start the empty-connection grace
+    /// clock now. Without this, a client that authenticates and never
+    /// opens a channel (`ssh -N`, a ControlMaster held open with no
+    /// commands, a client wedged before exec) is held forever: it
+    /// answers the 30s keepalives (any received data resets russh's
+    /// `alive_timeouts`), each reply also resets `inactivity_timeout`,
+    /// and the close-time arm in `channel_close` never runs because no
+    /// channel ever existed — one `max_connections` slot, one fd, and a
+    /// permanently elevated `connections_active` gauge.
+    /// `channel_open_session` disarms the timer, exactly as it does for
+    /// the arm-on-last-channel-close path.
+    async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
+        self.arm_empty_connection_timer(session);
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: russh::Channel<Msg>,
@@ -955,39 +1017,8 @@ impl Handler for ConnectionHandler {
         // (`ssh gw nix-daemon --stdio`, one channel) closes its own TCP
         // connection as soon as it receives `exit-status` — the timer
         // never fires for it.
-        //
-        // Race at the boundary: a channel open that arrives in the same
-        // instant the timer fires may lose (the abort in
-        // `channel_open_session` lands after `disconnect` was already
-        // queued). That is the inherent boundary condition of any idle
-        // timeout; the client retries on a fresh connection.
         if self.open_channels == 0 && self.sessions.is_empty() {
-            if let Some(prev) = self.pending_idle_disconnect.take() {
-                prev.abort();
-            }
-            let handle = session.handle();
-            let grace = self.empty_connection_grace;
-            let peer = self.peer_addr;
-            self.pending_idle_disconnect = Some(rio_common::task::spawn_monitored(
-                "idle-disconnect",
-                async move {
-                    tokio::time::sleep(grace).await;
-                    debug!(
-                        peer = ?peer,
-                        grace_secs = grace.as_secs(),
-                        "no open channels for the grace period; disconnecting"
-                    );
-                    // Err = the connection already ended for another
-                    // reason — nothing left to disconnect.
-                    let _ = handle
-                        .disconnect(
-                            Disconnect::ByApplication,
-                            "no open channels".to_owned(),
-                            String::new(),
-                        )
-                        .await;
-                },
-            ));
+            self.arm_empty_connection_timer(session);
         }
         Ok(())
     }

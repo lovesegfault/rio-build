@@ -77,15 +77,18 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 /// `gateway.toml max_channels_per_connection`.
 pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 
-/// Grace period between the last SSH channel closing and the gateway
-/// disconnecting the idle connection (`r[gw.conn.exit-status+1]`). A
-/// ControlMaster mux whose in-flight session count transits through
-/// zero between builds must NOT lose its transport — the master would
-/// exit and every remaining nix process in the batch would fall back to
-/// a corrupted direct connection. 60 s comfortably covers inter-build
-/// gaps; a genuinely abandoned connection is still reaped 60× sooner
-/// than `inactivity_timeout`. Overridable for tests via
-/// `with_empty_connection_grace`.
+/// Grace period a connection may have zero open channels — measured
+/// from authentication (established, nothing opened yet) or from the
+/// last SSH channel closing — before the gateway disconnects it
+/// (`r[gw.conn.exit-status+1]`). A ControlMaster mux whose in-flight
+/// session count transits through zero between builds must NOT lose its
+/// transport — the master would exit and every remaining nix process in
+/// the batch would fall back to a corrupted direct connection. 60 s
+/// comfortably covers inter-build gaps and the auth-to-first-exec delay
+/// of any real nix client (milliseconds); a genuinely abandoned or
+/// never-used connection is still reaped 60× sooner than
+/// `inactivity_timeout`, which an idle-but-keepalive-answering client
+/// never trips. Overridable for tests via `with_empty_connection_grace`.
 pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The SSH server that accepts connections and spawns protocol sessions.
