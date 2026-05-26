@@ -803,36 +803,52 @@ rec {
             )
         except Exception:
             print(f"=== wait_worker_pod TIMEOUT pool={pool} ns={ns} ===")
-            print(k3s_server.execute(
-                f"k3s kubectl -n {ns} get pool,job,pod -o wide 2>&1; "
-                f"k3s kubectl -n {ns} describe pod -l rio.build/pool={pool} 2>&1; "
-                f"echo '--- pod logs ---'; "
-                f"k3s kubectl -n {ns} logs -l rio.build/pool={pool} --tail=80 2>&1; "
-                "echo '--- controller (INFO+) ---'; "
-                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=400 2>&1 "
-                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30; "
-                "echo '--- scheduler (INFO+) ---'; "
-                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=400 2>&1 "
-                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30; "
-                # Every service the build depends on, not just the worker
-                # namespace: a crash-looping store or gateway makes the
-                # worker pod never appear, and without these dumps the
-                # only symptom in the test log is this timeout.
-                "echo '--- warning events (all namespaces) ---'; "
+
+            # Each section is its own execute()/print so one wedged or
+            # failing kubectl invocation cannot swallow the rest of the
+            # evidence (the original single-command dump was observed to
+            # stop after the controller section). A crash-looping
+            # dependency (store, gateway) leaves the worker namespace
+            # empty, so dump every service the build depends on, not just
+            # the worker pool. The store section reads the kubelet's
+            # container log files directly so crash-looped containers are
+            # covered even when `kubectl logs --previous` has rotated.
+            def _dump(title, cmd):
+                print(f"--- {title} ---")
+                print(k3s_server.execute(cmd + " 2>&1")[1])
+
+            _dump("worker ns", f"k3s kubectl -n {ns} get pool,job,pod -o wide")
+            _dump(
+                "worker pods",
+                f"k3s kubectl -n {ns} describe pod -l rio.build/pool={pool} | tail -60",
+            )
+            _dump(
+                "worker logs",
+                f"k3s kubectl -n {ns} logs -l rio.build/pool={pool} --tail=60",
+            )
+            _dump(
+                "warning events",
                 "k3s kubectl get events -A --field-selector type=Warning "
-                "  --sort-by=.lastTimestamp 2>&1 | tail -40; "
-                "echo '--- rio-store pods ---'; "
-                "k3s kubectl -n rio-store get pods -o wide 2>&1; "
-                "echo '--- rio-store logs (current) ---'; "
-                "k3s kubectl -n rio-store logs deploy/rio-store --tail=60 2>&1; "
-                "echo '--- rio-store logs (previous) ---'; "
-                "k3s kubectl -n rio-store logs deploy/rio-store --previous --tail=60 2>&1; "
-                "echo '--- gateway logs (tail) ---'; "
-                "k3s kubectl -n rio-system logs deploy/rio-gateway --tail=40 2>&1; "
-                "echo '--- fetcher ns ---'; "
-                "k3s kubectl -n ${nsFetchers} get job,pod -o wide 2>&1; "
-                "k3s kubectl -n ${nsFetchers} logs -l rio.build/kind=fetcher --tail=40 2>&1"
-            )[1])
+                "--sort-by=.lastTimestamp | tail -40",
+            )
+            _dump("rio-store pods", "k3s kubectl -n rio-store get pods -o wide")
+            _dump(
+                "rio-store container log files",
+                "tail -n 80 /var/log/pods/rio-store_rio-store-*/store/*.log",
+            )
+            _dump(
+                "gateway log tail",
+                "k3s kubectl -n rio-system logs deploy/rio-gateway --tail=40",
+            )
+            _dump(
+                "controller log tail",
+                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=60",
+            )
+            _dump(
+                "scheduler log tail",
+                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=60",
+            )
+            _dump("fetcher ns", "k3s kubectl -n ${nsFetchers} get job,pod -o wide")
             raise
         # Race: the pod can transition out of Running (build finished)
         # between the wait above and a second `succeed()` re-query —
