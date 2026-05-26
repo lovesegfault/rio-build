@@ -11,9 +11,11 @@
 //! - **(b) miss, `size ≤ stream_threshold`** — fetch the whole file via
 //!   `ReadBlob(file_digest)` into the per-build staging dir, verify its
 //!   blake3, `Promote` it into the shared cache, then as (a).
-//! - **(c) miss, `size > stream_threshold`** — P0575's streaming open.
-//!   Until that lands this takes case (b)'s whole-file path (correct,
-//!   just not streaming — see the TODO at the dispatch point).
+//! - **(c) miss, `size > stream_threshold`** — P0575's streaming open
+//!   ([`super::stream`]): spawn a background chunk-by-chunk fill and
+//!   reply `FOPEN_KEEP_CACHE` once the first chunk has landed; `read()`
+//!   serves from the partially-filled staging file until the fill
+//!   completes and promotes, after which the next open is case (a).
 //!
 //! The cache lookup / fill / promote sequence lives in [`OpenPath`],
 //! which is independent of fuser types (beyond `Errno`) so the mode
@@ -34,6 +36,7 @@ use rio_proto::types::ReadBlobRequest;
 
 use super::circuit::CircuitBreaker;
 use super::mountd_client::MountdClient;
+use super::stream::{self, StreamFill};
 use crate::IgnorePoison;
 use crate::store_fetch::StoreClients;
 
@@ -44,8 +47,9 @@ pub struct OpenConfig {
     pub jit_fetch_timeout: Duration,
     /// Per-request budget for every mountd UDS round-trip.
     pub mountd_request_timeout: Duration,
-    /// Files larger than this take the streaming path (P0575). Until
-    /// then the threshold only selects the `open_case_total` label.
+    /// Files larger than this take the streaming path (P0575): `open()`
+    /// returns after the first chunk while the rest fills in the
+    /// background, instead of blocking for the whole transfer.
     pub stream_threshold: u64,
 }
 
@@ -57,11 +61,14 @@ pub enum OpenCase {
     Hit,
     /// Miss, `size ≤ stream_threshold`: whole-file fetch.
     MissSmall,
-    /// Miss, `size > stream_threshold`: streaming fetch (P0575;
-    /// currently whole-file).
+    /// Miss, `size > stream_threshold`: this open started the
+    /// streaming fill (P0575) and returned once its first chunk
+    /// landed.
     MissStream,
-    /// Another open of the same `file_digest` was already filling;
-    /// this one waited for it.
+    /// Another open of the same `file_digest` was already filling
+    /// (whole-file or streaming); this one waited for it (completion
+    /// for the whole-file path, the first chunk for the streaming
+    /// path).
     WaitFetching,
 }
 
@@ -118,6 +125,21 @@ impl FillState {
     }
 }
 
+/// What `open()` should reply with, as decided by
+/// [`OpenPath::ensure_readable`].
+pub enum Readable {
+    /// The backing-cache entry is complete: open it and reply
+    /// passthrough (or the keep-cache fallback).
+    Backing(OpenCase),
+    /// A P0575 streaming fill is in progress (this open started it, or
+    /// attached to one already running): reply `FOPEN_KEEP_CACHE` and
+    /// serve `read()` from the shared fill until it completes.
+    Streaming {
+        fill: Arc<StreamFill>,
+        case: OpenCase,
+    },
+}
+
 /// The `open()` data path: cache lookup, JIT fetch, promote.
 ///
 /// Shared across all fuser threads behind `&self`; interior mutability
@@ -132,8 +154,17 @@ pub struct OpenPath {
     /// This build's staging dir (`/var/rio/staging/{build_id}`),
     /// builder-writable, created by mountd at `Mount` time.
     staging_dir: PathBuf,
-    /// Per-`file_digest` in-flight fills.
+    /// Shared node-SSD chunk cache root (`/var/rio/chunks`).
+    /// Mountd-owned, builder-readonly; entries appear here only via
+    /// `PromoteChunks`. Consulted by the P0575 streaming fill before
+    /// any remote chunk fetch.
+    chunks_dir: PathBuf,
+    /// Per-`file_digest` in-flight whole-file fills (case (b)).
     fills: Mutex<HashMap<[u8; 32], Arc<FillState>>>,
+    /// Per-`file_digest` in-flight streaming fills (case (c)). Behind
+    /// an `Arc` because each fill thread deregisters itself when it
+    /// finishes.
+    streams: Arc<Mutex<HashMap<[u8; 32], Arc<StreamFill>>>>,
     /// Breaker around the remote fetch. Checked before every `ReadBlob`
     /// attempt; recorded after.
     pub circuit: Arc<CircuitBreaker>,
@@ -165,6 +196,7 @@ impl OpenPath {
     pub fn new(
         cache_dir: PathBuf,
         staging_dir: PathBuf,
+        chunks_dir: PathBuf,
         clients: StoreClients,
         runtime: Handle,
         mountd: MountdClient,
@@ -173,7 +205,9 @@ impl OpenPath {
         Self {
             cache_dir,
             staging_dir,
+            chunks_dir,
             fills: Mutex::new(HashMap::new()),
+            streams: Arc::new(Mutex::new(HashMap::new())),
             circuit: Arc::new(CircuitBreaker::default()),
             clients,
             runtime,
@@ -208,23 +242,56 @@ impl OpenPath {
         self.staging_dir.join(hex::encode(file_digest))
     }
 
+    /// (a) Cache hit — the common steady-state case. No locks, no
+    /// RPCs: one stat against the node SSD. The objects-cache
+    /// observables count exactly this case: the digest was already
+    /// present in the shared backing cache, so `size` bytes did not
+    /// have to be re-fetched from the store (P0571).
+    // r[impl builder.fs.passthrough-on-hit]
+    fn cache_hit(&self, file_digest: &[u8; 32], size: u64) -> bool {
+        if self.cache_path(file_digest).exists() {
+            metrics::counter!("rio_builder_objects_cache_hit_total").increment(1);
+            metrics::counter!("rio_builder_objects_cache_bytes").increment(size);
+            return true;
+        }
+        false
+    }
+
+    /// The full `open()` dispatch: decide how this `(file_digest, size)`
+    /// will be served and make it so.
+    ///
+    /// - cache hit, or miss at `size ≤ stream_threshold` (whole-file
+    ///   fetch + promote) → [`Readable::Backing`]: the backing-cache
+    ///   entry is complete when this returns.
+    /// - miss at `size > stream_threshold` → [`Readable::Streaming`]:
+    ///   a background fill is running and at least its first chunk is
+    ///   servable when this returns.
+    // r[impl builder.fs.streaming-open-threshold]
+    pub fn ensure_readable(&self, file_digest: &[u8; 32], size: u64) -> Result<Readable, Errno> {
+        if size <= self.cfg.stream_threshold {
+            return self
+                .ensure_backing(file_digest, size)
+                .map(Readable::Backing);
+        }
+        if self.cache_hit(file_digest, size) {
+            return Ok(Readable::Backing(OpenCase::Hit));
+        }
+        let (fill, case) = self.attach_stream(file_digest, size)?;
+        Ok(Readable::Streaming { fill, case })
+    }
+
     /// Ensure `file_digest` is present in the backing cache, fetching
-    /// and promoting it if necessary. On success the file at
-    /// [`Self::cache_path`] exists and is complete. Returns which
+    /// and promoting it (whole-file) if necessary. On success the file
+    /// at [`Self::cache_path`] exists and is complete. Returns which
     /// dispatch case was taken.
     ///
     /// Safe to call concurrently for the same digest from multiple
     /// fuser threads: exactly one performs the fetch, the rest wait.
+    /// Files above the streaming threshold are dispatched to
+    /// [`Self::ensure_readable`]'s streaming arm instead — this method
+    /// always pays the whole transfer before returning.
     pub fn ensure_backing(&self, file_digest: &[u8; 32], size: u64) -> Result<OpenCase, Errno> {
-        // (a) Cache hit — the common steady-state case. No locks, no
-        // RPCs: one stat against the node SSD. The objects-cache
-        // observables count exactly this case: the digest was already
-        // present in the shared backing cache, so `size` bytes did not
-        // have to be re-fetched from the store (P0571).
-        // r[impl builder.fs.passthrough-on-hit]
-        if self.cache_path(file_digest).exists() {
-            metrics::counter!("rio_builder_objects_cache_hit_total").increment(1);
-            metrics::counter!("rio_builder_objects_cache_bytes").increment(size);
+        if self.cache_hit(file_digest, size) {
             return Ok(OpenCase::Hit);
         }
 
@@ -263,19 +330,8 @@ impl OpenPath {
         // remove the fill entry, even on the error paths — a leaked
         // in-progress FillState would park every future opener of this
         // digest until their wait deadline.
-        let case = if size <= self.cfg.stream_threshold {
-            OpenCase::MissSmall
-        } else {
-            // TODO: P0575 replaces this branch with
-            // StatBlob(send_chunks=true) + chunk-granular streaming so
-            // open() returns after the first chunk instead of after the
-            // whole file. A multi-GiB input currently pays its full
-            // transfer time in open() latency. The whole-file path is
-            // correct (same bytes, same verification), just not
-            // streaming.
-            OpenCase::MissStream
-        };
-        // The "always" above must survive a panic, not just an Err.
+        //
+        // The "always" must survive a panic, not just an Err.
         // The realistic panic in the fill is `Handle::block_on` on a
         // runtime that is shutting down (process teardown racing a
         // late open()); fuser catches callback panics, so without this
@@ -290,7 +346,70 @@ impl OpenPath {
         scopeguard::ScopeGuard::into_inner(unwind_guard);
         state.finish(outcome);
         self.fills.lock().ignore_poison().remove(file_digest);
-        outcome.map(|()| case)
+        outcome.map(|()| OpenCase::MissSmall)
+    }
+
+    /// Attach to (or start) the P0575 streaming fill for `file_digest`,
+    /// then wait until its first chunk is servable so the caller can
+    /// reply `FOPEN_KEEP_CACHE` immediately.
+    ///
+    /// The streams lock is held across the fill creation (a `.partial`
+    /// create + a thread spawn) so two racing first-opens of one digest
+    /// serialize into start-then-attach instead of both starting — the
+    /// same justification as `BackingTable`'s lock-across-mint.
+    // r[impl builder.fs.streaming-open]
+    fn attach_stream(
+        &self,
+        file_digest: &[u8; 32],
+        size: u64,
+    ) -> Result<(Arc<StreamFill>, OpenCase), Errno> {
+        let (fill, case) = {
+            let mut streams = self.streams.lock().ignore_poison();
+            if let Some(existing) = streams.get(file_digest) {
+                (Arc::clone(existing), OpenCase::WaitFetching)
+            } else {
+                // Starting a new fill: same fail-fast breaker gate as
+                // the whole-file path — don't queue another doomed
+                // fetch behind the ones already timing out.
+                self.circuit.check()?;
+                let budget =
+                    crate::store_fetch::jit_fetch_timeout(self.cfg.jit_fetch_timeout, size);
+                let ctx = stream::FillContext {
+                    file_digest: *file_digest,
+                    size,
+                    partial_path: self.staging_path(file_digest).with_extension("partial"),
+                    staging_path: self.staging_path(file_digest),
+                    staging_chunks_dir: self.staging_dir.join("chunks"),
+                    chunks_dir: self.chunks_dir.clone(),
+                    clients: self.clients.clone(),
+                    runtime: self.runtime.clone(),
+                    mountd: self.mountd.clone(),
+                    circuit: Arc::clone(&self.circuit),
+                    mountd_timeout: self.cfg.mountd_request_timeout,
+                    budget,
+                    registry: Arc::clone(&self.streams),
+                };
+                let partial_path = ctx.partial_path.clone();
+                let fill = match stream::spawn_fill(ctx) {
+                    Ok(fill) => fill,
+                    Err(e) => {
+                        tracing::error!(
+                            path = %partial_path.display(),
+                            error = %e,
+                            "castore-fuse: cannot start the streaming fill"
+                        );
+                        return Err(Errno::EIO);
+                    }
+                };
+                streams.insert(*file_digest, Arc::clone(&fill));
+                (fill, OpenCase::MissStream)
+            }
+        };
+        // Outside the lock: wait for the first chunk (or the fill's
+        // failure). Bounded by the flat JIT budget — the first chunk is
+        // one StatBlob plus one ≤256 KiB chunk, not the whole file.
+        fill.wait_first_chunk(self.cfg.jit_fetch_timeout)?;
+        Ok((fill, case))
     }
 
     /// The winner's fill: `ReadBlob` → staging, blake3 verify, rename,
@@ -423,16 +542,22 @@ impl OpenPath {
 
 /// `O_EXCL`-create the staging `.partial` and take an exclusive flock
 /// on it, held until the returned guard drops (fill complete or
-/// abandoned). The in-process [`FillState`] already guarantees one
-/// filler per digest; the `O_EXCL` + flock combination exists to detect
-/// and reclaim a `.partial` orphaned by an earlier fill whose thread
-/// died without cleaning up (panic swallowed by fuser): an orphan has
-/// no flock holder, so `EEXIST` → `flock(LOCK_NB)` succeeds → unlink →
-/// retry the create exactly once.
-fn create_partial(path: &Path) -> std::io::Result<nix::fcntl::Flock<File>> {
+/// abandoned). The in-process [`FillState`] (or the streaming fill
+/// registry) already guarantees one filler per digest; the `O_EXCL` +
+/// flock combination exists to detect and reclaim a `.partial`
+/// orphaned by an earlier fill whose thread died without cleaning up
+/// (panic swallowed by fuser): an orphan has no flock holder, so
+/// `EEXIST` → `flock(LOCK_NB)` succeeds → unlink → retry the create
+/// exactly once.
+///
+/// Opened read+write: the whole-file path only writes through it, but
+/// the P0575 streaming fill also serves `read()` upcalls from the same
+/// fd while it fills.
+pub(super) fn create_partial(path: &Path) -> std::io::Result<nix::fcntl::Flock<File>> {
     use nix::fcntl::{Flock, FlockArg};
     for attempt in 0..2 {
         match std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(path)

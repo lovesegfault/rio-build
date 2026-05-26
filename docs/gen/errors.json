@@ -1486,6 +1486,11 @@
       "doc": "Why a `ReadBlob` fill failed."
     },
     {
+      "name": "FillError",
+      "crate": "rio-builder",
+      "doc": "Why a streaming fill failed. Every variant surfaces to the kernel as `EIO`; the split decides which metric/log/circuit treatment applies."
+    },
+    {
       "name": "FrameError",
       "crate": "rio-builder",
       "doc": "Frame-level decode/encode errors (not protocol errors — those are [`ErrKind`])."

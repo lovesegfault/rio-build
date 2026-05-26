@@ -17,6 +17,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -27,7 +28,8 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyXattr, Request,
 };
 
-use super::open::{OpenCase, OpenPath};
+use super::open::{OpenCase, OpenPath, Readable};
+use super::stream::StreamFill;
 use super::tree::{InoMap, Node};
 use crate::IgnorePoison;
 
@@ -49,6 +51,11 @@ struct OpenEntry {
     /// `read()` can serve from it. Passthrough opens drop their fd —
     /// the kernel holds its own reference via the backing registration.
     file: Option<File>,
+    /// The in-flight P0575 streaming fill this fh reads from, when the
+    /// open landed in the streaming window (cache miss above the
+    /// stream threshold). `read()` serves from the shared partially-
+    /// filled staging file; the fill itself outlives the fh.
+    stream: Option<Arc<StreamFill>>,
 }
 
 /// One live kernel backing registration per distinct file content,
@@ -472,111 +479,140 @@ impl Filesystem for CastoreFs {
             return;
         }
 
-        // Ensure the backing-cache entry exists (fetch + promote on
-        // miss), then open it read-only.
-        let case = match self.open_path.ensure_backing(&file_digest, size) {
-            Ok(case) => case,
+        // Decide how this open is served: a complete backing-cache
+        // entry (hit, or whole-file fetch + promote on a small miss) or
+        // the P0575 streaming window (large miss — the fill is running
+        // and at least its first chunk landed).
+        let readable = match self.open_path.ensure_readable(&file_digest, size) {
+            Ok(readable) => readable,
             Err(errno) => {
                 metrics::counter!("rio_builder_castore_fuse_eio_total").increment(1);
                 reply.error(errno);
                 return;
             }
         };
-        let backing = self.open_path.cache_path(&file_digest);
-        let file = match File::open(&backing) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!(
-                    path = %backing.display(),
-                    error = %e,
-                    "castore-fuse: backing cache entry vanished after ensure_backing"
-                );
-                metrics::counter!("rio_builder_castore_fuse_eio_total").increment(1);
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let mode = if self.passthrough {
-            // One backing registration per file_digest, shared across
-            // every concurrent open of that content. The lock is held
-            // across the BackingOpen round-trip so two first-opens of
-            // one digest cannot both register — re-registering while
-            // the first registration is still attached to the inode is
-            // the kernel-EBUSY path (I-061). The round-trip is a
-            // sub-millisecond UDS-brokered ioctl, the same cost the old
-            // module paid for the in-process ioctl under its
-            // backing_state write lock.
-            let registered = self
-                .backings
-                .lock()
-                .ignore_poison()
-                .acquire(file_digest, || {
-                    self.open_path
-                        .mountd()
-                        .backing_open(file.as_raw_fd(), self.open_path.mountd_timeout())
-                });
-            match registered {
-                Ok(backing_id) => {
-                    // Register the open BEFORE replying: the kernel may
-                    // send release(fh) the instant the reply lands, and
-                    // a release that finds no entry would leak the
-                    // backing refcount.
-                    self.opens.write().ignore_poison().insert(
-                        fh,
-                        OpenEntry {
-                            backing_digest: Some(file_digest),
-                            file: None,
-                        },
-                    );
-                    // SAFETY: `backing_id` was minted by rio-mountd's
-                    // FUSE_DEV_IOC_BACKING_OPEN on its kept dup of this
-                    // session's /dev/fuse fd — same fuse_conn, so the
-                    // id is valid for this connection and stays
-                    // registered until our release() sends
-                    // BackingClose. into_raw() immediately defuses the
-                    // wrapper's Drop so fuser never issues the
-                    // (EPERM-for-this-process) close ioctl — mountd
-                    // owns the id's lifetime.
-                    let wrapped = unsafe { reply.wrap_backing(backing_id) };
-                    reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &wrapped);
-                    let _ = wrapped.into_raw();
-                    // The kernel took its own reference on the backing
-                    // file at BACKING_OPEN time; our fd is no longer
-                    // needed.
-                    drop(file);
-                    "passthrough"
-                }
-                Err(e) => {
-                    // Passthrough brokering failed (mountd restarting,
-                    // backing-id cap). Degrade this one open to
-                    // userspace reads rather than failing the build.
-                    tracing::warn!(
-                        error = %e,
-                        "castore-fuse: BackingOpen failed; serving this open without passthrough"
-                    );
+        let (case, mode, streamed) = match readable {
+            Readable::Streaming { fill, case } => {
+                // No complete backing file exists yet, so passthrough
+                // is impossible: reply FOPEN_KEEP_CACHE and serve
+                // read() from the shared partially-filled staging file
+                // until the fill completes. The next open of this
+                // digest (after the fill promotes) is a passthrough
+                // cache hit.
+                self.opens.write().ignore_poison().insert(
+                    fh,
+                    OpenEntry {
+                        backing_digest: None,
+                        file: None,
+                        stream: Some(fill),
+                    },
+                );
+                reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
+                (case, "keep_cache", "1")
+            }
+            Readable::Backing(case) => {
+                let backing = self.open_path.cache_path(&file_digest);
+                let file = match File::open(&backing) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(
+                            path = %backing.display(),
+                            error = %e,
+                            "castore-fuse: backing cache entry vanished after ensure_readable"
+                        );
+                        metrics::counter!("rio_builder_castore_fuse_eio_total").increment(1);
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                let mode = if self.passthrough {
+                    // One backing registration per file_digest, shared across
+                    // every concurrent open of that content. The lock is held
+                    // across the BackingOpen round-trip so two first-opens of
+                    // one digest cannot both register — re-registering while
+                    // the first registration is still attached to the inode is
+                    // the kernel-EBUSY path (I-061). The round-trip is a
+                    // sub-millisecond UDS-brokered ioctl, the same cost the old
+                    // module paid for the in-process ioctl under its
+                    // backing_state write lock.
+                    let registered =
+                        self.backings
+                            .lock()
+                            .ignore_poison()
+                            .acquire(file_digest, || {
+                                self.open_path
+                                    .mountd()
+                                    .backing_open(file.as_raw_fd(), self.open_path.mountd_timeout())
+                            });
+                    match registered {
+                        Ok(backing_id) => {
+                            // Register the open BEFORE replying: the kernel may
+                            // send release(fh) the instant the reply lands, and
+                            // a release that finds no entry would leak the
+                            // backing refcount.
+                            self.opens.write().ignore_poison().insert(
+                                fh,
+                                OpenEntry {
+                                    backing_digest: Some(file_digest),
+                                    file: None,
+                                    stream: None,
+                                },
+                            );
+                            // SAFETY: `backing_id` was minted by rio-mountd's
+                            // FUSE_DEV_IOC_BACKING_OPEN on its kept dup of this
+                            // session's /dev/fuse fd — same fuse_conn, so the
+                            // id is valid for this connection and stays
+                            // registered until our release() sends
+                            // BackingClose. into_raw() immediately defuses the
+                            // wrapper's Drop so fuser never issues the
+                            // (EPERM-for-this-process) close ioctl — mountd
+                            // owns the id's lifetime.
+                            let wrapped = unsafe { reply.wrap_backing(backing_id) };
+                            reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &wrapped);
+                            let _ = wrapped.into_raw();
+                            // The kernel took its own reference on the backing
+                            // file at BACKING_OPEN time; our fd is no longer
+                            // needed.
+                            drop(file);
+                            "passthrough"
+                        }
+                        Err(e) => {
+                            // Passthrough brokering failed (mountd restarting,
+                            // backing-id cap). Degrade this one open to
+                            // userspace reads rather than failing the build.
+                            tracing::warn!(
+                                error = %e,
+                                "castore-fuse: BackingOpen failed; serving this open without \
+                                 passthrough"
+                            );
+                            self.opens.write().ignore_poison().insert(
+                                fh,
+                                OpenEntry {
+                                    backing_digest: None,
+                                    file: Some(file),
+                                    stream: None,
+                                },
+                            );
+                            reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
+                            "keep_cache"
+                        }
+                    }
+                } else {
                     self.opens.write().ignore_poison().insert(
                         fh,
                         OpenEntry {
                             backing_digest: None,
                             file: Some(file),
+                            stream: None,
                         },
                     );
                     reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
                     "keep_cache"
-                }
+                };
+                (case, mode, "0")
             }
-        } else {
-            self.opens.write().ignore_poison().insert(
-                fh,
-                OpenEntry {
-                    backing_digest: None,
-                    file: Some(file),
-                },
-            );
-            reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
-            "keep_cache"
         };
 
         metrics::counter!("rio_builder_castore_fuse_open_mode_total", "mode" => mode).increment(1);
@@ -585,6 +621,7 @@ impl Filesystem for CastoreFs {
         metrics::histogram!(
             "rio_builder_castore_fuse_open_seconds",
             "hit" => if case == OpenCase::Hit { "node_ssd" } else { "remote" },
+            "streamed" => streamed,
         )
         .record(started.elapsed().as_secs_f64());
     }
@@ -602,11 +639,28 @@ impl Filesystem for CastoreFs {
     ) {
         Self::count_upcall("read");
         // Reachable only when an open replied FOPEN_KEEP_CACHE: the
-        // RIO_DISABLE_PASSTHROUGH escape hatch, a kernel without
-        // FUSE_PASSTHROUGH, or a per-open BackingOpen failure.
-        // Passthrough opens never upcall read. P0575's streaming window
-        // adds the serve-from-partial path here.
+        // P0575 streaming window, the RIO_DISABLE_PASSTHROUGH escape
+        // hatch, a kernel without FUSE_PASSTHROUGH, or a per-open
+        // BackingOpen failure. Passthrough opens never upcall read.
         let files = self.opens.read().ignore_poison();
+
+        // Streaming window: serve from the shared partially-filled
+        // staging file, blocking (bounded) until the requested range
+        // has been fetched and verified. The opens lock is dropped
+        // first — a blocked read must not stall open()/release(),
+        // which need the write half.
+        if let Some(fill) = files.get(&fh.0).and_then(|e| e.stream.as_ref()).cloned() {
+            drop(files);
+            match fill.read_at(offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(errno) => {
+                    metrics::counter!("rio_builder_castore_fuse_eio_total").increment(1);
+                    reply.error(errno);
+                }
+            }
+            return;
+        }
+
         let Some(file) = files.get(&fh.0).and_then(|e| e.file.as_ref()) else {
             drop(files);
             tracing::error!(
@@ -713,8 +767,9 @@ impl Filesystem for CastoreFs {
 
 /// `pread` exactly `buf.len()` bytes at `offset`, stopping early at
 /// EOF. Returns the number of bytes read. Stateless (no seek), so
-/// concurrent reads on the same fh are safe.
-fn read_at_full(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+/// concurrent reads on the same fh are safe. Shared with the P0575
+/// streaming read path, which preads the partially-filled staging file.
+pub(super) fn read_at_full(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     let mut filled = 0;
     while filled < buf.len() {

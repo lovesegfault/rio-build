@@ -4,6 +4,11 @@
 //! kernel filesystem — they drive [`tree::build_tree`] and
 //! [`open::OpenPath`] directly, which is everything `Filesystem::open`
 //! does short of the `reply.*` calls.
+//!
+//! The P0575 streaming-open tests live in [`stream`]; the harness here
+//! is shared.
+
+mod stream;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,14 +18,15 @@ use std::time::Duration;
 
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use rio_proto::castore::Directory;
 use rio_proto::types::{
-    BlobChunk, GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasDirectoriesRequest,
-    ReadBlobRequest, StatBlobRequest, StatBlobResponse,
+    BlobChunk, ChunkData, ChunkMeta, GetChunkRequest, GetChunkResponse, GetChunksRequest,
+    GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasChunksRequest, HasChunksResponse,
+    HasDirectoriesRequest, ReadBlobRequest, StatBlobRequest, StatBlobResponse,
 };
-use rio_proto::{DirectoryService, DirectoryServiceServer};
+use rio_proto::{ChunkService, ChunkServiceServer, DirectoryService, DirectoryServiceServer};
 use rio_test_support::grpc::spawn_grpc_server;
 
 use super::mountd_proto::{self as proto, Reply, Req, Resp};
@@ -53,6 +59,19 @@ struct MockState {
     /// Artificial delay before answering `GetDirectory` (for the
     /// prefetch-timeout test).
     get_directory_delay: std::sync::Mutex<Duration>,
+    /// `file_digest → chunk window` served by `StatBlob(send_chunks)`.
+    stat_plans: std::sync::Mutex<HashMap<[u8; 32], StatBlobResponse>>,
+    /// `file_digest → gRPC code` for seeding `StatBlob` failures (e.g.
+    /// the inline-manifest `FailedPrecondition`).
+    stat_errors: std::sync::Mutex<HashMap<[u8; 32], tonic::Code>>,
+    stat_blob_calls: AtomicUsize,
+    /// `chunk_digest → bytes` served by `GetChunks`.
+    chunks: std::sync::Mutex<HashMap<[u8; 32], Vec<u8>>>,
+    /// Every digest requested over `GetChunks`, in arrival order.
+    chunk_requests: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// When set, the `GetChunks` server consumes one permit per chunk
+    /// before sending it — tests gate fill progress by adding permits.
+    chunk_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl MockCastore {
@@ -71,6 +90,94 @@ impl MockCastore {
 
     fn read_blob_calls(&self) -> usize {
         self.state.read_blob_calls.load(Ordering::SeqCst)
+    }
+
+    fn stat_blob_calls(&self) -> usize {
+        self.state.stat_blob_calls.load(Ordering::SeqCst)
+    }
+
+    /// Digests requested over `GetChunks` so far, deduplicated but in
+    /// first-request order.
+    fn chunk_requests(&self) -> Vec<[u8; 32]> {
+        let mut seen = std::collections::HashSet::new();
+        self.state
+            .chunk_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| seen.insert(**d))
+            .copied()
+            .collect()
+    }
+
+    /// Gate `GetChunks`: the server sends one chunk per permit. Returns
+    /// the semaphore the test feeds via `add_permits`.
+    fn gate_chunks(&self, initial_permits: usize) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(initial_permits));
+        *self.state.chunk_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Seed one chunk body under its blake3 digest, returning the
+    /// digest.
+    fn seed_chunk(&self, bytes: Vec<u8>) -> [u8; 32] {
+        let digest = *blake3::hash(&bytes).as_bytes();
+        self.state.chunks.lock().unwrap().insert(digest, bytes);
+        digest
+    }
+
+    /// Seed a chunked blob for the streaming path: split `content`
+    /// into `chunk_payload`-sized pieces, pad the first and last chunk
+    /// with `pad` bytes of NAR-framing-like garbage on each side
+    /// (exercising `first_chunk_skip`/`last_chunk_take`), register
+    /// every chunk body, and register the `StatBlob` window for
+    /// `blake3(content)`. Returns the file digest and the chunk digests
+    /// in window order.
+    fn seed_chunked_blob(
+        &self,
+        content: &[u8],
+        chunk_payload: usize,
+        pad: usize,
+    ) -> ([u8; 32], Vec<[u8; 32]>) {
+        assert!(!content.is_empty() && chunk_payload > 0);
+        let file_digest = *blake3::hash(content).as_bytes();
+        let pieces: Vec<&[u8]> = content.chunks(chunk_payload).collect();
+        let n = pieces.len();
+        let mut metas = Vec::with_capacity(n);
+        let mut digests = Vec::with_capacity(n);
+        for (i, piece) in pieces.iter().enumerate() {
+            let mut chunk = Vec::new();
+            if i == 0 {
+                chunk.extend(std::iter::repeat_n(0x5A, pad));
+            }
+            chunk.extend_from_slice(piece);
+            if i == n - 1 {
+                chunk.extend(std::iter::repeat_n(0xA5, pad));
+            }
+            let size = chunk.len() as u64;
+            let digest = self.seed_chunk(chunk);
+            metas.push(ChunkMeta {
+                digest: digest.to_vec(),
+                size,
+            });
+            digests.push(digest);
+        }
+        let first_chunk_skip = u32::try_from(pad).unwrap();
+        let last_piece = pieces.last().unwrap().len();
+        let last_chunk_take = if n == 1 {
+            u32::try_from(pad + last_piece).unwrap()
+        } else {
+            u32::try_from(last_piece).unwrap()
+        };
+        self.state.stat_plans.lock().unwrap().insert(
+            file_digest,
+            StatBlobResponse {
+                chunks: metas,
+                first_chunk_skip,
+                last_chunk_take,
+            },
+        );
+        (file_digest, digests)
     }
 }
 
@@ -160,15 +267,111 @@ impl DirectoryService for MockCastore {
 
     async fn stat_blob(
         &self,
-        _request: Request<StatBlobRequest>,
+        request: Request<StatBlobRequest>,
     ) -> Result<Response<StatBlobResponse>, Status> {
-        Err(Status::unimplemented("MockCastore: StatBlob (P0570/P0575)"))
+        self.state.stat_blob_calls.fetch_add(1, Ordering::SeqCst);
+        let req = request.into_inner();
+        let digest: [u8; 32] = req
+            .file_digest
+            .try_into()
+            .map_err(|_| Status::invalid_argument("file_digest must be 32 bytes"))?;
+        if let Some(code) = self.state.stat_errors.lock().unwrap().get(&digest) {
+            return Err(Status::new(
+                *code,
+                "MockCastore: seeded StatBlob error (use ReadBlob)",
+            ));
+        }
+        if !req.send_chunks {
+            return Err(Status::unimplemented(
+                "MockCastore: presence probe not used by these tests",
+            ));
+        }
+        match self.state.stat_plans.lock().unwrap().get(&digest) {
+            Some(plan) => Ok(Response::new(plan.clone())),
+            None => Err(Status::not_found("MockCastore: no such blob")),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl ChunkService for MockCastore {
+    type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
+
+    async fn get_chunk(
+        &self,
+        _request: Request<GetChunkRequest>,
+    ) -> Result<Response<Self::GetChunkStream>, Status> {
+        Err(Status::unimplemented("MockCastore: GetChunk"))
+    }
+
+    async fn has_chunks(
+        &self,
+        _request: Request<HasChunksRequest>,
+    ) -> Result<Response<HasChunksResponse>, Status> {
+        Err(Status::unimplemented("MockCastore: HasChunks"))
+    }
+
+    type GetChunksStream = ReceiverStream<Result<ChunkData, Status>>;
+
+    /// Serves seeded chunks in request order, recording every requested
+    /// digest. When a gate is installed each chunk costs one permit, so
+    /// a test can hold the fill at an exact point and release it later.
+    async fn get_chunks(
+        &self,
+        request: Request<Streaming<GetChunksRequest>>,
+    ) -> Result<Response<Self::GetChunksStream>, Status> {
+        let mut frames = request.into_inner();
+        let state = Arc::clone(&self.state);
+        let gate = state.chunk_gate.lock().unwrap().clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Ok(Some(frame)) = frames.message().await {
+                for raw in frame.digests {
+                    let Ok(digest): Result<[u8; 32], _> = raw.clone().try_into() else {
+                        let _ = tx
+                            .send(Err(Status::invalid_argument("digest must be 32 bytes")))
+                            .await;
+                        return;
+                    };
+                    state.chunk_requests.lock().unwrap().push(digest);
+                    if let Some(gate) = &gate {
+                        let Ok(permit) = gate.acquire().await else {
+                            return;
+                        };
+                        permit.forget();
+                    }
+                    let body = state.chunks.lock().unwrap().get(&digest).cloned();
+                    let Some(body) = body else {
+                        let _ = tx
+                            .send(Err(Status::not_found(format!(
+                                "chunk {} not seeded",
+                                hex::encode(digest)
+                            ))))
+                            .await;
+                        return;
+                    };
+                    if tx
+                        .send(Ok(ChunkData {
+                            digest: raw,
+                            data: body.into(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
 async fn spawn_mock_castore() -> (MockCastore, StoreClients, tokio::task::JoinHandle<()>) {
     let mock = MockCastore::default();
-    let router = Server::builder().add_service(DirectoryServiceServer::new(mock.clone()));
+    let router = Server::builder()
+        .add_service(DirectoryServiceServer::new(mock.clone()))
+        .add_service(ChunkServiceServer::new(mock.clone()));
     let (addr, handle) = spawn_grpc_server(router).await;
     let ch = rio_proto::client::connect_channel(&addr.to_string())
         .await
@@ -178,17 +381,26 @@ async fn spawn_mock_castore() -> (MockCastore, StoreClients, tokio::task::JoinHa
 
 // ─── Fake mountd ───────────────────────────────────────────────────────
 
+/// Every `PromoteChunks` batch the fake mountd received, in arrival
+/// order, for assertions on the streaming fill's batching.
+type PromotedChunkBatches = Arc<std::sync::Mutex<Vec<Vec<[u8; 32]>>>>;
+
 /// The daemon end of a socketpair that answers `Promote{digest}` by
-/// copying `staging/{hex}` → `cache/{ab}/{hex}` — the same observable
-/// effect as the real rio-mountd's verified promote, minus the
-/// re-hash (which `vm-mountd` covers against the real daemon).
-/// `BackingOpen`/`BackingClose` reply with a synthetic id so the
-/// passthrough plumbing is exercisable without `CAP_SYS_ADMIN`.
+/// copying `staging/{hex}` → `cache/{ab}/{hex}` and
+/// `PromoteChunks{digests}` by copying `staging/chunks/{hex}` →
+/// `chunks/{ab}/{hex}` — the same observable effects as the real
+/// rio-mountd's verified promotes, minus the re-hash (which `vm-mountd`
+/// covers against the real daemon). `BackingOpen`/`BackingClose` reply
+/// with a synthetic id so the passthrough plumbing is exercisable
+/// without `CAP_SYS_ADMIN`. Promoted chunk batches are recorded for
+/// assertions.
 fn spawn_fake_mountd(
     staging: PathBuf,
     cache: PathBuf,
+    chunks: PathBuf,
 ) -> (
     super::mountd_client::MountdClient,
+    PromotedChunkBatches,
     std::thread::JoinHandle<()>,
 ) {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
@@ -202,9 +414,19 @@ fn spawn_fake_mountd(
     )
     .expect("socketpair");
     let client = super::mountd_client::MountdClient::from_fd(client_end);
+    let promoted_chunk_batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&promoted_chunk_batches);
 
     let handle = std::thread::spawn(move || {
         let mut next_backing_id = 1u32;
+        // Shard-copy `src` into `root/{ab}/{hex}`, like the real
+        // promotes do (without the re-hash).
+        let shard_copy = |src: &Path, root: &Path, hex: &str| -> std::io::Result<()> {
+            let shard = root.join(&hex[..2]);
+            std::fs::create_dir_all(&shard)?;
+            std::fs::copy(src, shard.join(hex))?;
+            Ok(())
+        };
         loop {
             let frame = match proto::recv_frame(daemon_end.as_raw_fd()) {
                 Ok(f) => f,
@@ -218,14 +440,26 @@ fn spawn_fake_mountd(
                 Req::Promote { digest } => {
                     let hex = hex::encode(digest);
                     let src = staging.join(&hex);
-                    let shard = cache.join(&hex[..2]);
-                    let dst = shard.join(&hex);
-                    std::fs::create_dir_all(&shard)
-                        .and_then(|()| std::fs::copy(&src, &dst))
-                        .and_then(|_| std::fs::remove_file(&src))
-                        .map(|_| Resp::Ok)
+                    shard_copy(&src, &cache, &hex)
+                        .and_then(|()| std::fs::remove_file(&src))
+                        .map(|()| Resp::Ok)
                         .unwrap_or_else(|e| {
                             Resp::Err(proto::ErrKind::Retryable(format!("fake promote: {e}")))
+                        })
+                }
+                Req::PromoteChunks { chunk_digests } => {
+                    recorded.lock().unwrap().push(chunk_digests.clone());
+                    chunk_digests
+                        .iter()
+                        .try_for_each(|digest| {
+                            let hex = hex::encode(digest);
+                            shard_copy(&staging.join("chunks").join(&hex), &chunks, &hex)
+                        })
+                        .map(|()| Resp::Ok)
+                        .unwrap_or_else(|e| {
+                            Resp::Err(proto::ErrKind::Retryable(format!(
+                                "fake promote_chunks: {e}"
+                            )))
                         })
                 }
                 Req::BackingOpen => {
@@ -234,7 +468,7 @@ fn spawn_fake_mountd(
                     Resp::BackingId(id)
                 }
                 Req::BackingClose { .. } => Resp::Ok,
-                Req::Mount { .. } | Req::PromoteChunks { .. } => {
+                Req::Mount { .. } => {
                     Resp::Err(proto::ErrKind::Retryable("not implemented in fake".into()))
                 }
             };
@@ -244,7 +478,7 @@ fn spawn_fake_mountd(
             }
         }
     });
-    (client, handle)
+    (client, promoted_chunk_batches, handle)
 }
 
 // ─── Harness ───────────────────────────────────────────────────────────
@@ -253,6 +487,12 @@ struct Harness {
     mock: MockCastore,
     open_path: Arc<OpenPath>,
     staging: PathBuf,
+    /// The mountd-owned shared chunk cache root (`/var/rio/chunks` in
+    /// production). Tests pre-seed it for local-hit scenarios and
+    /// assert PromoteChunks landed entries here.
+    chunks: PathBuf,
+    /// Every `PromoteChunks` batch the fake mountd received.
+    promoted_chunk_batches: PromotedChunkBatches,
     _tmp: tempfile::TempDir,
     _server: tokio::task::JoinHandle<()>,
     _mountd: std::thread::JoinHandle<()>,
@@ -273,13 +513,20 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache = tmp.path().join("cache");
     let staging = tmp.path().join("staging");
+    let chunks = tmp.path().join("chunks");
     std::fs::create_dir_all(&cache).unwrap();
+    // staging/chunks/ is NOT pre-created: the real mountd makes it at
+    // Mount time, but the streaming fill tolerates its absence (and the
+    // small-path tests assert staging is left empty).
     std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(&chunks).unwrap();
     let (mock, clients, server) = spawn_mock_castore().await;
-    let (mountd, mountd_thread) = spawn_fake_mountd(staging.clone(), cache.clone());
+    let (mountd, promoted_chunk_batches, mountd_thread) =
+        spawn_fake_mountd(staging.clone(), cache.clone(), chunks.clone());
     let open_path = Arc::new(OpenPath::new(
         cache.clone(),
         staging.clone(),
+        chunks.clone(),
         clients,
         tokio::runtime::Handle::current(),
         mountd,
@@ -289,6 +536,8 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
         mock,
         open_path,
         staging,
+        chunks,
+        promoted_chunk_batches,
         _tmp: tmp,
         _server: server,
         _mountd: mountd_thread,
@@ -441,24 +690,6 @@ async fn open_miss_fetches_verifies_and_promotes() {
         h.mock.read_blob_calls(),
         1,
         "no re-fetch on the second open"
-    );
-}
-
-/// Above the streaming threshold the dispatch picks `MissStream` —
-/// which, until P0575 lands, takes the same whole-file path. The case
-/// label is what distinguishes the two in metrics.
-#[tokio::test(flavor = "multi_thread")]
-async fn open_miss_above_threshold_is_the_stream_case() {
-    let h = harness().await;
-    let content = vec![0xAB; 4096]; // threshold in the harness is 1024
-    let digest = seeded_blob(&h.mock, &content);
-    let case = ensure_blocking(&h.open_path, digest, content.len() as u64)
-        .await
-        .expect("miss_stream");
-    assert_eq!(case, OpenCase::MissStream);
-    assert_eq!(
-        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
-        content
     );
 }
 
@@ -662,10 +893,12 @@ async fn open_fails_fast_once_the_circuit_trips() {
 #[tokio::test]
 async fn cache_path_matches_the_mountd_shard_layout() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mountd, _t) = spawn_fake_mountd(tmp.path().into(), tmp.path().into());
+    let (mountd, _batches, _t) =
+        spawn_fake_mountd(tmp.path().into(), tmp.path().into(), tmp.path().into());
     let op = OpenPath::new(
         PathBuf::from("/var/rio/cache"),
         PathBuf::from("/var/rio/staging/b1"),
+        PathBuf::from("/var/rio/chunks"),
         StoreClients::from_channel(rio_test_support::grpc::dead_channel()),
         tokio::runtime::Handle::current(),
         mountd,

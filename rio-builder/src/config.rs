@@ -156,6 +156,7 @@ pub struct Config {
     /// crossover at ~1.21 MiB, so 8 MiB sits 6.6× above it — trading
     /// ≤67 ms of whole-file open latency for not running the
     /// chunk-cache machinery on 1.2–8 MiB files.
+    // r[impl builder.fs.streaming-open-threshold]
     pub stream_threshold_bytes: u64,
     #[serde(flatten)]
     pub common: rio_common::config::CommonConfig,

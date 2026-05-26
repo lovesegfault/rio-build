@@ -308,6 +308,24 @@ impl MountdClient {
             other => Err(MountdError::UnexpectedReply(other)),
         }
     }
+
+    /// `PromoteChunks{digests}`: ask the daemon to verify-copy each
+    /// `staging/{build_id}/chunks/{hex}` into the shared chunk cache.
+    /// Used by the P0575 streaming fill so other builds on this node
+    /// can source those chunks locally; the caller's own assembly never
+    /// depends on the outcome.
+    pub fn promote_chunks(
+        &self,
+        chunk_digests: Vec<[u8; 32]>,
+        timeout: Duration,
+    ) -> Result<(), MountdError> {
+        let (resp, _) = self.call(Req::PromoteChunks { chunk_digests }, &[], timeout)?;
+        match resp {
+            Resp::Ok => Ok(()),
+            Resp::Err(kind) => Err(MountdError::Rejected(kind)),
+            other => Err(MountdError::UnexpectedReply(other)),
+        }
+    }
 }
 
 /// Receive frames until the socket dies, routing each reply to its

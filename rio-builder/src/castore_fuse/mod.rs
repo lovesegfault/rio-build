@@ -16,6 +16,9 @@
 //!   content-addressed inode table.
 //! - [`open`] — the `open()` data path: backing-cache lookup, JIT
 //!   fetch, promote.
+//! - [`stream`] — the P0575 streaming fill for large-file misses
+//!   (chunk-by-chunk background fetch served through `read()` while
+//!   it runs).
 //! - [`circuit`] — the fetch circuit breaker.
 //! - [`fs`] — the `fuser::Filesystem` impl tying it all together.
 //!
@@ -29,6 +32,7 @@ pub mod mountd;
 pub mod mountd_client;
 pub mod mountd_proto;
 pub mod open;
+pub mod stream;
 pub mod sweep;
 pub mod tree;
 

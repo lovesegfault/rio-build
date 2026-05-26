@@ -103,6 +103,11 @@
       "doc": "The castore-FUSE `open()` data path (ADR-022 §2.6–§2.7)."
     },
     {
+      "path": "castore_fuse/stream.rs",
+      "depth": 1,
+      "doc": "P0575 streaming `open()` — the during-fill mode for large files"
+    },
+    {
       "path": "castore_fuse/sweep.rs",
       "depth": 1,
       "doc": "Disk-pressure sweep over the mountd-owned `/var/rio` trees (P0571)."

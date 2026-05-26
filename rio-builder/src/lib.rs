@@ -162,31 +162,34 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_castore_fuse_open_mode_total",
         "Castore-FUSE open() replies by mode: passthrough (reads bypass FUSE entirely) \
-         or keep_cache (userspace pread per uncached read). passthrough=0 with \
-         keep_cache>0 means FUSE_PASSTHROUGH was not negotiated — check the kernel \
-         version and RIO_DISABLE_PASSTHROUGH."
+         or keep_cache (userspace pread per uncached read; also the streaming-fill \
+         window of a large-file miss). passthrough=0 with keep_cache>0 outside the \
+         streaming window means FUSE_PASSTHROUGH was not negotiated — check the \
+         kernel version and RIO_DISABLE_PASSTHROUGH."
     );
     describe_counter!(
         "rio_builder_castore_fuse_open_case_total",
         "Castore-FUSE open() dispatch decisions: hit (backing cache), miss_small \
-         (whole-file JIT fetch), miss_stream (above stream_threshold; streaming in \
-         P0575), wait_fetching (another open of the same digest was already filling)."
+         (whole-file JIT fetch), miss_stream (above stream_threshold: open() returns \
+         after the first chunk while the fill streams in the background), \
+         wait_fetching (another open of the same digest was already filling)."
     );
     describe_counter!(
         "rio_builder_castore_fuse_chunk_source_total",
         "Where castore-FUSE fill bytes came from, by src: remote (rio-store) or \
-         node_ssd (the shared chunk cache, P0575). The node_ssd fraction is the \
+         node_ssd (the shared chunk cache). The node_ssd fraction is the \
          cross-build dedup ratio."
     );
     describe_histogram!(
         "rio_builder_castore_fuse_open_seconds",
         "Castore-FUSE open() upcall-to-reply latency, labeled by hit \
-         (node_ssd = backing-cache hit, remote = JIT fetch)."
+         (node_ssd = backing-cache hit, remote = JIT fetch) and streamed \
+         (1 = the open returned inside a P0575 streaming-fill window)."
     );
     describe_counter!(
         "rio_builder_castore_fuse_fetch_bytes_total",
         "Bytes fetched on behalf of castore-FUSE open(), labeled by hit \
-         (remote = from rio-store; node_ssd = from the shared node cache, P0575)."
+         (remote = from rio-store; node_ssd = from the shared node chunk cache)."
     );
     describe_counter!(
         "rio_builder_castore_fuse_integrity_fail_total",
