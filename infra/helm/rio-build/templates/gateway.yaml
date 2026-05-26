@@ -84,12 +84,21 @@ spec:
       # so SIGKILL is a backstop for a hung process.
       terminationGracePeriodSeconds: {{ add $g.nlbDeregisterSecs $g.drainGraceSecs $g.sessionDrainSecs 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
-      {{- /* The effective floor is minReplicas under autoscaling and the
-             static replicas otherwise — anti-affinity must key on
-             whichever one actually governs the pod count, or a profile
-             with replicas:1 + autoscaling on would silently co-locate
-             both KEDA-managed pods. */}}
-      {{- if gt (int (ternary $g.autoscaling.minReplicas $g.replicas $g.autoscaling.enabled)) 1 }}
+      {{- /* Under autoscaling the gate keys on the CEILING (maxReplicas),
+             not the floor: KEDA owns the live count anywhere in
+             [minReplicas, maxReplicas], so the spread rule must hold
+             whenever the autoscaler MAY run more than one pod. Keying on
+             the floor would let an operator-set minReplicas:1 render no
+             anti-affinity while KEDA still scales to maxReplicas pods
+             that can all bin-pack onto one node — and a required
+             anti-affinity rule constrains nothing while only one pod
+             exists, so the ceiling costs nothing at the floor. Without
+             autoscaling the static replicas is the count.
+
+             Deliberate asymmetry with the rio-gateway PDB (pdb.yaml),
+             which keys on the FLOOR: a minAvailable:1 budget against a
+             1-pod floor would block every node drain. */}}
+      {{- if gt (int (ternary $g.autoscaling.maxReplicas $g.replicas $g.autoscaling.enabled)) 1 }}
       # r37 bug_020 (sweep): rio-gateway is the only build-submission
       # path (SSH ingress). Both replicas on one node → drain stalls
       # behind the PDB but every NLB target is gone for the eviction
