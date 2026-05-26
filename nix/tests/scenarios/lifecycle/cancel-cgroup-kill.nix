@@ -46,11 +46,36 @@ scope: with scope; ''
       # -print -quit stops after first match (no `| head` SIGPIPE).
       # `grep .` makes the command fail when find emits nothing (find
       # itself exits 0 on no-match), so wait_until_succeeds retries.
-      cgroup_path = worker_vm.wait_until_succeeds(
-          "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' "
-          "-print -quit 2>/dev/null | grep .",
-          timeout=180,
-      ).strip()
+      #
+      # On timeout, dump the builder-pod + scheduler views before
+      # re-raising: a build that fails pre-cgroup (castore mount,
+      # input_roots, sandbox prep) cycles ephemeral pods every few
+      # seconds and the bare timeout says nothing about WHY — same
+      # diagnosability pattern as the cgroup-removal wait below.
+      try:
+          cgroup_path = worker_vm.wait_until_succeeds(
+              "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' "
+              "-print -quit 2>/dev/null | grep .",
+              timeout=180,
+          ).strip()
+      except Exception:
+          k3s_server.execute(
+              "echo '=== DIAG: builder pods ===' >&2; "
+              "k3s kubectl -n ${nsBuilders} get pods -o wide >&2 || true; "
+              "echo '=== DIAG: recent builder pod logs (non-DEBUG) ===' >&2; "
+              "for p in $(k3s kubectl -n ${nsBuilders} get pods -o name "
+              "| tail -n 2); do "
+              "echo \"--- $p ---\" >&2; "
+              "k3s kubectl -n ${nsBuilders} logs $p --tail=60 2>&1 "
+              "| grep -vE '\"level\":\"DEBUG\"' | tail -n 40 >&2 || true; "
+              "done; "
+              "echo '=== DIAG: scheduler leader logs (non-DEBUG) ===' >&2; "
+              "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.holderIdentity}') && "
+              "k3s kubectl -n ${ns} logs $leader --since=4m "
+              "| grep -viE '\"level\":\"DEBUG\"|heartbeat' | tail -n 60 >&2 || true"
+          )
+          raise
       procs_before = int(worker_vm.succeed(
           f"wc -l < {cgroup_path}/cgroup.procs"
       ).strip())
