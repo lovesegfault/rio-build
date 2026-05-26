@@ -489,6 +489,85 @@ pub fn validate_dag(
         }
     }
 
+    // Declared output paths must be the ones the derivation itself
+    // derives to. Workers are untrusted, so this is the trusted-plane
+    // enforcement (the builder-side fixed-output binding is defense in
+    // depth): without it, any tenant could declare another derivation's
+    // not-yet-built input-addressed output path on a crafted .drv and
+    // have arbitrary content built, signed and served at that path.
+    // Mirrors CppNix, which recomputes IA output paths from the
+    // derivation (hashDerivationModulo + makeOutputPath) and never
+    // trusts the declared ones.
+    //
+    // Scope: only outputs whose declared path parses as a store path
+    // are compared — a malformed declared path cannot alias any real
+    // store object (the store rejects it at PutPath), so it is not a
+    // squatting vector; legacy fixtures and degenerate clients keep
+    // failing later with their existing errors. Fixed-output outputs
+    // are bound to their declared hash by the FOD rules, and
+    // floating-CA / deferred outputs have no static path to check.
+    // Nodes without a cached full derivation (BasicDerivation
+    // fallback) are skipped like the checks above; closure-incomplete
+    // derivations are rejected fail-closed — an attacker must not be
+    // able to dodge the check by withholding an input drv.
+    {
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+        for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+            if drv.is_fixed_output()
+                || drv.has_ca_floating_outputs()
+                || drv.has_unknown_output_paths()
+            {
+                continue;
+            }
+            if !drv
+                .outputs()
+                .iter()
+                .any(|o| StorePath::parse(o.path()).is_ok())
+            {
+                continue;
+            }
+            let derived = rio_nix::derivation::input_addressed_output_paths(
+                drv,
+                &node.drv_path,
+                &resolve,
+                &mut hash_cache,
+            )
+            .map_err(|e| {
+                format!(
+                    "cannot derive output paths for {} (rejecting rather than trusting the \
+                     declared ones): {e}",
+                    node.drv_path
+                )
+            })?;
+            for output in drv.outputs() {
+                if StorePath::parse(output.path()).is_err() {
+                    continue;
+                }
+                match derived.get(output.name()) {
+                    Some(expected) if expected.as_str() == output.path() => {}
+                    Some(expected) => {
+                        return Err(format!(
+                            "derivation {} declares output '{}' at {} but the derivation \
+                             derives to {} — declared output paths must match the derivation",
+                            node.drv_path,
+                            output.name(),
+                            output.path(),
+                            expected.as_str(),
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "derivation {} output '{}' has no derivable output path",
+                            node.drv_path,
+                            output.name(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1033,6 +1112,70 @@ mod tests {
     // populates drv_cache, then drive opcodes 36 + 46 and assert
     // the failure BuildResult carries the "sandbox escape" message).
 
+    /// A consistent input-addressed derivation (declared paths == the
+    /// paths it derives to) passes; declaring somebody else's
+    /// well-formed path is rejected; malformed declared paths are out
+    /// of scope for this gate (they cannot alias a real store object).
+    #[test]
+    fn validate_dag_binds_ia_declared_paths_to_the_derivation() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mine.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+
+        let aterm_with = |out_path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{out_path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+
+        // Compute the honest path for THIS derivation (declared paths are
+        // masked during the computation, so any placeholder works here).
+        let probe = aterm_with("/nix/store/dddddddddddddddddddddddddddddddd-mine");
+        let mut hash_cache = HashMap::new();
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let honest = rio_nix::derivation::input_addressed_output_paths(
+            &probe,
+            drv_path,
+            &resolve,
+            &mut hash_cache,
+        )
+        .expect("derive")["out"]
+            .as_str()
+            .to_owned();
+
+        // Consistent declaration → accepted.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with(&honest));
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "consistent IA declaration must pass"
+        );
+
+        // Declaring somebody else's (well-formed) path → rejected.
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with(victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation"),
+            "squatted path must be rejected: {err}"
+        );
+        assert!(err.contains(victim), "error names the declared path: {err}");
+
+        // Malformed declared path (not a store path) → out of scope here.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with("/nix/store/zzz-output"));
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "malformed declared paths are not this gate's concern"
+        );
+    }
+
     /// Any output declaring a hash algorithm the builder cannot handle
     /// is rejected at submission: a FOD with an md5 hash and a
     /// floating-CA output (algo set, hash empty) with an unsupported
@@ -1090,9 +1233,29 @@ mod tests {
             );
         }
 
-        // Input-addressed output (no hash, no algo) → never checked.
+        // Input-addressed output (no hash, no algo) → never checked by
+        // the ALGO gate. The IA path gate does apply, so give the
+        // fixture its honest derived path (any placeholder works for
+        // the computation — declared paths are masked out of it).
+        let ia_with = |out_path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{out_path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let mut hash_cache = HashMap::new();
+        let resolve_none = |_: &str| -> Option<&Derivation> { None };
+        let honest = rio_nix::derivation::input_addressed_output_paths(
+            &ia_with("/nix/store/dddddddddddddddddddddddddddddddd-src"),
+            drv_path,
+            &resolve_none,
+            &mut hash_cache,
+        )
+        .expect("derive")["out"]
+            .as_str()
+            .to_owned();
         let mut cache = HashMap::new();
-        cache.insert(key.clone(), fod_drv("", ""));
+        cache.insert(key.clone(), ia_with(&honest));
         assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
     }
 
