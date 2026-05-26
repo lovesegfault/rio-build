@@ -160,7 +160,7 @@ impl DagActor {
         // would always see zero stale entries.
         self.tick_hung_nodes(now);
         self.tick_check_heartbeats(now).await;
-        self.tick_sweep_recently_disconnected(now);
+        self.tick_sweep_recently_disconnected(now).await;
 
         // Ordering is load-bearing: backstop-process runs before the
         // per-build-timeout check, poison-expire runs last — matches
@@ -469,6 +469,23 @@ impl DagActor {
                 state.retry.failed_builders.insert(executor_id.clone());
                 state.retry.failure_count += 1;
             }
+            // 1a: the backstop observation's ledger row — appended at
+            // THIS site (the charging site), before the reassign clears
+            // the exec_id carrier. The delegation to
+            // `reassign_derivations` appends nothing further (the
+            // `disconnected` row is owned by the disconnect handler
+            // alone), so this stays the attempt's only row.
+            let row = self
+                .attempt_row_for(
+                    drv_hash,
+                    crate::state::OutcomeClass::Backstop,
+                    crate::state::ReportingParty::Scheduler,
+                )
+                .map(|mut r| {
+                    r.executor_id = Some(executor_id.clone());
+                    r
+                });
+            self.append_attempt_standalone(drv_hash, row).await;
             self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
                 .await;
         }

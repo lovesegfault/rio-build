@@ -2088,6 +2088,12 @@ impl DagActor {
     /// failure — re-read existing poison state only, do NOT record a
     /// failure or bump `retry.count`. `executor_id` is kept for logging
     /// parity with `reassign_derivations(.., lost_worker)`.
+    ///
+    /// Deliberately appends NO attempt-ledger row (Phase 1a): the
+    /// orphan reconcile is an adjacent decider over already-recorded
+    /// history, not a new attempt observation — the prior leader's
+    /// disconnect/backstop/report sites own whatever rows that attempt
+    /// earned before the failover.
     // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+4]
     async fn reset_orphan_to_ready(
         &mut self,

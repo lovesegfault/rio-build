@@ -24,8 +24,10 @@ pub(super) fn backdate(secs_ago: u64) -> Instant {
 }
 
 impl DagActor {
-    /// Dispatch a `cfg(test)` [`DebugCmd`].
-    pub(super) fn handle_debug(&mut self, d: DebugCmd) {
+    /// Dispatch a `cfg(test)` [`DebugCmd`]. Async because a handful of
+    /// commands (the disconnect-sweep forcer) drive real async actor
+    /// paths; the rest stay synchronous one-liners.
+    pub(super) async fn handle_debug(&mut self, d: DebugCmd) {
         match d {
             DebugCmd::QueryDerivation { drv_hash, reply } => {
                 let _ = reply.send(self.handle_debug_query_derivation(&drv_hash));
@@ -114,6 +116,14 @@ impl DagActor {
                     true
                 });
                 let _ = reply.send(ok);
+            }
+            DebugCmd::ForceDisconnectSweep { reply } => {
+                let n = self.recently_disconnected.len();
+                // "now" advanced past the TTL: every current entry is
+                // expired, so the establishment fill runs for each.
+                let advanced = Instant::now() + super::executor::TERMINATION_REPORT_TTL;
+                self.tick_sweep_recently_disconnected(advanced).await;
+                let _ = reply.send(n);
             }
             DebugCmd::SeedHwTable { factors, reply } => {
                 self.sla_estimator

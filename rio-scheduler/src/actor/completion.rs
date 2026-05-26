@@ -186,6 +186,92 @@ impl DagActor {
         }
     }
 
+    /// Append one attempt row with NO accompanying status persist — the
+    /// no-report observation sites (disconnect, force-drain, backstop)
+    /// whose own status writes happen elsewhere (inside
+    /// `reassign_derivations`, per drv). Best-effort like every 1a
+    /// append; leader-gated because the disconnect/drain arms also run
+    /// on standby replicas, which must not write attempt rows for
+    /// executions the live leader owns.
+    pub(super) async fn append_attempt_standalone(
+        &mut self,
+        drv_hash: &DrvHash,
+        row: Option<AttemptRow>,
+    ) {
+        if !self.leader.is_leader() {
+            return;
+        }
+        let Some(row) = row else {
+            return;
+        };
+        let result: Result<bool, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                if inserted && let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.push_attempt_record(row.to_record());
+                }
+            }
+            Err(e) => {
+                error!(drv_hash = %drv_hash, error = %e,
+                       "failed to persist attempt row (no-report observation)");
+            }
+        }
+    }
+
+    /// The second installment of a two-installment attempt: fill the
+    /// classification on the ledger row keyed by the RELEASED
+    /// `(derivation_id, exec_id)` (carried by the
+    /// `recently_disconnected` entry — never a DAG lookup), and mirror
+    /// it onto the in-memory record when the node still exists. First
+    /// writer wins (`WHERE termination_reason IS NULL`); returns
+    /// whether THIS call performed the fill. Best-effort and
+    /// leader-gated like the appends.
+    pub(super) async fn fill_attempt_termination(
+        &mut self,
+        drv_hash: &DrvHash,
+        derivation_id: Uuid,
+        exec_id: Uuid,
+        termination_reason: &str,
+        outcome_class: OutcomeClass,
+    ) -> bool {
+        if !self.leader.is_leader() {
+            return false;
+        }
+        let result: Result<bool, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            let won = crate::db::SchedulerDb::fill_termination(
+                &mut tx,
+                derivation_id,
+                exec_id,
+                termination_reason,
+                outcome_class,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(won)
+        }
+        .await;
+        match result {
+            Ok(won) => {
+                if won && let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.classify_attempt_record(exec_id, termination_reason, outcome_class);
+                }
+                won
+            }
+            Err(e) => {
+                error!(drv_hash = %drv_hash, exec_id = %exec_id, error = %e,
+                       "failed to fill attempt termination (second installment)");
+                false
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Best-effort persist helpers (13 call sites across actor/*)
     // -----------------------------------------------------------------------

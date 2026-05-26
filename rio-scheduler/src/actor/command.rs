@@ -649,6 +649,12 @@ pub enum DebugCmd {
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
+    /// Run the `recently_disconnected` establishment sweep as if
+    /// `TERMINATION_REPORT_TTL` had already elapsed for every entry.
+    /// For the no-report establishment tests — the 60 s TTL must never
+    /// sit on a test's critical path. Replies with the number of
+    /// entries swept.
+    ForceDisconnectSweep { reply: oneshot::Sender<usize> },
     /// Seed the SLA estimator's hw_table. For ref-seconds → wall-seconds
     /// denormalization tests (`min_factor()` needs a non-default table).
     SeedHwTable {

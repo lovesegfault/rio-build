@@ -262,6 +262,30 @@ pub(crate) struct AuthBinding {
     pub tenant: Option<Uuid>,
 }
 
+/// One executor that disconnected mid-build, awaiting the controller's
+/// classifying `ReportExecutorTermination` (or, failing that, the
+/// establishment sweep). Carries the RELEASED execution's identity —
+/// `(derivation_id, exec_id)` as they were at disconnect time — so the
+/// second installment and the establishment fill key the ledger row
+/// directly, with no DAG lookup: by the time the report (or the sweep)
+/// runs, the node may already carry the next attempt's exec_id or be
+/// reaped entirely.
+///
+/// `derivation_id`/`exec_id` are `None` only when the disconnect could
+/// not build a ledger row (node unknown / merge not yet committed / no
+/// execution minted) — then there is nothing to fill either.
+#[derive(Debug, Clone)]
+pub(crate) struct DisconnectedAttempt {
+    /// The derivation the released execution belonged to.
+    pub(crate) drv_hash: DrvHash,
+    /// `derivations.derivation_id` of that node at disconnect time.
+    pub(crate) derivation_id: Option<Uuid>,
+    /// The released execution's id (the ledger row's key).
+    pub(crate) exec_id: Option<Uuid>,
+    /// When the disconnect was observed (drives the TTL sweep).
+    pub(crate) at: Instant,
+}
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -314,14 +338,16 @@ pub struct DagActor {
     /// executor once the pod is gone).
     pub(crate) authoritative_binding: HashMap<DrvHash, AuthBinding>,
     /// Executors that disconnected mid-build, awaiting the controller's
-    /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
-    /// `(drv_hash, inserted_at)` — captured before
-    /// `self.executors.remove()`. The controller's report arrives ~1-3s
-    /// after disconnect; entries are swept on Tick after
-    /// [`executor::TERMINATION_REPORT_TTL`]. In-memory only: a lost
-    /// entry (scheduler restart) degrades to "one OOM doesn't promote"
-    /// — same as pre-I-197 behavior for one cycle.
-    pub(crate) recently_disconnected: HashMap<ExecutorId, (DrvHash, Instant)>,
+    /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason) or, if
+    /// no classifying report ever arrives, the establishment sweep.
+    /// Captured before `self.executors.remove()`. The controller's
+    /// report arrives ~1-3s after disconnect; entries are swept on Tick
+    /// after [`executor::TERMINATION_REPORT_TTL`], at which point the
+    /// released attempt's ledger row is established as an unreported
+    /// executor crash. In-memory only: a lost entry (scheduler restart)
+    /// degrades to "one OOM doesn't promote" — same as pre-I-197
+    /// behavior for one cycle.
+    pub(crate) recently_disconnected: HashMap<ExecutorId, DisconnectedAttempt>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Poison threshold + distinct-workers config. Replaces the
@@ -1306,7 +1332,7 @@ impl DagActor {
                 }
                 #[cfg(test)]
                 ActorCommand::Debug(d) => {
-                    self.handle_debug(d);
+                    self.handle_debug(d).await;
                 }
             }
 

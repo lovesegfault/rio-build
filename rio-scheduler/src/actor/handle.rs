@@ -315,6 +315,14 @@ impl ActorHandle {
         .await
     }
 
+    /// Force the `recently_disconnected` establishment sweep as if the
+    /// correlation TTL had elapsed for every entry. Returns how many
+    /// entries were swept. For the no-report establishment tests.
+    pub async fn debug_force_disconnect_sweep(&self) -> Result<usize, ActorError> {
+        self.debug(|reply| DebugCmd::ForceDisconnectSweep { reply })
+            .await
+    }
+
     /// Backdate an executor's `last_heartbeat`. For heartbeat-timeout
     /// tests. Returns `false` if executor not found.
     pub async fn debug_backdate_heartbeat(

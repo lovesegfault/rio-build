@@ -410,12 +410,38 @@ impl DagActor {
         // r[impl sched.retry.no-double-count]
         // Record for the controller's follow-up report. Only when the
         // worker died MID-BUILD (last_completed != running_build) — an
-        // expected one-shot exit needs no entry.
+        // expected one-shot exit needs no entry, and a promoting report
+        // that raced ahead already owns the attempt's row (it set
+        // last_completed so this guard skips).
         if let Some(drv) = to_reassign.first()
             && lost_last_completed.as_ref() != Some(drv)
         {
+            // 1a, installment 1: the released execution's `disconnected`
+            // row, appended BEFORE `reassign_derivations` clears the
+            // exec_id carrier. Classification (`termination_reason`)
+            // stays NULL here; the controller's report (E6/E7) or the
+            // establishment sweep fills it on this same row later. The
+            // grown entry carries the released (derivation_id, exec_id)
+            // so those fills never need a DAG lookup.
+            let row = self
+                .attempt_row_for(
+                    drv,
+                    crate::state::OutcomeClass::Disconnected,
+                    crate::state::ReportingParty::Scheduler,
+                )
+                .map(|mut r| {
+                    r.executor_id = Some(executor_id.clone());
+                    r
+                });
+            let entry = super::DisconnectedAttempt {
+                drv_hash: drv.clone(),
+                derivation_id: row.as_ref().map(|r| r.derivation_id),
+                exec_id: row.as_ref().and_then(|r| r.exec_id),
+                at: Instant::now(),
+            };
+            self.append_attempt_standalone(drv, row).await;
             self.recently_disconnected
-                .insert(executor_id.clone(), (drv.clone(), Instant::now()));
+                .insert(executor_id.clone(), entry);
         }
         self.reassign_derivations(&to_reassign, Some(executor_id))
             .await;
@@ -606,9 +632,18 @@ impl DagActor {
         };
 
         // r[impl sched.retry.no-double-count]
-        // Resolve drv. remove() = first-report-wins dedup.
+        // Resolve drv. remove() = first-report-wins dedup. The entry
+        // (when present) carries the RELEASED (derivation_id, exec_id)
+        // so the second-installment fill below targets the disconnect's
+        // row directly — even if the node has already been re-dispatched
+        // with a new exec_id (the late-installment shape).
+        let mut released: Option<(uuid::Uuid, uuid::Uuid)> = None;
+        let mut race_ahead = false;
         let drv_hash = match self.recently_disconnected.remove(executor_id) {
-            Some((drv, _)) => drv,
+            Some(entry) => {
+                released = entry.derivation_id.zip(entry.exec_id);
+                entry.drv_hash
+            }
             // Race-ahead: report landed before ExecutorDisconnected.
             // Look at the still-live executor.
             None => match self.executors.get_mut(executor_id) {
@@ -622,6 +657,7 @@ impl DagActor {
                         // and double-bumps (4× provisioning, or
                         // infra_count+=2 at ceiling → premature poison).
                         w.last_completed = Some(drv.clone());
+                        race_ahead = true;
                         drv
                     }
                     None => {
@@ -640,6 +676,36 @@ impl DagActor {
         };
 
         let outcome = self.bump_resource_floor(&drv_hash, reason, label).await;
+
+        // 1a, installment 2: classify the released attempt's ledger row.
+        // The class follows the floor outcome — exempt when the report
+        // promoted the floor, plain infra otherwise — mirroring the
+        // worker-reported E2 split. A correlated report fills the row
+        // the disconnect appended (first writer wins); a race-ahead
+        // report appends the row itself, already classified, and the
+        // later disconnect appends nothing (last_completed guard plus
+        // the exec_id unique index).
+        let class = if outcome.promoted {
+            crate::state::OutcomeClass::ExemptInfra
+        } else {
+            crate::state::OutcomeClass::Infra
+        };
+        if let Some((derivation_id, exec_id)) = released {
+            self.fill_attempt_termination(&drv_hash, derivation_id, exec_id, label, class)
+                .await;
+        } else if race_ahead {
+            let row = self
+                .attempt_row_for(&drv_hash, class, crate::state::ReportingParty::Controller)
+                .map(|mut r| {
+                    r.executor_id = Some(executor_id.clone());
+                    r.termination_reason = Some(label.to_string());
+                    r.exempt = outcome.promoted;
+                    r.floor_promoted = outcome.promoted;
+                    r.floor_at_cap = outcome.at_cap;
+                    r
+                });
+            self.append_attempt_standalone(&drv_hash, row).await;
+        }
 
         // m044: at the ceiling (`at_cap=true`), this path owns the cap
         // check + increment + poison. Kubelet-level OOMKilled /
@@ -727,14 +793,30 @@ impl DagActor {
                     TimedOut first)");
             return false;
         };
-        let (drv_hash, _) = self
+        let entry = self
             .recently_disconnected
             .remove(&pod_name)
             .expect("key found above");
+        let drv_hash = entry.drv_hash.clone();
 
         let outcome = self
             .bump_resource_floor(&drv_hash, R::DeadlineExceeded, "deadline_exceeded")
             .await;
+
+        // 1a, installment 2: the DeadlineExceeded report classifies the
+        // released attempt's row as a timeout (first writer wins; the
+        // fill is keyed by the entry's released exec_id so it lands on
+        // the OLD attempt even after a re-dispatch).
+        if let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id) {
+            self.fill_attempt_termination(
+                &drv_hash,
+                derivation_id,
+                exec_id,
+                "deadline_exceeded",
+                crate::state::OutcomeClass::Timeout,
+            )
+            .await;
+        }
 
         let max = self.retry_policy.max_timeout_retries;
         if let Some(state) = self.dag.node_mut(&drv_hash)
@@ -776,11 +858,37 @@ impl DagActor {
     /// Sweep `recently_disconnected` entries older than
     /// [`TERMINATION_REPORT_TTL`]. Called from `handle_tick`. A swept
     /// entry means the controller's report never arrived (controller
-    /// down, Pod deleted before reconcile observed it) — degrades to
-    /// "this one OOM didn't promote".
-    pub(super) fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
+    /// down, Pod deleted before reconcile observed it) — for the floor
+    /// that still degrades to "this one OOM didn't promote", and the
+    /// released attempt's ledger row is ESTABLISHED as an unreported
+    /// executor crash (`termination_reason='unreported'`,
+    /// `outcome_class='executor_crash'`) so no row sits
+    /// `disconnected/NULL` forever (the C2 data half). The fill is
+    /// keyed by the entry's carried (derivation_id, exec_id) — no DAG
+    /// lookup, so establishment still lands if the node was reaped
+    /// during the window. No charge, no decision — that is Phase 1b.
+    pub(super) async fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
+        let expired: Vec<super::DisconnectedAttempt> = self
+            .recently_disconnected
+            .values()
+            .filter(|e| now.duration_since(e.at) >= TERMINATION_REPORT_TTL)
+            .cloned()
+            .collect();
         self.recently_disconnected
-            .retain(|_, (_, at)| now.duration_since(*at) < TERMINATION_REPORT_TTL);
+            .retain(|_, e| now.duration_since(e.at) < TERMINATION_REPORT_TTL);
+        for entry in expired {
+            let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id) else {
+                continue;
+            };
+            self.fill_attempt_termination(
+                &entry.drv_hash,
+                derivation_id,
+                exec_id,
+                "unreported",
+                crate::state::OutcomeClass::ExecutorCrash,
+            )
+            .await;
+        }
     }
 
     /// Mark a worker draining. In-flight builds continue; no new
@@ -898,6 +1006,30 @@ impl DagActor {
                     );
                     metrics::counter!("rio_scheduler_cancel_signals_total").increment(sent);
                 }
+            }
+
+            // 1a: the taken in-flight execution's ledger row, complete
+            // in ONE installment (`termination_reason='force_drain'`):
+            // no `recently_disconnected` entry is inserted for a drain
+            // and no controller crash report will correlate to it, so
+            // it must never sit unclassified, and nothing later charges
+            // it (as-built force-drain charges nothing). Appended
+            // before the reassign clears the exec_id carrier; the
+            // worker's subsequent real disconnect finds running_build
+            // already taken and appends nothing further.
+            for drv in &to_reassign {
+                let row = self
+                    .attempt_row_for(
+                        drv,
+                        crate::state::OutcomeClass::Disconnected,
+                        crate::state::ReportingParty::Scheduler,
+                    )
+                    .map(|mut r| {
+                        r.executor_id = Some(executor_id.clone());
+                        r.termination_reason = Some("force_drain".to_string());
+                        r
+                    });
+                self.append_attempt_standalone(drv, row).await;
             }
 
             // Reassign. Worker later sends CompletionReport{Cancelled};

@@ -2125,7 +2125,12 @@ async fn clear_persisted_state_clears_per_generation_maps() {
 
     actor.recently_disconnected.insert(
         "stale-exec".into(),
-        ("stale".into(), std::time::Instant::now()),
+        crate::actor::DisconnectedAttempt {
+            drv_hash: "stale".into(),
+            derivation_id: None,
+            exec_id: None,
+            at: std::time::Instant::now(),
+        },
     );
     actor
         .hung_nodes

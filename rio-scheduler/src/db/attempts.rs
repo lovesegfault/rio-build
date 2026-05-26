@@ -384,8 +384,6 @@ impl SchedulerDb {
     /// `recently_disconnected` entry so the establishment fill never
     /// needs a DAG lookup (the node may already be reaped or carry the
     /// next attempt's exec_id).
-    // TODO: callers land with the no-report two-installment paths (T-1a.5).
-    #[allow(dead_code)]
     pub(crate) async fn fill_termination(
         tx: &mut PgConnection,
         derivation_id: Uuid,

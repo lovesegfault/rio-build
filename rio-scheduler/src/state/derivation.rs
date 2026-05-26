@@ -1701,6 +1701,30 @@ impl DerivationState {
         self.attempt_history = history;
     }
 
+    /// Mirror a successful `fill_termination` (the second installment
+    /// of a two-installment attempt) onto the in-memory record for
+    /// `exec_id`. No-op when no record carries that execution (the
+    /// suffix was reloaded post-fill, or the row predates this
+    /// leader's history). Returns whether a record was updated.
+    pub(crate) fn classify_attempt_record(
+        &mut self,
+        exec_id: Uuid,
+        termination_reason: &str,
+        outcome_class: OutcomeClass,
+    ) -> bool {
+        for record in self.attempt_history.iter_mut().rev() {
+            if record.exec_id == Some(exec_id) {
+                if record.termination_reason.is_none() {
+                    record.termination_reason = Some(termination_reason.to_string());
+                    record.outcome_class = outcome_class;
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
     /// The in-memory attempt history (the committed suffix mirror).
     /// Test-only in Phase 1a — no decision consults it until the
     /// Phase-1b collapse.

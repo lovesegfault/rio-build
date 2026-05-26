@@ -4782,3 +4782,294 @@ async fn test_force_drain_heartbeat_race_no_infra_count() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Attempt ledger (drv_attempts, Phase 1a): the no-report paths — the
+// two-installment correlation, the establishment sweep, the backstop and
+// force-drain rows. One physical death = one row in every arrival order
+// (the exec_id partial unique index is the schema half; these tests pin
+// the wiring half).
+// ---------------------------------------------------------------------------
+
+/// Disconnect → controller report: installment 1 appends the
+/// `disconnected` row, installment 2 classifies that SAME row.
+#[tokio::test]
+async fn attempt_ledger_disconnect_then_report_one_row() -> TestResult {
+    let (db, handle, _task, rx) = setup_with_worker("nrp-w1", "x86_64-linux").await?;
+    let drv_hash = "nrp-d1";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Assigned
+    );
+    disconnect(&handle, "nrp-w1").await?;
+    drop(rx);
+
+    // Installment 1: the released execution's row, unclassified.
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome_class, "disconnected");
+    assert_eq!(rows[0].termination_reason, None);
+    assert!(
+        rows[0].exec_id.is_some(),
+        "the released execution keys the row"
+    );
+
+    // Installment 2: the controller's classifying report fills it.
+    let promoted = report_termination(
+        &handle,
+        "nrp-w1",
+        rio_proto::types::TerminationReason::OomKilled,
+    )
+    .await?;
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the report must not add a second row: {rows:?}"
+    );
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("oom_killed"));
+    let expected_class = if promoted { "exempt_infra" } else { "infra" };
+    assert_eq!(rows[0].outcome_class, expected_class);
+    Ok(())
+}
+
+/// Report → disconnect (the race-ahead order): the report appends the
+/// already-classified row itself; the late disconnect appends nothing.
+#[tokio::test]
+async fn attempt_ledger_report_then_disconnect_one_row() -> TestResult {
+    let (db, handle, _task, rx) = setup_with_worker("nrp-w2", "x86_64-linux").await?;
+    let drv_hash = "nrp-d2";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    let promoted = report_termination(
+        &handle,
+        "nrp-w2",
+        rio_proto::types::TerminationReason::OomKilled,
+    )
+    .await?;
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("oom_killed"));
+    let expected_class = if promoted { "exempt_infra" } else { "infra" };
+    assert_eq!(rows[0].outcome_class, expected_class);
+
+    disconnect(&handle, "nrp-w2").await?;
+    drop(rx);
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the late disconnect must not add a row: {rows:?}"
+    );
+    Ok(())
+}
+
+/// Two controller observations of ONE death (the pod-level non-promoting
+/// report and the job-level DeadlineExceeded), both orders: exactly one
+/// row, finally classified `timeout`; the non-promoting report neither
+/// consumes the dedup entry nor establishes the row.
+#[tokio::test]
+async fn attempt_ledger_dual_report_orders_classify_timeout() -> TestResult {
+    use rio_proto::types::TerminationReason as R;
+    // Order A: disconnect → non-promoting pod report → DeadlineExceeded.
+    {
+        let (db, handle, _task, rx) = setup_with_worker("ddl-w1-abcde", "x86_64-linux").await?;
+        let drv_hash = "ddl-d1";
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        disconnect(&handle, "ddl-w1-abcde").await?;
+        drop(rx);
+
+        let _ = report_termination(&handle, "ddl-w1-abcde", R::Error).await?;
+        let rows = ledger_rows(&db.pool, drv_hash).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].termination_reason, None,
+            "a non-promoting report must not establish the row"
+        );
+
+        let _ = report_termination(&handle, "ddl-w1", R::DeadlineExceeded).await?;
+        let rows = ledger_rows(&db.pool, drv_hash).await;
+        assert_eq!(rows.len(), 1, "one death = one row: {rows:?}");
+        assert_eq!(rows[0].outcome_class, "timeout");
+        assert_eq!(
+            rows[0].termination_reason.as_deref(),
+            Some("deadline_exceeded")
+        );
+    }
+    // Order B: disconnect → DeadlineExceeded → non-promoting pod report.
+    {
+        let (db, handle, _task, rx) = setup_with_worker("ddl-w2-abcde", "x86_64-linux").await?;
+        let drv_hash = "ddl-d2";
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        disconnect(&handle, "ddl-w2-abcde").await?;
+        drop(rx);
+
+        let _ = report_termination(&handle, "ddl-w2", R::DeadlineExceeded).await?;
+        let _ = report_termination(&handle, "ddl-w2-abcde", R::Error).await?;
+        let rows = ledger_rows(&db.pool, drv_hash).await;
+        assert_eq!(rows.len(), 1, "one death = one row: {rows:?}");
+        assert_eq!(rows[0].outcome_class, "timeout");
+        assert_eq!(
+            rows[0].termination_reason.as_deref(),
+            Some("deadline_exceeded")
+        );
+    }
+    Ok(())
+}
+
+/// A report that never arrives: the (test-forced) correlation-TTL sweep
+/// establishes the row as an unreported executor crash — fills, never
+/// inserts.
+#[tokio::test]
+async fn attempt_ledger_unreported_crash_established_by_sweep() -> TestResult {
+    let (db, handle, _task, rx) = setup_with_worker("est-w", "x86_64-linux").await?;
+    let drv_hash = "est-d";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+    disconnect(&handle, "est-w").await?;
+    drop(rx);
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome_class, "disconnected");
+    assert_eq!(rows[0].termination_reason, None);
+
+    let swept = handle.debug_force_disconnect_sweep().await?;
+    assert_eq!(swept, 1, "exactly the one expired entry");
+    barrier(&handle).await;
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "establishment fills, never inserts: {rows:?}"
+    );
+    assert_eq!(rows[0].outcome_class, "executor_crash");
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("unreported"));
+    Ok(())
+}
+
+/// A backstop fire writes exactly ONE row for that attempt — the
+/// `backstop` row at the charging site; the delegation to
+/// `reassign_derivations` adds no `disconnected` row.
+#[tokio::test]
+async fn attempt_ledger_backstop_fire_single_row() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("bsr-w", "x86_64-linux").await?;
+    let drv_hash = "bsr-d";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+    let ok = handle.debug_backdate_running(drv_hash, 200).await?;
+    assert!(ok, "backdate must succeed");
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row per backstopped attempt: {rows:?}"
+    );
+    assert_eq!(rows[0].outcome_class, "backstop");
+    assert_eq!(rows[0].executor_id.as_deref(), Some("bsr-w"));
+    assert!(
+        rows[0].exec_id.is_some(),
+        "the wedged execution is recorded"
+    );
+    Ok(())
+}
+
+/// Force-drain with a running build: one row, complete in a single
+/// installment (`termination_reason='force_drain'`); the worker's
+/// subsequent real disconnect appends nothing further.
+#[tokio::test]
+async fn attempt_ledger_force_drain_single_classified_row() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("fdr-w", "x86_64-linux").await?;
+    let drv_hash = "fdr-d";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "fdr-w".into(),
+            force: true,
+            reply: reply_tx,
+        })
+        .await?;
+    let _ = reply_rx.await?;
+    barrier(&handle).await;
+
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome_class, "disconnected");
+    assert_eq!(
+        rows[0].termination_reason.as_deref(),
+        Some("force_drain"),
+        "a drain's row is complete in one installment"
+    );
+
+    disconnect(&handle, "fdr-w").await?;
+    drop(rx);
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the post-drain disconnect must not add a row: {rows:?}"
+    );
+    Ok(())
+}
+
+/// Late installment after a re-dispatch: the controller's report for the
+/// OLD death classifies the OLD attempt's row (keyed by the released
+/// exec_id), never the new attempt's.
+#[tokio::test]
+async fn attempt_ledger_late_installment_lands_on_old_attempt() -> TestResult {
+    let (db, handle, _task, rx1) = setup_with_worker("li-w1", "x86_64-linux").await?;
+    let drv_hash = "li-d";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+    disconnect(&handle, "li-w1").await?;
+    drop(rx1);
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1);
+    let old_exec = rows[0].exec_id.expect("released execution recorded");
+
+    // Re-dispatch to a fresh worker: a NEW execution for the same drv.
+    let mut rx2 = connect_executor(&handle, "li-w2", "x86_64-linux").await?;
+    let _assignment = recv_assignment(&mut rx2).await;
+    let new_exec: Uuid = sqlx::query_scalar(
+        "SELECT exec_id FROM drv_executions WHERE drv_hash = $1 ORDER BY exec_id DESC LIMIT 1",
+    )
+    .bind(rio_nix::store_path::drv_log_hash(&test_drv_path(drv_hash)))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(new_exec, old_exec, "the re-dispatch minted a new execution");
+
+    let _ = report_termination(
+        &handle,
+        "li-w1",
+        rio_proto::types::TerminationReason::OomKilled,
+    )
+    .await?;
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].exec_id,
+        Some(old_exec),
+        "the late installment lands on the released execution, not the new one"
+    );
+    assert!(rows[0].termination_reason.is_some());
+    Ok(())
+}
