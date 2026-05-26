@@ -65,7 +65,7 @@ const PROMOTE_BATCH: usize = 32;
 ///
 /// One per `file_digest`, shared by every `open()` of that digest in
 /// this process (winner and attachers alike) and by the fill thread.
-/// FUSE `read()` callbacks consult it via [`StreamFill::read_at`];
+/// FUSE `read()` callbacks consult it via `StreamFill::read_at`;
 /// they never talk to the fill thread directly.
 pub struct StreamFill {
     /// The staging `.partial`: written sequentially by the fill thread

@@ -15,7 +15,7 @@
 //! Best-effort by construction: a per-path failure is logged, counted,
 //! and stamped onto `narinfo.compat_attempted_at` (which rotates the
 //! row behind newer pending paths — see
-//! [`metadata::bump_compat_attempt`]); the path stays pending (NULL)
+//! `metadata::bump_compat_attempt`); the path stays pending (NULL)
 //! and the loop moves on — it never crashes the process and never
 //! blocks an upload. A tick keeps draining only while batches make
 //! progress, so a backlog of permanently-failing rows degrades to one
@@ -80,7 +80,7 @@ impl ReconcileStats {
 
 // r[impl store.compat.reconcile+2]
 /// Process one batch of pending paths: refresh the backlog gauge, list
-/// up to [`RECONCILE_BATCH`] pending paths, and publish each one.
+/// up to `RECONCILE_BATCH` pending paths, and publish each one.
 /// Failures are per-path; this function only errors if the *listing*
 /// itself fails (PG unreachable), in which case the caller just waits
 /// for the next tick.
@@ -139,7 +139,7 @@ pub async fn run_once(
 /// permanently failing (missing chunks, unreachable compat bucket) —
 /// ends the tick instead of immediately re-listing the same rows
 /// forever. Failed rows are stamped via
-/// [`metadata::bump_compat_attempt`], so on the next tick (and on the
+/// `metadata::bump_compat_attempt`, so on the next tick (and on the
 /// next batch within this tick) never-attempted paths sort ahead of
 /// them; the combination bounds re-attempts of a permanently-failing
 /// row to roughly once per tick while newer pending paths are never
