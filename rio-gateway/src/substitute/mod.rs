@@ -262,6 +262,12 @@ struct SyncCandidate {
 /// Never returns an error: every failure mode degrades to "still
 /// missing". A broken peer must not break `nix copy` against a
 /// gateway that could have served the request without one.
+///
+/// TODO: the whole sync runs inside the client's `wopQueryValidPaths`
+/// round-trip with no STDERR activity sent back, so a long delta-sync
+/// (many candidates, slow peer) looks like a hung `nix copy` until it
+/// finishes. Emitting periodic STDERR_NEXT progress lines (or activity
+/// frames) from here would make the wait observable client-side.
 #[instrument(skip_all, fields(peer = %peer.addr, missing = missing.len()))]
 pub(crate) async fn try_substitute_missing(
     ctx: &mut SessionContext,
@@ -382,7 +388,10 @@ async fn sync_candidates(
     // contents, like upload_one already is. A peer-down cooldown
     // shared across sessions is also not implemented — each
     // wopQueryValidPaths re-probes; the first transport failure only
-    // short-circuits the rest of THAT call's probes. Acceptable today
+    // short-circuits the rest of THAT call's probes — and probe
+    // outcomes are not cached per session either, so a client that
+    // re-asks about the same paths in one session pays the
+    // QueryPathInfo + GetNarIndex probe again. Acceptable today
     // because a mostly-missing closure declines cheaply at the
     // probe/HasBlobs stage anyway and the client's whole-NAR push
     // takes over.

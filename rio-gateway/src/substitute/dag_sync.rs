@@ -57,8 +57,12 @@ pub(crate) struct SyncStats {
     /// File contents fetched from the remote (`ReadBlob`).
     pub blobs_fetched: u64,
     /// Bytes of file content NOT transferred from the remote because
-    /// the local store already held the blob (summed over the file
-    /// entries of every synced NAR).
+    /// the local store already held the blob. Credited at reassembly
+    /// time, when the local `ReadBlob` happens: one credit per DISTINCT
+    /// file digest per attempted NAR (a digest repeated across entries
+    /// counts once), and still credited if that NAR's subsequent
+    /// `PutPath` fails — it measures remote bytes avoided, not paths
+    /// committed.
     pub bytes_saved: u64,
     /// Bytes of file content transferred from the remote.
     pub bytes_fetched: u64,
@@ -653,6 +657,95 @@ mod tests {
             out.candidate_files,
             HashMap::from([(d(0xA), 5)]),
             "only files under CHANGED directories are fetch candidates"
+        );
+    }
+
+    /// A `GetDirectory` failure mid-BFS (a body the remote cannot serve)
+    /// aborts the walk with the RPC error — the caller falls back to the
+    /// whole-NAR push for every candidate rather than syncing a partial
+    /// discovery.
+    #[tokio::test]
+    async fn walk_aborts_on_get_directory_failure() {
+        let mut remote = MemCastore::default();
+        // Root body exists but its child (2) was never inserted — the
+        // remote answers NotFound for it mid-BFS.
+        remote.bodies.insert(
+            d(1),
+            DirectoryChildren {
+                dirs: vec![d(2)],
+                files: vec![],
+            },
+        );
+        let mut local = MemCastore::default();
+        let mut stats = SyncStats::default();
+        let err = walk_dag(&mut local, &mut remote, &[d(1)], &mut stats)
+            .await
+            .expect_err("missing remote body must abort the walk");
+        assert!(
+            matches!(
+                err,
+                DagSyncError::Rpc {
+                    rpc: "GetDirectory",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// A candidate blob absent from BOTH stores surfaces as the remote's
+    /// ReadBlob error instead of being silently skipped (a skip would
+    /// later fail reassembly with a less specific error).
+    #[tokio::test]
+    async fn fetch_missing_blobs_errors_when_blob_is_nowhere() {
+        let mut local = MemCastore::default();
+        let mut remote = MemCastore::default();
+        let candidates = HashMap::from([(d(0xA), 5u64)]);
+        let mut stats = SyncStats::default();
+        let err = fetch_missing_blobs(&mut local, &mut remote, &candidates, &mut stats)
+            .await
+            .expect_err("blob absent from both stores must error");
+        assert!(
+            matches!(
+                err,
+                DagSyncError::Rpc {
+                    rpc: "ReadBlob",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(stats.blobs_fetched, 0);
+    }
+
+    /// The discovery walk is bounded: a frontier that explodes past
+    /// WALK_MAX_DIRS distinct digests is rejected instead of enumerating
+    /// it against the remote one directory at a time.
+    #[tokio::test]
+    async fn walk_rejects_oversized_dag() {
+        // One root whose body fans out to more children than the cap.
+        let child = |i: u32| -> [u8; 32] {
+            let mut d = [0u8; 32];
+            d[..4].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0xFF;
+            d
+        };
+        let mut remote = MemCastore::default();
+        remote.bodies.insert(
+            d(1),
+            DirectoryChildren {
+                dirs: (0..=(WALK_MAX_DIRS as u32)).map(child).collect(),
+                files: vec![],
+            },
+        );
+        let mut local = MemCastore::default();
+        let mut stats = SyncStats::default();
+        let err = walk_dag(&mut local, &mut remote, &[d(1)], &mut stats)
+            .await
+            .expect_err("oversized DAG must be rejected");
+        assert!(
+            matches!(err, DagSyncError::WalkTooLarge(WALK_MAX_DIRS)),
+            "{err}"
         );
     }
 

@@ -256,6 +256,11 @@ pkgs.testers.runNixOSTest {
         # O(changed-subtrees) discovery: >90% of the tree was pruned
         # without being enumerated against the remote, and exactly one
         # file's content was fetched.
+        # Exact deltas (76 pruned / 6 fetched / 1 blob) rather than the
+        # plan's >=0.9 ratio: the b_dirs == 82 precondition above is the
+        # fixture-drift guard — a changed tree shape trips that assert
+        # first (with update instructions), so these constants cannot
+        # silently rot.
         after = scrape_metrics(${gatewayHost}, 9090)
         floor = int(${toString totalDirs} * 0.9) + 1
         assert ${toString expectedPruned} >= floor, (
