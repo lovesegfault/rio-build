@@ -2732,7 +2732,7 @@ impl DagActor {
         // this arm stays the defense-in-depth backstop it has always
         // been; the dispatch-time backstop (E9) covers paths that
         // bypass this handler (worker disconnect, recovery reconcile).
-        let eligible: HashSet<ExecutorId> = self
+        let eligible: std::collections::BTreeSet<ExecutorId> = self
             .dag
             .node(drv_hash)
             .map(|state| {

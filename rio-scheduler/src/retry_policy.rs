@@ -96,7 +96,7 @@
 //!   event that was dropped by such a guard is simply absent from the
 //!   observed history.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use crate::state::{AttemptEventKind, AttemptRecord, ExecutorId, OutcomeClass, ReportingParty};
 
@@ -191,7 +191,7 @@ impl Budget {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FleetView {
     /// Statically-eligible, non-draining, registered executor ids.
-    pub eligible: HashSet<String>,
+    pub eligible: BTreeSet<String>,
 }
 
 /// One observed accounting event. The variants are the nine entry points'
@@ -319,7 +319,7 @@ pub(crate) struct Counters {
     /// The per-executor exclusion set (`RetryState::failed_builders`).
     /// Drives `hard_filter`'s placement exclusion, the distinct-workers
     /// poison threshold, and the fleet-exhaust check.
-    pub failed_builders: HashSet<String>,
+    pub failed_builders: BTreeSet<String>,
     /// Flat failure count for `require_distinct_workers = false`
     /// (`RetryState::failure_count`).
     pub failure_count: u32,
@@ -401,7 +401,7 @@ pub(crate) struct PersistedRetryColumns {
     /// `derivations.resubmit_cycles`.
     pub resubmit_cycles: u32,
     /// `derivations.failed_builders`.
-    pub failed_builders: HashSet<String>,
+    pub failed_builders: BTreeSet<String>,
     /// `derivations.poisoned_at`, already converted to the abstract
     /// clock and already filtered for TTL expiry.
     pub poisoned_at: Option<AbsTime>,
@@ -471,7 +471,7 @@ pub(crate) enum Verdict {
 /// fleet is empty (no pool is connected — that is a transient the
 /// autoscaler handles, and poisoning would brick builds during a
 /// rollout).
-pub(crate) fn exhausts_fleet(failed_builders: &HashSet<String>, fleet: &FleetView) -> bool {
+pub(crate) fn exhausts_fleet(failed_builders: &BTreeSet<String>, fleet: &FleetView) -> bool {
     if failed_builders.is_empty() || fleet.eligible.is_empty() {
         return false;
     }
@@ -852,7 +852,7 @@ pub(crate) struct Decision {
     /// E9 dispatch backstop intersect it with the live eligible fleet via
     /// [`placeable`]; `hard_filter` consumes the same set through the
     /// fold-refreshed cached view (`RetryState::failed_builders`).
-    pub exclusion: HashSet<ExecutorId>,
+    pub exclusion: BTreeSet<ExecutorId>,
     /// The deterministic backoff deadline (no jitter — the dispatch site
     /// applies the production jitter exactly as today).
     pub backoff_until: Option<AbsTime>,
@@ -1155,8 +1155,8 @@ pub(crate) enum Placement {
 /// `failed_builders_exhausts_fleet`): an empty exclusion set or an empty
 /// eligible fleet never reads as exhausted.
 pub(crate) fn placeable(
-    excluded: &HashSet<ExecutorId>,
-    eligible: &HashSet<ExecutorId>,
+    excluded: &BTreeSet<ExecutorId>,
+    eligible: &BTreeSet<ExecutorId>,
 ) -> Placement {
     if eligible.is_empty() {
         return Placement::NoEligibleWorkers;
@@ -1916,7 +1916,7 @@ mod tests {
     /// `disconnected` row (not yet established) still charges nothing.
     #[test]
     fn decide_executor_crash_history_charges_the_threshold_budget() {
-        let ex = |ids: &[&str]| -> HashSet<ExecutorId> {
+        let ex = |ids: &[&str]| -> BTreeSet<ExecutorId> {
             ids.iter().map(|s| ExecutorId::from(*s)).collect()
         };
         let crash = |w: &str, at: u32| {
@@ -2121,7 +2121,7 @@ mod tests {
     /// fleet-exhaust predicate, including both empty-set carve-outs.
     #[test]
     fn placeable_mirrors_the_fleet_exhaust_predicate() {
-        let ex = |ids: &[&str]| -> HashSet<ExecutorId> {
+        let ex = |ids: &[&str]| -> BTreeSet<ExecutorId> {
             ids.iter().map(|s| ExecutorId::from(*s)).collect()
         };
         assert_eq!(

@@ -5725,7 +5725,7 @@ async fn phase1b_failover_budget_recovered_view_equals_fold() -> TestResult {
         info.retry.last_infra_failure_at.is_some(),
         c.last_infra_failure_at.is_some()
     );
-    let ram_exclusion: std::collections::HashSet<String> = info
+    let ram_exclusion: std::collections::BTreeSet<String> = info
         .retry
         .failed_builders
         .iter()

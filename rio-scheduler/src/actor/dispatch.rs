@@ -2036,7 +2036,7 @@ impl DagActor {
             crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
             Some(state.legacy_retry_floor()),
         );
-        let eligible: HashSet<ExecutorId> = self
+        let eligible: std::collections::BTreeSet<ExecutorId> = self
             .executors
             .values()
             .filter(|w| !w.is_draining() && crate::assignment::statically_eligible(w, state))
