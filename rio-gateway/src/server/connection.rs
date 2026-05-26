@@ -135,6 +135,13 @@ impl Drop for ChannelSession {
 /// in — the release has to ride on the session's own task ending.
 pub(super) struct EmptyConnectionTimer {
     inner: std::sync::Mutex<EmptyConnectionTimerInner>,
+    /// Transport force-close deadline shared with the accept-site
+    /// [`super::ConnDeadline`] wrapper. Armed by the timer task at the
+    /// moment it queues its `Disconnect::ByApplication`, so a peer that
+    /// keeps that disconnect undeliverable (parked key exchange) or
+    /// ignores it (never closes its socket) is force-closed
+    /// [`super::FORCE_CLOSE_SLACK`] later anyway.
+    force_close: Arc<super::ForceClose>,
 }
 
 struct EmptyConnectionTimerInner {
@@ -152,13 +159,14 @@ struct EmptyConnectionTimerInner {
 }
 
 impl EmptyConnectionTimer {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(force_close: Arc<super::ForceClose>) -> Self {
         Self {
             inner: std::sync::Mutex::new(EmptyConnectionTimerInner {
                 live_sessions: 0,
                 pending_disconnect: None,
                 connection_closed: false,
             }),
+            force_close,
         }
     }
 
@@ -214,6 +222,20 @@ impl EmptyConnectionTimer {
                     grace_secs = grace.as_secs(),
                     "no active sessions for the grace period; disconnecting"
                 );
+                // Decide-then-enforce: arm the transport force-close BEFORE
+                // queueing the polite disconnect. The disconnect rides the
+                // russh handle queue, which is only drained between key
+                // exchanges and whose delivery the peer can defeat (parked
+                // rekey) or ignore (never closing its socket — russh's
+                // post-disconnect drain-read loop has no timeout of its
+                // own). Once armed, the accept-site `ConnDeadline` fails
+                // the transport read `FORCE_CLOSE_SLACK` from now, ending
+                // russh's session loop (or its drain loop) and releasing
+                // the permit, fd, and gauges through the normal drop paths
+                // with zero further cooperation from the peer. Arming
+                // before the send also keeps this task bounded if the
+                // handle queue itself is parked full.
+                timer.force_close.arm_within(super::FORCE_CLOSE_SLACK);
                 // Err = the connection already ended for another
                 // reason — nothing left to disconnect.
                 let _ = handle
@@ -273,10 +295,10 @@ impl EmptyConnectionTimer {
 /// the connection's live-session count. Held by the session's response
 /// task and dropped when the session ACTUALLY ends — the protocol task
 /// has returned (client EOF, handshake/idle timeout, protocol error, or
-/// graceful shutdown) and the server-side `exit-status`/`eof`/`close`
-/// have been sent — or when the `ChannelSession` is dropped early
-/// (client channel close, connection end) and the response task is
-/// aborted with it.
+/// graceful shutdown), BEFORE the server-side `exit-status`/`eof`/`close`
+/// are attempted — or when the `ChannelSession` is dropped early (client
+/// channel close, connection end) and the response task is aborted with
+/// it.
 ///
 /// This is what makes a SERVER-side session ending release capacity: a
 /// client that ignores the server's channel close and keeps answering
@@ -285,7 +307,11 @@ impl EmptyConnectionTimer {
 /// removes). Tying it to the task means every ending — client- or
 /// server-initiated — releases the permit, the gauge, and (via
 /// [`EmptyConnectionTimer::session_ended`]) starts the empty-connection
-/// grace when the last live session is gone.
+/// grace when the last live session is gone. The drop deliberately
+/// precedes the close-out sends (see [`finish_channel_session`]): those
+/// ride the per-connection russh handle queue, which a hostile peer can
+/// park, and capacity release must never depend on the peer's transport
+/// cooperation.
 struct SessionGuard {
     /// Global session-cap permit (`r[gw.conn.session-cap]`), acquired in
     /// `exec_request` before the duplex buffers are allocated.
@@ -309,6 +335,73 @@ impl Drop for SessionGuard {
         // ChannelSession::Drop, connection teardown).
         metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
         Arc::clone(&self.timer).session_ended(self.handle.clone(), self.peer, self.grace);
+    }
+}
+
+/// End-of-session bookkeeping run by the response task once the protocol
+/// handler's output stream is exhausted: release the session's capacity
+/// FIRST (drop the [`SessionGuard`]), then make a bounded best-effort
+/// attempt to deliver the RFC 4254 close-out (`exit-status 0`, `eof`,
+/// `close`), then reap the client pump.
+///
+/// Both the ordering and the bound are load-bearing:
+///
+/// - The close-out rides this connection's russh handle queue (10 slots),
+///   which russh only drains between key exchanges. A peer that parks a
+///   key exchange while that queue is full would wedge these sends
+///   forever; if the guard were still held, the dead session's permit,
+///   gauge slot, and live-session count would stay pinned with it — and
+///   so would every later ended session's, since their response tasks
+///   block on the same queue. Capacity release must not depend on the
+///   peer's transport cooperation, so the guard drops before the first
+///   send. The empty-connection grace the drop may arm measures live
+///   sessions, not whether these close-out bytes were flushed.
+/// - The sends are bounded by `close_out_timeout` so a full queue cannot
+///   park this task forever either. A connection in that state has been
+///   (or is about to be) told to disconnect, and the transport
+///   force-close ([`super::ConnDeadline`]) bounds *that*; skipping the
+///   exit-status/eof/close on such a connection costs nothing.
+async fn finish_channel_session(
+    handle: russh::server::Handle,
+    channel_id: ChannelId,
+    session_guard: SessionGuard,
+    client_pump: tokio::task::JoinHandle<()>,
+    close_out_timeout: std::time::Duration,
+) {
+    drop(session_guard);
+    // r[impl gw.conn.exit-status+3]
+    // RFC 4254 §6.10: send `exit-status` BEFORE eof/close. Without it,
+    // openssh's foreground client process (under ControlMaster) never
+    // returns to nix → nix blocks in pipe-read → `nom build` hangs until
+    // ControlPersist expires. Unconditionally 0: the wire-level
+    // `BuildResult` already conveys per-build success/failure to the nix
+    // client; the ssh exit code only signals "the daemon session ended",
+    // which it did.
+    let close_out = async {
+        if handle.exit_status_request(channel_id, 0).await.is_err() {
+            warn!(channel = ?channel_id, "failed to send exit-status to SSH client");
+        }
+        if let Err(e) = handle.eof(channel_id).await {
+            warn!(channel = ?channel_id, error = ?e, "failed to send EOF to SSH client");
+        }
+        if let Err(e) = handle.close(channel_id).await {
+            warn!(channel = ?channel_id, error = ?e, "failed to close SSH channel");
+        }
+    };
+    if tokio::time::timeout(close_out_timeout, close_out)
+        .await
+        .is_err()
+    {
+        warn!(
+            channel = ?channel_id,
+            "timed out delivering exit-status/eof/close (russh handle queue not draining); \
+             abandoning the channel close-out"
+        );
+    }
+    if let Err(e) = client_pump.await
+        && e.is_panic()
+    {
+        error!(channel = ?channel_id, "client pump task panicked: {e}");
     }
 }
 
@@ -451,6 +544,13 @@ pub struct ConnectionHandler {
     /// and the client never sends another SSH message. See
     /// [`EmptyConnectionTimer`].
     pub(super) idle: Arc<EmptyConnectionTimer>,
+    /// Transport force-close deadline for this connection, created in
+    /// `new_client` and shared with the accept-site
+    /// [`super::ConnDeadline`] stream wrapper (which enforces it) and
+    /// with [`Self::idle`] (whose grace timer arms it when it queues a
+    /// disconnect). Held here so the accept site can reach it after
+    /// `new_client` returns; the handler itself never arms it.
+    pub(super) force_close: Arc<super::ForceClose>,
 }
 
 impl ConnectionHandler {
@@ -1172,36 +1272,22 @@ impl Handler for ConnectionHandler {
                     }
                 }
             }
-            // r[impl gw.conn.exit-status+3]
-            // RFC 4254 §6.10: send `exit-status` BEFORE eof/close. Without
-            // it, openssh's foreground client process (under ControlMaster)
-            // never returns to nix → nix blocks in pipe-read → `nom build`
-            // hangs until ControlPersist expires. Unconditionally 0: the
-            // wire-level `BuildResult` already conveys per-build success/
-            // failure to the nix client; the ssh exit code only signals
-            // "the daemon session ended", which it did.
-            if handle.exit_status_request(channel_id, 0).await.is_err() {
-                warn!(channel = ?channel_id, "failed to send exit-status to SSH client");
-            }
-            if let Err(e) = handle.eof(channel_id).await {
-                warn!(channel = ?channel_id, error = ?e, "failed to send EOF to SSH client");
-            }
-            if let Err(e) = handle.close(channel_id).await {
-                warn!(channel = ?channel_id, error = ?e, "failed to close SSH channel");
-            }
-            // The protocol session is over and the server-side channel
-            // close has been sent: release the session permit, the gauge,
-            // and the live-session count NOW. Waiting for the client to
-            // acknowledge (or for the connection to end) would let a
+            // The protocol session is over: release the permit, the gauge,
+            // and the live-session count, then deliver the close-out to
+            // the client on a best-effort, bounded basis. Waiting for the
+            // client to acknowledge (or for the close-out sends to make it
+            // through a handle queue the peer may have parked) would let a
             // client that ignores the close pin a global session slot
             // indefinitely — the dead session must stop counting the
             // moment the server is done with it.
-            drop(session_guard);
-            if let Err(e) = client_pump.await
-                && e.is_panic()
-            {
-                error!(channel = ?channel_id, "client pump task panicked: {e}");
-            }
+            finish_channel_session(
+                handle,
+                channel_id,
+                session_guard,
+                client_pump,
+                super::FORCE_CLOSE_SLACK,
+            )
+            .await;
         });
 
         self.sessions.insert(
@@ -1417,6 +1503,169 @@ mod tests {
         assert_eq!(
             handler.open_channels, 0,
             "a duplicate close must not skew the counter"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // finish_channel_session — the response task's end-of-session tail.
+    // Driven against a REAL russh session handle whose receiver never
+    // drains: russh only drains handle messages between key exchanges, and
+    // these sessions never complete the initial exchange (the "client" is a
+    // raw duplex half that sends its banner and nothing else), which is the
+    // same parked-queue condition a hostile peer creates by stalling a
+    // rekey. Staging an authenticated client that parks a mid-session
+    // rekey end-to-end is not possible with the available plumbing (the
+    // russh client exposes no "start a rekey and stall" control, and a raw
+    // TCP client would need a full SSH implementation to authenticate), so
+    // the guarantee is pinned here at the unit level instead.
+    // -----------------------------------------------------------------------
+
+    /// Spawn a real russh server session over an in-memory duplex whose
+    /// handle queue is permanently parked (initial key exchange never
+    /// completes), and fill that queue to capacity. Returns the handle, the
+    /// number of messages it took to fill the queue, and the client half of
+    /// the duplex — KEEP IT ALIVE: dropping it EOFs the transport, the
+    /// session loop exits, the receiver drops, and every parked send fails
+    /// instead of blocking (which would let a wrong implementation pass).
+    async fn parked_handle_with_full_queue()
+    -> anyhow::Result<(russh::server::Handle, usize, tokio::io::DuplexStream)> {
+        use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
+        use russh::keys::{Algorithm, PrivateKey};
+        use russh::server::Server as _;
+
+        let (_s, store_addr, _sh) = spawn_mock_store().await?;
+        let (_d, sched_addr, _dh) = spawn_mock_scheduler().await?;
+        let store = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let sched = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+        let mut server = super::super::GatewayServer::new(store, sched, vec![]);
+        let handler = server.new_client(None);
+
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let config = Arc::new(super::super::build_ssh_config(host_key));
+
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        // run_stream reads the client identification string before
+        // spawning the session loop; provide one, then go silent so the
+        // server-initiated initial key exchange stays active forever.
+        client_io.write_all(b"SSH-2.0-rio-test-parked\r\n").await?;
+        let running = russh::server::run_stream(config, server_io, handler).await?;
+        let handle = running.handle();
+
+        // Fill the handle queue until a send no longer completes. With the
+        // exchange active the receiver arm of russh's session loop is
+        // disabled, so nothing ever drains what we queue here.
+        let filler = channel_id(99);
+        let mut filled = 0usize;
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                handle.exit_status_request(filler, 0),
+            )
+            .await
+            {
+                Ok(Ok(())) => filled += 1,
+                Ok(Err(())) => anyhow::bail!("russh receiver dropped while filling the queue"),
+                Err(_) => break,
+            }
+            anyhow::ensure!(
+                filled < 1024,
+                "handle queue never filled; russh appears to drain it during a key exchange now"
+            );
+        }
+        Ok((handle, filled, client_io))
+    }
+
+    /// Build a [`SessionGuard`] holding the only permit of `sem`.
+    fn guard_holding_only_permit(
+        sem: &Arc<Semaphore>,
+        handle: russh::server::Handle,
+    ) -> SessionGuard {
+        let force_close = Arc::new(super::super::ForceClose::new());
+        SessionGuard {
+            _permit: Arc::clone(sem)
+                .try_acquire_owned()
+                .expect("fresh semaphore must have its permit available"),
+            timer: Arc::new(EmptyConnectionTimer::new(force_close)),
+            handle,
+            peer: None,
+            grace: std::time::Duration::from_secs(60),
+        }
+    }
+
+    // r[verify gw.conn.session-cap]
+    /// The session permit (and gauge/live-count, all owned by the
+    /// [`SessionGuard`]) MUST be released before — and independently of —
+    /// the exit-status/eof/close sends: those ride the per-connection
+    /// handle queue, which here is full and never drained, exactly like a
+    /// peer that parks a rekey. The deliberately huge close-out timeout
+    /// means a wrong ordering (guard dropped after the sends) can only
+    /// release the permit after that timeout, which the test window never
+    /// reaches — so a pass here proves the release does not depend on the
+    /// handle queue at all.
+    #[tokio::test]
+    async fn ended_session_releases_permit_with_parked_handle_queue() -> anyhow::Result<()> {
+        let (handle, _filled, _client_io) = parked_handle_with_full_queue().await?;
+        let sem = Arc::new(Semaphore::new(1));
+        let guard = guard_holding_only_permit(&sem, handle.clone());
+        assert_eq!(sem.available_permits(), 0, "guard must hold the permit");
+
+        let finish = tokio::spawn(finish_channel_session(
+            handle,
+            channel_id(1),
+            guard,
+            tokio::spawn(async {}),
+            std::time::Duration::from_secs(600),
+        ));
+
+        // The permit must come back promptly even though the close-out can
+        // never complete (600 s timeout, queue never drained).
+        let mut released = false;
+        for _ in 0..200 {
+            if sem.available_permits() == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            released,
+            "the ended session's permit must be released even though the handle \
+             queue is parked full and the close-out sends cannot complete"
+        );
+        finish.abort();
+        Ok(())
+    }
+
+    // r[verify gw.conn.exit-status+3]
+    /// The close-out sends themselves MUST be bounded: with the handle
+    /// queue parked full, `finish_channel_session` gives up after its
+    /// close-out timeout instead of parking the response task forever
+    /// (which would pin the task — and under the old ordering the permit —
+    /// until the connection dies).
+    #[tokio::test]
+    async fn parked_close_out_is_abandoned_after_timeout() -> anyhow::Result<()> {
+        let (handle, _filled, _client_io) = parked_handle_with_full_queue().await?;
+        let sem = Arc::new(Semaphore::new(1));
+        let guard = guard_holding_only_permit(&sem, handle.clone());
+
+        let finish = finish_channel_session(
+            handle,
+            channel_id(1),
+            guard,
+            tokio::spawn(async {}),
+            std::time::Duration::from_millis(200),
+        );
+        // Generous outer bound: the helper must return on its own once the
+        // 200 ms close-out budget expires; without the bound it would park
+        // here forever.
+        tokio::time::timeout(std::time::Duration::from_secs(10), finish)
+            .await
+            .expect("finish_channel_session must give up on a parked handle queue");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit must have been released along the way"
         );
         Ok(())
     }

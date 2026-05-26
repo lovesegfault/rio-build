@@ -976,10 +976,12 @@ async fn test_silent_tcp_connection_is_reaped() -> anyhow::Result<()> {
 /// The gateway must therefore force-close the transport a short, fixed
 /// slack after the polite disconnect at the pre-auth deadline. Observable
 /// here with `max_connections = 1`: while the parked peer is alive a real
-/// client is rejected at the connection cap; within
-/// `grace + PRE_AUTH_FORCE_CLOSE_SLACK` (+ scheduling margin) the slot
-/// must be released exactly once and a real client must connect and
-/// authenticate, and the parked peer's socket must be closed.
+/// client is rejected at the connection cap (checked immediately AND just
+/// past the grace, so the test cannot pass vacuously if russh ever starts
+/// erroring on the cleartext IGNOREs and dropping the peer early); within
+/// `grace + FORCE_CLOSE_SLACK` (+ scheduling margin) the slot must be
+/// released exactly once and a real client must connect and authenticate,
+/// and the parked peer's socket must be closed.
 #[tokio::test]
 async fn test_kex_parked_preauth_connection_is_force_closed() -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1006,6 +1008,7 @@ async fn test_kex_parked_preauth_connection_is_force_closed() -> anyhow::Result<
         0, 0, 0, 0, // ignore payload: empty string
         0, 0, 0, 0, 0, 0, // padding
     ];
+    let parked_at = tokio::time::Instant::now();
     let mut parked = tokio::net::TcpStream::connect(addr).await?;
     parked.write_all(b"SSH-2.0-rio-test-kex-parked\r\n").await?;
     let (mut parked_read, mut parked_write) = parked.into_split();
@@ -1033,14 +1036,38 @@ async fn test_kex_parked_preauth_connection_is_force_closed() -> anyhow::Result<
          must be rejected at the connection cap"
     );
 
+    // Mid-window probe, just past the grace and well before the slack: the
+    // parked peer must STILL hold the only slot — the polite disconnect
+    // queued at the grace is undeliverable while the key exchange is in
+    // flight. If a client gets in here, the parked socket was dropped
+    // early (e.g. russh started erroring on the cleartext IGNOREs), and
+    // the force-close assertion below would pass without exercising the
+    // force-close at all.
+    tokio::time::sleep_until(parked_at + GRACE + std::time::Duration::from_secs(1)).await;
+    let mid_window = connect_and_auth(addr, client_key.clone()).await;
+    if let Ok(session) = mid_window {
+        // Only conclusive while still inside the force-close window: a
+        // badly stalled runner could land this probe after the slack, at
+        // which point the slot is legitimately free.
+        let elapsed = parked_at.elapsed();
+        assert!(
+            elapsed >= GRACE + rio_gateway::server::FORCE_CLOSE_SLACK,
+            "the parked peer no longer holds the connection slot at ~grace+1s \
+             (elapsed {elapsed:?}): it was released before the force-close window, \
+             so the IGNORE-trickling peer is being dropped early and this test \
+             would pass vacuously"
+        );
+        drop(session);
+    }
+
     // Within grace + slack (+ generous scheduling margin) the gateway must
     // have force-closed the parked transport and released its slot: a real
     // client can connect and authenticate. The polite disconnect alone can
     // never achieve this — russh cannot deliver it while the peer keeps
     // the initial key exchange open.
     let force_close_budget =
-        GRACE + rio_gateway::server::PRE_AUTH_FORCE_CLOSE_SLACK + std::time::Duration::from_secs(5);
-    let deadline = tokio::time::Instant::now() + force_close_budget;
+        GRACE + rio_gateway::server::FORCE_CLOSE_SLACK + std::time::Duration::from_secs(5);
+    let deadline = parked_at + force_close_budget;
     let mut admitted = None;
     while tokio::time::Instant::now() < deadline {
         match connect_and_auth(addr, client_key.clone()).await {
@@ -1072,6 +1099,231 @@ async fn test_kex_parked_preauth_connection_is_force_closed() -> anyhow::Result<
 
     trickle.abort();
     drop(admitted);
+    srv.abort();
+    Ok(())
+}
+
+/// Forwarding TCP proxy for one connection that can be flipped into a
+/// "hold the socket" mode: from that point on it forwards nothing in
+/// either direction and never closes the gateway-side socket on its own —
+/// not when the russh client half goes away, and not when the gateway
+/// half-closes its write side (the TCP FIN russh sends right after
+/// processing a queued `SSH_MSG_DISCONNECT`). This stages the post-auth
+/// squatter a well-behaved russh client cannot: a peer that receives the
+/// gateway's disconnect and simply keeps the TCP connection open. Once
+/// holding, the task never finishes on its own — abort it at the end of
+/// the test; the force-close itself is observed from the gateway side
+/// (slot release / gauge), not from here.
+async fn spawn_socket_holding_proxy(
+    upstream: SocketAddr,
+) -> anyhow::Result<(
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+)> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hold_pump = Arc::clone(&hold);
+    let task = tokio::spawn(async move {
+        let Ok((mut client_sock, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut server_sock) = tokio::net::TcpStream::connect(upstream).await else {
+            return;
+        };
+        let mut cbuf = [0u8; 16 * 1024];
+        let mut sbuf = [0u8; 16 * 1024];
+        // Once holding, neither a client-side close nor a gateway-side
+        // half-close may take the held socket down: the held fd must stay
+        // open until the gateway force-closes (which the test observes
+        // from the gateway's own accounting) and this task is aborted.
+        let mut client_open = true;
+        let mut server_open = true;
+        loop {
+            if !client_open && !server_open {
+                // Fully quiesced in hold mode: nothing left to relay; just
+                // keep the sockets alive (that IS the hold) until aborted.
+                std::future::pending::<()>().await;
+            }
+            // The hold flag is loaded when an event is HANDLED, not before
+            // parking in the select: the test flips it while this task is
+            // parked, and the very next event (the russh client closing
+            // its half once the test drops it) must already see the hold.
+            tokio::select! {
+                r = client_sock.read(&mut cbuf), if client_open => {
+                    let holding = hold_pump.load(Ordering::SeqCst);
+                    match r {
+                        Ok(0) | Err(_) => {
+                            if holding {
+                                client_open = false;
+                            } else {
+                                break;
+                            }
+                        }
+                        Ok(n) => {
+                            if !holding && server_sock.write_all(&cbuf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                },
+                r = server_sock.read(&mut sbuf), if server_open => {
+                    let holding = hold_pump.load(Ordering::SeqCst);
+                    match r {
+                        // EOF here is only the gateway half-closing its
+                        // write side (FIN after the disconnect); a
+                        // socket-holding peer keeps its own end open
+                        // regardless.
+                        Ok(0) | Err(_) => {
+                            if holding {
+                                server_open = false;
+                            } else {
+                                break;
+                            }
+                        }
+                        Ok(n) => {
+                            if !holding && client_sock.write_all(&sbuf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    });
+    Ok((addr, hold, task))
+}
+
+// r[verify gw.conn.exit-status+3]
+/// The post-auth squatter: an authenticated, exec-less peer that simply
+/// never closes its socket after the empty-connection grace disconnect.
+/// russh queues the `SSH_MSG_DISCONNECT`, half-closes its write side, and
+/// then parks in its post-disconnect drain-read loop — which has no
+/// timeout and arms no keepalives — so without a transport-level bound
+/// the connection's fd, `max_connections` permit, and
+/// `connections_active` slot are pinned until the peer goes away on its
+/// own (i.e. never).
+///
+/// The gateway must force-close such a transport within
+/// `grace + FORCE_CLOSE_SLACK`. Observable with `max_connections = 1`:
+/// while the holder lives, a real client is rejected at the connection
+/// cap (checked immediately AND just past the grace, so a pass cannot
+/// come from some earlier teardown); within grace + slack (+ scheduling
+/// margin) the gateway must release the slot (a real client connects and
+/// authenticates) and undo the holder's `connections_active` increment —
+/// neither of which can happen while the held connection's handler is
+/// still alive.
+#[tokio::test]
+async fn test_socket_holding_authenticated_connection_is_force_closed() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+    const GAUGE: &str = "rio_gateway_connections_active{}";
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (addr, client_key, srv) =
+        spawn_ssh_server_with(|s| s.with_empty_connection_grace(GRACE).with_max_connections(1))
+            .await?;
+
+    // The holder authenticates through the holding proxy and never execs;
+    // right after auth the proxy stops relaying and keeps the gateway-side
+    // socket open no matter what the russh client half does.
+    let (proxy_addr, hold, proxy_task) = spawn_socket_holding_proxy(addr).await?;
+    let holder_at = tokio::time::Instant::now();
+    let holder = connect_and_auth(proxy_addr, client_key.clone()).await?;
+    assert_eq!(
+        recorder.gauge_value(GAUGE),
+        Some(1.0),
+        "the authenticated holder must count toward connections_active; gauges: {:?}",
+        recorder.gauge_names()
+    );
+    hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The russh client object is no longer needed: the proxy now owns the
+    // gateway-facing half of the connection, and dropping the client must
+    // not release anything on the gateway side — that is the hold.
+    drop(holder);
+
+    // Precondition: the holder owns the only permit, so a real client is
+    // rejected at the connection cap. Proves the success below can't pass
+    // vacuously.
+    let denied = connect_and_auth(addr, client_key.clone()).await;
+    assert!(
+        denied.is_err(),
+        "while the holder owns the only permit, a second connection must be \
+         rejected at the connection cap"
+    );
+
+    // Mid-window probe, just past the grace and well before the slack: the
+    // polite disconnect has been queued by now, but a peer that holds its
+    // socket open must STILL be occupying the slot — only the force-close
+    // may take it away.
+    tokio::time::sleep_until(holder_at + GRACE + std::time::Duration::from_secs(1)).await;
+    let mid_window = connect_and_auth(addr, client_key.clone()).await;
+    if let Ok(session) = mid_window {
+        // Only conclusive while still inside the force-close window: a
+        // badly stalled runner could land this probe after the slack, at
+        // which point the slot is legitimately free.
+        let elapsed = holder_at.elapsed();
+        assert!(
+            elapsed >= GRACE + rio_gateway::server::FORCE_CLOSE_SLACK,
+            "the holder's slot was released at ~grace+1s (elapsed {elapsed:?}), before \
+             the force-close window — something other than the force-close tore the \
+             held connection down, so this test is not exercising the socket-holding \
+             path"
+        );
+        drop(session);
+    }
+
+    // Within grace + slack (+ generous scheduling margin) the gateway must
+    // have force-closed the held transport and released its slot: a real
+    // client can connect and authenticate. The polite disconnect alone can
+    // never achieve this — the holder never acts on it.
+    let force_close_budget =
+        GRACE + rio_gateway::server::FORCE_CLOSE_SLACK + std::time::Duration::from_secs(5);
+    let deadline = holder_at + force_close_budget;
+    let mut admitted = None;
+    while tokio::time::Instant::now() < deadline {
+        match connect_and_auth(addr, client_key.clone()).await {
+            Ok(session) => {
+                admitted = Some(session);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+        }
+    }
+    assert!(
+        admitted.is_some(),
+        "a peer that holds its socket open after the grace disconnect must be \
+         force-closed within grace + FORCE_CLOSE_SLACK, releasing the connection \
+         slot for a real client"
+    );
+
+    // And the holder's accounting must be undone: with the follow-up
+    // client now the only live connection, connections_active is back to
+    // exactly one — the holder's increment was released by its drop. Poll
+    // briefly; the handler drop runs as the transport task unwinds.
+    let mut active = recorder.gauge_value(GAUGE);
+    for _ in 0..40 {
+        if active == Some(1.0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        active = recorder.gauge_value(GAUGE);
+    }
+    assert_eq!(
+        active,
+        Some(1.0),
+        "connections_active must return to the follow-up client alone once the \
+         held connection is force-closed; gauges: {:?}",
+        recorder.gauge_names()
+    );
+
+    drop(admitted);
+    proxy_task.abort();
     srv.abort();
     Ok(())
 }

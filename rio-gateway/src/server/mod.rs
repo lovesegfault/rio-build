@@ -90,9 +90,9 @@ pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 /// has not authenticated within it is disconnected by the accept-site
 /// deadline in [`GatewayServer::run_on_listener`] (russh has no
 /// login-grace of its own, and an answering-but-idle client never trips
-/// `inactivity_timeout`/`keepalive_max`), with
-/// [`PRE_AUTH_FORCE_CLOSE_SLACK`] bounding how long that disconnect may
-/// remain undeliverable before the transport is closed outright.
+/// `inactivity_timeout`/`keepalive_max`), with [`FORCE_CLOSE_SLACK`]
+/// bounding how long that disconnect may remain undeliverable before the
+/// transport is closed outright.
 ///
 /// A ControlMaster mux whose in-flight session count transits through
 /// zero between builds must NOT lose its transport — the master would
@@ -106,23 +106,31 @@ pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 /// Overridable for tests via `with_empty_connection_grace`.
 pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Extra time after the pre-auth deadline's polite `SSH_MSG_DISCONNECT`
-/// before the gateway force-closes a still-unauthenticated transport
-/// (`r[gw.conn.exit-status+3]`).
+/// Extra time the gateway gives a peer to act on a polite
+/// `SSH_MSG_DISCONNECT` before it force-closes the transport
+/// (`r[gw.conn.exit-status+3]`), and the budget a session's response task
+/// spends trying to deliver its final `exit-status`/`eof`/`close` before
+/// abandoning them.
 ///
-/// The polite disconnect is queued through the russh session handle, and
-/// russh only drains handle messages between key exchanges — a peer that
-/// keeps the initial key exchange perpetually in flight (banner, then
-/// trickled `SSH_MSG_IGNORE`s and never a KEX reply) defers delivery
-/// indefinitely while also resetting the keepalive/inactivity timers with
-/// every packet it sends, so nothing transport-level ever reaps it. After
-/// this slack the accept-site read deadline fails the transport read,
-/// which ends russh's session loop and drops the connection handler — the
-/// permit, fd, and tasks are released exactly once through the normal
-/// drop path. A few seconds is plenty for any deliverable disconnect to
-/// have been delivered and acted on; only a peer gaming the key exchange
-/// ever reaches the hard close.
-pub const PRE_AUTH_FORCE_CLOSE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+/// A queued disconnect is best-effort twice over: russh only drains handle
+/// messages between key exchanges — a peer that keeps a key exchange
+/// perpetually in flight (banner, then trickled `SSH_MSG_IGNORE`s and never
+/// a KEX reply) defers delivery indefinitely while also resetting the
+/// keepalive/inactivity timers with every packet it sends — and a peer that
+/// does receive it can simply never close its end, parking russh's
+/// post-disconnect drain-read loop (which has no timeout and arms no
+/// keepalives) forever. So every site that decides a connection must go
+/// away arms the transport-level `ConnDeadline` this far in the future:
+/// the pre-auth deadline arms it at accept (covering the
+/// never-authenticated population), and the empty-connection grace timer
+/// arms it the moment it queues its disconnect for an authenticated one.
+/// Once the deadline passes, the transport read fails, russh's session loop
+/// (or its drain loop) returns, and the handler + stream drop — releasing
+/// the permit, fd, and gauges exactly once through the normal drop path. A
+/// few seconds is plenty for any compliant peer to have closed; only one
+/// gaming the key exchange or squatting on the socket ever reaches the
+/// hard close.
+pub const FORCE_CLOSE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The SSH server that accepts connections and spawns protocol sessions.
 pub struct GatewayServer {
@@ -433,6 +441,7 @@ impl GatewayServer {
             };
             let handler = self.new_client(Some(peer));
             let stage = Arc::clone(&handler.stage);
+            let force_close = Arc::clone(&handler.force_close);
             let config = Arc::clone(&config);
             let auth_grace = self.empty_connection_grace;
             // Detached: NOT coupled to accept-loop lifetime. The handler
@@ -469,12 +478,15 @@ impl GatewayServer {
                 // flight (russh only drains handle messages between key
                 // exchanges), so after the slack the wrapper fails the
                 // read, russh's session loop returns the error, and the
-                // handler/stream drop releases the permit and fd. See
-                // [`PreAuthDeadline`].
-                let stream = PreAuthDeadline::new(
+                // handler/stream drop releases the permit and fd. The same
+                // wrapper also enforces the post-auth force-close armed by
+                // any later "this connection must go away" decision (the
+                // empty-connection grace timer). See [`ConnDeadline`].
+                let stream = ConnDeadline::new(
                     stream,
                     Arc::clone(&stage),
-                    auth_deadline + PRE_AUTH_FORCE_CLOSE_SLACK,
+                    force_close,
+                    auth_deadline + FORCE_CLOSE_SLACK,
                 );
                 // r[impl gw.conn.exit-status+3]
                 // Phase 1 — version exchange / transport setup. A client
@@ -519,12 +531,13 @@ impl GatewayServer {
                 // between key exchanges (`!kex.active()`), so a peer
                 // that keeps a key exchange perpetually in flight never
                 // receives this polite disconnect — for that peer the
-                // [`PreAuthDeadline`] read deadline force-closes the
-                // transport `PRE_AUTH_FORCE_CLOSE_SLACK` after this
-                // deadline instead. The polite path stays because for
-                // every deliverable case (rejected key, wedged
-                // ssh-agent, stalled-but-not-rekeying client) it ends
-                // the connection cleanly and promptly.
+                // [`ConnDeadline`] pre-auth read deadline (armed at
+                // accept, expiring `FORCE_CLOSE_SLACK` after this
+                // instant) force-closes the transport instead, so no
+                // extra arming is needed here. The polite path stays
+                // because for every deliverable case (rejected key,
+                // wedged ssh-agent, stalled-but-not-rekeying client) it
+                // ends the connection cleanly and promptly.
                 tokio::select! {
                     r = &mut session => {
                         if let Err(e) = r {
@@ -561,89 +574,223 @@ impl GatewayServer {
     }
 }
 
-// r[impl gw.conn.exit-status+3]
-/// Transport wrapper that enforces the pre-auth deadline at the stream
-/// level: once the hard deadline (accept + grace +
-/// [`PRE_AUTH_FORCE_CLOSE_SLACK`]) passes with the connection still not
-/// authenticated, reads fail with `TimedOut`, russh's read loop returns
-/// the error, the spawned session task ends, and the handler + stream
-/// drop — releasing the connection permit and fd exactly once through
-/// the normal drop path.
+/// Transport force-close deadline for one connection, shared between the
+/// [`ConnDeadline`] stream wrapper (which enforces it) and every site that
+/// decides the connection must go away (which arms it). Created in
+/// [`GatewayServer::new_client`], threaded to the wrapper at the accept
+/// site and to the empty-connection grace timer via the
+/// `ConnectionHandler`.
 ///
-/// Why a stream wrapper and not the session handle: the deadline's
-/// polite `SSH_MSG_DISCONNECT` travels through the russh handle, and
-/// russh 0.61 only drains handle messages between key exchanges
-/// (`!kex.active()` gates the `receiver.recv()` arm of its session
-/// loop), so a peer that keeps the initial key exchange perpetually in
-/// flight never receives it — while every packet it trickles (e.g.
-/// `SSH_MSG_IGNORE`) resets russh's keepalive failure counter and
-/// inactivity timer, so no transport-level limit reaps it either. russh
-/// offers no way to abort the session loop it spawned (`RunningSession`
-/// wraps a result oneshot, not an abortable `JoinHandle`), which leaves
-/// the transport itself as the only reliable lever. The deadline is
-/// armed once at accept and never consulted again after the connection
-/// reaches `ConnStage::Authenticated`; an authenticated session can idle
-/// or re-key for as long as the post-auth limits allow.
-struct PreAuthDeadline<S> {
-    inner: S,
-    /// Highest [`connection::ConnStage`] reached, shared with the
-    /// `ConnectionHandler`. At `Authenticated` and above the wrapper is
-    /// permanently transparent.
-    stage: Arc<AtomicU8>,
-    /// Fires at accept + grace + [`PRE_AUTH_FORCE_CLOSE_SLACK`]. Boxed
-    /// so the wrapper stays `Unpin` (russh requires it of the stream).
-    deadline: Pin<Box<tokio::time::Sleep>>,
-    /// Latched once the deadline has fired so subsequent reads keep
-    /// failing without polling a completed timer again.
-    expired: bool,
+/// The contract: arm it AT THE MOMENT a `Disconnect::ByApplication` is
+/// queued for the connection (currently the empty-connection grace timer in
+/// `connection.rs`; the pre-auth polite disconnect is covered by the
+/// pre-auth deadline the wrapper already carries, which fires at the same
+/// instant this would). Arming before the handle send matters: the polite
+/// disconnect rides the russh handle queue, which a hostile peer can park
+/// (key exchange held open) — the decision to disconnect must be bounded
+/// even if the polite send itself never completes.
+///
+/// Lock-free: a single `AtomicU64` of nanoseconds relative to `origin`
+/// (`NOT_ARMED` = nothing pending), so the wrapper's hot path is one
+/// relaxed load. Arming keeps the earliest deadline (`fetch_min`) — repeat
+/// decisions can only tighten the bound — and there is deliberately no
+/// disarm: once the gateway has told a connection to go away, nothing
+/// un-decides it.
+struct ForceClose {
+    /// Reference instant for the nanosecond encoding (handler creation,
+    /// i.e. accept time).
+    origin: tokio::time::Instant,
+    /// Nanoseconds after `origin` at which transport reads must start
+    /// failing. [`Self::NOT_ARMED`] = no force-close pending.
+    kill_at_nanos: std::sync::atomic::AtomicU64,
 }
 
-impl<S> PreAuthDeadline<S> {
-    fn new(inner: S, stage: Arc<AtomicU8>, deadline: tokio::time::Instant) -> Self {
+impl ForceClose {
+    const NOT_ARMED: u64 = u64::MAX;
+
+    fn new() -> Self {
         Self {
-            inner,
-            stage,
-            deadline: Box::pin(tokio::time::sleep_until(deadline)),
-            expired: false,
+            origin: tokio::time::Instant::now(),
+            kill_at_nanos: std::sync::atomic::AtomicU64::new(Self::NOT_ARMED),
         }
     }
 
-    /// Whether the pre-auth deadline applies and has passed. Registers
-    /// the timer with the task context so the parked read is woken when
-    /// it fires (the whole point — a KEX-parked peer's read would
-    /// otherwise only be re-polled when the peer sends more bytes).
-    fn check_expired(&mut self, cx: &mut TaskContext<'_>) -> bool {
-        if self.stage.load(Ordering::Relaxed) >= connection::ConnStage::Authenticated as u8 {
-            return false;
+    /// Arm the force-close `slack` from now (keeping an earlier already
+    /// armed deadline). Relaxed ordering is sufficient: the value itself is
+    /// the entire message, no other memory is published with it.
+    fn arm_within(&self, slack: Duration) {
+        let nanos = u64::try_from(
+            (tokio::time::Instant::now() + slack)
+                .saturating_duration_since(self.origin)
+                .as_nanos(),
+        )
+        .unwrap_or(Self::NOT_ARMED - 1)
+        .min(Self::NOT_ARMED - 1);
+        self.kill_at_nanos.fetch_min(nanos, Ordering::Relaxed);
+    }
+
+    /// The armed force-close instant, if any. One relaxed atomic load.
+    fn armed_deadline(&self) -> Option<tokio::time::Instant> {
+        match self.kill_at_nanos.load(Ordering::Relaxed) {
+            Self::NOT_ARMED => None,
+            nanos => Some(self.origin + Duration::from_nanos(nanos)),
         }
-        if !self.expired && self.deadline.as_mut().poll(cx).is_ready() {
-            self.expired = true;
+    }
+}
+
+// r[impl gw.conn.exit-status+3]
+/// Transport wrapper that enforces the gateway's read deadlines at the
+/// stream level — the only lever that works without the peer's
+/// cooperation. russh 0.61 only drains handle messages between key
+/// exchanges (`!kex.active()` gates the `receiver.recv()` arm of its
+/// session loop), offers no way to abort the session loop it spawned
+/// (`RunningSession` wraps a result oneshot, not an abortable
+/// `JoinHandle`), and once a queued disconnect IS processed it parks in a
+/// post-disconnect drain-read loop that has no timeout and arms no
+/// keepalives, waiting for the peer to close. Failing the read ends every
+/// one of those states: both the main loop and the drain loop surface the
+/// error and return, the spawned session task drops the handler and
+/// stream, and the connection permit, fd, and gauges release exactly once
+/// through the existing drop paths.
+///
+/// Two deadlines, one mechanism:
+///
+/// - **Pre-auth:** reads fail once `pre_auth_deadline` (accept + grace +
+///   [`FORCE_CLOSE_SLACK`]) passes with the connection still not
+///   authenticated. Ignored permanently once the connection reaches
+///   `ConnStage::Authenticated`; an authenticated session can idle or
+///   re-key for as long as the post-auth limits allow.
+/// - **Force-close:** reads fail once the shared [`ForceClose`] deadline
+///   passes, regardless of auth state. It is armed the moment the gateway
+///   queues a `Disconnect::ByApplication` for the connection, so a peer
+///   that keeps that disconnect undeliverable (parked key exchange) or
+///   ignores it (never closes its socket) is closed within the slack
+///   anyway.
+///
+/// Cost on the hot path (authenticated, nothing armed): one relaxed atomic
+/// load per read poll — the pre-auth stage check latches off after the
+/// first authenticated poll, and the internal sleep is only armed/polled
+/// while a deadline is actually pending. Polling the sleep is what wakes a
+/// read that is parked with no inbound bytes (the KEX-parked or
+/// socket-holding peer) when its deadline arrives; a peer whose kill is
+/// armed while its read is already parked mid-key-exchange is picked up on
+/// its next inbound packet or russh's next keepalive tick, both of which
+/// re-poll the read.
+struct ConnDeadline<S> {
+    inner: S,
+    /// Highest [`connection::ConnStage`] reached, shared with the
+    /// `ConnectionHandler`. At `Authenticated` and above the pre-auth
+    /// deadline no longer applies.
+    stage: Arc<AtomicU8>,
+    /// Latched copy of "stage reached `Authenticated`" so the hot path
+    /// does not re-load `stage` on every poll (auth is monotonic).
+    authenticated: bool,
+    /// Shared force-close deadline, armed by whichever site queues a
+    /// `Disconnect::ByApplication` for this connection.
+    force_close: Arc<ForceClose>,
+    /// The pre-auth bound: accept + grace + [`FORCE_CLOSE_SLACK`].
+    pre_auth_deadline: tokio::time::Instant,
+    /// Sleep used to wake a parked read when the applicable deadline
+    /// fires. Re-armed whenever that deadline changes (pre-auth → armed
+    /// force-close). Boxed so the wrapper stays `Unpin` (russh requires
+    /// it of the stream).
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// Which instant `deadline` is currently set to, so redundant resets
+    /// are skipped.
+    sleep_target: Option<tokio::time::Instant>,
+    /// Latched once a deadline has fired so subsequent reads keep failing
+    /// without polling a completed timer again.
+    expired: Option<&'static str>,
+}
+
+impl<S> ConnDeadline<S> {
+    fn new(
+        inner: S,
+        stage: Arc<AtomicU8>,
+        force_close: Arc<ForceClose>,
+        pre_auth_deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            inner,
+            stage,
+            authenticated: false,
+            force_close,
+            pre_auth_deadline,
+            deadline: Box::pin(tokio::time::sleep_until(pre_auth_deadline)),
+            sleep_target: Some(pre_auth_deadline),
+            expired: None,
+        }
+    }
+
+    /// Whether a deadline applies and has passed. While one is pending,
+    /// polling the internal sleep registers this task's waker so a read
+    /// that is parked with no inbound bytes is still woken when the
+    /// deadline arrives (a KEX-parked peer's read would otherwise only be
+    /// re-polled when the peer sends more bytes; a post-disconnect socket
+    /// holder's never).
+    fn check_expired(&mut self, cx: &mut TaskContext<'_>) -> Option<&'static str> {
+        if self.expired.is_some() {
+            return self.expired;
+        }
+        // Hot path: a single relaxed load. `None` (nothing armed) on an
+        // authenticated connection falls straight through to the inner
+        // read.
+        let force_close_at = self.force_close.armed_deadline();
+        let (target, reason) = match force_close_at {
+            Some(at) => (
+                at,
+                "connection was told to disconnect and did not close within the slack; \
+                 force-closing transport",
+            ),
+            None => {
+                if self.authenticated {
+                    return None;
+                }
+                if self.stage.load(Ordering::Relaxed) >= connection::ConnStage::Authenticated as u8
+                {
+                    // Monotonic: the pre-auth deadline can never apply
+                    // again, so skip the stage load on future polls.
+                    self.authenticated = true;
+                    return None;
+                }
+                (
+                    self.pre_auth_deadline,
+                    "pre-auth deadline exceeded with authentication incomplete; closing transport",
+                )
+            }
+        };
+        if self.sleep_target != Some(target) {
+            self.deadline.as_mut().reset(target);
+            self.sleep_target = Some(target);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.expired = Some(reason);
         }
         self.expired
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for PreAuthDeadline<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for ConnDeadline<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.check_expired(cx) {
+        if let Some(reason) = this.check_expired(cx) {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "pre-auth deadline exceeded with authentication incomplete; closing transport",
+                reason,
             )));
         }
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
-/// Writes delegate untouched: pre-auth server writes are tiny (banner,
-/// KEXINIT, auth replies) and never park; failing the read side is what
-/// ends russh's session loop.
-impl<S: AsyncWrite + Unpin> AsyncWrite for PreAuthDeadline<S> {
+/// Writes delegate untouched: server writes are tiny (banner, KEXINIT,
+/// auth replies, channel bookkeeping) and never park; failing the read
+/// side is what ends russh's session loop.
+impl<S: AsyncWrite + Unpin> AsyncWrite for ConnDeadline<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -822,6 +969,10 @@ impl russh::server::Server for GatewayServer {
             warn!(peer = ?peer_addr, "connection cap reached; rejecting at auth");
             metrics::counter!("rio_gateway_errors_total", "type" => "conn_cap").increment(1);
         }
+        // One per connection, shared between the accept-site ConnDeadline
+        // wrapper (enforces it) and the empty-connection grace timer
+        // (arms it when it queues a disconnect).
+        let force_close = Arc::new(ForceClose::new());
         ConnectionHandler {
             peer_addr,
             store_client: self.store_client.clone(),
@@ -849,7 +1000,10 @@ impl russh::server::Server for GatewayServer {
             accepted_channels: HashSet::new(),
             empty_connection_grace: self.empty_connection_grace,
             handshake_timeout: self.handshake_timeout,
-            idle: Arc::new(connection::EmptyConnectionTimer::new()),
+            idle: Arc::new(connection::EmptyConnectionTimer::new(Arc::clone(
+                &force_close,
+            ))),
+            force_close,
         }
     }
 }
@@ -909,6 +1063,96 @@ mod conn_cap_tests {
             sem.available_permits(),
             before,
             "dropping None must not release a permit"
+        );
+    }
+}
+
+// r[verify gw.conn.exit-status+3]
+#[cfg(test)]
+mod conn_deadline_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    fn stage(stage: connection::ConnStage) -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(stage as u8))
+    }
+
+    /// Pre-auth deadline in the past + connection not authenticated →
+    /// reads fail with `TimedOut` even though bytes are available, which
+    /// is what ends russh's session loop for a never-authenticating peer.
+    #[tokio::test]
+    async fn unauthenticated_read_fails_after_pre_auth_deadline() {
+        let (mut far, near) = tokio::io::duplex(1024);
+        far.write_all(b"client bytes").await.unwrap();
+        let mut wrapped = ConnDeadline::new(
+            near,
+            stage(connection::ConnStage::AuthAttempted),
+            Arc::new(ForceClose::new()),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 16];
+        let err = wrapped
+            .read(&mut buf)
+            .await
+            .expect_err("read must fail once the pre-auth deadline passed unauthenticated");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Once the connection is authenticated the pre-auth deadline never
+    /// applies again: with nothing armed, the wrapper is transparent — a
+    /// read past the (long-expired) pre-auth instant still returns data.
+    #[tokio::test]
+    async fn authenticated_read_ignores_pre_auth_deadline() {
+        let (mut far, near) = tokio::io::duplex(1024);
+        far.write_all(b"post-auth data").await.unwrap();
+        let mut wrapped = ConnDeadline::new(
+            near,
+            stage(connection::ConnStage::Authenticated),
+            Arc::new(ForceClose::new()),
+            tokio::time::Instant::now() - Duration::from_secs(60),
+        );
+        let mut buf = [0u8; 32];
+        let n = wrapped
+            .read(&mut buf)
+            .await
+            .expect("authenticated connection with nothing armed must read through");
+        assert_eq!(&buf[..n], b"post-auth data");
+    }
+
+    /// The force-close deadline applies REGARDLESS of auth state, and the
+    /// wrapper's own timer wakes a read that is parked with no inbound
+    /// bytes — the post-disconnect "holds the socket" peer parks russh in
+    /// its drain-read loop exactly like this, with nothing else left to
+    /// wake it.
+    #[tokio::test]
+    async fn force_close_fails_a_parked_authenticated_read() {
+        const SLACK: Duration = Duration::from_millis(150);
+        let (_far, near) = tokio::io::duplex(1024);
+        let force_close = Arc::new(ForceClose::new());
+        let mut wrapped = ConnDeadline::new(
+            near,
+            stage(connection::ConnStage::Authenticated),
+            Arc::clone(&force_close),
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
+        // Armed BEFORE the read is polled — the production ordering: the
+        // grace timer arms the force-close before queueing the disconnect,
+        // and russh only reaches its drain-read loop after processing that
+        // disconnect.
+        force_close.arm_within(SLACK);
+        let started = tokio::time::Instant::now();
+        let mut buf = [0u8; 16];
+        // Bounded from the outside so a regression (parked forever) fails
+        // the test instead of hanging it.
+        let err = tokio::time::timeout(Duration::from_secs(5), wrapped.read(&mut buf))
+            .await
+            .expect("force-close must wake the parked read at the deadline")
+            .expect_err("read must fail once the force-close deadline passes");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() >= SLACK,
+            "force-close must not fire before its slack elapses"
         );
     }
 }
