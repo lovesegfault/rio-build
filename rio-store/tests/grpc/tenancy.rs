@@ -305,3 +305,90 @@ async fn put_path_batch_with_tenant_attributes_all_outputs() -> TestResult {
     assert_eq!(total, 2, "exactly one row per committed output");
     Ok(())
 }
+
+/// Dedup re-push — the spec'd negative contract: a SECOND tenant pushing
+/// an already-complete path takes the idempotent fast path (`created =
+/// false`), gains NO `path_tenants` row (it committed nothing and proved
+/// possession of no content), and its castore reads still get NotFound.
+/// Attribution stays exactly where the original upload put it.
+// r[verify store.put.tenant-attribution]
+// r[verify store.castore.tenant-scope]
+#[tokio::test]
+async fn repush_of_complete_path_grants_no_attribution() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "dedup-a").await;
+    let tenant_b = seed_tenant(&db.pool, "dedup-b").await;
+
+    // Tenant A pushes the path (store session forwarding A's JWT).
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let payload = b"shared source pushed twice";
+    let (nar, nar_hash, path) = make_source_nar("dedup-source", payload);
+    let info_a = make_path_info(&path, &nar, nar_hash);
+    assert!(
+        put_path(&mut store_a, info_a, nar.clone()).await?,
+        "fresh push creates"
+    );
+
+    // Tenant B re-pushes the SAME path + content through its own session.
+    let (mut store_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+    let info_b = make_path_info(&path, &nar, nar_hash);
+    assert!(
+        !put_path(&mut store_b, info_b, nar).await?,
+        "already-complete path must take the idempotent fast path (created = false)"
+    );
+
+    // Attribution: A keeps its row; B gained nothing from the re-push.
+    assert_eq!(attribution_count(&db.pool, &path, tenant_a).await, 1);
+    assert_eq!(
+        attribution_count(&db.pool, &path, tenant_b).await,
+        0,
+        "the already-complete fast path must NOT attribute the path to the re-pusher"
+    );
+
+    // Castore read surface: B still NotFound on the path's root digest;
+    // A (the original pusher) still resolves it.
+    let dirs = poll_scalar_until(&db.pool, "SELECT count(*) FROM directory_paths", 1i64).await;
+    assert_eq!(dirs, 1, "eager index populated by the original push");
+    let root_digest: Vec<u8> = sqlx::query_scalar("SELECT digest FROM directory_paths LIMIT 1")
+        .fetch_one(&db.pool)
+        .await?;
+
+    let (mut dir_client, dir_server) = spawn_directory_service(db.pool.clone()).await;
+    let _dir_guard = scopeguard::guard(dir_server, |h| h.abort());
+
+    let err = dir_client
+        .get_directory(with_assignment_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(root_digest.clone())),
+                recursive: false,
+                digests: vec![],
+            },
+            &assignment_token(tenant_b),
+        ))
+        .await
+        .expect_err("the re-pushing tenant must still not see the Directory body");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let resp = dir_client
+        .get_directory(with_assignment_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(root_digest)),
+                recursive: false,
+                digests: vec![],
+            },
+            &assignment_token(tenant_a),
+        ))
+        .await?;
+    let bodies: Vec<_> = resp.into_inner().filter_map(|r| r.ok()).collect().await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "the original pusher still resolves the body"
+    );
+
+    Ok(())
+}
