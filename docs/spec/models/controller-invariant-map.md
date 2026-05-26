@@ -825,3 +825,275 @@ Outcome summary:
   holds on the as-built baseline). The main models and their wired
   Stage-B regime checks are untouched by Stage C, so the Stage-B
   verdict table and state counts above stand as recorded.
+
+## Stage-C calibration: the historical-fix corpus replayed against the models
+
+The 95-commit corpus pinned above, replayed against `spawnCoherence.qnt`
+(Model J) and `nodeclaimLifecycle.qnt` (Model N): for each commit the
+pre-fix behavior is either expressed as an override of the as-built
+model and shown to falsify an invariant (the model would re-find that
+bug), or its non-encodability is dispositioned with the missing
+dimension and the covering vehicle named. Method per the prior
+campaigns: each override is a module in
+`docs/spec/models/calibration/controller-<family>.qnt` that instantiates
+the as-built model, replaces ONE tick action with a local PRE-FIX
+variant, and exposes it as a `calibStep`; the violation latches keep the
+as-built oracle. Verdicts are TLC results (violation runs stop at the
+first counterexample); verdict format: invariant @ step (depth, states
+generated / distinct). Wall-clocks live in the introducing commits'
+messages and the run-record section above.
+
+Classification legend: **ENC** — encodable, override written and run.
+**ENC-A** — encodable, dispositioned by analogy: the mechanism is
+encoded in the as-built model and the named sibling override (or wired
+check) exercises the same tick-arm machinery; not separately run.
+**NOT-ENC** — the model abstracts the mechanism away (missing dimension
+named). **ORIGIN** — the commit introduced the mechanism the model now
+encodes; no pre-fix defect of the modeled protocol to revert. **N/A** —
+remainder (docs/test/alert/infra sweeps, incidental cross-crate).
+
+### G-A — spawn↔reap↔queued coherence (10)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `fba9086dc` | excess-pending DELETE on the informer census alone (no live pod-phase re-check) | ENC | `gaCalibNoLiveRecheck` | **FALSIFIES** reapSafety @ calibStep (depth 10, 4,799/1,000) |
+| `6c4f4983d` | orphan_reap_gate treated Ok([]) as authoritative (C3); the C2 orphan-pending arm and C6 admin_call chokepoint are as-built mechanisms | ENC | `gaCalibOrphanGateEmptyOk` | **FALSIFIES** reapSafety @ calibStep (depth 12, 19,785/3,399) |
+| `8b0128f5a` | CRD-absent arm armed the gate, so reap_excess_pending ran against an ungated queue | ENC | `gaCalibCrdAbsentArmed` (crd-absent cfg) | **FALSIFIES** gateFailClosed @ calibStep (depth 6, 242/132) |
+| `7f04c9d88` | want.is_empty() early-return skipped reap_stale entirely at ceiling-saturation; spawn loop 409-churned | ENC-A | the wantEmpty guard, skip-set and 409-dedupe are the encoded mechanisms; a due-but-skipped stale reap is exactly the orphanRemoved (I2 safety form) latch; same reap-arm machinery as the two G-A overrides above | by analogy |
+| `6a9ba0ef0` | spawn stopped at queued−active; selector-drift Pending never reaped | ENC-A | the drift-reap arm and the all-intents spawn iteration are encoded; kept reachable by canReachDriftReap / canReach409Dedupe; the starvation half is liveness-shaped | by analogy |
+| `fb0953870` | terminal Jobs name-colliding with a re-queued intent never reaped → respawn blocked | ENC-A | the terminal-collision arm is the encoded unblock mechanism (ETerminalReap path); its loss is a liveness regression below the safety set | by analogy (mechanism encoded; no safety latch) |
+| `9123e72d4` | orphan gate without the leader-age arm (plus reap/spawn coherence wiring) | ENC-A | dropping any single 3-arm conjunct reaps under a gate the as-built oracle rejects — same shape and same latch as `gaCalibOrphanGateEmptyOk` | by analogy (sibling falsified reapSafety) |
+| `fd5d7c988` | freed slots not credited to headroom the same tick | ENC-A | the freedSlotsSpendable invariant is this clause verbatim; the freed-slot credit is in the encoded headroom arithmetic | by analogy (mechanism encoded; latch exists) |
+| `5e01a9ff1` | orphan-reap re-deleted Terminating Jobs every tick | NOT-ENC | the JobPhase partition makes the re-delete a no-op at model resolution (API churn); coverage: is_running_job unit tests, the foreground-delete discipline | n/a |
+| `004956eeb` | unpinned selector (reaper thrash on softmax re-roll), HashMap-order truncation, ack arming for headroom-gated intents | ENC-A | the fingerprint pin is the encoded drift mechanism; the deterministic idRank order is by construction; the false-arm half is the same ackSoundness shape `gbCalibAckAttempted` falsifies | by analogy (sibling falsified ackSoundness) |
+
+### G-B — ack/ICE protocol (7)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `cdc78f839` | the ATTEMPTED spawn slice was acked (failed creates and 409s included) | ENC | `gbCalibAckAttempted` | **FALSIFIES** ackSoundness @ calibStep (depth 10, 11,881/705) |
+| `5815a7544` | only spawned-this-tick intents acked; already-Pending never re-acked after a scheduler restart | ENC | `gbCalibAckOnlyNew` (CEILING=2) | **FALSIFIES** ackCoversPending @ calibStep (depth 11, 9,252/1,776); baseline as-built step HOLDS (depth 32, 81,467,617/4,414,304) |
+| `485e736a2` | heartbeat ICE-clear regardless of admissible-cell count | NOT-ENC | scheduler-side clear path (out of J/N per the design); `sched.sla.hw-class.ice-mask` + scheduler tests | n/a |
+| `af1383c0e` | intent.ready unwrap back-compat | NOT-ENC | proto-compat surface; unit tests | n/a |
+| `e8bd76451` | ready filter + hw_class_names label reconstruction | NOT-ENC | proto-compat surface; unit tests | n/a |
+| `d6bc376d3` | trust_threshold single-source | NOT-ENC | §13a bench-gate config plumbing (out of model); hw-bench unit tests + `ctrl.pool.hw-bench-needed+2` | n/a |
+| `408a48bcb` | per-dim min_tenants gate | NOT-ENC | same as above | n/a |
+
+### G-C — resource-accounting parity (8)
+
+`a415a9a8b`, `286566a57`, `d5602b3aa`, `073170dfb`, `5250a4b9a`,
+`b25836ef1`, `5c2a83761`, `bcfdc2262`: **NOT-ENC**, exactly as
+pre-registered — quantity arithmetic across pod spec / FFD / eviction
+classification, not protocol state. Coverage: the
+Simulator-shares-accounting chokepoint tests in `pool/jobs.rs` /
+`pod.rs`, the eviction-classification tests, and the design §3.6 Kani
+candidate. The fetcher-budget stream (`2fff4e938`, `782b6155b`) extends
+this surface and inherits the same disposition.
+
+### G-D — placement derivation (8)
+
+`80cfcd65c`, `039861b56`, `3f416e02e`, `2f9a3769c`, `9fd4b6e59`,
+`b570cdd8d`, `015667efa`, `f97644a53`: **NOT-ENC** (k8s object
+construction parity — affinity/toleration/selector/schedulerName).
+Coverage: pool construction unit tests, `vm-protocol-*` /
+`vm-forecast-provisioning`, helm/CRD drift checks.
+
+### G-E — deadline coupling (2)
+
+| Commit | Class | Coverage |
+|---|---|---|
+| `172776b1b` | NOT-ENC | the controller half is plumbing (daemon timeout from intent deadline); the at-cap behavior of the report it feeds is the retry campaign's E7 surface (its calibration row `retryCalibG1DeadlineUncapped` already pins the no-cap world) |
+| `f73b98b1f` | NOT-ENC | deadline floor constant; unit tests |
+
+### G-F — identity/security plumbing (3)
+
+`a6697c6b0`, `ea10e1d74`, `acf6d476b`: **NOT-ENC** (token/claims
+plumbing). Coverage: token-mode unit/VM tests (`vm-token-mode`), auth
+tests.
+
+### G-G — reap delete-propagation & report-path mechanics (6)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `1779975f6` | is_pending_job counted Terminating Jobs as Pending (census, excess set, ack set); background delete propagation | ENC (census half) / NOT-ENC (propagation half) | `ggCalibTerminatingPending`; the propagation half sits below the model's deletion atomicity — ci-failure-patterns' job-tracking-finalizer entry, `vm-lifecycle-*` | **FALSIFIES** ackSoundness @ calibStep (depth 12, 30,838/4,920) — on today's protocol the lost filter resurfaces as a false re-ack |
+| `2f04e5432` | orphan-running reap used background delete (second finalizer-orphan callsite) | NOT-ENC | below deletion atomicity; same coverage as above; the foreground-delete discipline is an explicit §4 non-candidate | n/a |
+| `8cbf6d7b3` | kubelet eviction-message match | NOT-ENC | report-classification string matching; unit tests | n/a |
+| `12b86c285` | daemon_timeout/deadline alignment + DeadlineExceeded report | NOT-ENC | G-E coupling; the scheduler half is the retry campaign's surface | n/a |
+| `2acd1b327` | floor promotion gated on OOMKilled/DiskPressure | NOT-ENC | scheduler-side promotion gate (retry G6 family) | n/a |
+| `6d678ac87` | consolidated Job constructor; manifest-path protections | NOT-ENC | G-D construction parity; unit + VM tests | n/a |
+
+### M1 — prev_idle / idle model (7)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `79f86b888` | prev_idle cleared only on the reload Ok arm — a failed reload kept the previous tenure's entries (amplify polarity) | ENC | `m1CalibAcquireClearOkOnly` + named run `m1AcquireClearOkOnlyRun` | **FALSIFIES** idleReapSafety @ calibStep (depth 20, 2,355,905/26,339) |
+| `13806e99a` (busy-guard half) | reap_idle did not re-check requested>0 at reap time | ENC-probe | `m1CalibReapBusyGuardProbe` — exhaustive | **HOLDS** idleReapSafety @ calibStep (depth 20, 242,933/1,660 — the as-built base state space; the guard never binds at model resolution). Disposition in the run-record section: defense-in-depth below the tick-internal observe-before-reap ordering; not a deletion candidate |
+| `13806e99a` (windowed-lambda half) | consolidate_after finite-difference hazard | NOT-ENC | threshold arithmetic inside the abstracted NA model; consolidate.rs unit tests + `ctrl.nodeclaim.consolidate-na+6` | n/a |
+| `34f37d7e9` | idle tracking read the dead Karpenter Empty condition | ORIGIN | introduced the controller-side prev_idle mechanism the model encodes as pIdle; the pre-fix world has no idle reaps at all (cost/liveness, no safety latch) | n/a |
+| `a19394346` | FFD placed onto terminating NodeClaims | NOT-ENC | the placement-quality consequence is below the safety set; the budget half (terminating still billed) is encoded and checked by provisioningBudget; ffd.rs unit tests + `ctrl.nodeclaim.ffd-exclude-terminating` | n/a |
+| `7f91f1892` | builder consolidation floor 60s | NOT-ENC | threshold constant; consolidate.rs tests | n/a |
+| `cc2e99887`, `a12c6f9f9` | per-cell context refactor; hold-open clamp | NOT-ENC | refactor / threshold structure inside the abstracted NA model; consolidate.rs tests | n/a |
+
+### M2 — inflight_created / ICE detection (5)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `08d49c52c` (bug_012 half) | consolidate_only never pruned inflight_created — the controller's own reaps read as Karpenter GC on the next full tick | ENC | `m2CalibNoConsolidatePrune` + named run `m2NoConsolidatePruneRun` | **FALSIFIES** iceMarkSoundness @ calibStep (depth 16, 1,085,474/4,039) |
+| `08d49c52c` (bug_020 half) | detect_vanished pruned entries on first sight in live — fast-GC'd claims escaped detection | ENC | `m2CalibInflightDropOnSight` (module-local invariant `inflightKeptWhileInFlight` — the harm is a missed mark, completeness-shaped, so the calibration pins the structural conservation half) | **FALSIFIES** inflightKeptWhileInFlight @ calibStep (depth 3, 290/6); baseline as-built step HOLDS (depth 18, 242,933/1,660) |
+| `0507f9874` | (pre-fix world: no vanish/LaunchFailed ICE detection at all; cover from rio.build/* labels) | ORIGIN (detection half) / NOT-ENC (requirements half) | the detection mechanism is what the model encodes (kept reachable by canReachVanishMark); the requirements half is construction parity | n/a |
+| `5935d9122` | reap_unhealthy 404 arm did not mask; dead-cap counted in-flight | NOT-ENC | the LIST-vs-delete 404 race sits below the tick's atomicity; dead_nodes is consumed input (out of model). Coverage: health.rs unit tests. Re-dispositioned from the design's family-level "encodable" pre-registration | n/a |
+| `4ece337a4` | failed creates consumed per-tick budget (under-cover within the round-robin) | NOT-ENC | within-tick per-create granularity is below the tick-global create-fault bit, and the budget is recomputed per tick (no cross-tick consequence); coverage: cover.rs accounting tests, `ctrl.nodeclaim.budget.per-class+2`'s failed-creates clause, canReachCreateFailure keeps the path reachable. Re-dispositioned from the design's pre-registration | n/a |
+| `92c2a89f2` | drop-reason metrics split | NOT-ENC | observability only | n/a |
+
+### M3/M4 — sketches lifecycle (10)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `703cbf42a` | reload latch cleared on the load attempt; persist ungated | ENC | `m34CalibLatchClearOnAttempt` | **FALSIFIES** reloadLatchRespected @ calibStep (depth 14, 40,457/815) |
+| `92a3dc47d` (recency-gate half) | observe_registered emitted clears (and samples) for stale registrations after an acquire | ENC | `m34CalibNoRecencyGate` | **FALSIFIES** noMassClearAfterFailover @ calibStep (depth 14, 34,086/767) |
+| `92a3dc47d` (other halves) | lease hooks doing the unarm/reload work; ack dedup; non-blocking connect_pg | ENC-A / by construction | the hook machinery is the as-built E-acq/E-loss encoding exercised by the fault-lease regime; the per-tick mark dedup is set-valued by construction; connect_pg is plumbing | n/a |
+| `2d62e0b49`, `bd8e57de5`, `6052f84df`, `95fc40fb6`, `9c9bfb7c8`, `b92981881`, `df077d82b` | seed/rotate ordering, shadow gates, quantile fallbacks, cell-key aliases | NOT-ENC | sketch contents and key forms are abstracted (the design's pre-registered split); sketch.rs unit tests | n/a |
+| `3c9aa3919` | sketch persistence serialization (bincode→postcard) | NOT-ENC | serialization format below the abstract PG cell; sketch.rs round-trip tests | n/a |
+
+### M5/M6 — gauge staleness (4)
+
+| Commit | Class | Coverage |
+|---|---|---|
+| `d0c858955` | ENC-A (the kube-only-observations sharing half) / NOT-ENC (the trailing-zero gauge half) | the shared observation block is the as-built consolidate-only encoding; the residual unobserved window (the ⊥ early-return) is exactly the pre-registered as-built falsification already wired (`quint-nodeclaim-falsification-boot-sample-lost`); gauges are observability |
+| `cab0d2d46`, `d4184cf2b`, `e0d504321` | NOT-ENC | observability only (the model carries no cleanup-set / gauge state — recorded as a deviation from the design's "polarity classification encodable" pre-registration); gauge_universe / emit_live_gauges unit tests |
+
+### FFD/cover ⇄ scheduler-config parity (16)
+
+| Commit / row | Pre-fix behavior | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| family-level reconstruction (anchors: the cover.rs class_budget mechanism, `ctrl.nodeclaim.budget.per-class+2`; the design's named representative `5f754baeb` turned out to be the per-claim sizing half) | cover sized against the global fleet budget only — no per-class clamp | ENC | `ffdCalibNoClassClamp` | **FALSIFIES** provisioningBudget @ calibStep (depth 8, 2,368/42) |
+| `5f754baeb` | per-claim SizingCfg from global max_cores/mem (oversized NodeClaims → InsufficientCapacity → ICE loop) | NOT-ENC | per-claim sizing arithmetic (the design's pre-registered NOT-ENCODED half); cover.rs sizing unit tests; §3.6 Kani candidate | n/a |
+| `79aa88da2` | no periodic HwClassConfig refresh (unbounded skew); node-role label | NOT-ENC | the refresh cadence is below time resolution — the model's configuredCells / ceilingsKnown environment actions abstract it; the fail-closed gate it feeds IS encoded (degradedCoverPolarity + canReachCeilingsFailClosed) | n/a |
+| `9ff9387f0`, `811489319`, `bd781b004`, `787243ef3`, `45f83cdcd` | sizing predicate / chunking / per-cell cap filtering / anchor sizing / reference-cell assignment | NOT-ENC | FFD/cover sizing arithmetic (pre-registered); cover.rs + ffd.rs unit tests, Kani candidate | n/a |
+| `f333ebed5`, `58cd38885`, `c5320b40e`, `e013b2044`, `6c8f13710`, `0fa79fcdf` | feature/arch-axis parity chokepoints shared with the scheduler | NOT-ENC | axis-derivation parity (G-D-shaped); chokepoint unit tests on both sides | n/a |
+| `d674f0983`, `4fdf3337b`, `979608619` | NodeClaim spec construction (expireAfter), ffd arch-matching, cover ceilings chokepoint | NOT-ENC | construction/axis parity; unit tests + `vm-forecast-provisioning` | n/a |
+
+### Remainder (9)
+
+`2ad753db9`, `416895e3e` (test/doc sweeps), `3c3062760`, `c8ca42a91`,
+`dbc7f7cb2` (incidental cross-crate, named by the design), `a49f78722`,
+`f1caa0b60` (helm/alert plumbing), `ff5f4e95e` (configmap/RBAC infra),
+`99a17cd2f` (scheduler-side authoritative-binding fix; its
+controller-side touch is the dead-node reap path — consumed input, out
+of model per the Stage-A out-of-model list): **N/A** — no modeled
+protocol content.
+
+### Outside the corpus, listed for checker honesty
+
+`ff7f99ab8`, `b80d6f135` (M12/M13 bound-intent disambiguation,
+node_informer family): **NOT-ENC** — Models J/N carry no Pod objects
+and `dead_nodes` is consumed input; their protection is the design
+§4(a)1 gate tests (the ported two-pods-one-intent derivation tests and
+the consequence-chain coverage), not an F1–F5 invariant. Recorded here
+so the boundary stays explicit.
+
+### Permanent expect-violation witnesses (wired into nix/quint.nix)
+
+Six of the thirteen modules are wired as `quint-ctrl-calib-*` checks —
+one per falsifying family with a plausible regression path in the
+as-built code and a cheap state space (the same proportion as the prior
+campaigns); the rest are evidence modules, re-runnable with the README
+recipe.
+
+| Check | Module | Violated invariant | Guards against |
+|---|---|---|---|
+| `quint-ctrl-calib-ga-live-recheck` | `gaCalibNoLiveRecheck` | `reapSafety` | losing the live pod-phase re-check before the excess DELETE (fba9086dc) |
+| `quint-ctrl-calib-gb-ack-spawned-only` | `gbCalibAckAttempted` | `ackSoundness` | acking attempted instead of created spawns (cdc78f839) |
+| `quint-ctrl-calib-m1-acquire-clear` | `m1CalibAcquireClearOkOnly` | `idleReapSafety` | regressing the unconditional prev_idle clear to the Ok arm (79f86b888) |
+| `quint-ctrl-calib-m2-consolidate-prune` | `m2CalibNoConsolidatePrune` | `iceMarkSoundness` | losing the consolidate-only inflight prune (08d49c52c) |
+| `quint-ctrl-calib-m34-reload-latch` | `m34CalibLatchClearOnAttempt` | `reloadLatchRespected` | clearing the reload latch on attempt instead of on Ok (703cbf42a) |
+| `quint-ctrl-calib-ffd-class-clamp` | `ffdCalibNoClassClamp` | `provisioningBudget` | dropping the per-class fleet clamp from cover |
+
+The G-G and the second M1/M2/M3-M4 overrides, the crd-absent and
+orphan-gate G-A overrides, the CEILING=2 G-B override and the
+busy-guard probe stay evidence modules: their regression paths are
+either already guarded by a wired sibling on the same tick arm, pinned
+by a deterministic named run, or (the probe) are HOLDS evidence rather
+than a regression guard.
+
+### Phase-0 exit-gate verdict
+
+**Met.** Per the design §5 Stage-C gate:
+
+- **Every family has a falsifying representative or an explicit
+  NOT-ENCODED disposition naming its coverage.** Falsifying
+  representatives exist for G-A (3), G-B (2), G-G (1), M1 (1), M2 (2),
+  M3/M4 (2) and FFD/cover (1, family-level); G-C, G-D, G-E, G-F, M5/M6
+  and the remainder carry per-commit NOT-ENCODED / N-A rows naming the
+  covering vehicle, exactly as the design pre-registered for them.
+- **Every falsification trace was walked against the code path** during
+  module construction (each override's header cites the decision sites
+  and the incident the historical fix recorded; the two deepest traces
+  are additionally pinned as deterministic named runs).
+- **Permanent `quint-ctrl-calib-*` checks are wired** for the
+  regression-worthy subset (six, one per falsifying family).
+- **The calibration table is committed next to the invariant map** (this
+  section), and the corpus denominator was pinned before any override
+  ran.
+- **No stop-and-report event occurred**; the main models are untouched,
+  so the Stage-B verdicts stand without re-runs.
+
+Honest deltas from the design's pre-registration, all argued in the
+rows above: the verdict shape is leaner than the predicted "45–50 of
+~101 encodable through a representative" — about 20 of the 95 pinned
+commits are ENC/ENC-A, because the per-commit pin shows the family
+tails are dominated by sizing arithmetic, content/serialization,
+axis-parity and observability commits that the design itself
+pre-registered as NOT-ENCODED at the family level; the per-commit
+re-dispositions (`5935d9122`, `4ece337a4`, `5f754baeb`'s sizing
+content, M5/M6's missing cleanup-set state, the `13806e99a` busy-guard
+probe) are recorded as checked-prediction corrections rather than
+silent shrinks. The MBT decision the design deferred to this gate:
+calibration did NOT keep tripping on model/code mismatch (every
+override falsified as predicted on the first run), so the §3.6
+recommendation stands — no MBT/trait-extraction prerequisite is imposed
+on Phase 1; the decision is recorded as "not now", revisitable if
+Phase-1 work surfaces conformance doubts.
+
+### Phase-1 input list
+
+What the calibration adds to the Phase-1 plan, beyond the design §4
+scope it leaves unchanged:
+
+- **Licensed by the calibration (no further model evidence needed):**
+  nothing new — the §4(a) recomputable-cache deletions (PodRequestedCache
+  → per-tick LIST with the named derivation rule and gate tests;
+  NodeLabelCache labels → per-need GET / per-flush LIST with the M11
+  cursor semantics named) were never model-gated and proceed on their
+  own named test/VM evidence, after this Stage C, as the design
+  schedules them.
+- **§4(b) candidates surfaced by the table: none.** No mechanism's
+  revert came back HOLDS-because-redundant with a confirming second
+  representative. The single HOLDS row (the `13806e99a` busy-guard) is
+  explicitly NOT a candidate: its trigger lives below the model's
+  tick-internal ordering resolution, which is an abstraction of the
+  model, not a property of the code.
+- **Caches the calibration does NOT license for deletion:** `prev_idle`
+  (M1), `inflight_created` (M2), the sketches reload latch and
+  recency gate (M3/M4), the placeable gate and its fail-closed
+  consumer postures, the per-class cover clamp — each now has a wired
+  expect-violation check demonstrating the model re-finds the bug its
+  removal would reintroduce; they are exactly the design's §4
+  non-candidates, now with machine-checked evidence attached.
+- **Carry-forward observations for Phase-1/2 work:**
+  - The ⊥-tick early-return observation skip (the one pre-registered
+    as-built falsification) remains open; when its fix lands, the two
+    `quint-nodeclaim-falsification-*` checks flip to HOLD invariants in
+    the fault-rpc regime per the Stage-B flip protocol — Phase 1 should
+    schedule that fix or explicitly defer it.
+  - The `inflight_created` mutator-list comment in
+    `nodeclaim_pool/mod.rs` still names a config-reload clear that has
+    no call site (the Stage-B encoding note); whoever touches that
+    block next should reconcile the comment or add the clear, and the
+    model's `configDropsCell` action is the place to mirror it.
+  - `ctrl.pool.spawn-once` still carries no verify marker (the Stage-B
+    encoding note); a Phase-2 code-level dedupe test remains the
+    cheapest way to close it.
+  - The G-C/G-D/G-F NOT-ENCODED families and the FFD/cover sizing tail
+    are where the §3.6 Kani candidates live if Phase 2 wants more than
+    unit tests there.

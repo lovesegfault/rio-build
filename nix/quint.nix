@@ -2265,5 +2265,91 @@ in
       main = "nodeclaimLifecycleFaultLease";
       witness = "canReachStaleRecordOnly";
     };
+
+    # ---- Controller Stage-C calibration witnesses --------------------
+    # The controller-formal historical-fix corpus replayed against the
+    # two reconcile models (controller-invariant-map.md, the Stage-C
+    # calibration table). Each check instantiates the as-built model,
+    # swaps ONE tick action for its PRE-FIX behavior (the calibration
+    # module's `calibStep`) and passes only while the checker still
+    # falsifies the invariant the corresponding historical fix protects
+    # — machine-checked evidence that the model would re-find that bug
+    # class if it were reintroduced, and that the invariant is not
+    # vacuous for it. One representative per falsifying family with a
+    # plausible regression path; the remaining override modules under
+    # docs/spec/models/calibration/ are evidence modules (not wired).
+    # Deliberately no tracey markers: the spec rules are verified by the
+    # HOLD regime checks above, not by these pre-fix reproductions.
+
+    # G-A (fba9086dc): losing the live pod-phase re-check before the
+    # excess-pending DELETE reaps a Job whose pod is already running.
+    quint-ctrl-calib-ga-live-recheck = mkQuintWitnessCheck {
+      name = "ctrl-calib-ga-live-recheck";
+      spec = "calibration/controller-ga";
+      main = "gaCalibNoLiveRecheck";
+      extraSpecs = [ "spawnCoherence" ];
+      step = "calibStep";
+      witness = "reapSafety";
+    };
+
+    # G-B (cdc78f839): acking the attempted spawn slice instead of the
+    # successfully-created set arms dispatched_cells with no Job behind
+    # it.
+    quint-ctrl-calib-gb-ack-spawned-only = mkQuintWitnessCheck {
+      name = "ctrl-calib-gb-ack-spawned-only";
+      spec = "calibration/controller-gb";
+      main = "gbCalibAckAttempted";
+      extraSpecs = [ "spawnCoherence" ];
+      step = "calibStep";
+      witness = "ackSoundness";
+    };
+
+    # M1 (79f86b888): clearing prev_idle only on the reload Ok arm lets
+    # a stale entry survive a failed-reload acquire and over-reap a
+    # freshly idle claim (the amplify-polarity row of the lease-edge
+    # table).
+    quint-ctrl-calib-m1-acquire-clear = mkQuintWitnessCheck {
+      name = "ctrl-calib-m1-acquire-clear";
+      spec = "calibration/controller-m1";
+      main = "m1CalibAcquireClearOkOnly";
+      extraSpecs = [ "nodeclaimLifecycle" ];
+      step = "calibStep";
+      witness = "idleReapSafety";
+    };
+
+    # M2 (08d49c52c): dropping the consolidate-only inflight prune makes
+    # the controller's own reap read as a Karpenter vanish on the next
+    # full tick — a spurious ICE mark.
+    quint-ctrl-calib-m2-consolidate-prune = mkQuintWitnessCheck {
+      name = "ctrl-calib-m2-consolidate-prune";
+      spec = "calibration/controller-m2";
+      main = "m2CalibNoConsolidatePrune";
+      extraSpecs = [ "nodeclaimLifecycle" ];
+      step = "calibStep";
+      witness = "iceMarkSoundness";
+    };
+
+    # M3/M4 (703cbf42a): clearing the reload latch on the load attempt
+    # (not on Ok) lets the same tick persist the stale standby snapshot
+    # over PG.
+    quint-ctrl-calib-m34-reload-latch = mkQuintWitnessCheck {
+      name = "ctrl-calib-m34-reload-latch";
+      spec = "calibration/controller-m34";
+      main = "m34CalibLatchClearOnAttempt";
+      extraSpecs = [ "nodeclaimLifecycle" ];
+      step = "calibStep";
+      witness = "reloadLatchRespected";
+    };
+
+    # FFD/cover (family-level): sizing cover against the global budget
+    # only lets one cell exceed its per-class fleet cap.
+    quint-ctrl-calib-ffd-class-clamp = mkQuintWitnessCheck {
+      name = "ctrl-calib-ffd-class-clamp";
+      spec = "calibration/controller-ffd";
+      main = "ffdCalibNoClassClamp";
+      extraSpecs = [ "nodeclaimLifecycle" ];
+      step = "calibStep";
+      witness = "provisioningBudget";
+    };
   };
 }
