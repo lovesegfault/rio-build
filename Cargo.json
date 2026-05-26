@@ -20743,6 +20743,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-lease",
+          "packageId": "rio-lease"
+        },
+        {
           "name": "rio-migrations",
           "packageId": "rio-migrations"
         },
@@ -29006,10 +29010,6 @@
           "packageId": "elliptic-curve 0.14.0-rc.32"
         },
         {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
           "name": "fastrand",
           "packageId": "fastrand"
         },
@@ -29075,16 +29075,6 @@
         {
           "name": "hyper",
           "packageId": "hyper 1.9.0"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",
@@ -29589,10 +29579,6 @@
           "packageId": "elliptic-curve 0.14.0-rc.32"
         },
         {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
           "name": "fastrand",
           "packageId": "fastrand"
         },
@@ -29658,16 +29644,6 @@
         {
           "name": "hyper",
           "packageId": "hyper 1.9.0"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",

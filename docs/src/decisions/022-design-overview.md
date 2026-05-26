@@ -332,6 +332,8 @@ r[obs.metric.chunk-backend-tiered]
 
 r[obs.metric.compat]
 
+r[obs.metric.express-eviction]
+
 | Metric | Meaning |
 |---|---|
 | `rio_builder_castore_fuse_open_seconds` (histogram) | wall-clock from `open()` upcall to reply, labeled `{hit="node_ssd"\|"remote", streamed="0"\|"1"}` |
@@ -339,6 +341,8 @@ r[obs.metric.compat]
 | `rio_builder_castore_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"getattr"\|"readdir"\|"readlink"\|"open"\|"read"}` |
 | `rio_builder_castore_dag_prefetch_seconds` | `GetDirectory(recursive)` wall-clock per build |
 | `rio_store_tiered_local_hit_ratio` | Express-tier hits ÷ total `get()` per replica |
+| `rio_store_express_bytes` (gauge) | per-AZ Express bucket size in bytes, from the eviction sweeper's listing pass (§9), labeled `{az_id}`; published only by the lease-holding sweeper |
+| `rio_store_express_evicted_total` | objects deleted from Express by the bounded-MRU eviction sweep, labeled `{az_id}` |
 | `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"error"}` |
 | `rio_store_compat_write_failures_total` | compat writes that failed post-commit (reconciler backlog) |
 | `rio_store_compat_write_bytes_total` | compressed bytes published as compat `nar/` objects (the S3 cost of compat-ON) |

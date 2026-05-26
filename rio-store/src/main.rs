@@ -310,6 +310,28 @@ async fn main() -> anyhow::Result<()> {
     // tasks: panics logged, shutdown-on-cancel.
     rio_store::nar_index::spawn_indexer_loop(pool.clone(), chunk_cache.clone(), shutdown.clone());
 
+    // S3 Express eviction sweeper (P0585): only meaningful when the
+    // tiered backend has a local Express tier configured. Inside K8s the
+    // sweep itself is gated on the per-AZ Lease (one sweeper per AZ);
+    // outside (VM tests, dev) the sole replica sweeps unconditionally.
+    if let Some(rio_store::config::ChunkBackendKind::Tiered {
+        express_bucket: Some(express_bucket),
+        express,
+        ..
+    }) = &cfg.chunk_backend
+    {
+        // Fresh client rather than the read path's 2-attempt Express
+        // client: a background sweep prefers the full retry budget over
+        // failing fast.
+        let sweep_client = rio_common::s3::default_client(cfg.s3_max_attempts).await;
+        rio_store::backend::express_sweep::spawn_express_sweep(
+            express.clone(),
+            sweep_client,
+            express_bucket.clone(),
+            shutdown.clone(),
+        );
+    }
+
     let max_msg_size = rio_common::grpc::max_message_size();
 
     let addr = cfg.listen_addr;

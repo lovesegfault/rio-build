@@ -1285,6 +1285,11 @@
       "doc": "Chunk storage backends."
     },
     {
+      "path": "backend/express_sweep.rs",
+      "depth": 1,
+      "doc": "S3 Express eviction sweeper — size-bounded MRU for the per-AZ cache"
+    },
+    {
       "path": "backend/tiered.rs",
       "depth": 1,
       "doc": "Two-tier chunk backend: per-AZ S3 Express read-through cache over"

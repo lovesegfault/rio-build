@@ -258,6 +258,32 @@
         "Zakarum <zaq.dev@icloud.com>"
       ]
     },
+    "annotate-snippets": {
+      "crateName": "annotate-snippets",
+      "version": "0.12.16",
+      "edition": "2024",
+      "sha256": "1w8kdyj2fh4n666wvd1krj2zcyjls9vlqrmpslx1yr5w0lcaa4gj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "anstream": {
       "crateName": "anstream",
       "version": "1.0.0",
@@ -461,6 +487,21 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "arraydeque": {
+      "crateName": "arraydeque",
+      "version": "0.5.1",
+      "edition": "2021",
+      "sha256": "0dn2xdfg3rkiqsh8a6achnmvf5nf11xk33xgjzpksliab4yjx43x",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "andylokandy"
       ]
     },
     "arrayref": {
@@ -5236,6 +5277,52 @@
         "RustCrypto Developers"
       ]
     },
+    "encoding_rs": {
+      "crateName": "encoding_rs",
+      "version": "0.8.35",
+      "edition": "2018",
+      "sha256": "1wv64xdrr9v37rqqdjsyb8l8wzlcbab80ryxhrszvnj59wy0y0vm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Henri Sivonen <hsivonen@hsivonen.fi>"
+      ]
+    },
+    "encoding_rs_io": {
+      "crateName": "encoding_rs_io",
+      "version": "0.1.7",
+      "edition": "2015",
+      "sha256": "10ra4l688cdadd8h1lsbahld1zbywnnqv68366mbhamn3xjwbhqw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "encoding_rs",
+          "packageId": "encoding_rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
     "endian-type": {
       "crateName": "endian-type",
       "version": "0.1.2",
@@ -6320,6 +6407,34 @@
       ],
       "authors": [
         "Rust and WebAssembly Working Group"
+      ]
+    },
+    "granit-parser": {
+      "crateName": "granit-parser",
+      "version": "0.0.2",
+      "edition": "2021",
+      "sha256": "0y6pi7pbjvllf2c2yy0id7zdkl02haqmws70vjkm6748wggkdrxp",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arraydeque",
+          "packageId": "arraydeque"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Ethiraric <ethiraric@gmail.com>",
+        "David Aguilar <davvid@gmail.com>",
+        "Yuheng Chen <yuhengchen@sensetime.com>",
+        "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
       ]
     },
     "group": {
@@ -9503,6 +9618,25 @@
         "The nix-rust Project Developers"
       ]
     },
+    "nohash-hasher": {
+      "crateName": "nohash-hasher",
+      "version": "0.2.0",
+      "edition": "2018",
+      "sha256": "0lf4p6k01w4wm7zn4grnihzj8s7zd5qczjmzng7wviwxawih5x9b",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Parity Technologies <admin@parity.io>"
+      ]
+    },
     "nu-ansi-term": {
       "crateName": "nu-ansi-term",
       "version": "0.50.3",
@@ -12681,6 +12815,104 @@
         "Rio Contributors"
       ]
     },
+    "rio-crds": {
+      "crateName": "rio-crds",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-crds"
+      },
+      "dependencies": [
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-lease": {
+      "crateName": "rio-lease",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-lease"
+      },
+      "dependencies": [
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-migrations": {
       "crateName": "rio-migrations",
       "version": "0.1.0",
@@ -12962,6 +13194,10 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-lease",
+          "packageId": "rio-lease"
         },
         {
           "name": "rio-migrations",
@@ -14026,6 +14262,71 @@
       "authors": [
         "Erick Tryzelaar <erick.tryzelaar@gmail.com>",
         "David Tolnay <dtolnay@gmail.com>"
+      ]
+    },
+    "serde-saphyr": {
+      "crateName": "serde-saphyr",
+      "version": "0.0.26",
+      "edition": "2024",
+      "sha256": "1w7a4acvdyyf958wpakyqki7z975j65kn9g6r1xsj0jdwd4gxiyw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
+          "name": "annotate-snippets",
+          "packageId": "annotate-snippets"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "encoding_rs_io",
+          "packageId": "encoding_rs_io"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "granit-parser",
+          "packageId": "granit-parser",
+          "rename": "saphyr_parser"
+        },
+        {
+          "name": "nohash-hasher",
+          "packageId": "nohash-hasher"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "zmij",
+          "packageId": "zmij"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "deserialize",
+        "serialize"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "serde-value": {
@@ -17680,6 +17981,26 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
+    "unicode-width": {
+      "crateName": "unicode-width",
+      "version": "0.2.2",
+      "edition": "2021",
+      "sha256": "0m7jjzlcccw716dy9423xxh0clys8pfpllc5smvfxrzdf66h9b5l",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "cjk",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
     "unicode-xid": {
       "crateName": "unicode-xid",
       "version": "0.2.6",
@@ -19502,10 +19823,6 @@
           "packageId": "elliptic-curve 0.14.0-rc.32"
         },
         {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
           "name": "fastrand",
           "packageId": "fastrand"
         },
@@ -19571,16 +19888,6 @@
         {
           "name": "hyper",
           "packageId": "hyper"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",
@@ -20085,10 +20392,6 @@
           "packageId": "elliptic-curve 0.14.0-rc.32"
         },
         {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
           "name": "fastrand",
           "packageId": "fastrand"
         },
@@ -20154,16 +20457,6 @@
         {
           "name": "hyper",
           "packageId": "hyper"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",

@@ -57,7 +57,63 @@ pub enum ChunkBackendKind {
         /// `None` = no cache tier in this AZ.
         #[serde(default)]
         express_bucket: Option<String>,
+        /// Express cache-tier eviction sweep tuning (P0585). Only
+        /// consulted when `express_bucket` is set. TOML
+        /// `[chunk_backend.express]`, env `RIO_CHUNK_BACKEND__EXPRESS__*`.
+        #[serde(default)]
+        express: ExpressConfig,
     },
+}
+
+/// S3 Express eviction-sweep tuning (design overview §9 / ADR-023): the
+/// per-AZ directory bucket is a bounded read-through cache, and because
+/// directory-bucket lifecycle rules are age-based only, this
+/// application-level sweep is what enforces the byte budget. The elected
+/// sweeper lists the bucket every `sweep_interval_secs`; when the total
+/// exceeds `target_bytes × evict_high_watermark` it deletes
+/// oldest-by-`LastModified` objects until back under
+/// `target_bytes × evict_low_watermark`. See
+/// [`crate::backend::express_sweep`].
+///
+/// Nested under the `tiered` chunk-backend variant so the whole cache
+/// tier is configured in one place: TOML `[chunk_backend.express]`, env
+/// `RIO_CHUNK_BACKEND__EXPRESS__<FIELD>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ExpressConfig {
+    /// Target Express bucket size in bytes. Default 8 TiB
+    /// (8_796_093_022_208) — matches the provisioning assumption in
+    /// `infra/eks/s3-express.tf`. Set via
+    /// `RIO_CHUNK_BACKEND__EXPRESS__TARGET_BYTES`.
+    pub target_bytes: u64,
+    /// Eviction trigger: a sweep starts deleting only when the listed
+    /// total exceeds `target_bytes × evict_high_watermark`. Default 1.10.
+    /// Set via `RIO_CHUNK_BACKEND__EXPRESS__EVICT_HIGH_WATERMARK`.
+    pub evict_high_watermark: f64,
+    /// Eviction floor: once triggered, the sweep deletes oldest objects
+    /// until the total is back under `target_bytes × evict_low_watermark`.
+    /// Must be ≤ `evict_high_watermark`. Default 0.90. Set via
+    /// `RIO_CHUNK_BACKEND__EXPRESS__EVICT_LOW_WATERMARK`.
+    pub evict_low_watermark: f64,
+    /// Sweep cadence in seconds. Default 3600 (hourly — the full
+    /// ListObjectsV2 pass is ~130k requests at the 8 TiB design point,
+    /// fine hourly, wasteful much faster). `0` disables the sweeper
+    /// entirely (the bucket then grows until the age-based S3 Lifecycle
+    /// expiration). Set via
+    /// `RIO_CHUNK_BACKEND__EXPRESS__SWEEP_INTERVAL_SECS`.
+    pub sweep_interval_secs: u64,
+}
+
+impl Default for ExpressConfig {
+    fn default() -> Self {
+        Self {
+            // 8 TiB.
+            target_bytes: 8_796_093_022_208,
+            evict_high_watermark: 1.10,
+            evict_low_watermark: 0.90,
+            sweep_interval_secs: 3600,
+        }
+    }
 }
 
 /// NAR compression codec for binary-cache-compat objects
@@ -442,6 +498,36 @@ impl rio_common::config::ValidateConfig for Config {
             "substitute_admission_permits must be >= 1; unset \
              RIO_SUBSTITUTE_ADMISSION_PERMITS to derive from pg_max_connections"
         );
+        // Express eviction-sweep watermarks: a NaN/negative factor or an
+        // inverted pair (low > high) makes the sweeper silently never
+        // evict or thrash list+delete every tick — degenerate states an
+        // operator only notices when the bucket blows past its budget.
+        // Reject at boot. Only reachable on the tiered variant (the only
+        // place the sweep config exists).
+        if let Some(ChunkBackendKind::Tiered { express, .. }) = &self.chunk_backend {
+            anyhow::ensure!(
+                express.target_bytes >= 1,
+                "chunk_backend.express.target_bytes must be >= 1; \
+                 set RIO_CHUNK_BACKEND__EXPRESS__TARGET_BYTES"
+            );
+            anyhow::ensure!(
+                express.evict_high_watermark.is_finite()
+                    && express.evict_low_watermark.is_finite()
+                    && express.evict_high_watermark > 0.0
+                    && express.evict_low_watermark > 0.0,
+                "chunk_backend.express.evict_{{high,low}}_watermark must be finite and > 0; \
+                 set RIO_CHUNK_BACKEND__EXPRESS__EVICT_HIGH_WATERMARK / \
+                 RIO_CHUNK_BACKEND__EXPRESS__EVICT_LOW_WATERMARK"
+            );
+            anyhow::ensure!(
+                express.evict_low_watermark <= express.evict_high_watermark,
+                "chunk_backend.express.evict_low_watermark ({}) must be <= \
+                 evict_high_watermark ({}) — an inverted pair makes every sweep \
+                 trigger and immediately stop",
+                express.evict_low_watermark,
+                express.evict_high_watermark
+            );
+        }
         // binary_cache_compat.bucket: absent means "use the chunk
         // backend's S3-standard bucket"; present must be a real bucket
         // name. Some("") (e.g. a templating layer rendering an empty
@@ -523,6 +609,9 @@ pub async fn init_chunk_backend(
             bucket,
             prefix,
             express_bucket,
+            // Sweep tuning is consumed by `backend::express_sweep` (spawned
+            // from main.rs), not by the read/write backend built here.
+            express: _,
         } => {
             info!(
                 %bucket,
@@ -874,6 +963,7 @@ mod tests {
                 bucket,
                 prefix,
                 express_bucket,
+                express,
             }) => {
                 assert_eq!(bucket, "rio-chunks");
                 assert_eq!(prefix, "prod");
@@ -881,9 +971,111 @@ mod tests {
                     express_bucket.as_deref(),
                     Some("rio-chunk-cache--use1-az4--x-s3")
                 );
+                // No [chunk_backend.express] table → compiled defaults
+                // (8 TiB target, 1.10/0.90 watermarks, hourly sweep).
+                assert_eq!(express, ExpressConfig::default());
             }
             other => panic!("expected Tiered, got {other:?}"),
         }
+    }
+
+    /// `[chunk_backend.express]` table threads through the config-crate
+    /// Value layer into the variant's nested struct, with unspecified
+    /// fields falling back to the struct-level `#[serde(default)]`.
+    #[test]
+    fn chunk_backend_kind_toml_tiered_express_overrides() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "tiered"
+            bucket = "rio-chunks"
+            prefix = ""
+            express_bucket = "rio-chunk-cache--use2-az1--x-s3"
+
+            [chunk_backend.express]
+            target_bytes = 1099511627776
+            evict_high_watermark = 1.25
+            sweep_interval_secs = 600
+            "#,
+        );
+        match cfg.chunk_backend {
+            Some(ChunkBackendKind::Tiered { express, .. }) => {
+                assert_eq!(express.target_bytes, 1_099_511_627_776);
+                assert_eq!(express.evict_high_watermark, 1.25);
+                // Unspecified → default.
+                assert_eq!(express.evict_low_watermark, 0.90);
+                assert_eq!(express.sweep_interval_secs, 600);
+            }
+            other => panic!("expected Tiered, got {other:?}"),
+        }
+    }
+
+    /// ExpressConfig defaults are the spec'd values (design overview §9):
+    /// 8 TiB target, 1.10 / 0.90 watermarks, hourly sweep. Changing any
+    /// of these changes how much S3 Express a bare tiered deployment
+    /// retains — deliberate only.
+    #[test]
+    fn express_config_defaults_are_stable() {
+        let d = ExpressConfig::default();
+        assert_eq!(d.target_bytes, 8_796_093_022_208);
+        assert_eq!(d.evict_high_watermark, 1.10);
+        assert_eq!(d.evict_low_watermark, 0.90);
+        assert_eq!(d.sweep_interval_secs, 3600);
+    }
+
+    /// Inverted watermarks (low > high) are rejected at boot — the sweep
+    /// would otherwise trigger and immediately stop on every tick.
+    #[test]
+    fn validate_rejects_inverted_express_watermarks() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Tiered {
+                bucket: "rio-chunks".into(),
+                prefix: String::new(),
+                express_bucket: Some("rio-chunk-cache--use2-az1--x-s3".into()),
+                express: ExpressConfig {
+                    evict_high_watermark: 0.8,
+                    evict_low_watermark: 1.2,
+                    ..ExpressConfig::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("evict_low_watermark"), "got: {err}");
+
+        // NaN / zero factors also rejected.
+        for (high, low) in [(f64::NAN, 0.9), (1.1, 0.0)] {
+            let cfg = Config {
+                database_url: "postgres://x".into(),
+                chunk_backend: Some(ChunkBackendKind::Tiered {
+                    bucket: "rio-chunks".into(),
+                    prefix: String::new(),
+                    express_bucket: None,
+                    express: ExpressConfig {
+                        evict_high_watermark: high,
+                        evict_low_watermark: low,
+                        ..ExpressConfig::default()
+                    },
+                }),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("watermark"), "got: {err}");
+        }
+
+        // The defaults pass.
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            chunk_backend: Some(ChunkBackendKind::Tiered {
+                bucket: "rio-chunks".into(),
+                prefix: String::new(),
+                express_bucket: Some("rio-chunk-cache--use2-az1--x-s3".into()),
+                express: ExpressConfig::default(),
+            }),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     /// `express_bucket` omitted → `None`. A replica scheduled in an AZ
@@ -997,6 +1189,39 @@ mod tests {
                         express_bucket.as_deref(),
                         Some("rio-chunk-cache--use1-az4--x-s3")
                     );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    /// The express sweep knobs ride the same `__`-nested env path the
+    /// rest of the tagged enum uses (`RIO_CHUNK_BACKEND__EXPRESS__*`),
+    /// including numeric/float coercion via the env layer's
+    /// `try_parsing`. Absent vars → compiled defaults.
+    #[test]
+    fn chunk_backend_kind_env_tiered_express_overrides() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            jail.set_env(
+                "RIO_CHUNK_BACKEND__EXPRESS_BUCKET",
+                "rio-chunk-cache--use2-az1--x-s3",
+            );
+            jail.set_env("RIO_CHUNK_BACKEND__EXPRESS__TARGET_BYTES", "1073741824");
+            jail.set_env("RIO_CHUNK_BACKEND__EXPRESS__EVICT_LOW_WATERMARK", "0.5");
+            jail.set_env("RIO_CHUNK_BACKEND__EXPRESS__SWEEP_INTERVAL_SECS", "0");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                Some(ChunkBackendKind::Tiered { express, .. }) => {
+                    assert_eq!(express.target_bytes, 1_073_741_824);
+                    assert_eq!(express.evict_low_watermark, 0.5);
+                    // 0 = sweeper disabled.
+                    assert_eq!(express.sweep_interval_secs, 0);
+                    // Untouched field keeps its default.
+                    assert_eq!(express.evict_high_watermark, 1.10);
                 }
                 other => panic!("expected Tiered; got {other:?}"),
             }

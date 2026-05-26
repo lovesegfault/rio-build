@@ -180,6 +180,7 @@
       "prod": [
         "rio-auth",
         "rio-common",
+        "rio-lease",
         "rio-migrations",
         "rio-nix",
         "rio-proto"

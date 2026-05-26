@@ -25,6 +25,7 @@ schema = []
 server = [
   "dep:rio-common",
   "dep:rio-auth",
+  "dep:rio-lease",
   "dep:rio-nix",
   "dep:rio-proto",
   "dep:tokio",
@@ -82,6 +83,13 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 # --- server-only (gated via the `server` feature) ---------------------
 rio-common = { workspace = true, features = ["aws"], optional = true }
 rio-auth = { workspace = true, optional = true }
+# Per-AZ Lease election for the S3 Express eviction sweeper (P0585):
+# exactly one replica per AZ runs the hourly ListObjectsV2/DeleteObjects
+# sweep. rio-lease is already the hoisted shared lease crate (extracted
+# from rio-scheduler/src/lease/); depending on rio-scheduler instead
+# would be a workspace cycle (rio-scheduler depends on rio-store's
+# `schema` feature for the CA resolver).
+rio-lease = { workspace = true, optional = true }
 rio-nix = { workspace = true, optional = true }
 rio-proto = { workspace = true, optional = true }
 # Optional: only when test-utils feature is on. Also a dev-dep below so

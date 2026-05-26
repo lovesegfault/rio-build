@@ -19,6 +19,7 @@
 //! prefix spreads load across S3 shards per `store.typ`),
 //! `{prefix}/{key}` for blobs.
 
+pub mod express_sweep;
 mod tiered;
 
 pub use tiered::TieredChunkBackend;

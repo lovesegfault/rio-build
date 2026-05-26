@@ -1354,7 +1354,7 @@
       {
         "name": "rio_store_gc_s3_key_enqueued_total",
         "kind": "counter",
-        "help": "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
+        "help": "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks plus swept paths' binary-cache compat narinfo/NAR objects)."
       },
       {
         "name": "rio_store_gc_sweep_paths_remaining",
@@ -1474,7 +1474,7 @@
       {
         "name": "rio_store_s3_requests_total",
         "kind": "counter",
-        "help": "S3 API calls (labeled by operation: put_object/get_object/head_object/delete_object)"
+        "help": "S3 API calls, labeled by operation (put_object, get_object, head_object, delete_object, list_objects_v2, delete_objects)"
       },
       {
         "name": "rio_store_service_token_accepted_total",

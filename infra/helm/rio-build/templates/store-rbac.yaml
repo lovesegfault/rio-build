@@ -1,0 +1,69 @@
+{{- /*
+Express eviction sweeper (P0585) leader election: rio-store's only K8s
+API surface. One Lease per AZ (`rio-store-express-sweep-<az-id>`) elects
+which store replica runs the hourly ListObjectsV2/DeleteObjects sweep
+that keeps the S3 Express directory bucket under its byte budget.
+
+Rendered only for the configuration that actually runs the sweeper:
+kind=tiered with an explicit expressBucket. The az-id in the Lease name
+is derived from the directory-bucket name suffix
+(`...--<az-id>--x-s3`), mirroring rio-store's own parsing
+(backend/express_sweep.rs::az_id_from_bucket); a non-conforming name
+(e.g. a VM-test stand-in bucket) falls back to "unknown" on both sides.
+
+NOTE — this Role is the RBAC half only. The store ServiceAccount keeps
+automountServiceAccountToken: false (rbac.yaml) and store-egress
+(networkpolicy.yaml) still denies the kube-apiserver entity, per
+r[store.netpol.egress]: a compromised store must not reach the K8s API.
+Until those two are deliberately relaxed for tiered deployments
+(tracked with the P0554 prod-Express enablement), an in-cluster store
+logs "kube client init failed; lease loop exiting" and never sweeps —
+the directory bucket's age-based lifecycle expiration
+(infra/eks/s3-express.tf) is the growth backstop.
+*/ -}}
+{{- if and .Values.store.enabled (eq .Values.store.chunkBackend.kind "tiered") .Values.store.chunkBackend.expressBucket }}
+{{- $bucket := .Values.store.chunkBackend.expressBucket -}}
+{{- $azId := "unknown" -}}
+{{- if hasSuffix "--x-s3" $bucket -}}
+{{- $parts := splitList "--" (trimSuffix "--x-s3" $bucket) -}}
+{{- if and (gt (len $parts) 1) (ne (last $parts) "") -}}
+{{- $azId = last $parts -}}
+{{- end -}}
+{{- end -}}
+---
+# Same least-privilege shape as the scheduler/controller lease Roles:
+# `create` cannot be scoped by `resourceNames` (the object doesn't exist
+# yet), so it is a separate unrestricted rule; `get`/`update` are scoped
+# to the one per-AZ Lease this replica's bucket maps to (r43 bug_014).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rio-store-express-sweep-lease
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [{{ printf "rio-store-express-sweep-%s" $azId | quote }}]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rio-store-express-sweep-lease
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rio-store-express-sweep-lease
+subjects:
+  - kind: ServiceAccount
+    name: rio-store
+    namespace: {{ .Values.namespaces.store.name }}
+{{- end }}

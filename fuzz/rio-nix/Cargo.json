@@ -13816,10 +13816,6 @@
           "packageId": "elliptic-curve"
         },
         {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
           "name": "fastrand",
           "packageId": "fastrand"
         },
@@ -13885,16 +13881,6 @@
         {
           "name": "hyper",
           "packageId": "hyper"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",
@@ -14399,10 +14385,6 @@
           "packageId": "elliptic-curve"
         },
         {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
           "name": "fastrand",
           "packageId": "fastrand"
         },
@@ -14468,16 +14450,6 @@
         {
           "name": "hyper",
           "packageId": "hyper"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
         },
         {
           "name": "hyper-util",

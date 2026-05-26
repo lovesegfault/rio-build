@@ -40,7 +40,6 @@ ed25519 = { version = "3", default-features = false, features = ["alloc", "pkcs8
 ed25519-dalek = { version = "3.0.0-pre.7", features = ["alloc", "pkcs8", "rand_core"] }
 either = { version = "1", features = ["serde", "use_std"] }
 elliptic-curve = { version = "0.14.0-rc.32", features = ["basepoint-table", "ecdh", "getrandom", "pem", "std"] }
-event-listener-strategy = { version = "0.5" }
 fastrand = { version = "2" }
 futures = { version = "0.3" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -161,7 +160,6 @@ ed25519 = { version = "3", default-features = false, features = ["alloc", "pkcs8
 ed25519-dalek = { version = "3.0.0-pre.7", features = ["alloc", "pkcs8", "rand_core"] }
 either = { version = "1", features = ["serde", "use_std"] }
 elliptic-curve = { version = "0.14.0-rc.32", features = ["basepoint-table", "ecdh", "getrandom", "pem", "std"] }
-event-listener-strategy = { version = "0.5" }
 fastrand = { version = "2" }
 futures = { version = "0.3" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -260,7 +258,6 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "resource", "sched", "signal", "socket", "user"] }
@@ -271,7 +268,6 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "resource", "sched", "signal", "socket", "user"] }
@@ -282,7 +278,6 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "resource", "sched", "signal", "socket", "user"] }
@@ -293,7 +288,6 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "logging", "native-tokio", "tls12"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "resource", "sched", "signal", "socket", "user"] }

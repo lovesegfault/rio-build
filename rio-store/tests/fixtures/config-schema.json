@@ -245,6 +245,16 @@
                 ],
                 "default": null
               },
+              "express": {
+                "description": "Express cache-tier eviction sweep tuning (P0585). Only\nconsulted when `express_bucket` is set. TOML\n`[chunk_backend.express]`, env `RIO_CHUNK_BACKEND__EXPRESS__*`.",
+                "$ref": "#/$defs/ExpressConfig",
+                "default": {
+                  "target_bytes": 8796093022208,
+                  "evict_high_watermark": 1.1,
+                  "evict_low_watermark": 0.9,
+                  "sweep_interval_secs": 3600
+                }
+              },
               "kind": {
                 "type": "string",
                 "const": "tiered"
@@ -257,6 +267,38 @@
             ]
           }
         ]
+      },
+      "ExpressConfig": {
+        "description": "S3 Express eviction-sweep tuning (design overview §9 / ADR-023): the\nper-AZ directory bucket is a bounded read-through cache, and because\ndirectory-bucket lifecycle rules are age-based only, this\napplication-level sweep is what enforces the byte budget. The elected\nsweeper lists the bucket every `sweep_interval_secs`; when the total\nexceeds `target_bytes × evict_high_watermark` it deletes\noldest-by-`LastModified` objects until back under\n`target_bytes × evict_low_watermark`. See\n[`crate::backend::express_sweep`].\n\nNested under the `tiered` chunk-backend variant so the whole cache\ntier is configured in one place: TOML `[chunk_backend.express]`, env\n`RIO_CHUNK_BACKEND__EXPRESS__<FIELD>`.",
+        "type": "object",
+        "properties": {
+          "target_bytes": {
+            "description": "Target Express bucket size in bytes. Default 8 TiB\n(8_796_093_022_208) — matches the provisioning assumption in\n`infra/eks/s3-express.tf`. Set via\n`RIO_CHUNK_BACKEND__EXPRESS__TARGET_BYTES`.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 8796093022208
+          },
+          "evict_high_watermark": {
+            "description": "Eviction trigger: a sweep starts deleting only when the listed\ntotal exceeds `target_bytes × evict_high_watermark`. Default 1.10.\nSet via `RIO_CHUNK_BACKEND__EXPRESS__EVICT_HIGH_WATERMARK`.",
+            "type": "number",
+            "format": "double",
+            "default": 1.1
+          },
+          "evict_low_watermark": {
+            "description": "Eviction floor: once triggered, the sweep deletes oldest objects\nuntil the total is back under `target_bytes × evict_low_watermark`.\nMust be ≤ `evict_high_watermark`. Default 0.90. Set via\n`RIO_CHUNK_BACKEND__EXPRESS__EVICT_LOW_WATERMARK`.",
+            "type": "number",
+            "format": "double",
+            "default": 0.9
+          },
+          "sweep_interval_secs": {
+            "description": "Sweep cadence in seconds. Default 3600 (hourly — the full\nListObjectsV2 pass is ~130k requests at the 8 TiB design point,\nfine hourly, wasteful much faster). `0` disables the sweeper\nentirely (the bucket then grows until the age-based S3 Lifecycle\nexpiration). Set via\n`RIO_CHUNK_BACKEND__EXPRESS__SWEEP_INTERVAL_SECS`.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 3600
+          }
+        }
       },
       "BinaryCacheCompat": {
         "description": "Stock-Nix binary-cache compatibility layer (ADR-022 Design Overview\n§10). When `enabled`, every committed path is *additionally*\nwritten to S3-standard as a stock-Nix object pair\n(`{store-path-hash}.narinfo` + `nar/{file-hash}.nar.<ext>`), so\n`nix copy --from s3://bucket` substitutes with no rio process\nrunning. Runtime config, not a build flag: toggling OFF stops new\ncompat writes (existing objects stay); toggling ON resumes for\nsubsequent puts. Never affects chunked storage either way.\n\nHow the objects get written (`compat::writer`): paths committed\nthrough the buffered upload RPCs (`PutPath`/`PutPathBatch` — the\ngateway surface) are published synchronously after the PG commit;\npaths committed via `PutPathChunked` or upstream substitution keep\n`narinfo.compat_file_hash IS NULL` and are backfilled by the P0582\ncompat reconciler off the upload hot path.",

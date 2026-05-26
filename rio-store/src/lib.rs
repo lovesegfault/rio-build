@@ -184,7 +184,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_s3_requests_total",
-        "S3 API calls (labeled by operation: put_object/get_object/head_object/delete_object)"
+        "S3 API calls, labeled by operation (put_object, get_object, head_object, \
+         delete_object, list_objects_v2, delete_objects)"
     );
     describe_counter!(
         "rio_store_chunk_cache_hits_total",
@@ -210,9 +211,10 @@ pub fn describe_metrics() {
         "rio_store_tiered_writethrough_errors_total",
         "Tiered backend Express write-through failures (chunk served from S3 standard but Express not warmed)"
     );
-    // Spec'd in observability.typ ahead of P0585 (Express eviction
-    // sweeper); register HELP text now so the metrics_registered
-    // spec→describe gate passes, the sweeper adds the emit sites.
+    // Emitted by backend/express_sweep.rs (P0585) — the per-AZ Express
+    // eviction sweeper. Only the lease-holding (or sole, outside K8s)
+    // sweeper publishes them, so absence means "this replica isn't the
+    // sweeper", not "the bucket is empty".
     describe_gauge!(
         "rio_store_express_bytes",
         "Per-AZ Express bucket size in bytes (labeled az_id; emitted by the lease-holding sweeper)"
