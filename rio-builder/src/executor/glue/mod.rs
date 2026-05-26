@@ -495,6 +495,7 @@ fn plan_outputs(
 /// 32-bit personality selection: building a 32-bit system on its 64-bit
 /// host needs `PER_LINUX32` so `uname -m` inside the sandbox reports the
 /// 32-bit machine.
+// r[impl builder.platform.i686+2]
 fn personality_for(drv_system: &str, host_system: &str) -> Personality {
     let linux32 = matches!(
         (host_system, drv_system),
@@ -870,6 +871,7 @@ mod tests {
         );
     }
 
+    // r[verify builder.platform.i686+2]
     #[test]
     fn personality_selection() {
         assert_eq!(

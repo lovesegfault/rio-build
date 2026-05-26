@@ -133,16 +133,20 @@ to lazily fetch @store-path content on demand.
   coreutils, etc.) stay warm at the storage layer even though every pod-level
   FUSE cache is fresh.
 
-#r("builder.platform.i686")[
-  The per-build daemon's `nix.conf` MUST set `extra-platforms` to the worker's
-  resolved `RIO_SYSTEMS` (minus the `builtin` pseudo-system). This keeps
-  daemon acceptance consistent with what the heartbeat advertises to the
-  scheduler: an x86_64 Pool with `systems: [x86_64-linux, i686-linux]` routes
-  i686 derivations to its pods, and the daemon accepts them because
-  `extra-platforms = x86_64-linux i686-linux`. The host system appearing in
-  `extra-platforms` is a no-op; on aarch64 builders the line contains only
-  `aarch64-linux` so the setting is inert.
+#r("builder.platform.i686+2")[
+  When a worker executes a derivation whose `system` is a 32-bit platform
+  hosted by its 64-bit kernel (`i686-linux` on an `x86_64-*` worker, 32-bit
+  ARM on an `aarch64-*` worker), the executor MUST set the 32-bit
+  architecture personality (`PER_LINUX32`) on the build process before
+  `execve`, so `uname -m` and the syscall ABI observed by the build match
+  the declared system.
 ]
+Routing is unchanged: a Pool advertising `systems: [x86_64-linux, i686-linux]`
+still receives i686 derivations via the heartbeat. The personality switch
+(`personality_for` in the request glue, applied by rio-exec before exec) is
+what makes the accepted build behave as i686 --- the daemon-era
+`extra-platforms` `nix.conf` mechanism is gone with the daemon, and the
+multi-ABI seccomp filter already admits the 32-bit syscall ABI.
 
 #r("builder.fuse.cache-ephemeral-memory")[
   The SQLite cache index is `:memory:` --- the pod's filesystem is discarded

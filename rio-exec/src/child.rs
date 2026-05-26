@@ -722,6 +722,7 @@ fn apply_personality(p: Personality) -> Result<(), SetupError> {
     unsafe {
         match p {
             Personality::Native => {}
+            // r[impl builder.platform.i686+2]
             Personality::Linux32 => {
                 // The 32-bit base personality replaces the whole word;
                 // a process that cannot get it would run the 64-bit
