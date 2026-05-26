@@ -17,13 +17,12 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::Serialize;
-use sha2::Digest as _;
 use tokio::sync::mpsc;
 
 use rio_exec::{ExecEvent, HostLayout};
@@ -35,9 +34,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use super::glue::log::{LineAction, NixLogFilter};
 use super::glue::{GluePlan, SandboxOptions, SandboxPaths, derivation_into_request};
-use super::native_result::{
-    ExitClassification, OutputToProcess, ProcessedOutput, classify_exit, process_outputs,
-};
+use super::native_result::{ExitClassification, OutputToProcess, classify_exit, process_outputs};
 
 /// Driver configuration (one invocation = one derivation).
 #[derive(Debug)]
@@ -333,7 +330,7 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
             // semantics (unknown algorithm = rejection) so the harness
             // exercises the same decision the production path will make.
             if is_fod {
-                report.fod_check = Some(check_fod_hash(&drv, &processed.outputs));
+                report.fod_check = Some(check_fod_hash(&drv, &store_dir));
                 if report.fod_check.as_deref() != Some("ok") {
                     report.classification = Some(status_name(BuildResultStatus::OutputRejected));
                     report.error_msg = report.fod_check.clone();
@@ -470,40 +467,15 @@ fn decode_sri_sha256(sri: &str) -> anyhow::Result<[u8; 32]> {
 
 /// Verify a fixed-output derivation's declared hash against the
 /// produced output. Fail-closed: unknown algorithms are rejections.
-fn check_fod_hash(drv: &Derivation, outputs: &[ProcessedOutput]) -> String {
-    let Some(out) = drv.outputs().iter().find(|o| !o.hash().is_empty()) else {
-        return "ok".to_string();
-    };
-    let Some(processed) = outputs.iter().find(|p| p.name == out.name()) else {
-        return format!("declared fixed output '{}' was not produced", out.name());
-    };
-    let algo = out.hash_algo();
-    let (recursive, algo_name) = match algo.strip_prefix("r:") {
-        Some(rest) => (true, rest),
-        None => (false, algo),
-    };
-    if algo_name != "sha256" {
-        // sha1/sha512 are verifiable in production; the harness corpus
-        // only uses sha256 (and the deliberately-unsupported md5 entry,
-        // which must land here).
-        return format!("unsupported outputHashAlgo '{algo}' (fail-closed)");
-    }
-    let computed_hex = if recursive {
-        // NAR of the canonicalised output (already canonicalised by
-        // process_outputs) — its sha256 is exactly the nar_hash we
-        // already computed.
-        hex::encode(processed.nar_hash)
-    } else {
-        match std::fs::read(&processed.host_path) {
-            Ok(bytes) => hex::encode(sha2::Sha256::digest(&bytes)),
-            Err(e) => return format!("reading flat output: {e}"),
-        }
-    };
-    let declared = out.hash().to_ascii_lowercase();
-    if computed_hex == declared {
-        "ok".to_string()
-    } else {
-        format!("hash mismatch: declared {declared}, got {computed_hex}")
+fn check_fod_hash(drv: &Derivation, store_dir: &Path) -> String {
+    // Delegate to the production fail-closed gate (sha1/sha256/sha512,
+    // unknown algorithms rejected) instead of reimplementing it: the
+    // harness must exercise the same decision the activation will make,
+    // and the r[verify builder.fod.verify-hash] marker on this scenario
+    // depends on the production code path being the thing exercised.
+    match super::inputs::verify_fod_hashes(drv, store_dir) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("{e:#}"),
     }
 }
 

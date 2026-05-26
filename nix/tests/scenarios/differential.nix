@@ -330,6 +330,14 @@ pkgs.testers.runNixOSTest {
                 )
                 for oname, native in native_outputs.items():
                     expected = oracle[oname]
+                    # The realized path must match, not just the content:
+                    # for floating-CA outputs an identical NAR with a wrong
+                    # computed content-address is exactly the registration
+                    # bug this harness exists to catch.
+                    assert native["store_path"] == expected["path"], (
+                        f"{name}!{oname}: realized store path differs: "
+                        f"{native['store_path']} != {expected['path']}"
+                    )
                     if native["nar_hash"] != expected["nar_hex"]:
                         # Show the divergence before failing.
                         native_dir = f"/tmp/native/{name}/store/" + expected["path"].split("/")[-1]
