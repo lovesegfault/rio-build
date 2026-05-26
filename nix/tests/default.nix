@@ -1161,6 +1161,12 @@ in
               # containerd cgroup-chown gap; vmtest-full-nonpriv.yaml).
               privileged: null
               seccompProfile: null
+              # The native executor reads RIO_HASHED_MIRRORS from the
+              # Pool spec (controller env injection); the legacy
+              # nixConf.hashedMirrors ConfigMap above only fed the
+              # removed nix-daemon path and goes away with it.
+              hashedMirrors:
+                - http://upstream-v4/
         '')
       ];
     };
