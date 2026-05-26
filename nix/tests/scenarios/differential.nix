@@ -24,8 +24,15 @@
 {
   pkgs,
   rio-workspace,
+  # Nightly tier: adds the 32-bit (i686) corpus and a real stdenv build
+  # on top of the merge-gate corpus. Too heavy for the per-PR gate —
+  # exposed as `packages.vm-differential-nightly` (see flake.nix), run
+  # by .github/workflows/nightly.yml or manually.
+  nightly ? false,
 }:
 let
+  inherit (pkgs) lib;
+
   # The corpus builders: a static bash (the builder executable, so
   # structuredAttrs' `.attrs.sh` — bash syntax — sources cleanly, exactly
   # like stdenv builds) and a static busybox (PATH utilities).
@@ -36,6 +43,48 @@ let
   sandboxShell = pkgs.busybox-sandbox-shell;
 
   corpusFile = ../lib/derivations/differential-corpus.nix;
+
+  # ── Nightly tier ────────────────────────────────────────────────────
+  # 32-bit busybox: every syscall in the i686-* entries goes through
+  # the i386 ABI, exercising the multi-ABI seccomp filter. The glibc
+  # (non-static) i686 build is used because its toolchain is
+  # substitutable — the static musl32 variants would bootstrap a cross
+  # toolchain from source on every cold cache.
+  busybox32 = pkgs.pkgsi686Linux.busybox;
+  corpusNightlyFile = ../lib/derivations/differential-corpus-nightly.nix;
+
+  # Real stdenv probe: a genuine stdenv.mkDerivation (setup.sh, phases,
+  # cc-wrapper, fixupPhase) instead of an inline-busybox script. The
+  # expression lives in its own corpus file and is instantiated INSIDE
+  # the VM (so no derivation closure has to be exported from the host);
+  # the host evaluates the same file only to reach `.inputDerivation`,
+  # whose closure ships the probe's build-time dependencies into the VM
+  # store. See the header of differential-stdenv-probe.nix.
+  stdenvProbeFile = ../lib/derivations/differential-stdenv-probe.nix;
+  stdenvProbe =
+    (import stdenvProbeFile {
+      pkgsPath = pkgs.path;
+      inherit (pkgs.stdenv.hostPlatform) system;
+    }).stdenv-probe;
+
+  nightlyEntryMeta = {
+    i686-trivial = {
+      expect = "parity";
+      corpus = "nightly";
+    };
+    i686-setuid-attempt = {
+      expect = "parity";
+      corpus = "nightly";
+    };
+    i686-multi-output = {
+      expect = "parity";
+      corpus = "nightly";
+    };
+    stdenv-probe = {
+      expect = "parity";
+      corpus = "stdenv";
+    };
+  };
 
   # Per-entry expectations, consumed by the testScript.
   #
@@ -131,21 +180,23 @@ let
       # now realize the same content-addressed paths as the oracle.
       expect = "parity";
     };
-  };
+  }
+  // lib.optionalAttrs nightly nightlyEntryMeta;
 in
 pkgs.testers.runNixOSTest {
-  name = "rio-differential";
+  name = "rio-differential" + lib.optionalString nightly "-nightly";
   # Two real sandboxed builds per corpus entry plus the driver's own
-  # closure copies; generous but bounded.
-  globalTimeout = 3600;
+  # closure copies; generous but bounded. The nightly tier adds the
+  # stdenv probe (a real cc invocation per side) and the i686 entries.
+  globalTimeout = if nightly then 7200 else 3600;
 
   nodes.machine =
     { pkgs, ... }:
     {
       virtualisation = {
         cores = 4;
-        memorySize = 4096;
-        diskSize = 8192;
+        memorySize = if nightly then 6144 else 4096;
+        diskSize = if nightly then 16384 else 8192;
         # The oracle (`nix-build`) needs a writable store. The native
         # side does NOT build against /nix/store (the driver copies the
         # closure into a scratch dir), so the worker fixtures'
@@ -158,6 +209,20 @@ pkgs.testers.runNixOSTest {
           busyboxStatic
           sandboxShell
           "${corpusFile}"
+        ]
+        ++ lib.optionals nightly [
+          busybox32
+          "${corpusNightlyFile}"
+          "${stdenvProbeFile}"
+          # The nixpkgs source tree, so the VM can instantiate the
+          # stdenv probe itself …
+          "${pkgs.path}"
+          # … and the OUTPUTS of everything the probe builds with
+          # (cc-wrapper, binutils, glibc, coreutils, …), which is
+          # exactly what inputDerivation's closure carries. The probe's
+          # own output is deliberately NOT shipped — both sides must
+          # genuinely build it inside the VM.
+          stdenvProbe.inputDerivation
         ];
       };
 
@@ -191,6 +256,12 @@ pkgs.testers.runNixOSTest {
     BUSYBOX = "${busyboxStatic}"
     SANDBOX_SHELL = "${sandboxShell}/bin/busybox"
     CORPUS = "${corpusFile}"
+    # Nightly tier only; empty strings (and never referenced) in the
+    # merge-gate variant.
+    CORPUS_NIGHTLY = "${lib.optionalString nightly "${corpusNightlyFile}"}"
+    BUSYBOX32 = "${lib.optionalString nightly "${busybox32}"}"
+    CORPUS_STDENV = "${lib.optionalString nightly "${stdenvProbeFile}"}"
+    PKGS_PATH = "${lib.optionalString nightly "${pkgs.path}"}"
     META = json.loads('${builtins.toJSON entryMeta}')
 
     divergences = []
@@ -201,7 +272,23 @@ pkgs.testers.runNixOSTest {
         return base64.b64decode(sri.split("-", 1)[1]).hex()
 
 
-    def instantiate(attr):
+    def instantiate(attr, meta):
+        if meta.get("corpus") == "nightly":
+            return machine.succeed(
+                "nix-instantiate --impure "
+                f"--arg busybox32 'builtins.storePath \"{BUSYBOX32}\"' "
+                f"-A {attr} {CORPUS_NIGHTLY}"
+            ).strip()
+        if meta.get("corpus") == "stdenv":
+            # The probe file does a pristine `import <nixpkgs>` itself;
+            # instantiation takes a while the first time (full stdenv
+            # eval) but builds against dependencies already shipped via
+            # additionalPaths.
+            return machine.succeed(
+                "nix-instantiate --impure "
+                f"--arg pkgsPath 'builtins.storePath \"{PKGS_PATH}\"' "
+                f"-A {attr} {CORPUS_STDENV}"
+            ).strip()
         return machine.succeed(
             "nix-instantiate --impure "
             f"--arg busybox 'builtins.storePath \"{BUSYBOX}\"' "
@@ -286,7 +373,7 @@ pkgs.testers.runNixOSTest {
 
     def check_entry(name, meta):
         with subtest(f"corpus entry: {name}"):
-            drv = instantiate(name)
+            drv = instantiate(name, meta)
             # Later corpus entries depend on earlier entries' outputs
             # (e.g. erg-with-drv exports the trivial entry's graph), and
             # the native driver computes its input closure with

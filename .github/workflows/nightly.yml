@@ -1,0 +1,34 @@
+name: nightly
+# Nightly-tier targets: too heavy for the per-PR merge gate, still worth
+# continuous signal. Currently just the nightly differential parity
+# harness (merge-gate corpus + i686 entries + a real stdenv build through
+# the native executor); add further nightly-only targets here rather
+# than growing the ci.yml matrices.
+on:
+  schedule:
+    # 09:17 UTC daily — after the bulk of CI traffic, before the work day.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC → niks3
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  differential-nightly:
+    name: vm-differential-nightly
+    runs-on: rio-ci-kvm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+        with:
+          kvm: true
+      - name: Verify KVM
+        run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
+      - name: Build the nightly differential harness
+        run: nix build --print-build-logs .#vm-differential-nightly

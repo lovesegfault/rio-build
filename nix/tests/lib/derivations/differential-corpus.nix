@@ -19,9 +19,11 @@
 # handles fine, but inline scripts keep the input closure to exactly
 # `busybox`, which keeps the per-entry copy fast.
 #
-# Nightly-tier entries (stdenv bootstrap, i686) are deliberately absent:
-# they are not viable in the per-PR merge gate. TODO(nixless-m7): add a
-# nightly-tier variant of this corpus that includes them.
+# Nightly-tier entries (stdenv, i686) are deliberately absent: they are
+# not viable in the per-PR merge gate. They live in
+# differential-corpus-nightly.nix (i686) plus a host-instantiated stdenv
+# probe in scenarios/differential.nix, wired as `nix build
+# .#vm-differential-nightly`.
 {
   busybox,
   bash,

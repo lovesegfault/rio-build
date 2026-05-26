@@ -934,6 +934,17 @@
                 tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
                 # Typst design book outputs.
                 inherit (docsLib) docs docs-pdf;
+                # Nightly-tier differential parity harness: the merge-gate
+                # corpus plus the 32-bit (i686) entries and a real stdenv
+                # build through the native executor. Deliberately NOT in
+                # `checks` (and not in any CI matrix or the coverage
+                # matrix) — too heavy for the per-PR gate. Run by
+                # .github/workflows/nightly.yml, or manually:
+                #   nix build .#vm-differential-nightly
+                vm-differential-nightly = import ./nix/tests/scenarios/differential.nix {
+                  inherit pkgs rio-workspace;
+                  nightly = true;
+                };
               }
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`
