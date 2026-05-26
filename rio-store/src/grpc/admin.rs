@@ -604,7 +604,9 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// CASCADE'd manifests, path_tenants, and — unless
     /// `keep_realisations` — realisations/realisation_deps resolving
     /// to it) so the next submission misses and re-executes. Chunk
-    /// data is untouched; GC reclaims orphans on its normal sweep.
+    /// refcounts are decremented exactly as the GC sweep would have
+    /// done for this path (zeroed chunks get enqueued for the S3
+    /// drain); chunk bytes themselves are never touched here.
     /// Idempotent: an absent path returns `found = false` with zero
     /// counts.
     #[instrument(skip(self, request), fields(rpc = "InvalidatePath"))]
@@ -618,10 +620,14 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let store_path = rio_nix::store_path::StorePath::parse(&req.store_path)
             .status_invalid(&format!("invalid store_path {:?}", req.store_path))?;
 
-        let counts =
-            metadata::invalidate::invalidate_path(&self.pool, &store_path, req.keep_realisations)
-                .await
-                .map_err(|e| super::metadata_status("InvalidatePath", e))?;
+        let counts = metadata::invalidate::invalidate_path(
+            &self.pool,
+            &store_path,
+            req.keep_realisations,
+            self.chunk_backend.as_ref(),
+        )
+        .await
+        .map_err(|e| super::metadata_status("InvalidatePath", e))?;
 
         info!(
             store_path = %store_path,
