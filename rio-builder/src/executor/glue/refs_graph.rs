@@ -16,15 +16,22 @@
 //! Both forms need the same two computations, which live here: the
 //! closure of the requested paths *within the build's input closure*
 //! (a path outside it is an input-rejection, matching CppNix
-//! `exportReferences`), and the per-path info rendering.
+//! `exportReferences`), and the per-path info rendering. Like CppNix,
+//! the closure is then expanded with the output closures of any `.drv`
+//! files it contains (see `closure_of`).
 //!
-//! The closure data comes from the input metadata rio already fetched
-//! for the synthetic-DB path (`ValidatedPathInfo`: references, NAR hash
-//! and size) — no additional store round-trips.
+//! The closure data comes from the input metadata that accompanies the
+//! build's input manifest (`ValidatedPathInfo`: references, NAR hash
+//! and size) — no store round-trips; the only file access is reading
+//! `.drv` text from the already-materialized input store during the
+//! expansion above.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 
+use rio_nix::derivation::Derivation;
 use rio_nix::hash::{HashAlgo, NixHash};
+use rio_nix::store_path::basename;
 use rio_proto::validated::ValidatedPathInfo;
 use serde_json::Value;
 
@@ -36,6 +43,11 @@ pub(crate) struct ClosureIndex<'a> {
     /// The full input closure (every store path the build may read).
     /// Membership here is the "is it in the input closure" gate.
     input_closure: BTreeSet<&'a str>,
+    /// Host directory holding the materialized inputs (the merged-store
+    /// bind source), used to read `.drv` contents when a graph closure
+    /// needs derivation-output expansion. `None` only in callers whose
+    /// graphs cannot contain `.drv` paths (unit fixtures).
+    store_dir: Option<&'a Path>,
 }
 
 impl<'a> ClosureIndex<'a> {
@@ -46,7 +58,16 @@ impl<'a> ClosureIndex<'a> {
                 .map(|i| (i.store_path.as_str(), i))
                 .collect(),
             input_closure: input_paths.iter().map(String::as_str).collect(),
+            store_dir: None,
         }
+    }
+
+    /// Provide the host directory the input closure is materialized in,
+    /// enabling `.drv` closure expansion (reading the drv text is the
+    /// only file access this module performs).
+    pub(crate) fn with_store_dir(mut self, dir: &'a Path) -> Self {
+        self.store_dir = Some(dir);
+        self
     }
 
     /// The closure of `targets` (BFS over references), all of which must
@@ -80,23 +101,87 @@ impl<'a> ClosureIndex<'a> {
             }
         }
 
-        // CppNix expands the closure with the outputs of any .drv files
-        // it contains (the closureInfo / NixOS-image pattern). That
-        // expansion needs the .drv *contents* (to learn its outputs) and
-        // those outputs' own closures — neither of which is part of the
-        // build's input metadata. Today the daemon-based path fails the
-        // same way (the synthetic DB doesn't contain those outputs
-        // either), so rather than half-implement it we reject loudly.
-        // TODO: support .drv expansion by parsing the .drv from the
-        // merged store and requiring its outputs to be present in the
-        // input closure.
-        if let Some(drv) = closure.iter().find(|p| p.ends_with(".drv")) {
-            return Err(GlueError::ExportRefsDrvExpansionUnsupported {
-                path: (*drv).to_owned(),
-            });
+        // CppNix (`LocalDerivationGoal::exportReferences`) post-processes
+        // the closure: every `.drv` file in it is parsed and the closure
+        // of each of its *outputs* is unioned in — the pattern used to
+        // hand a build the full build-time dependency graph of something
+        // (installer images, `closureInfo`-style registration sets). Two
+        // details mirrored exactly:
+        //   - the expansion runs over a snapshot of the closure, so a
+        //     `.drv` that only appears inside an expanded output closure
+        //     is not itself expanded;
+        //   - an output without a statically-known path (content-
+        //     addressed derivation) is an error, as in CppNix.
+        // CppNix reads output closures from the global store DB; the
+        // worker's view of the store is the input metadata index, so
+        // every expanded path must be present there. Whenever the
+        // deriving expression used `drvPath`-style context the resolver
+        // has already pulled those outputs into the input set, so this
+        // is the common case rather than an extra requirement.
+        let drvs: Vec<&'a str> = closure
+            .iter()
+            .copied()
+            .filter(|p| p.ends_with(".drv"))
+            .collect();
+        for drv_path in drvs {
+            for (output, out_path) in self.drv_outputs(drv_path)? {
+                if out_path.is_empty() {
+                    return Err(GlueError::ExportRefsDrvFloatingOutput {
+                        drv: drv_path.to_owned(),
+                        output,
+                    });
+                }
+                // BFS the output's closure out of the index. Unlike the
+                // requested graph targets, the output is not required to
+                // be inside the *input closure* (the registration file
+                // may name paths the sandbox cannot read — same as
+                // CppNix), but it must be known to the index.
+                let mut queue: Vec<&str> = vec![out_path.as_str()];
+                while let Some(p) = queue.pop() {
+                    let Some(info) = self.by_path.get(p) else {
+                        return Err(GlueError::ExportRefsDrvOutputMissing {
+                            drv: drv_path.to_owned(),
+                            path: p.to_owned(),
+                        });
+                    };
+                    if !closure.insert(info.store_path.as_str()) {
+                        continue;
+                    }
+                    for r in &info.references {
+                        queue.push(r.as_str());
+                    }
+                }
+            }
         }
 
         Ok(closure)
+    }
+
+    /// Read and parse a `.drv` from the materialized input store and
+    /// return its `(output name, declared store path)` pairs (the
+    /// declared path is empty for floating content-addressed outputs).
+    fn drv_outputs(&self, drv_store_path: &str) -> Result<Vec<(String, String)>, GlueError> {
+        let unreadable = |reason: String| GlueError::ExportRefsDrvUnreadable {
+            path: drv_store_path.to_owned(),
+            reason,
+        };
+        let Some(dir) = self.store_dir else {
+            return Err(unreadable(
+                "no materialized input store is available to this caller".to_owned(),
+            ));
+        };
+        let Some(base) = basename(drv_store_path) else {
+            return Err(unreadable("not a valid store path".to_owned()));
+        };
+        let host_path = dir.join(base);
+        let text = std::fs::read_to_string(&host_path)
+            .map_err(|e| unreadable(format!("reading {}: {e}", host_path.display())))?;
+        let drv = Derivation::parse(&text).map_err(|e| unreadable(format!("parsing: {e}")))?;
+        Ok(drv
+            .outputs()
+            .iter()
+            .map(|o| (o.name().to_owned(), o.path().to_owned()))
+            .collect())
     }
 
     /// The legacy registration text for the closure of `targets`.
@@ -318,17 +403,117 @@ mod tests {
         assert!(matches!(err, GlueError::ExportRefsOutsideClosure { path } if path == OUTSIDE));
     }
 
+    const DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-probe.drv";
+    const DOUT: &str = "/nix/store/ffffffffffffffffffffffffffffffff-probe-out";
+
+    /// Write a minimal input-addressed `.drv` (ATerm) into `dir` under
+    /// the store-path basename, declaring the given `(name, path)`
+    /// outputs.
+    fn write_drv(dir: &std::path::Path, drv_store_path: &str, outputs: &[(&str, &str)]) {
+        let outs: Vec<String> = outputs
+            .iter()
+            .map(|(n, p)| format!("(\"{n}\",\"{p}\",\"\",\"\")"))
+            .collect();
+        let env: Vec<String> = outputs
+            .iter()
+            .map(|(n, p)| format!("(\"{n}\",\"{p}\")"))
+            .collect();
+        let aterm = format!(
+            "Derive([{}],[],[],\"x86_64-linux\",\"/bin/sh\",[],[{}])",
+            outs.join(","),
+            env.join(",")
+        );
+        std::fs::write(dir.join(basename(drv_store_path).unwrap()), aterm).unwrap();
+    }
+
     #[test]
-    fn drv_in_closure_is_rejected_for_now() {
-        let drv_path = "/nix/store/dddddddddddddddddddddddddddddddd-x.drv";
-        let infos = vec![info(A, 10, &[drv_path]), info(drv_path, 5, &[])];
-        let paths = vec![A.to_string(), drv_path.to_string()];
+    fn drv_in_closure_expands_to_its_output_closure() {
+        // A (the requested target) → DRV; DRV declares output DOUT → C.
+        // The graph must contain {A, DRV, DOUT, C}: the derivation
+        // closure plus each output's closure, exactly CppNix's
+        // `exportReferences` expansion. DOUT and C are deliberately NOT
+        // part of the input closure — expanded outputs only need
+        // metadata, not sandbox visibility.
+        let infos = vec![
+            info(A, 10, &[DRV]),
+            info(DRV, 5, &[]),
+            info(DOUT, 30, &[C]),
+            info(C, 40, &[]),
+        ];
+        let paths = vec![A.to_string(), DRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        write_drv(tmp.path(), DRV, &[("out", DOUT)]);
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+
+        let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
+        for p in [A, DRV, DOUT, C] {
+            assert!(text.contains(p), "{p} missing from registration:\n{text}");
+        }
+
+        // The structured-attrs JSON form sees the same expansion, with
+        // closure sizes computed over the expanded set.
+        let v = index.closure_info_json(&[A.to_string()]).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        let dout = arr.iter().find(|e| e["path"] == DOUT).unwrap();
+        assert_eq!(dout["closureSize"], serde_json::json!(70));
+    }
+
+    #[test]
+    fn drv_floating_output_is_rejected() {
+        let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
+        let paths = vec![A.to_string(), DRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        // Floating-CA output: empty declared path, hash algo set.
+        std::fs::write(
+            tmp.path().join(basename(DRV).unwrap()),
+            "Derive([(\"out\",\"\",\"r:sha256\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[],[(\"out\",\"\")])",
+        )
+        .unwrap();
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsDrvFloatingOutput { ref output, .. } if output == "out"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn drv_output_without_metadata_is_rejected() {
+        // DRV declares DOUT but the index has no metadata for it.
+        let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
+        let paths = vec![A.to_string(), DRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        write_drv(tmp.path(), DRV, &[("out", DOUT)]);
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsDrvOutputMissing { ref path, .. } if path == DOUT),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unreadable_drv_is_rejected() {
+        let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
+        let paths = vec![A.to_string(), DRV.to_string()];
+
+        // No store dir at all.
         let index = ClosureIndex::new(&infos, &paths);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
-        assert!(matches!(
-            err,
-            GlueError::ExportRefsDrvExpansionUnsupported { .. }
-        ));
+        assert!(
+            matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
+            "{err}"
+        );
+
+        // Store dir present but the .drv file is missing from it.
+        let tmp = tempfile::tempdir().unwrap();
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
+            "{err}"
+        );
     }
 
     #[test]

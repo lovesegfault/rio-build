@@ -174,14 +174,16 @@ rec {
       };
 
   # exportReferencesGraph whose exported closure contains a .drv file:
-  # the closure-expansion rule. Real Nix expands the graph; the current
-  # request glue rejects it (ExportRefsDrvExpansionUnsupported) — a
-  # known divergence the harness records as the M7 punch-list item.
+  # the closure-expansion rule. Both sides expand the graph with the
+  # .drv's output closures (CppNix `exportReferences`; the glue's
+  # ClosureIndex mirrors it), so the registration file — and therefore
+  # the output NAR — must be byte-identical. No fallback on the cp: a
+  # missing graph file must fail the build, not converge on a stub.
   erg-with-drv =
     mkDrv "rio-diff-erg-drv"
       ''
         mkdir -p $out
-        cp refs $out/refs || echo "no-graph" > $out/refs
+        cp refs $out/refs
       ''
       {
         exportReferencesGraph = [

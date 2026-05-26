@@ -75,11 +75,20 @@ pub(crate) enum GlueError {
     #[error("exportReferencesGraph: no metadata for closure path {path}")]
     ExportRefsMissingMetadata { path: String },
 
+    #[error("exportReferencesGraph: cannot read derivation {path} for closure expansion: {reason}")]
+    ExportRefsDrvUnreadable { path: String, reason: String },
+
     #[error(
-        "exportReferencesGraph closure contains a .drv ({path}); expanding derivation outputs \
-         is not supported"
+        "exportReferencesGraph: cannot expand {drv}: output `{output}` has no statically-known \
+         store path (content-addressed derivations are not supported here, matching Nix)"
     )]
-    ExportRefsDrvExpansionUnsupported { path: String },
+    ExportRefsDrvFloatingOutput { drv: String, output: String },
+
+    #[error(
+        "exportReferencesGraph: expanding {drv} requires path info for {path}, which is not in \
+         the build's input metadata"
+    )]
+    ExportRefsDrvOutputMissing { drv: String, path: String },
 
     #[error("exportReferencesGraph value is malformed (expected `name path` pairs): {value}")]
     ExportRefsMalformed { value: String },
@@ -195,14 +204,6 @@ pub(crate) struct PlannedOutput {
 #[derive(Debug)]
 pub(crate) struct PreparedBuild {
     pub request: ExecutionRequest,
-    /// Placeholder → in-sandbox path map used while constructing the
-    /// request. The floating-CA finalization derives its own
-    /// scratch→final rewrites from the planned outputs, so nothing
-    /// reads this yet; it is kept because the upload-threading
-    /// follow-up (TODO(M8) in `collect_native_outputs`) needs the same
-    /// map to translate placeholder references in failure diagnostics.
-    #[allow(dead_code)]
-    pub input_rewrites: BTreeMap<String, String>,
     /// Outputs in derivation declaration order.
     pub outputs: Vec<PlannedOutput>,
 }
@@ -262,7 +263,8 @@ pub(crate) fn derivation_into_request(
     let env::BuilderEnv { env, passed_files } = env::build_env(drv, &input_rewrites, &env_opts);
 
     // ---- inline files ---------------------------------------------------
-    let closure = ClosureIndex::new(input_metadata, input_paths);
+    let closure =
+        ClosureIndex::new(input_metadata, input_paths).with_store_dir(&paths.merged_store);
     let mut inline_files: Vec<InlineFile> = Vec::new();
 
     for pf in passed_files {
@@ -408,7 +410,6 @@ pub(crate) fn derivation_into_request(
 
     Ok(GluePlan::Sandbox(Box::new(PreparedBuild {
         request,
-        input_rewrites,
         outputs,
     })))
 }

@@ -82,10 +82,7 @@ let
       ];
     };
     erg-with-drv = {
-      expect = "diverge";
-      nix = "succeeds";
-      rio_glue_error = "exportReferencesGraph";
-      note = "drv-closure expansion is unimplemented in the request glue; M7 punch list";
+      expect = "parity";
     };
     disallowed-requisites = {
       expect = "both-fail";

@@ -55,8 +55,9 @@ impl BuildOutputs {
 /// - the upload still re-streams each output from disk (the store needs
 ///   the NAR bytes regardless); the scan pass inside `prepare_output`
 ///   is redundant with the pipeline's scan and is kept for now —
-///   TODO(M8): pass the precomputed reference sets into the upload
-///   module and drop its rescan.
+///   TODO: pass the precomputed reference sets into the upload module
+///   and drop its rescan (it re-scans every output NAR for store-path
+///   references the result pipeline has already extracted).
 /// - `content_address` is threaded through so floating-CA narinfos
 ///   carry their `CA:` field.
 #[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]

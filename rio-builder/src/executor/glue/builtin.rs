@@ -59,7 +59,7 @@ pub(crate) fn prepare_fetchurl(
         .filter(|u| !u.is_empty())
         .ok_or(GlueError::FetchurlMissingUrl)?;
 
-    let (input_rewrites, outputs) = plan_outputs(drv_path, drv)?;
+    let (_, outputs) = plan_outputs(drv_path, drv)?;
     // builtin:fetchurl always has exactly one output; tolerate anything
     // else by fetching into the first declared output (parity with the
     // daemon, which only ever looked at "out").
@@ -220,11 +220,7 @@ pub(crate) fn prepare_fetchurl(
         .validate()
         .map_err(|e| GlueError::InvalidRequest(e.to_string()))?;
 
-    Ok(PreparedBuild {
-        request,
-        input_rewrites,
-        outputs,
-    })
+    Ok(PreparedBuild { request, outputs })
 }
 
 #[cfg(test)]
