@@ -456,14 +456,18 @@ impl SchedulerDb {
     /// The mirror columns are frozen as of the T-1b.13 cutover: their
     /// per-counter writers are gone and only the reset paths still zero
     /// them, so they hold at most what the pre-cutover writers left.
-    // TODO: Phase 2 drops the `derivations.{retry_count, failed_builders,
+    // TODO: drop the `derivations.{retry_count, failed_builders,
     // resubmit_cycles}` mirror columns, this seed loader, and the
     // `legacy_seed` parameter of `decide()` (restoring the frozen §5a-2
     // 3-arg signature) once the drain condition holds: no non-terminal or
     // poisoned derivation has non-empty mirror columns together with an
     // attempt suffix that contains no reset row — i.e. every live failure
     // history is either fully post-066 or has passed through a reset that
-    // makes the seed unreachable.
+    // makes the seed unreachable. The Phase-2 close-out deferred the drop
+    // (the condition is unmet by definition at the 066 release boundary);
+    // the operational drain probe and the retirement checklist live in
+    // docs/spec/models/retry-invariant-map.md ("Mirror-column
+    // retirement").
     pub(crate) async fn load_retry_seed_in_tx(
         tx: &mut PgConnection,
         derivation_id: uuid::Uuid,

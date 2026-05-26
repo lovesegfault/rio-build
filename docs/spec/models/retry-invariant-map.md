@@ -1892,3 +1892,74 @@ the invariant, Kani harness, or test that owns them. The rows that were
 never in the decision path (build-level bookkeeping, serialization,
 tracing metadata, the floor ladder's internals, the lease fence) keep
 their existing vehicles, unchanged.
+
+### Mirror-column retirement: deferred behind the drain condition
+
+The Phase-2 hand-off names the DROP of the three frozen mirror columns
+(`derivations.{retry_count, failed_builders, resubmit_cycles}`) plus
+the removal of the legacy floor (`decide()`'s `legacy_seed` argument,
+`load_retry_seed_in_tx`, `DerivationState::legacy_retry_floor`, the
+`load_poisoned_display` legacy union), restoring the frozen §5a-2
+three-argument `decide()`. `poisoned_at` is not part of the drop — it
+is the poison-lifecycle carve-out (`sched.poison.ttl-persist`), not a
+counter mirror. Decision: **deferred — no migration 067 ships in this
+phase, and the legacy-seed code path stays.**
+
+Why: the drop is gated (T-1b.13, decision P5) on the drain condition —
+no non-terminal or poisoned derivation has non-empty mirror columns
+together with a reset-free attempt suffix. At the release boundary that
+ships Phases 1+2 this condition is unmet *by definition*: every
+deployment that upgrades through migration 066 still carries pre-066
+failure histories whose only record is the mirror columns, and those
+histories stay live until each such derivation completes, passes
+through a durable reset (resubmit, cache-hit clear, poison clear), or
+is removed. Dropping the columns in the same release train would forget
+exactly the state the design's §5 1b gate ("no counter that survives
+failover today stops surviving") and `sched.retry.failover-budget`
+exist to preserve — the upgrade itself would act as the budget refresh
+the rule forbids. A guard inside the migration (fail the deploy if
+undrained rows exist) was considered and rejected: migrations are
+frozen and run unconditionally at startup, so a data-dependent failure
+mode would turn routine deploys into outages on exactly the
+deployments that most need the seed.
+
+What this phase records instead:
+
+- The columns stay frozen: no writer has touched them since the
+  T-1b.13 cutover except the reset paths zeroing them, which is the
+  durable counterpart of "a reset-row suffix ignores the seed" and
+  must be retired together with the columns, not before.
+- The seed semantics are pinned by the fold unit battery and stated
+  as Kani contracts (`check_decide_contract`'s seed-floor clause,
+  `check_legacy_seed_merge_monotone`), so the transitional argument
+  keeps a precisely specified surface while it lives.
+- The operational drain probe, so the eventual drop is a measurement
+  rather than a guess — run against a deployment considering the drop
+  (statuses listed are the non-terminal set plus `poisoned`):
+
+  ```sql
+  SELECT count(*)
+  FROM derivations d
+  WHERE d.status IN ('created','queued','ready','assigned',
+                     'running','substituting','poisoned')
+    AND (COALESCE(d.retry_count, 0) > 0
+         OR COALESCE(array_length(d.failed_builders, 1), 0) > 0
+         OR COALESCE(d.resubmit_cycles, 0) > 0)
+    AND NOT EXISTS (
+          SELECT 1 FROM drv_attempts a
+          WHERE a.derivation_id = d.derivation_id
+            AND a.event_kind = 'reset');
+  ```
+
+  When this returns 0 (or the operator explicitly accepts forgetting
+  the residual rows it returns), a later release ships migration 067:
+  DROP the three columns; delete `load_retry_seed_in_tx`, the
+  `legacy_seed` argument and the P5 floor block in `decide()` (the
+  contracts' seed clauses go with them), `legacy_retry_floor` and its
+  construction sites, and the `load_poisoned_display` legacy union;
+  frozen-migration rules apply (M_067 commentary in
+  `rio-migrations/src/migrations.rs`, new PINNED checksum, the regen
+  umbrella).
+
+The `// TODO:` at `load_retry_seed_in_tx` (db/derivations.rs) is the
+code-side anchor for this decision and now points at this subsection.
