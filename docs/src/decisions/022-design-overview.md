@@ -61,13 +61,16 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 └────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌── rio-mountd (DaemonSet, root, CAP_SYS_ADMIN) ─────┐
-│  setup:  open("/dev/fuse") (keep dup), mount fuse  │──── SCM_RIGHTS ───► builder
+│  setup:  keep the builder-opened /dev/fuse dup     │◄─── SCM_RIGHTS ──── builder
+│          from Mount{} (no device open, no mount —  │     (builder opens + mount(2)s
+│          the builder mounts in its own ns)         │      its own fd)
 │          mkdir staging/{build_id} (builder uid)    │
 │  serve:  BackingOpen{fd} → ioctl BACKING_OPEN → id │◄─── per-open ─────► builder
 │          Promote{digest} → verify-copy → cache     │
 │  owns:   /var/rio/cache/ (read-only to builders)   │
-│  on UDS close: umount2(MNT_DETACH), rm staging     │
-│  on start: scan + reap orphaned castore_mnt mounts │
+│  on UDS close: rm staging, release uid/build_id    │
+│  on start: scan + reap pre-cutover orphan mounts,  │
+│            staging trees, .promoting placeholders  │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -75,7 +78,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 
 The builder assembles `/nix/store` from two layers per build:
 
-1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
+1. **castore-FUSE** — a `fuser` filesystem the builder mounts on a per-build mountpoint inside its own mount namespace (under the build's working area; the `/dev/fuse` fd comes from rio-mountd) serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
 
 r[builder.overlay.castore-lower]
 
@@ -240,14 +243,15 @@ The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not open
 
 | Step | Actor | Action |
 |---|---|---|
-| 1 | rio-mountd | `fuse_fd = open("/dev/fuse")`; **keep a `dup()`**; `mount("fuse", "/var/rio/castore/{build_id}", …, "fd=N,allow_other,default_permissions,…")`; send fd over UDS via `SCM_RIGHTS` |
-| 2 | builder | receive fuse fd; spawn castore-FUSE server on it (`fuser::Session::from_fd`) |
+| 1 | builder | `fuse_fd = open("/dev/fuse")` (the device node every executor pod carries via containerd's `base_runtime_spec`); send `Mount{build_id}` with a dup of the fd in `SCM_RIGHTS`. The kernel only accepts a fuse `mount(2)` from the user namespace that opened the device, so the builder must be the opener |
+| 1′ | rio-mountd | keep the received fd for the connection's lifetime (the `BackingOpen`/`BackingClose` ioctl target); create `staging/{build_id}` (0700, peer uid, project quota). **No device open, no mount** — the DaemonSet is unprivileged, so a daemon-side mount could never propagate into builder pods (P0560 option (b)) |
+| 2 | builder (in own userns) | `mount("fuse.rio-castore", castore_mnt, …, "fd=N,rootmode=40555,user_id=<own>,group_id=<own>,default_permissions")` on a builder-owned per-build mountpoint; spawn the castore-FUSE server on the fd (`fuser::Session::from_fd`) |
 | 3 | builder (in own userns) | `mount("overlay", merged, "overlay", 0, "userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>")`; bind `merged` → `/nix/store` |
 | per-open | builder → rio-mountd | `BackingOpen{cache_fd}` over UDS (`SCM_RIGHTS`) → mountd `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN)` → reply `backing_id`. `BackingClose{id}` on release. mountd does not inspect the fd — the ioctl rejects depth>0 backing, and `backing_id` is conn-scoped. |
 | per-promote | builder → rio-mountd | `Promote{digest}` → mountd opens `staging/<digest>`, stream-copies into mountd-owned `cache/ab/<digest>.promoting` while hashing, verifies `blake3 == digest`, renames into place, unlinks staging. |
-| teardown | rio-mountd | on UDS close: `umount2(castore_mnt, MNT_DETACH)`; `rm -rf staging/{build_id}`; `rmdir`; drop kept fuse-fd. Builder mount-ns death drops overlay. On daemon start: scan `/var/rio/castore/*` + `/var/rio/staging/*` and reap orphans (`r[builder.mountd.orphan-scan]`). |
+| teardown | builder, then rio-mountd | builder: `umount2(castore_mnt, MNT_DETACH)` + drop the UDS connection + abort the FUSE connection (its mount-ns death would drop both mounts anyway). rio-mountd on UDS close: `rm -rf staging/{build_id}`; release the uid/build_id claims; drop kept fuse-fd. On daemon start: scan `/var/rio/castore/*` (pre-cutover leftovers only) + `/var/rio/staging/*` and reap orphans (`r[builder.mountd.orphan-scan]`). |
 
-**Ordering is load-bearing:** the castore-FUSE server must be answering before step 3. overlayfs probes the lower's root at `mount(2)`; an unserved FUSE there deadlocks the mount syscall.
+**Ordering is load-bearing:** the castore-FUSE server must be answering before step 3 (and the step-2 `mount(2)` must precede serving — `Session::from_fd` answers the `FUSE_INIT` that mount queues). overlayfs probes the lower's root at `mount(2)`; an unserved FUSE there deadlocks the mount syscall.
 
 r[builder.mountd.backing-broker]
 
