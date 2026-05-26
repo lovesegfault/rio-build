@@ -13,7 +13,7 @@ mod stream;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio_stream::wrappers::ReceiverStream;
@@ -72,9 +72,55 @@ struct MockState {
     /// When set, the `GetChunks` server consumes one permit per chunk
     /// before sending it — tests gate fill progress by adding permits.
     chunk_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// The `x-rio-assignment-token` value seen on each castore RPC,
+    /// keyed by method name, in arrival order. `None` = the request
+    /// carried no token header.
+    seen_tokens: std::sync::Mutex<Vec<(&'static str, Option<String>)>>,
+    /// When set, any castore RPC arriving WITHOUT a token header is
+    /// rejected with `UNAUTHENTICATED` — the same shape rio-store's
+    /// tenant gate produces (`store.castore.tenant-scope`).
+    require_token: AtomicBool,
 }
 
 impl MockCastore {
+    /// Record the assignment token (if any) `request` carried and apply
+    /// the `require_token` gate. Called at the top of every castore
+    /// handler so tests can assert exactly what auth metadata each RPC
+    /// presented.
+    fn observe_token<T>(&self, method: &'static str, request: &Request<T>) -> Result<(), Status> {
+        let token = request
+            .metadata()
+            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let missing = token.is_none();
+        self.state.seen_tokens.lock().unwrap().push((method, token));
+        if missing && self.state.require_token.load(Ordering::SeqCst) {
+            return Err(Status::unauthenticated(
+                "DirectoryService requires a tenant: send a JWT or an HMAC assignment token",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Tokens observed for `method`, in arrival order.
+    fn tokens_for(&self, method: &str) -> Vec<Option<String>> {
+        self.state
+            .seen_tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| *m == method)
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+
+    /// Reject token-less castore RPCs with `UNAUTHENTICATED` from now
+    /// on (rio-store's tenant-gate behavior).
+    fn require_token(&self) {
+        self.state.require_token.store(true, Ordering::SeqCst);
+    }
+
     fn seed_dirs(&self, dirs: &HashMap<[u8; 32], Directory>) {
         let mut ordered: Vec<_> = dirs.values().cloned().collect();
         // Deterministic stream order (the client dedups by digest, so
@@ -189,6 +235,7 @@ impl DirectoryService for MockCastore {
         &self,
         request: Request<GetDirectoryRequest>,
     ) -> Result<Response<Self::GetDirectoryStream>, Status> {
+        self.observe_token("get_directory", &request)?;
         self.state
             .get_directory_calls
             .fetch_add(1, Ordering::SeqCst);
@@ -236,6 +283,7 @@ impl DirectoryService for MockCastore {
         &self,
         request: Request<ReadBlobRequest>,
     ) -> Result<Response<Self::ReadBlobStream>, Status> {
+        self.observe_token("read_blob", &request)?;
         self.state.read_blob_calls.fetch_add(1, Ordering::SeqCst);
         let digest: [u8; 32] = request
             .into_inner()
@@ -269,6 +317,7 @@ impl DirectoryService for MockCastore {
         &self,
         request: Request<StatBlobRequest>,
     ) -> Result<Response<StatBlobResponse>, Status> {
+        self.observe_token("stat_blob", &request)?;
         self.state.stat_blob_calls.fetch_add(1, Ordering::SeqCst);
         let req = request.into_inner();
         let digest: [u8; 32] = req
@@ -320,6 +369,7 @@ impl ChunkService for MockCastore {
         &self,
         request: Request<Streaming<GetChunksRequest>>,
     ) -> Result<Response<Self::GetChunksStream>, Status> {
+        self.observe_token("get_chunks", &request)?;
         let mut frames = request.into_inner();
         let state = Arc::clone(&self.state);
         let gate = state.chunk_gate.lock().unwrap().clone();
@@ -559,6 +609,10 @@ struct Harness {
 
 const FAST: Duration = Duration::from_secs(5);
 
+/// The assignment token the harness's `OpenPath` (and the token-aware
+/// tests) present on every castore RPC.
+const HARNESS_TOKEN: &str = "harness-assignment-token";
+
 async fn harness() -> Harness {
     harness_with(OpenConfig {
         jit_fetch_timeout: FAST,
@@ -590,6 +644,7 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
         tokio::runtime::Handle::current(),
         mountd,
         Arc::new(super::circuit::CircuitBreaker::default()),
+        HARNESS_TOKEN.to_string(),
         cfg,
     ));
     Harness {
@@ -624,6 +679,94 @@ fn seeded_blob(mock: &MockCastore, content: &[u8]) -> [u8; 32] {
     digest
 }
 
+// ─── assignment-token plumbing ─────────────────────────────────────────
+
+/// Every castore RPC must present the build's assignment token —
+/// rio-store derives the caller's tenant from it and rejects token-less
+/// requests as UNAUTHENTICATED. Covers the DAG prefetch (GetDirectory)
+/// and the whole-file JIT fetch (ReadBlob); the streaming fill's
+/// StatBlob/GetChunks coverage lives in `tests/stream.rs` next to the
+/// other fill tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn castore_rpcs_carry_the_assignment_token() {
+    // DAG prefetch.
+    let (mock, clients, _server) = spawn_mock_castore().await;
+    mock.require_token();
+    let fx = tree::tests::fixture();
+    mock.seed_dirs(&fx.dirs);
+    build_tree(&clients, &fx.roots, FAST, "tree-token")
+        .await
+        .expect("a token-bearing prefetch is accepted");
+    assert_eq!(
+        mock.tokens_for("get_directory"),
+        vec![Some("tree-token".to_string())],
+        "GetDirectory must carry x-rio-assignment-token"
+    );
+
+    // Whole-file JIT fetch through the harness's OpenPath.
+    let h = harness().await;
+    h.mock.require_token();
+    let content = b"token-carrying blob".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("a token-bearing JIT fetch is accepted");
+    assert_eq!(
+        h.mock.tokens_for("read_blob"),
+        vec![Some(HARNESS_TOKEN.to_string())],
+        "ReadBlob must carry x-rio-assignment-token"
+    );
+}
+
+/// When rio-store rejects the DAG prefetch as UNAUTHENTICATED (missing/
+/// tenant-less token, or no HMAC verifier on the store), the mount must
+/// fail with the dedicated, actionable error — not the generic
+/// "is the indexer running?" wording, and never a panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_castore_prefetch_is_an_actionable_mount_failure() {
+    use super::mount::{CastoreMountError, CastoreOptions, MountInputs, prepare_mount};
+
+    let (mock, clients, _server) = spawn_mock_castore().await;
+    mock.require_token();
+    let fx = tree::tests::fixture();
+    mock.seed_dirs(&fx.dirs);
+
+    let opts = CastoreOptions::from_config(&crate::config::Config::default());
+    let circuit = Arc::new(super::circuit::CircuitBreaker::default());
+    let runtime = tokio::runtime::Handle::current();
+    let roots = fx.roots.clone();
+    // prepare_mount bridges async via block_on — run it the way the
+    // executor does, on a thread that may block.
+    let err = tokio::task::spawn_blocking(move || {
+        prepare_mount(
+            &MountInputs {
+                build_id: "b-unauth",
+                roots: &roots,
+                // No token → the mock (like rio-store) rejects with
+                // UNAUTHENTICATED before streaming any Directory body.
+                assignment_token: "",
+            },
+            clients,
+            runtime,
+            circuit,
+            &opts,
+        )
+        .err()
+        .expect("an unauthenticated prefetch must fail the mount")
+    })
+    .await
+    .expect("prepare_mount must not panic");
+
+    assert!(
+        matches!(err, CastoreMountError::Unauthenticated { .. }),
+        "got {err:?}"
+    );
+    let msg = err.to_string();
+    for needle in ["unauthenticated", "assignment token", "tenant", "HMAC"] {
+        assert!(msg.contains(needle), "error must mention {needle:?}: {msg}");
+    }
+}
+
 // ─── build_tree ────────────────────────────────────────────────────────
 
 /// The mount-time prefetch issues exactly ONE `GetDirectory` call
@@ -636,7 +779,7 @@ async fn build_tree_prefetches_the_dag_in_one_call() {
     let fx = tree::tests::fixture();
     mock.seed_dirs(&fx.dirs);
 
-    let map = build_tree(&clients, &fx.roots, FAST)
+    let map = build_tree(&clients, &fx.roots, FAST, HARNESS_TOKEN)
         .await
         .expect("build_tree");
 
@@ -670,7 +813,7 @@ async fn build_tree_skips_the_rpc_when_there_are_no_dir_roots() {
         .filter(|(p, _)| !p.ends_with("aaaa-hello"))
         .cloned()
         .collect();
-    let map = build_tree(&clients, &file_only, FAST)
+    let map = build_tree(&clients, &file_only, FAST, HARNESS_TOKEN)
         .await
         .expect("build_tree");
     assert_eq!(mock.state.get_directory_calls.load(Ordering::SeqCst), 0);
@@ -687,9 +830,14 @@ async fn build_tree_times_out_as_a_prefetch_error() {
     mock.seed_dirs(&fx.dirs);
     *mock.state.get_directory_delay.lock().unwrap() = Duration::from_secs(60);
 
-    let err = build_tree(&clients, &fx.roots, Duration::from_millis(100))
-        .await
-        .expect_err("must time out");
+    let err = build_tree(
+        &clients,
+        &fx.roots,
+        Duration::from_millis(100),
+        HARNESS_TOKEN,
+    )
+    .await
+    .expect_err("must time out");
     assert!(
         matches!(err, tree::TreeError::PrefetchTimeout(_)),
         "got {err:?}"
@@ -1044,6 +1192,7 @@ async fn cache_path_matches_the_mountd_shard_layout() {
         tokio::runtime::Handle::current(),
         mountd,
         Arc::new(super::circuit::CircuitBreaker::default()),
+        HARNESS_TOKEN.to_string(),
         OpenConfig {
             jit_fetch_timeout: FAST,
             mountd_request_timeout: FAST,

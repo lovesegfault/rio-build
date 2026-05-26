@@ -204,6 +204,10 @@ pub struct OpenPath {
     /// reintroduce that shape here.
     runtime: Handle,
     mountd: MountdClient,
+    /// This build's HMAC assignment token, attached as
+    /// `x-rio-assignment-token` to every castore RPC (the store derives
+    /// the caller's tenant from it — `r[store.castore.tenant-scope]`).
+    assignment_token: String,
     cfg: OpenConfig,
 }
 
@@ -217,6 +221,7 @@ impl OpenPath {
         runtime: Handle,
         mountd: MountdClient,
         circuit: Arc<CircuitBreaker>,
+        assignment_token: String,
         cfg: OpenConfig,
     ) -> Self {
         Self {
@@ -229,6 +234,7 @@ impl OpenPath {
             clients,
             runtime,
             mountd,
+            assignment_token,
             cfg,
         }
     }
@@ -415,6 +421,7 @@ impl OpenPath {
                     circuit: Arc::clone(&self.circuit),
                     mountd_timeout: self.cfg.mountd_request_timeout,
                     budget,
+                    assignment_token: self.assignment_token.clone(),
                     registry: Arc::clone(&self.streams),
                 };
                 let partial_path = ctx.partial_path.clone();
@@ -471,7 +478,12 @@ impl OpenPath {
         // r[impl builder.fs.file-digest-integrity]
         let fetch = self.runtime.block_on(tokio::time::timeout(
             self.cfg.jit_fetch_timeout,
-            read_blob_into(self.clients.clone(), *file_digest, &mut file),
+            read_blob_into(
+                self.clients.clone(),
+                *file_digest,
+                &mut file,
+                &self.assignment_token,
+            ),
         ));
         let fetched = match fetch {
             Err(_elapsed) => {
@@ -721,12 +733,18 @@ async fn read_blob_into(
     mut clients: StoreClients,
     file_digest: [u8; 32],
     dst: &mut File,
+    assignment_token: &str,
 ) -> Result<u64, FetchError> {
+    let req = crate::store_fetch::authed_request(
+        ReadBlobRequest {
+            file_digest: file_digest.to_vec(),
+        },
+        assignment_token,
+    )
+    .map_err(FetchError::Rpc)?;
     let mut stream = clients
         .directory
-        .read_blob(ReadBlobRequest {
-            file_digest: file_digest.to_vec(),
-        })
+        .read_blob(req)
         .await
         .map_err(FetchError::Rpc)?
         .into_inner();

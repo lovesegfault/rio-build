@@ -53,6 +53,23 @@ impl StoreClients {
     }
 }
 
+/// Wrap a request body in [`tonic::Request`] carrying the build's
+/// assignment token (`x-rio-assignment-token`) plus the current trace
+/// context — the same metadata the upload path attaches
+/// ([`crate::upload::common::attach_assignment_token`]). rio-store's
+/// castore surface (`GetDirectory`/`ReadBlob`/`StatBlob`/`GetChunks`)
+/// derives the caller's tenant from this token
+/// (`r[store.castore.tenant-scope]`); a request without it is rejected
+/// as `UNAUTHENTICATED`, so every castore-FUSE RPC goes through here.
+pub(crate) fn authed_request<T>(
+    msg: T,
+    assignment_token: &str,
+) -> Result<tonic::Request<T>, tonic::Status> {
+    let mut req = tonic::Request::new(msg);
+    crate::upload::common::attach_assignment_token(&mut req, assignment_token)?;
+    Ok(req)
+}
+
 /// Minimum expected store→builder throughput for JIT fetch-timeout
 /// sizing. I-178: 15 MiB/s is a conservative floor — half the ~30 MB/s
 /// observed in cluster on the pre-castore JIT fetch path. A 1.9 GB NAR at this

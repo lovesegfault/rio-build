@@ -890,3 +890,38 @@ async fn streaming_open_reclaims_an_orphaned_partial() {
         content
     );
 }
+
+/// The streaming fill's RPCs (StatBlob for the chunk window, GetChunks
+/// for the misses) carry the build's assignment token, same as the
+/// whole-file path — the store's tenant gate applies to them equally.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_fill_rpcs_carry_the_assignment_token() {
+    let h = harness().await;
+    h.mock.require_token();
+    let content = patterned(5000);
+    let (digest, _chunks) = h.mock.seed_chunked_blob(&content, 1000, 16);
+
+    let (fill, _case) = unwrap_streaming(
+        ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
+            .await
+            .expect("a token-bearing streaming open succeeds"),
+    );
+    assert_eq!(
+        read_blocking(&fill, 0, content.len() as u32).await.unwrap(),
+        content
+    );
+
+    assert_eq!(
+        h.mock.tokens_for("stat_blob"),
+        vec![Some(HARNESS_TOKEN.to_string())],
+        "StatBlob must carry x-rio-assignment-token"
+    );
+    let chunk_tokens = h.mock.tokens_for("get_chunks");
+    assert!(
+        !chunk_tokens.is_empty()
+            && chunk_tokens
+                .iter()
+                .all(|t| t.as_deref() == Some(HARNESS_TOKEN)),
+        "every GetChunks stream must carry x-rio-assignment-token, got {chunk_tokens:?}"
+    );
+}

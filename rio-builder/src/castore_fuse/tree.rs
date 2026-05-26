@@ -512,6 +512,7 @@ pub async fn build_tree(
     store: &StoreClients,
     roots: &[(String, RootNode)],
     dag_prefetch_timeout: Duration,
+    assignment_token: &str,
 ) -> Result<InoMap, TreeError> {
     let started = std::time::Instant::now();
 
@@ -529,11 +530,17 @@ pub async fn build_tree(
 
     let mut dirs: HashMap<[u8; 32], Directory> = HashMap::new();
     if let Some((first, rest)) = dir_roots.split_first() {
-        let req = GetDirectoryRequest {
-            by_what: Some(get_directory_request::ByWhat::Digest(first.clone())),
-            recursive: true,
-            digests: rest.to_vec(),
-        };
+        // The assignment token is how rio-store's tenant gate
+        // authenticates this build's castore reads — without it the
+        // call is rejected before any Directory body is streamed.
+        let req = crate::store_fetch::authed_request(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(first.clone())),
+                recursive: true,
+                digests: rest.to_vec(),
+            },
+            assignment_token,
+        )?;
         let mut client = store.directory.clone();
         let fetch = async {
             let mut stream = client.get_directory(req).await?.into_inner();

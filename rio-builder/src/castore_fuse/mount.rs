@@ -135,6 +135,18 @@ impl CastoreOptions {
     }
 }
 
+/// The per-build inputs to a castore mount, extracted from the
+/// `WorkAssignment`: the (mountd-compliant) build id, the closure's
+/// castore roots, and the HMAC assignment token every castore RPC
+/// carries as `x-rio-assignment-token` (rio-store derives the caller's
+/// tenant from it — `r[store.castore.tenant-scope]`; without it the
+/// DAG prefetch and every JIT fetch are rejected as `UNAUTHENTICATED`).
+pub struct MountInputs<'a> {
+    pub build_id: &'a str,
+    pub roots: &'a [(String, RootNode)],
+    pub assignment_token: &'a str,
+}
+
 /// Why a castore mount could not be assembled. Every variant is an
 /// infrastructure failure (the build never started, no partial state);
 /// the messages name the unhealthy component so the on-call signal is
@@ -149,6 +161,21 @@ pub enum CastoreMountError {
          processed every input path?"
     )]
     Tree(#[from] TreeError),
+    /// rio-store rejected a castore RPC as unauthenticated. The builder
+    /// attaches the build's HMAC assignment token to every castore RPC;
+    /// this firing means the token is missing/invalid, carries no
+    /// tenant claim, or the store has no matching HMAC verifier.
+    #[error(
+        "rio-store rejected the castore DAG prefetch as unauthenticated: {source} — the \
+         builder sends the build's HMAC assignment token (x-rio-assignment-token) on every \
+         castore RPC; check that the scheduler signs assignment tokens with a tenant claim \
+         (hmac key + tenanted submission) and that rio-store is configured with the matching \
+         HMAC verifier"
+    )]
+    Unauthenticated {
+        #[source]
+        source: tonic::Status,
+    },
     /// Opening `/dev/fuse` failed — the device node is missing from the
     /// pod or the device cgroup denies it.
     #[error(
@@ -232,17 +259,36 @@ pub(super) struct PreparedMount {
 /// `Mount{build_id}` handshake. Blocking (bridges the async prefetch
 /// via `runtime.block_on`); call from a thread that may block.
 pub(super) fn prepare_mount(
-    build_id: &str,
-    roots: &[(String, RootNode)],
+    inputs: &MountInputs<'_>,
     clients: StoreClients,
     runtime: Handle,
     circuit: Arc<CircuitBreaker>,
     opts: &CastoreOptions,
 ) -> Result<PreparedMount, CastoreMountError> {
+    let build_id = inputs.build_id;
     // ── (1) Directory-DAG prefetch. One multi-root recursive
     // GetDirectory for the whole closure; an unindexed root or an empty
-    // stream is a typed, actionable error.
-    let tree = runtime.block_on(tree::build_tree(&clients, roots, opts.dag_prefetch_timeout))?;
+    // stream is a typed, actionable error. An auth rejection gets its
+    // own variant: "the indexer is behind" and "the store refused the
+    // token" need very different operators.
+    let tree = runtime
+        .block_on(tree::build_tree(
+            &clients,
+            inputs.roots,
+            opts.dag_prefetch_timeout,
+            inputs.assignment_token,
+        ))
+        .map_err(|e| match e {
+            TreeError::Rpc(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                ) =>
+            {
+                CastoreMountError::Unauthenticated { source: status }
+            }
+            other => CastoreMountError::Tree(other),
+        })?;
     if tree.is_empty() {
         // Legal (a closure-less derivation mounts an empty tree), but
         // worth a breadcrumb: an empty `input_roots` can also mean the
@@ -286,6 +332,7 @@ pub(super) fn prepare_mount(
         runtime,
         client.clone(),
         circuit,
+        inputs.assignment_token.to_owned(),
         OpenConfig {
             jit_fetch_timeout: opts.jit_fetch_timeout,
             mountd_request_timeout: opts.mountd_request_timeout,
@@ -312,19 +359,18 @@ pub(super) fn prepare_mount(
 /// `mount_point` must be a builder-owned path on a filesystem the
 /// builder can `mkdir` (the executor uses
 /// `{overlay_base_dir}/{build_id}.castore`); it is created if missing
-/// and removed again at teardown. `build_id` must already be
+/// and removed again at teardown. `inputs.build_id` must already be
 /// mountd-compliant (see [`mountd_build_id`]).
 pub fn mount_castore_background(
     mount_point: &Path,
-    build_id: &str,
-    roots: &[(String, RootNode)],
+    inputs: &MountInputs<'_>,
     clients: StoreClients,
     runtime: Handle,
     circuit: Arc<CircuitBreaker>,
     opts: &CastoreOptions,
 ) -> Result<CastoreMount, CastoreMountError> {
-    let prepared = prepare_mount(build_id, roots, clients, runtime, circuit, opts)?;
-    serve_prepared(prepared, mount_point, build_id, opts)
+    let prepared = prepare_mount(inputs, clients, runtime, circuit, opts)?;
+    serve_prepared(prepared, mount_point, inputs.build_id, opts)
 }
 
 /// Steps (3) and (4): mount the handed-off fd and start serving it.

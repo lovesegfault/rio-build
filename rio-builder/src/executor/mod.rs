@@ -51,7 +51,8 @@ use outputs::{BuildOutputs, collect_outputs};
 use sandbox::prepare_sandbox;
 
 use crate::castore_fuse::mount::{
-    CastoreMount, CastoreMountError, CastoreOptions, mount_castore_background, mountd_build_id,
+    CastoreMount, CastoreMountError, CastoreOptions, MountInputs, mount_castore_background,
+    mountd_build_id,
 };
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
@@ -623,14 +624,22 @@ pub async fn execute_build(
         let castore_opts = env.castore.clone();
         let castore_circuit = Arc::clone(&env.castore_circuit);
         let castore_clients = store_clients.clone();
+        // The assignment token authenticates every castore read this
+        // build makes (DAG prefetch + JIT open()/streaming fetches) —
+        // the same token the upload path presents on PutPathChunked;
+        // rio-store derives the build's tenant from it.
+        let assignment_token = assignment.assignment_token.clone();
         let runtime = tokio::runtime::Handle::current();
         let overlay_base = env.overlay_base_dir.clone();
         let build_id_owned = build_id.clone();
         let (castore_mount, overlay_mount) = tokio::task::spawn_blocking(move || {
             let castore = mount_castore_background(
                 &castore_mp,
-                &castore_build_id,
-                &roots,
+                &MountInputs {
+                    build_id: &castore_build_id,
+                    roots: &roots,
+                    assignment_token: &assignment_token,
+                },
                 castore_clients,
                 runtime,
                 castore_circuit,

@@ -233,6 +233,11 @@ pub(super) struct FillContext {
     /// the final verify/rename), sized to the file like the whole-file
     /// path's JIT budget.
     pub budget: Duration,
+    /// This build's HMAC assignment token, attached as
+    /// `x-rio-assignment-token` to every store RPC the fill makes
+    /// (`StatBlob`, `GetChunks`, the `ReadBlob` fallback) — the store
+    /// derives the caller's tenant from it.
+    pub assignment_token: String,
     /// The in-flight fill registry this fill deregisters from when it
     /// finishes (so the next opener of a failed digest starts fresh).
     pub registry: Arc<Mutex<HashMap<[u8; 32], Arc<StreamFill>>>>,
@@ -529,7 +534,11 @@ fn fill_blob(ctx: &FillContext, fill: &StreamFill, deadline: Instant) -> Result<
         probed: 0,
         requested: HashSet::new(),
         pending: HashMap::new(),
-        remote: RemoteChunks::new(ctx.clients.clone(), ctx.runtime.clone()),
+        remote: RemoteChunks::new(
+            ctx.clients.clone(),
+            ctx.runtime.clone(),
+            ctx.assignment_token.clone(),
+        ),
         promote_batch: Vec::new(),
         hasher: blake3::Hasher::new(),
         offset: 0,
@@ -573,17 +582,17 @@ enum StatOutcome {
 fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatOutcome, FillError> {
     let left = remaining(deadline)?;
     let mut directory = ctx.clients.directory.clone();
-    let file_digest = ctx.file_digest.to_vec();
-    let resp = ctx.runtime.block_on(async move {
-        tokio::time::timeout(
-            left,
-            directory.stat_blob(StatBlobRequest {
-                file_digest,
-                send_chunks: true,
-            }),
-        )
-        .await
-    });
+    let req = crate::store_fetch::authed_request(
+        StatBlobRequest {
+            file_digest: ctx.file_digest.to_vec(),
+            send_chunks: true,
+        },
+        &ctx.assignment_token,
+    )
+    .map_err(|s| FillError::Store(format!("StatBlob: {s}")))?;
+    let resp = ctx
+        .runtime
+        .block_on(async move { tokio::time::timeout(left, directory.stat_blob(req)).await });
     match resp {
         Err(_elapsed) => Err(FillError::Timeout),
         // The documented "no chunk list — use ReadBlob" signal
@@ -608,14 +617,17 @@ fn fill_from_read_blob(
 
     let left = remaining(deadline)?;
     let mut directory = ctx.clients.directory.clone();
-    let file_digest = ctx.file_digest.to_vec();
-    let mut stream = match ctx.runtime.block_on(async move {
-        tokio::time::timeout(
-            left,
-            directory.read_blob(rio_proto::types::ReadBlobRequest { file_digest }),
-        )
-        .await
-    }) {
+    let req = crate::store_fetch::authed_request(
+        rio_proto::types::ReadBlobRequest {
+            file_digest: ctx.file_digest.to_vec(),
+        },
+        &ctx.assignment_token,
+    )
+    .map_err(|s| FillError::Store(format!("ReadBlob: {s}")))?;
+    let mut stream = match ctx
+        .runtime
+        .block_on(async move { tokio::time::timeout(left, directory.read_blob(req)).await })
+    {
         Err(_elapsed) => return Err(FillError::Timeout),
         Ok(Err(status)) => return Err(FillError::Store(format!("ReadBlob: {status}"))),
         Ok(Ok(resp)) => resp.into_inner(),
@@ -910,6 +922,9 @@ impl FillRun<'_> {
 struct RemoteChunks {
     clients: StoreClients,
     runtime: Handle,
+    /// Attached to the `GetChunks` stream-open request (the per-frame
+    /// digests inherit the stream's auth).
+    assignment_token: String,
     live: Option<(
         tokio::sync::mpsc::Sender<GetChunksRequest>,
         tonic::Streaming<ChunkData>,
@@ -917,10 +932,11 @@ struct RemoteChunks {
 }
 
 impl RemoteChunks {
-    fn new(clients: StoreClients, runtime: Handle) -> Self {
+    fn new(clients: StoreClients, runtime: Handle, assignment_token: String) -> Self {
         Self {
             clients,
             runtime,
+            assignment_token,
             live: None,
         }
     }
@@ -933,9 +949,11 @@ impl RemoteChunks {
             // produce before the server starts draining.
             let (tx, rx) = tokio::sync::mpsc::channel::<GetChunksRequest>(8);
             let mut chunk_client = self.clients.chunk.clone();
+            let req =
+                crate::store_fetch::authed_request(ReceiverStream::new(rx), &self.assignment_token)
+                    .map_err(|s| FillError::Store(format!("GetChunks: {s}")))?;
             let connect = self.runtime.block_on(async {
-                tokio::time::timeout(timeout, chunk_client.get_chunks(ReceiverStream::new(rx)))
-                    .await
+                tokio::time::timeout(timeout, chunk_client.get_chunks(req)).await
             });
             let streaming = match connect {
                 Err(_elapsed) => return Err(FillError::Timeout),
