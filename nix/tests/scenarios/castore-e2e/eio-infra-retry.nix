@@ -69,11 +69,33 @@ scope: with scope; ''
               timeout=300,
           )
           status_after_fail = drv_status(drv_eio)
-          assert status_after_fail not in ("failed", "poisoned", "dependency_failed"), (
-              f"eio-infra-retry: derivation went terminally {status_after_fail!r} "
-              f"after the input-read EIO — the failure was not classified as "
-              f"infrastructure (or the scheduler poisoned it)"
-          )
+          if status_after_fail in ("failed", "poisoned", "dependency_failed"):
+              # Capture WHY before failing: the executor's reported
+              # message and the scheduler's classification decision are
+              # the evidence that distinguishes a misclassification from
+              # a test-construction problem.
+              drv_base = drv_eio.rsplit("/", 1)[-1]
+              k3s_server.execute(
+                  "echo '=== eio-infra-retry DIAG: first-attempt pod logs ===' >&2; "
+                  f"k3s kubectl -n ${nsBuilders} logs {first_pod} --tail=200 2>&1 "
+                  "| grep -avE '\"level\":\"DEBUG\"' | tail -60 >&2 || true; "
+                  "echo '=== eio-infra-retry DIAG: scheduler view of the drv ===' >&2; "
+                  "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
+                  "--tail=20000 --since=15m 2>/dev/null "
+                  f"| grep -aF '{drv_base}' "
+                  "| grep -avE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
+                  "echo '=== eio-infra-retry DIAG: scheduler poison/permanent lines ===' >&2; "
+                  "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
+                  "--tail=20000 --since=15m 2>/dev/null "
+                  "| grep -aiE 'poison|permanent|InputRejected|input materialization' "
+                  "| grep -avE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
+              )
+              raise AssertionError(
+                  f"eio-infra-retry: derivation went terminally {status_after_fail!r} "
+                  f"after the input-read EIO — the failure was not classified as "
+                  f"infrastructure (or the scheduler poisoned it); see the DIAG "
+                  f"dump above for the executor message and scheduler decision"
+              )
           print(
               f"eio-infra-retry: first attempt over (pod {first_pod} done), drv "
               f"status {status_after_fail!r} (re-queued, not poisoned)"

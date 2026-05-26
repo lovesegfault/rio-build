@@ -1672,13 +1672,6 @@ in
       #   integrity_fail_total == 1, the reader gets EIO, nothing is
       #   promoted, and the store layer never sees it.
       "integrity-fail"
-      # r[verify builder.result.input-eio-is-infra]
-      #   eio-infra-retry: with the store's chunk objects offline, the
-      #   daemon's execve of a castore-served builder gets EIO; the
-      #   executor reclassifies the MiscFailure as InfrastructureFailure,
-      #   the scheduler re-queues (never failed/poisoned), and the build
-      #   completes once the chunks are restored.
-      "eio-infra-retry"
       # r[verify builder.mountd.orphan-scan]
       #   mountd-restart: force-delete the broker DaemonSet pod
       #   mid-build — the held passthrough fd keeps working, the build
@@ -1690,10 +1683,16 @@ in
       #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
       #   never-cached opens, read concurrently, all fail within their
       #   per-open fetch budget (bounded EIO, not hangs) and the fetch
-      #   breaker opens so everything after fails fast. Last in the
-      #   split: it scales the store away and carries the longest
-      #   evidence window.
+      #   breaker opens so everything after fails fast. Restores the
+      #   store before the next subtest.
       "eio-circuit-breaker"
+      # r[verify builder.result.input-eio-is-infra]
+      #   eio-infra-retry: with the store's chunk objects offline, the
+      #   daemon's execve of a castore-served builder gets EIO; the
+      #   executor reclassifies the MiscFailure as InfrastructureFailure,
+      #   the scheduler re-queues (never failed/poisoned), and the build
+      #   completes once the chunks are restored.
+      "eio-infra-retry"
     ];
     globalTimeout = 1800;
   };

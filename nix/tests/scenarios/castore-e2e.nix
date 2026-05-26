@@ -814,12 +814,12 @@ let
       {
         before = "mountd-restart";
         after = "eio-circuit-breaker";
-        msg = "eio-circuit-breaker scales the store away and has the longest evidence window — keep it after the mountd bounce, last in the split";
+        msg = "eio-circuit-breaker scales the store away — keep it after the mountd bounce";
       }
       {
-        name = "eio-circuit-breaker";
-        last = true;
-        msg = "eio-circuit-breaker leaves the store scaled away on failure — keep it last";
+        before = "eio-circuit-breaker";
+        after = "eio-infra-retry";
+        msg = "eio-infra-retry needs the store healthy again — run it after the breaker subtest restored it";
       }
     ];
   };
