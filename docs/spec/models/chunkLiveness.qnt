@@ -511,6 +511,328 @@ module chunkLiveness {
   pure def countsForOne(parsed: Set[int]): int -> int =
     HASHES.mapBy(h => if (parsed.contains(h)) 1 else 0)
 
+  // --- 7. invariants ------------------------------------------------------
+  //
+  // CR-1..CR-4 are the campaign's committed invariants
+  // (refcount-formal-design.md §3.3, refcount-invariant-map.md); the
+  // S/L items are the supporting set carried for calibration. Spec
+  // rules are named in each comment; the r[verify ...] markers live at
+  // the check wiring points in nix/quint.nix.
+
+  /// The runtime residual of TypeOK plus the self-consistency facts the
+  /// other encodings rely on: refcounts within the bound the one-shot
+  /// uploaders imply, clocks within their caps, a soft-deleted row is
+  /// at refcount 0 (the upsert's resurrect arm clears `deleted` in the
+  /// same statement as any increment), needs-upload sets within the
+  /// written list, and at most one placeholder generation per path at a
+  /// time (the ON CONFLICT DO NOTHING idempotency lock).
+  val boundsOK = and {
+    HASHES.forall(h =>
+      val c = chunks.get(h)
+      and {
+        c.rc >= 0,
+        c.rc <= MAX_UPLOADERS + MAX_PATHS,
+        c.age >= 0 and c.age <= AGE_CAP,
+        not(c.present) implies (c.rc == 0 and not(c.uploadedAt) and not(c.deleted) and c.age == 0),
+        c.deleted implies c.rc == 0,
+      }),
+    PATHS.forall(p =>
+      val r = paths.get(p)
+      and {
+        r.gen >= 0 and r.gen <= MAX_UPLOADERS,
+        r.staleness >= 0 and r.staleness <= STALE_CAP,
+        r.status == PNone implies (r.mdata == NoMd and r.staleness == 0),
+      }),
+    UPLOADERS.forall(u =>
+      val r = ups.get(u)
+      and {
+        r.needsUpload.subseteq(r.list),
+        r.list.subseteq(HASHES),
+        r.pc == UIdle implies (r.path == 0 and r.claim == 0 and r.list == Set()),
+      }),
+  }
+
+  /// M_023's `CHECK (refcount >= 0)`: under-counts are never sanctioned
+  /// (store.chunk.refcount-meaning's last clause). A double decrement
+  /// for the same manifest generation would push a counter below zero
+  /// or below the fold; this is the direct schema-level image.
+  val m023NonNegative = HASHES.forall(h => chunks.get(h).rc >= 0)
+
+  /// CR-1 `NoLiveChunkCollected` (store.chunk.no-live-collect; = S1).
+  /// State form: a chunk referenced by any existing 'complete' manifest
+  /// has its backend object present ('uploading' manifests are excluded
+  /// — their PUTs may still be in flight; the write-ahead upsert
+  /// deliberately precedes the upload). Action form: a backend
+  /// DeleteObject is issued only in states where no existing manifest
+  /// of any status references the chunk — recorded by the
+  /// deletedWhileReferenced ghost at the two delete sites (drainOk,
+  /// drainCrashAfterS3). This is the data-loss invariant.
+  val cr1NoLiveChunkCollected = and {
+    HASHES.forall(h => completeRefs(h) != Set() implies s3.contains(h)),
+    not(wit.deletedWhileReferenced),
+  }
+
+  /// CR-2 `BoundedGarbageRetention` (store.gc.bounded-garbage-retention;
+  /// = L1+L2), as-built structural form. The cadence/wall-clock half of
+  /// the rule's bound (15-minute scanner, hourly sweep, 30 s drain) is
+  /// background-loop scheduling, not protocol, and is not modeled; what
+  /// the protocol must guarantee is that garbage never becomes
+  /// UNRECLAIMABLE by the standing machinery:
+  ///   (a) an existing, not-yet-soft-deleted chunk with no manifest
+  ///       references is at refcount 0 — i.e. it remains eligible for
+  ///       the zero-detect / orphan-chunk-sweep predicates. As built
+  ///       this is exactly the conditionality on the counter: a
+  ///       refcount stuck above zero with no references is permanent
+  ///       garbage (nothing ever decrements it again).
+  ///   (b) a soft-deleted chunk whose backend object still exists is
+  ///       enqueued in the outbox — the irreversible step remains
+  ///       scheduled (the drain-lag tail of the bound).
+  /// The corrupt regime checks the carved form below instead; the
+  /// unconditional form falsifying there (C12) is the pre-registered
+  /// as-built deviation (the rule's carve-out clause).
+  val cr2NoStrandedGarbage = HASHES.forall(h =>
+    val c = chunks.get(h)
+    and {
+      (c.present and refs(h) == Set() and not(c.deleted)) implies c.rc == 0,
+      (c.deleted and s3.contains(h)) implies outbox.contains(h),
+    })
+
+  /// CR-2, corrupt-regime carved form (the rule's carve-out clause +
+  /// observability requirement): stranded garbage may exist only for
+  /// chunks whose references-on-record were destroyed by a corrupt
+  /// chunk_list skip, the skip is observable (the leakedRefs ghost is
+  /// the model image of the warn + the absent decrement), and the
+  /// stranded amount is exactly the skipped amount. The outbox clause
+  /// is unconditional — corruption never strands an already-enqueued
+  /// object.
+  val cr2CarvedCorrupt = HASHES.forall(h =>
+    val c = chunks.get(h)
+    and {
+      (c.present and refs(h) == Set() and not(c.deleted) and c.rc > 0) implies
+        (leakedRefs.get(h) > 0 and c.rc <= leakedRefs.get(h)),
+      (c.deleted and s3.contains(h)) implies outbox.contains(h),
+    })
+
+  /// CR-3 `CounterRefinesManifestFold` (store.chunk.refcount-meaning;
+  /// = S2): the counter equals the manifest fold (and a hash with no
+  /// chunks row is referenced by no manifest — the upsert and the
+  /// manifest_data INSERT are one transaction). Every model action is
+  /// a whole SQL transaction, so every reachable state is a quiescent
+  /// point and the equality is checked everywhere. The design allows
+  /// "sanctioned transient over-counts after C1-C7 crashes"; at this
+  /// granularity those windows leave the manifest row in place, so the
+  /// fold still counts it and no carve-out is needed — a crash-regime
+  /// HOLDS verdict on this exact form is a stronger result than the
+  /// design asked for, not a weaker encoding. In the corrupt regime
+  /// this exact form is the pre-registered expected falsification (the
+  /// C12 sanctioned permanent over-count); the carved form below is
+  /// that regime's stated-form invariant.
+  val cr3CounterRefinesFold = HASHES.forall(h =>
+    (chunks.get(h).present implies chunks.get(h).rc == refs(h).size()) and
+    (not(chunks.get(h).present) implies refs(h) == Set()))
+
+  /// CR-3, corrupt-regime carved form (the rule's sanctioned permanent
+  /// over-count): the counter equals the fold plus exactly the
+  /// decrements that were skipped against unparseable chunk_lists.
+  /// Under-counts remain unsanctioned in every regime.
+  val cr3CarvedCorrupt = HASHES.forall(h =>
+    (chunks.get(h).present implies chunks.get(h).rc == refs(h).size() + leakedRefs.get(h)) and
+    (not(chunks.get(h).present) implies refs(h) == Set()))
+
+  /// CR-4 `PresenceNeverInferredFromCounter`
+  /// (store.chunk.liveness-not-presence, store.cas.upsert-inserted+2,
+  /// store.cas.chunk-upload-committed; = S3, the M_033 lesson):
+  ///   (a) a writer skips the backend PUT only for chunks whose
+  ///       uploaded_at is set (the needs-upload verdict is keyed on
+  ///       confirmed presence, never the counter) — recorded by the
+  ///       skippedPutWithoutPresence ghost at the upgrade action;
+  ///   (b) uploaded_at is set only while the backend object is present
+  ///       (set after an observed successful put; cleared by the
+  ///       soft-delete before any drain can remove the object).
+  val cr4PresenceFromConfirmedUpload = and {
+    not(wit.skippedPutWithoutPresence),
+    HASHES.forall(h => chunks.get(h).uploadedAt implies s3.contains(h)),
+  }
+
+  /// S4 `OwnerOnlyMutation` (store.put.placeholder-claim+2,
+  /// store.put.drop-cleanup+2): an owner-credentialed cleanup takes
+  /// effect only against the placeholder generation that issued the
+  /// credential. Quantified over the admission predicates the actions
+  /// themselves use (the logService authGate pattern): if the claim
+  /// reap or the token rollback is admitted for an uploader, the row it
+  /// would mutate is that uploader's own generation. Dropping the
+  /// claim/token conjunct from the predicates falsifies this.
+  val s4OwnerOnlyMutation = UPLOADERS.forall(u =>
+    val r = ups.get(u)
+    and {
+      (r.pc == UReaping and r.path != 0 and claimReapAdmitted(r.path, r.claim)) implies
+        paths.get(r.path).gen == r.claim,
+      (r.pc == URollback and r.path != 0 and rollbackAdmitted(r.path, r.claim, r.tokenStale)) implies
+        paths.get(r.path).gen == r.claim,
+    })
+
+  /// S5 `LiveOwnerNeverReaped` (store.gc.orphan-heartbeat,
+  /// store.put.stale-reclaim / store.substitute.stale-reclaim): a
+  /// stale-path reclaim never deletes a placeholder whose owner is
+  /// alive in a guard-armed phase. Holds because the heartbeat deadline
+  /// is strictly below both reclaim thresholds and time cannot advance
+  /// past the deadline for a live-owned row (the production heartbeat
+  /// contract); the chunkLivenessThresholdOrder regime inverts the
+  /// ordering and must falsify exactly this.
+  val s5LiveOwnerNeverReaped = not(wit.liveOwnerReaped)
+
+  /// L3 support `NoForeignFreshen` (store.put.placeholder-claim+2's
+  /// heartbeat clause; the 937a9c928 lesson): the heartbeat freshens
+  /// only the heartbeater's own placeholder generation — a stale
+  /// uploader can never keep a successor's (or any foreign) placeholder
+  /// artificially fresh, which is what makes every abandoned
+  /// 'uploading' row eventually reapable (PlaceholderConvergence's
+  /// safety content at this granularity).
+  val l3NoForeignFreshen = UPLOADERS.forall(u =>
+    val r = ups.get(u)
+    (r.path != 0 and heartbeatAdmitted(r.path, r.claim)) implies paths.get(r.path).gen == r.claim)
+
+  // --- expect-violation witnesses (non-vacuity probes) --------------------
+  //
+  // The vals below are NOT invariants and must never appear in a regime
+  // check's invariant list. Each states "the interesting thing never
+  // happens"; the quint-chunk-liveness-witness-* checks verify one each
+  // and PASS only when the checker reports a violation — machine-checked
+  // evidence that the contended state the headline invariants constrain
+  // is actually reachable in that regime's explored space.
+
+  /// Violated when a chunked upload completes: a 'complete' manifest
+  /// whose every chunk is backend-present and presence-confirmed. The
+  /// headline non-vacuity probe — CR-1's state form only bites for
+  /// complete manifests.
+  val noCompleteUpload = not(PATHS.exists(p => and {
+    paths.get(p).status == PComplete,
+    listOf(p) != Set(),
+    listOf(p).forall(h => s3.contains(h) and chunks.get(h).uploadedAt),
+  }))
+
+  /// Violated when a backend DeleteObject has actually been issued —
+  /// CR-1's action form is exercised against real deletes, not an
+  /// empty delete set.
+  val noBackendDelete = not(wit.s3Deleted)
+
+  /// Violated when a referenced chunk exists whose backend presence is
+  /// not yet confirmed (refcount >= 1, uploaded_at NULL) — the M_033
+  /// precondition: the state in which trusting the counter for
+  /// presence loses data.
+  val noUnconfirmedReferencedChunk = not(HASHES.exists(h => and {
+    chunks.get(h).present,
+    chunks.get(h).rc >= 1,
+    not(chunks.get(h).uploadedAt),
+  }))
+
+  /// Violated when the in-process rollback no-ops because the
+  /// uploader's own heartbeat advanced updated_at after the upgrade
+  /// (C4) — the deliberate token false-negative is reachable, so the
+  /// orphan scanner's repair obligation for it is not vacuous.
+  val noStaleTokenRollbackNoop = not(wit.rollbackNoopStaleToken)
+
+  /// Violated when a heartbeat resets a non-zero staleness — the
+  /// heartbeat is load-bearing for keeping live uploads below the
+  /// reclaim thresholds (S5's mechanism actually does work).
+  val noHeartbeatReset = not(wit.heartbeatReset)
+
+  /// Violated when one sweep batch decrements a chunk by 2 or more — a
+  /// chunk shared by several manifests dying in one batch is
+  /// decremented by count, not collapsed to one (the adfd303d7-C2
+  /// clause of store.chunk.refcount-decrement).
+  val noSharedByCountDecrement = not(wit.sweptSharedByCount)
+
+  /// Violated when the drain re-check skips a resurrected chunk — the
+  /// G4a TOCTOU defense at the irreversible step is exercised.
+  val noDrainResurrectSkip = not(wit.drainSkippedResurrected)
+
+  /// Violated when the orphan-chunk sweep's inner UPDATE re-check
+  /// excludes a candidate the outer SELECT had already chosen (C11).
+  val noOrphanRecheckSave = not(wit.orphanRecheckSaved)
+
+  /// Violated when an owner-side cleanup (claim reap or token
+  /// rollback) arrives late and no-ops against a missing, foreign or
+  /// refreshed row — the contended state S4 is about actually arises.
+  val noLateCleanupNoop = not(wit.lateCleanupNoop)
+
+  /// Violated when the hot-path stale reclaim fires (a claim attempt
+  /// against an abandoned placeholder reclaims it at the 300 s
+  /// threshold, before the 15-minute scanner would).
+  val noHotpathReclaim = not(wit.hotpathReaped)
+
+  /// Violated when the orphan scanner reaps an abandoned placeholder —
+  /// the 15-minute backstop repair path runs (L3's repair term).
+  val noScannerReap = not(wit.scannerReaped)
+
+  /// Violated when an abandoned upload's accounting is reachable: an
+  /// 'uploading' manifest whose owner crashed, its chunks still
+  /// counted (refcount >= 1). This is the as-built C2 leak shape — the
+  /// manifest row survives the crash, so the counter still agrees with
+  /// the fold and the garbage is *accounted*, awaiting the reaper.
+  /// (The literal "refcount > 0 with zero manifests" shape of design
+  /// §3.5 is NOT reachable as built outside the corrupt regime —
+  /// decrements are atomic with manifest deletion; see the corrupt
+  /// regime's c12 falsification checks for the only true leak shape.)
+  val noAbandonedAccounting = not(PATHS.exists(p => and {
+    paths.get(p).status == PUploading,
+    listOf(p) != Set(),
+    listOf(p).forall(h => chunks.get(h).rc >= 1),
+    UPLOADERS.exists(u => and {
+      ups.get(u).path == p,
+      ups.get(u).claim == paths.get(p).gen,
+      ups.get(u).pc == UCrashed,
+    }),
+  }))
+
+  /// Violated when an uploader has crashed while holding a claimed but
+  /// not-yet-upgraded placeholder (C1).
+  val noCrashAtClaimed = not(UPLOADERS.exists(u => and {
+    ups.get(u).pc == UCrashed,
+    ups.get(u).path != 0,
+    ups.get(u).list == Set(),
+    paths.get(ups.get(u).path).status == PUploading,
+    paths.get(ups.get(u).path).gen == ups.get(u).claim,
+  }))
+
+  /// Violated when an uploader has crashed after its upgrade committed
+  /// (write-ahead state durable, upload incomplete) — C2.
+  val noCrashAfterUpgrade = not(UPLOADERS.exists(u => and {
+    ups.get(u).pc == UCrashed,
+    ups.get(u).list != Set(),
+    paths.get(ups.get(u).path).status == PUploading,
+    paths.get(ups.get(u).path).gen == ups.get(u).claim,
+  }))
+
+  /// Violated when an uploader has crashed with its claim-gated reap
+  /// still pending (the drop-guard / abort cleanup never ran) — C5,
+  /// and the observable state C3/C7 collapse onto.
+  val noCrashBeforeReap = not(UPLOADERS.exists(u => and {
+    ups.get(u).pc == UCrashed,
+    ups.get(u).path != 0,
+    paths.get(ups.get(u).path).status == PUploading,
+    paths.get(ups.get(u).path).gen == ups.get(u).claim,
+  }))
+  // (noCrashBeforeReap is intentionally weaker than the two above: any
+  // crashed owner with a surviving placeholder is a pending-repair
+  // state; the two above pin the specific C1/C2 phases.)
+
+  /// Violated when BOTH uploaders have crashed after staging
+  /// (upgrading) their outputs — the PutPathBatch C6 shape: k of N
+  /// outputs staged, none completed, every guard dead.
+  val noDoubleCrashStaged = not(
+    UPLOADERS.filter(u => ups.get(u).pc == UCrashed and ups.get(u).list != Set()).size() >= 2)
+
+  /// Violated when the corrupt-skip leak shape is reached: a chunk with
+  /// no manifest references whose refcount is stuck above zero (only
+  /// reachable through the C12 skip — the corrupt regime's
+  /// pre-registered CR-3/CR-2 deviation made concrete).
+  val noCorruptLeak = not(HASHES.exists(h => and {
+    chunks.get(h).present,
+    refs(h) == Set(),
+    chunks.get(h).rc > 0,
+  }))
+
   // --- 6. actions ---------------------------------------------------------
   //
   // Each action is one production SQL transaction (or one named
@@ -1027,4 +1349,276 @@ module chunkLiveness {
       tick,
     }
   }
+}
+
+// =========================================================================
+// THE BASE REGIME: one writer, the full background machinery, no faults.
+// The happy path, the explicit abort/rollback paths, the orphan-chunk
+// sweep and the drain all interleave; the counter must refine the
+// manifest fold at every state and nothing the GC pipeline does may
+// touch a referenced chunk's object. This is the regime where a core
+// protocol regression surfaces fastest.
+// =========================================================================
+module chunkLivenessBase {
+  import chunkLiveness(
+    MAX_HASHES = 3,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 1,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(2), Set(3), Set(1, 2), Set(1, 3), Set(2, 3), Set(1, 2, 3)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1
+  ).*
+
+  /// The happy path: claim, upgrade (write-ahead increment), upload,
+  /// mark presence, complete; then the path becomes unreachable, the
+  /// sweep soft-deletes its chunks, and the drain removes the objects.
+  run happyPathRun =
+    init
+      .then(claimPath(1, 1))
+      .then(upgradeManifest(1, Set(1, 2)))
+      .then(uploadChunks(1))
+      .then(markUploaded(1))
+      .then(completeManifest(1))
+      .expect(all {
+        paths.get(1).status == PComplete,
+        chunks.get(1).rc == 1 and chunks.get(2).rc == 1,
+        s3 == Set(1, 2),
+        chunks.get(1).uploadedAt and chunks.get(2).uploadedAt,
+        cr3CounterRefinesFold,
+        cr1NoLiveChunkCollected,
+      })
+      .then(pathSweepOne(1))
+      .expect(all {
+        paths.get(1).status == PNone,
+        chunks.get(1).rc == 0 and chunks.get(1).deleted,
+        outbox == Set(1, 2),
+        not(chunks.get(1).uploadedAt),
+      })
+      .then(drainOne(1))
+      .then(drainOne(2))
+      .expect(all {
+        s3 == Set(),
+        outbox == Set(),
+        cr2NoStrandedGarbage,
+        cr3CounterRefinesFold,
+      })
+
+  /// The C4 shape without any fault: a tick forces a heartbeat (token
+  /// goes stale), the upload then fails, and the rollback no-ops —
+  /// the leaked accounting is left for the scanner, exactly as
+  /// documented at PlaceholderToken.
+  run staleTokenRollbackRun =
+    init
+      .then(claimPath(1, 1))
+      .then(upgradeManifest(1, Set(1)))
+      .then(tick)
+      .then(heartbeat(1))
+      .then(uploadFailsToRollback(1))
+      .then(rollbackTx(1))
+      .expect(all {
+        wit.rollbackNoopStaleToken,
+        paths.get(1).status == PUploading,
+        chunks.get(1).rc == 1,
+        cr3CounterRefinesFold,
+      })
+}
+
+// =========================================================================
+// THE CRASH REGIME: two writers, process death enabled at every
+// in-flight phase (C1, C2, C5, C6, C7), the drain's mid-transaction
+// crash (C10), plus everything the base regime has. The reapers are the
+// repair path: every crash window's leaked accounting must stay exactly
+// accounted (CR-3 still exact at transaction granularity) and must
+// remain reclaimable (CR-2) once the placeholder goes stale.
+// =========================================================================
+module chunkLivenessCrash {
+  import chunkLiveness(
+    MAX_HASHES = 2,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 2,
+    ENABLE_CRASH = true,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1
+  ).*
+
+  /// The I-040/I-207 shape: a crashed chunked upload leaves an
+  /// accounted placeholder; the hot-path reclaim reaps it at the 300 s
+  /// threshold (decrementing and enqueueing), and a fresh upload of
+  /// the same path re-uploads the chunk because uploaded_at was
+  /// cleared — no stale-presence skip.
+  run staleReclaimRerunRun =
+    init
+      .then(claimPath(1, 1))
+      .then(upgradeManifest(1, Set(1)))
+      .then(uploadChunks(1))
+      .then(markUploaded(1))
+      .then(crash(1))
+      .then(tick)
+      .then(tick)
+      .expect(hotpathStale(1))
+      .then(hotPathReclaim(1))
+      .expect(all {
+        paths.get(1).status == PNone,
+        chunks.get(1).rc == 0 and chunks.get(1).deleted,
+        not(chunks.get(1).uploadedAt),
+        outbox == Set(1),
+        wit.hotpathReaped,
+      })
+      .then(claimPath(2, 1))
+      .then(upgradeManifest(2, Set(1)))
+      .expect(all {
+        // resurrected and needing a re-upload: the liveness signal was
+        // never consulted for presence (CR-4)
+        not(chunks.get(1).deleted),
+        chunks.get(1).rc == 1,
+        ups.get(2).needsUpload == Set(1),
+        cr3CounterRefinesFold,
+      })
+      .then(drainOne(1))
+      .expect(all {
+        // drain re-check sees the resurrection and skips the delete
+        wit.drainSkippedResurrected,
+        s3.contains(1),
+        cr1NoLiveChunkCollected,
+      })
+}
+
+// =========================================================================
+// THE CONTEND REGIME: two live writers sharing chunks against the GC
+// pipeline and the drain — the G4a TOCTOU family (collect vs
+// re-reference), the C11 select-vs-update race, the by-count batch
+// sweep, and the late-cleanup no-op contention. No process death: every
+// interleaving here is one production schedules on healthy processes.
+// =========================================================================
+module chunkLivenessContend {
+  import chunkLiveness(
+    MAX_HASHES = 2,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 2,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1
+  ).*
+
+  /// Two complete manifests share chunk 1; one batch sweep deletes
+  /// both and decrements the shared chunk by two in a single
+  /// transaction (the adfd303d7-C2 by-count discipline), zero-detects
+  /// it and enqueues it once. The second writer's upgrade also skips
+  /// the shared chunk's PUT (uploaded_at already set — the CR-4
+  /// compliant dedup).
+  run sharedChunkBatchSweepRun =
+    init
+      .then(claimPath(1, 1))
+      .then(upgradeManifest(1, Set(1, 2)))
+      .then(uploadChunks(1))
+      .then(markUploaded(1))
+      .then(completeManifest(1))
+      .then(claimPath(2, 2))
+      .then(upgradeManifest(2, Set(1)))
+      .expect(ups.get(2).needsUpload == Set())
+      .then(uploadChunks(2))
+      .then(markUploaded(2))
+      .then(completeManifest(2))
+      .expect(all {
+        chunks.get(1).rc == 2,
+        cr3CounterRefinesFold,
+      })
+      .then(pathSweepBatch)
+      .expect(all {
+        wit.sweptSharedByCount,
+        chunks.get(1).rc == 0 and chunks.get(1).deleted,
+        outbox == Set(1, 2),
+        cr3CounterRefinesFold,
+        cr2NoStrandedGarbage,
+      })
+}
+
+// =========================================================================
+// THE CORRUPT REGIME: two writers with the C12 surface enabled — an
+// existing manifest_data.chunk_list can become
+// unparseable, and every deletion path that parses it at delete time
+// (the claim reap, the stale reclaims, the path sweep) skips the
+// decrement for that manifest while still deleting it. The carved
+// CR-2/CR-3 forms hold (the leak is exactly the observably-skipped
+// decrements); the unconditional forms are expected to falsify here and
+// are wired as expect-violation checks (the pre-registered as-built
+// deviation of the invariant map), never as invariants of this regime.
+// =========================================================================
+module chunkLivenessCorrupt {
+  import chunkLiveness(
+    MAX_HASHES = 2,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 2,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = true,
+    LIST_CHOICES = Set(Set(1), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1
+  ).*
+
+  /// The C12 permanent leak: a complete manifest's chunk_list rots,
+  /// the path sweep deletes the manifest but cannot parse the list, the
+  /// decrement is skipped, and the chunk is stranded (refcount above
+  /// zero, no references, never collectable) — the storage-only leak
+  /// the as-built protocol accepts and the carved invariant forms
+  /// sanction.
+  run corruptSkipLeakRun =
+    init
+      .then(claimPath(1, 1))
+      .then(upgradeManifest(1, Set(1)))
+      .then(uploadChunks(1))
+      .then(markUploaded(1))
+      .then(completeManifest(1))
+      .then(corruptChunkList(1))
+      .then(pathSweepOne(1))
+      .expect(all {
+        paths.get(1).status == PNone,
+        chunks.get(1).rc == 1,
+        refs(1) == Set(),
+        leakedRefs.get(1) == 1,
+        not(chunks.get(1).deleted),
+        cr3CarvedCorrupt,
+        cr2CarvedCorrupt,
+        not(cr3CounterRefinesFold),
+        s3.contains(1),
+      })
+}
+
+// =========================================================================
+// THE THRESHOLD-ORDER REGIME: deliberately misordered clock constants
+// (the hot-path reclaim threshold equals the heartbeat deadline). Used
+// ONLY by the expect-violation check on S5: with the production
+// ordering heartbeat << hot-path <= scanner broken, a live, progressing
+// owner's placeholder becomes reclaimable between two of its own
+// heartbeats and the reap of a live owner is reachable. This is the
+// machine-checked form of "the scaled thresholds preserve the ordering
+// and the ordering is load-bearing" (design §3.5).
+// =========================================================================
+module chunkLivenessThresholdOrder {
+  import chunkLiveness(
+    MAX_HASHES = 2,
+    MAX_PATHS = 1,
+    MAX_UPLOADERS = 1,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 1,
+    SCANNER_AFTER = 2,
+    GRACE_TICKS = 1
+  ).*
 }
