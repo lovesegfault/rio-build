@@ -18,7 +18,12 @@
 //! (a path outside it is an input-rejection, matching CppNix
 //! `exportReferences`), and the per-path info rendering. Like CppNix,
 //! the closure is then expanded with the output closures of any `.drv`
-//! files it contains (see `closure_of`).
+//! files it contains (see `closure_of`). One deliberate strictness
+//! difference: CppNix resolves those output closures from whatever
+//! happens to be valid in the builder-local store, so the same
+//! derivation can succeed on one machine and fail on another; rio only
+//! consults the build's declared input metadata, so the outcome is the
+//! same on every worker.
 //!
 //! The closure data comes from the input metadata that accompanies the
 //! build's input manifest (`ValidatedPathInfo`: references, NAR hash
@@ -405,18 +410,28 @@ mod tests {
 
     const DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-probe.drv";
     const DOUT: &str = "/nix/store/ffffffffffffffffffffffffffffffff-probe-out";
+    const DRV2: &str = "/nix/store/gggggggggggggggggggggggggggggggg-inner.drv";
+    const OUT2: &str = "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-inner-out";
+    const FDRV: &str = "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-fetch.drv";
+    const FOUT: &str = "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-fetched";
 
     /// Write a minimal input-addressed `.drv` (ATerm) into `dir` under
-    /// the store-path basename, declaring the given `(name, path)`
-    /// outputs.
-    fn write_drv(dir: &std::path::Path, drv_store_path: &str, outputs: &[(&str, &str)]) {
+    /// the store-path basename, declaring the given
+    /// `(name, path, hashAlgo, hash)` outputs: empty hash fields =
+    /// input-addressed, empty path + hashAlgo = floating CA, path +
+    /// hash fields = fixed-output.
+    fn write_drv(
+        dir: &std::path::Path,
+        drv_store_path: &str,
+        outputs: &[(&str, &str, &str, &str)],
+    ) {
         let outs: Vec<String> = outputs
             .iter()
-            .map(|(n, p)| format!("(\"{n}\",\"{p}\",\"\",\"\")"))
+            .map(|(n, p, algo, hash)| format!("(\"{n}\",\"{p}\",\"{algo}\",\"{hash}\")"))
             .collect();
         let env: Vec<String> = outputs
             .iter()
-            .map(|(n, p)| format!("(\"{n}\",\"{p}\")"))
+            .map(|(n, p, _, _)| format!("(\"{n}\",\"{p}\")"))
             .collect();
         let aterm = format!(
             "Derive([{}],[],[],\"x86_64-linux\",\"/bin/sh\",[],[{}])",
@@ -442,7 +457,7 @@ mod tests {
         ];
         let paths = vec![A.to_string(), DRV.to_string()];
         let tmp = tempfile::tempdir().unwrap();
-        write_drv(tmp.path(), DRV, &[("out", DOUT)]);
+        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
         let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
 
         let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
@@ -465,11 +480,7 @@ mod tests {
         let paths = vec![A.to_string(), DRV.to_string()];
         let tmp = tempfile::tempdir().unwrap();
         // Floating-CA output: empty declared path, hash algo set.
-        std::fs::write(
-            tmp.path().join(basename(DRV).unwrap()),
-            "Derive([(\"out\",\"\",\"r:sha256\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[],[(\"out\",\"\")])",
-        )
-        .unwrap();
+        write_drv(tmp.path(), DRV, &[("out", "", "r:sha256", "")]);
         let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
@@ -479,12 +490,72 @@ mod tests {
     }
 
     #[test]
+    fn drv_reached_via_expanded_output_is_not_reexpanded() {
+        // Snapshot rule (CppNix iterates a snapshot of the closure): DRV's
+        // output DOUT references DRV2 — a derivation that only enters the
+        // graph through that expanded output closure. DRV2 itself must NOT
+        // be expanded: it is readable and well-formed, but its declared
+        // output OUT2 has no metadata in the index, so a (wrong) fixpoint
+        // expansion would fail with ExportRefsDrvOutputMissing instead of
+        // succeeding.
+        let infos = vec![
+            info(A, 10, &[DRV]),
+            info(DRV, 5, &[]),
+            info(DOUT, 30, &[DRV2]),
+            info(DRV2, 5, &[]),
+        ];
+        let paths = vec![A.to_string(), DRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
+        write_drv(tmp.path(), DRV2, &[("out", OUT2, "", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+
+        let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
+        assert!(
+            text.contains(DRV2),
+            "DRV2 belongs to DOUT's closure:\n{text}"
+        );
+        assert!(
+            !text.contains(OUT2),
+            "OUT2 must not appear: DRV2 was reached only via an expanded output closure\n{text}"
+        );
+    }
+
+    #[test]
+    fn fixed_output_drv_in_graph_expands_like_any_other() {
+        // A fixed-output derivation has a declared path AND hash fields;
+        // it must expand normally, not trip the floating-CA rejection
+        // (which is keyed on an *empty* declared path).
+        let infos = vec![
+            info(A, 10, &[FDRV]),
+            info(FDRV, 5, &[]),
+            info(FOUT, 30, &[]),
+        ];
+        let paths = vec![A.to_string(), FDRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        write_drv(
+            tmp.path(),
+            FDRV,
+            &[(
+                "out",
+                FOUT,
+                "r:sha256",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )],
+        );
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+
+        let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
+        assert!(text.contains(FOUT), "{text}");
+    }
+
+    #[test]
     fn drv_output_without_metadata_is_rejected() {
         // DRV declares DOUT but the index has no metadata for it.
         let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
         let paths = vec![A.to_string(), DRV.to_string()];
         let tmp = tempfile::tempdir().unwrap();
-        write_drv(tmp.path(), DRV, &[("out", DOUT)]);
+        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
         let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(

@@ -86,7 +86,8 @@ pub(crate) enum GlueError {
 
     #[error(
         "exportReferencesGraph: expanding {drv} requires path info for {path}, which is not in \
-         the build's input metadata"
+         the build's input metadata — reference the derivation via its `drvPath` (or otherwise \
+         add its outputs to the build's inputs) so their metadata travels with the input set"
     )]
     ExportRefsDrvOutputMissing { drv: String, path: String },
 
