@@ -1724,9 +1724,11 @@ impl DerivationState {
     }
 
     /// The in-memory attempt history (the committed suffix mirror).
-    /// Test-only in Phase 1a — no decision consults it until the
-    /// Phase-1b collapse.
-    #[cfg(test)]
+    /// Consulted by the Phase-1b collapsed sites' uncommitted-merge
+    /// fallback (no `derivations` row to read the suffix from yet) and,
+    /// from T-1b.13, by the fold-derived dispatch-time view; the
+    /// authoritative read for a verdict stays the appending
+    /// transaction's suffix SELECT.
     pub(crate) fn attempt_history(&self) -> &[AttemptRecord] {
         &self.attempt_history
     }

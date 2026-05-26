@@ -1295,15 +1295,30 @@ impl DagActor {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
                 // WITHOUT inserting into failed_builders.
-                self.handle_infrastructure_failure(
-                    drv_hash,
-                    executor_id,
-                    FailureReportCtx {
-                        final_line_count: report_line_count,
-                        error_msg: &result.error_msg,
-                    },
-                )
-                .await;
+                let handling = self
+                    .handle_infrastructure_failure(
+                        drv_hash,
+                        executor_id,
+                        FailureReportCtx {
+                            final_line_count: report_line_count,
+                            error_msg: &result.error_msg,
+                        },
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        self.requeue_failure_completion(
+                            executor_id,
+                            drv_hash,
+                            status,
+                            &result.error_msg,
+                            final_line_count,
+                        );
+                    }
+                }
             }
             rio_proto::types::BuildResultStatus::PermanentFailure
             | rio_proto::types::BuildResultStatus::CachedFailure
@@ -1389,15 +1404,34 @@ impl DagActor {
                     "unsolicited Cancelled from worker (DAG not Cancelled) \
                      — treating as infrastructure failure"
                 );
-                self.handle_infrastructure_failure(
-                    drv_hash,
-                    executor_id,
-                    FailureReportCtx {
-                        final_line_count: report_line_count,
-                        error_msg: "worker reported Cancelled without scheduler-initiated cancel",
-                    },
-                )
-                .await;
+                let handling = self
+                    .handle_infrastructure_failure(
+                        drv_hash,
+                        executor_id,
+                        FailureReportCtx {
+                            final_line_count: report_line_count,
+                            error_msg: "worker reported Cancelled without scheduler-initiated cancel",
+                        },
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        // Re-deliver with the original worker-reported
+                        // status so the routing arm re-runs this same
+                        // treat-as-infra path (and re-synthesizes the
+                        // message).
+                        self.requeue_failure_completion(
+                            executor_id,
+                            drv_hash,
+                            status,
+                            &result.error_msg,
+                            final_line_count,
+                        );
+                    }
+                }
             }
             rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
@@ -2355,6 +2389,48 @@ impl DagActor {
     /// intermediate (state machine requires Running before Poisoned
     /// from those states). Ready→Poisoned is direct (I-065:
     /// `failed_builders` exhausts the fleet — never assigned). For
+    /// Phase-1b sibling of [`Self::poison_and_cascade`] for collapsed
+    /// sites whose appending transaction already wrote the attempt row
+    /// AND persisted the Poisoned status: performs only the in-memory
+    /// transition (with the same precondition guard), the unpin, and the
+    /// shared terminal epilogue — no further PG writes. The epilogue's
+    /// event status stays `TransientFailure`, matching what
+    /// `poison_and_cascade` has always emitted for budget-exhaustion
+    /// poisons.
+    pub(super) async fn poison_already_recorded(
+        &mut self,
+        drv_hash: &DrvHash,
+        error_msg: &str,
+        final_line_count: Option<i64>,
+    ) {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        debug_assert!(
+            matches!(
+                state.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+            ),
+            "poison_already_recorded precondition violated: got {:?}",
+            state.status()
+        );
+        state.ensure_running();
+        if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+            warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                  "poison_already_recorded: ->Poisoned transition rejected, skipping cascade");
+            return;
+        }
+        state.retry.poisoned_at = Some(Instant::now());
+        self.unpin_best_effort(drv_hash).await;
+        self.terminal_failure_epilogue(
+            drv_hash,
+            error_msg,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            final_line_count,
+        )
+        .await;
+    }
+
     /// the reassign path (worker disconnect), the caller checks the
     /// threshold BEFORE reset_to_ready — the drv is still
     /// Assigned/Running then.
@@ -2519,28 +2595,17 @@ impl DagActor {
         }
     }
 
-    /// Shared tail of the non-terminal retry paths
+    /// Shared tail of the collapsed non-terminal retry paths
     /// (`handle_infrastructure_failure`, `handle_timeout_failure`
-    /// under-cap): persist `Ready` (together with the attempt-ledger
-    /// row the caller built for this observation), re-queue, emit
-    /// progress so the dashboard sees the requeue. The caller has
-    /// already done the `reset_to_ready` transition + counter
-    /// bookkeeping.
+    /// under-cap): the `Ready` persist already happened inside the
+    /// site's appending transaction, so only the in-memory queueing and
+    /// the dashboard progress emit remain. The caller has already done
+    /// the `reset_to_ready` transition + counter bookkeeping.
     ///
     /// `handle_transient_failure` does NOT use this — it goes through
     /// the `Failed→Ready` intermediate with backoff, which has
     /// different ordering constraints (push_ready inside the
     /// `node_mut` block).
-    async fn requeue_after_retry(&mut self, drv_hash: &DrvHash, attempt_row: Option<AttemptRow>) {
-        self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Ready, None)
-            .await;
-        self.requeue_after_recorded_retry(drv_hash);
-    }
-
-    /// Post-commit tail of a Phase-1b requeue verdict: the `Ready`
-    /// persist already happened inside the appending transaction, so
-    /// only the in-memory queueing and the dashboard progress emit
-    /// remain.
     fn requeue_after_recorded_retry(&mut self, drv_hash: &DrvHash) {
         self.push_ready(drv_hash.clone());
         for build_id in self.get_interested_builds(drv_hash) {
@@ -2834,12 +2899,20 @@ impl DagActor {
     /// into the transient-failure budget: 3× infra + 1× transient
     /// should NOT poison on the transient (the transient is the first
     /// REAL failure; the 3 infra were worker-side noise).
+    /// E2, collapsed onto `decide()`/`classify()` (Phase 1b): the
+    /// exempt-vs-counted classification comes from `classify()` over the
+    /// site's floor-outcome locals, and the requeue / exempt-cap /
+    /// infra-cap verdict comes from the fold over the appended attempt
+    /// suffix inside the appending transaction. The legacy RAM counter
+    /// mutations stay per verdict arm (rule 1, until T-1b.13); a failed
+    /// transaction leaves the derivation in its pre-report state for
+    /// re-delivery.
     pub(super) async fn handle_infrastructure_failure(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
-    ) {
+    ) -> FailureHandling {
         let error_msg = report.error_msg;
         // Ledger row for this observed attempt (1a): captured before
         // the floor bump / reset clears the exec_id carrier. The class
@@ -2878,16 +2951,15 @@ impl DagActor {
             super::floor::FloorOutcome::default()
         };
 
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return;
-        };
+        if self.dag.node(drv_hash).is_none() {
+            return FailureHandling::Handled;
+        }
 
         // D4: a floor bump that returned `promoted=true` is a sizing
         // signal — the next dispatch goes larger; the THIS-attempt
         // failure is not the build's fault. Exempt from the infra cap
         // alongside the I-127 PutPath case below. At-cap (`at_cap=
-        // true`) is NOT exempt — the increment after reset_to_ready
-        // counts it toward the cap.
+        // true`) is NOT exempt — the counted charge is what bounds it.
         //
         // I-127: "concurrent PutPath" is NEVER counted toward the
         // infra cap. It means another builder is uploading the SAME
@@ -2901,150 +2973,197 @@ impl DagActor {
         // when a leaked lock (I-125a) made 4 builders hit this in a
         // row → poison at 99.7%.
         //
-        // Substring match mirrors `is_concurrent_put_path` in
-        // rio-builder/src/upload.rs; both reference
-        // `rio_proto::CONCURRENT_PUTPATH_MSG` so the contract can't
-        // drift between store emit sites (PutPath / PutPathBatch) and
-        // the two consumer match sites.
-        let exempt_from_cap =
-            floor_outcome.promoted || error_msg.contains(rio_proto::CONCURRENT_PUTPATH_MSG);
+        // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) now
+        // lives in `classify()` — the single append-time classifier —
+        // so the row's class is what the fold charges, and this site
+        // only mirrors it into the legacy RAM counters below.
+        let class = crate::retry_policy::classify(
+            &crate::retry_policy::ObservedFailure::WorkerInfra { error_msg },
+            crate::retry_policy::FloorOutcomeView {
+                promoted: floor_outcome.promoted,
+                at_cap: floor_outcome.at_cap,
+            },
+        );
+        let exempt_from_cap = class == OutcomeClass::ExemptInfra;
 
         // Refine the ledger row with the site's classification: the
         // exempt class plus the floor-outcome discriminators the fold
-        // will read instead of re-deriving the floor at decision time.
+        // reads instead of re-deriving the floor at decision time.
         if let Some(row) = attempt_row.as_mut() {
             row.exempt = exempt_from_cap;
             row.floor_promoted = floor_outcome.promoted;
             row.floor_at_cap = floor_outcome.at_cap;
-            if exempt_from_cap {
-                row.outcome_class = OutcomeClass::ExemptInfra;
-            }
+            row.outcome_class = class;
         }
 
-        // r[impl sched.retry.exempt-infra-cap]
-        // High-water terminal for the cap-exemption: increments on
-        // EVERY exempt attempt (both CONCURRENT_PUTPATH and
-        // `promoted`) and poisons at a generous bound well above the
-        // I-127 4-in-a-row benign ceiling. Without this, a leaked
-        // store-side placeholder lock makes every honest worker report
-        // CONCURRENT_PUTPATH → infinite pod churn with no `warn!`
-        // signal and no counter advancing. The cap converts a silent
-        // livelock into an actionable poison; recovery cost is one
-        // `ClearPoison` after the store is fixed.
-        if exempt_from_cap {
-            state.retry.exempt_infra_count += 1;
-            if state.retry.exempt_infra_count >= self.retry_policy.max_exempt_infra_retries {
-                state.ensure_running();
+        // The verdict: decide() over the appended suffix inside the
+        // appending transaction (poison verdicts persist Poisoned,
+        // requeue persists Ready — both on the same connection). The
+        // uncommitted-merge edge (no db row) folds the in-memory
+        // attempt history instead and persists nothing (there is no
+        // derivations row to update either).
+        let (decision, recorded_row) = if let Some(row) = attempt_row {
+            let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                } else {
+                    crate::db::SchedulerDb::update_derivation_status_in_tx(
+                        &mut tx,
+                        drv_hash,
+                        DerivationStatus::Ready,
+                        None,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok(decision)
+            }
+            .await;
+            match result {
+                Ok(decision) => (decision, Some(row)),
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                          "infrastructure failure: appending transaction failed; derivation \
+                           stays in its pre-report state pending re-delivery");
+                    return FailureHandling::RecordFailed;
+                }
+            }
+        } else {
+            let history = self
+                .dag
+                .node(drv_hash)
+                .map(|s| s.attempt_history().to_vec())
+                .unwrap_or_default();
+            (
+                crate::retry_policy::decide(
+                    &history,
+                    &self.decision_budget(),
+                    crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+                    None,
+                ),
+                None,
+            )
+        };
+
+        // Push the committed row onto the in-memory history before
+        // acting on the verdict.
+        if let Some(row) = recorded_row
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.push_attempt_record(row.to_record());
+        }
+
+        match decision.verdict {
+            crate::retry_policy::Verdict::Poison(
+                crate::retry_policy::PoisonReason::ExemptInfraBudget,
+            ) => {
+                // High-water terminal for the cap-exemption
+                // (`sched.retry.exempt-infra-cap`, now decided by the
+                // fold): a leaked store-side placeholder lock or a stuck
+                // floor-promote becomes an actionable poison instead of a
+                // silent livelock. The legacy RAM counter still gets the
+                // increment the as-built arm performed before its check.
                 let max = self.retry_policy.max_exempt_infra_retries;
-                let count = state.retry.exempt_infra_count;
+                if let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.retry.exempt_infra_count += 1;
+                }
                 warn!(
                     drv_hash = %drv_hash,
                     executor_id = %executor_id,
-                    exempt_infra_count = count,
+                    exempt_infra_count = decision.counters.exempt_infra_count,
                     max,
                     "exempt infra-retry cap exceeded; poisoning \
                      (likely leaked store lock / stuck floor-promote)"
                 );
-                self.poison_and_cascade(
+                self.poison_already_recorded(
                     drv_hash,
                     &format!("max_exempt_infra_retries={max} exceeded: {error_msg}"),
                     report.final_line_count,
-                    attempt_row,
                 )
                 .await;
-                return;
+            }
+            crate::retry_policy::Verdict::Poison(reason) => {
+                // The counted infra budget (or, defensively, any other
+                // poison reason the fold could ever produce here): the
+                // derivation is likely hitting a deterministic failure
+                // the worker misclassifies as infra — more retries won't
+                // help, and the operator needs the poison signal. The
+                // as-built arm performed no RAM increment on this path.
+                let max = self.retry_policy.max_infra_retries;
+                if !matches!(reason, crate::retry_policy::PoisonReason::InfraBudget) {
+                    error!(drv_hash = %drv_hash, ?reason,
+                           "decide() returned an unexpected poison reason for an infra failure; \
+                            poisoning with the infra-budget message (investigate)");
+                }
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    infra_retry_count = decision.counters.infra_count,
+                    max,
+                    "infrastructure failure: max_infra_retries exhausted, poisoning"
+                );
+                self.poison_already_recorded(
+                    drv_hash,
+                    &format!(
+                        "max_infra_retries={max} exhausted after infrastructure failures: {error_msg}"
+                    ),
+                    report.final_line_count,
+                )
+                .await;
+            }
+            _ => {
+                // Requeue. Apply the legacy RAM mutations exactly as the
+                // as-built requeue arm did (rule 1, until T-1b.13): the
+                // exempt charge, the I-127 stale-window reset, and the
+                // counted-infra increment + window anchor. NO
+                // failed_builders insert, NO retry_count++, NO backoff —
+                // infra failures are worker-local and requeue
+                // immediately.
+                let Some(state) = self.dag.node_mut(drv_hash) else {
+                    return FailureHandling::Handled;
+                };
+                if exempt_from_cap {
+                    state.retry.exempt_infra_count += 1;
+                }
+                if !floor_outcome.at_cap
+                    && let Some(last) = state.retry.last_infra_failure_at
+                    && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
+                {
+                    debug!(
+                        drv_hash = %drv_hash,
+                        prev_count = state.retry.infra_count,
+                        window_secs = self.retry_policy.infra_retry_window_secs,
+                        "infra-retry window elapsed — resetting counter"
+                    );
+                    state.retry.infra_count = 0;
+                }
+                if let Err(e) = state.reset_to_ready() {
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "infrastructure failure: reset_to_ready failed, skipping");
+                    return FailureHandling::Handled;
+                }
+                // D4: `bump_floor_or_count` never mutates `infra_count`;
+                // THIS increment is the legacy single source of truth
+                // for the RAM view, after the reset above, exactly as
+                // the as-built arm ordered it.
+                if !exempt_from_cap {
+                    state.retry.infra_count += 1;
+                    state.retry.last_infra_failure_at = Some(Instant::now());
+                }
+                info!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    infra_retry_count = state.retry.infra_count,
+                    exempt_from_cap,
+                    error_msg,
+                    "infrastructure failure — retry without poison count"
+                );
+                self.requeue_after_recorded_retry(drv_hash);
             }
         }
-
-        // I-127 time-window reset: if the last counted infra failure
-        // was longer ago than `infra_retry_window_secs`, treat this as
-        // a fresh incident — reset the counter before the cap check.
-        // Sparse failures over a long build (4 fails over an hour)
-        // are independent; only a tight burst (4 fails in 2min)
-        // suggests a misclassified permanent error.
-        //
-        // `!at_cap` guard: at-cap resource exhaustion is deterministic
-        // (build needs > max_mem regardless of when the last attempt
-        // ran), so the sparse-vs-burst window doesn't apply — same
-        // rationale as `timeout_count` having no window reset. Without
-        // the guard, a slow trickle of at-cap OOMs would reset the
-        // counter every window and loop at max_mem forever (m044).
-        if !floor_outcome.at_cap
-            && let Some(last) = state.retry.last_infra_failure_at
-            && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
-        {
-            debug!(
-                drv_hash = %drv_hash,
-                prev_count = state.retry.infra_count,
-                window_secs = self.retry_policy.infra_retry_window_secs,
-                "infra-retry window elapsed — resetting counter"
-            );
-            state.retry.infra_count = 0;
-        }
-
-        // Bound check BEFORE reset_to_ready: if we've already exhausted
-        // the infra budget, poison instead. The derivation is likely
-        // hitting a deterministic failure the worker misclassifies as
-        // infra — more retries won't help, and the operator needs the
-        // poison signal to investigate. ensure_running() first:
-        // poison_and_cascade expects Running (not Assigned).
-        // Exempt errors skip the cap entirely (see above).
-        if !exempt_from_cap && state.retry.infra_count >= self.retry_policy.max_infra_retries {
-            state.ensure_running();
-            let max = self.retry_policy.max_infra_retries;
-            warn!(
-                drv_hash = %drv_hash,
-                executor_id = %executor_id,
-                infra_retry_count = state.retry.infra_count,
-                max,
-                resource_floor = ?state.sched.resource_floor,
-                "infrastructure failure: max_infra_retries exhausted, poisoning"
-            );
-            self.poison_and_cascade(
-                drv_hash,
-                &format!(
-                    "max_infra_retries={max} exhausted after infrastructure failures: {error_msg}"
-                ),
-                report.final_line_count,
-                attempt_row,
-            )
-            .await;
-            return;
-        }
-
-        if let Err(e) = state.reset_to_ready() {
-            warn!(drv_hash = %drv_hash, error = %e,
-                  "infrastructure failure: reset_to_ready failed, skipping");
-            return;
-        }
-        // NO insert into failed_builders (infra is worker-local, not
-        // build-local). NO retry_count++ (infra doesn't eat transient
-        // budget). NO backoff (re-dispatch immediately; P0211's
-        // store_degraded check excludes still-broken workers). But DO
-        // count against the SEPARATE infra bound — livelock prevention.
-        // Exempt errors (concurrent PutPath) don't increment — they
-        // can't indicate a misclassified permanent failure, so the
-        // hot-loop guard isn't needed for them.
-        //
-        // D4: `bump_floor_or_count` never mutates `infra_count`; THIS
-        // increment is the single source of truth and runs AFTER the
-        // cap check above, so at-cap cgroup-OOM and non-floor infra
-        // (FUSE EIO, store unreachable, …) poison at the same attempt
-        // number. Covers cold-start `{promoted:false, at_cap:false}`
-        // (est=None, floor=0) too.
-        if !exempt_from_cap {
-            state.retry.infra_count += 1;
-            state.retry.last_infra_failure_at = Some(Instant::now());
-        }
-        info!(
-            drv_hash = %drv_hash,
-            executor_id = %executor_id,
-            infra_retry_count = state.retry.infra_count,
-            exempt_from_cap,
-            error_msg,
-            "infrastructure failure — retry without poison count"
-        );
-        self.requeue_after_retry(drv_hash, attempt_row).await;
+        FailureHandling::Handled
     }
 
     /// E3, collapsed onto `decide()` (Phase 1b): the verdict for a

@@ -5150,3 +5150,208 @@ async fn phase1b_e4_timeout_verdicts_unchanged() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.4): E2 collapsed onto decide()/classify(). Worker-only
+// histories are behavior-preserving; the two adjudicated mixed-channel
+// deltas (D2, D3) become decision-visible here and are pinned red-first.
+// ---------------------------------------------------------------------------
+
+/// Worker-only equivalence battery: a mixed exempt / counted run keeps
+/// the as-built outcomes (exempt attempts never consume the counted
+/// budget, the legacy RAM counters keep tracking, no poison under the
+/// caps) and the ledger carries the per-class rows the fold reads.
+#[tokio::test]
+async fn phase1b_e2_worker_only_infra_battery_counters_and_rows_agree() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("e2batt-w", "x86_64-linux").await?;
+    let drv = "e2batt";
+    let drv_path = test_drv_path(drv);
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    let putpath = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);
+    let msgs = ["fuse: EIO", putpath.as_str(), "store unreachable"];
+    for msg in msgs {
+        assert!(handle.debug_force_assign(drv, "e2batt-w").await?);
+        complete_failure(
+            &handle,
+            "e2batt-w",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            msg,
+        )
+        .await?;
+        barrier(&handle).await;
+    }
+    let info = expect_drv(&handle, drv).await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "all under cap");
+    assert_eq!(info.retry.infra_count, 2, "two counted infra failures");
+    assert_eq!(info.retry.exempt_infra_count, 1, "one exempt attempt");
+    assert_eq!(info.retry.count, 0, "infra never eats the transient budget");
+    assert!(
+        info.retry.failed_builders.is_empty(),
+        "infra failures never join the exclusion set"
+    );
+    assert_eq!(
+        ledger_classes(&db.pool, drv).await,
+        vec!["infra", "exempt_infra", "infra"],
+        "the append-time classification carries the exempt split"
+    );
+    Ok(())
+}
+
+/// DIVERGENCE D2 (red-first for T-1b.4): an exclusively
+/// controller-counted at-cap OOM run followed by a sparse (> 300 s)
+/// non-at-cap worker infra failure is forgiven — the fold anchors the
+/// 300 s window on every counted increment regardless of channel, so
+/// the stale-window reset fires. Against the as-built RAM counters this
+/// poisons: the controller increments never stamp the anchor, the reset
+/// cannot fire, and E2's cap check sees the whole run.
+#[tokio::test]
+async fn phase1b_e2_d2_controller_counted_infra_run_forgiven_after_sparse_window() -> TestResult {
+    use rio_proto::types::TerminationReason as R;
+    let max_mem = crate::sla::config::SlaConfig::test_default()
+        .max_mem
+        .unwrap();
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy = crate::RetryPolicy {
+            max_infra_retries: 2,
+            ..Default::default()
+        };
+    });
+    let drv = "d2-ctrl-run";
+    let drv_path = test_drv_path(drv);
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    // Pin the floor at the ceiling so every controller OOM is at_cap
+    // (counted), never promoted.
+    handle
+        .debug_seed_sched_hint(
+            drv,
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: max_mem,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    // Exclusively controller-counted at-cap run (max_infra_retries = 2).
+    for i in 0..2 {
+        let w = format!("d2-w{i}");
+        let mut rx = connect_builder(&handle, &w, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        disconnect(&handle, &w).await?;
+        drop(rx);
+        let promoted = report_termination(&handle, &w, R::OomKilled).await?;
+        assert!(!promoted, "at the ceiling the report must not promote");
+    }
+    let info = expect_drv(&handle, drv).await;
+    assert_eq!(
+        info.retry.infra_count, 2,
+        "the controller channel counted the run (RAM view)"
+    );
+    assert_ne!(info.status, DerivationStatus::Poisoned, "still under cap");
+
+    // The run happened > 300 s ago. Backdate the ledger rows; the RAM
+    // anchor is untouched — it was never stamped by the controller
+    // increments, which is exactly D2's defect.
+    sqlx::query(
+        "UPDATE drv_attempts SET occurred_at = occurred_at - interval '400 seconds' \
+         WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)",
+    )
+    .bind(drv)
+    .execute(&db.pool)
+    .await?;
+
+    // A fresh worker reports a plain (non-at-cap, non-exempt) infra
+    // failure for the same derivation.
+    let mut rx = connect_builder(&handle, "d2-w-final", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "d2-w-final",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "fuse: EIO talking to the store",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, drv).await;
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "a sparse (>300 s) non-at-cap infra failure after a controller-counted run is a fresh \
+         incident and must be forgiven, not poisoned (D2)"
+    );
+    Ok(())
+}
+
+/// DIVERGENCE D3 / contradiction C3 (red-first for T-1b.4): a
+/// floor-promoted controller-reported OOM charges the exemption budget
+/// (`sched.retry.exempt-infra-cap`'s "every exempt attempt"), so an
+/// exempt run that spans both reporting channels poisons once the
+/// worker-reported exempt failure crosses `max_exempt_infra_retries`.
+/// Against the as-built RAM counters the controller attempts charge
+/// nothing and the run keeps requeueing.
+// r[verify sched.retry.exempt-infra-cap]
+#[tokio::test]
+async fn phase1b_e2_d3_promoted_controller_terminations_charge_exempt_budget() -> TestResult {
+    use rio_proto::types::TerminationReason as R;
+    let db = TestDb::new(&MIGRATOR).await;
+    // Big SLA ceilings (test_sla_config: 256 GiB) so every dispatched
+    // intent sits far below the cap and each OOM report has room to
+    // double the floor -> promoted=true on both controller cycles.
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.sla = test_sla_config();
+        c.retry_policy = crate::RetryPolicy {
+            max_exempt_infra_retries: 2,
+            ..Default::default()
+        };
+    });
+    let drv = "d3-exempt-run";
+    let drv_path = test_drv_path(drv);
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    // Two promoted controller-observed OOMs.
+    for i in 0..2 {
+        let w = format!("d3-w{i}");
+        let mut rx = connect_builder(&handle, &w, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        disconnect(&handle, &w).await?;
+        drop(rx);
+        let promoted = report_termination(&handle, &w, R::OomKilled).await?;
+        assert!(promoted, "below the ceiling the report must promote");
+    }
+    assert_eq!(
+        ledger_classes(&db.pool, drv).await,
+        vec!["exempt_infra", "exempt_infra"],
+        "both controller attempts classified exempt"
+    );
+    let info = expect_drv(&handle, drv).await;
+    assert_ne!(info.status, DerivationStatus::Poisoned);
+
+    // A worker-reported exempt infra failure (CONCURRENT_PUTPATH) is
+    // the third exempt attempt: it crosses max_exempt_infra_retries=2.
+    let mut rx = connect_builder(&handle, "d3-w-final", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    let putpath_msg = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);
+    complete_failure(
+        &handle,
+        "d3-w-final",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        &putpath_msg,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, drv).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "the exemption budget must bound exempt attempts on BOTH reporting channels (D3)"
+    );
+    Ok(())
+}
