@@ -871,6 +871,9 @@ pub fn build_submit_request(
         build_timeout: 0,
         build_cores: 0,
         keep_going: policy.keep_going,
+        // Wire-default false = today's behavior; the per-tenant policy
+        // plumbing for this lands separately.
+        force_build_roots: false,
     }
 }
 

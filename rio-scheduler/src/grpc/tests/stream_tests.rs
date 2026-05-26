@@ -77,6 +77,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
         build_timeout: 0,
         build_cores: 0,
         keep_going: false,
+        force_build_roots: false,
     };
     let mut event_stream = sched_client
         .submit_build(submit_req)

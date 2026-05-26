@@ -475,6 +475,11 @@ message SubmitBuildRequest {
   // resolves to UUID via tenants table — see r[sched.tenant.resolve].
   // Empty string = single-tenant mode.
   string tenant_name = 9;
+  // Build the submission's root derivations even when their outputs are
+  // upstream-substitutable (r[sched.merge.force-build-roots]). Set by the
+  // gateway from the per-tenant build policy; locally-present roots still
+  // short-circuit to Completed. Wire-default false = today's behavior.
+  bool force_build_roots = 10;
 }
 
 message WatchBuildRequest {

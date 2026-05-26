@@ -35,6 +35,7 @@ WorkAssignmentAck ack = 1;
 bool accepted = 1;
 bool cancelled = 1;
 bool draining = 11;
+bool force_build_roots = 10;
 bool is_fixed_output = 8;
 bool keep_going = 8;
 bool store_degraded = 9;

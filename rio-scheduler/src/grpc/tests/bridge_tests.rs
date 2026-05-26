@@ -192,6 +192,7 @@ async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
         build_timeout: 0,
         build_cores: 0,
         keep_going: false,
+        force_build_roots: false,
     };
 
     // First submission.
