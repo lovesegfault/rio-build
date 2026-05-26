@@ -556,6 +556,16 @@ impl DagActor {
     /// `status=NULL` until the store's TTL sweep — truthful: that
     /// execution was abandoned, not terminated.)
     ///
+    /// Returns the join handle of the spawned `drv_executions` stamp
+    /// write, `None` when nothing was stamped (hash not in DAG, no
+    /// exec_id, status outside the vocabulary). Production callers sit
+    /// in the actor loop and ignore it — awaiting it there would block
+    /// the actor on PG, exactly what the fire-and-forget design avoids.
+    /// Tests await it to order assertions after the stamp has
+    /// committed: the monotone-guard test needs a happens-before edge
+    /// on a write whose correct outcome is "zero rows changed", which
+    /// no row poll can observe.
+    ///
     /// r[impl sched.merge.exec-correlation+7]
     pub(super) fn terminal_log_epilogue(
         &self,
@@ -569,12 +579,12 @@ impl DagActor {
         // execution as incomplete — the conservative direction (never
         // falsely claim a log is complete).
         final_line_count: Option<i64>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let Some(state) = self.dag.node(drv_hash) else {
             // Should be impossible at this call site (terminal handlers
             // already validated the hash exists in the DAG), but defensive.
             warn!(drv_hash = %drv_hash, "terminal_log_epilogue: hash not in DAG, skipping");
-            return;
+            return None;
         };
         // Resolve the execution to finalize ONCE and thread it through
         // both steps so the `bd.exec_id` write and the lifecycle stamp
@@ -589,10 +599,10 @@ impl DagActor {
                 status,
                 "terminal_log_epilogue: no exec_id (never dispatched), skipping"
             );
-            return;
+            return None;
         };
         self.record_exec_correlation(drv_hash, exec_id, interested_builds);
-        self.stamp_drv_execution_terminal(drv_hash, exec_id, status, final_line_count);
+        self.stamp_drv_execution_terminal(drv_hash, exec_id, status, final_line_count)
     }
 
     /// Stamp the `drv_executions` lifecycle row terminal. Fire-and-forget
@@ -614,14 +624,19 @@ impl DagActor {
     ///
     /// `AND status IS NULL` keeps the stamp monotone: a second terminal
     /// event for the same execution (a completion racing a cancellation)
-    /// cannot overwrite the first verdict.
+    /// cannot overwrite the first verdict — first stamp to LAND wins,
+    /// the loser matches zero rows.
+    ///
+    /// Returns the spawned write's join handle (`None` on the
+    /// vocabulary-error arm). [`Self::terminal_log_epilogue`] forwards
+    /// it; production never awaits it (see the caveat there).
     fn stamp_drv_execution_terminal(
         &self,
         drv_hash: &DrvHash,
         exec_id: Uuid,
         status: &'static str,
         final_line_count: Option<i64>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         use rio_migrations::schema::{
             EXEC_STATUS_CANCELLED, EXEC_STATUS_FAILED, EXEC_STATUS_SUCCEEDED,
         };
@@ -637,11 +652,11 @@ impl DagActor {
                     "terminal_log_epilogue called with a status outside the \
                      drv_executions vocabulary; lifecycle row left unstamped"
                 );
-                return;
+                return None;
             }
         };
         let pool = self.db.pool().clone();
-        rio_common::task::spawn_monitored("drv-execution-terminal", async move {
+        let handle = rio_common::task::spawn_monitored("drv-execution-terminal", async move {
             if let Err(e) = sqlx::query(
                 "UPDATE drv_executions \
                  SET status = $2, finished_at = now(), final_line_count = $3 \
@@ -662,5 +677,6 @@ impl DagActor {
                 );
             }
         });
+        Some(handle)
     }
 }

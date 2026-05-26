@@ -4439,8 +4439,16 @@ async fn terminal_with_zero_line_count_writes_null() -> TestResult {
 }
 
 /// The terminal stamp is monotone: `AND status IS NULL` means the first
-/// verdict wins. A second terminal for the same execution (a completion
-/// racing a cancellation) must not overwrite the first.
+/// verdict to land wins. A second terminal for the same execution (a
+/// completion racing a cancellation) must not overwrite the first.
+///
+/// The two verdicts are sequenced by awaiting each spawned stamp's join
+/// handle: the guard's contract is arrival order at PG, not epilogue
+/// call order — issuing both fire-and-forget and expecting the first
+/// *call* to win was a race the test lost whenever the second UPDATE
+/// reached the row first. Awaiting the second handle before the read
+/// also makes the no-overwrite assertion a real happens-after check
+/// instead of a sleep-bounded one.
 #[tokio::test]
 async fn second_terminal_does_not_overwrite() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -4472,25 +4480,34 @@ async fn second_terminal_does_not_overwrite() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    // First verdict: succeeded with a real line count.
-    actor.terminal_log_epilogue(&DrvHash::from(drv_hash), "succeeded", &[], Some(10));
-    // Second verdict (a racing cancel): must be a no-op on the row.
-    actor.terminal_log_epilogue(&DrvHash::from(drv_hash), "cancelled", &[], None);
+    // First verdict: succeeded with a real line count. Await the
+    // spawned stamp so it has committed before the second verdict is
+    // issued — the racing-cancel scenario under test is "second
+    // terminal arrives after the first stamped", and the guard must
+    // make it a no-op.
+    actor
+        .terminal_log_epilogue(&DrvHash::from(drv_hash), "succeeded", &[], Some(10))
+        .expect("exec_id is set, so the first verdict spawns a stamp")
+        .await?;
+    let (status, count): (Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT status, final_line_count FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        status.as_deref(),
+        Some("succeeded"),
+        "first stamp must land"
+    );
+    assert_eq!(count, Some(10), "first stamp must carry the line count");
 
-    // Both stamps are fire-and-forget; poll until the FIRST lands, then
-    // give the second a beat to (incorrectly) land before asserting.
-    for _ in 0..100 {
-        let stamped: Option<String> =
-            sqlx::query_scalar("SELECT status FROM drv_executions WHERE exec_id = $1")
-                .bind(exec_id)
-                .fetch_one(&db.pool)
-                .await?;
-        if stamped.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Second verdict (a racing cancel): must be a no-op on the row.
+    // Await its spawned write too, so the assertions below read the row
+    // strictly after the second UPDATE has executed.
+    actor
+        .terminal_log_epilogue(&DrvHash::from(drv_hash), "cancelled", &[], None)
+        .expect("the node still carries the exec_id, so the second verdict spawns too")
+        .await?;
     let (status, count): (Option<String>, Option<i64>) =
         sqlx::query_as("SELECT status, final_line_count FROM drv_executions WHERE exec_id = $1")
             .bind(exec_id)
