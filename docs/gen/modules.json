@@ -1242,6 +1242,11 @@
       "doc": "Mark phase: compute unreachable paths via recursive CTE."
     },
     {
+      "path": "gc/mark_scan_bench.rs",
+      "depth": 1,
+      "doc": "Mark-scan cost measurement for the lazy chunk collector (design §5a go/no-go)."
+    },
+    {
       "path": "gc/orphan.rs",
       "depth": 1,
       "doc": "Orphan scanner: reap stale 'uploading' manifests."
