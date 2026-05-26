@@ -1116,6 +1116,19 @@ async fn run_native_lifecycle(
             )));
         }
     }
+    // `/build` is the build's cwd, `TMPDIR`/`TEMP*`, and `NIX_BUILD_TOP`.
+    // The directory was just created root:root 0755; hand it to the
+    // sandbox user exactly like CppNix's `chownToBuilder(tmpDir)` (mode
+    // 0700, builder-owned) — without this every build that writes scratch
+    // files outside `$out` (unpackPhase, `mktemp`, configure's conftest)
+    // fails EACCES. The merged store gets the equivalent treatment via
+    // `make_store_scratch_writable` further up.
+    if let Err(e) = make_build_dir_writable(&build_dir, SANDBOX_BUILD_UID, SANDBOX_BUILD_GID) {
+        return Err(ExecutorError::SandboxSetup(format!(
+            "preparing {} for the sandbox user failed: {e}",
+            build_dir.display()
+        )));
+    }
 
     // ── Request glue. ────────────────────────────────────────────────────
     let paths = glue::SandboxPaths {
@@ -1371,6 +1384,21 @@ fn make_store_scratch_writable(merged_store: &std::path::Path, gid: u32) -> std:
     // fail in unprivileged unit tests.
     std::fs::set_permissions(merged_store, std::fs::Permissions::from_mode(0o1775))?;
     std::os::unix::fs::chown(merged_store, None, Some(gid))
+}
+
+/// Hand the per-build scratch directory (the sandbox's `/build`: the
+/// build's cwd, `TMPDIR`, and `NIX_BUILD_TOP`) to the sandbox user —
+/// CppNix's `chownToBuilder(tmpDir)` contract: mode `0700`, owned by the
+/// build uid/gid. The chown half only runs when privileged (production);
+/// unprivileged unit tests and the differential driver already own the
+/// directory they pass in.
+fn make_build_dir_writable(build_dir: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(build_dir, std::fs::Permissions::from_mode(0o700))?;
+    if nix::unistd::geteuid().is_root() {
+        std::os::unix::fs::chown(build_dir, Some(uid), Some(gid))?;
+    }
+    Ok(())
 }
 
 /// What [`native_log_loop`] reports back to the lifecycle.
@@ -2056,6 +2084,28 @@ mod tests {
             // Unprivileged: the chmod half must have applied (asserted
             // above); the chown half is allowed to fail.
             let _ = res;
+        }
+    }
+
+    /// The per-build `/build` scratch must end up `0700` and (when
+    /// privileged) owned by the sandbox uid/gid — CppNix's
+    /// `chownToBuilder(tmpDir)` contract. A root:root 0755 `/build`
+    /// makes every build that writes to `$TMPDIR` fail EACCES.
+    #[test]
+    fn build_dir_made_writable_for_sandbox_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_build_dir_writable(dir.path(), SANDBOX_BUILD_UID, SANDBOX_BUILD_GID)
+            .expect("prepare build dir");
+        let md = std::fs::metadata(dir.path()).expect("stat");
+        assert_eq!(
+            md.permissions().mode() & 0o7777,
+            0o700,
+            "/build must be 0700"
+        );
+        if nix::unistd::geteuid().is_root() {
+            assert_eq!(md.uid(), SANDBOX_BUILD_UID);
+            assert_eq!(md.gid(), SANDBOX_BUILD_GID);
         }
     }
 
