@@ -1,9 +1,16 @@
-//! I-201: stranded chunks — `chunks.refcount > 0 AND NOT deleted` but
-//! the S3 object is absent. Race: SIGKILL mid-upload leaves the PG row
-//! at refcount=1 while PutObject never completed; a concurrent dedup
-//! sees the row, skips its own upload, chunk permanently missing.
+//! I-201: stranded chunks — PG records a confirmed upload
+//! (`uploaded_at` set, row not deleted) but the S3 object is absent.
+//! That is the inconsistency that turns a dedup'd PutPath into data
+//! loss: a later writer of the same content trusts the confirmed
+//! presence, skips its own upload, and the chunk stays permanently
+//! missing.
 //!
-//! Direct probe: sample referenced chunks from PG, S3 HeadObject each.
+//! Direct probe: sample confirmed-uploaded chunks from PG, S3
+//! HeadObject each. Presence is keyed on `uploaded_at` — the same
+//! predicate as the server-side VerifyChunks scan — never on the
+//! refcount liveness signal (liveness is not presence; the in-flight
+//! window where refcount >= 1 but the PUT has not finished is not a
+//! finding).
 //! S3 key layout is `chunks/{aa}/{blake3-hex}` (rio-store/backend.rs).
 
 use std::time::Duration;
@@ -51,7 +58,7 @@ impl Scenario for StrandedChunks {
 
         let rows = sqlx::query(
             "SELECT encode(blake3_hash, 'hex') AS h FROM chunks \
-             WHERE refcount > 0 AND NOT deleted \
+             WHERE uploaded_at IS NOT NULL AND NOT deleted \
              ORDER BY created_at DESC LIMIT $1",
         )
         .bind(SAMPLE)
@@ -78,7 +85,7 @@ impl Scenario for StrandedChunks {
                 let msg = format!("{e:#}");
                 if msg.contains("Not Found") || msg.contains("NoSuchKey") || msg.contains("404") {
                     return Ok(Verdict::Fail(format!(
-                        "stranded chunk: PG refcount>0 for {hex} but s3://{bucket}/{key} → 404"
+                        "stranded chunk: PG says uploaded (`uploaded_at` set, not deleted) for {hex} but s3://{bucket}/{key} → 404"
                     )));
                 }
                 // Other errors (auth, throttle) propagate.

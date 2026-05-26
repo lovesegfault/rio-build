@@ -1838,7 +1838,7 @@
     {
       "path": "k8s/qa/scenarios/i201_stranded_chunks.rs",
       "depth": 3,
-      "doc": "I-201: stranded chunks — `chunks.refcount > 0 AND NOT deleted` but"
+      "doc": "I-201: stranded chunks — PG records a confirmed upload"
     },
     {
       "path": "k8s/qa/scenarios/i204_big_parallel_routing.rs",
