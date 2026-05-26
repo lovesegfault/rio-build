@@ -1472,12 +1472,18 @@
                   # these harnesses verify the per-decision arithmetic
                   # over the full u64 domain.
                   #
-                  # kani-rio-retry-kernel (the scheduler's retry/poison
-                  # decision kernels) is deliberately NOT in this set: it
-                  # stays a manual target — see the entry in nix/kani.nix
-                  # for the measured CBMC cost and what still blocks
-                  # gating it.
-                  inherit (kaniChecks) kani-rio-lease kani-rio-store;
+                  # kani-rio-retry-kernel: same pipeline over the
+                  # scheduler's retry/poison decision kernels
+                  # (rio-retry-kernel) — the decide()/classify()/placeable()
+                  # contracts, the legacy-seed floor, the fold's
+                  # fleet-exhaust arm, and the proof-time bounded-set
+                  # representation's set-semantics harness. Gated once the
+                  # cfg(kani) IdSet/BoundedIdSet representation swap
+                  # brought the harnesses inside the gate budget; the
+                  # formal model (quint-retry-policy-*, in miscChecks)
+                  # checks the protocol, these harnesses the decision
+                  # arithmetic over bounded arbitrary inputs.
+                  inherit (kaniChecks) kani-rio-lease kani-rio-store kani-rio-retry-kernel;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.
                   # No KVM needed (synthetic tarballs).

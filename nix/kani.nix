@@ -168,14 +168,16 @@ in
   # harnesses verify in seconds — the dominant cost is the symbolic
   # execution of the std Vec/slice/sort machinery the parse and dedup
   # use, which travels with the code into the goto model (the same
-  # blowup class the rio-retry-kernel deferral below records), not the
-  # contract assertions themselves. Until a CBMC-affordable shape exists
-  # (candidate follow-ups: prove a dependency-free dedup kernel à la
-  # rio-retry-kernel, or revisit alongside the Phase-2 decide_collect
-  # kernel work), the contract is NOT claimed as verified here and no
-  # verify marker is carried for it; the parse's corrupt-class and dedup
-  # behavior is pinned by its unit tests in gc/mod.rs and the
-  # fuzz/rio-store manifest_deserialize target.
+  # blowup class that kept rio-retry-kernel out of the gate before its
+  # bounded-representation change), not the contract assertions
+  # themselves. This parse contract is the next candidate for exactly
+  # that pattern: a proof-only bounded parse/dedup representation
+  # swapped in under cfg(kani) (rio-retry-kernel's IdSet/BoundedIdSet
+  # template), or revisit alongside the Phase-2 decide_collect kernel
+  # work. Until one of those lands, the contract is NOT claimed as
+  # verified here and no verify marker is carried for it; the parse's
+  # corrupt-class and dedup behavior is pinned by its unit tests in
+  # gc/mod.rs and the fuzz/rio-store manifest_deserialize target.
   # r[verify store.log.session-keyed]
   # r[verify store.log.ingest-bounds]
   # r[verify store.log.completeness-gate]
@@ -190,35 +192,36 @@ in
   # dependency-free crate so the harnesses' goto model closes over the
   # kernel alone — the extraction the retry campaign's Phase-2 deferral
   # recorded in docs/spec/models/retry-invariant-map.md as the
-  # precondition for gating this check.
+  # precondition for gating this check. Gated (in checks.*) since the
+  # kernel's exclusion-set representation became cfg(kani)-swappable:
+  # under kani every executor-id set is the kernel's fixed-capacity
+  # BoundedIdSet (via the IdSet alias) instead of std's BTreeSet, the
+  # ledger fold runs without an intermediate Vec, and the exemption
+  # predicate's substring search is a windowed byte comparison — the
+  # extraction alone had NOT been sufficient (the harnesses spent their
+  # budget symbolically executing std BTreeSet/Vec/str machinery; the
+  # measured history lives in the extraction follow-up's and the
+  # representation change's commit messages). The swap is proof-only:
+  # production keeps BTreeSet, and the two representations are pinned to
+  # each other by the kernel's differential unit tests plus the
+  # set-semantics harness below.
   #
-  # STILL A MANUAL TARGET — run with
-  #   nix build .#kani-toolchain.kani-checks.kani-rio-retry-kernel
-  # The extraction turned out to be necessary but not sufficient: the
-  # dominant CBMC cost is not the host crate's reachable code but the
-  # symbolic execution of the std BTreeSet/Vec machinery inside the fold
-  # and the contract instrumentation around it, which travels with the
-  # code into any crate (measured numbers and the per-harness diagnosis
-  # in the kernel-extraction follow-up's commit messages). The classify
-  # harness additionally needed an explicit unwind bound — without one
-  # CBMC unwinds a memcmp in the substring search without limit. Until
-  # the set-folding harnesses fit a merge-gate budget (candidate
-  # follow-ups: a CBMC-friendlier exclusion-set representation inside
-  # the kernel — the same verifier-affordability tactic as the
-  # HashSet-to-BTreeSet switch that preceded the contracts — or a
-  # bounded bitset projection proven equivalent to the BTreeSet fold),
-  # this stays out of checks.* and carries no verify markers: the
-  # affected rules keep their unit-test and model-check verify sites,
-  # and a marker here would claim CI coverage the gate does not run.
-  #
-  # Six harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
-  #   - check_decide_contract: #[kani::proof_for_contract] over bounded
-  #     arbitrary attempt suffixes, scaled budgets, and optional legacy
-  #     seeds — the verdict partition is consistent with the final
-  #     counters (each terminal verdict names a budget really at its
-  #     bound; fleet-exhaust is unreachable from decide()), a Requeue
-  #     verdict never exceeds a budget cap, the exclusion set contains
-  #     the executor of every charged threshold attempt plus the legacy
+  # Seven harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
+  #   - check_bounded_set_models_set_semantics: the proof-time bounded
+  #     set obeys set semantics over symbolic values (insert newness,
+  #     precise membership, distinct-count len, order-insensitivity,
+  #     iter-yields-members) — the harness half of the representation
+  #     equivalence pin.
+  #   - check_decide_contract: asserts decide()'s four stated ensures
+  #     clauses (through their shared predicate bodies; the
+  #     contract-instrumented proof_for_contract form of a fold this
+  #     size exceeds the gate budget) over bounded arbitrary attempt
+  #     suffixes, scaled budgets, and optional legacy seeds — the
+  #     verdict partition is consistent with the final counters (each
+  #     terminal verdict names a budget really at its bound;
+  #     fleet-exhaust is unreachable from decide()), a Requeue verdict
+  #     never exceeds a budget cap, the exclusion set contains the
+  #     executor of every charged threshold attempt plus the legacy
   #     seed's members, the seed floor never drops below the frozen
   #     mirror columns, and (overflow checks on) the fold's counter
   #     arithmetic cannot overflow over the domain.
@@ -240,9 +243,16 @@ in
   #   - check_fold_fleet_exhaust_arm: the fold-side fleet-exhaust arm
   #     (E1) needs a non-empty fully-failed fleet; an empty fleet never
   #     poisons.
+  # r[verify sched.retry.transient-budget]
+  # r[verify sched.retry.attempts-bounded+2]
+  # r[verify sched.retry.exempt-infra-cap]
+  # r[verify sched.retry.recovery-projection+2]
+  # r[verify sched.retry.per-executor-budget+2]
+  # r[verify sched.dispatch.fleet-exhaust+3]
+  # r[verify sched.state.poisoned-ttl]
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 6;
+    expectedHarnesses = 7;
   };
 }

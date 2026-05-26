@@ -1594,46 +1594,51 @@ The decision kernels — the reference fold, `decide()`, `classify()` and
 (extracted from `rio-scheduler/src/retry_policy.rs`, which is now the
 projection shim over it). The kernel carries the function contracts
 (`#[kani::ensures]`, instrumented under `cfg(kani)` only) on `decide()`,
-`classify()` and `placeable()`, plus six proof harnesses in its
-`#[cfg(kani)] mod proofs`, wired as the `kani-rio-retry-kernel` target
-in nix/kani.nix (run with
-`nix build .#kani-toolchain.kani-checks.kani-rio-retry-kernel`; exact
-harness-count tripwire pinned at 6).
+`classify()` and `placeable()`, plus seven proof harnesses in its
+`#[cfg(kani)] mod proofs`, wired as the `kani-rio-retry-kernel` check
+in nix/kani.nix and gated in `checks.*` (run on its own with
+`nix build .#checks.x86_64-linux.kani-rio-retry-kernel`, or via the
+`.#kani-toolchain.kani-checks.kani-rio-retry-kernel` manual alias;
+exact harness-count tripwire pinned at 7).
 
-**Verification status — manual target, not yet in the merge gate.**
-CBMC on these harnesses inside rio-scheduler's artifact context did not
-converge within a merge-gate-compatible budget when they were
-introduced (the contracts-introducing commit's message records the
-measured numbers; the first cut on hash-set kernels was strictly worse —
-the ordered-set refactor that precedes the contracts commit was made for
-exactly this reason), and the recorded remediation was to extract the
-kernels into a dependency-light context the way the log campaign's
-`rio-store/src/logs/kernel.rs` was. That extraction has now landed (the
-`rio-retry-kernel` crate: no dependencies, no `Arc`, no floats in the
-proof path, the executor-identity type a parameter the harnesses
-instantiate with a small copy type while production keeps the fold's
-`String` vocabulary), and it sharpened the diagnosis rather than
-discharging the deferral: the dominant CBMC cost is not the host
-crate's reachable code but the symbolic execution of the std
-`BTreeSet`/`Vec` machinery inside the fold and the contract
-instrumentation around it, which travels with the code into any crate.
-The classification harness additionally needed an explicit unwind bound
-(without one CBMC unwinds a `memcmp` inside the substring search
-without limit — a harness defect the original artifact context masked
-by never getting that far). The extraction follow-up's commit messages
-record the measured numbers; the gate-wiring (and the corresponding
-verify markers at the wiring point) stays deferred until the
-set-folding harnesses fit a merge-gate budget — candidate follow-ups
-are a CBMC-friendlier exclusion-set representation inside the kernel
-(the same verifier-affordability tactic as the HashSet→BTreeSet
-switch) or a bounded bitset projection proven equivalent to the
-BTreeSet fold. Until then the properties below are stated, not
-machine-proven; the load-bearing coverage for the affected rules stays
-with the fold unit battery (which now exercises the kernel through the
-scheduler shim), the per-site tests, and the `quint-retry-policy-*`
-regimes.
+**Verification status — merge-gated.** CBMC on these harnesses did not
+converge within a merge-gate-compatible budget when the contracts were
+introduced inside rio-scheduler, and the extraction into the
+dependency-free kernel crate — the remediation the earlier deferral
+recorded — turned out to be necessary but not sufficient: the dominant
+cost was the symbolic execution of the std `BTreeSet`/`Vec`/`str`
+machinery inside the fold, the harnesses, and the contract
+instrumentation, which travels with the code into any crate (the
+contracts-introducing and extraction-follow-up commit messages record
+those measurements, including the classification harness's missing
+unwind bound). What closed the gap is the proof-time representation
+change: under `cfg(kani)` every executor-id set in the kernel is
+`BoundedIdSet` (via the `IdSet` alias) — a fixed-capacity array set
+whose operations are plain, concretely bounded index loops — the
+ledger fold runs without an intermediate event buffer, and the
+exemption predicate's substring search is a windowed byte comparison
+shared by the implementation and the contract. Production keeps
+`BTreeSet` (the alias resolves to it under every non-kani cfg), and
+the two representations are pinned to each other by the kernel's
+differential unit tests and the `check_bounded_set_models_set_semantics`
+harness. With that in place the harnesses converge inside the
+merge-gate budget (per-harness wall-clocks are recorded in the
+representation change's commit messages), `kani-rio-retry-kernel` is
+inherited into `checks.*` alongside `kani-rio-lease` /
+`kani-rio-store`, and the corresponding `r[verify]` markers live at
+the wiring point in nix/kani.nix. One mechanism note: `classify()` and
+`placeable()` are verified as `proof_for_contract` harnesses, while
+`decide()`'s four clauses are asserted by its harness through shared
+predicate bodies (the same text the `#[kani::ensures]` attributes
+wrap) — kani's contract-instrumented wrapper around the whole fold is
+the one shape that still exceeds the gate budget, and the assert form
+proves the identical clauses over the identical domain. The properties below are
+machine-checked over the stated bounded domains on every merge; the
+fold unit battery (which exercises the kernel through the scheduler
+shim), the per-site tests, and the `quint-retry-policy-*` regimes
+remain the load-bearing coverage for everything outside those domains.
 
-What the contracts state and the harnesses are built to prove, over
+What the contracts state and the harnesses prove, over
 every attempt suffix of up to 4 arbitrary ledger rows (arbitrary class /
 kind / flag / party / executor / timestamp combinations — a strict
 superset of what the appending sites can write), every budget with caps
@@ -1701,6 +1706,14 @@ every (or no) frozen-mirror-column seed:
   `sched.dispatch.fleet-exhaust+3`), exhaustion requires a non-empty
   fleet every member of which has already failed the derivation, and
   the fold-side fleet arm (E1) obeys the same predicate.
+- **The proof-time set representation models set semantics**
+  (`check_bounded_set_models_set_semantics`): the bounded array set the
+  kani cfg substitutes for `BTreeSet` (the `IdSet` alias) reports
+  insert newness, membership and distinct-count length exactly as a
+  set, is insertion-order-insensitive, and iterates exactly its
+  members — the harness half of the representation-equivalence pin
+  (the differential unit tests against `BTreeSet` are the production
+  half).
 
 Domain honesty: the contracts are stated over bounded suffixes and
 scaled budgets (the same scaling the quint regimes use), not over the
@@ -1713,10 +1726,10 @@ unrelated, the CONCURRENT_PUTPATH marker verbatim and embedded), with
 the kernel's copy of the marker pinned to
 `rio_proto::CONCURRENT_PUTPATH_MSG` by a lockstep unit test in the
 scheduler shim. The CBMC cost evidence lives in the
-contracts-introducing and extraction-follow-up commit messages;
-per-harness verdicts and check counts will live in the target's
-transcript once the remaining tractability follow-up (the verification
-status above) lets the target run in CI.
+contracts-introducing, extraction-follow-up, and bounded-representation
+commit messages; per-harness verdicts and check counts live in the
+gated check's transcript (`nix log` of the derivation, or the check's
+output file).
 
 Layer separation: the model (`quint-retry-policy-*`) checks the
 protocol — which observations arrive, what the appending transaction
@@ -1805,8 +1818,8 @@ refreshed per append), every charge/verdict/status persist commits or
 fails as one appending transaction, classification happens once at
 append time (`classify()`), placement consumes the fold's exclusion set
 (`placeable()`), recovery rebuilds the view from the same fold, and the
-decision arithmetic carries stated Kani contracts
-(`kani-rio-retry-kernel`, manual target).
+decision arithmetic carries machine-checked Kani contracts
+(`kani-rio-retry-kernel`, merge-gated).
 
 Verdict legend, following the log campaign's table: **CONSTRUCTION** —
 the state or code path the bug lived in does not exist post-collapse;
@@ -1817,10 +1830,11 @@ jointly by the Kani contracts, the fold unit battery, and the
 still live (deliberately kept); the named invariant / Kani harness /
 test holds the hazard down. **OUTSIDE** — no footprint in the collapsed
 decision path then or now; the named conventional vehicle owns it,
-unchanged by this campaign. Kani harness citations refer to the stated
-contracts (the manual `kani-rio-retry-kernel` target — see the
-assurance-layer verification status above); they are cited as the
-precise property statements and are never a row's sole checker.
+unchanged by this campaign. Kani harness citations refer to the
+machine-checked contracts (the merge-gated `kani-rio-retry-kernel`
+check — see the assurance-layer verification status above); they are
+cited as the precise property statements and are never a row's sole
+checker.
 
 #### G1 — counter incremented on the wrong path / not incremented where needed
 
@@ -2085,12 +2099,13 @@ design-§3 invariant HOLDs over the post-collapse model's four regimes
 (verdict table v2), the four pre-registered as-built falsifications
 (D1, D2/D3, D4, C2) flipped to HOLDs with the Phase-1b fixes,
 `FailoverPreservesHistory` is checked for the first time and HOLDs, and
-the decision kernels carry stated Kani contracts (the manual
-`kani-rio-retry-kernel` target: 6 harnesses over the verdict partition,
-the cap bounds, the exclusion superset, the legacy-seed floor,
-classification and placement; machine-proving them inside a
-merge-gate budget remains open after the kernel extraction — see the
-assurance-layer verification status). The machinery
+the decision kernels carry machine-checked Kani contracts (the
+merge-gated `kani-rio-retry-kernel` check: seven harnesses over the
+verdict partition, the cap bounds, the exclusion superset, the
+legacy-seed floor, classification, placement, and the proof-time set
+representation; gated once the bounded exclusion-set representation
+brought them inside the gate budget — see the assurance-layer
+verification status). The machinery
 that enforces the policy is one fold over
 durable rows: the seventeen in-place counter mutations, the per-counter
 mirror writers, and the nine divergent cap-check
@@ -2118,15 +2133,14 @@ report is bounded by the per-executor threshold via establishment
 (`sched.retry.failover-budget`) instead of refreshing on every flap.
 
 **The design-§5 Phase-2 gate, assessed honestly.** The gate has two
-clauses. "The full stack in the gate": partially met — the per-regime
-model checks, the reachability witnesses and the named-run replays are
-`checks.*` derivations on the merge gate; the Kani contracts are landed
-but still run as a manual target — the kernel extraction landed and
-moved them into `rio-retry-kernel`, but their CBMC cost is dominated by
-the std set/vector machinery in the fold rather than the host crate's
-context, so it remains above the gate budget (the assurance-layer
-verification status records the diagnosis and the remaining
-follow-ups) — and the MBT slot is the documented omission above.
+clauses. "The full stack in the gate": substantially met — the
+per-regime model checks, the reachability witnesses and the named-run
+replays are `checks.*` derivations on the merge gate, and the Kani
+contracts now run in the gate too (`kani-rio-retry-kernel` joined the
+checks.* kani set once the cfg(kani) bounded exclusion-set
+representation brought the harnesses inside the gate budget — the
+assurance-layer verification status records the history); the MBT slot
+is the documented omission above.
 "Net-negative diff for the four core
 files": NOT met, and recorded as such rather than reinterpreted. Against the pre-campaign baseline (the
 parent of the first Phase-1a commit), measured on the integrated branch
@@ -2199,9 +2213,17 @@ each handler also gains a durable write).
   the diagnosis (the CBMC cost is dominated by the std set/vector
   machinery in the fold and harnesses, not by the host crate's
   reachable code) but did not bring the set-folding harnesses inside
-  the gate budget, so the gate-wiring itself remains deferred — see
-  the assurance-layer verification status for the measured behavior,
-  the classify-harness unwind fix, and the candidate follow-ups.
+  the gate budget, so the gate-wiring itself remained deferred at that
+  point. **Status after the bounded-representation follow-up: gated.**
+  Under `cfg(kani)` the kernel's executor-id sets are the
+  fixed-capacity `BoundedIdSet` (the `IdSet` alias swap; equivalence
+  pinned by differential unit tests and a set-semantics harness), the
+  ledger fold runs without an intermediate event buffer, and the
+  exemption predicate's substring search is a windowed byte
+  comparison; with that representation the harnesses converge inside
+  the gate budget, and `kani-rio-retry-kernel` now runs in `checks.*`
+  with the `r[verify]` markers at the wiring point and the
+  harness-count tripwire pinned at 7 — this deferral is closed.
 - The mirror-column DROP, the legacy-floor removal, and the frozen
   three-argument `decide()` — behind the drain condition, with the
   operational probe recorded (the mirror-column subsection above).
