@@ -85,6 +85,18 @@ pub(crate) enum GlueError {
     #[error("exportReferencesGraph: cannot read derivation {path} for closure expansion: {reason}")]
     ExportRefsDrvUnreadable { path: String, reason: String },
 
+    /// Transient I/O failure reading a `.drv` from the materialized
+    /// input store (FUSE/JIT-fetch hiccup, EIO, missing materialization).
+    /// Unlike [`GlueError::ExportRefsDrvUnreadable`] — which covers
+    /// structural problems with the derivation itself (unparseable text,
+    /// no store available to the caller) — this is a property of the
+    /// worker's input materialization, so the executor classifies it as
+    /// infra-transient and the build is retried instead of being
+    /// rejected (the same bucket as a bind-mount materialization
+    /// failure).
+    #[error("exportReferencesGraph: I/O error reading derivation {path}: {reason}")]
+    ExportRefsDrvIo { path: String, reason: String },
+
     #[error(
         "exportReferencesGraph: cannot expand {drv}: output `{output}` has no statically-known \
          store path (content-addressed derivations are not supported here, matching Nix)"
@@ -150,6 +162,17 @@ pub(crate) enum GlueError {
     /// "input problems only" contract above).
     #[error("constructed execution request failed validation: {0}")]
     InvalidRequest(String),
+}
+
+impl GlueError {
+    /// `true` for failures that are properties of this worker's input
+    /// materialization (transient I/O while reading materialized inputs)
+    /// rather than of the derivation. The executor maps these to its
+    /// infra-transient bucket so the build is retried elsewhere instead
+    /// of being permanently rejected.
+    pub(crate) fn is_transient_io(&self) -> bool {
+        matches!(self, GlueError::ExportRefsDrvIo { .. })
+    }
 }
 
 /// Host-side directories backing the sandbox's writable mounts.

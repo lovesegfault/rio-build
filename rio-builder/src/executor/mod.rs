@@ -1173,12 +1173,25 @@ async fn run_native_lifecycle(
         Err(e) => {
             // Input-shaped rejection: report through the normal result
             // channel (the caller maps Glue → InputRejected) after the
-            // cgroup has been drained below.
+            // cgroup has been drained below. The one exception is a
+            // transient I/O failure reading materialized inputs (e.g. a
+            // FUSE hiccup while expanding an exportReferencesGraph .drv):
+            // that is the same class of fault as a bind-mount
+            // materialization failure, so it maps to the infra-transient
+            // bucket and the build is retried instead of rejected.
+            // r[impl builder.result.input-materialization-is-infra+3]
             monitors.stop();
             drain_build_cgroup(build_cgroup).await;
             scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            let build_result = Err(if e.is_transient_io() {
+                ExecutorError::SandboxSetup(format!(
+                    "reading materialized inputs for the request glue: {e}"
+                ))
+            } else {
+                ExecutorError::Glue(e.to_string())
+            });
             return Ok(NativeOutcome {
-                build_result: Err(ExecutorError::Glue(e.to_string())),
+                build_result,
                 peak_memory_bytes: 0,
                 peak_cpu_cores: 0.0,
                 final_line_count: opts.batcher_seed,

@@ -119,8 +119,8 @@ impl<'a> ClosureIndex<'a> {
 
         while let Some(p) = queue.pop() {
             let Some(info) = self.by_path.get(p) else {
-                // Every input-closure path has metadata (the same data
-                // fed the synthetic DB); a miss means the caller passed
+                // Every input-closure path has an entry in the build's
+                // input metadata index; a miss means the caller passed
                 // inconsistent inputs.
                 return Err(GlueError::ExportRefsMissingMetadata { path: p.to_owned() });
             };
@@ -207,8 +207,16 @@ impl<'a> ClosureIndex<'a> {
             return Err(unreadable("not a valid store path".to_owned()));
         };
         let host_path = dir.join(base);
-        let text = std::fs::read_to_string(&host_path)
-            .map_err(|e| unreadable(format!("reading {}: {e}", host_path.display())))?;
+        // I/O failures reading the materialized .drv (FUSE/JIT-fetch EIO,
+        // a file the materialization should have produced but didn't) are
+        // a property of this worker's input materialization, not of the
+        // derivation — keep them distinct from the structural
+        // `ExportRefsDrvUnreadable` cases so the executor can classify
+        // them as infra-transient and retry.
+        let text = std::fs::read_to_string(&host_path).map_err(|e| GlueError::ExportRefsDrvIo {
+            path: drv_store_path.to_owned(),
+            reason: format!("reading {}: {e}", host_path.display()),
+        })?;
         let drv = Derivation::parse(&text).map_err(|e| unreadable(format!("parsing: {e}")))?;
         Ok(drv
             .outputs()
@@ -637,22 +645,43 @@ mod tests {
         let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
         let paths = vec![A.to_string(), DRV.to_string()];
 
-        // No store dir at all.
+        // No store dir at all: structural — the caller cannot expand
+        // .drvs here at all. Permanent.
         let index = ClosureIndex::new(&infos, &paths);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
             matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
             "{err}"
         );
+        assert!(!err.is_transient_io());
 
-        // Store dir present but the .drv file is missing from it.
+        // Store dir present but the .drv text is unparseable: a property
+        // of the derivation, not of this worker. Permanent.
         let tmp = tempfile::tempdir().unwrap();
+        let drv_base = DRV.strip_prefix("/nix/store/").unwrap();
+        std::fs::write(tmp.path().join(drv_base), b"not an aterm derivation").unwrap();
         let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
             matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
             "{err}"
         );
+        assert!(!err.is_transient_io());
+    }
+
+    #[test]
+    fn io_failure_reading_drv_is_transient() {
+        // Store dir present but the .drv file is missing from it: the
+        // materialization should have produced it, so this is an
+        // infra/materialization fault — surfaced as the transient-I/O
+        // variant so the executor retries instead of rejecting.
+        let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
+        let paths = vec![A.to_string(), DRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(matches!(err, GlueError::ExportRefsDrvIo { .. }), "{err}");
+        assert!(err.is_transient_io());
     }
 
     #[test]
