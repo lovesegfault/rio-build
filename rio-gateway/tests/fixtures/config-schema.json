@@ -98,25 +98,11 @@
         "default": null
       },
       "max_connections": {
-        "description": "Global SSH connection cap (`r[gw.conn.cap]`). At cap, new\nconnects are rejected at the first `auth_*` callback. Bounds\nper-connection russh state and file descriptors; session memory\nis bounded separately by `max_sessions`. Default\n[`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000). Set via\n`RIO_MAX_CONNECTIONS`.",
+        "description": "Global SSH connection cap (`r[gw.conn.cap]`). At cap, new\nconnects are rejected at the first `auth_*` callback. Default\n[`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000 —\n≈2 GiB bounded at 4 channels × 2×256 KiB each).",
         "type": "integer",
         "format": "uint",
         "minimum": 0,
         "default": 1000
-      },
-      "max_sessions": {
-        "description": "Global active-session cap (`r[gw.conn.session-cap+2]`). Each\nexec'd protocol session costs ~550 KiB of buffers steady-state,\nso the default 4096 ≈ 2.2 GiB of the 4 GiB pod limit; per-session\negress is additionally paced by the SSH channel window the client\ngrants, and a `wopNarFromPath` transiently buffers up to one NAR\non top of that. At cap, additional `exec` requests are rejected\ncleanly (the SSH channel opens, the exec gets `channel_failure` +\nexit-status 1) — never with a channel-open refusal, which\ncorrupts stock nix clients behind `ControlMaster`. Default\n[`crate::server::DEFAULT_MAX_SESSIONS`]. Set via\n`RIO_MAX_SESSIONS`.",
-        "type": "integer",
-        "format": "uint",
-        "minimum": 0,
-        "default": 4096
-      },
-      "max_channels_per_connection": {
-        "description": "Per-connection SSH channel bound (`r[gw.conn.channel-limit+4]`).\nAn absurdity detector for channel-leaking or hostile clients,\nnot a resource bound — that is `max_sessions`. Default\n[`crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION`] (512 —\na 128-core CI machine running nix-fast-build behind one\nControlMaster with 4× headroom). Set via\n`RIO_MAX_CHANNELS_PER_CONNECTION`.",
-        "type": "integer",
-        "format": "uint",
-        "minimum": 0,
-        "default": 512
       },
       "max_transitive_inputs": {
         "description": "DAG-reconstruction cap on transitive input derivations per\nbuild (DoS guard). Default\n[`crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS`]\n(100k — ~8 MB of path strings). Set via\n`RIO_MAX_TRANSITIVE_INPUTS`.",
@@ -124,6 +110,14 @@
         "format": "uint",
         "minimum": 0,
         "default": 1048576
+      },
+      "build_policy": {
+        "description": "Per-tenant build-policy map, keyed by tenant name (the\nauthorized_keys comment). Settable only via the TOML file layer\n(`/etc/rio/gateway.toml`; exposed as helm `gateway.buildPolicy`\nonce the chart grows a gateway.toml mount); the env layer can't\nreliably express map keys (tenant names contain `-` and mixed\ncase, which the `RIO_*__` separator mangles). Unknown tenants →\ndefault (all-false). See `r[gw.build.per-tenant-policy]`.",
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/$defs/BuildPolicy"
+        },
+        "default": {}
       }
     },
     "$defs": {
@@ -192,6 +186,17 @@
           "per_minute",
           "burst"
         ]
+      },
+      "BuildPolicy": {
+        "description": "Per-tenant build-policy entry, keyed by tenant name in\n[`Config::build_policy`]. Controls fields the gateway stamps onto\n`SubmitBuildRequest` for that tenant's ssh-ng submissions.\nTenants not present in the map get `BuildPolicy::default()`\n(everything false — today's behavior).",
+        "type": "object",
+        "properties": {
+          "keep_going": {
+            "description": "`SubmitBuildRequest.keep_going`: continue building independent\nderivations after a failure instead of fail-fast cancelling the\nrest of the submission. See `r[gw.build.per-tenant-policy]`.",
+            "type": "boolean",
+            "default": false
+          }
+        }
       }
     }
   },
@@ -221,8 +226,7 @@
     "rate_limit": null,
     "service_hmac_key_path": null,
     "max_connections": 1000,
-    "max_sessions": 4096,
-    "max_channels_per_connection": 512,
-    "max_transitive_inputs": 1048576
+    "max_transitive_inputs": 1048576,
+    "build_policy": {}
   }
 }

@@ -132,6 +132,12 @@
         "type": "uint",
         "default": "1048576",
         "description": "DAG-reconstruction cap on transitive input derivations per build (DoS guard)."
+      },
+      {
+        "key": "build_policy",
+        "type": "object",
+        "default": "",
+        "description": "Per-tenant build-policy map, keyed by tenant name (the authorized_keys comment)."
       }
     ],
     "scheduler": [

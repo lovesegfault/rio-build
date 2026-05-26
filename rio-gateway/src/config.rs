@@ -10,6 +10,27 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+/// Per-tenant build-policy entry, keyed by tenant name in
+/// [`Config::build_policy`]. Controls fields the gateway stamps onto
+/// `SubmitBuildRequest` for that tenant's ssh-ng submissions.
+/// Tenants not present in the map get `BuildPolicy::default()`
+/// (everything false — today's behavior).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(default)]
+pub struct BuildPolicy {
+    /// `SubmitBuildRequest.keep_going`: continue building independent
+    /// derivations after a failure instead of fail-fast cancelling the
+    /// rest of the submission. See `r[gw.build.per-tenant-policy]`.
+    pub keep_going: bool,
+}
+
+/// Tenant name → policy. TOML: `[build_policy."tenant-name"]` tables in
+/// `/etc/rio/gateway.toml` (exposed as helm `gateway.buildPolicy` once
+/// the chart grows a gateway.toml mount).
+pub type BuildPolicyMap = std::collections::BTreeMap<String, BuildPolicy>;
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
@@ -125,6 +146,14 @@ pub struct Config {
     /// (100k — ~8 MB of path strings). Set via
     /// `RIO_MAX_TRANSITIVE_INPUTS`.
     pub max_transitive_inputs: usize,
+    /// Per-tenant build-policy map, keyed by tenant name (the
+    /// authorized_keys comment). Settable only via the TOML file layer
+    /// (`/etc/rio/gateway.toml`; exposed as helm `gateway.buildPolicy`
+    /// once the chart grows a gateway.toml mount); the env layer can't
+    /// reliably express map keys (tenant names contain `-` and mixed
+    /// case, which the `RIO_*__` separator mangles). Unknown tenants →
+    /// default (all-false). See `r[gw.build.per-tenant-policy]`.
+    pub build_policy: BuildPolicyMap,
 }
 
 impl Default for Config {
@@ -155,6 +184,7 @@ impl Default for Config {
             max_sessions: crate::server::DEFAULT_MAX_SESSIONS,
             max_channels_per_connection: crate::server::DEFAULT_MAX_CHANNELS_PER_CONNECTION,
             max_transitive_inputs: crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS,
+            build_policy: BuildPolicyMap::new(),
         }
     }
 }
@@ -278,6 +308,7 @@ mod tests {
         // Rate limiting disabled by default — no compiled-in quota
         // (the right value is workload-dependent).
         assert!(d.rate_limit.is_none());
+        assert!(d.build_policy.is_empty());
         assert_eq!(d.max_connections, crate::server::DEFAULT_MAX_CONNECTIONS);
         assert_eq!(d.max_sessions, crate::server::DEFAULT_MAX_SESSIONS);
         assert_eq!(
@@ -312,6 +343,9 @@ mod tests {
         [rate_limit]
         per_minute = 42
         burst = 7
+
+        [build_policy."parity-leaf"]
+        keep_going = true
         "#,
         |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
@@ -334,6 +368,12 @@ mod tests {
                 .expect("[rate_limit] table must deserialize to Some");
             assert_eq!(rl.per_minute.get(), 42);
             assert_eq!(rl.burst.get(), 7);
+            let pol = cfg
+                .build_policy
+                .get("parity-leaf")
+                .copied()
+                .expect("[build_policy.\"parity-leaf\"] table must deserialize");
+            assert!(pol.keep_going, "keep_going=true must round-trip");
         }
     );
 
@@ -341,6 +381,10 @@ mod tests {
         assert_eq!(cfg.session_drain, std::time::Duration::from_secs(60));
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.rate_limit.is_none());
+        assert!(
+            cfg.build_policy.is_empty(),
+            "build_policy defaults to empty"
+        );
         assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.max_connections, crate::server::DEFAULT_MAX_CONNECTIONS);
         assert_eq!(cfg.max_sessions, crate::server::DEFAULT_MAX_SESSIONS);
