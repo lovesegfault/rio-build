@@ -374,15 +374,26 @@ async fn a_corrupt_chunk_fails_the_fill_and_the_next_open_retries() {
         .unwrap()
         .insert(chunk_digests[2], b"corrupted bytes".to_vec());
 
-    let (fill, _case) = unwrap_streaming(
-        ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
-            .await
-            .expect("the open itself succeeds — the first chunk is fine"),
-    );
-    let err = read_blocking(&fill, content.len() as u64 - 10, 10)
-        .await
-        .expect_err("a read past the corrupt chunk fails");
-    assert_eq!(err.code(), fuser::Errno::EIO.code());
+    // The first chunk is fine, so the open usually succeeds and the EIO
+    // surfaces on a read past the corrupt chunk. On a loaded machine the
+    // fill can hit the corrupt chunk and publish its failure before the
+    // opener's first-chunk barrier acquires the lock, in which case
+    // `wait_covering` (deliberately — fail-fast once the fill is dead)
+    // reports the EIO at open() instead. Same outcome, different timing.
+    match ensure_readable_blocking(&h.open_path, digest, content.len() as u64).await {
+        Ok(readable) => {
+            let (fill, _case) = unwrap_streaming(readable);
+            let err = read_blocking(&fill, content.len() as u64 - 10, 10)
+                .await
+                .expect_err("a read past the corrupt chunk fails");
+            assert_eq!(err.code(), fuser::Errno::EIO.code());
+        }
+        Err(errno) => assert_eq!(
+            errno.code(),
+            fuser::Errno::EIO.code(),
+            "an open that lost the race to the failed fill surfaces the same EIO"
+        ),
+    }
     assert!(
         !h.open_path.cache_path(&digest).exists(),
         "corrupt content is never promoted into the shared cache"
@@ -529,11 +540,14 @@ async fn a_whole_file_digest_mismatch_is_never_promoted() {
         .unwrap()
         .insert(claimed, plan);
 
-    let (fill, _case) = unwrap_streaming(
-        ensure_readable_blocking(&h.open_path, claimed, content.len() as u64)
-            .await
-            .expect("the open succeeds — per-chunk checks pass"),
-    );
+    // The open usually returns inside the fill window (per-chunk checks
+    // pass), but on a loaded machine the whole 4-chunk fill plus its
+    // failed whole-file verification can finish before the opener's
+    // first-chunk barrier acquires the lock — and `wait_covering`
+    // deliberately reports a dead fill's error even for ranges it
+    // already covers (the §2.7/§13 fail-fast promise). Both orderings
+    // are the same outcome; only how early the EIO surfaces differs.
+    let opened = ensure_readable_blocking(&h.open_path, claimed, content.len() as u64).await;
     wait_until("the failed fill to clean up its .partial", || {
         !h.staging
             .join(format!("{}.partial", hex::encode(claimed)))
@@ -545,22 +559,32 @@ async fn a_whole_file_digest_mismatch_is_never_promoted() {
             && !h.staging.join(hex::encode(claimed)).exists(),
         "a file failing its whole-file digest is neither promoted nor left in staging"
     );
-    // The verification failure is published right after the cleanup;
-    // reads on the streaming handle turn into EIO from that point on
-    // (ranges already assembled included).
-    let mut last = read_blocking(&fill, 0, 16).await;
-    for _ in 0..200 {
-        if last.is_err() {
-            break;
+    match opened {
+        Ok(readable) => {
+            let (fill, _case) = unwrap_streaming(readable);
+            // The verification failure is published right after the
+            // cleanup; reads on the streaming handle turn into EIO from
+            // that point on (ranges already assembled included).
+            let mut last = read_blocking(&fill, 0, 16).await;
+            for _ in 0..200 {
+                if last.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                last = read_blocking(&fill, 0, 16).await;
+            }
+            assert_eq!(
+                last.expect_err("reads after the failed verification are EIO")
+                    .code(),
+                fuser::Errno::EIO.code()
+            );
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        last = read_blocking(&fill, 0, 16).await;
+        Err(errno) => assert_eq!(
+            errno.code(),
+            fuser::Errno::EIO.code(),
+            "an open that lost the race to the failed fill surfaces the same EIO"
+        ),
     }
-    assert_eq!(
-        last.expect_err("reads after the failed verification are EIO")
-            .code(),
-        fuser::Errno::EIO.code()
-    );
 }
 
 /// A Promote failure after the fill has verified and renamed is
