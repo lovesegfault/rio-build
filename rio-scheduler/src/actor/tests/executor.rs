@@ -5073,3 +5073,57 @@ async fn attempt_ledger_late_installment_lands_on_old_attempt() -> TestResult {
     assert!(rows[0].termination_reason.is_some());
     Ok(())
 }
+
+/// Phase 1b (T-1b.6): the backstop's poison verdict is computed at the
+/// E8 charging site by decide() over the appended backstop rows — it no
+/// longer depends on E5's re-check inside `reassign_derivations`. Three
+/// backstop fires from three distinct wedged workers poison the
+/// derivation, and the E5 re-check arm's log line never appears (the
+/// structural pin that the verdict was not delegated); PG and the
+/// ledger agree with the in-memory verdict.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn phase1b_e8_backstop_poison_decided_at_site_without_e5_recheck() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "bs-site", PriorityClass::Scheduled).await?;
+
+    for i in 0..3 {
+        let id = format!("bs-site-w{i}");
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        assert!(handle.debug_backdate_running("bs-site", 200).await?);
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        let _ = rx.try_recv();
+    }
+
+    assert_eq!(
+        expect_drv(&handle, "bs-site").await.status,
+        DerivationStatus::Poisoned,
+        "the third distinct wedged worker crosses the threshold"
+    );
+    // The verdict was computed and acted on at the backstop site: the
+    // reassign-side poison arm (E5's re-check) never fired.
+    assert!(
+        logs_contain("backstop timeout: build running far longer than expected"),
+        "the backstop observability stays on the restructured path"
+    );
+    assert!(
+        !logs_contain("reassign: poison threshold reached, poisoning instead of retry"),
+        "the poison must not be delegated to reassign_derivations' re-check"
+    );
+    // PG agrees (the status persisted inside the appending transaction)
+    // and the ledger holds exactly the three backstop rows.
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind("bs-site")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pg_status, "poisoned");
+    assert_eq!(
+        ledger_classes(&db.pool, "bs-site").await,
+        vec!["backstop", "backstop", "backstop"],
+    );
+    Ok(())
+}

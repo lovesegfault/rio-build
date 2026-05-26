@@ -459,22 +459,27 @@ impl DagActor {
             }
             // r[impl sched.backstop.timeout+3]
             // Backstop is the no-CompletionReport path — completion.rs
-            // will never account this attempt. Record it here so
-            // `is_poisoned()` in `reassign_derivations` caps the loop
-            // at `threshold`. NOT a sizing signal —
-            // `handle_timeout_failure` (worker-reported TimedOut) does
-            // the floor promotion; this scheduler-side backstop is
-            // "worker hung, never reported."
+            // will never account this attempt. The legacy RAM charge
+            // stays (rule 1, until T-1b.13); the verdict now comes from
+            // decide() over the appended suffix at THIS charging site
+            // (Phase 1b), so the backstop's poison decision no longer
+            // depends on E5's re-check in `reassign_derivations`. NOT a
+            // sizing signal — `handle_timeout_failure` (worker-reported
+            // TimedOut) does the floor promotion; this scheduler-side
+            // backstop is "worker hung, never reported."
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 state.retry.failed_builders.insert(executor_id.clone());
                 state.retry.failure_count += 1;
             }
-            // 1a: the backstop observation's ledger row — appended at
-            // THIS site (the charging site), before the reassign clears
-            // the exec_id carrier. The delegation to
-            // `reassign_derivations` appends nothing further (the
-            // `disconnected` row is owned by the disconnect handler
-            // alone), so this stays the attempt's only row.
+            // The appending transaction: the backstop observation's row
+            // (captured before the reassign clears the exec_id carrier)
+            // plus the fold; a threshold verdict persists Poisoned in
+            // the same transaction and the poison runs here directly.
+            // The delegation to `reassign_derivations` below stays the
+            // reassignment mechanics only (requeue + its status persist)
+            // and appends nothing further, so this stays the attempt's
+            // only row. Leader-gated like the 1a append it replaces — a
+            // standby must neither write rows nor decide.
             let row = self
                 .attempt_row_for(
                     drv_hash,
@@ -485,7 +490,50 @@ impl DagActor {
                     r.executor_id = Some(executor_id.clone());
                     r
                 });
-            self.append_attempt_standalone(drv_hash, row).await;
+            if self.leader.is_leader()
+                && let Some(row) = row
+            {
+                let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
+                    let mut tx = self.db.pool().begin().await?;
+                    let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                    if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
+                        crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                    }
+                    tx.commit().await?;
+                    Ok(decision)
+                }
+                .await;
+                match result {
+                    Ok(decision) => {
+                        if let Some(state) = self.dag.node_mut(drv_hash) {
+                            state.push_attempt_record(row.to_record());
+                        }
+                        if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
+                            // The backstop-recorded charge crossed the
+                            // poison threshold: poison at this site (the
+                            // status already persisted in the appending
+                            // transaction) and skip the reassign-side
+                            // requeue — exactly what the as-built E5
+                            // re-check produced for the same history,
+                            // including the reason string (A8: strings
+                            // unchanged).
+                            self.poison_already_recorded(
+                                drv_hash,
+                                "poison threshold reached on worker disconnect after prior failures",
+                                None,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                              "backstop: appending transaction failed; leaving the build Running \
+                               so the next housekeeping tick re-drives it");
+                        continue;
+                    }
+                }
+            }
             self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
                 .await;
         }
