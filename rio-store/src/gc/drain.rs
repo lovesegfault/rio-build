@@ -37,6 +37,17 @@ const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// - On success: DELETE the pending row
 /// - On failure: UPDATE attempts = attempts + 1, last_error
 ///
+/// `kind='blob'` rows (a swept path's binary-cache compat objects) are
+/// deleted through `delete_blob` against `blob_backend` when one is
+/// supplied, falling back to `backend` otherwise. `blob_backend` is
+/// the compat layer's dedicated bucket (`binary_cache_compat.bucket`)
+/// — the writer publishes there, so the drain must delete there too;
+/// deleting through the chunk backend would silently no-op in the
+/// wrong bucket and leak the objects forever
+/// (`r[store.compat.gc-coupled]`). When no dedicated bucket is
+/// configured the compat objects live in the chunk backend's blob
+/// namespace and the fallback is exactly right.
+///
 /// Transactional: SELECT ... FOR UPDATE SKIP LOCKED grabs a batch
 /// of rows and holds row-level locks until commit. Multiple store
 /// replicas running drain concurrently each grab DISJOINT batches
@@ -58,6 +69,7 @@ const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 pub async fn drain_once(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
+    blob_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<(u64, u64), sqlx::Error> {
     let mut deleted = 0u64;
     let mut failed = 0u64;
@@ -69,7 +81,7 @@ pub async fn drain_once(
     let mut seen: Vec<i64> = Vec::new();
 
     for _ in 0..DRAIN_BATCH_SIZE {
-        match drain_one_row(pool, backend, &seen).await? {
+        match drain_one_row(pool, backend, blob_backend, &seen).await? {
             None => break,
             Some((id, DrainOutcome::Deleted)) => {
                 seen.push(id);
@@ -137,9 +149,13 @@ enum DrainOutcome {
 /// One per-row drain transaction: SELECT one pending row FOR UPDATE
 /// SKIP LOCKED, re-check `chunks.(deleted AND refcount=0)` FOR UPDATE,
 /// S3 delete, commit. Returns `None` if no eligible row.
+///
+/// `blob_backend`: where `kind='blob'` rows are deleted (see
+/// [`drain_once`]); `None` falls back to `backend`'s blob namespace.
 async fn drain_one_row(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
+    blob_backend: Option<&Arc<dyn ChunkBackend>>,
     skip_ids: &[i64],
 ) -> Result<Option<(i64, DrainOutcome)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -222,7 +238,11 @@ async fn drain_one_row(
     }
 
     let delete_result = if kind == "blob" {
-        backend.delete_blob(&key).await
+        // Compat objects live wherever the writer put them: the
+        // dedicated compat bucket when one is configured, else the
+        // chunk backend's blob namespace. Deleting through the wrong
+        // backend would succeed as a no-op and leak the real object.
+        blob_backend.unwrap_or(backend).delete_blob(&key).await
     } else {
         backend.delete_by_key(&key).await
     };
@@ -277,16 +297,23 @@ async fn drain_one_row(
 
 /// Spawn the periodic drain task. Runs `drain_once` every
 /// DRAIN_INTERVAL. Exits cleanly when `shutdown` is cancelled.
+///
+/// `blob_backend` is the binary-cache compat blob target (the
+/// dedicated `binary_cache_compat.bucket` backend when one is
+/// configured) — `kind='blob'` rows are deleted there; `None` means
+/// compat objects live in `backend`'s blob namespace.
 pub fn spawn_drain_task(
     pool: PgPool,
     backend: Arc<dyn ChunkBackend>,
+    blob_backend: Option<Arc<dyn ChunkBackend>>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     rio_common::task::spawn_periodic("gc-drain-task", DRAIN_INTERVAL, shutdown, move || {
         let pool = pool.clone();
         let backend = Arc::clone(&backend);
+        let blob_backend = blob_backend.clone();
         async move {
-            if let Err(e) = drain_once(&pool, &backend).await {
+            if let Err(e) = drain_once(&pool, &backend, blob_backend.as_ref()).await {
                 warn!(error = %e, "drain iteration failed (will retry)");
             }
         }
@@ -321,7 +348,7 @@ mod tests {
 
         // Drain: should delete the chunk from backend + remove
         // the pending row.
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         assert_eq!(deleted, 1, "one row drained");
         assert_eq!(failed, 0);
 
@@ -362,7 +389,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         assert_eq!(deleted, 2, "present object + absent candidate both drain");
         assert_eq!(failed, 0);
 
@@ -377,6 +404,87 @@ mod tests {
         assert_eq!(count, 0, "both outbox rows consumed");
     }
 
+    // r[verify store.compat.gc-coupled]
+    /// Dedicated-compat-bucket configuration end to end: the writer
+    /// published into a SEPARATE bucket (`binary_cache_compat.bucket`),
+    /// so after the GC sweep enqueues the path's compat keys the drain
+    /// must delete them from that dedicated backend — not the chunk
+    /// backend, where a delete would no-op in the wrong namespace and
+    /// silently leak the real objects.
+    #[tokio::test]
+    async fn drain_deletes_blob_rows_from_dedicated_compat_backend() {
+        use crate::test_helpers::StoreSeed;
+        use rio_test_support::fixtures::test_store_path;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_backend: Arc<dyn ChunkBackend> = mem_backend();
+        let compat_backend: Arc<dyn ChunkBackend> = mem_backend();
+
+        // A compat-written path whose objects live ONLY in the
+        // dedicated compat backend.
+        let path = test_store_path("dedicated-bucket-gc");
+        let hash = StoreSeed::raw_path(&path).seed(&db.pool).await;
+        let file_hash = [0x6Bu8; 32];
+        sqlx::query("UPDATE narinfo SET compat_file_hash = $2 WHERE store_path_hash = $1")
+            .bind(&hash)
+            .bind(file_hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let hash_part = rio_nix::store_path::StorePath::parse(&path)
+            .unwrap()
+            .hash_part();
+        let narinfo_key = format!("{hash_part}.narinfo");
+        let nar_key = format!(
+            "nar/{}.nar.zst",
+            rio_nix::store_path::nixbase32::encode(&file_hash)
+        );
+        for key in [&narinfo_key, &nar_key] {
+            compat_backend
+                .put_blob(key, bytes::Bytes::from_static(b"compat object"))
+                .await
+                .unwrap();
+        }
+
+        // GC the path (enqueues the blob keys), then drain with the
+        // dedicated blob target wired — exactly main.rs's shape when
+        // binary_cache_compat.bucket is set.
+        let stats = crate::gc::sweep::sweep(
+            &db.pool,
+            None,
+            vec![hash],
+            false,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+
+        let (deleted, failed) = drain_once(&db.pool, &chunk_backend, Some(&compat_backend))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 4, "narinfo + three NAR candidates drained");
+        assert_eq!(failed, 0);
+
+        assert!(
+            compat_backend
+                .get_blob(&narinfo_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "narinfo must be deleted from the DEDICATED compat backend"
+        );
+        assert!(
+            compat_backend.get_blob(&nar_key).await.unwrap().is_none(),
+            "NAR object must be deleted from the DEDICATED compat backend"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "outbox fully drained");
+    }
+
     #[tokio::test]
     async fn drain_increments_attempts_on_failure() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -389,7 +497,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(failed, 1, "invalid key → delete fails");
 
@@ -460,7 +568,7 @@ mod tests {
             .unwrap();
 
         // Drain.
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         assert_eq!(deleted, 1, "only Y S3-deleted; X resurrected → skipped");
         assert_eq!(failed, 0);
 
@@ -502,7 +610,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         assert_eq!(deleted, 1, "NULL blake3_hash → drain proceeds");
         assert_eq!(failed, 0);
         assert!(
@@ -528,7 +636,7 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         // Both 0: the row is excluded by WHERE attempts < MAX.
         // Operator investigates; this row is effectively "parked."
         assert_eq!(deleted, 0);
@@ -560,7 +668,7 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(&db.pool, &backend, None).await.unwrap();
         assert_eq!((deleted, failed), (0, 0));
 
         assert_eq!(
@@ -628,7 +736,7 @@ mod tests {
         let backend_a = Arc::clone(&backend);
 
         let (drain_res, upsert_res) = tokio::join!(
-            drain_once(&pool_a, &backend_a),
+            drain_once(&pool_a, &backend_a, None),
             // PutPath's chunk upsert: ON CONFLICT bumps refcount,
             // clears deleted. RETURNING (uploaded_at IS NULL) tells
             // caller whether to upload (true = no prior upload
@@ -764,7 +872,7 @@ mod tests {
         });
 
         let pool = db.pool.clone();
-        let drain = tokio::spawn(async move { drain_once(&pool, &backend).await });
+        let drain = tokio::spawn(async move { drain_once(&pool, &backend, None).await });
 
         // Wait until row 1 committed and row 2's S3 delete is mid-flight.
         entered_second.notified().await;
@@ -822,8 +930,8 @@ mod tests {
         let backend_b = Arc::clone(&backend);
 
         let (a, b) = tokio::join!(
-            drain_once(&pool_a, &backend_a),
-            drain_once(&pool_b, &backend_b),
+            drain_once(&pool_a, &backend_a, None),
+            drain_once(&pool_b, &backend_b, None),
         );
         let (del_a, fail_a) = a.unwrap();
         let (del_b, fail_b) = b.unwrap();

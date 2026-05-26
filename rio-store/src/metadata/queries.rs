@@ -811,6 +811,60 @@ mod tests {
     /// matching the seeded `nar_size` of 100.
     const ONE_CHUNK: &[([u8; 32], u32)] = &[([0x55; 32], 100)];
 
+    // r[verify store.compat.reconcile+2]
+    /// Compat-queue rotation ordering: a stamped (previously-failed)
+    /// row sorts BEHIND a never-attempted one regardless of age, and
+    /// among stamped rows the least-recently-attempted comes first.
+    /// Pins the `compat_attempted_at ASC NULLS FIRST` clause — a
+    /// silent revert to plain registration-time ordering would let a
+    /// failing prefix starve newer pending paths again.
+    #[tokio::test]
+    async fn list_compat_pending_orders_never_attempted_first() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // `older` is registered before `newer` (registration_time 10 vs
+        // 20) so plain registration-time ordering would put it first.
+        let older = test_store_path("compat-order-older");
+        let newer = test_store_path("compat-order-newer");
+        for (path, reg) in [(&older, 10i64), (&newer, 20i64)] {
+            StoreSeed::raw_path(path).seed(&db.pool).await;
+            sqlx::query("UPDATE narinfo SET registration_time = $2 WHERE store_path = $1")
+                .bind(path)
+                .bind(reg)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Stamp the OLDER row as a failed attempt → it must rotate
+        // behind the never-attempted newer row.
+        bump_compat_attempt(&db.pool, &older).await.unwrap();
+        let pending = list_compat_pending(&db.pool, 10).await.unwrap();
+        assert_eq!(
+            pending,
+            vec![newer.clone(), older.clone()],
+            "never-attempted rows must sort before previously-failed ones"
+        );
+
+        // Both stamped, with `newer` attempted strictly later
+        // (explicit timestamps so the ordering can't tie): the queue
+        // falls back to least-recently-attempted first.
+        sqlx::query(
+            "UPDATE narinfo SET compat_attempted_at = now() + interval '1 hour' \
+             WHERE store_path = $1",
+        )
+        .bind(&newer)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let pending = list_compat_pending(&db.pool, 10).await.unwrap();
+        assert_eq!(
+            pending,
+            vec![older, newer],
+            "among stamped rows, least-recently-attempted comes first"
+        );
+    }
+
     /// Empty input → empty output, no DB round-trip.
     #[tokio::test]
     async fn find_missing_paths_empty_input() {

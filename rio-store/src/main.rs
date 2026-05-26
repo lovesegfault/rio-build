@@ -160,24 +160,30 @@ async fn main() -> anyhow::Result<()> {
         store_service = store_service.with_nar_budget(budget as usize);
     }
 
-    // Stock-Nix binary-cache compat writer (ADR-022 §10). Constructed
-    // only when enabled — the absence of a writer IS the OFF state
-    // (r[store.compat.runtime-toggle]). bucket unset → compat objects
-    // go through the chunk backend's blob namespace (same bucket +
-    // prefix as chunks/); bucket set → a dedicated S3-standard target
-    // at the bucket root, independent of the chunk backend kind.
+    // Stock-Nix binary-cache compat blob target (ADR-022 §10). `Some`
+    // only when a dedicated bucket is configured; `None` means compat
+    // objects live in the chunk backend's blob namespace (same bucket +
+    // prefix as chunks/). Built REGARDLESS of `enabled`: the GC drain
+    // must be able to delete objects written while compat was on even
+    // after an operator turns it off (r[store.compat.gc-coupled]).
+    let compat_blob_target: Option<Arc<dyn ChunkBackend>> = match &cfg.binary_cache_compat.bucket {
+        Some(bucket) => {
+            let client = rio_common::s3::default_client(cfg.s3_max_attempts).await;
+            Some(Arc::new(rio_store::backend::S3ChunkBackend::new(
+                client,
+                bucket.clone(),
+                String::new(),
+            )))
+        }
+        None => None,
+    };
+
+    // Compat writer: constructed only when enabled — the absence of a
+    // writer IS the OFF state (r[store.compat.runtime-toggle]).
     if cfg.binary_cache_compat.enabled {
-        let blob_target: Arc<dyn ChunkBackend> = match &cfg.binary_cache_compat.bucket {
-            Some(bucket) => {
-                let client = rio_common::s3::default_client(cfg.s3_max_attempts).await;
-                Arc::new(rio_store::backend::S3ChunkBackend::new(
-                    client,
-                    bucket.clone(),
-                    String::new(),
-                ))
-            }
-            None => chunk_cache.backend(),
-        };
+        let blob_target: Arc<dyn ChunkBackend> = compat_blob_target
+            .clone()
+            .unwrap_or_else(|| chunk_cache.backend());
         info!(
             bucket = cfg.binary_cache_compat.bucket.as_deref().unwrap_or("<chunk backend>"),
             compression = ?cfg.binary_cache_compat.compression,
@@ -289,7 +295,16 @@ async fn main() -> anyhow::Result<()> {
         chunk_backend_for_gc,
         shutdown.clone(),
     );
-    rio_store::gc::drain::spawn_drain_task(pool.clone(), chunk_cache.backend(), shutdown.clone());
+    // The drain gets the compat blob target so kind='blob' rows (a
+    // swept path's narinfo/NAR compat objects) are deleted from the
+    // bucket the writer actually published to; None = the chunk
+    // backend's blob namespace.
+    rio_store::gc::drain::spawn_drain_task(
+        pool.clone(),
+        chunk_cache.backend(),
+        compat_blob_target.clone(),
+        shutdown.clone(),
+    );
     // NAR indexer: drains the `WHERE NOT nar_indexed` work-queue for
     // paths the eager PutPath path skipped. Same disposition as the GC
     // tasks: panics logged, shutdown-on-cancel.

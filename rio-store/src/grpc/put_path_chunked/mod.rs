@@ -427,7 +427,7 @@ impl StoreServiceImpl {
         // compress + S3 PUT would add minutes to large builder uploads.
         // These outputs keep `narinfo.compat_file_hash IS NULL`, which is
         // exactly what `compat::reconciler` drains to backfill them off
-        // the hot path (r[store.compat.reconcile]).
+        // the hot path (r[store.compat.reconcile+2]).
 
         for g in guards {
             g.defuse();

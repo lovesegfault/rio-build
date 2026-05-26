@@ -978,7 +978,7 @@ inline --- they are exactly the rows the compat reconciler
 backfills off the hot path, which keeps builder-upload latency unaffected by
 the compat layer.
 
-#r("store.compat.reconcile")[
+#r("store.compat.reconcile+2")[
   When the compat layer is enabled, the store MUST run a background
   reconciler that repeatedly selects committed paths whose
   `narinfo.compat_file_hash` is NULL (bounded batches; never-attempted paths

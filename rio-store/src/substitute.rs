@@ -944,7 +944,7 @@ impl Substituter {
             // lives in some public binary cache. The row keeps
             // `narinfo.compat_file_hash IS NULL`, so `compat::reconciler`
             // republishes it to our bucket off the hot path
-            // (r[store.compat.reconcile]).
+            // (r[store.compat.reconcile+2]).
             ingest::persist_nar(
                 &self.pool,
                 &self.chunk_backend,

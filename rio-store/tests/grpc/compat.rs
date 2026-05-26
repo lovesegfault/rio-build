@@ -246,7 +246,7 @@ async fn compat_failure_does_not_fail_put_path() -> TestResult {
     Ok(())
 }
 
-// r[verify store.compat.reconcile]
+// r[verify store.compat.reconcile+2]
 /// The reconciler backfills exactly the pending set: a path whose NAR
 /// exists only as chunks (uploaded with compat OFF) gets its object
 /// pair published from a chunk-store reassembly and its
@@ -333,7 +333,7 @@ async fn reconciler_backfills_pending_paths() -> TestResult {
     Ok(())
 }
 
-// r[verify store.compat.reconcile]
+// r[verify store.compat.reconcile+2]
 /// Per-path failures don't poison the batch: a pending row whose
 /// chunks are missing from the backend fails (and stays pending),
 /// while a healthy pending path in the same batch is still published.
@@ -398,7 +398,7 @@ async fn reconciler_failure_keeps_path_pending_and_loop_alive() -> TestResult {
     Ok(())
 }
 
-// r[verify store.compat.reconcile]
+// r[verify store.compat.reconcile+2]
 /// The tick (the loop body the periodic wrapper sleeps between):
 /// a batch of permanently-failing rows ends the tick after ONE pass —
 /// no progress means back to the interval sleep, never an immediate

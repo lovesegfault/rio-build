@@ -272,6 +272,20 @@ async fn enqueue_compat_objects(
     };
     let file_b32 = rio_nix::store_path::nixbase32::encode(&digest);
 
+    // TODO: the nar/* object is content-addressed by the COMPRESSED
+    // digest, so two distinct store paths with byte-identical NARs
+    // (e.g. two fixed-output paths whose contents happen to match)
+    // share one nar/* object while each carries its own narinfo row
+    // and compat_file_hash. Sweeping ONE of them enqueues that shared
+    // nar/* key and the drain deletes it out from under the survivor:
+    // stock-Nix substitution of the survivor then 404s on its NAR, and
+    // the reconciler will not re-publish it because the survivor's
+    // compat_file_hash is still non-NULL. Fix when it bites: in this
+    // same transaction, skip the nar/* candidates when another narinfo
+    // row (different store_path_hash) carries the same
+    // compat_file_hash, so only the last referrer's sweep deletes the
+    // shared object. The .narinfo key is per-path and never shared, so
+    // it stays unconditional.
     let keys = [
         format!("{hash_part}.narinfo"),
         format!("nar/{file_b32}.nar.zst"),

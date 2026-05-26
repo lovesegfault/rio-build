@@ -78,7 +78,7 @@ impl ReconcileStats {
     }
 }
 
-// r[impl store.compat.reconcile]
+// r[impl store.compat.reconcile+2]
 /// Process one batch of pending paths: refresh the backlog gauge, list
 /// up to [`RECONCILE_BATCH`] pending paths, and publish each one.
 /// Failures are per-path; this function only errors if the *listing*
