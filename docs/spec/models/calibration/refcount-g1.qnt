@@ -185,12 +185,31 @@ module refcountCalibG1RollbackPreToken {
 // fan-out heartbeated nothing), encoded as the contract-free clock
 // below; the claim gate is the mechanism under test, the baselineStep
 // keeps the same clock with the as-built gate.
-// PREDICTED: cr1NoLiveChunkCollected falsifies — the foreign flip makes
-// the successor's still-uploading manifest readable ('complete') while
-// its chunks' PUTs have not happened, the exact premature-visibility
-// data-loss shape the claim gate exists to forbid.
+// PREDICTED: the local ownership invariant
+// `completionRequiresCurrentOwner` falsifies (a row flipped 'complete'
+// over the in-flight holder of its current generation — the clobber the
+// claim gate forbids), and cr1NoLiveChunkCollected falsifies as the
+// harm-level consequence (the foreign flip makes the successor's
+// still-uploading manifest readable while its chunks' PUTs have not
+// happened).
 // Restricted alphabet (one path, two uploaders) ⇒ the baselineStep below
-// is the distinguishing control, recorded as HOLDS in the table.
+// is the distinguishing control, recorded in the table: it HOLDS the
+// local ownership invariant (the claim gate is the only thing that
+// changes between the two relations). NOTE, found by the verification
+// runs and walked against the code: the baseline does NOT hold CR-1 —
+// under the contract-free clock the as-built actions already reach a
+// data-loss state through an unrelated window (a stale reclaim
+// soft-deletes an uploaded-but-unmarked chunk; the still-alive owner's
+// late `mark_chunks_uploaded` — `WHERE uploaded_at IS NULL`, no deleted
+// or claim guard, chunked.rs — re-asserts uploaded_at on the soft-
+// deleted row; the drain then deletes the object; the next writer
+// trusts uploaded_at and skips the PUT). The CR-1 falsification is
+// therefore attributable to the claim-gate revert only through the
+// trace shape (the foreign flip is the shallower counterexample), while
+// the local invariant isolates the gate cleanly; the late-mark window
+// itself is recorded in the calibration findings and the Phase-1 input
+// list (it is excluded as-built solely by the heartbeat contract, the
+// same assumption that carries S5).
 // =========================================================================
 module refcountCalibG1CompletionUnclaimGated {
   import chunkLiveness(
@@ -244,6 +263,25 @@ module refcountCalibG1CompletionUnclaimGated {
     s3' = s3, outbox' = outbox, orphanCand' = orphanCand, ups' = ups,
     leakedRefs' = leakedRefs, wit' = wit,
   }
+
+  /// Local restatement of the ownership content of the completion claim
+  /// gate (the S4-family form for this revert, the way the retry
+  /// calibration carried module-local invariants where the main model's
+  /// admission-predicate forms cannot see an override): a path is never
+  /// 'complete' while the uploader holding its CURRENT placeholder
+  /// generation is still in a pre-completion phase. As built (and under
+  /// baselineStep) the only action that flips a row to 'complete' is the
+  /// claim-gated completion, performed by the current generation's owner
+  /// in the same transition that retires it — so this holds; dropping
+  /// the claim gate lets a stale uploader flip the successor's in-flight
+  /// row and falsifies it.
+  val completionRequiresCurrentOwner = PATHS.forall(p =>
+    paths.get(p).status == PComplete implies
+      not(UPLOADERS.exists(u => and {
+        ups.get(u).path == p,
+        ups.get(u).claim == paths.get(p).gen,
+        Set(UClaimed, UUpgraded, UPutDone, UMarked).contains(ups.get(u).pc),
+      })))
 
   action calibStep = {
     nondet u = UPLOADERS.oneOf()
