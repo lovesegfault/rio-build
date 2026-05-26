@@ -914,7 +914,12 @@ pub struct DerivationState {
     /// cleared whenever the chain ends — the ok=true completion, the
     /// genuine-failure (ok=false) revert, the topdown fail-fast, an
     /// accepted worker-build verdict after a from-source routing, and
-    /// the inline store-batch completion. A stale entry surviving into
+    /// every non-substitution completion (the inline store-batch
+    /// completion, the merge-time cached-hit lane, the CA early-cutoff
+    /// Skip). As a backstop, the stale-Completed/Skipped reset in
+    /// `verify_preexisting_completed` clears it again at the moment a
+    /// NEW chain begins, so no completion path missing from that list
+    /// can leak the set across chains. A stale entry surviving into
     /// a LATER chain would veto forgiving a path no live build wants
     /// any more and demote a fully-substitutable node to a from-source
     /// build. A resubmit-reset rebuilds the node state from scratch

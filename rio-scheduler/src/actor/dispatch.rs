@@ -1271,12 +1271,15 @@ impl DagActor {
         // chain: it is cleared at every chain ending (the ok=true
         // completion, the genuine-failure revert below, the topdown
         // fail-fast above, a worker-build verdict after a from-source
-        // routing, an inline store completion, or the node being
-        // reset/removed) — only this re-spawn and the deferred
-        // next-pass delta re-walk retain it. A NEW chain requires an
-        // external event (a later dispatch-pass or merge-time
-        // classification spawning a fresh walk), which re-establishes
-        // the same per-chain bound rather than re-opening this one.
+        // routing, any non-substitution completion — inline
+        // store-batch, merge-time cached-hit, CA-cutoff Skip — or the
+        // node being reset/removed, including the stale-Completed
+        // reset that opens the next chain) — only this re-spawn and
+        // the deferred next-pass delta re-walk retain it. A NEW chain
+        // requires an external event (a later dispatch-pass or
+        // merge-time classification spawning a fresh walk), which
+        // re-establishes the same per-chain bound rather than
+        // re-opening this one.
         //
         // The in-memory revert to `to` only satisfies the transition
         // table (there is no Substituting→Substituting); PG keeps

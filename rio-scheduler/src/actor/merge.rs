@@ -811,6 +811,14 @@ impl DagActor {
                     // expected_output_paths). For IA nodes it's expected_output_paths
                     // (same as before). check_cached_outputs populates the right one.
                     state.output_paths = output_paths.clone();
+                    // A merge-time cached-hit completion ends any
+                    // substitution chain that left this node pre-dispatch
+                    // (e.g. a downgraded walk reverted to Ready and the
+                    // trigger-wanting build went terminal before the delta
+                    // re-walk ran). The spent-forgiveness set is
+                    // chain-scoped — clear it like every other completion
+                    // site does.
+                    state.never_forgive_paths.clear();
                     // I-099/I-094: re-probe hit on a previously-failed node
                     // — failure history is moot now we have the output.
                     if matches!(
@@ -1448,6 +1456,16 @@ impl DagActor {
                 continue;
             }
             state.output_paths.clear();
+            // This reset is the moment a NEW substitution chain begins
+            // for the node (the to_spawn lane below or the next
+            // dispatch pass walks it afresh). However the previous
+            // chain ended — including completion paths with no chain
+            // bookkeeping of their own — the chain-scoped
+            // spent-forgiveness set must not leak into this one: a
+            // stale entry would veto forgiving a path no live build
+            // wants any more and demote a fully-substitutable node to
+            // a from-source build.
+            state.never_forgive_paths.clear();
             // r[impl sched.merge.stale-completed-verify+5]
             // Pre-existing Ready parents of this reset node were Ready
             // against its now-gone output. Collect for demotion to

@@ -4550,13 +4550,16 @@ async fn substitute_complete_recheck_forgiven_against_grown_wanted_set() -> Test
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+5]
 /// Once a forgiven seed has triggered a downgrade (it became wanted
-/// mid-fetch), it must NEVER be treated as forgivable again for that
-/// node — even if the build that wanted it later goes terminal. Without
-/// this, the walk chain could oscillate forgivable↔wanted indefinitely
-/// under build churn (the live effective wanted set shrinks when a build
-/// goes terminal and re-grows when a new one merges); with it, every
+/// mid-fetch), it must NEVER be treated as forgivable again in later
+/// walks of the substitution chain that recorded it — even if the build
+/// that wanted it later goes terminal mid-chain. Without this, the walk
+/// chain could oscillate forgivable↔wanted indefinitely under build
+/// churn (the live effective wanted set shrinks when a build goes
+/// terminal and re-grows when a new one merges); with it, every
 /// downgrade permanently consumes one of the node's finitely many
-/// declared outputs, so the chain is bounded.
+/// declared outputs for the rest of that chain, so the chain is
+/// bounded. (Once the chain ends, the bookkeeping is dropped — the
+/// chain-scoping tests below cover that half.)
 ///
 /// Staging: build B wants {out}; walk 1 forgives P_debug's failure;
 /// build C (wanting {debug}) merges mid-fetch → the completion is
@@ -5182,6 +5185,122 @@ async fn substitute_inline_store_completion_clears_spent_forgiveness() -> TestRe
          into a later substitution chain: P_debug is unwanted now, its \
          absence must be forgiven, and the node must complete by \
          substitution instead of demoting to a from-source dispatch"
+    );
+    assert_eq!(
+        query_status(&handle, build_d).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build D's wanted output was substituted; it must complete"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.substitute.detached+5]
+/// Same chain-scoping property as the two tests above, but chain 1 ends
+/// through the merge-time cached-hit lane: after the downgrade the
+/// trigger-wanting build is cancelled, and a NEW build re-merges the
+/// same drv while the node is parked Ready — the merge re-probe sees
+/// every live-wanted output already present locally and
+/// `apply_cached_hits` completes the node during the merge itself; no
+/// dispatch pass and no further walk ever runs. The spent-forgiveness
+/// bookkeeping must not survive that completion (or the
+/// stale-Completed reset that opens the next chain) into a later
+/// substitution chain.
+#[tokio::test]
+async fn substitute_merge_cached_hit_completion_clears_spent_forgiveness() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("nfg-mc-out");
+    let dbg = test_store_path("nfg-mc-debug");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store.state.indeterminate.write().unwrap().push(dbg.clone());
+    store
+        .faults
+        .fail_qpi_internal_paths
+        .write()
+        .unwrap()
+        .insert(dbg.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("nfg-mc-drv");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out.clone(), dbg.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // Chain 1: B wants {out} → walk 1 (forgivable={P_debug}) parks at
+    // the gate; C (wanting {debug}) merges mid-fetch; release → the
+    // completion is downgraded and P_debug's forgiveness is spent.
+    // (Keep the event receivers alive — the orphan-watcher cancels
+    // unwatched Active builds in tests.)
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    wait_for_status(&handle, "nfg-mc-drv", DerivationStatus::Substituting).await;
+    let build_c = Uuid::new_v4();
+    let _ev_c = merge_dag(&handle, build_c, vec![mk(&["debug"])], vec![], false).await?;
+    barrier(&handle).await;
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    settle_substituting(&handle, &["nfg-mc-drv"]).await;
+    assert_eq!(
+        expect_drv(&handle, "nfg-mc-drv").await.status,
+        DerivationStatus::Ready,
+        "precondition: the downgraded completion reverts to Ready"
+    );
+
+    // C goes terminal before any dispatch pass runs: the only live
+    // demand left is B's {out}, which walk 1 already materialized in
+    // the local store.
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: build_c,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: cancel_tx,
+        })
+        .await?;
+    assert!(cancel_rx.await??, "cancel C");
+
+    // Chain 1 ends in the MERGE path: build E (also wanting only {out})
+    // re-merges the drv while the node is parked Ready. The re-probe
+    // classifies it as a cached hit (every live-wanted output is
+    // locally present) and `apply_cached_hits` completes it during the
+    // merge — no dispatch pass, no walk, no worker.
+    let build_e = Uuid::new_v4();
+    let _ev_e = merge_dag(&handle, build_e, vec![mk(&["out"])], vec![], false).await?;
+    assert_eq!(
+        expect_drv(&handle, "nfg-mc-drv").await.status,
+        DerivationStatus::Completed,
+        "precondition: the re-merge completes the node through the \
+         merge-time cached-hit lane (chain 1 is over)"
+    );
+
+    // Later: P_out is GC'd and build D (wanting only {out}) merges. The
+    // stale-Completed verify resets the node and spawns a NEW chain;
+    // nothing live wants P_debug, so it must be forgiven and the node
+    // must complete by substitution.
+    store.state.paths.write().unwrap().remove(&out);
+    let build_d = Uuid::new_v4();
+    let _ev_d = merge_dag(&handle, build_d, vec![mk(&["out"])], vec![], false).await?;
+    settle_substituting(&handle, &["nfg-mc-drv"]).await;
+
+    assert_eq!(
+        expect_drv(&handle, "nfg-mc-drv").await.status,
+        DerivationStatus::Completed,
+        "spent forgiveness must not survive a merge-time cached-hit \
+         completion into a later substitution chain: P_debug is unwanted \
+         now, its absence must be forgiven, and the node must complete \
+         by substitution instead of demoting to a from-source dispatch"
     );
     assert_eq!(
         query_status(&handle, build_d).await?.state,
