@@ -3,9 +3,9 @@
 //! Peak memory: the full (rewritten) NAR of each CA output is held in
 //! memory during hashing/finalization — the operative bound for very
 //! large content-addressed outputs. Flat-method outputs additionally
-//! read the file once more for hashing; collapsing that double read is
-//! a known follow-up (TODO(M8)) kept out of the activation commit to
-//! avoid touching the harness-validated path.
+//! read the file once more for hashing; TODO: collapse that double
+//! read by hashing flat-method outputs from the bytes already held in
+//! memory.
 //!
 //! A floating-CA output (`outputHashAlgo` set, no declared path, no
 //! declared hash) is built into a deterministic *scratch* path because

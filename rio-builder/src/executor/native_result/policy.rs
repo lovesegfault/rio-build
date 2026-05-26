@@ -22,10 +22,10 @@
 //! a parser that read only the legacy keys would silently skip every
 //! check for exactly the derivations nixpkgs is migrating toward.
 //
-// TODO(M7): the __json navigation here should move to the shared
-// StructuredEnv parser introduced by the request-glue work so the
-// gateway, the request glue, and this module read structured attrs
-// through one implementation.
+// TODO: move the __json navigation to the shared StructuredEnv parser
+// (the request glue has one) so the gateway, the request glue, and this
+// module read structured attrs through a single implementation instead
+// of three hand-rolled ones.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 

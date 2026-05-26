@@ -21,11 +21,11 @@
 //! checks, so the policy checks (and the upload metadata) always see
 //! the final, content-derived store paths and reference sets.
 //!
-//! Nothing in this module is wired into the live build path yet — the
-//! activation milestone (M7) replaces the daemon lifecycle with
-//! `rio_exec::execute` + this module.
-
-#![allow(dead_code)] // removed at activation (M7)
+//! Both halves run in the live build path: the executor's native
+//! lifecycle calls [`classify_exit`] on every finished execution and
+//! [`process_outputs`] (via `spawn_blocking` — it does blocking I/O and
+//! hashing) on success, before the upload step streams the canonicalised
+//! outputs to the store.
 
 pub(crate) mod ca;
 pub(crate) mod canonicalise;
