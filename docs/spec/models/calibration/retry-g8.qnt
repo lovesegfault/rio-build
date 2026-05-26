@@ -25,7 +25,7 @@
 // back as anything but Poisoned), failover alphabet.
 // =========================================================================
 module retryCalibG8PoisonedRowNotReloaded {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 2,
@@ -37,7 +37,7 @@ module retryCalibG8PoisonedRowNotReloaded {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX leader failover: poisoned rows are simply not reloaded --
   /// the new leader's DAG has no trace of the poison.
@@ -114,7 +114,7 @@ module retryCalibG8PoisonedRowNotReloaded {
 // derives failed_builders.len()), failover alphabet.
 // =========================================================================
 module retryCalibG8FailureCountNotDerived {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 2,
@@ -126,7 +126,7 @@ module retryCalibG8FailureCountNotDerived {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX leader failover: the non-terminal recovery constructor loads
   /// count / resubmit_cycles / failed_builders but leaves failure_count at

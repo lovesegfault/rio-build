@@ -20,7 +20,7 @@
 // fleet-exhaust path and would mask the draining-specific regression.
 // =========================================================================
 module retryCalibG7ExhaustCountsDraining {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 2,
@@ -32,7 +32,7 @@ module retryCalibG7ExhaustCountsDraining {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E9: the exhaust predicate is evaluated over every REGISTERED
   /// slot, draining or not -- the draining filter the fix added is gone.

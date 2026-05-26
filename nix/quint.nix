@@ -1297,7 +1297,7 @@ in
       name = "retry-calib-g1-controller-cap";
       spec = "calibration/retry-g1";
       main = "retryCalibG1ControllerOomUncapped";
-      extraSpecs = [ "retryPolicy" ];
+      extraSpecs = [ "retryPolicyAsBuilt" ];
       step = "calibStep";
       witness = "boundsOK";
     };
@@ -1309,7 +1309,7 @@ in
       name = "retry-calib-g2-resubmit-split";
       spec = "calibration/retry-g2";
       main = "retryCalibG2ResubmitSharedCounter";
-      extraSpecs = [ "retryPolicy" ];
+      extraSpecs = [ "retryPolicyAsBuilt" ];
       step = "calibStep";
       witness = "countersRefineHistory";
     };
@@ -1320,7 +1320,7 @@ in
       name = "retry-calib-g3-cascade";
       spec = "calibration/retry-g3";
       main = "retryCalibG3PoisonWithoutCascade";
-      extraSpecs = [ "retryPolicy" ];
+      extraSpecs = [ "retryPolicyAsBuilt" ];
       step = "calibStep";
       witness = "cascadeReachesExactlyTheDependents";
     };
@@ -1333,7 +1333,7 @@ in
       name = "retry-calib-g4-clear-ordering";
       spec = "calibration/retry-g4";
       main = "retryCalibG4ClearInMemFirst";
-      extraSpecs = [ "retryPolicy" ];
+      extraSpecs = [ "retryPolicyAsBuilt" ];
       step = "calibStep";
       witness = "clearedPoisonClearsDurably";
     };
@@ -1345,7 +1345,7 @@ in
       name = "retry-calib-g5-race-ahead";
       spec = "calibration/retry-g5";
       main = "retryCalibG5RaceAheadKeepsPending";
-      extraSpecs = [ "retryPolicy" ];
+      extraSpecs = [ "retryPolicyAsBuilt" ];
       step = "calibStep";
       witness = "noDoubleCount";
     };
@@ -1360,7 +1360,7 @@ in
       name = "retry-calib-g8-poison-reload";
       spec = "calibration/retry-g8";
       main = "retryCalibG8PoisonedRowNotReloaded";
-      extraSpecs = [ "retryPolicy" ];
+      extraSpecs = [ "retryPolicyAsBuilt" ];
       step = "calibStep";
       witness = "recoveryPreservesPoisonStatus";
     };

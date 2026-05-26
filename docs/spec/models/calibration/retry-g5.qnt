@@ -17,7 +17,7 @@
 // where the as-built dedup holds it (the Stage-B dual-regime headline).
 // =========================================================================
 module retryCalibG5RaceAheadKeepsPending {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 3,
@@ -29,7 +29,7 @@ module retryCalibG5RaceAheadKeepsPending {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E6 race-ahead arm: the charge lands, but last_completed is
   /// not set (the disconnect that follows will insert a
@@ -151,7 +151,7 @@ module retryCalibG5RaceAheadKeepsPending {
 // fairness-dependent liveness harm the safety invariants cannot state.
 // =========================================================================
 module retryCalibG5NonPromotingConsumesEntry {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 3,
@@ -163,7 +163,7 @@ module retryCalibG5NonPromotingConsumesEntry {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX: the non-promoting report consumes the dedup entry and then
   /// no-ops (the as-built code returns before touching it, which is why

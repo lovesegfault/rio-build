@@ -4,7 +4,7 @@
 // the wrong path, or not incremented on a path that needed it"
 // (retry-invariant-map.md, calibration table; inventory section 5).
 //
-// Each module instantiates the as-built retryPolicy model and swaps ONE
+// Each module instantiates the frozen as-built retryPolicyAsBuilt model and swaps ONE
 // entry point's action for a local PRE-FIX variant (the behavior the named
 // historical fix removed), exposed through a `calibStep` that restricts the
 // alphabet to what the scenario family needs -- the same extend-and-override
@@ -29,7 +29,7 @@
 // worker-channel-only alphabet where the as-built encoding holds it.
 // =========================================================================
 module retryCalibG1WindowResetUngated {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1", "w2"),
     MAX_TIME = 3,
     MAX_ATTEMPTS = 4,
@@ -41,7 +41,7 @@ module retryCalibG1WindowResetUngated {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E2 (worker-reported infra classes only): identical to the
   /// as-built infraArm except the window-reset guard drops the
@@ -139,7 +139,7 @@ module retryCalibG1WindowResetUngated {
 // as-built on this alphabet via the documented D2 divergence.)
 // =========================================================================
 module retryCalibG1ControllerOomUncapped {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 3,
@@ -151,7 +151,7 @@ module retryCalibG1ControllerOomUncapped {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E6 (the recently_disconnected-correlated arm): identical to
   /// the as-built ctrlDeliverOomLate except there is NO cap check -- the
@@ -223,7 +223,7 @@ module retryCalibG1ControllerOomUncapped {
 // a deadline-death alphabet where the as-built encoding holds it.
 // =========================================================================
 module retryCalibG1DeadlineUncapped {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 4,
@@ -235,7 +235,7 @@ module retryCalibG1DeadlineUncapped {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E7: identical to the as-built ctrlDeliverDeadline except the
   /// cap arm only logs (here: does nothing) -- the charge is unconditional
@@ -303,7 +303,7 @@ module retryCalibG1DeadlineUncapped {
 // db457374f-C3 (the same charge-gated-on-floor-outcome shape on E7).
 // =========================================================================
 module retryCalibG1TimeoutChargeSkipped {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 3,
@@ -315,7 +315,7 @@ module retryCalibG1TimeoutChargeSkipped {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E4: the report is consumed and the derivation requeued, but
   /// the cold-start (never-promoted) gate skips the timeout_count charge.
@@ -367,7 +367,7 @@ module retryCalibG1TimeoutChargeSkipped {
 // as-built encoding holds both.
 // =========================================================================
 module retryCalibG1BackstopUncounted {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1", "w2"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 4,
@@ -382,7 +382,7 @@ module retryCalibG1BackstopUncounted {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = true,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E8: the backstop frees the slot and requeues the derivation
   /// but records nothing and quarantines nothing.
@@ -440,7 +440,7 @@ module retryCalibG1BackstopUncounted {
 // alphabet.
 // =========================================================================
 module retryCalibG1AtCapOomDoubleCount {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 3,
@@ -452,7 +452,7 @@ module retryCalibG1AtCapOomDoubleCount {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E2, at-cap OOM only: the charge is applied twice (the
   /// pre-FloorOutcome world where both the bump helper and the handler
@@ -524,7 +524,7 @@ module retryCalibG1AtCapOomDoubleCount {
 // downstream consequence (verdictMatchesFold, secondary).
 // =========================================================================
 module retryCalibG1PutPathNotExempt {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 4,
@@ -536,7 +536,7 @@ module retryCalibG1PutPathNotExempt {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E2, PutPath class only: treated as a plain (non-exempt)
   /// infrastructure failure, with no window reset (the window did not
@@ -605,7 +605,7 @@ module retryCalibG1PutPathNotExempt {
 // (the fold charges exempt_infra_count), worker-channel alphabet.
 // =========================================================================
 module retryCalibG1ExemptPathUncapped {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 4,
@@ -617,7 +617,7 @@ module retryCalibG1ExemptPathUncapped {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E2, exempt classes only: exempt from the infra cap AND from
   /// any budget at all -- no exempt_infra_count, no exempt cap.
@@ -684,7 +684,7 @@ module retryCalibG1ExemptPathUncapped {
 // invariants on this alphabet -- confirmed with baselineStep).
 // =========================================================================
 module retryCalibG1DisconnectCharges {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1", "w2"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 4,
@@ -696,7 +696,7 @@ module retryCalibG1DisconnectCharges {
     ENABLE_CRASH = true,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E5: the mid-build disconnect records the lost worker
   /// (failed_builders + failure_count + the PG mirror append) and then

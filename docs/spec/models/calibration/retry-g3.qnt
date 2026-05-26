@@ -15,7 +15,7 @@
 // failure class (the simplest poison).
 // =========================================================================
 module retryCalibG3PoisonWithoutCascade {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 2,
@@ -27,7 +27,7 @@ module retryCalibG3PoisonWithoutCascade {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX E3: the permanent failure poisons the derivation but no
   /// cascade reaches the dependent.
@@ -89,7 +89,7 @@ module retryCalibG3PoisonWithoutCascade {
 // lost mirror write) where the as-built encoding holds it.
 // =========================================================================
 module retryCalibG3RecoveryNoRecascade {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 3,
@@ -101,7 +101,7 @@ module retryCalibG3RecoveryNoRecascade {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = true
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX leader failover: identical to the as-built recovery except
   /// the poisoned-row arm does not re-seed the dependent's

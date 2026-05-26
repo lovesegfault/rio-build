@@ -18,7 +18,7 @@
 // consequence (the bounded-resubmit guard never engages).
 // =========================================================================
 module retryCalibG2ResubmitSharedCounter {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1", "w2"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 4,
@@ -30,7 +30,7 @@ module retryCalibG2ResubmitSharedCounter {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = true
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX resubmit reset: clears the poison status (and the dependent's
   /// DependencyFailed) but carries the per-cycle counters over and never

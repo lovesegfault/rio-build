@@ -20,7 +20,7 @@
 // exactly what the new invariant pins.)
 // =========================================================================
 module retryCalibG4ClearInMemFirst {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 2,
     MAX_ATTEMPTS = 2,
@@ -32,7 +32,7 @@ module retryCalibG4ClearInMemFirst {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = true
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX admin ClearPoison: in-memory reset first (the node leaves the
   /// poison set immediately), PG clear second and best-effort -- a lost
@@ -88,7 +88,7 @@ module retryCalibG4ClearInMemFirst {
 // elapse before the failover.
 // =========================================================================
 module retryCalibG4ReloadExpiredPoison {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 4,
     MAX_ATTEMPTS = 2,
@@ -100,7 +100,7 @@ module retryCalibG4ReloadExpiredPoison {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = false
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX leader failover: no expired-poison filter -- every poisoned
   /// row is reloaded as poisoned, and the clamp stamps poisoned_at with
@@ -196,7 +196,7 @@ module retryCalibG4ReloadExpiredPoison {
 // as-built" -- not evidence that the code-level check is dead.
 // =========================================================================
 module retryCalibG4DisconnectThresholdProbe {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1", "w2"),
     MAX_TIME = 3,
     MAX_ATTEMPTS = 4,
@@ -208,7 +208,7 @@ module retryCalibG4DisconnectThresholdProbe {
     ENABLE_CRASH = true,
     ENABLE_WEDGE = true,
     ENABLE_RESETS = true
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// "The disconnect path's threshold re-check never produces the poison"
   /// -- checked as an invariant over the as-built step; HOLDS means the
@@ -232,7 +232,7 @@ module retryCalibG4DisconnectThresholdProbe {
 // alphabet with enough clock for the TTL to elapse.
 // =========================================================================
 module retryCalibG4TtlClearKeepsExclusions {
-  import retryPolicy(
+  import retryPolicyAsBuilt(
     EXECUTORS = Set("w1"),
     MAX_TIME = 3,
     MAX_ATTEMPTS = 2,
@@ -244,7 +244,7 @@ module retryCalibG4TtlClearKeepsExclusions {
     ENABLE_CRASH = false,
     ENABLE_WEDGE = false,
     ENABLE_RESETS = true
-  ).* from "../retryPolicy"
+  ).* from "../retryPolicyAsBuilt"
 
   /// PRE-FIX poison-TTL expiry: the durable clear updates only the
   /// status/timestamp; the failed_builders exclusion set and the retry

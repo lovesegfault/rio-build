@@ -1208,6 +1208,65 @@ transient arm carries no promotion exemption and `classify()` never
 consults the floor for transients (P4 — coverage stays with the
 `sched.retry.promotion-exempt+3` unit tests).
 
+#### Phase-1c model flip (T-1c.1): the post-collapse encoding and the frozen as-built model
+
+The Stage-B as-built encoding is frozen at
+`docs/spec/models/retryPolicyAsBuilt.qnt` (module `retryPolicyAsBuilt`,
+no semantic edits; imported only by the Stage-C calibration corpus and
+retired with it in Phase 2). The new `retryPolicy.qnt` main encodes the
+post-collapse code: every accounting action advances the cached view,
+the durable ledger fold (`pg.ledger`) and the reference-fold ghost with
+the same `specApply` application — the appending transaction — so
+`countersRefineHistory` and `durableMirrorsCharges` are
+true-by-construction tripwires there; the four mirror-column bits and
+the lost-mirror-write fault are replaced by the ledger abstraction plus
+a single `attemptTxFails` fault action (charge nothing, re-deliver the
+event); the failover arm rebuilds the view from the durable fold (the
+selective-forgiveness projection and its `recoveryIsTheDocumentedProjection`
+invariant are deleted with it, superseded by `failoverPreservesHistory`
+in T-1c.3 plus the kept `recoveryNeverFabricatesFailures` /
+`recoveryPreservesPoisonStatus`).
+
+Abstraction choices recorded for the C2/establishment encoding (T-1c.1
+step 1):
+
+- **The establishment is clock-decoupled.** `establishUnreportedCrash(w)`
+  is enabled as soon as the released attempt's `recently_disconnected`
+  entry has no deliverable classifying report (`ctrl == NoCtrl` or the
+  pending report belongs to a different death), with no 60 s TTL gate —
+  an over-approximation of production timing that is conservative for
+  the safety invariants; the classification window the TTL protects is
+  preserved by the no-deliverable-report precondition. The entry is
+  resolved by a classifying report or by establishment, never silently
+  dropped (the as-built tick-sweep drop arm is gone, matching the
+  post-collapse sweep whose expiry IS the establishment).
+- **The un-established re-dispatch window is bounded by identity
+  freshness.** A slot whose previous death is still awaiting
+  establishment is not placeable for this derivation (production
+  replacement pods are fresh identities; the crashed identity never
+  re-registers). A slot whose death has a deliverable controller report
+  pending stays placeable, so the late-installment /
+  re-dispatch-before-classification interleavings remain reachable.
+  This is what makes `attemptsBoundedGlobal` a meaningful HOLD in the
+  crash regime rather than a restatement of the dispatch ceiling.
+- **Crash-regime instantiation:** two slots (`w1`,`w2`), so the
+  establishment→charge→terminal route is the production distinct-worker
+  threshold (THRESHOLD = 2) rather than the fleet-exhaust fallback a
+  one-slot regime would force; `ATTEMPT_BOUND = 2` (= THRESHOLD; the
+  un-established window adds no extra attempt because an
+  establishment-pending slot is not re-dispatched) with
+  `MAX_ATTEMPTS = 4` strictly above it, so the HOLD is carried by the
+  charging machinery, not by `dispatchTo`'s own ceiling.
+  `quint-retry-policy-crash-unbounded` (expect-violation) flips to the
+  `attemptsBoundedGlobal` HOLD in this regime at T-1c.2.
+- **Ghost attribution:** the per-slot `deathCharges` ghost tracks the
+  slot's most recent death; an establishment for an entry whose death is
+  no longer the most recent one (re-dispatch while the report was
+  deliverable, then a newer death) does not increment it — the older
+  death's charge is structurally at-most-once (its report was
+  overwritten, so establishment is its only possible charge), and the
+  newer death's accounting stays exact for `noDoubleCount`.
+
 ### Stage-C verify-marker status
 
 No new tracey markers: the calibration checks are regression guards for
