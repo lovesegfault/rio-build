@@ -2000,3 +2000,134 @@ What the retired checks guarded and where that duty now lives:
   contended precondition. The historical falsification evidence stays
   in the calibration table. No live invariant loses its exhaustive
   HOLD check.
+
+## Campaign close-out — retry/poison/cascade (campaign #4)
+
+The retry-formal campaign is complete: Phase 0 (the spec audit, the
+reference fold, the as-built model, the calibration), Phase 1 (the
+durable attempt ledger, the nine-site collapse onto
+`decide()`/`classify()`/`placeable()`, the post-collapse model flip),
+and Phase 2 (the Kani contracts, the acceptance table, the retirement
+of the as-built corpus, and the decisions recorded above). This section
+is the campaign-level record, in the same shape as the log campaign's
+close-out; the per-phase evidence lives in the sections above, the
+introducing commits, and the CI transcripts.
+
+**Outcome against the design's two committed goals (§1).** Both hold.
+The failure policy is an exhaustively checked invariant set: every
+design-§3 invariant HOLDs over the post-collapse model's four regimes
+(verdict table v2), the four pre-registered as-built falsifications
+(D1, D2/D3, D4, C2) flipped to HOLDs with the Phase-1b fixes,
+`FailoverPreservesHistory` is checked for the first time and HOLDs, and
+the decision kernels carry stated Kani contracts (the manual
+`kani-rio-scheduler` target: 6 harnesses over the verdict partition,
+the cap bounds, the exclusion superset, the legacy-seed floor,
+classification and placement; machine-proving them inside a
+merge-gate budget is the recorded extraction follow-up). The machinery
+that enforces the policy is one fold over
+durable rows: the seventeen in-place counter mutations, the per-counter
+mirror writers, and the nine divergent cap-check
+implementations are gone; the nine entry points append a classified row
+and call the same three pure functions; the counters are a derived
+view; recovery is the same fold over the same rows. (The poison-status
+persist survives outside the appending transaction only for the
+row-less degraded paths — the E5 re-check, recovery enforcement, and
+the no-db-id fallbacks — exactly as the Phase-1 deletions-not-taken
+record states.)
+
+**What the campaign fixed in production behavior** (all adjudicated,
+red-first, spec-amended): failed builds' logs no longer read
+incomplete (the report's `final_line_count` is stamped on the failure
+path); a wedged-worker derivation that exhausts its timeout budget via
+the controller backstop is `Cancelled` (immediately resubmit-retriable)
+instead of `Poisoned` for 24 h, independent of which observer reports
+first (D1/C1/C4); a controller-counted at-cap OOM run participates in
+the 300 s window like any other counted infra failure (D2); a
+floor-promoted controller-reported OOM charges the exemption budget
+(D3/C3); the backstop's poison-threshold progress survives failover
+(D4); a derivation that deterministically kills its worker with no
+report is bounded by the per-executor threshold via establishment
+(C2/P1); and budgets survive leader failover
+(`sched.retry.failover-budget`) instead of refreshing on every flap.
+
+**The design-§5 Phase-2 gate, assessed honestly.** The gate has two
+clauses. "The full stack in the gate": partially met — the per-regime
+model checks, the reachability witnesses and the named-run replays are
+`checks.*` derivations on the merge gate; the Kani contracts are landed
+but run as a manual target until the kernel-extraction follow-up brings
+their CBMC cost inside the gate budget, and the MBT slot is the
+documented omission above. "Net-negative diff for the four core
+files": NOT met, and recorded as such rather than reinterpreted. Against the pre-campaign baseline (the
+parent of the first Phase-1a commit), measured on the integrated branch
+at the close of Phase 2:
+
+| File | Baseline lines | Now | Δ raw | Δ excluding comments/blanks |
+|---|---|---|---|---|
+| `actor/completion.rs` | 2,709 | 3,615 | +906 | +707 |
+| `actor/executor.rs` | 1,413 | 1,930 | +517 | +360 |
+| `actor/housekeeping.rs` | 772 | 855 | +83 | +56 |
+| `actor/floor.rs` | 269 | 269 | 0 | 0 |
+
+The growth is not decision logic — that contracted into
+`retry_policy.rs` (~+1,500 lines vs the same baseline, including its
+unit battery, the Kani contracts and the proof harnesses, all pure and
+leaf) and `db/attempts.rs` (+513 lines, the ledger access layer) — it
+is the durable write discipline the
+design chose deliberately: every exit path now opens an appending
+transaction, threads the report into it, stamps the execution row,
+handles the two-installment correlation and establishment, and persists
+the verdict it computed, where it previously mutated RAM counters and
+issued zero-to-four best-effort UPDATEs. The deletions the design
+predicted did land (the 17 mutation sites, the mirror writers, the
+divergent checks, ~471 raw lines removed from the four files), but they
+are outweighed by the transaction plumbing added at each of the nine
+sites plus the new tests' fixtures. The accurate summary of the §1 goal
+is therefore: the *decision surface* shrank from nine divergent
+implementations to one checked fold, and the *counter state* shrank
+from ten independently-mutated fields to a derived view — but the
+*failure-handling code* in the four core files grew, because durability
+was added where there was none. This deviation is recorded rather than
+explained away; the executor-lifecycle campaign should budget for the
+same shape (collapsing decisions does not shrink handler files when
+each handler also gains a durable write).
+
+**What transfers to the executor-lifecycle campaign (#1):**
+
+- The stream-epoch / heartbeat-binding halves of `db457374f` and the
+  late-disconnect-vs-reconnect race (G5's stream-epoch half) — the
+  executor-map lifecycle the retry model treats as environment.
+- Heterogeneous static eligibility (`a62631c90`): the exhaust
+  *predicate* is now contracted (`placeable()`), but the eligibility
+  computation that feeds it (kind/system/features × draining ×
+  registration) is executor-lifecycle territory, still NOT-ENC.
+- The correlation/dedup state (`recently_disconnected`,
+  `last_completed`, the establishment TTL sweep): this campaign
+  extended it to carry the released `exec_id` and to establish
+  unreported crashes; its lifecycle (when entries are created, expire,
+  and are swept) belongs to the executor-lifecycle model.
+- The `ExecRec`/slot identity-freshness abstractions in
+  `retryPolicy.qnt` (pod-identity scoping, `ctrlStale`, establishment
+  preconditions) — reusable as the starting encoding for the executor
+  model's slot state.
+- The lesson above about file-size expectations under a
+  durability-adding collapse.
+
+**What Phase 2 deferred, explicitly:**
+
+- Gate-wiring (and therefore machine-proving) of the Kani contracts:
+  the harnesses verify nothing until they run, and they do not run in
+  the gate until the counter-arithmetic kernels are extracted into a
+  dependency-light context (the log campaign's `kernel.rs` pattern);
+  the contracts, the harness suite, the manual target and the
+  harness-count tripwire are in place for that follow-up.
+- The mirror-column DROP, the legacy-floor removal, and the frozen
+  three-argument `decide()` — behind the drain condition, with the
+  operational probe recorded (the mirror-column subsection above).
+- A real ledger GC policy (P8): the compile-time retention-floor
+  assertion and the suffix bound stand in; a sweep is future work and
+  must respect the recorded retention floor (≥ the poison TTL).
+- The deliberately-open policy questions: A7 uniform backoff, A10
+  fencepost unification, A8 poison-reason strings (P6 — unadjudicated
+  policy changes, not refactoring debt).
+- Model-based testing of the fold: the reasoned omission above, with
+  its reconsideration triggers.
