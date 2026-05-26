@@ -1285,6 +1285,82 @@ pub const M_066: () = ();
 /// which also collects the new chunk layout's orphans.
 pub const M_067: () = ();
 
+/// `migrations/068_drv_attempts.sql`
+///
+/// The scheduler-owned durable attempt ledger: one row per attempt or
+/// reset event in a derivation's failure history. This is the data
+/// half of the retry-machinery replacement — the ten RAM-only
+/// `RetryState` counters become a fold over these rows; in the ledger
+/// phase (1a) the rows are written but nothing reads them for
+/// decisions.
+///
+/// **Why a new table** (and not `drv_executions` or `assignments`):
+/// both existing tables are read by rio-store with latest-row
+/// semantics — `drv_executions` is the log subsystem's per-execution
+/// anchor (latest-exec resolution in `logs/tail.rs`, the completeness
+/// gate in `logs/gate.rs`) and is TTL-swept by the store at
+/// `log_retention_days`; `assignments`' latest row per derivation
+/// authorizes the executor's log appends (`logs/gate.rs`). Non-dispatch
+/// attempt rows (cascade victims, fleet-exhaust markers, resets,
+/// never-dispatched attempts) inserted there would shadow the real
+/// execution for those readers and put retry history under store-owned
+/// retention. `drv_attempts` is read by the scheduler alone and its
+/// retention is scheduler-owned.
+///
+/// **Key choice:** rows key on `derivations.derivation_id` (the DAG
+/// key). `drv_executions.drv_hash` is the 32-char `drv_log_hash()`
+/// chunk-key form, not the DAG key, and never-dispatched attempts have
+/// no exec_id to join through `assignments` — so the recovery fold
+/// loads the suffix directly by `derivation_id = ANY(...)`.
+///
+/// **No FK on `exec_id`** — a deliberate deviation from the design's
+/// "optional exec_id FK" wording: an enforced FK to the store-swept
+/// `drv_executions` would re-introduce exactly the retention coupling
+/// the new table exists to avoid (the store's TTL sweep would either
+/// fail or cascade into scheduler-owned history). Same no-FK posture
+/// as M_028. `derivation_id` likewise carries no FK: terminal
+/// derivations are GC-swept (`gc_orphan_terminal_derivations`) on the
+/// scheduler's own schedule.
+///
+/// **Two-installment write discipline:** the controller-reported paths
+/// (pod OOM/DiskPressure/DeadlineExceeded) never see the failure kind
+/// and the exec_id in the same scope, so those attempts are written in
+/// two installments on ONE row — the disconnect appends the row
+/// (`outcome_class = 'disconnected'`, `termination_reason` NULL), and
+/// the controller's later report fills `termination_reason` (and
+/// reclassifies) via an UPDATE guarded `WHERE termination_reason IS
+/// NULL`, never a second INSERT. The partial unique index on `exec_id`
+/// makes one-row-per-execution a schema property rather than a caller
+/// discipline: a duplicate append for the same execution is rejected
+/// by the index regardless of arrival order. Rows with no exec_id are
+/// outside the partial index — they are verdict markers or reset
+/// events, not physical executions.
+///
+/// **`outcome_class` CHECK is the `classify()` alphabet** (the third
+/// total function of the decision surface). Extending the alphabet is
+/// a new migration, never an edit here. `substitution` is deliberately
+/// absent: the substitution-failure decider stays outside the retry
+/// collapse (harden-subst ownership), so reserving the name without a
+/// writer would be dead schema.
+///
+/// **Decision-input completeness** (the §5a-1 contract): every input
+/// the nine retry/poison entry points consult is either a column here
+/// (outcome class, exemption + floor flags, executor, exec_id,
+/// timestamps, termination reason, error message, resubmit cycle), a
+/// `Budget` field (the caps, the 300 s window, the poison threshold,
+/// backoff curve, resubmit limit, poison TTL), or a named caller-side
+/// input (the live eligible fleet for the fleet-exhaust check, the
+/// clock for the window/TTL/backoff). The floor outcome is consumed at
+/// append time — the row carries its classification — so the fold
+/// itself never reads the floor ladder.
+///
+/// **Retention** is scheduler-owned by construction; there is no TTL
+/// sweep in Phase 1 (the suffix bound — rows since the last reset
+/// event — keeps reads O(per-cycle attempts)). A startup assertion in
+/// rio-scheduler pins any future sweep at ≥ max(infra retry window,
+/// poison TTL); a real GC policy is a recorded Phase-2 follow-up.
+pub const M_068: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
