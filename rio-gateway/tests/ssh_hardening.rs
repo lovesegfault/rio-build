@@ -522,6 +522,81 @@ async fn test_exec_session_streams_protocol_reply_to_client() -> anyhow::Result<
     Ok(())
 }
 
+/// One SSH session channel runs at most one exec: the first
+/// `nix-daemon --stdio` exec is admitted (and consumes the channel's
+/// write half), so a second exec request on the SAME channel must be
+/// refused with `channel_failure` and the channel torn down like any
+/// other rejected exec — exit-status 1, then close — rather than
+/// silently replacing the live protocol session. RFC 4254 sessions run
+/// one command and OpenSSH never re-execs a channel, so only a
+/// non-stock client ever sends this; the pin matters because a silent
+/// replace would abort the first session's protocol task with no
+/// visible signal to either side.
+#[tokio::test]
+async fn test_second_exec_on_same_channel_is_rejected() -> anyhow::Result<()> {
+    common::init_test_logging();
+    let (addr, client_key, srv) = spawn_ssh_server().await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    let mut ch = session.channel_open_session().await?;
+
+    // First exec: admitted — this is the one exec the channel may run.
+    ch.exec(true, "nix-daemon --stdio").await?;
+    let first = ch.wait().await.expect("server reply to first exec");
+    anyhow::ensure!(
+        matches!(first, russh::ChannelMsg::Success),
+        "first exec on the channel must be admitted: {first:?}"
+    );
+
+    // Second exec on the SAME channel: must be refused.
+    ch.exec(true, "nix-daemon --stdio").await?;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(10), ch.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the second exec's reply"))?
+        .expect("server reply to second exec");
+    assert!(
+        matches!(second, russh::ChannelMsg::Failure),
+        "a second exec on an already-exec'd channel must get channel_failure, got {second:?}"
+    );
+
+    // ...and the channel must then be closed out like any rejected exec
+    // (exit-status 1, eof, close) so a foreground `ssh` exits instead of
+    // hanging. Collect until the close arrives; other channel messages
+    // (eof, window adjusts) may interleave.
+    let mut saw_exit_status_1 = false;
+    let mut saw_close = false;
+    while !saw_close {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ch.wait())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out waiting for the rejected channel's close-out \
+                     (exit-status 1 seen: {saw_exit_status_1})"
+                )
+            })?;
+        match msg {
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                assert_eq!(exit_status, 1, "rejected exec must report exit-status 1");
+                saw_exit_status_1 = true;
+            }
+            Some(russh::ChannelMsg::Close) => saw_close = true,
+            // The channel's receiver ending means russh processed the
+            // server's close — equally proof the channel was torn down.
+            None => saw_close = true,
+            Some(_) => {}
+        }
+    }
+    assert!(
+        saw_exit_status_1,
+        "rejected exec must deliver exit-status 1 before the channel closes"
+    );
+
+    drop(ch);
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
 // r[verify gw.conn.exit-status+3]
 /// A connection whose channel count transits through zero must survive
 /// for the grace period (a ControlMaster between builds), and must

@@ -1060,7 +1060,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // Unconditional removal here defeats CancelBuild-on-disconnect for
     // mid-opcode client drops. The trace:
     //
-    //   1. Client disconnects mid-build → response-task's handle.data()
+    //   1. Client disconnects mid-build → response-task's write-half send
     //      fails → outbound pipe reader drops → next stderr.log write
     //      in process_build_events gets BrokenPipe → WireError
     //   2. :372 breaks with outcome = Err(StreamProcessError::Wire(_))
