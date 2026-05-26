@@ -129,7 +129,7 @@ pub struct BuildSpawnContext {
     pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
     /// the executor can `register_inputs` (JIT allowlist) and
-    /// `prefetch_manifests` (I-110c) before daemon spawn.
+    /// `prefetch_manifests` (I-110c) before the build executes.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
     /// JIT lookup scales it per path via `jit_fetch_timeout(this,

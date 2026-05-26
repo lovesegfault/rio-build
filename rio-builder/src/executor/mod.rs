@@ -1633,11 +1633,13 @@ struct ResolvedInputs {
 /// during SubmitBuild); fetch + parse to get output paths.
 ///
 /// Also computes the full transitive input closure (BFS over
-/// QueryPathInfo references) for the synth DB ValidPaths table. The
-/// scheduler sends a PrefetchHint (approx_input_closure) before the
-/// WorkAssignment so the FUSE cache starts warming; that's a HINT, not
-/// a replacement for this computation — the synth DB needs the FULL
-/// closure.
+/// QueryPathInfo references). The closure feeds the request glue's
+/// planning (sandbox input set, `exportReferencesGraph` expansion), the
+/// output policy checks / reference-scan candidate set, and the FUSE
+/// warm. The scheduler sends a PrefetchHint (approx_input_closure)
+/// before the WorkAssignment so the FUSE cache starts warming; that's a
+/// HINT, not a replacement for this computation — the glue needs the
+/// FULL closure.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 async fn resolve_inputs(
     store_client: &StoreServiceClient<Channel>,
@@ -1744,7 +1746,8 @@ async fn resolve_inputs(
         ExecutorError::InvalidDerivation(format!("failed to build BasicDerivation: {e}"))
     })?;
 
-    // Compute input closure for the synthetic DB (ValidPaths table)
+    // Compute the full input closure for the request glue (sandbox
+    // input set, exportReferencesGraph), the output policy checks,
     // and the FUSE warm. The BFS seeds with resolved_input_srcs so
     // it walks the runtime references of inputDrv OUTPUTS — a .drv
     // file's narinfo references don't include its outputs (those are
@@ -1785,13 +1788,10 @@ async fn resolve_inputs(
 /// DURING execute_build (inside `run_native_lifecycle`), so spawn_
 /// build_task registers the path PREDICTIVELY before spawning and
 /// removes it after. If a cancel arrives before the cgroup exists,
-/// cgroup.kill returns ENOENT — try_cancel_build logs and moves on
-/// (the build will fail anyway since the sandbox dies when the cgroup
-/// IS created with a stale kill file — no, cgroup.kill isn't a
-/// persistent file, it's a write-once trigger. ENOENT just means no
-/// kill happened, the build proceeds. Harmless race — a cancel
+/// cgroup.kill returns ENOENT — try_cancel_build logs and moves on:
+/// no kill happens and the build proceeds. Harmless race — a cancel
 /// arriving THAT early is extremely rare and the scheduler will
-/// re-send on the next dispatch cycle if the build keeps running).
+/// re-send on the next dispatch cycle if the build keeps running.
 // r[impl builder.exec.build-id-sanitized]
 pub fn sanitize_build_id(drv_path: &str) -> String {
     // /nix/store/abc...-foo.drv -> abc___-foo_drv
@@ -1799,9 +1799,9 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
     // Derivation names from nixpkgs are NOT constrained to filesystem- or
     // URL-safe characters. fetchpatch against a Gentoo mirror produces e.g.
     // `opensp-1.5.2-c11-using.patch?id=688d9675...drv` (I-167). The build_id
-    // becomes an overlay directory name, a cgroup v2 name, and a component of
-    // the synth_db sqlite:// URI — so anything outside [A-Za-z0-9_-] is
-    // collapsed to `_`. nixbase32 hash chars (0-9 a-z) are already in-set.
+    // becomes an overlay directory name and a cgroup v2 name — so anything
+    // outside [A-Za-z0-9_-] is collapsed to `_`. nixbase32 hash chars
+    // (0-9 a-z) are already in-set.
     drv_path
         .rsplit('/')
         .next()
@@ -2069,7 +2069,7 @@ mod tests {
             resolved.basic_drv.input_srcs().contains(&static_src),
             "static input_srcs must be preserved"
         );
-        // And the closure includes the dep output (synth DB seed set).
+        // And the closure includes the dep output (full input closure).
         assert!(
             resolved.input_paths.contains(&dep_out),
             "input_paths closure must include resolved inputDrv output"
