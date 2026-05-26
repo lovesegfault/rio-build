@@ -127,6 +127,11 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
 pub struct OutputToUpload {
     /// Full `/nix/store/...` path (final, post-CA-finalization).
     pub store_path: String,
+    /// Where the output's bytes live on the worker host (the overlay
+    /// upper layer entry; for finalized floating-CA outputs, the
+    /// renamed-in-place final basename — see `native_result::ca`). The
+    /// NAR dump streams from here.
+    pub host_path: std::path::PathBuf,
     /// Sorted full-store-path references to register, post
     /// `unsafeDiscardReferences`. A self-referencing output lists its
     /// own final path here.
@@ -156,7 +161,6 @@ pub struct OutputToUpload {
 #[instrument(skip_all)]
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
-    upper_store: &Path,
     assignment_token: &str,
     deriver: &str,
     outputs: &[OutputToUpload],
@@ -207,7 +211,7 @@ pub async fn upload_all_outputs(
     // `unsafeDiscardReferences`, and remapped floating-CA self/sibling
     // references to their final paths — that recorded set is what gets
     // registered, exactly as Nix registers it.
-    // r[impl builder.upload.references-scanned]
+    // r[impl builder.upload.references-scanned+2]
     let by_basename: std::collections::HashMap<String, &OutputToUpload> = outputs
         .iter()
         .map(|o| (basename_of(&o.store_path), o))
@@ -234,8 +238,8 @@ pub async fn upload_all_outputs(
         metrics::histogram!("rio_builder_upload_references_count")
             .record(o.references.len() as f64);
         prepared.push(PreparedOutput {
-            basename: b.clone(),
             store_path: o.store_path.clone(),
+            host_path: o.host_path.clone(),
             parsed,
             references: o.references.clone(),
             content_address: o.content_address.clone(),
@@ -266,15 +270,7 @@ pub async fn upload_all_outputs(
             if attempt > 0 {
                 tokio::time::sleep(UPLOAD_BACKOFF.duration(attempt - 1)).await;
             }
-            match upload_outputs_batch(
-                store_client,
-                upper_store,
-                &prepared,
-                assignment_token,
-                deriver,
-            )
-            .await
-            {
+            match upload_outputs_batch(store_client, &prepared, assignment_token, deriver).await {
                 Ok(mut results) => {
                     results.append(&mut skipped_results);
                     return Ok(results);
@@ -315,7 +311,6 @@ pub async fn upload_all_outputs(
         "uploading build outputs (independent PutPath)"
     );
 
-    let upper_store = upper_store.to_path_buf();
     // Clone the token into each task (it's a String in each async
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
@@ -323,10 +318,9 @@ pub async fn upload_all_outputs(
     let results: Vec<Result<ValidatedPathInfo, UploadError>> = stream::iter(prepared)
         .map(|p| {
             let mut client = store_client.clone();
-            let upper_store = upper_store.clone();
             let token = token.clone();
             let deriver = deriver.clone();
-            async move { upload_output(&mut client, &upper_store, p, &token, &deriver).await }
+            async move { upload_output(&mut client, p, &token, &deriver).await }
         })
         .buffer_unordered(MAX_PARALLEL_UPLOADS)
         .collect()
@@ -471,10 +465,12 @@ mod tests {
     use rio_test_support::fixtures::seed_store_output as make_output_file;
 
     /// Build the `OutputToUpload` an `upload_all_outputs` caller (the
-    /// result pipeline) would pass: full store path + recorded refs.
-    fn out_for(basename: &str, references: &[String]) -> OutputToUpload {
+    /// result pipeline) would pass: full store path, on-disk location,
+    /// and recorded refs.
+    fn out_for(store_dir: &Path, basename: &str, references: &[String]) -> OutputToUpload {
         OutputToUpload {
             store_path: format!("/nix/store/{basename}"),
+            host_path: store_dir.join(basename),
             references: references.to_vec(),
             content_address: None,
         }
@@ -483,11 +479,11 @@ mod tests {
     /// Prep helper for tests calling `upload_output` directly: builds the
     /// `PreparedOutput` exactly as `upload_all_outputs` does, with the
     /// caller-provided (pipeline-recorded) references.
-    fn prep_one(basename: &str, references: &[String]) -> common::PreparedOutput {
+    fn prep_one(store_dir: &Path, basename: &str, references: &[String]) -> common::PreparedOutput {
         let store_path = format!("/nix/store/{basename}");
         common::PreparedOutput {
-            basename: basename.to_string(),
             store_path: store_path.clone(),
+            host_path: store_dir.join(basename),
             parsed: StorePath::parse(&store_path).expect("test basename is a valid store path"),
             references: references.to_vec(),
             content_address: None,
@@ -500,8 +496,8 @@ mod tests {
         let basename = test_store_basename("hello");
         let (_tmp, store_dir) = make_output_file(&basename, b"hello world")?;
 
-        let p = prep_one(&basename, &[]);
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("upload should succeed");
 
@@ -529,8 +525,8 @@ mod tests {
         let basename = test_store_basename("retry");
         let (_tmp, store_dir) = make_output_file(&basename, b"retry me")?;
 
-        let p = prep_one(&basename, &[]);
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("upload should succeed on 3rd attempt");
 
@@ -553,8 +549,8 @@ mod tests {
         let basename = test_store_basename("exhaust");
         let (_tmp, store_dir) = make_output_file(&basename, b"never uploads")?;
 
-        let p = prep_one(&basename, &[]);
-        let err = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let err = upload_output(&mut client, p, "", "")
             .await
             .expect_err("upload should exhaust retries");
 
@@ -593,8 +589,8 @@ mod tests {
             nar.clone(),
         );
 
-        let p = prep_one(&basename, &[]);
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("should adopt concurrent uploader's result");
 
@@ -629,8 +625,8 @@ mod tests {
         let basename = test_store_basename("clears");
         let (_tmp, store_dir) = make_output_file(&basename, b"clears eventually")?;
 
-        let p = prep_one(&basename, &[]);
-        let result = upload_output(&mut client, &store_dir, p, "", "")
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "")
             .await
             .expect("should retry upload after poll window");
 
@@ -688,10 +684,13 @@ mod tests {
 
         let results = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             "",
-            &[out_for(&b1, &[]), out_for(&b2, &[]), out_for(&b3, &[])],
+            &[
+                out_for(&store_dir, &b1, &[]),
+                out_for(&store_dir, &b2, &[]),
+                out_for(&store_dir, &b3, &[]),
+            ],
         )
         .await
         .expect("all uploads succeed");
@@ -721,7 +720,7 @@ mod tests {
         // validation and into the dump that actually ENOENTs.
         let basename = test_store_basename("nonexistent");
         let (_store, mut client, _h) = spawn_mock_store_with_client().await?;
-        let err = upload_output(&mut client, &store_dir, prep_one(&basename, &[]), "", "")
+        let err = upload_output(&mut client, prep_one(&store_dir, &basename, &[]), "", "")
             .await
             .expect_err("should fail NAR serialization in the dump");
 
@@ -779,8 +778,8 @@ mod tests {
         let basename = test_store_basename("tee-hash");
         let (_tmp, store_dir) = make_output_file(&basename, b"tee upload test data")?;
 
-        let p = prep_one(&basename, &[]);
-        let result = upload_output(&mut client, &store_dir, p, "", "").await?;
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", "").await?;
 
         // The hash returned by upload_output == the hash MockStore recorded
         // == SHA-256 of dump_path(). Three-way consistency.
@@ -809,14 +808,15 @@ mod tests {
     const DEP_HASH_A: &str = "7rjj5xmrxb3n63wlk6mzlwxzxbvg7r3a";
     const DEP_HASH_B: &str = "v5sv61sszx301i0x6xysaqzla09nksnd";
 
-    /// r[verify builder.upload.references-scanned]
+    /// r[verify builder.upload.references-scanned+2]
     /// r[verify builder.upload.deriver-populated]
     ///
-    /// End-to-end: output file embeds a store-path string → pre-scan finds
-    /// it → PathInfo.references arrives at MockStore non-empty. Also checks
+    /// End-to-end: the references recorded by the result pipeline are
+    /// delivered unchanged → PathInfo.references arrives at MockStore
+    /// exactly as provided (no rescan, no additions). Also checks
     /// PathInfo.deriver is populated (was String::new() before this fix).
     #[tokio::test]
-    async fn test_upload_output_scans_references() -> anyhow::Result<()> {
+    async fn test_upload_output_sends_recorded_references() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("scanned");
         let deriver = test_drv_path("scanned");
@@ -833,8 +833,8 @@ mod tests {
         // References as the result pipeline recorded them: dep-A + the
         // output's own path (self-references are legal — binaries embed
         // their own store path in rpaths). dep-B is NOT recorded.
-        let p = prep_one(&basename, &[dep_a.clone(), self_path.clone()]);
-        let result = upload_output(&mut client, &store_dir, p, "", &deriver).await?;
+        let p = prep_one(&store_dir, &basename, &[dep_a.clone(), self_path.clone()]);
+        let result = upload_output(&mut client, p, "", &deriver).await?;
 
         // Result carries exactly the provided refs — no rescan, no
         // additions, dep-B absent.
@@ -870,8 +870,8 @@ mod tests {
         let deriver = test_drv_path("noref");
         let (_tmp, store_dir) = make_output_file(&basename, b"plain text, no store paths here")?;
 
-        let p = prep_one(&basename, &[]);
-        let result = upload_output(&mut client, &store_dir, p, "", &deriver).await?;
+        let p = prep_one(&store_dir, &basename, &[]);
+        let result = upload_output(&mut client, p, "", &deriver).await?;
 
         assert!(
             result.references.is_empty(),
@@ -912,12 +912,11 @@ mod tests {
         let deriver = test_drv_path("multi");
         let results = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             &deriver,
             &[
-                out_for(&out1, std::slice::from_ref(&dep_a)),
-                out_for(&out2, std::slice::from_ref(&dep_b)),
+                out_for(&store_dir, &out1, std::slice::from_ref(&dep_a)),
+                out_for(&store_dir, &out2, std::slice::from_ref(&dep_b)),
             ],
         )
         .await?;
@@ -1032,7 +1031,7 @@ mod tests {
         );
 
         let results =
-            upload_all_outputs(&client, &store_dir, "", "", &[out_for(&basename, &[])]).await?;
+            upload_all_outputs(&client, "", "", &[out_for(&store_dir, &basename, &[])]).await?;
 
         // Zero PutPath calls — the skip fired.
         assert_eq!(
@@ -1071,10 +1070,12 @@ mod tests {
 
         let results = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             "",
-            &[out_for(&b_present, &[]), out_for(&b_missing, &[])],
+            &[
+                out_for(&store_dir, &b_present, &[]),
+                out_for(&store_dir, &b_missing, &[]),
+            ],
         )
         .await?;
 
@@ -1123,7 +1124,7 @@ mod tests {
         fs::write(store_dir.join(&basename), b"disk fallback")?;
 
         let results =
-            upload_all_outputs(&client, &store_dir, "", "", &[out_for(&basename, &[])]).await?;
+            upload_all_outputs(&client, "", "", &[out_for(&store_dir, &basename, &[])]).await?;
 
         // FindMissingPaths failed → fell back to upload → PutPath called.
         // (MockStore's put_path doesn't implement the idempotent no-op;
@@ -1157,11 +1158,7 @@ mod tests {
         // MockStore doesn't expose call-count for find_missing_paths.
         // Just assert empty result + zero PutPath. The is_empty() guard
         // is simple enough that existence-in-code is the real assurance.
-        let tmp = tempfile::tempdir()?;
-        // upper_store doesn't exist — scan_new_outputs returns empty.
-
-        let results =
-            upload_all_outputs(&client, &tmp.path().join("nonexistent"), "", "", &[]).await?;
+        let results = upload_all_outputs(&client, "", "", &[]).await?;
         assert!(results.is_empty());
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
@@ -1195,12 +1192,11 @@ mod tests {
 
         let err = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             "",
             &[
-                out_for(&b_ok, &[]),
-                out_for(&b_bad, &["not-a-store-path".to_string()]),
+                out_for(&store_dir, &b_ok, &[]),
+                out_for(&store_dir, &b_bad, &["not-a-store-path".to_string()]),
             ],
         )
         .await
@@ -1234,10 +1230,9 @@ mod tests {
 
         let results = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             "",
-            &[out_for(&b1, &[]), out_for(&b2, &[])],
+            &[out_for(&store_dir, &b1, &[]), out_for(&store_dir, &b2, &[])],
         )
         .await
         .expect("batch upload should succeed on 3rd attempt");
@@ -1275,10 +1270,12 @@ mod tests {
 
         let err = upload_all_outputs(
             &client,
-            &store_dir,
             "",
             "",
-            &[out_for(&b_a, &[]), out_for(&b_b, &[])],
+            &[
+                out_for(&store_dir, &b_a, &[]),
+                out_for(&store_dir, &b_b, &[]),
+            ],
         )
         .await
         .expect_err("batch should exhaust retries");

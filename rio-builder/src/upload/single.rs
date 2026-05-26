@@ -1,6 +1,6 @@
 //! Per-output `PutPath` upload with retry + concurrent-put adoption.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -60,12 +60,11 @@ pub(super) const CONCURRENT_PUT_POLL_ATTEMPTS: u32 = 5;
 #[instrument(skip_all, fields(store_path = %prepared.store_path))]
 pub(super) async fn upload_output(
     store_client: &mut StoreServiceClient<Channel>,
-    upper_store: &Path,
     prepared: PreparedOutput,
     assignment_token: &str,
     deriver: &str,
 ) -> Result<ValidatedPathInfo, UploadError> {
-    let output_path = upper_store.join(&prepared.basename);
+    let output_path = prepared.host_path.clone();
     let PreparedOutput {
         store_path,
         parsed: parsed_path,

@@ -214,8 +214,8 @@
       "enum": "UploadError",
       "name": "InvalidReference",
       "crate": "rio-builder",
-      "msg": "ref-scan returned unparseable store path {path:?}",
-      "doc": "Ref-scan returned a path that fails `StorePath::parse`. The candidate set is built from validated input-closure paths, so this indicates a bug in `CandidateSet::resolve` (or a mismatched store-prefix). Surfaced as an error — silently dropping the ref would publish a path with a broken reference graph."
+      "msg": "unparseable store path in recorded references: {path:?}",
+      "doc": "A reference recorded by the result pipeline fails `StorePath::parse`. The pipeline resolves references against validated input-closure and output paths, so this indicates a bug upstream (or a mismatched store-prefix). Surfaced as an error — silently dropping the ref would publish a path with a broken reference graph."
     },
     {
       "enum": "UploadError",

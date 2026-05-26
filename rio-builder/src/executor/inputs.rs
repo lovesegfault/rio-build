@@ -948,7 +948,7 @@ mod tests {
     /// sensitivity proof: same output bytes, direct-only candidate set →
     /// transitive ref is missed. That's the exact shape of the original bug.
     ///
-    // r[verify builder.upload.references-scanned]
+    // r[verify builder.upload.references-scanned+2]
     #[tokio::test]
     async fn test_candidate_set_is_transitive_not_direct() -> anyhow::Result<()> {
         use rio_nix::refscan::{CandidateSet, RefScanSink};

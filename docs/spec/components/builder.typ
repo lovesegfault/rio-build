@@ -703,21 +703,24 @@ pod's emptyDir.
     is done store-side.
 ]
 
-#r("builder.upload.references-scanned")[
-  Before the retry loop, `upload_output` performs a *pre-scan pass*: a single
-  extra disk read through `RefScanSink` only (no hash, no network). The NAR is
-  dumped via `dump_path_streaming` into the scanner, which finds every
-  candidate hash part embedded anywhere in the stream (including inside
-  binaries, RPATH strings, symlink targets, directory names). The candidate
-  set is the *transitive input closure* ∪ `drv.outputs()`: every path
-  reachable via BFS over store references from the derivation's inputs, plus
-  all of this derivation's own outputs (for self-references and cross-output
-  references). This matches Nix's `computeFSClosure`
-  (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`).
-  A build can legitimately embed any transitively-reachable path --- e.g.
-  `hello-2.12.2` references `glibc`, which is not a direct input but arrives
-  via `closure(stdenv)`. The resolved reference list is *sorted* (affects the
-  narinfo signature fingerprint --- must be deterministic).
+#r("builder.upload.references-scanned+2")[
+  The references registered for each output are the reference sets the
+  result pipeline recorded — scanned once during output processing,
+  post-`unsafeDiscardReferences`, with floating-CA self/sibling references
+  remapped to their final paths — and they are delivered unchanged in
+  `PathInfo`; the upload performs no additional reference scan of its own.
+  The pipeline's scan finds every candidate hash part embedded anywhere in
+  the output (including inside binaries, RPATH strings, symlink targets,
+  directory names) against the candidate set *transitive input closure* ∪
+  `drv.outputs()`: every path reachable via BFS over store references from
+  the derivation's inputs, plus all of this derivation's own outputs (for
+  self-references and cross-output references). This matches Nix's
+  `computeFSClosure` (`derivation-building-goal.cc:444,450` /
+  `derivation-builder.cc:1335-1344`). A build can legitimately embed any
+  transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`,
+  which is not a direct input but arrives via `closure(stdenv)`. The
+  registered reference list is *sorted* (affects the narinfo signature
+  fingerprint --- must be deterministic).
 ]
 
 #r("builder.upload.deriver-populated")[

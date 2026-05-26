@@ -166,10 +166,10 @@ pub(super) fn uploaded_info(
 /// does not re-scan outputs for references.
 #[derive(Clone, Debug)]
 pub(super) struct PreparedOutput {
-    /// Basename under `upper_store` (`"abc…-hello"`).
-    pub basename: String,
-    /// `"/nix/store/{basename}"` — the string form sent in `PathInfo`.
+    /// Full `/nix/store/...` path — the string form sent in `PathInfo`.
     pub store_path: String,
+    /// On-disk location of the output's bytes (the NAR dump source).
+    pub host_path: std::path::PathBuf,
     /// Validated parse of `store_path`.
     pub parsed: StorePath,
     /// Sorted full-store-path references to register.

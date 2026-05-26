@@ -298,7 +298,7 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
     Ok(FixedCaDescriptor { recursive, hash })
 }
 
-// r[impl sec.authz.ca-path-derived+2]
+// r[impl sec.authz.ca-path-derived+3]
 /// Floating-CA path-authorization gate. When `claims.is_ca` is set,
 /// [`validate_put_metadata`] skipped the `store_path ∈
 /// expected_outputs` check (the path isn't known at sign time). This
@@ -406,6 +406,10 @@ pub(in crate::grpc) fn verify_ca_store_path(
                 "{ctx_label}: flat content-addressed upload declares a self-reference"
             )));
         }
+        // extract_single_file copies the file bytes out of the buffered
+        // NAR, briefly doubling peak memory for this upload — fine at
+        // FOD/flat-output sizes; offset-based hashing over the NAR slice
+        // is the future option if that ever matters.
         let file = rio_nix::nar::extract_single_file(nar_data).map_err(|e| {
             Status::invalid_argument(format!(
                 "{ctx_label}: flat content-addressed upload is not a single-file NAR: {e}"

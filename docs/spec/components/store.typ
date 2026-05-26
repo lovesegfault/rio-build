@@ -313,14 +313,17 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+2")[
+#r("sec.authz.ca-path-derived+3")[
   For floating-CA derivations (`AssignmentClaims.is_ca = true`),
   `expected_outputs` is unknown at dispatch time. Instead of skipping
   authorization, the store recomputes the CA store path *server-side* from the
-  SHA-256 it computed over the buffered NAR (via
-  `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)`) and
-  rejects with `PERMISSION_DENIED` if it does not match the uploaded
-  `store_path`. The server-side CA-path recompute MUST run BEFORE the
+  buffered NAR using the ingestion method declared by the upload's `fixed:`
+  content-address descriptor — recursive (NAR) or flat (single regular file),
+  sha1/sha256/sha512, hash-modulo when a self-reference is declared (via
+  `StorePath::make_fixed_output_with_self`), cross-checking the descriptor's
+  declared hash against its own recompute; uploads without a descriptor are
+  verified as recursive SHA-256 --- and rejects with `PERMISSION_DENIED` if it
+  does not match the uploaded `store_path`. The server-side CA-path recompute MUST run BEFORE the
   `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
   1), so a worker holding an `is_ca` token cannot squat placeholders for paths
   it has not content-proven (it would otherwise drip-feed chunks while

@@ -117,6 +117,7 @@ pub(super) async fn collect_native_outputs(
         .iter()
         .map(|o| upload::OutputToUpload {
             store_path: o.store_path.clone(),
+            host_path: o.host_path.clone(),
             references: o.references.clone(),
             content_address: o.content_address.clone(),
         })
@@ -126,32 +127,31 @@ pub(super) async fn collect_native_outputs(
     // silently discards anything in the chroot store that is not a
     // declared output, and so do we (they are simply never uploaded) —
     // but a build writing them is unusual enough to be worth a warning.
-    if let Ok(found) = upload::scan_new_outputs(&overlay_mount.upper_store()) {
-        let expected: std::collections::HashSet<&str> = processed
-            .outputs
-            .iter()
-            .filter_map(|o| o.store_path.strip_prefix("/nix/store/"))
-            .collect();
-        for name in found {
-            if !expected.contains(name.as_str()) {
-                tracing::warn!(
-                    drv_path = %drv_path,
-                    stray = %name,
-                    "build left a stray store path in the overlay upper layer; not uploading it"
-                );
+    match upload::scan_new_outputs(&overlay_mount.upper_store()) {
+        Ok(found) => {
+            let expected: std::collections::HashSet<&str> = processed
+                .outputs
+                .iter()
+                .filter_map(|o| o.store_path.strip_prefix("/nix/store/"))
+                .collect();
+            for name in found {
+                if !expected.contains(name.as_str()) {
+                    tracing::warn!(
+                        drv_path = %drv_path,
+                        stray = %name,
+                        "build left a stray store path in the overlay upper layer; not uploading it"
+                    );
+                }
             }
         }
+        Err(e) => tracing::debug!(
+            drv_path = %drv_path,
+            error = %e,
+            "could not scan the overlay upper store for stray paths"
+        ),
     }
 
-    match upload::upload_all_outputs(
-        store_client,
-        &overlay_mount.upper_store(),
-        assignment_token,
-        drv_path,
-        &to_upload,
-    )
-    .await
-    {
+    match upload::upload_all_outputs(store_client, assignment_token, drv_path, &to_upload).await {
         Ok(upload_results) => {
             // Defensive map back to the pipeline's processed outputs (the
             // upload set is constructed from them, so a miss here is an

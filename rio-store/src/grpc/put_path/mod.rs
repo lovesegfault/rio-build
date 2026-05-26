@@ -158,7 +158,7 @@ impl StoreServiceImpl {
         let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
-        // r[impl sec.authz.ca-path-derived+2]
+        // r[impl sec.authz.ca-path-derived+3]
         // For is_ca tokens, validate_put_metadata skips the
         // `store_path ∈ expected_outputs` membership check (the path is
         // content-derived). The CA authorization gate —

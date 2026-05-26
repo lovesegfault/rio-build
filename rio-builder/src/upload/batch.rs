@@ -1,6 +1,5 @@
 //! Atomic multi-output upload via `PutPathBatch`.
 
-use std::path::Path;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -48,7 +47,6 @@ pub(super) fn batch_stream_timeout(n_outputs: usize) -> Duration {
 #[instrument(skip_all, fields(outputs = prepared.len()))]
 pub(super) async fn upload_outputs_batch(
     store_client: &StoreServiceClient<Channel>,
-    upper_store: &Path,
     prepared: &[PreparedOutput],
     assignment_token: &str,
     deriver: &str,
@@ -62,7 +60,6 @@ pub(super) async fn upload_outputs_batch(
     // (nar_hash, nar_size) per output; `uploaded_info` is built after
     // the gRPC commit so a post-stream failure cannot desync client and
     // server state.
-    let upper_store = upper_store.to_path_buf();
     let prepared_owned: Vec<PreparedOutput> = prepared.to_vec();
     let deriver_owned = deriver.to_string();
 
@@ -92,7 +89,7 @@ pub(super) async fn upload_outputs_batch(
             // Inner channel: spawn_blocking produces PutPathRequest, async
             // side wraps + forwards. Same tee pattern as do_upload_streaming.
             let (inner_tx, mut inner_rx) = mpsc::channel::<PutPathRequest>(STREAM_CHANNEL_BUF);
-            let dump_task = spawn_dump_tee(upper_store.join(&p.basename), inner_tx);
+            let dump_task = spawn_dump_tee(p.host_path.clone(), inner_tx);
 
             // Forward chunks + trailer, tagging with output_index.
             while let Some(inner) = inner_rx.recv().await {

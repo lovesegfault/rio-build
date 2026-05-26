@@ -726,7 +726,7 @@ in
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
       "gc-sweep"
-      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
