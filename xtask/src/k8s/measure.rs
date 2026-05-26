@@ -404,8 +404,14 @@ fn coalesce_trace(path: &Path) -> Result<Vec<(u64, u64)>> {
         let (ofs, len) = line
             .split_once('\t')
             .with_context(|| format!("{}:{}: expected `ofs<TAB>len`", path.display(), i + 1))?;
-        let ofs: u64 = ofs.trim().parse()?;
-        let len: u64 = len.trim().parse()?;
+        let ofs: u64 = ofs
+            .trim()
+            .parse()
+            .with_context(|| format!("{}:{}: offset column `{ofs}`", path.display(), i + 1))?;
+        let len: u64 = len
+            .trim()
+            .parse()
+            .with_context(|| format!("{}:{}: length column `{len}`", path.display(), i + 1))?;
         events.push((ofs, ofs + len));
     }
     ensure!(!events.is_empty(), "{}: empty trace", path.display());

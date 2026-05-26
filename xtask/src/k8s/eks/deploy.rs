@@ -319,7 +319,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // ONE JSON env var on the store Deployment; the per-pod AZ →
         // bucket match happens store-side at startup (RIO_NODE_ZONE
         // from the pod's topology label). Flipping back to kind=s3 is
-        // instant and lossless (r[infra.express.cache-tier]).
+        // instant and lossless.
+        // r[impl infra.express.cache-tier]
         if !express_by_zone.is_empty() {
             helm = helm.set("store.chunkBackend.kind", "tiered").set_json(
                 "store.chunkBackend.expressBucketByZone",
