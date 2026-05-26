@@ -261,7 +261,7 @@ in
   #   empty-connection grace once the last protocol session ends — NOT
   #   on last-session-close, which would kill a ControlMaster
   #   mid-batch); `ssh gateway echo` (rejected exec) must exit ≠124.
-  # r[verify builder.stderr.forward-set-phase]
+  # r[verify builder.stderr.forward-set-phase+2]
   #   phase-reporter entry: the @nix setPhase frames are consumed by the
   #   native log filter (none may reach the forwarded log) and surface
   #   as ordered phases in the driver report.
@@ -539,7 +539,7 @@ in
       {
         name = "disrupt";
         subtests = [
-          # r[verify builder.silence.timeout-kill+2]
+          # r[verify builder.silence.timeout-kill+3]
           # r[verify sched.timeout.promote-on-exceed+3]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]

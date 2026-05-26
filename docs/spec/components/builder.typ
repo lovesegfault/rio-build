@@ -532,15 +532,17 @@ is present in the worker image and no external process is delegated to.
   (`Overlay`) are NOT retried locally.
 ]
 
-#r("builder.silence.timeout-kill+2")[
+#r("builder.silence.timeout-kill+3")[
   `maxSilentTime` (seconds, forwarded from client `--option max-silent-time`)
   is enforced by the executor: captured build output resets the silence
   deadline, and when the deadline passes with no output the build is killed
   via the per-build cgroup and reported as `BuildStatus::TimedOut` with an
-  error message naming the silence window. Phase-change frames do NOT reset
-  the timer --- a build emitting only phase markers with no output is still
-  "silent". The enforcement is rio-side and authoritative; nothing else in
-  the build path enforces it.
+  error message naming the silence window. All builder output counts as
+  activity, including `@nix` side-channel frames (`setPhase` and friends):
+  the deadline is reset by the raw pty bytes before any frame is consumed,
+  matching CppNix, where any builder stderr output resets the silence clock.
+  The enforcement is rio-side and authoritative; nothing else in the build
+  path enforces it.
 ]
 
 Before the build process starts, the worker writes a 3-line `rio:` header
@@ -564,12 +566,14 @@ prior attempt's final line count so output line numbers continue. The normative
 requirement and the display-only / no-pod-identity rationale live in
 #rref("obs.log.worker-header") in the observability spec.
 
-#r("builder.stderr.forward-set-phase")[
+#r("builder.stderr.forward-set-phase+2")[
   The build-log loop consumes nixpkgs' `@nix {"action":"setPhase", ...}`
   side-channel lines (they never appear in the persisted build log) and
   forwards each phase change as a `BuildPhase{derivation_path, phase}`
   `ExecutorMessage`. Phase is a state edge, not log content --- it is sent
-  unbatched and does not reset the max-silent-time deadline.
+  unbatched, and forwarding it plays no part in silence accounting (the
+  max-silent deadline is governed by the builder's raw output, which
+  includes the frame itself; see #rref("builder.silence.timeout-kill")).
 ]
 
 #r("builder.stderr.msg-cap")[

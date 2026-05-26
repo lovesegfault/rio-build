@@ -1074,8 +1074,8 @@ struct NativeOutcome {
 /// `NativeOutcome.build_result` so the caller tears down the overlay
 /// before propagating.
 // r[impl builder.cores.cgroup-clamp+2]
-// r[impl builder.silence.timeout-kill+2]
-// r[impl builder.stderr.forward-set-phase]
+// r[impl builder.silence.timeout-kill+3]
+// r[impl builder.stderr.forward-set-phase+2]
 #[instrument(skip_all, fields(drv_path = %args.drv_path))]
 async fn run_native_lifecycle(
     args: NativeLifecycleArgs<'_>,
@@ -1264,7 +1264,7 @@ async fn run_native_lifecycle(
         // and the daemon-era path report it as a permanent build failure
         // in the build log, not as something to retry. Materialization
         // faults stay infra-transient: they surface earlier as bind-mount
-        // failures (r[builder.result.input-materialization-is-infra]) or
+        // failures (r[builder.result.input-materialization-is-infra+3]) or
         // as EIO, never as these errnos at exec time — every input bind
         // already succeeded by the time the child execs.
         Err(rio_exec::ExecError::Setup(se))
@@ -1459,9 +1459,12 @@ struct LogLoopResult {
 /// lived in the daemon-era stderr loop.
 ///
 /// Daemon-era semantics preserved (normative):
-/// - phase frames flush pending log lines first and never reset the
-///   silence deadline (the deadline lives in rio-exec, which never sees
-///   the frame);
+/// - phase frames flush pending log lines first; silence accounting is
+///   not this loop's concern — the max-silent deadline lives in rio-exec
+///   and is reset by ANY builder pty output, including the raw bytes of
+///   `@nix` frames, before this loop ever classifies them (CppNix
+///   behaves the same way: any builder stderr output resets the silence
+///   clock);
 /// - the byte cap (`LogLimits.total_bytes`) and the line cap
 ///   (`MAX_BUILD_LOG_LINES`) abort the build by killing the cgroup; the
 ///   lifecycle then reports `LogLimitExceeded`.
@@ -1513,7 +1516,7 @@ async fn native_log_loop(
                         }
                     },
                     glue::log::LineAction::Phase(phase) => {
-                        // r[impl builder.stderr.forward-set-phase]
+                        // r[impl builder.stderr.forward-set-phase+2]
                         if batcher.has_pending() {
                             let msg = ExecutorMessage {
                                 msg: Some(executor_message::Msg::LogBatch(batcher.flush())),

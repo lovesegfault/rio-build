@@ -15,11 +15,12 @@
 //! The activation milestone wires this between `rio_exec::ExecEvent::Log`
 //! and the existing `LogBatcher`, preserving the daemon-era semantics
 //! documented on [`LineAction::Phase`]: flush the batcher before sending
-//! the phase frame (line-number ordering stays monotone), do **not**
-//! reset the max-silent deadline (a build that only emits phase markers
-//! is still "silent"), and count every line against the message cap so a
-//! build cannot flood the scheduler with phase frames
-//! (`r[builder.stderr.msg-cap]` successor).
+//! the phase frame (line-number ordering stays monotone), play no part
+//! in silence accounting (the max-silent deadline lives in rio-exec and
+//! is reset by the builder's raw output — including these frames —
+//! exactly as the daemon-era path reset it on any stderr output), and
+//! count every line against the message cap so a build cannot flood the
+//! scheduler with phase frames (`r[builder.stderr.msg-cap]` successor).
 //!
 //! [`BuildPhase`]: rio_proto::types::BuildPhase
 
@@ -47,7 +48,9 @@ pub(crate) enum LineAction {
     /// - flush the batcher first if it has pending lines, so the phase
     ///   frame cannot overtake buffered log lines on the channel;
     /// - send the frame directly on `log_tx`, NOT through the batcher;
-    /// - do NOT reset the max-silent deadline.
+    /// - leave silence accounting alone — the max-silent deadline lives
+    ///   in rio-exec and was already reset by the frame's raw pty bytes,
+    ///   like any other builder output.
     Phase(String),
     /// A `@nix ` frame that is not a well-formed `setPhase` (other
     /// actions like `msg`/`start`/`stop`/`result`, or malformed JSON):
