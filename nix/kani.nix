@@ -178,7 +178,7 @@ in
   # counter-arithmetic kernels are extracted into a dependency-light
   # context the way rio-store's logs/kernel.rs was (the recorded Phase-2
   # deferral in docs/spec/models/retry-invariant-map.md), and add the
-  # r[verify] markers for the covered sched.retry.* rules at this wiring
+  # verify markers for the covered sched.retry.* rules at this wiring
   # point at the same time (markers are deliberately absent until the
   # check actually runs in CI — the rules keep their existing
   # unit-test / model-check verify sites meanwhile).
