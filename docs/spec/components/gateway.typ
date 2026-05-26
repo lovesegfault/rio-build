@@ -1179,14 +1179,23 @@ exchanges, so a peer that keeps a key exchange perpetually in flight defers
 delivery for as long as it keeps the exchange active --- an upstream russh
 constraint --- and the transport's own limits never step in for such a peer,
 because every packet it trickles (e.g. `SSH_MSG_IGNORE`) resets both the
-keepalive failure counter and the inactivity timer. The bound is therefore
-delivered in two stages: the polite `SSH_MSG_DISCONNECT` at the grace for
-every peer russh can deliver it to, and a forced transport close
-`PRE_AUTH_FORCE_CLOSE_SLACK` (5 s) after the deadline for one it cannot ---
-the accept-site read deadline fails the still-unauthenticated transport,
-which ends russh's session loop and releases the connection slot and fd
-through the normal drop path. A peer that goes silent mid-exchange is still
-caught earlier by `keepalive_max` (\~300 s).
+keepalive failure counter and the inactivity timer. Delivery is also only
+half the story: a peer that does receive the disconnect can simply never
+close its end, and russh then waits in a post-disconnect drain-read loop
+that has no timeout and arms no keepalives. The bound is therefore
+delivered in two stages for both the pre-auth and the authenticated
+populations: the polite `SSH_MSG_DISCONNECT` the moment the gateway decides
+the connection must go (the pre-auth deadline or the empty-connection
+grace), then a forced transport close `FORCE_CLOSE_SLACK` (5 s) later if
+the connection is still open --- the accept-site read deadline covers the
+never-authenticated peer, and the same wrapper enforces a force-close
+deadline armed whenever a disconnect is queued for an authenticated one, so
+the failed read ends russh's session loop (or its drain loop) and releases
+the connection slot and fd through the normal drop path. That forced close
+at grace + slack is what reaps a peer that stalls or squats mid-exchange
+--- long before `keepalive_max` (\~300 s) would --- leaving keepalive as
+the backstop only for connections the gateway has not (yet) decided to
+disconnect.
 
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at

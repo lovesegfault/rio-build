@@ -505,9 +505,12 @@ pub struct ConnectionHandler {
     pub(super) sessions_shutdown: CancellationToken,
     /// Global active-session semaphore (`r[gw.conn.session-cap]`),
     /// shared with `GatewayServer` and every other connection.
-    /// `exec_request` does `try_acquire_owned()`; the permit lives in
-    /// the `ChannelSession`. This — not the per-connection channel
-    /// bound — is the resource limit that protects pod memory.
+    /// `exec_request` does `try_acquire_owned()`; the permit is owned by
+    /// the session's [`SessionGuard`] (held by its response task), so it
+    /// is released when the protocol session actually ends rather than
+    /// when the client deigns to close the channel. This — not the
+    /// per-connection channel bound — is the resource limit that
+    /// protects pod memory.
     pub(super) session_sem: Arc<Semaphore>,
     /// Per-connection SSH channel absurdity bound
     /// (`r[gw.conn.channel-limit+3]`). See

@@ -116,7 +116,7 @@ const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 // r[impl gw.handshake.timeout]
 /// Max time to wait for the FIRST byte (`WORKER_MAGIC_1`) through the
-/// handshake completing. Guards the gap before [`OPCODE_IDLE_TIMEOUT`]
+/// handshake completing. Guards the gap before `OPCODE_IDLE_TIMEOUT`
 /// applies: an authenticated client that opens a channel + sends the
 /// exec_request then goes silent would otherwise park on
 /// `read_u64(WORKER_MAGIC_1)` forever (russh keepalives keep transport

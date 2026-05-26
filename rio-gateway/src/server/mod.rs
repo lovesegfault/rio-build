@@ -184,8 +184,11 @@ pub struct GatewayServer {
     conn_sem: Arc<Semaphore>,
     // r[impl gw.conn.session-cap]
     /// Global active-session semaphore. One permit per spawned protocol
-    /// session across all connections; acquired in `exec_request`,
-    /// released when the `ChannelSession` drops. Default
+    /// session across all connections; acquired in `exec_request` and
+    /// owned by the session's `SessionGuard` (held by its response
+    /// task), so it is released when the protocol session actually ends
+    /// — server- or client-side — or when the session is torn down early
+    /// and the aborted task drops the guard. Default
     /// [`DEFAULT_MAX_SESSIONS`]; override via `with_max_sessions()`.
     session_sem: Arc<Semaphore>,
     /// Per-connection SSH channel absurdity bound. Default
