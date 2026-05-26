@@ -348,11 +348,11 @@ pub async fn execute(
         }
     })
     .await;
-    if let Some(line) = splitter.flush()
-        && events_open
-    {
-        // The channel may already be gone; the line is best-effort.
-        let _ = events.send(line).await;
+    for line in splitter.flush() {
+        // The channel may already be gone; the lines are best-effort.
+        if events_open && events.send(line).await.is_err() {
+            events_open = false;
+        }
     }
     // The status report normally resolved long ago; give a straggler
     // (e.g. a setup failure racing the reap, or a program so fast that
@@ -909,16 +909,20 @@ impl LineSplitter {
         events
     }
 
-    /// Emit the trailing unterminated line, if any. Called once after
-    /// EOF so a final `printf` without a newline is not lost.
-    fn flush(&mut self) -> Option<ExecEvent> {
+    /// Emit every stream's trailing unterminated line. Called after EOF
+    /// so a final `printf` without a newline is not lost — under
+    /// [`OutputCapture::SeparatePipes`] both stdout and stderr can end
+    /// with a partial line, so all pending buffers are drained, not
+    /// just the first.
+    fn flush(&mut self) -> Vec<ExecEvent> {
         self.pending
             .iter_mut()
-            .find(|(_, buf)| !buf.is_empty())
+            .filter(|(_, buf)| !buf.is_empty())
             .map(|(stream, buf)| ExecEvent::Log {
                 stream: *stream,
                 line: std::mem::take(buf),
             })
+            .collect()
     }
 }
 
@@ -1118,7 +1122,7 @@ mod tests {
             .expect("pending entry");
         assert_eq!(pending.len(), MAX_PENDING_LINE_BYTES / 2);
         // The remainder still flushes at EOF.
-        assert!(s.flush().is_some());
+        assert!(!s.flush().is_empty());
     }
 
     #[test]
@@ -1128,7 +1132,7 @@ mod tests {
         assert_eq!(lines(events), vec![(LogStream::Merged, b"hello".to_vec())]);
         let events = s.push(LogStream::Merged, b"ld\n");
         assert_eq!(lines(events), vec![(LogStream::Merged, b"world".to_vec())]);
-        assert!(s.flush().is_none());
+        assert!(s.flush().is_empty());
     }
 
     #[test]
@@ -1140,13 +1144,26 @@ mod tests {
             lines(events),
             vec![(LogStream::Stderr, b"err-line".to_vec())]
         );
-        match s.flush() {
-            Some(ExecEvent::Log { stream, line }) => {
-                assert_eq!(stream, LogStream::Stdout);
-                assert_eq!(line, b"out-partial".to_vec());
-            }
-            other => panic!("expected the stdout partial, got {other:?}"),
-        }
+        assert_eq!(
+            lines(s.flush()),
+            vec![(LogStream::Stdout, b"out-partial".to_vec())]
+        );
+    }
+
+    #[test]
+    fn line_splitter_flush_drains_every_streams_trailing_partial() {
+        // Under SeparatePipes both stdout and stderr can end with an
+        // unterminated line; flush must emit both, not just the first
+        // non-empty buffer it finds.
+        let mut s = LineSplitter::default();
+        assert!(s.push(LogStream::Stdout, b"out-tail").is_empty());
+        assert!(s.push(LogStream::Stderr, b"err-tail").is_empty());
+        let flushed = lines(s.flush());
+        assert_eq!(flushed.len(), 2);
+        assert!(flushed.contains(&(LogStream::Stdout, b"out-tail".to_vec())));
+        assert!(flushed.contains(&(LogStream::Stderr, b"err-tail".to_vec())));
+        // Everything was drained; a second flush has nothing left.
+        assert!(s.flush().is_empty());
     }
 
     #[test]
