@@ -1807,15 +1807,37 @@ impl DagActor {
         }
 
         // ADR-022 castore-FUSE (P0588): resolve the transitive input
-        // closure + castore root nodes. On PG failure or timeout we
-        // send empty input_roots and the builder falls back to
-        // QueryPathInfo BFS. Timeout + heartbeat credit like every
+        // closure + castore root nodes. There is NO builder-side
+        // fallback when this comes out empty: the per-build castore
+        // mount serves exactly these roots, so a derivation with
+        // declared inputs dispatched with empty input_roots cannot
+        // see them and the builder rejects the assignment as an
+        // actionable infrastructure failure (executor/mod.rs empty-
+        // roots guard). Empty is only correct for a derivation with
+        // no inputs at all. Timeout + heartbeat credit like every
         // other actor-blocking PG await on this path (I-139): a slow
         // recursive CTE must not stall the mailbox long enough to
         // falsely reap live workers.
         // r[impl sched.dispatch.input-roots]
         let input_root_rows = {
-            let seeds = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+            let mut seeds = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+            // Sparse node: no DAG children AND no parsed inputSrcs.
+            // That happens when the node was submitted without
+            // drv_content (gRPC-direct SubmitBuild, recovered DAG) —
+            // the scheduler then has nothing to derive the closure
+            // from and would dispatch a guaranteed-to-fail build.
+            // Fetch the .drv from the store and parse its inputSrcs
+            // before giving up; on failure, dispatch anyway with a
+            // loud breadcrumb (the builder-side guard turns it into
+            // an actionable InfrastructureFailure).
+            if seeds.is_empty()
+                && self
+                    .dag
+                    .node(drv_hash)
+                    .is_some_and(|s| s.drv_content.is_empty())
+            {
+                seeds = self.sparse_node_seeds_from_store(drv_hash).await;
+            }
             if seeds.is_empty() {
                 Vec::new()
             } else {
@@ -1828,14 +1850,16 @@ impl DagActor {
                     Ok(Ok(rows)) => rows,
                     Ok(Err(e)) => {
                         warn!(drv_hash = %drv_hash, error = %e,
-                              "input_roots closure compute failed; \
-                               builder falls back to QueryPathInfo BFS");
+                              "input_roots closure compute failed; dispatching with empty \
+                               input_roots — the builder will fail the assignment as an \
+                               infrastructure failure if the derivation has inputs");
                         Vec::new()
                     }
                     Err(_) => {
                         warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
-                              "input_roots closure compute timed out; \
-                               builder falls back to QueryPathInfo BFS");
+                              "input_roots closure compute timed out; dispatching with empty \
+                               input_roots — the builder will fail the assignment as an \
+                               infrastructure failure if the derivation has inputs");
                         Vec::new()
                     }
                 }
@@ -2215,6 +2239,68 @@ impl DagActor {
                 (drv_content, Vec::new(), Vec::new())
             }
         }
+    }
+
+    /// Derive input-closure seeds for a *sparse* node — one with no DAG
+    /// children and no inline `drv_content` (gRPC-direct submit,
+    /// recovered DAG) — by fetching its `.drv` from the store and
+    /// parsing `inputSrcs`.
+    ///
+    /// Under the castore stack (ADR-022) the per-build mount serves
+    /// exactly `WorkAssignment.input_roots`; a sparse node dispatched
+    /// without seeds gets an empty mount and fails on its first input
+    /// access. This fallback recovers the declared `inputSrcs` (the
+    /// only closure information a single-node DAG carries) so the
+    /// recursive-CTE closure expansion has something to start from.
+    /// `inputDrvs` outputs are NOT recovered here — multi-node
+    /// submissions carry them as DAG children, which
+    /// [`crate::assignment::approx_input_closure`] already covers.
+    ///
+    /// On success the parsed `inputSrcs` are also stashed back on the
+    /// node (what merge-time parsing would have produced) so dispatch
+    /// retries and the prefetch hint don't re-fetch. On any failure
+    /// (store unconfigured, GetPath error, parse failure) this returns
+    /// empty and logs the actionable breadcrumb — the builder-side
+    /// empty-roots guard then fails the assignment as an
+    /// infrastructure error rather than a poisoned derivation.
+    async fn sparse_node_seeds_from_store(&mut self, drv_hash: &DrvHash) -> Vec<String> {
+        let started = std::time::Instant::now();
+        let fetched = match self.dag.node(drv_hash) {
+            Some(state) => self.fetch_drv_content_from_store(drv_hash, state).await,
+            None => None,
+        };
+        // The fetch is bounded (2 s) but still actor-blocking — credit
+        // heartbeats like every other await on the dispatch path (I-139).
+        self.credit_heartbeats_for_stall(started.elapsed());
+
+        let srcs: Vec<String> = fetched
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| rio_nix::derivation::Derivation::parse(text).ok())
+            .map(|drv| drv.input_srcs().iter().cloned().collect())
+            .unwrap_or_default();
+
+        if srcs.is_empty() {
+            warn!(
+                drv_hash = %drv_hash,
+                "sparse node (no drv_content, no DAG children): could not derive inputSrcs \
+                 from the store — dispatching with empty input_roots; the builder will fail \
+                 the assignment as an infrastructure failure if the derivation has inputs"
+            );
+            return Vec::new();
+        }
+
+        tracing::info!(
+            drv_hash = %drv_hash,
+            srcs = srcs.len(),
+            "sparse node: derived input-closure seeds from the store-fetched .drv"
+        );
+        // Stash for subsequent dispatches/prefetch of this node — the
+        // same field merge-time parsing fills when drv_content is inline.
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            state.input_srcs = srcs.clone();
+        }
+        srcs
     }
 
     /// Fetch a derivation's ATerm bytes from the store via `GetPath`.

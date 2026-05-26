@@ -815,6 +815,83 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 }
 
 // -----------------------------------------------------------------------------
+// Sparse-node dispatch: derive input_roots seeds from the store-fetched .drv
+// -----------------------------------------------------------------------------
+
+// r[verify sched.dispatch.input-roots]
+/// A node submitted with NO drv_content and NO DAG children (gRPC-direct
+/// single-node SubmitBuild) carries no parsed `inputSrcs`, so
+/// `approx_input_closure` yields nothing. Under the castore stack empty
+/// `input_roots` is a guaranteed build failure for any derivation that
+/// has inputs, so dispatch fetches the `.drv` from the store and seeds
+/// the closure from its declared `inputSrcs` instead of dispatching
+/// blind.
+#[tokio::test]
+async fn sparse_node_dispatch_derives_input_roots_from_store() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let tag = "sparse-node";
+    let drv_path = test_drv_path(tag);
+    let src = test_store_path("sparse-busybox-static");
+    let out = test_store_path("sparse-node-out");
+    // The .drv exactly as `nix copy --derivation` would have stored it:
+    // one inputSrc (the static-busybox shape every trivial test drv
+    // has), no inputDrvs.
+    let aterm = format!(
+        r#"Derive([("out","{out}","","")],[],["{src}"],"x86_64-linux","{src}/bin/sh",["-c","build"],[("out","{out}")])"#
+    );
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let mut rx = connect_executor(&handle, "sparse-w", "x86_64-linux").await?;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![make_node(tag)], vec![], false).await?;
+
+    let a = recv_assignment(&mut rx).await;
+    assert_eq!(a.drv_path, drv_path);
+    assert!(
+        a.input_closure.contains(&src),
+        "input_closure must contain the .drv's declared inputSrc; got {:?}",
+        a.input_closure
+    );
+    assert!(
+        a.input_roots.iter().any(|r| r.store_path == src),
+        "input_roots must carry the inputSrc-derived closure entry; got {:?}",
+        a.input_roots
+    );
+    Ok(())
+}
+
+/// Sparse node + store fetch failure: dispatch still proceeds with empty
+/// `input_roots` (the builder-side empty-roots guard owns the loud,
+/// infra-classified failure) instead of wedging the ready queue behind a
+/// node the scheduler cannot describe.
+#[tokio::test]
+async fn sparse_node_dispatch_degrades_when_store_fetch_fails() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    store
+        .faults
+        .fail_get_path
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut rx = connect_executor(&handle, "sparse-w2", "x86_64-linux").await?;
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("sparse-degrade")],
+        vec![],
+        false,
+    )
+    .await?;
+
+    let a = recv_assignment(&mut rx).await;
+    assert!(a.drv_path.contains("sparse-degrade"));
+    assert!(
+        a.input_roots.is_empty() && a.input_closure.is_empty(),
+        "store fetch failed → empty roots/closure (builder guard reports it), not a wedge"
+    );
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // maybe_resolve_ca gate-path passthrough coverage
 // -----------------------------------------------------------------------------
 
