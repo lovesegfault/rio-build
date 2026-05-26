@@ -218,19 +218,26 @@ plus the prose corrections of P1–P4.
 
 ## Verify-marker status
 
-The five new rules carry no `r[impl]` / `r[verify]` markers yet, by design:
-Phase 0 Stage A is spec-and-audit only (no Rust is touched), and their
-verification arrives with the Stage-B model checks (`chunkLiveness.qnt`
-wired into `nix/quint.nix`) and, for the surviving rules, with the Phase-1
-implementation/test annotations. Until then they appear in
-`tracey query uncovered` / `untested` — expected, and preferable to
-annotating existing code against rules whose enforcing mechanism the campaign
-is about to replace. The existing markers on
-`store.chunk.refcount-txn`, `store.chunk.lock-order`, `store.chunk.grace-ttl`,
-`store.put.placeholder-claim+2`, `store.gc.orphan-heartbeat`,
+The five new rules carry no `r[impl]` markers yet, by design: Phase 0 is
+spec-audit-and-model only (no Rust is touched), and the implementing-code
+annotations arrive with the Phase-1 work. Their first `r[verify]` markers
+landed with Stage B: the `quint-chunk-liveness-*` regime checks in
+`nix/quint.nix` carry markers for `store.chunk.no-live-collect`,
+`store.gc.bounded-garbage-retention`, `store.chunk.refcount-meaning`,
+`store.chunk.refcount-decrement`, and `store.chunk.liveness-not-presence`
+at the wiring points (the house rule: a marker at the wiring point
+structurally proves the check is built), alongside model-checked markers
+for the pre-existing mechanism rules those regimes exercise
+(`store.chunk.refcount-txn`, `store.chunk.grace-ttl`,
 `store.cas.upsert-inserted+2`, `store.cas.chunk-upload-committed`,
-`store.gc.pending-deletes` (inventory Appendix B) are unaffected: no existing
-rule text was changed, so nothing went stale.
+`store.gc.pending-deletes`, `store.put.placeholder-claim+2`,
+`store.gc.orphan-heartbeat`). The five new rules still appear in
+`tracey query uncovered` (no `impl` sites) — expected, and preferable to
+annotating existing code against rules whose enforcing mechanism the
+campaign is about to replace. The existing unit-test markers from
+inventory Appendix B are unaffected: no existing rule text was changed, so
+nothing went stale. `store.chunk.lock-order` deliberately gains no model
+marker (pre-registered NOT-ENCODED — below transaction granularity).
 
 ## Consumer audit (design §5a): every reader/writer of `chunks.refcount` outside `rio-store/src`
 
@@ -315,3 +322,161 @@ stale-reference list (5 sites). 0 class-(a) findings: the §5a no-go trigger
 "a production decision-path consumer outside the §1.2 reader list" is not
 met, and the audit found nothing that gates anything other than GC
 deletion-eligibility on the counter.
+
+## Stage-B results (`chunkLiveness.qnt`, the as-built model)
+
+The model is `docs/spec/models/chunkLiveness.qnt`: the write-ahead uploader
+state machine (claim, the upgrade transaction's manifest_data INSERT +
+refcount UPSERT + token capture, the S3 PUT fan-out, the presence commit,
+the claim-gated completion), the token-gated rollback (DEC-1), the
+claim-gated reap, the heartbeat, the hot-path and scanner stale reclaims,
+the path-sweep batch (single-path and by-count two-path forms), the
+orphan-chunk sweep split into its outer SELECT and inner UPDATE so the C11
+window is a real interleaving, the outbox drain with its `FOR UPDATE`
+re-check, the crash windows of inventory §2.2 as the fault alphabet, and
+`refs(h)` (the manifest fold) as the recomputed ghost truth. One model
+action per SQL transaction (design §3.2); scope boundaries and encoding
+decisions (the path-level reachability GC abstracted to an environment
+choice per the G4b pre-registration; lock order NOT-ENCODED per G6; the S3
+PUT fan-out collapsed to one non-transactional action; the outbox attempts
+counter and the parked-row alerting tail out of scope; the relative clock
+with saturation and the heartbeat contract as a `tick` precondition) are
+documented in the model header. Four exhaustive TLC regimes are wired into
+`nix/quint.nix` (`quint-chunk-liveness-{base,crash,contend,corrupt}`),
+plus the named-run replays, sixteen non-vacuity witness checks, the two
+pre-registered corrupt-regime falsification checks, and the
+threshold-ordering inversion check.
+
+### Verdict table
+
+Distinct-state counts are as measured at the introducing commit (also in
+that commit's message and the CI transcripts): base 7,791 distinct
+(735,841 generated, depth 14), crash 2,964,717 (145,054,657, depth 25),
+contend 1,332,821 (53,843,425, depth 23), corrupt 3,307,725 (142,073,313,
+depth 26). Every regime's HOLDS column is an exhaustive TLC result over
+that regime's full reachable space.
+
+| Design invariant (§3.3) | Model form | base | crash | contend | corrupt |
+|---|---|---|---|---|---|
+| CR-1 `NoLiveChunkCollected` (state + action form) | `cr1NoLiveChunkCollected` | HOLDS | HOLDS | HOLDS | HOLDS |
+| CR-2 `BoundedGarbageRetention` (as-built structural form) | `cr2NoStrandedGarbage` | HOLDS | HOLDS | HOLDS | **FALSIFIES-AS-PRE-REGISTERED** — the C12 stranded-garbage shape (`quint-chunk-liveness-corrupt-c12-stranded`); the carved form below is this regime's stated form |
+| CR-2, corrupt-regime carved form (the rule's carve-out clause) | `cr2CarvedCorrupt` | — (base form checked) | — | — | HOLDS |
+| CR-3 `CounterRefinesManifestFold` | `cr3CounterRefinesFold` | HOLDS | HOLDS | HOLDS | **FALSIFIES-AS-PRE-REGISTERED** — the C12 sanctioned permanent over-count (`quint-chunk-liveness-corrupt-c12-overcount`) |
+| CR-3, corrupt-regime carved form (counter = fold + observably-skipped decrements) | `cr3CarvedCorrupt` | — | — | — | HOLDS |
+| CR-4 `PresenceNeverInferredFromCounter` | `cr4PresenceFromConfirmedUpload` | HOLDS | HOLDS | HOLDS | HOLDS |
+| S4 `OwnerOnlyMutation` | `s4OwnerOnlyMutation` (admission-predicate form) | HOLDS | HOLDS | HOLDS | HOLDS |
+| S5 `LiveOwnerNeverReaped` | `s5LiveOwnerNeverReaped` | HOLDS | HOLDS | HOLDS | HOLDS |
+| L3 `PlaceholderConvergence` (safety support: no foreign freshen) | `l3NoForeignFreshen` | HOLDS | HOLDS | HOLDS | HOLDS |
+| M_023 `CHECK (refcount >= 0)` | `m023NonNegative` | HOLDS | HOLDS | HOLDS | HOLDS |
+| structural bounds / self-consistency | `boundsOK` | HOLDS | HOLDS | HOLDS | HOLDS |
+
+Forms and qualifications, relative to design §3.3's statements:
+
+- **CR-3 needed no C1–C7 carve-out.** The design sanctioned "transient
+  over-counts after C1–C7 crashes, repaired within the scanner threshold";
+  at transaction granularity those windows leave the `'uploading'`
+  manifest row (and its `manifest_data`) in place, so the fold still
+  counts the abandoned references and the counter never diverges — the
+  crash regime HOLDS on the exact equality at every reachable state, a
+  stronger verdict than the gate required. The only sanctioned deviation
+  that exists as built is C12's permanent over-count, carved exactly by
+  `cr3CarvedCorrupt` (counter = fold + per-chunk skipped-decrement count).
+- **CR-2 is encoded structurally, not clocked.** The rule's bound mixes
+  protocol obligations with background-loop cadences (15-minute scanner,
+  hourly orphan-chunk sweep, 30 s drain); the cadences are scheduling
+  facts about `spawn_periodic` loops, not protocol state, so the model
+  checks the protocol half: garbage never becomes *unreclaimable by the
+  standing machinery* — an unreferenced, not-yet-soft-deleted chunk is
+  always at refcount 0 (still eligible for the zero-detect / orphan-chunk
+  sweep predicates), and a soft-deleted chunk whose object still exists
+  is always enqueued. As built that is exactly the conditionality on the
+  counter the Stage-A row recorded: a refcount stuck above zero with no
+  references is permanent garbage, which is why the unconditional form
+  falsifies in the corrupt regime and only there. The wall-clock tail of
+  the bound (cadence + drain lag + the attempts-cap parking) stays with
+  the existing loop tests under `store.gc.pending-deletes` and the
+  stale-reclaim rules.
+- **CR-1's action form** is carried by the `deletedWhileReferenced` ghost
+  recorded at the only two backend-delete sites (the drain transaction
+  and its C10 crash variant); the state form is the `'complete'`-manifest
+  presence clause. Both hold in all four regimes; the corrupt regime's
+  HOLDS is the design's "C12 errs toward retention, never toward
+  data loss" claim, machine-checked.
+- **S5 holds against the production threshold ordering, and the ordering
+  is load-bearing**: the `chunkLivenessThresholdOrder` regime lowers the
+  hot-path threshold to the heartbeat deadline and S5 falsifies there
+  (`quint-chunk-liveness-threshold-order` passes only while it does).
+  S4/L3 are encoded over the admission predicates the actions themselves
+  use (the logService authGate pattern), so dropping a claim/token/status
+  conjunct from a cleanup or heartbeat guard falsifies them.
+- **L4 `RepairLoopLiveness` is not encoded** (per the design's "encode
+  only if cheap"): pagination, poison-row isolation and per-row
+  transaction shapes are below this model's granularity; the G7 family
+  stays with the existing loop tests. L3's liveness half ("every
+  abandoned row is eventually reaped") is carried as the no-foreign-
+  freshen safety support plus the scanner/hot-path reachability
+  witnesses; the eventuality itself is a fairness property outside an
+  interleaving safety model.
+
+### Witness results
+
+All sixteen non-vacuity witnesses are violated (the contended states are
+reachable) in the regime each is wired against, and the three
+expected-falsification probes reproduce; every row below is a CI check.
+
+| Witness (model `val`) | Regime | Probes | Result |
+|---|---|---|---|
+| `noCompleteUpload` | base | a complete chunked upload exists (CR-1's state form is non-vacuous) | violated |
+| `noBackendDelete` | base | a backend DeleteObject actually fires (CR-1's action form is non-vacuous) | violated |
+| `noUnconfirmedReferencedChunk` | base | the M_033 precondition (refcount ≥ 1, `uploaded_at` NULL) | violated |
+| `noStaleTokenRollbackNoop` | base | the C4 own-heartbeat token no-op | violated |
+| `noHeartbeatReset` | base | a heartbeat resets non-zero staleness (the heartbeat is load-bearing) | violated |
+| `noCrashAtClaimed` | crash | C1 | violated |
+| `noCrashAfterUpgrade` | crash | C2 | violated |
+| `noCrashBeforeReap` | crash | C5 (the state C3/C7 collapse onto) | violated |
+| `noDoubleCrashStaged` | crash | C6 (both writers staged, both dead) | violated |
+| `noAbandonedAccounting` | crash | the as-built leak shape: abandoned `'uploading'` manifest, chunks still counted | violated |
+| `noHotpathReclaim` | crash | the 300 s hot-path reclaim fires | violated |
+| `noScannerReap` | crash | the 15-minute scanner reaps an abandoned row | violated |
+| `noSharedByCountDecrement` | contend | one batch decrements a shared chunk by ≥ 2 (the adfd303d7-C2 clause) | violated |
+| `noDrainResurrectSkip` | contend | the drain re-check skips a resurrected chunk (G4a) | violated |
+| `noOrphanRecheckSave` | contend | the orphan-sweep inner re-check excludes a resurrected candidate (C11) | violated |
+| `noLateCleanupNoop` | contend | an owner-side cleanup no-ops against a foreign/missing row (the G1 contention) | violated |
+| `cr3CounterRefinesFold` (pre-registered falsification) | corrupt | the C12 permanent over-count | violated, as pre-registered |
+| `cr2NoStrandedGarbage` (pre-registered falsification) | corrupt | the C12 stranded garbage | violated, as pre-registered |
+| `noCorruptLeak` | corrupt | the literal leak shape (refcount > 0, zero referencing manifests) | violated |
+| `s5LiveOwnerNeverReaped` (threshold-ordering inversion) | threshold-order | a live, progressing owner reaped once heartbeat-deadline ≥ hot-path threshold | violated |
+
+One §3.5 witness was corrected against the code rather than encoded as
+written: the design asks for "refcount > 0 with zero manifests" to be
+reachable in the **crash** regime before the reaper runs. As built that
+state is unreachable outside the corrupt regime — both decrement
+statements run in the same transaction as the manifest deletion that
+justifies them, and the C1–C7 windows leave the manifest row in place, so
+crashes leave *accounted* garbage (`noAbandonedAccounting`), not a
+counter/fold divergence. The literal leak shape is reachable exactly where
+a decrement is skipped against a surviving reference record's deletion —
+the corrupt regime — and is pinned there by `noCorruptLeak`. This is a
+design-§3.5 wording correction, not a model gap; the same observation is
+why CR-3 needs no crash-regime carve-out.
+
+### Notes for the Phase-0 exit gate (what the model run established)
+
+- The full encoded invariant set HOLDS on the unmodified as-built model in
+  every regime, in each regime's stated form (the corrupt regime's stated
+  forms being the carved CR-2/CR-3), with the two unconditional-form
+  falsifications in the corrupt regime exactly matching this map's
+  pre-registered as-built deviations (CR-2 conditional on CR-3; C12's
+  sanctioned permanent over-count). No unexpected falsification occurred.
+- Encoding observations worth carrying into Stage C and Phase 1:
+  `upgrade_manifest_to_chunked`'s ownership guard is the `FOR UPDATE` on
+  the `'uploading'` row plus its existence — there is no claim_id filter
+  in that statement; the model encodes it faithfully and no invariant
+  falsifies, because a reaped-then-re-claimed path can only reach that
+  state after the original owner stopped heartbeating, and a stopped
+  owner never reaches its upgrade step. Calibration should keep this in
+  mind when reverting heartbeat/claim mechanisms (a G1/G5-family revert
+  may surface it).
+- The Stage-C calibration corpus (design §3.4) is the next stage and is
+  NOT part of this section's claims; its overrides will import this model
+  the way `calibration/retry-g*.qnt` import `retryPolicyAsBuilt.qnt`.
