@@ -455,6 +455,31 @@ references should be read as anchored to `1fa6a1c7d` from here on.
   branch. If either starts before Phase 1, it gets a named owner and an
   ordering against this campaign at that point, and the affected map
   sections are re-audited.
+- **The executor-lifecycle campaign (#1) has started** (2026-05-26,
+  Phase 0 on the formal-sprint lineage; owner: B. Meurer — also this
+  campaign's owner). This is the named-owner-and-ordering entry the
+  bullet above and the re-pin protocol require. Ordering: this map's
+  Stage C closed before that campaign began, so the option-(a)
+  precondition recorded in its design — controller Stage C closes
+  before its Phase 1b touches `pool/{jobs,job}.rs` — is met; recording
+  that here is NOT a discharge of this map's own constraints. Because
+  that campaign starts while this one has no Phase-1 record, two
+  obligations are recorded with the ordering: (i) the affected sections
+  of this map (J11, the orphan-reap rows, F1/F3, the I12 out-of-model
+  entry) are due a re-audit when that campaign's 1b/1d change the
+  behavior they describe — carried as named exit-gate deliverables of
+  its 1b and 1d; (ii) if its 0e go/no-go is reached while this campaign
+  still has no Phase-1 record/close-out, the re-pin-protocol clause
+  below ("executor-lifecycle replacement green-lit mid-campaign")
+  applies in full: this map's F1/F3 rows become a prerequisite review
+  input to that 0e decision, the Stage-B models are re-checked with the
+  heartbeat-authority assumptions removed (carried by that campaign's
+  planned 1c'/1d Model J/N checklist re-derivation and check re-runs),
+  and this map's Stage-C calibration table gets a delta pass. Tracking
+  artifact: `docs/spec/models/executor-invariant-map.md` (its Phase-0a
+  cross-campaign section); the OA2 hung-node-successor ask (decision
+  due at that campaign's 0e) and the jointly-owned OA6 forecast-spawn
+  data query are recorded there.
 - **The retry campaign** (the other active campaign on this lineage,
   same owner): its Phase-0 artifacts and Phase-1a ledger work are
   ancestors of the base tip (`99e07563f`, `b5498a904`, `7c3ea5bcf`,

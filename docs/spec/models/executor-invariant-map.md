@@ -253,6 +253,48 @@ already in the table; no marker names a repair behavior outside it.
 The table is therefore NOT extended and no new F-family is needed at
 0b beyond the design's F1–F8.
 
+### Cross-campaign sequencing and standing directives
+
+- **Retry campaign (#4): closed.** `retry-invariant-map.md` carries
+  the campaign close-out ("Campaign close-out — retry/poison/cascade
+  (campaign #4)"). The hand-off items this campaign now owns (from
+  its "What transfers to the executor-lifecycle campaign (#1)"
+  list): the stream-epoch / heartbeat-binding halves of `db457374f`
+  and the late-disconnect-vs-reconnect race; heterogeneous static
+  eligibility (`a62631c90` — the eligibility computation feeding
+  `placeable()`); the correlation/dedup-state lifecycle
+  (`recently_disconnected` with the released `exec_id`,
+  `last_completed`, the establishment TTL sweep); the
+  `ExecRec`/slot identity-freshness encodings in `retryPolicy.qnt`
+  as a starting point for Model S's slot state; and the
+  file-size-expectation lesson for any durability-adding collapse.
+- **Controller campaign: Phase 0 complete, Phase 1 not started.**
+  Verified at the pin: `controller-invariant-map.md` carries its
+  Stage-C corpus pin (95 commits at `746164c4f`), the calibration
+  table, the Stage-C run record, six wired `quint-ctrl-calib-*`
+  witnesses, and a "Phase-0 exit-gate verdict: Met" — and no Phase-1
+  record or close-out. The design's 0a ordering decision is
+  therefore recorded as: **controller Stage C closed — option (a)'s
+  ordering precondition (Stage C before this campaign's 1b touches
+  `pool/{jobs,job}.rs`) is met.** This is NOT a discharge of that
+  map's own constraints; the named-owner-and-ordering entry with the
+  start/green-light obligations lives in
+  `controller-invariant-map.md`'s in-flight-work section (added in
+  this same commit set), and its obligations — the affected-section
+  re-audit (J11, the orphan-reap rows, F1/F3, the I12 out-of-model
+  entry) at this campaign's 1b/1d, the F1/F3 prerequisite review at
+  0e if that campaign is still mid-campaign, and the Stage-C
+  calibration-table delta pass — are carried into this campaign's 0e
+  and Phase-1 gates (T-0e.6, T-0e.8). G7 cross-references at 0d are
+  unblocked (the controller table exists).
+- **Standing rebase directive (harden-subst follow-ups).** The
+  formal-sprint lineage is periodically rebased onto harden-subst
+  follow-ups; the third such rebase already rewrote one
+  representative hash (`5c47af5ad` → `0ea9bd701`). A rebase that
+  rewrites the pinned base or any hash named in this map triggers
+  the re-pin protocol below — re-locate by subject, record old→new
+  rows, re-run the corpus query — never a silent re-anchor.
+
 ### Re-pin protocol
 
 Run immediately before Stage B (0c) starts and again immediately
@@ -523,3 +565,185 @@ a silent re-disposition.
 | F7 (G7 scheduler-side rows) | NOT re-modeled — covered by `spawnCoherence.qnt` (controller campaign) plus Model S's stated guarantees (busy-accuracy, ack arming, report idempotency); expected NOT-ENCODED rows naming that coverage |
 | F8 (G8) | NOT-ENCODED by design (bounds checks + existing unit tests at the gRPC boundary) |
 | G7 controller half (cross-campaign bucket) | controller campaign's table (already calibrated there) |
+
+## Open adjudications (0a tracking)
+
+Owner for every entry: B. Meurer (campaign owner; also the
+controller-campaign owner, so the cross-campaign asks below are
+recorded as self-issued and tracked here rather than negotiated).
+Status values: open / data-pending / decided-at-0e.
+
+### OA1 — establishment-window instrument (decision recorded at 0a)
+
+Decision needed at 0e: the pull-mode establishment deadline + slack
+and the no-report degradation mode, signed against an as-built
+baseline of (i) Job/pod-terminal → `ReportExecutorTermination`
+acked, and (ii) terminal/death observation → derivation back to
+Ready, per cause (worker-report / pod-terminal / establishment).
+
+**Instrument decision at 0a: option (b) — the documented log/DB join
+— was audited first per the plan's default; the audit (below) shows
+interval (i) cannot be reconstructed from existing sources at
+production retention, so the option-(a) authorization request
+(additive histogram pair, the design's single sanctioned Phase-0
+production change) is escalated to the campaign owner now, at 0a.**
+Until that authorization is granted or refused, option (b)'s partial
+query (below) is the standing instrument and starts accumulating
+what it can measure; the controller-outage arm is exercised in the
+VM suite either way. If authorization is refused and (b) cannot be
+extended, no-go condition 5 ("the OA1 baseline cannot be obtained")
+is the live risk to record at 0e — not a reason to soften the gate.
+
+Bounded source audit (the option-(b) feasibility evidence, verified
+at the pin):
+
+- Interval (i) endpoint A — Job/pod terminal: exists only as k8s
+  object state (pod `containerStatuses[].state.terminated`
+  / Job `Failed/DeadlineExceeded` conditions). Jobs and their
+  terminal conditions are TTL-reaped 600 s after finish
+  (`JOB_TTL_SECS`, `pool/job.rs:50`); pods can be deleted earlier by
+  the Job controller. The controller does not log the observation
+  per se; `report_terminated_pods` / `report_deadline_exceeded_jobs`
+  log at `debug!` for skips and at `warn!` for RPC errors.
+- Interval (i) endpoint B — report acked: the controller logs
+  `info!` ONLY when the scheduler reply says the floor was promoted
+  ("reported pod termination → scheduler bumped resource_floor",
+  `pool/job.rs` ≈ `:1034`, and the DeadlineExceeded twin ≈ `:1106`);
+  non-promoting acks are silent at info. On the scheduler side the
+  second-installment classification is persisted by
+  `fill_termination` (`db/attempts.rs:386`), which updates
+  `termination_reason`/`outcome_class`/floor flags and **writes no
+  timestamp** — the attempt row's `occurred_at`/`recorded_at` are
+  set when the row is appended (at disconnect/dispatch time), so
+  report/ack time is not recoverable from the DB.
+- Interval (ii) endpoint A — death/terminal observation: the
+  disconnect is countable (`rio_scheduler_worker_disconnects_total`,
+  `actor/executor.rs:452`) but not timestamped per-executor in any
+  durable store; the pod-terminal cause's true start (the pod's
+  death) is the same k8s-side timestamp as interval (i) endpoint A.
+- Interval (ii) endpoint B — derivation back to Ready: recoverable.
+  The requeue happens in the same actor turn as the terminal
+  observation's attempt-row append, so `drv_attempts.recorded_at`
+  per `outcome_class ∈ {disconnected, executor_crash, backstop,
+  infra, timeout, …}` (cause label = `outcome_class` ×
+  `reporting_party`) is a faithful end-point; `derivations.updated_at`
+  (001) is overwritten by later transitions and is only a weak
+  cross-check. Establishment-cause rows are exactly the
+  `fill_termination` calls made by the TTL sweep
+  (`actor/executor.rs:1143-1290`).
+- `build_event_log` (003) is prost-encoded BYTEA, filtered to
+  state-machine events, and GC'd on terminal cleanup
+  (`actor/build.rs:730`) plus a 24 h sweep
+  (`housekeeping.rs:767`) — not a usable latency source.
+
+Conclusion: interval (ii) is measurable end-to-end only for the
+worker-report cause (observation and requeue are the same actor
+turn) and measurable as "scheduler-side processing time" for the
+other causes; interval (i) — the number OA1 actually sizes the
+establishment slack against — has neither endpoint durably
+timestamped on the rio side, and the k8s-side endpoint ages out in
+≤600 s. A log join could only work in an environment that retains
+debug-level controller and scheduler logs, which the named target
+environment does not guarantee.
+
+Committed option-(b) query (what (b) can measure today; per-cause
+requeue/processing latency, NOT interval (i)):
+
+```sql
+-- per-cause attempt-terminal events at the scheduler (end-points of
+-- interval (ii)); join key for any log-side start-point is
+-- (executor_id, exec_id).
+SELECT outcome_class,
+       reporting_party,
+       date_trunc('hour', recorded_at)            AS bucket,
+       count(*)                                   AS n,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY recorded_at - occurred_at)  AS p50_record_lag,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY recorded_at - occurred_at) AS p99_record_lag
+FROM drv_attempts
+WHERE event_kind = 'attempt'
+  AND outcome_class IN ('disconnected','executor_crash','backstop','infra','exempt_infra','timeout')
+GROUP BY 1, 2, 3
+ORDER BY 3, 1, 2;
+```
+
+Environment / population the baseline accumulates from (named so AD5
+and no-go conditions 4/5 are evaluated against a stated population):
+the EKS deployment described by `infra/eks` + `infra/helm/rio-build`
+(the only standing non-VM environment), all Builder/Fetcher pools,
+window = from instrument availability to the 0e cut; the
+controller-outage arm is exercised at least once in the VM suite
+(`nix/tests` lifecycle/chaos scenarios) and recorded alongside, per
+the plan. A change of population at 0e is a recorded deviation.
+
+Status: **escalated** (option-(a) authorization request open with
+the campaign owner; decision due before 0b closes so the histograms
+— if authorized — accumulate through 0c/0d). 0e-blocking via no-go
+condition 5.
+
+### OA2 — hung-node aggregation owner and shape (0e-blocking)
+
+The ask to the controller-campaign owner is issued as part of this
+0a engagement (same owner; the ordering entry added to
+`controller-invariant-map.md` in this commit set is the venue): pick
+the replacement signal shape for the multi-tenant stale-node signal
+— L10 health reap, node conditions / NotReady-age, per-node
+Job-deadline/pull-latency clustering, or an interim scheduler-side
+ledger sweep over open attempts + spawn-ack node binding — and
+either commit a landing slot no later than 1c or sign the accepted
+1b→1d coverage gap with its bound and named compensating controls
+(per design §5.2). Requested decision-by: 0e (target 2026-06-06), so
+0e records a decision rather than opening the negotiation.
+Status: open, 0e-blocking.
+
+### OA3 — fetcher pull cardinality (data request)
+
+Data needed: fetcher pool churn/cost (pod creations per FOD fetch,
+fetch duration distribution vs pod cold-start, I-116 idle-exit rate
+for fetchers). Source: existing pool/Job metrics + `drv_attempts`
+fetcher-kind rows in the OA1 environment. Default absent data:
+one-pull. Owner: campaign owner; due: before 0e (target 2026-06-06).
+Status: data-pending.
+
+### OA4 — BuildPhase fate (dashboard owner ping)
+
+Ask issued to the dashboard owner (same person at present): drop
+BuildPhase or keep it as a fire-and-forget unary in the replacement.
+Inventory §1.11 records it as cosmetic (dashboard phase column
+only). Due: 0e (target 2026-06-06). Status: open.
+
+### OA5 — operator-facing fleet view and controls
+
+Inventory of the surfaces that go blind for pull-mode pods at 1b:
+`ListExecutors` / `DebugListExecutors` (admin/executors.rs, CLI),
+the `workers_active` gauge, the dashboard fleet view, and the
+operator controls `DrainExecutor` (per-executor drain / force-evict)
+and the fleet-wide stop. 0e must record the open-attempts +
+Job-census successor surface, what the dashboard loses (per-pod
+heartbeat age), the sign-off owner, and the O1–O3 control
+successors; the sign-off itself happens against the running
+replacement at 1b. Owner: campaign owner + dashboard/operator owner.
+Due: surface + owner recorded by 0e (target 2026-06-06). Status:
+open.
+
+### OA6 — forecast-spawn data query (0e-blocking, jointly owned with the controller campaign)
+
+The 0e choice (a third `NotYetReady` pull outcome vs a ready filter
+at the placeable gate / spawn pass) is data-driven. Data query
+issued at 0a, due before 0d closes (target 2026-06-03), shared with
+the controller-campaign owner:
+
+- fraction of spawned Builder Jobs whose intent was ready=false at
+  spawn (the §13b no-ready-filter path recorded above);
+- how often such a pod registers before its drv becomes Ready, and
+  the registration→Ready latency distribution;
+- the I-116 idle-exit rate for those pods;
+- the cold-start side: what a forecast-warmed, already-registered
+  pod saves vs spawn+register (pod creation→registration latency).
+
+Sources: `rio_scheduler_sla_forecast_dropped_total`,
+`rio_controller_nodeclaim_forecast_hit_ewma` and the §13b SLI set
+where they suffice; otherwise a documented log/DB join defined the
+same way as the OA1 option-(b) instrument and committed alongside
+this map before 0d closes. Owner: campaign owner (joint sign-off
+with the controller campaign at 0e). Status: data-pending,
+0e-blocking.
