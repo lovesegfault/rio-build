@@ -1016,7 +1016,7 @@ fn apply_intent_resources(
     // BEFORE K8s SIGKILLs, so `CompletionReport{TimedOut}` (primary
     // path) carries telemetry and reaches `handle_timeout_failure`'s
     // cap-check; `DeadlineExceeded` stays the wedged-worker backstop
-    // per `r[sched.termination.deadline-exceeded+2]`.
+    // per `r[sched.termination.deadline-exceeded+3]`.
     // `ephemeral_deadline` floors at 180 so `− 90` never underflows
     // the `.max(60)` clamp into a tie.
     let worker_timeout = (ephemeral_deadline(i) - WORKER_DEADLINE_SLACK_SECS).max(60);

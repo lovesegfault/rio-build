@@ -1608,10 +1608,12 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     );
 
     // Uniform-cap semantics (cap-check BEFORE increment): 2nd at-cap
-    // → 1>=1 → poison HERE. Backstop fires when the worker is too
+    // → 1>=1 → terminal HERE. Backstop fires when the worker is too
     // wedged to send CompletionReport{TimedOut}, so handle_timeout_
-    // failure's cap-check never runs; without owning poison this
-    // loops at 24h forever (is_poisoned() never reads timeout_count).
+    // failure's cap-check never runs; without owning the terminal
+    // transition this loops at 24h forever. Since the D1 collapse the
+    // terminal state is Cancelled (the worker-channel terminal), never
+    // Poisoned — and never "no action at the cap".
     let mut rx = connect_builder(&handle, "rio-b-dl-abc-aaaaa", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "rio-b-dl-abc-aaaaa").await?;
@@ -1622,9 +1624,10 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     assert_eq!(s.retry.timeout_count, 1);
     assert_eq!(
         s.status,
-        DerivationStatus::Poisoned,
-        "DeadlineExceeded backstop: timeout_count exhausted at cap → poison \
-         (m044 cap-check; was warn-only → 24h loop forever)"
+        DerivationStatus::Cancelled,
+        "DeadlineExceeded backstop: timeout budget exhausted at cap → terminal Cancelled \
+         (D1: same terminal as the worker-reported path; was Poisoned pre-Phase-1, \
+          warn-only → 24h loop before that)"
     );
     Ok(())
 }
@@ -2203,7 +2206,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     Ok(())
 }
 
-// r[verify sched.termination.deadline-exceeded+2]
+// r[verify sched.termination.deadline-exceeded+3]
 /// Non-promoting report (`Error`/`Completed`/`EvictedOther`) MUST NOT
 /// consume the `recently_disconnected` entry. Before the
 /// `reason_label` gate was hoisted above `remove()`, an `Error` report
@@ -2492,7 +2495,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.termination.deadline-exceeded+2]
+// r[verify sched.termination.deadline-exceeded+3]
 /// `activeDeadlineSeconds` backstop fired (worker too wedged to report
 /// `TimedOut` itself). Controller reports `DeadlineExceeded` by JOB
 /// name; scheduler prefix-matches the disconnected pod, promotes
@@ -4696,11 +4699,15 @@ async fn test_heartbeat_cross_executor_spoof_rejected() -> TestResult {
     Ok(())
 }
 
-/// merged_bug_147 / I-200: `handle_deadline_exceeded` increments
+/// merged_bug_147 / I-200: `handle_deadline_exceeded` counts
 /// `timeout_count` UNCONDITIONALLY, so a deterministically-wedging drv
-/// poisons after `max_timeout_retries` backstop reports instead of
-/// climbing ~9 free ladder rungs. Default `max_timeout_retries=4`.
+/// reaches its terminal state after `max_timeout_retries` backstop
+/// reports instead of climbing ~9 free ladder rungs. Default
+/// `max_timeout_retries=4`. Since the D1 collapse the cap's terminal
+/// state on this controller-observed path is `Cancelled` (the same as
+/// the worker-reported path), never `Poisoned`.
 // r[verify sched.timeout.promote-on-exceed+2]
+// r[verify sched.termination.deadline-exceeded+3]
 #[tokio::test]
 async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
     use rio_proto::types::TerminationReason;
@@ -4721,7 +4728,10 @@ async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
 
     // 5 cycles of fresh-pod connect → dispatch → disconnect →
     // DeadlineExceeded report. timeout_count goes 1,2,3,4; the 5th
-    // report sees count >= max=4 → poison.
+    // report sees count >= max=4 → terminal Cancelled (D1: the same
+    // terminal state the worker-reported TimedOut path produces for the
+    // exhausted budget — immediately resubmit-retriable, no 24 h
+    // lockout; the pre-Phase-1 Poisoned arm was the off-spec side).
     for i in 0..5 {
         let pod = format!("rio-builder-dl-{i}-abcde");
         let job = format!("rio-builder-dl-{i}");
@@ -4740,14 +4750,116 @@ async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
                 "I-200: every DeadlineExceeded consumes budget (cycle {i})"
             );
             assert_ne!(info.status, DerivationStatus::Poisoned);
+            assert_ne!(info.status, DerivationStatus::Cancelled);
         } else {
             assert_eq!(
                 info.status,
-                DerivationStatus::Poisoned,
-                "max_timeout_retries=4 exhausted → poisoned on 5th report"
+                DerivationStatus::Cancelled,
+                "max_timeout_retries=4 exhausted → terminal Cancelled on the 5th report \
+                 (never Poisoned, never no-action — the loop stays broken)"
+            );
+            assert!(
+                info.retry.poisoned_at.is_none(),
+                "the timeout-cap terminal is Cancelled, not a poison: no TTL lockout"
             );
         }
     }
+    Ok(())
+}
+
+// r[verify sched.termination.deadline-exceeded+3]
+/// Phase 1b (T-1b.10), divergence D1 red-first: a wedged-worker history
+/// that exhausts the timeout budget exclusively via controller
+/// `DeadlineExceeded` reports ends terminal `Cancelled` — immediately
+/// resubmit-retriable, no `poisoned_at`, no 24 h TTL — exactly as the
+/// same physical history observed via worker-reported `TimedOut` does
+/// (the channel-invariance pin). Pre-Phase-1 the controller path
+/// poisoned at the cap (the 172776b1b loop-breaker), so the verdict
+/// depended on which observer reported the overrun first.
+#[tokio::test]
+async fn phase1b_e7_d1_deadline_cap_cancels_on_both_channels() -> TestResult {
+    use rio_proto::types::TerminationReason as R;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy = crate::RetryPolicy {
+            max_timeout_retries: 2,
+            ..Default::default()
+        };
+    });
+
+    // ── Controller channel: every deadline overrun is observed only by
+    // the controller backstop (the worker is too wedged to report). ──
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "d1-ctrl", PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint("d1-ctrl", None, None, Some(300), None)
+        .await?;
+    for i in 0..3u32 {
+        let pod = format!("rio-builder-d1c-{i}-abcde");
+        let job = format!("rio-builder-d1c-{i}");
+        let mut rx = connect_builder(&handle, &pod, "x86_64-linux").await?;
+        tick(&handle).await?;
+        let _ = recv_assignment(&mut rx).await;
+        disconnect(&handle, &pod).await?;
+        drop(rx);
+        report_termination(&handle, &job, R::DeadlineExceeded).await?;
+    }
+    let ctrl = expect_drv(&handle, "d1-ctrl").await;
+    assert_eq!(
+        ctrl.status,
+        DerivationStatus::Cancelled,
+        "the controller-observed run of the exhausted timeout budget must end terminal \
+         Cancelled (D1) — not Poisoned, and never no-action-at-the-cap"
+    );
+    assert!(
+        ctrl.retry.poisoned_at.is_none(),
+        "the timeout-cap terminal is Cancelled: no 24 h poison lockout"
+    );
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind("d1-ctrl")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "cancelled",
+        "the Cancelled status persisted inside the installment transaction"
+    );
+    assert_eq!(
+        ledger_classes(&db.pool, "d1-ctrl").await,
+        vec!["timeout", "timeout", "timeout"],
+        "every controller-observed overrun classified its released attempt as a timeout"
+    );
+
+    // ── Worker channel: the same physical history reported by the
+    // worker (`TimedOut`) ends in the same terminal state. ───────────
+    let _ev2 =
+        merge_single_node(&handle, Uuid::new_v4(), "d1-wrkr", PriorityClass::Scheduled).await?;
+    let drv_path = test_drv_path("d1-wrkr");
+    for i in 0..3u32 {
+        let w = format!("d1w-{i}");
+        let mut rx = connect_builder(&handle, &w, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        complete_failure(
+            &handle,
+            &w,
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TimedOut,
+            "wedged",
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(rx);
+    }
+    let wrkr = expect_drv(&handle, "d1-wrkr").await;
+    assert_eq!(
+        wrkr.status,
+        DerivationStatus::Cancelled,
+        "the worker-observed run of the same history ends in the same terminal state"
+    );
+    assert_eq!(
+        ctrl.status, wrkr.status,
+        "the timeout-cap verdict is channel-invariant"
+    );
     Ok(())
 }
 

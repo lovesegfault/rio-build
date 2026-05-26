@@ -385,6 +385,13 @@ impl DerivationStatus {
             // existing orphan-removal path).
             (Self::Assigned, Self::Cancelled) => true, // cancel before worker ACK
             (Self::Running, Self::Cancelled) => true,  // cancel mid-build
+            // Timeout-budget exhaustion observed by the controller's
+            // DeadlineExceeded backstop (sched.termination.deadline-
+            // exceeded+3): the disconnect already re-queued the node, so
+            // the terminal Cancelled transition the cap mandates starts
+            // from Ready — the Cancelled counterpart of the
+            // Ready→Poisoned fleet-exhaust edge above.
+            (Self::Ready, Self::Cancelled) => true,
             // CA early-cutoff: a CA dep completed with unchanged
             // output hash → this derivation would produce the same
             // output. Skip without running. Ready is allowed for
@@ -2245,10 +2252,15 @@ mod tests {
         assert!(Cancelled.is_terminal());
         assert!(Cancelled.validate_transition(Created).is_err());
         assert!(Cancelled.validate_transition(Ready).is_err());
-        // Cancel from NON-in-flight states: invalid. Queued/Ready
-        // orphans are just removed from ready_queue, not transitioned.
+        // Cancel from NON-dispatched states: invalid for build-cancel
+        // orphans (Queued/Created are just removed from the ready
+        // queue, not transitioned). Ready IS allowed — the
+        // controller-observed timeout cap (DeadlineExceeded backstop)
+        // takes its terminal Cancelled transition from Ready because
+        // the disconnect already re-queued the node (the Cancelled
+        // counterpart of the Ready→Poisoned fleet-exhaust edge).
         assert!(Queued.validate_transition(Cancelled).is_err());
-        assert!(Ready.validate_transition(Cancelled).is_err());
+        assert!(Ready.validate_transition(Cancelled).is_ok());
         assert!(Created.validate_transition(Cancelled).is_err());
     }
 
@@ -2582,6 +2594,10 @@ mod tests {
             // Cancel from in-flight
             (Assigned, Cancelled),
             (Running, Cancelled),
+            // Timeout-cap terminal observed by the controller backstop
+            // after the disconnect already re-queued (D1 / the
+            // deadline-exceeded rule's Cancelled-at-cap clause).
+            (Ready, Cancelled),
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),

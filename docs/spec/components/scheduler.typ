@@ -588,30 +588,32 @@ code defect rather than a fold gap.
   scheduler backstop timer) delivered each physical event or in what order
   the channels delivered them.
 ]
-The as-built code violates this on at least one reachable history,
+The pre-Phase-1 code violated this on at least one reachable history,
 recorded as divergence D1 in the invariant map: the same exhausted timeout
-budget lands as `Cancelled` (worker-reported `TimedOut`) or `Poisoned`
+budget landed as `Cancelled` (worker-reported `TimedOut`) or `Poisoned`
 (controller-reported `DeadlineExceeded`) depending on which observer
-reports the deadline overrun first --- the two reports describe one
-physical fact and which arrives first is a race. The rule is added
-marker-first so the model run that falsifies it is confirming a documented
-defect; the code fix is a Phase-1 disposition. Adding it marker-first also
-creates a rule-vs-rule tension:
-#rref("sched.termination.deadline-exceeded") as written assigns terminal
-ownership at the timeout cap exclusively to the worker-side `TimedOut`
-path (the controller path "only promotes and counts"), so on the reachable
-wedged-worker history where only the controller ever observes the deadline
-overrun, no implementation can satisfy both rules --- honoring the
-deadline-exceeded clause makes the verdict channel-dependent (no terminal
-on the controller-observed run, `Cancelled` on the worker-observed run of
-the same physical history). The design pre-commits the resolution: Phase 1
-amends the deadline-exceeded rule (with the corresponding version bump) to
-permit terminal `Cancelled` at the cap on the controller path; the
-invariant map records this as rule-vs-rule contradiction C4. The related
+reported the deadline overrun first --- the two reports describe one
+physical fact and which arrives first is a race. The rule was added
+marker-first so the model run that falsified it was confirming a documented
+defect, and adding it marker-first also surfaced a rule-vs-rule tension:
+#rref("sched.termination.deadline-exceeded") as then written assigned
+terminal ownership at the timeout cap exclusively to the worker-side
+`TimedOut` path (the controller path "only promotes and counts"), so on the
+reachable wedged-worker history where only the controller ever observes the
+deadline overrun, no implementation could satisfy both rules --- honoring
+the deadline-exceeded clause made the verdict channel-dependent (no
+terminal on the controller-observed run, `Cancelled` on the worker-observed
+run of the same physical history); the invariant map records this as
+rule-vs-rule contradiction C4. Phase 1 resolved both as the design
+pre-committed: the deadline-exceeded rule's `+3` revision requires terminal
+`Cancelled` at the cap on the controller path and the collapsed verdict
+path produces it, so the exhausted timeout budget converges on `Cancelled`
+regardless of the observing channel. The related
 which-counter-does-a-promoted-OOM-charge inconsistency (divergence D3) is
 *not* a channel race --- a cgroup-level OOM and a pod-level OOM are
 physically distinct events --- and is recorded as a contradiction of
-#rref("sched.retry.exempt-infra-cap") instead.
+#rref("sched.retry.exempt-infra-cap") instead; its exemption charge landed
+on the controller channel with the same Phase-1 collapse.
 
 #r("sched.retry.no-double-count")[
   One physical executor death MUST produce at most one counted accounting
@@ -2064,7 +2066,7 @@ tracks queued derivations per kind.
   I-188 race at the source.
 ]
 
-#r("sched.termination.deadline-exceeded+2")[
+#r("sched.termination.deadline-exceeded+3")[
   A `ReportExecutorTermination(DeadlineExceeded)` MUST double
   `resource_floor.deadline_secs` (or increment `timeout_retry_count` if already
   at the 24h cap, #rref("sched.sla.reactive-floor")) for the derivation that
@@ -2079,11 +2081,28 @@ tracks queued derivations per kind.
   #rref("ctrl.ephemeral.intent-deadline") the scheduler-computed
   `SpawnIntent.deadline_secs` carries 5× headroom over the predicted p99 wall
   time, so this only fires when the worker is too wedged (FUSE deadlock, kernel
-  hang) to time itself out. The disconnect path already re-queued, so this does
-  NOT `reset_to_ready` --- it only promotes (so the next dispatch goes larger)
-  and counts (so the ladder is bounded). At `max_timeout_retries` the floor is
-  at ceiling; terminal `Cancelled` is owned by the worker-side `TimedOut` path.
+  hang) to time itself out. Below the cap the disconnect path already
+  re-queued, so this does NOT `reset_to_ready` --- it promotes (so the next
+  dispatch goes larger) and counts (so the ladder is bounded). At
+  `max_timeout_retries` the controller-observed path MUST take the same
+  terminal `Cancelled` transition the worker-side `TimedOut` path takes for the
+  exhausted budget (#rref("sched.timeout.promote-on-exceed")) --- immediately
+  retriable on explicit resubmit, no poison TTL: the backstop exists precisely
+  for the worker that is too wedged to ever send the report that would
+  otherwise own that transition, so the cap's terminal state must not depend on
+  which channel observed the overrun
+  (#rref("sched.retry.verdict-channel-invariant")).
 ]
+The `+3` revision of this rule landed with the Phase-1 collapse of the
+controller-observed timeout verdict onto the shared fold. The previous
+revision assigned terminal ownership at the cap exclusively to the
+worker-side path, which made it jointly unsatisfiable with
+#rref("sched.retry.verdict-channel-invariant") on the wedged-worker history
+(rule-vs-rule contradiction C4 in the invariant map) and left the as-built
+off-spec `Poisoned`-at-cap escape hatch as the only loop-breaker (C1/D1).
+The amendment dissolves C4 and resolves C1: both observers of an exhausted
+timeout budget converge on terminal `Cancelled`, and the cap still always
+produces a terminal state (never "no action at the cap").
 
 #r("sched.ephemeral.no-redispatch-after-completion")[
   When an executor completes a build and its `running_build` slot becomes

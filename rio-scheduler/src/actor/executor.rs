@@ -680,7 +680,7 @@ impl DagActor {
     ) -> bool {
         use rio_proto::types::TerminationReason as R;
 
-        // r[impl sched.termination.deadline-exceeded+2]
+        // r[impl sched.termination.deadline-exceeded+3]
         // DeadlineExceeded is reported by JOB name (the Job controller
         // deletes the Pod when activeDeadlineSeconds fires, so the
         // controller never sees a terminated container). Prefix-match
@@ -961,7 +961,7 @@ impl DagActor {
 
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
     /// to fire its own `daemon_timeout`. Bump `resource_floor.
-    /// deadline_secs` (D4) and increment `timeout_count`
+    /// deadline_secs` (D4) and count the timeout
     /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+2]`, same
     /// I-200 semantics as `handle_timeout_failure`): every timeout
     /// consumes budget regardless of promotion, so
@@ -978,13 +978,22 @@ impl DagActor {
     /// `reset_to_ready` — `handle_executor_disconnected` already re-
     /// queued, and the drv may already be re-dispatched.
     ///
-    /// `timeout_count >= max_timeout_retries` poisons HERE — the
-    /// backstop fires precisely when the worker is too wedged
-    /// (FUSE/kernel hang) to send `CompletionReport{TimedOut}`, so
-    /// `handle_timeout_failure`'s cap-check never runs and a
-    /// deterministically-wedging drv would otherwise re-queue forever
-    /// (`is_poisoned()` reads `failure_count`/`failed_builders`,
-    /// never `timeout_count`).
+    /// E7, collapsed onto `decide()` (Phase 1b, T-1b.10 — divergence
+    /// D1): the verdict comes from the fold over the suffix updated by
+    /// the second installment, in the same transaction. At
+    /// `max_timeout_retries` the verdict is `Cancel` and this path
+    /// takes the SAME terminal `Cancelled` transition as the
+    /// worker-reported `TimedOut` path (immediately resubmit-retriable,
+    /// no `poisoned_at`, no 24 h TTL) — the backstop fires precisely
+    /// when the worker is too wedged (FUSE/kernel hang) to send
+    /// `CompletionReport{TimedOut}`, so this site owns the terminal
+    /// transition for the controller-observed run of that history.
+    /// The as-built `Poisoned`-at-cap escape hatch (172776b1b) is
+    /// retired with the `sched.termination.deadline-exceeded+3`
+    /// amendment; the cap still produces a terminal state — never "no
+    /// action at the cap" — so the loop the poison was added to break
+    /// stays broken.
+    // r[impl sched.termination.deadline-exceeded+3]
     async fn handle_deadline_exceeded(&mut self, job_name: &ExecutorId) -> bool {
         use rio_proto::types::TerminationReason as R;
         let prefix = format!("{job_name}-");
@@ -1010,46 +1019,123 @@ impl DagActor {
             .bump_resource_floor(&drv_hash, R::DeadlineExceeded, "deadline_exceeded")
             .await;
 
-        // 1a, installment 2: the DeadlineExceeded report classifies the
-        // released attempt's row as a timeout (first writer wins; the
-        // fill is keyed by the entry's released exec_id so it lands on
-        // the OLD attempt even after a re-dispatch).
-        if let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id) {
-            self.fill_attempt_termination(
-                &drv_hash,
-                derivation_id,
-                exec_id,
-                "deadline_exceeded",
-                crate::state::OutcomeClass::Timeout,
-                (false, outcome.promoted, outcome.at_cap),
-            )
-            .await;
-        }
-
-        let max = self.retry_policy.max_timeout_retries;
-        if let Some(state) = self.dag.node_mut(&drv_hash)
-            && matches!(
-                state.status(),
+        // The late-installment-after-redispatch guard, unchanged: a
+        // terminal verdict is acted on only while the derivation is
+        // still in a cancel-able status; the installment always lands.
+        let verdict_eligible = self.dag.node(&drv_hash).is_some_and(|s| {
+            matches!(
+                s.status(),
                 DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
             )
+        });
+        let max = self.retry_policy.max_timeout_retries;
+
+        // Installment 2 + the verdict, one transaction: the
+        // DeadlineExceeded report classifies the released attempt's row
+        // as a timeout (first writer wins; the fill is keyed by the
+        // entry's released exec_id so it lands on the OLD attempt even
+        // after a re-dispatch), the fold re-runs over the updated
+        // suffix, and a Cancel verdict persists Cancelled on the same
+        // connection. Leader-gated like the 1a fill it replaces; a
+        // failed transaction performs no installment and produces no
+        // verdict (the consumed entry is not re-inserted — a re-report
+        // would double-bump the floor; the worker-side report or the
+        // next deadline overrun re-drives the budget).
+        let mut decision: Option<crate::retry_policy::Decision> = None;
+        if self.leader.is_leader()
+            && let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id)
         {
-            if state.retry.timeout_count >= max {
-                warn!(
-                    drv_hash = %drv_hash, job_name = %job_name,
-                    timeout_retry_count = state.retry.timeout_count, max,
-                    resource_floor = ?state.sched.resource_floor,
-                    "DeadlineExceeded backstop: max_timeout_retries exhausted, poisoning"
-                );
-                self.poison_and_cascade(
-                    &drv_hash,
-                    &format!("max_timeout_retries={max} exhausted (DeadlineExceeded backstop)"),
-                    None,
-                    None,
-                )
-                .await;
-                return false;
+            let floor_flags = (false, outcome.promoted, outcome.at_cap);
+            let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let (won, decision) = self
+                    .fill_and_decide_in_tx(
+                        &mut tx,
+                        derivation_id,
+                        exec_id,
+                        "deadline_exceeded",
+                        crate::state::OutcomeClass::Timeout,
+                        floor_flags,
+                    )
+                    .await?;
+                if verdict_eligible
+                    && matches!(decision.verdict, crate::retry_policy::Verdict::Cancel)
+                {
+                    crate::db::SchedulerDb::update_derivation_status_in_tx(
+                        &mut tx,
+                        &drv_hash,
+                        DerivationStatus::Cancelled,
+                        None,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok((won, decision))
             }
+            .await;
+            match result {
+                Ok((won, d)) => {
+                    if won && let Some(state) = self.dag.node_mut(&drv_hash) {
+                        state.classify_attempt_record(
+                            exec_id,
+                            "deadline_exceeded",
+                            crate::state::OutcomeClass::Timeout,
+                            floor_flags,
+                        );
+                    }
+                    decision = Some(d);
+                }
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, job_name = %job_name, error = %e,
+                          "DeadlineExceeded backstop: installment transaction failed; no verdict \
+                           taken (the worker-side report or the next deadline overrun re-drives \
+                           the budget)");
+                }
+            }
+        }
+
+        // Legacy RAM bookkeeping (rule 1, until T-1b.13), as-built
+        // shape: every under-cap DeadlineExceeded consumes budget; the
+        // at-cap event is the terminal one and never incremented.
+        if verdict_eligible
+            && let Some(state) = self.dag.node_mut(&drv_hash)
+            && state.retry.timeout_count < max
+        {
             state.retry.timeout_count += 1;
+        }
+
+        // Act on the verdict: Cancel reuses the worker-reported timeout
+        // path's terminal `Cancelled` (epilogue, no `poisoned_at`, no
+        // 24 h TTL — D1's adjudicated side); Requeue is a no-op (the
+        // disconnect already re-queued the derivation).
+        if verdict_eligible
+            && let Some(d) = decision
+            && d.verdict == crate::retry_policy::Verdict::Cancel
+        {
+            warn!(
+                drv_hash = %drv_hash, job_name = %job_name,
+                timeout_retry_count = d.counters.timeout_count, max,
+                resource_floor = ?self.dag.node(&drv_hash).map(|s| s.sched.resource_floor),
+                "DeadlineExceeded backstop: max_timeout_retries exhausted, transitioning to \
+                 Cancelled"
+            );
+            if let Some(state) = self.dag.node_mut(&drv_hash) {
+                state.ensure_running();
+                if let Err(e) = state.transition(DerivationStatus::Cancelled) {
+                    warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                          "handle_deadline_exceeded: ->Cancelled transition rejected, skipping");
+                    return outcome.promoted;
+                }
+            }
+            self.unpin_best_effort(&drv_hash).await;
+            self.terminal_failure_epilogue(
+                &drv_hash,
+                &format!("max_timeout_retries={max} exhausted (DeadlineExceeded backstop)"),
+                rio_proto::types::BuildResultStatus::TimedOut,
+                None,
+            )
+            .await;
+            return outcome.promoted;
         }
 
         if let Some(state) = self.dag.node(&drv_hash) {
