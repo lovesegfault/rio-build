@@ -8,14 +8,15 @@ scope: with scope; ''
   # reply passthrough and neither may produce a read upcall. miss_stream
   # must stay at zero (≤threshold never streams).
   #
-  # The script then attempts `echo poison > /var/rio/cache/ab/test`; if
-  # that WRITE SUCCEEDS it exits 9 before the probe marker. The pod's
-  # logs and volumeMounts are captured here (while the pod still exists)
-  # and asserted by the cache-readonly subtest.
+  # The script attempts `echo poison > /var/rio/cache/ab/test` after the
+  # two opens; if that WRITE SUCCEEDS it exits 9 — before the warm_4k
+  # sentinel read. The pod's volumeMounts are captured here (while the
+  # pod still exists) for the cache-readonly subtest.
   #
-  # Gate: warm_4k is read AFTER both small_1m opens, and this is its
-  # first read on the node — its appearance in /var/rio/cache is the
-  # host-visible "both opens already happened" signal.
+  # Gate: warm_4k is read AFTER both small_1m opens AND the poison
+  # write attempt, and this is its first read on the node — its
+  # appearance in /var/rio/cache is the host-visible "both opens
+  # happened and the write attempt did not succeed" signal.
   with subtest("passthrough-small: two opens of a small input, both passthrough"):
       drv_pt, build_pt = submit_drv(
           "${ptSmallDrv}",
@@ -51,8 +52,8 @@ scope: with scope; ''
           f"{fam(m, 'rio_builder_castore_fuse_open_case_total')!r}"
       )
 
-      # Capture evidence for cache-readonly while the pod still exists.
-      pt_small_logs = kubectl(f"logs {pt_small_pod} --tail=200", ns="${nsBuilders}")
+      # Capture the pod's volume-mount shape for cache-readonly while
+      # the pod still exists.
       pt_small_mounts = kubectl(
           f"get pod {pt_small_pod} -o jsonpath="
           "'{range .spec.containers[0].volumeMounts[*]}{.name}={.mountPath}:ro={.readOnly} {end}'",

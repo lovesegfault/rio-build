@@ -39,14 +39,16 @@ scope: with scope; ''
               "${eioInfraDrv}",
               extra_args=f"--arg eioBuilder '(builtins.storePath {p_eio_builder})'",
           )
-          # The worker reports the reclassified failure to the scheduler;
-          # its completion handler logs the worker's error message. This
-          # is the classification evidence (the worker pod is one-shot
-          # and already gone by the time the failure is observable).
+          # First attempt: a pod comes up, the execve EIOs, the executor
+          # reports the failure and the pod leaves Running. Pod
+          # lifecycle (not log polling) is the "first attempt is over"
+          # signal.
+          first_pod = castore_pod()
           k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
-              "--tail=-1 2>/dev/null | grep -q 'input materialization failed'",
-              timeout=420,
+              f"phase=$(k3s kubectl -n ${nsBuilders} get pod {first_pod} "
+              "-o jsonpath='{.status.phase}' 2>/dev/null || echo Gone); "
+              "test \"$phase\" != Running && test \"$phase\" != Pending",
+              timeout=300,
           )
           status_after_fail = drv_status(drv_eio)
           assert status_after_fail not in ("failed", "poisoned", "dependency_failed"), (
@@ -55,8 +57,8 @@ scope: with scope; ''
               f"infrastructure (or the scheduler poisoned it)"
           )
           print(
-              f"eio-infra-retry: infra classification observed, drv status now "
-              f"{status_after_fail!r} (re-queued, not poisoned)"
+              f"eio-infra-retry: first attempt over (pod {first_pod} done), drv "
+              f"status {status_after_fail!r} (re-queued, not poisoned)"
           )
       finally:
           # Restore the chunk objects no matter what — every later fetch
@@ -73,5 +75,23 @@ scope: with scope; ''
       # builder script's digest lands in the node cache on the way.
       wait_drv_status(drv_eio, ["completed"], timeout=600, ctx="eio-infra-retry recovery")
       assert_cached(b3_eio_builder, "eio builder after the successful retry", timeout=120)
+
+      # Classification evidence: the executor's reclassified error
+      # message ("input materialization failed (I-043/I-178): …
+      # executing '<builder>': Input/output error") flows into the
+      # scheduler's infrastructure-failure handler log line. One bounded
+      # fetch after the fact — the line distinguishes the infra path
+      # from a permanent-failure retry, which the PG status alone
+      # cannot.
+      sched_tail = k3s_server.succeed(
+          "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
+          "--tail=20000 --since=20m 2>/dev/null | "
+          "grep -c 'input materialization failed' || true"
+      ).strip()
+      assert int(sched_tail or "0") >= 1, (
+          "eio-infra-retry: the scheduler never logged the input-materialization "
+          "reclassification for the failed attempt — the EIO was not classified "
+          "as an infrastructure failure"
+      )
       print("eio-infra-retry PASS: EIO classified as infra, re-queued, recovered")
 ''

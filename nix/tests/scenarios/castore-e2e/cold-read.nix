@@ -11,7 +11,9 @@ scope: with scope; ''
   #   - open_seconds recorded a streamed="1" sample (the open returned
   #     inside the fill window) and exactly one DAG prefetch ran;
   #   - the dd|cmp in the script passed (streamed prefix == head4k) —
-  #     reaching CASTORE-PROBE-READY proves it;
+  #     proven by the sentinel read placed after it (a cmp failure
+  #     exits the script before the sentinel, so its cache entry never
+  #     appears);
   #   - the fill completed and promoted: both digests appear in
   #     /var/rio/cache and the chunk cache is non-empty (host probes);
   #   - rio-mountd served Mount + Promote/PromoteChunks (DS metrics).
@@ -21,7 +23,8 @@ scope: with scope; ''
           "${coldDrv}",
           extra_args=(
               f"--arg bigA '(builtins.storePath {p_big_a})' "
-              f"--arg head4kA '(builtins.storePath {p_head4k})'"
+              f"--arg head4kA '(builtins.storePath {p_head4k})' "
+              f"--arg sentinel '(builtins.storePath {p_sent_cold})'"
           ),
       )
       pod = castore_pod()
@@ -70,15 +73,11 @@ scope: with scope; ''
       assert_cached(b3_head4k, "head4k after the whole-file miss", timeout=120)
       k3s_agent.succeed("find /var/rio/chunks -type f -print -quit | grep -q .")
 
-      # The dd|cmp passed: the script only prints the probe marker after
-      # the cmp; a mismatch would have exited before it. One-shot log
-      # fetch (no polling).
-      logs = kubectl(f"logs {pod} --tail=200", ns="${nsBuilders}")
-      assert "CASTORE-PROBE-READY" in logs, (
-          "cold-read: builder script never reached CASTORE-PROBE-READY — the "
-          "dd|cmp of the streamed prefix failed (wrong bytes?) or the build "
-          f"died early. Pod log tail:\n{logs[-2000:]}"
-      )
+      # The dd|cmp passed: the script reads the sentinel only after the
+      # cmp succeeded, and this is the sentinel's first-ever read on the
+      # node, so its cache entry appearing is the structural proof the
+      # streamed prefix byte-compared equal to head4k.
+      assert_cached(b3_sent_cold, "cold-read sentinel (dd|cmp passed)", timeout=180)
 
       # mountd observability: the DaemonSet served this build's Mount and
       # at least one promote (whole-file or chunk batch).

@@ -98,9 +98,14 @@ let
   # stream_threshold_bytes default), plus a 4 KiB whole-file miss. The
   # cmp makes "the streamed bytes are correct" a build-script property
   # (dd output of the first 4 KiB must equal the separately-pushed
-  # head4k file).
+  # head4k file); the sentinel read AFTER it is how the test observes
+  # the cmp passed — build-script stdout is not reliably visible in
+  # `kubectl logs` (it flows through the LogService data plane, and the
+  # pod log is debug-level executor tracing), so the host-visible cache
+  # entry of a first-ever-read input is the structural "script got this
+  # far" signal.
   coldDrv = pkgs.writeText "castore-cold.nix" ''
-    { busybox, bigA, head4kA }:
+    { busybox, bigA, head4kA, sentinel }:
     derivation {
       name = "rio-castore-cold";
       system = builtins.currentSystem;
@@ -108,6 +113,7 @@ let
       args = [ "-c" '''
         ''${busybox}/bin/busybox dd if=''${bigA} bs=4096 count=1 2>/dev/null \
           | ''${busybox}/bin/busybox cmp - ''${head4kA} || exit 1
+        ''${busybox}/bin/busybox cat ''${sentinel} > /dev/null || exit 1
         echo CASTORE-PROBE-READY
         for i in $(''${busybox}/bin/busybox seq 1 36); do ''${busybox}/bin/busybox sleep 5; done
         echo done > $out
@@ -134,13 +140,12 @@ let
   '';
 
   # passthrough-small: a ≤threshold (1 MiB) input opened twice — both
-  # opens must be passthrough, zero read upcalls. The warm_4k read after
-  # them is the sentinel the test gates on (its first-ever read on the
-  # node ⇒ its cache entry appearing means both small_1m opens already
-  # happened). The embedded /var/rio/cache write attempt feeds the
-  # cache-readonly subtest: if the write SUCCEEDS the script exits 9
-  # before the probe marker (and cache-readonly fails on the logs +
-  # host probe).
+  # opens must be passthrough, zero read upcalls. The /var/rio/cache
+  # write attempt sits BEFORE the warm_4k sentinel read: if the write
+  # SUCCEEDS the script exits 9 and the sentinel never gets read, so
+  # the warm_4k cache entry the test gates on doubles as the
+  # cache-readonly "the sandbox could not create the file" proof
+  # (plus the host probe in that subtest).
   ptSmallDrv = pkgs.writeText "castore-pt-small.nix" ''
     { busybox, small1m, warm4k }:
     derivation {
@@ -150,8 +155,8 @@ let
       args = [ "-c" '''
         ''${busybox}/bin/busybox cat ''${small1m} > /dev/null || exit 1
         ''${busybox}/bin/busybox cat ''${small1m} > /dev/null || exit 1
-        ''${busybox}/bin/busybox cat ''${warm4k} > /dev/null || exit 1
         if echo poison > /var/rio/cache/ab/test 2>/dev/null; then exit 9; fi
+        ''${busybox}/bin/busybox cat ''${warm4k} > /dev/null || exit 1
         echo CASTORE-PROBE-READY
         for i in $(''${busybox}/bin/busybox seq 1 24); do ''${busybox}/bin/busybox sleep 5; done
         echo ok > $out
