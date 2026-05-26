@@ -307,66 +307,6 @@ impl DagActor {
         }
     }
 
-    /// The second installment of a two-installment attempt: fill the
-    /// classification on the ledger row keyed by the RELEASED
-    /// `(derivation_id, exec_id)` (carried by the
-    /// `recently_disconnected` entry — never a DAG lookup), and mirror
-    /// it onto the in-memory record when the node still exists. First
-    /// writer wins (`WHERE termination_reason IS NULL`); returns
-    /// whether THIS call performed the fill. Best-effort and
-    /// leader-gated like the appends.
-    pub(super) async fn fill_attempt_termination(
-        &mut self,
-        drv_hash: &DrvHash,
-        derivation_id: Uuid,
-        exec_id: Uuid,
-        termination_reason: &str,
-        outcome_class: OutcomeClass,
-        // The classifying report's floor outcome `(exempt, promoted,
-        // at_cap)` — carried onto the row so the fold can tell a
-        // counted at-cap controller termination from the
-        // charges-nothing cold-start shape; all false for
-        // non-classifying fills (the establishment sweep).
-        floor: (bool, bool, bool),
-    ) -> bool {
-        if !self.leader.is_leader() {
-            return false;
-        }
-        let result: Result<bool, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
-            let won = crate::db::SchedulerDb::fill_termination(
-                &mut tx,
-                derivation_id,
-                exec_id,
-                termination_reason,
-                outcome_class,
-                floor,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(won)
-        }
-        .await;
-        match result {
-            Ok(won) => {
-                if won && let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.classify_attempt_record(
-                        exec_id,
-                        termination_reason,
-                        outcome_class,
-                        floor,
-                    );
-                }
-                won
-            }
-            Err(e) => {
-                error!(drv_hash = %drv_hash, exec_id = %exec_id, error = %e,
-                       "failed to fill attempt termination (second installment)");
-                false
-            }
-        }
-    }
-
     /// Build a reset-event ledger row for `drv_hash`. `resubmit_cycle`
     /// is read from the node's CURRENT in-memory value (already
     /// incremented for a resubmit reset; already cleared for a

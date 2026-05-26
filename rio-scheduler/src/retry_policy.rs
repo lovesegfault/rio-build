@@ -242,6 +242,17 @@ pub(crate) enum AttemptEvent {
     /// E8 — the scheduler-side backstop timer: Running for longer than
     /// `max(est × 3, daemon_timeout + slack)` with no report.
     BackstopTimeout { at: AbsTime, executor: String },
+    /// The correlation-TTL sweep established a released execution whose
+    /// classifying report never arrived (`outcome_class='executor_crash'`,
+    /// `termination_reason='unreported'`). Phase 1b (T-1b.11, the C2
+    /// adjudication): an established no-report crash charges the
+    /// threshold/exclusion budget — `failed_builders[executor]` +
+    /// `failure_count`, nothing else (decision P1) — so the no-report
+    /// crash loop is bounded by the same budget the existing
+    /// `sched.retry.per-executor-budget` "executor disconnect DOES
+    /// count" MUST names. A bare `Disconnect` (not yet established)
+    /// stays uncharged.
+    EstablishedCrash { at: AbsTime, executor: String },
     /// A successful dispatch. Clears `backoff_until`
     /// (`assign_to_worker`).
     Dispatched { at: AbsTime, executor: String },
@@ -275,6 +286,7 @@ impl AttemptEvent {
             | Self::ControllerTermination { at, .. }
             | Self::ControllerDeadlineExceeded { at, .. }
             | Self::BackstopTimeout { at, .. }
+            | Self::EstablishedCrash { at, .. }
             | Self::Dispatched { at, .. }
             | Self::ResubmitReset { at }
             | Self::CacheHitClear { at }
@@ -753,6 +765,30 @@ fn apply(c: &mut Counters, ev: &AttemptEvent, budget: &Budget, fleet: &FleetView
             }
         }
 
+        // ── The establishment sweep (C2, Phase 1b T-1b.11) ──────────
+        // r[impl sched.retry.per-executor-budget]
+        // A released execution whose classifying report never arrived,
+        // established by the correlation-TTL sweep (or recorded by the
+        // backstop, which has its own arm above): charges the
+        // threshold/exclusion budget — `failed_builders[executor]` +
+        // `failure_count`, nothing else (decision P1) — and re-checks
+        // the threshold, so a derivation that deterministically kills
+        // its worker with no report is bounded by the same budget the
+        // per-executor-budget rule's "executor disconnect DOES count"
+        // clause names. The not-yet-established `Disconnect` event
+        // stays uncharged (the classification window must stay open
+        // for the controller's report).
+        AttemptEvent::EstablishedCrash { at, executor } => {
+            c.failed_builders.insert(executor.clone());
+            c.failure_count += 1;
+            if c.poison_threshold_reached(budget) {
+                c.poisoned_at = Some(*at);
+                Verdict::Poison(PoisonReason::Threshold)
+            } else {
+                Verdict::Requeue
+            }
+        }
+
         // ── assign_to_worker ────────────────────────────────────────
         AttemptEvent::Dispatched { .. } => {
             c.backoff_until = None;
@@ -982,11 +1018,10 @@ fn record_to_event(record: &AttemptRecord) -> Option<AttemptEvent> {
         // First-installment disconnect rows: classification not yet
         // established; charges nothing, re-checks the threshold (E5).
         OutcomeClass::Disconnected => Some(AttemptEvent::Disconnect { at, executor }),
-        // TODO: T-1b.11 (C2) — an established unreported executor crash
-        // charges the threshold/exclusion budget once that task lands.
-        // Until then it folds exactly as an uncharged disconnect
-        // re-check, which is the as-built behavior.
-        OutcomeClass::ExecutorCrash => Some(AttemptEvent::Disconnect { at, executor }),
+        // C2 (T-1b.11): an established unreported executor crash (the
+        // TTL sweep filled `termination_reason='unreported'`) charges
+        // the threshold/exclusion budget.
+        OutcomeClass::ExecutorCrash => Some(AttemptEvent::EstablishedCrash { at, executor }),
         OutcomeClass::Cascade | OutcomeClass::FleetExhaust => None,
         // Reset classes only ever ride on `event_kind = 'reset'` rows
         // (handled above); an attempt-kind row carrying one is malformed
@@ -1857,26 +1892,70 @@ mod tests {
         assert_eq!(d.exclusion.len(), 3);
     }
 
-    /// An `executor_crash` history charges nothing yet: the C2 charge
-    /// lands in T-1b.11; until then an established crash folds exactly
-    /// like an uncharged disconnect re-check (the as-built behavior).
-    // TODO: T-1b.11 — flip this test to assert the threshold/exclusion
-    // charge once classify()/decide() charge established crashes.
+    // r[verify sched.retry.per-executor-budget]
+    /// C2 (T-1b.11): an `executor_crash` history charges the
+    /// threshold/exclusion budget — each established crash joins
+    /// `failed_builders` and increments `failure_count`, the placement
+    /// exclusion picks the crashing executors up, and the third
+    /// distinct establishment crosses the default threshold. A bare
+    /// `disconnected` row (not yet established) still charges nothing.
     #[test]
-    fn decide_executor_crash_history_is_uncharged_until_t1b11() {
-        let h: Vec<AttemptRecord> = (0..4)
-            .map(|i| {
-                rec(
-                    OutcomeClass::ExecutorCrash,
-                    ReportingParty::Scheduler,
-                    &format!("w{i}"),
-                    100 + i,
-                )
-            })
-            .collect();
+    fn decide_executor_crash_history_charges_the_threshold_budget() {
+        let ex = |ids: &[&str]| -> HashSet<ExecutorId> {
+            ids.iter().map(|s| ExecutorId::from(*s)).collect()
+        };
+        let crash = |w: &str, at: u32| {
+            rec(
+                OutcomeClass::ExecutorCrash,
+                ReportingParty::Scheduler,
+                w,
+                u64::from(at),
+            )
+        };
+        // Two establishments: charged and excluded, still under the
+        // threshold; the fold-view exclusion feeds placeable().
+        let h = [crash("w0", 100), crash("w1", 101)];
+        let d = decide_default(&h, 200);
+        assert_eq!(d.counters.failure_count, 2);
+        assert_eq!(d.counters.failed_builders.len(), 2);
+        assert_eq!(d.verdict, Verdict::Requeue);
+        assert!(d.exclusion.contains(&ExecutorId::from("w0")));
+        assert!(d.exclusion.contains(&ExecutorId::from("w1")));
+        assert_eq!(
+            placeable(&d.exclusion, &ex(&["w0", "w1"])),
+            Placement::FleetExhausted,
+            "a fleet consisting only of crashed executors reads exhausted"
+        );
+        assert_eq!(
+            placeable(&d.exclusion, &ex(&["w0", "w1", "w-fresh"])),
+            Placement::Placeable,
+            "a fresh executor keeps the derivation placeable"
+        );
+
+        // The third distinct establishment crosses the threshold (the
+        // C2 boundedness the as-built code lacked).
+        let h = [crash("w0", 100), crash("w1", 101), crash("w2", 102)];
+        let d = decide_default(&h, 200);
+        assert_eq!(d.verdict, Verdict::Poison(PoisonReason::Threshold));
+        assert_eq!(d.counters.failed_builders.len(), 3);
+
+        // Unestablished disconnects stay uncharged.
+        let h = [
+            rec(
+                OutcomeClass::Disconnected,
+                ReportingParty::Scheduler,
+                "w0",
+                100,
+            ),
+            rec(
+                OutcomeClass::Disconnected,
+                ReportingParty::Scheduler,
+                "w1",
+                101,
+            ),
+        ];
         let d = decide_default(&h, 200);
         assert_eq!(d.counters, Counters::default());
-        assert_eq!(d.verdict, Verdict::Requeue);
         assert!(d.exclusion.is_empty());
     }
 

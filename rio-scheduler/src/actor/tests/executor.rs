@@ -5173,6 +5173,112 @@ async fn attempt_ledger_unreported_crash_established_by_sweep() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.retry.per-executor-budget]
+// r[verify sched.retry.attempts-bounded+2]
+/// Phase 1b (T-1b.11), the C2 adjudication red-first: a derivation that
+/// deterministically kills its worker with no `CompletionReport`, no
+/// OOM/DiskPressure/DeadlineExceeded reason, repeatedly — each death
+/// observed only as a disconnect whose classifying report never arrives
+/// — is poisoned once the third distinct executor's crash is
+/// established by the (test-forced) correlation-TTL sweep. As-built the
+/// establishment charged nothing, so this loop was bounded by nothing
+/// in the retry machinery.
+#[tokio::test]
+async fn phase1b_c2_unreported_crash_loop_poisons_at_threshold() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let drv = "c2-crash-loop";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    for i in 0..3u32 {
+        let w = format!("c2-w{i}");
+        let mut rx = connect_builder(&handle, &w, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        // The daemon dies with no report: the stream just drops.
+        disconnect(&handle, &w).await?;
+        drop(rx);
+        // No controller report ever arrives; the (test-forced)
+        // correlation-TTL sweep establishes the crash and re-decides.
+        let swept = handle.debug_force_disconnect_sweep().await?;
+        assert_eq!(swept, 1, "cycle {i}: exactly the one expired entry");
+        barrier(&handle).await;
+
+        let info = expect_drv(&handle, drv).await;
+        if i < 2 {
+            assert_ne!(
+                info.status,
+                DerivationStatus::Poisoned,
+                "cycle {i}: under the threshold the establishment requeues"
+            );
+        } else {
+            assert_eq!(
+                info.status,
+                DerivationStatus::Poisoned,
+                "the third distinct established crash crosses the poison threshold (C2); \
+                 as-built the no-report crash loop was unbounded"
+            );
+        }
+    }
+    assert_eq!(
+        ledger_classes(&db.pool, drv).await,
+        vec!["executor_crash", "executor_crash", "executor_crash"],
+        "every death is established exactly once"
+    );
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind(drv)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "poisoned",
+        "the poison persisted inside the establishment transaction"
+    );
+    Ok(())
+}
+
+/// C2 companion: an establishment followed by a late classifying report
+/// for the same death does not double-charge — the crash row is already
+/// established (first writer wins) and the late report finds neither a
+/// dedup entry nor a live executor, so one death stays one row and one
+/// charge.
+#[tokio::test]
+async fn phase1b_c2_establishment_then_late_report_no_double_charge() -> TestResult {
+    let (db, handle, _task, rx) = setup_with_worker("c2nd-w", "x86_64-linux").await?;
+    let drv = "c2nd-d";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+    disconnect(&handle, "c2nd-w").await?;
+    drop(rx);
+    let swept = handle.debug_force_disconnect_sweep().await?;
+    assert_eq!(swept, 1);
+    barrier(&handle).await;
+
+    // The late controller report for the same death arrives after the
+    // establishment: no dedup entry, no live executor → no-op; the
+    // first-writer-wins fill keeps the established classification.
+    let promoted = report_termination(
+        &handle,
+        "c2nd-w",
+        rio_proto::types::TerminationReason::OomKilled,
+    )
+    .await?;
+    assert!(
+        !promoted,
+        "the late report must not re-classify or re-charge"
+    );
+
+    let rows = ledger_rows(&db.pool, drv).await;
+    assert_eq!(rows.len(), 1, "one death = one row: {rows:?}");
+    assert_eq!(rows[0].outcome_class, "executor_crash");
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("unreported"));
+    let info = expect_drv(&handle, drv).await;
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "one established charge stays under the threshold"
+    );
+    Ok(())
+}
+
 /// A backstop fire writes exactly ONE row for that attempt — the
 /// `backstop` row at the charging site; the delegation to
 /// `reassign_derivations` adds no `disconnected` row.

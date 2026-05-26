@@ -1160,7 +1160,21 @@ impl DagActor {
     /// `disconnected/NULL` forever (the C2 data half). The fill is
     /// keyed by the entry's carried (derivation_id, exec_id) — no DAG
     /// lookup, so establishment still lands if the node was reaped
-    /// during the window. No charge, no decision — that is Phase 1b.
+    /// during the window.
+    ///
+    /// Phase 1b (T-1b.11, the C2 adjudication): the establishment is
+    /// also the charge — the same transaction re-runs `decide()` over
+    /// the updated suffix (the established crash joins the
+    /// threshold/exclusion budget, decision P1) and the sweep acts on
+    /// the verdict at this site, so a derivation that deterministically
+    /// kills its workers with no report, no classifying reason, and no
+    /// backstop-visible wedge is bounded by the poison threshold. The
+    /// E8 backstop — the other establishment vehicle — already charges
+    /// and decides at its own site; the controller's non-promoting
+    /// report deliberately establishes nothing (the classification
+    /// window for a promoting or DeadlineExceeded report stays open
+    /// until this sweep).
+    // r[impl sched.retry.per-executor-budget]
     pub(super) async fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
         let expired: Vec<super::DisconnectedAttempt> = self
             .recently_disconnected
@@ -1174,15 +1188,87 @@ impl DagActor {
             let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id) else {
                 continue;
             };
-            self.fill_attempt_termination(
-                &entry.drv_hash,
-                derivation_id,
-                exec_id,
-                "unreported",
-                crate::state::OutcomeClass::ExecutorCrash,
-                (false, false, false),
-            )
+            // Standby replicas must neither write attempt rows nor
+            // decide from them (the same gate the 1a fill carried).
+            if !self.leader.is_leader() {
+                continue;
+            }
+            let drv_hash = &entry.drv_hash;
+            // A terminal verdict is acted on only while the derivation
+            // is still in a poison-able status (it may have been
+            // re-dispatched, completed elsewhere, or reaped during the
+            // 60 s window); the establishment fill itself always lands.
+            let verdict_eligible = self.dag.node(drv_hash).is_some_and(|s| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Ready
+                        | DerivationStatus::Assigned
+                        | DerivationStatus::Running
+                )
+            });
+            let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let (won, decision) = self
+                    .fill_and_decide_in_tx(
+                        &mut tx,
+                        derivation_id,
+                        exec_id,
+                        "unreported",
+                        crate::state::OutcomeClass::ExecutorCrash,
+                        (false, false, false),
+                    )
+                    .await?;
+                if verdict_eligible
+                    && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
+                {
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                }
+                tx.commit().await?;
+                Ok((won, decision))
+            }
             .await;
+            let decision = match result {
+                Ok((won, decision)) => {
+                    if won && let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.classify_attempt_record(
+                            exec_id,
+                            "unreported",
+                            crate::state::OutcomeClass::ExecutorCrash,
+                            (false, false, false),
+                        );
+                    }
+                    decision
+                }
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, exec_id = %exec_id, error = %e,
+                          "establishment sweep: installment transaction failed; the row stays \
+                           unestablished for this pass (no charge, no verdict)");
+                    continue;
+                }
+            };
+            if verdict_eligible
+                && let crate::retry_policy::Verdict::Poison(reason) = decision.verdict
+            {
+                if !matches!(reason, crate::retry_policy::PoisonReason::Threshold) {
+                    error!(drv_hash = %drv_hash, ?reason,
+                           "decide() returned an unexpected poison reason for an established \
+                            crash; poisoning with the threshold message (investigate)");
+                }
+                warn!(
+                    drv_hash = %drv_hash,
+                    exec_id = %exec_id,
+                    failure_count = decision.counters.failure_count,
+                    failed_builders = decision.counters.failed_builders.len(),
+                    "establishment sweep: unreported executor crashes reached the poison \
+                     threshold, poisoning"
+                );
+                self.poison_already_recorded(
+                    drv_hash,
+                    "poison threshold reached after unreported executor crashes",
+                    None,
+                )
+                .await;
+            }
         }
     }
 

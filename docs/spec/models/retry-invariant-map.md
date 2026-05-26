@@ -1036,6 +1036,25 @@ dispositions already recorded above (D1–D4, C1–C4, A5–A10):
     failed-builders-membership disposition if that disposition answers
     boundedness explicitly). The E5 re-check item below references this
     adjudication; settling it does not by itself license that deletion.
+    **Phase-1b record (T-1b.11, decision P1):** the charge is the
+    threshold/exclusion budget — `failed_builders[executor]` +
+    `failure_count`, nothing else — applied by the fold's
+    `executor_crash` arm once the failure is established. The
+    establishment vehicles are the correlation-TTL sweep (which now
+    follows its installment with the same in-transaction
+    `decide()` + status persist as every collapsed site) and the E8
+    backstop (which already charges and decides at its own site); the
+    controller's non-promoting report deliberately does NOT establish,
+    preserving the classification window for a promoting or
+    DeadlineExceeded report for the same death. Unestablished
+    `disconnected` rows stay uncharged. The A5 membership question for
+    this class is folded into the exclusion-membership clause; the spec
+    wording that makes the membership explicit ("an established executor
+    crash with no report joins `failed_builders` and counts toward the
+    poison threshold") is owned by T-1b.12a's single
+    `sched.retry.per-executor-budget → +2` amendment (the one bump P1
+    commits to) — T-1b.11 itself made no spec edit, relying on the
+    existing "Executor disconnect DOES count" MUST.
 - **Mechanisms probed for redundancy (neither is a free deletion):**
   - E5's poison-threshold re-check in `reassign_derivations`: the
     machine-checked claim (the b09c5b312-X6 probe) is only that the
