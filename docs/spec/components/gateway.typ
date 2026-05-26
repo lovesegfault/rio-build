@@ -1280,6 +1280,27 @@ Like #rref("gw.conn.keepalive+2") (I-161), this was an SSH-hardening limit
 calibrated to an assumption about stock-client behavior that stock clients
 violate.
 
+#r("gw.conn.channel-types")[
+  The gateway accepts only `session` channel opens. Any other channel-open
+  type (`direct-tcpip`, `x11`, `forwarded-tcpip`, `direct-streamlocal`) MUST
+  terminate the connection: the handler returns an error and the SSH session
+  ends. These channel types are never part of the build-submission protocol,
+  and refusing one per-open would leave per-connection russh state unbounded
+  for the same reason as #rref("gw.conn.channel-limit").
+]
+
+The same russh behavior drives both rules: a refused open's channel state is
+registered in the per-connection map for any non-error handler result and
+never freed, and non-session opens are not even counted toward
+`max_channels_per_connection` (only accepted session opens are), so a client
+looping `direct-tcpip` opens would leak with no bound ever tripping.
+Terminating is the only bounded response. The clients that send these are
+either hostile or carry a stray `LocalForward`/`DynamicForward`/ProxyJump
+configuration pointed at the gateway --- a forward this single-purpose
+`nix-daemon --stdio` ingress was never going to honor, so a terminated
+connection (instead of a politely refused open) is an acceptable outcome for
+them.
+
 #r("gw.conn.session-cap+2")[
   The gateway MUST bound the total number of concurrently active protocol
   sessions across all connections on the instance (`max_sessions`, default

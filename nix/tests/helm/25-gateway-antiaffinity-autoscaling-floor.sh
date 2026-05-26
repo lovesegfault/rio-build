@@ -44,6 +44,17 @@ grep -q 'requiredDuringSchedulingIgnoredDuringExecution' <<<"$aff" || {
   exit 1
 }
 
+# Premise guard for the absence assertion below: the scheduler keeps its
+# chart-default 2 replicas in this render, so its PDB must be present.
+# Proves pdb.yaml was evaluated under podDisruptionBudget.enabled=true —
+# without this, a renamed template or flag would make the rio-gateway
+# absence check pass vacuously.
+sched_pdb=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-scheduler")' "$floor")
+test -n "$sched_pdb" || {
+  echo "FAIL: rio-scheduler PDB did not render at default replicas=2 — pdb.yaml (or podDisruptionBudget.enabled) is not being evaluated, so the rio-gateway PDB-absence assertion would be vacuous" >&2
+  exit 1
+}
+
 # PDB keys on the floor: at minReplicas=1 the rio-gateway PDB must NOT
 # render, or every node drain would be blocked by minAvailable=1
 # against a single pod.

@@ -356,6 +356,78 @@ async fn test_channel_open_over_bound_terminates_connection() -> anyhow::Result<
     Ok(())
 }
 
+// r[verify gw.conn.channel-types]
+/// A non-`session` channel open terminates the CONNECTION: the gateway
+/// only ever carries `nix-daemon --stdio` over session channels, and a
+/// per-open refusal of anything else would leak the same
+/// russh-registers-on-any-Ok per-channel state as the channel bound —
+/// without even counting toward `open_channels`, so the bound never
+/// trips. The client must see a connection-level error (NOT the
+/// `ChannelOpenFailure` of a polite refusal) and the connection must be
+/// unusable afterwards.
+///
+/// direct-tcpip stands in for all four non-session open types
+/// (x11/forwarded-tcpip/direct-streamlocal share the same handler shape
+/// and rationale); it is also the realistic one — a stray
+/// `LocalForward`/`DynamicForward` in a client config pointed at the
+/// gateway.
+///
+/// Every await on the (dying) connection is bounded so a regression that
+/// leaves it half-alive fails the test instead of hanging it.
+#[tokio::test]
+async fn test_non_session_channel_open_terminates_connection() -> anyhow::Result<()> {
+    common::init_test_logging();
+    const STEP: std::time::Duration = std::time::Duration::from_secs(10);
+    let (addr, client_key, srv) = spawn_ssh_server().await?;
+    let session = connect_and_auth(addr, client_key).await?;
+
+    let open = tokio::time::timeout(
+        STEP,
+        session.channel_open_direct_tcpip("127.0.0.1", 80, "127.0.0.1", 12345),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("direct-tcpip open did not resolve within {STEP:?}"))?;
+    assert!(
+        open.is_err(),
+        "a direct-tcpip open must fail, got a usable channel"
+    );
+    assert!(
+        !matches!(open, Err(russh::Error::ChannelOpenFailure(_))),
+        "a non-session channel open must terminate the connection, not be refused \
+         per-open with SSH_MSG_CHANNEL_OPEN_FAILURE; got the per-open refusal: {open:?}"
+    );
+
+    // The connection itself must be dead: the handler error ends russh's
+    // session loop, so the client observes the close shortly after. Poll
+    // bounded — Drop-side teardown runs strictly after the error.
+    let mut closed = session.is_closed();
+    for _ in 0..40 {
+        if closed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        closed = session.is_closed();
+    }
+    assert!(
+        closed,
+        "the connection must be torn down after a non-session channel open, not stay usable"
+    );
+
+    // And a legitimate session open afterwards must fail too — the
+    // termination is connection-wide, not per-channel.
+    let after = tokio::time::timeout(STEP, session.channel_open_session())
+        .await
+        .map_err(|_| anyhow::anyhow!("post-termination open did not resolve within {STEP:?}"))?;
+    assert!(
+        after.is_err(),
+        "an open after the connection was terminated must fail, got a usable channel"
+    );
+
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
 // r[verify gw.conn.real-connection-marker]
 /// `auth_publickey_offered` rejects a key not in `authorized_keys`
 /// BEFORE the client computes a signature. russh::client handles the

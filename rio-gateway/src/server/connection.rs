@@ -952,6 +952,37 @@ impl ConnectionHandler {
         self.open_channels = self.open_channels.saturating_sub(1);
         true
     }
+
+    // r[impl gw.conn.channel-types]
+    /// Build the error that ends the connection in response to a
+    /// non-`session` channel-open request — the shared body of the
+    /// `channel_open_direct_tcpip` / `channel_open_x11` /
+    /// `channel_open_forwarded_tcpip` / `channel_open_direct_streamlocal`
+    /// overrides. The gateway exists solely to carry `nix-daemon
+    /// --stdio` over session channels, so none of these are ever part
+    /// of the build-submission protocol; they come from a stray
+    /// `LocalForward`/`DynamicForward`/ProxyJump in a client config or
+    /// from a hostile peer. Refusing per-open (`Ok(false)`, russh's own
+    /// default for these callbacks) is not an option for the same
+    /// reason as the channel bound in `channel_open_session`: russh
+    /// registers the channel's state in its per-connection map for any
+    /// non-error result and never removes it for a refused open — and
+    /// these opens never count toward `open_channels`, so they cannot
+    /// even trip that bound. Erroring keeps russh-side state bounded; a
+    /// terminated connection is an acceptable outcome for a
+    /// forwarding-configured client, whose forward was never going to
+    /// be honored anyway.
+    fn reject_unsupported_channel_open(&self, channel_type: &'static str) -> anyhow::Error {
+        warn!(
+            peer = ?self.peer_addr,
+            channel_type,
+            "closing SSH connection: gateway does not support TCP/X11/socket forwarding \
+             channels, only sessions"
+        );
+        metrics::counter!("rio_gateway_errors_total", "type" => "unsupported_channel_type")
+            .increment(1);
+        anyhow::anyhow!("unsupported SSH channel-open type: {channel_type}")
+    }
 }
 
 impl Drop for ConnectionHandler {
@@ -1292,25 +1323,26 @@ impl Handler for ConnectionHandler {
         //
         // Crossing the bound ends the CONNECTION (handler error ends
         // russh's session loop), not just the offending open: russh
-        // allocates and registers the channel's state (an eager mpsc
-        // plus window ref in its per-connection channel map) BEFORE
-        // consulting this handler and never removes that entry for a
-        // refused open — the client sends no CHANNEL_CLOSE for an open
-        // that failed, and russh's open-failure removal only covers
-        // server-initiated opens — so a per-open `Ok(false)` refusal
-        // lets an over-bound client keep looping CHANNEL_OPENs and grow
-        // per-connection memory without bound, defeating the bound
-        // itself. Erroring out is the only response that keeps
-        // russh-side state bounded: nothing is inserted for this open,
-        // and the connection unwinds through the normal drop paths
-        // (conn permit/fd/gauges, per-channel tasks, session permits),
-        // surfacing via the accept-site `log_session_end`. A connection
-        // at this bound is already leaking channels or hostile —
-        // legitimate ControlMaster fan-out sits far below it (a
-        // 128-core CI box running nix-fast-build behind one mux is
-        // ~128 channels, ~4× headroom), so the corrupted-fallback
-        // concern that argues for polite per-open handling of stock nix
-        // clients does not apply here.
+        // allocates the channel's state (an eager mpsc plus window ref)
+        // before consulting this handler, inserts it into its
+        // per-connection channel map for any non-error result, and
+        // never removes that entry for a refused open — the client
+        // sends no CHANNEL_CLOSE for an open that failed, and russh's
+        // open-failure removal only covers server-initiated opens — so
+        // a per-open `Ok(false)` refusal lets an over-bound client keep
+        // looping CHANNEL_OPENs and grow per-connection memory without
+        // bound, defeating the bound itself. Erroring out is the only
+        // response that keeps russh-side state bounded: nothing is
+        // inserted for this open, and the connection unwinds through
+        // the normal drop paths (conn permit/fd/gauges, per-channel
+        // tasks, session permits), surfacing via the accept-site
+        // `log_session_end`. A connection at this bound is already
+        // leaking channels or hostile — legitimate ControlMaster
+        // fan-out sits far below it (a 128-core CI box running
+        // nix-fast-build behind one mux is ~128 channels, ~4×
+        // headroom), so the corrupted-fallback concern that argues for
+        // polite per-open handling of stock nix clients does not apply
+        // here.
         if self.open_channels >= self.max_channels_per_connection {
             warn!(
                 peer = ?self.peer_addr,
@@ -1354,6 +1386,53 @@ impl Handler for ConnectionHandler {
             "SSH session channel opened"
         );
         Ok(true)
+    }
+
+    // r[impl gw.conn.channel-types]
+    // Non-session channel opens (this and the three overrides below)
+    // end the connection; see `reject_unsupported_channel_open` for the
+    // shared rationale.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: russh::Channel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Err(self.reject_unsupported_channel_open("direct-tcpip"))
+    }
+
+    async fn channel_open_x11(
+        &mut self,
+        _channel: russh::Channel<Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Err(self.reject_unsupported_channel_open("x11"))
+    }
+
+    async fn channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: russh::Channel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Err(self.reject_unsupported_channel_open("forwarded-tcpip"))
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        _channel: russh::Channel<Msg>,
+        _socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Err(self.reject_unsupported_channel_open("direct-streamlocal"))
     }
 
     // r[impl gw.conn.exec-request]
@@ -1403,7 +1482,7 @@ impl Handler for ConnectionHandler {
         // client `MUX_S_SESSION_OPENED`, so a `channel_failure` here
         // produces a clean `ssh` exit — no fallback to a direct
         // connection, no LocalCommand corruption (the fallback a refused
-        // channel OPEN would trigger; see gw.conn.channel-limit+4).
+        // channel OPEN would trigger; see gw.conn.session-cap+2).
         // At the default cap (4096 ≈ 2.2 GiB of steady-state buffers;
         // russh-side buffering on top of that is paced per session by
         // the client-granted window via the write half taken below)
