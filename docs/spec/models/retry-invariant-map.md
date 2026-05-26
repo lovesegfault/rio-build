@@ -694,6 +694,60 @@ None of these corrections touches the fold's input alphabet, the ten
 stamping, so they are inventory-row corrections for Stage C, not model or
 fold changes.
 
+### 2026-05-25 re-validation: live effective wanted set and chain-scoped never-forgive
+
+The second harden-subst rebase brings in thirteen further commits. The
+scheduler-side ones (`71587d8a0`, `aa3131697`, `427129fc9` per-build wanted
+contributions + the live effective wanted set; `b8d353bd6` stale-Completed
+forgiveness gated on it; `c54a3d585` its spec rule; `a3fa4b6c1`, `abdd7ada3`
+chain-scoped `never_forgive_paths` and spent-forgiveness clearing) change the
+forgiveness/wanted-set semantics the previous subsection described; the
+gateway connection-bounding and KEDA commits touch nothing under
+`rio-scheduler/src/`. Re-checked against the merged tree:
+
+- **E5 and the fold's charging semantics: unaffected.** `actor/executor.rs`
+  (E5), `actor/housekeeping.rs`, `actor/floor.rs`, `actor/event.rs`, and
+  `retry_policy.rs` remain untouched. Unlike the first batch, harden-subst
+  now does edit `actor/completion.rs` — but the edit is a single
+  DAG-bookkeeping insertion ahead of the verdict dispatch (an accepted
+  worker verdict clears the node's `never_forgive_paths` as a chain
+  ending); it adds no `RetryState` mutation, no ledger append, and does not
+  change which completion arm fires. The new dispatch.rs/merge.rs/dag
+  edits likewise add no `RetryState` counter writes, no `retry.clear()`
+  sites, no `backoff_until` writes, no exec_id minting, no
+  `poison_and_cascade` callers (the one `clear_poison` mention is a
+  comment on pre-existing re-spawn behaviour). The `substitute_tried`
+  one-shot charging is unchanged: forgiven-now-wanted downgrades still
+  revert without setting it. The substitution-failure path therefore stays
+  the adjacent decider, outside the fold's event alphabet — the carve-out
+  holds.
+- **Deltas to the previous subsection's notes (1)–(3).** The wanted-set
+  source for the spawn-time forgivable complement, the post-walk
+  `forgiven`-seed re-check, and the stale-Completed forgiveness/routing is
+  now the LIVE effective wanted set — `effective_wanted` over live
+  interested builds' per-build contributions (`wanted_by_build`), falling
+  back to the stored node-level union — rather than the post-merge stored
+  union; "no interested build wants it" reads "no live interested build
+  wants it" throughout. Additionally a path that already triggered a
+  forgiven-now-wanted downgrade is excluded from later walks' forgivable
+  sets for the rest of that substitution chain (`never_forgive_paths`,
+  cleared at every chain ending and re-cleared by the stale-Completed
+  reset that opens the next chain), and the downgrade-termination argument
+  in note (1) now rests on that set rather than on the union's
+  monotonicity. Notes (4)–(7) — including the charging qualification in
+  (4) — are unaffected. Stage C inherits these as additional inventory-row
+  corrections on top of the Phase-1 "substitution-path corrections" list.
+- **Phase-1a ledger rows: nothing new recorded for substitution
+  failures.** `handle_substitute_complete` still has no append site, and
+  `substitution` is deliberately absent from the `OutcomeClass` alphabet
+  (migration 066). The only substitution-adjacent ledger writes remain the
+  `cache_hit_clear` reset rows in the cached-hit / re-probe lanes; their
+  trigger predicate now evaluates the live effective set, so *when* such a
+  reset fires can shift (a terminal build's wide wants no longer pin a
+  node), but the row contents, the one-transaction clear-poison shape, and
+  the no-charge semantics are unchanged. The new `never_forgive_paths`
+  clears that land beside those lanes are DAG bookkeeping only.
+
 ## Stage-C calibration: the historical-fix corpus replayed against the model
 
 The 45-commit fix corpus (inventory §5, eight families G1–G8) replayed
