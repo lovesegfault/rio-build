@@ -177,15 +177,23 @@ module retryCalibG4ReloadExpiredPoison {
 // =========================================================================
 // REACHABILITY PROBE (not an override) -- b09c5b312's X6 half added a
 // poison-threshold re-check to the disconnect path. In today's code the
-// charging sites themselves check the threshold at record time
-// (record-then-check) and the dispatch-time fleet-exhaust backstop covers
-// the placement-starvation shape, so the E5 re-check should only be
-// reachable if some OTHER path can leave a Running derivation with a
-// threshold-crossing failed_builders set -- which the as-built model says
-// cannot happen. The probe runs the AS-BUILT step over a two-slot
-// pod-death alphabet and asserts the E5 threshold poison never fires; a
-// "no violation" verdict is the machine-checked evidence for the
-// redundancy disposition recorded in the calibration table.
+// record-then-check premise holds for the WORKER-REPORTED charging sites
+// (they check the threshold at the moment they record), and the
+// dispatch-time fleet-exhaust backstop covers the placement-starvation
+// shape -- but NOT for the backstop charging site:
+// tick_process_backstop_timeouts records failed_builders/failure_count
+// WITHOUT checking and explicitly delegates the poison decision to
+// reassign_derivations, so the same code-level check is the only
+// threshold gate on that path. The model encodes that delegated check
+// inside backstopFires (observed as OE8), which is deliberately OUTSIDE
+// this probe's scope: the probe asserts only that the
+// disconnect/force-drain-triggered arm (observed as OE5) never fires
+// over the as-built step on a two-slot worker+pod-death+crash+wedge
+// alphabet with MAX_FAILOVERS = 0 and PG_FAULTS = 0 (no failover, no
+// lost-PG-write histories). A "no violation" verdict is the
+// machine-checked evidence for the NARROWED disposition recorded in the
+// calibration table -- "the disconnect-triggered arm is unreachable
+// as-built" -- not evidence that the code-level check is dead.
 // =========================================================================
 module retryCalibG4DisconnectThresholdProbe {
   import retryPolicy(
@@ -204,7 +212,11 @@ module retryCalibG4DisconnectThresholdProbe {
 
   /// "The disconnect path's threshold re-check never produces the poison"
   /// -- checked as an invariant over the as-built step; HOLDS means the
-  /// arm is dead code in today's structure (the record-then-check sites
-  /// and the fleet-exhaust backstop subsume it).
+  /// disconnect/force-drain-triggered arm never fires in today's
+  /// structure over this probe's alphabet (no failover, no lost PG
+  /// writes). It does NOT mean the code-level check is dead: the same
+  /// block is the only threshold gate on the backstop path, whose
+  /// instance is modeled inside backstopFires (OE8) and is outside this
+  /// probe's scope.
   val noDisconnectThresholdPoison = not(last.kind == OE5 and last.terminal)
 }

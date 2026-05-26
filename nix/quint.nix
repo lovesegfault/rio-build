@@ -1340,10 +1340,12 @@ in
       witness = "noDoubleCount";
     };
 
-    # G8 (891a6520d shape): recovery drops poisoned rows -> a durable,
+    # G8: the poison set fails to survive failover -> a durable,
     # unexpired Poisoned row behind a derivation recovered as anything
-    # but Poisoned (also the non-vacuity guard for the
-    # recoveryPreservesPoisonStatus invariant added with the calibration).
+    # but Poisoned (the recoveryPreservesPoisonStatus non-vacuity guard;
+    # anchored on 891a6520d's poison-set half -- the poisoned_at-IS-NULL
+    # load filter and the remove_build reap, abstracted at model
+    # resolution as "not reloaded").
     quint-retry-calib-g8-poison-reload = mkQuintWitnessCheck {
       name = "retry-calib-g8-poison-reload";
       spec = "calibration/retry-g8";

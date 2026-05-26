@@ -665,11 +665,17 @@ module retryCalibG1ExemptPathUncapped {
 }
 
 // =========================================================================
-// CALIBRATION -- pre-I-213 (c13f6a277 / 8d38cb999 / dc094dd0c): the
-// disconnect path recorded the lost worker into failed_builders /
-// failure_count unconditionally -- a kubelet-eviction (floor-promotion)
-// ladder or an assigned-only disconnect was charged as poison-threshold
-// progress, so a resizing build was poisoned by its own promotions.
+// CALIBRATION -- the disconnect/eviction half of pre-I-213 (8d38cb999 /
+// dc094dd0c): the disconnect path recorded the lost worker into
+// failed_builders / failure_count unconditionally -- a kubelet-eviction
+// (floor-promotion) ladder or an assigned-only disconnect was charged as
+// poison-threshold progress, so a resizing build was poisoned by its own
+// promotions. (The E1 half of the same incident -- c13f6a277,
+// floor-promoted transient failures consuming max_retries -- is NOT
+// covered by this override: the floor outcome exists only on OOM-class
+// events in the model and the fold, so that commit is dispositioned
+// NOT-ENC in the calibration table and its coverage stays with the
+// promotion-exempt unit tests.)
 // PREDICTED: countersRefineHistory falsifies at the first charging
 // disconnect (today's E5 -- and the fold -- charge nothing), and the
 // distinct-worker threshold poison the fold does not sanction follows

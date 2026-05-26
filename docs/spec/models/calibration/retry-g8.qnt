@@ -5,11 +5,21 @@
 // section 5). Same extend-and-override pattern as retry-g1.qnt.
 
 // =========================================================================
-// CALIBRATION -- the 891a6520d shape: recovery does not reload poisoned
-// rows into the live state at all (historically: the poisoned derivations
-// were missing from the recovery maps, so the build read them as
-// succeeded). The model-level revert: the poisoned-row arm of the
-// failover behaves like the not-reloaded arm.
+// CALIBRATION -- the 891a6520d poison-set shape, "the poison set fails to
+// survive failover". The commit's actual mechanisms: (a) the old
+// load_poisoned_derivations skipped status='poisoned' rows whose
+// poisoned_at was NULL -- the crash window of the old non-atomic
+// persist_status + set_poisoned_at sequence, closed by the atomic
+// persist_poisoned -- and (b) the dag::remove_build reap deleted
+// recovered-poisoned nodes (interested_builds empty from birth) on the
+// first build completion after recovery. The pre-fix DAG DID reload
+// timestamped poisoned rows; this override is an abstraction at model
+// resolution, not a literal revert: the model's PG poison write is one
+// atomic step (no NULL-timestamp window) and it has no build-completion
+// reap, so both mechanisms are abstracted as "the poisoned-row arm of
+// the failover behaves like the not-reloaded arm". The commit's
+// id_to_hash/build-summary half is NOT covered here (build-level
+// bookkeeping, NOT-ENC in the calibration table).
 // PREDICTED: recoveryPreservesPoisonStatus falsifies in the post-failover
 // state (a durable, unexpired Poisoned row behind a derivation that came
 // back as anything but Poisoned), failover alphabet.
