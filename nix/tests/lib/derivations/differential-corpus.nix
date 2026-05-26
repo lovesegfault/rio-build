@@ -238,6 +238,16 @@ rec {
     chmod 775 $out
   '' { };
 
+  # Group/other execute WITHOUT owner execute (0655): CppNix keys the
+  # store/NAR executable bit on owner-x only, so canonicalisation must
+  # land this file at 0444 (not 0555) in both arms — the NAR hashes
+  # diverge if the native side keys on any execute bit.
+  group-exec-file = mkDrv "rio-diff-group-exec" ''
+    mkdir -p $out
+    echo "not actually executable" > $out/tool
+    chmod 0655 $out/tool
+  '' { };
+
   # ── structuredAttrs / passAsFile / placeholders ──────────────────────
 
   # __structuredAttrs: .attrs.json and .attrs.sh are copied into $out so
@@ -512,6 +522,28 @@ rec {
         __contentAddressed = true;
         outputHashMode = "recursive";
         outputHashAlgo = "sha256";
+      };
+
+  # Floating-CA + unsafeDiscardReferences with a textual self-reference:
+  # the output embeds its own path, but the discard empties the recorded
+  # reference set — so the `:self` fingerprint flag must come from the
+  # (empty) recorded references while the content hash is still computed
+  # modulo the scratch hash and the embedded path is still rewritten.
+  # Both arms must mint the same final path, and the registered
+  # reference set must be empty.
+  ca-discard-self =
+    mkDrv "rio-diff-ca-discard-self"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        echo "''${outputs[out]}" > ''${outputs[out]}/self
+      ''
+      {
+        __structuredAttrs = true;
+        __contentAddressed = true;
+        outputHashMode = "recursive";
+        outputHashAlgo = "sha256";
+        unsafeDiscardReferences.out = true;
       };
 
   # setPhase emission: stdenv-style phase reporting through the @nix

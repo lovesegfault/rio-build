@@ -1104,6 +1104,31 @@ mod verify_nar_tests {
         assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
     }
 
+    /// Self-embedding content (so the fallback hash-modulo recompute is
+    /// exercised) with a LYING `fixed:` descriptor: neither the plain nor
+    /// the modulo recompute matches the declared hash, so the gate must
+    /// reject for the descriptor mismatch — not fall through to a path
+    /// derivation that could mask the lie.
+    #[test]
+    fn ca_discarded_self_descriptor_lie_rejected() {
+        let (path, nar) = build_self_referencing_upload("selfref-desc-lie");
+        // References empty (discarded-self shape) so the plain hash cannot
+        // match a modulo descriptor, forcing the fallback recompute path.
+        let mut info = ca_info(&path, &[], &nar);
+        let other_digest: [u8; 32] = Sha256::digest(b"not the uploaded bytes").into();
+        let other_hash =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, other_digest.to_vec())
+                .unwrap();
+        info.content_address = Some(format!("fixed:r:{}", other_hash.to_colon()));
+        let e = verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t").unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "got: {e:?}");
+        assert!(
+            e.message().contains("descriptor does not match"),
+            "rejection must name the descriptor mismatch, got: {}",
+            e.message()
+        );
+    }
+
     /// Flat verification has no 256 MiB ceiling: a single-file NAR whose
     /// contents exceed the general-purpose parser's per-file cap still
     /// verifies (the store's own upload limit is the only ceiling).

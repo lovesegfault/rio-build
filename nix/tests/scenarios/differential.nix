@@ -108,6 +108,9 @@ let
       expect = "both-fail";
       rio_status = "OutputRejected";
     };
+    group-exec-file = {
+      expect = "parity";
+    };
     stray-store-path = {
       expect = "parity";
     };
@@ -189,6 +192,13 @@ let
       # M6b floating-CA finalization is merged: the native side must
       # now realize the same content-addressed paths as the oracle.
       expect = "parity";
+    };
+    ca-discard-self = {
+      # Self-reference textually present but discarded: both arms must
+      # mint the path without the `:self` fingerprint flag and register
+      # an empty reference set.
+      expect = "parity";
+      references_must_be_empty = true;
     };
     # ── Heavyweight entries: 32-bit ABI + real stdenv ──────────────────
     i686-trivial = {
