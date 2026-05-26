@@ -495,7 +495,7 @@ impl DagActor {
             {
                 let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
                     let mut tx = self.db.pool().begin().await?;
-                    let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                    let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
                     if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
                         crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
                     }

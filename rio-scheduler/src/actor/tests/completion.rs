@@ -5295,6 +5295,12 @@ async fn phase1b_e2_d2_controller_counted_infra_run_forgiven_after_sparse_window
 /// worker-reported exempt failure crosses `max_exempt_infra_retries`.
 /// Against the as-built RAM counters the controller attempts charge
 /// nothing and the run keeps requeueing.
+///
+/// The cap is 3 so the two controller charges stay under it — the
+/// worker-reported attempt is the one that crosses, pinning the
+/// cross-channel accumulation at the E2 site. (The controller-channel
+/// cap crossing itself poisons at the E6 site since T-1b.9 and is
+/// pinned by `phase1b_e6_d3_promoted_controller_oom_charges_exempt_budget`.)
 // r[verify sched.retry.exempt-infra-cap]
 #[tokio::test]
 async fn phase1b_e2_d3_promoted_controller_terminations_charge_exempt_budget() -> TestResult {
@@ -5306,7 +5312,7 @@ async fn phase1b_e2_d3_promoted_controller_terminations_charge_exempt_budget() -
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.sla = test_sla_config();
         c.retry_policy = crate::RetryPolicy {
-            max_exempt_infra_retries: 2,
+            max_exempt_infra_retries: 3,
             ..Default::default()
         };
     });
@@ -5333,7 +5339,7 @@ async fn phase1b_e2_d3_promoted_controller_terminations_charge_exempt_budget() -
     assert_ne!(info.status, DerivationStatus::Poisoned);
 
     // A worker-reported exempt infra failure (CONCURRENT_PUTPATH) is
-    // the third exempt attempt: it crosses max_exempt_infra_retries=2.
+    // the third exempt attempt: it crosses max_exempt_infra_retries=3.
     let mut rx = connect_builder(&handle, "d3-w-final", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     let putpath_msg = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);

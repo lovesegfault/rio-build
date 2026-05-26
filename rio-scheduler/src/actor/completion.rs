@@ -195,22 +195,77 @@ impl DagActor {
     /// mirror-column seed (decision P5) on the same connection, and fold
     /// them through `decide()`. The caller persists the verdict's status
     /// via the `_in_tx` variants on the same connection and commits.
+    ///
+    /// Returns whether the append actually inserted (an exec_id-bearing
+    /// duplicate is rejected by the partial-unique index and reads back
+    /// as the existing row) so callers that mirror the row onto the
+    /// in-memory history can skip the push for duplicates.
     pub(super) async fn append_and_decide_in_tx(
         &self,
         tx: &mut sqlx::PgConnection,
         row: &AttemptRow,
-    ) -> Result<crate::retry_policy::Decision, sqlx::Error> {
-        crate::db::SchedulerDb::append_attempt(tx, row).await?;
+    ) -> Result<(bool, crate::retry_policy::Decision), sqlx::Error> {
+        let inserted = crate::db::SchedulerDb::append_attempt(tx, row).await?;
         let suffix =
             crate::db::SchedulerDb::load_attempt_suffix_one_in_tx(tx, row.derivation_id).await?;
         let seed = crate::db::SchedulerDb::load_retry_seed_in_tx(tx, row.derivation_id).await?;
         let history: Vec<crate::state::AttemptRecord> =
             suffix.iter().map(AttemptRow::to_record).collect();
-        Ok(crate::retry_policy::decide(
-            &history,
-            &self.decision_budget(),
-            crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-            seed.as_ref(),
+        Ok((
+            inserted,
+            crate::retry_policy::decide(
+                &history,
+                &self.decision_budget(),
+                crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+                seed.as_ref(),
+            ),
+        ))
+    }
+
+    /// The two-installment re-decide (E6/E7, Phase 1b): perform the
+    /// second installment on the released attempt's row (first writer
+    /// wins, keyed by the carried `(derivation_id, exec_id)` — never a
+    /// DAG lookup) and re-run `decide()` over the updated suffix plus
+    /// the transitional legacy seed on the same connection. The caller
+    /// persists the verdict's terminal status via the `_in_tx` variants
+    /// on the same transaction (when it is going to act on it) and
+    /// commits; the in-memory record mirror
+    /// (`classify_attempt_record`) happens after the commit, exactly as
+    /// the appends do.
+    ///
+    /// Returns whether THIS call performed the fill alongside the
+    /// decision.
+    pub(super) async fn fill_and_decide_in_tx(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        derivation_id: Uuid,
+        exec_id: Uuid,
+        termination_reason: &str,
+        outcome_class: OutcomeClass,
+        floor: (bool, bool, bool),
+    ) -> Result<(bool, crate::retry_policy::Decision), sqlx::Error> {
+        let won = crate::db::SchedulerDb::fill_termination(
+            tx,
+            derivation_id,
+            exec_id,
+            termination_reason,
+            outcome_class,
+            floor,
+        )
+        .await?;
+        let suffix =
+            crate::db::SchedulerDb::load_attempt_suffix_one_in_tx(tx, derivation_id).await?;
+        let seed = crate::db::SchedulerDb::load_retry_seed_in_tx(tx, derivation_id).await?;
+        let history: Vec<crate::state::AttemptRecord> =
+            suffix.iter().map(AttemptRow::to_record).collect();
+        Ok((
+            won,
+            crate::retry_policy::decide(
+                &history,
+                &self.decision_budget(),
+                crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+                seed.as_ref(),
+            ),
         ))
     }
 
@@ -2801,7 +2856,7 @@ impl DagActor {
         let (decision, fleet_exhausted, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<(crate::retry_policy::Decision, bool), sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
                 let fleet_exhausted = matches!(
                     crate::retry_policy::placeable(&decision.exclusion, &eligible),
                     crate::retry_policy::Placement::FleetExhausted
@@ -3122,7 +3177,7 @@ impl DagActor {
         let (decision, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
                 if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
                     crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
                 } else {
@@ -3329,7 +3384,7 @@ impl DagActor {
             // commit or leave the derivation untouched.
             let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
                 crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
                 tx.commit().await?;
                 Ok(decision)
@@ -3483,7 +3538,7 @@ impl DagActor {
         let (verdict, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
                 let status = match decision.verdict {
                     crate::retry_policy::Verdict::Cancel => DerivationStatus::Cancelled,
                     _ => DerivationStatus::Ready,

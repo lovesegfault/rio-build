@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::dag::DerivationDag;
@@ -753,29 +753,92 @@ impl DagActor {
 
         let outcome = self.bump_resource_floor(&drv_hash, reason, label).await;
 
-        // 1a, installment 2: classify the released attempt's ledger row.
-        // The class follows the floor outcome — exempt when the report
-        // promoted the floor, plain infra otherwise — mirroring the
-        // worker-reported E2 split. A correlated report fills the row
-        // the disconnect appended (first writer wins); a race-ahead
-        // report appends the row itself, already classified, and the
-        // later disconnect appends nothing (last_completed guard plus
-        // the exec_id unique index).
-        let class = if outcome.promoted {
-            crate::state::OutcomeClass::ExemptInfra
-        } else {
-            crate::state::OutcomeClass::Infra
-        };
-        if let Some((derivation_id, exec_id)) = released {
-            self.fill_attempt_termination(
-                &drv_hash,
-                derivation_id,
-                exec_id,
-                label,
-                class,
-                (outcome.promoted, outcome.promoted, outcome.at_cap),
+        // E6, collapsed onto decide()/classify() (Phase 1b, T-1b.9): the
+        // second installment classifies the released attempt's row
+        // through `classify()` — the single append-time owner of the
+        // exemption predicate — and the same transaction re-runs
+        // `decide()` over the updated suffix, acting on the verdict at
+        // this site. The floor bump above stays at the site; only its
+        // outcome feeds the classifier. The class follows the floor
+        // outcome — exempt when the report promoted the floor, plain
+        // infra otherwise — mirroring the worker-reported E2 split. A
+        // correlated report fills the row the disconnect appended
+        // (first writer wins); a race-ahead report appends the row
+        // itself, already classified, and the later disconnect appends
+        // nothing (last_completed guard plus the exec_id unique index).
+        let class = crate::retry_policy::classify(
+            &crate::retry_policy::ObservedFailure::ControllerResourceTermination,
+            crate::retry_policy::FloorOutcomeView {
+                promoted: outcome.promoted,
+                at_cap: outcome.at_cap,
+            },
+        );
+        let floor_flags = (outcome.promoted, outcome.promoted, outcome.at_cap);
+        // The late-installment-after-redispatch guard (unchanged from
+        // the as-built m044 arm): a terminal verdict is acted on only
+        // while the derivation is still in a poison-able status; the
+        // installment itself always lands. The disconnect already
+        // re-queued (Ready), but a dispatch tick may have raced
+        // (Assigned/Running); any other state (Completed elsewhere,
+        // already Poisoned, reaped) → record only, never act.
+        let verdict_eligible = self.dag.node(&drv_hash).is_some_and(|s| {
+            matches!(
+                s.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
             )
+        });
+
+        // The installment transaction: fill (or race-ahead append) +
+        // suffix/seed read + decide(), plus the Poisoned persist when a
+        // poison verdict will be acted on, committed together.
+        // Leader-gated like the 1a writes it replaces. A failed
+        // transaction performs no installment and produces no verdict —
+        // the legacy RAM bookkeeping below still runs, the budget is
+        // re-driven by the next counted failure (or the establishment
+        // sweep / backstop for a row that stayed unclassified), and the
+        // consumed `recently_disconnected` entry is NOT re-inserted
+        // (re-inserting would let the controller's ~10s re-report
+        // double-bump the floor).
+        let mut decision: Option<crate::retry_policy::Decision> = None;
+        if !self.leader.is_leader() {
+            // Standby replicas must neither write attempt rows nor
+            // decide from them (same gate as the 1a fill/append).
+        } else if let Some((derivation_id, exec_id)) = released {
+            let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let (won, decision) = self
+                    .fill_and_decide_in_tx(
+                        &mut tx,
+                        derivation_id,
+                        exec_id,
+                        label,
+                        class,
+                        floor_flags,
+                    )
+                    .await?;
+                if verdict_eligible
+                    && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
+                {
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                }
+                tx.commit().await?;
+                Ok((won, decision))
+            }
             .await;
+            match result {
+                Ok((won, d)) => {
+                    if won && let Some(state) = self.dag.node_mut(&drv_hash) {
+                        state.classify_attempt_record(exec_id, label, class, floor_flags);
+                    }
+                    decision = Some(d);
+                }
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                          "controller termination: installment transaction failed; no verdict \
+                           taken (the next counted failure or the establishment sweep re-drives \
+                           the budget)");
+                }
+            }
         } else if race_ahead {
             let row = self
                 .attempt_row_for(&drv_hash, class, crate::state::ReportingParty::Controller)
@@ -787,49 +850,110 @@ impl DagActor {
                     r.floor_at_cap = outcome.at_cap;
                     r
                 });
-            self.append_attempt_standalone(&drv_hash, row).await;
+            if let Some(row) = row {
+                let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
+                    let mut tx = self.db.pool().begin().await?;
+                    let (inserted, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                    if verdict_eligible
+                        && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
+                    {
+                        crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                    }
+                    tx.commit().await?;
+                    Ok((inserted, decision))
+                }
+                .await;
+                match result {
+                    Ok((inserted, d)) => {
+                        if inserted && let Some(state) = self.dag.node_mut(&drv_hash) {
+                            state.push_attempt_record(row.to_record());
+                        }
+                        decision = Some(d);
+                    }
+                    Err(e) => {
+                        warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                              "controller termination (race-ahead): appending transaction \
+                               failed; no verdict taken");
+                    }
+                }
+            }
         }
 
-        // m044: at the ceiling (`at_cap=true`), this path owns the cap
-        // check + increment + poison. Kubelet-level OOMKilled /
-        // EvictedDiskPressure means the pod died — there is no
-        // worker-reported `CompletionReport`, so
-        // `handle_infrastructure_failure`'s cap check never fires and
-        // the build loops at the ceiling forever otherwise. Mirrors
-        // completion.rs `handle_infrastructure_failure`: cap-check
-        // BEFORE increment, so at-cap poisons at the same attempt
-        // number as non-floor infra. Guard on `at_cap` (resource
-        // reasons only — non-resource returned early via
-        // reason_label=None) AND a poison-able status: the disconnect
-        // already re-queued (Ready), but a dispatch tick may have
-        // raced (Assigned/Running); any other state (Completed
-        // elsewhere, already Poisoned) → skip.
+        // m044, restructured: at the ceiling (`at_cap=true`) this path
+        // still owns the accounting — kubelet-level OOMKilled /
+        // EvictedDiskPressure means the pod died and no worker
+        // CompletionReport will ever arrive — but the cap check is now
+        // the fold's verdict above. The legacy RAM increment stays
+        // until T-1b.13 (rule 1) with its as-built shape: only an
+        // under-cap at-cap event bumps the counter, and only while the
+        // derivation is still poison-able.
         let max = self.retry_policy.max_infra_retries;
         if outcome.at_cap
+            && verdict_eligible
             && let Some(state) = self.dag.node_mut(&drv_hash)
-            && matches!(
-                state.status(),
-                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
-            )
+            && state.retry.infra_count < max
         {
-            if state.retry.infra_count >= max {
-                warn!(
-                    drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
-                    infra_retry_count = state.retry.infra_count, max,
-                    resource_floor = ?state.sched.resource_floor,
-                    "controller-reported termination: max_infra_retries \
-                     exhausted at ceiling, poisoning"
-                );
-                self.poison_and_cascade(
-                    &drv_hash,
-                    &format!("max_infra_retries={max} exhausted at resource ceiling ({reason:?})"),
-                    None,
-                    None,
-                )
-                .await;
-                return false;
-            }
             state.retry.infra_count += 1;
+        }
+
+        // Act on the verdict. Requeue verdicts are a no-op — the
+        // disconnect already re-queued the derivation (or the race-ahead
+        // node is still live on its worker); poison verdicts persist
+        // happened inside the transaction, so only the in-memory
+        // transition + cascade remain.
+        if verdict_eligible
+            && let Some(d) = decision
+            && let crate::retry_policy::Verdict::Poison(poison_reason) = d.verdict
+        {
+            match poison_reason {
+                crate::retry_policy::PoisonReason::ExemptInfraBudget => {
+                    // DIVERGENCE D3 / contradiction C3, adjudicated: a
+                    // floor-promoted controller-reported termination
+                    // charges the exemption budget
+                    // (`sched.retry.exempt-infra-cap`'s "every exempt
+                    // attempt"), so the controller channel is bounded by
+                    // `max_exempt_infra_retries` exactly as the worker
+                    // channel is — as-built it charged nothing here.
+                    let max_exempt = self.retry_policy.max_exempt_infra_retries;
+                    warn!(
+                        drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
+                        exempt_infra_count = d.counters.exempt_infra_count,
+                        max = max_exempt,
+                        resource_floor = ?self.dag.node(&drv_hash).map(|s| s.sched.resource_floor),
+                        "controller-reported termination: exempt infra-retry cap exceeded, \
+                         poisoning (likely leaked store lock / stuck floor-promote)"
+                    );
+                    self.poison_already_recorded(
+                        &drv_hash,
+                        &format!("max_exempt_infra_retries={max_exempt} exceeded ({reason:?})"),
+                        None,
+                    )
+                    .await;
+                }
+                other => {
+                    if !matches!(other, crate::retry_policy::PoisonReason::InfraBudget) {
+                        error!(drv_hash = %drv_hash, ?other,
+                               "decide() returned an unexpected poison reason for a controller \
+                                termination; poisoning with the infra-budget message (investigate)");
+                    }
+                    warn!(
+                        drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
+                        infra_retry_count = d.counters.infra_count, max,
+                        resource_floor = ?self.dag.node(&drv_hash).map(|s| s.sched.resource_floor),
+                        "controller-reported termination: max_infra_retries \
+                         exhausted at ceiling, poisoning"
+                    );
+                    self.poison_already_recorded(
+                        &drv_hash,
+                        &format!(
+                            "max_infra_retries={max} exhausted at resource ceiling ({reason:?})"
+                        ),
+                        None,
+                    )
+                    .await;
+                }
+            }
+            return outcome.promoted;
         }
 
         outcome.promoted

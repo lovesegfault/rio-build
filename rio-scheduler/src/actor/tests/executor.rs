@@ -2008,6 +2008,85 @@ async fn controller_oom_at_ceiling_poisons() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.retry.exempt-infra-cap]
+/// Phase 1b (T-1b.9), divergence D3 / contradiction C3 red-first: a
+/// floor-promoted controller-reported OOM charges `exempt_infra_count`
+/// — `sched.retry.exempt-infra-cap`'s "every exempt attempt" on the
+/// controller channel — so with `max_exempt_infra_retries = 3` the
+/// third promoted controller termination poisons with the
+/// exempt-budget verdict at the E6 site. As-built the controller
+/// channel charged nothing for promoted terminations and the ladder
+/// was bounded only by the floor ceiling (the D3 deviation), so this
+/// history requeued forever.
+#[tokio::test]
+async fn phase1b_e6_d3_promoted_controller_oom_charges_exempt_budget() -> TestResult {
+    use rio_proto::types::TerminationReason;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.sla = test_sla_config();
+        c.retry_policy = crate::RetryPolicy {
+            max_exempt_infra_retries: 3,
+            ..Default::default()
+        };
+    });
+    let tag = "d3-exempt-cap";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
+
+    for i in 1..=3u32 {
+        let id = format!("d3-w{i}");
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
+        let asgn = recv_assignment(&mut rx).await;
+        assert!(asgn.drv_path.contains(tag));
+        // Seed est_memory_bytes after dispatch so it isn't clobbered;
+        // after cycle 1 the (sticky) floor exceeds the est and is the
+        // doubling base, so every cycle keeps promoting well under the
+        // 256 GiB ceiling.
+        handle
+            .debug_seed_sched_hint(tag, Some(4 << 30), None, None, None)
+            .await?;
+        disconnect(&handle, &id).await?;
+        drop(rx);
+        let promoted = report_termination(&handle, &id, TerminationReason::OomKilled).await?;
+        assert!(
+            promoted,
+            "cycle {i}: OomKilled under the ceiling must promote the floor"
+        );
+
+        let s = expect_drv(&handle, tag).await;
+        if i < 3 {
+            assert_ne!(
+                s.status,
+                DerivationStatus::Poisoned,
+                "cycle {i}: under the exempt cap the promoted termination requeues"
+            );
+        } else {
+            assert_eq!(
+                s.status,
+                DerivationStatus::Poisoned,
+                "the third promoted controller termination reaches \
+                 max_exempt_infra_retries=3 and must poison with the exempt budget (D3); \
+                 as-built the controller channel charged nothing"
+            );
+        }
+    }
+    // Every cycle classified its released attempt as an exempt infra
+    // attempt — the charge the verdict folded over.
+    assert_eq!(
+        ledger_classes(&db.pool, tag).await,
+        vec!["exempt_infra", "exempt_infra", "exempt_infra"],
+    );
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "poisoned",
+        "the poison persisted inside the installment transaction"
+    );
+    Ok(())
+}
+
 // r[verify sched.sla.reactive-floor+2]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// Bare disconnect does NOT promote `resource_floor`; the
@@ -4872,7 +4951,11 @@ async fn attempt_ledger_report_then_disconnect_one_row() -> TestResult {
 /// Two controller observations of ONE death (the pod-level non-promoting
 /// report and the job-level DeadlineExceeded), both orders: exactly one
 /// row, finally classified `timeout`; the non-promoting report neither
-/// consumes the dedup entry nor establishes the row.
+/// consumes the dedup entry nor establishes the row; the timeout budget
+/// is charged exactly once for the death and the threshold/exclusion
+/// budget not at all (T-1b.9: the dual-report charge pin — the cap
+/// verdict on such a history is invariant to the presence and order of
+/// the non-promoting observation).
 #[tokio::test]
 async fn attempt_ledger_dual_report_orders_classify_timeout() -> TestResult {
     use rio_proto::types::TerminationReason as R;
@@ -4902,6 +4985,16 @@ async fn attempt_ledger_dual_report_orders_classify_timeout() -> TestResult {
             rows[0].termination_reason.as_deref(),
             Some("deadline_exceeded")
         );
+        let info = expect_drv(&handle, drv_hash).await;
+        assert_eq!(
+            info.retry.timeout_count, 1,
+            "the timeout budget is charged exactly once for the one death"
+        );
+        assert_eq!(
+            info.retry.failure_count, 0,
+            "neither observation of the death charges the threshold budget"
+        );
+        assert!(info.retry.failed_builders.is_empty());
     }
     // Order B: disconnect → DeadlineExceeded → non-promoting pod report.
     {
@@ -4922,6 +5015,16 @@ async fn attempt_ledger_dual_report_orders_classify_timeout() -> TestResult {
             rows[0].termination_reason.as_deref(),
             Some("deadline_exceeded")
         );
+        let info = expect_drv(&handle, drv_hash).await;
+        assert_eq!(
+            info.retry.timeout_count, 1,
+            "the timeout budget is charged exactly once for the one death"
+        );
+        assert_eq!(
+            info.retry.failure_count, 0,
+            "neither observation of the death charges the threshold budget"
+        );
+        assert!(info.retry.failed_builders.is_empty());
     }
     Ok(())
 }
