@@ -846,16 +846,20 @@ pub async fn filter_and_inline_drv(
 /// inner. The type guarantees no leading/trailing/interior whitespace
 /// ever reaches the scheduler.
 ///
-/// Build-option fields (`max_silent_time`/`build_timeout`/`build_cores`/
-/// `keep_going`) are hardcoded to defaults: ssh-ng clients never send
-/// `wopSetOptions` (see [`handle_set_options`](crate::handler)), so the only
-/// way to set these is via the gRPC path (rio-cli), which constructs
+/// Build-option fields (`max_silent_time`/`build_timeout`/`build_cores`)
+/// are hardcoded to defaults: ssh-ng clients never send `wopSetOptions`
+/// (see [`handle_set_options`](crate::handler)), so the only way to set
+/// these is via the gRPC path (rio-cli), which constructs
 /// `SubmitBuildRequest` directly without going through this helper.
+/// `keep_going` instead comes from the session's resolved per-tenant
+/// [`BuildPolicy`](crate::config::BuildPolicy), not from the client.
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,
     priority_class: &str,
     tenant_name: Option<&NormalizedName>,
+    // r[impl gw.build.per-tenant-policy]
+    policy: crate::config::BuildPolicy,
 ) -> types::SubmitBuildRequest {
     types::SubmitBuildRequest {
         // Proto convention: empty string = absent/single-tenant.
@@ -866,7 +870,7 @@ pub fn build_submit_request(
         max_silent_time: 0,
         build_timeout: 0,
         build_cores: 0,
-        keep_going: false,
+        keep_going: policy.keep_going,
     }
 }
 
@@ -947,17 +951,42 @@ mod tests {
 
     #[test]
     fn test_build_submit_request_carries_tenant_name() {
+        use crate::config::BuildPolicy;
         let name = NormalizedName::new("team-foo").unwrap();
-        let req = build_submit_request(vec![], vec![], "ci", Some(&name));
+        let req = build_submit_request(vec![], vec![], "ci", Some(&name), BuildPolicy::default());
         assert_eq!(req.tenant_name, "team-foo");
         assert_eq!(req.priority_class, "ci");
 
         // None → empty string on the wire (proto's empty-as-absent
         // convention for single-tenant mode).
-        let req_empty = build_submit_request(vec![], vec![], "ci", None);
+        let req_empty = build_submit_request(vec![], vec![], "ci", None, BuildPolicy::default());
         assert_eq!(
             req_empty.tenant_name, "",
             "None tenant_name → empty string (single-tenant mode)"
+        );
+    }
+
+    #[test]
+    fn test_build_submit_request_applies_build_policy() {
+        use crate::config::BuildPolicy;
+        let name = NormalizedName::new("parity-leaf").unwrap();
+        let req = build_submit_request(
+            vec![],
+            vec![],
+            "ci",
+            Some(&name),
+            BuildPolicy { keep_going: true },
+        );
+        assert!(
+            req.keep_going,
+            "policy keep_going=true must reach the proto"
+        );
+
+        let req_default =
+            build_submit_request(vec![], vec![], "ci", Some(&name), BuildPolicy::default());
+        assert!(
+            !req_default.keep_going,
+            "default policy must keep today's keep_going=false"
         );
     }
 

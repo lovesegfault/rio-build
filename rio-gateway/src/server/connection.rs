@@ -671,7 +671,7 @@ pub struct ConnectionHandler {
     /// submits.
     pub(super) limiter: TenantLimiter,
     /// Per-tenant build-policy map, shared (`Arc`) with `GatewayServer`.
-    /// Resolved against `tenant_name` once per channel in `channel_exec`
+    /// Resolved against `tenant_name` once per channel in `exec_request`
     /// — the session sees the resolved `BuildPolicy`, not the map.
     pub(super) build_policy: Arc<crate::config::BuildPolicyMap>,
     /// Per-tenant quota cache, cloned from `GatewayServer`. Shared

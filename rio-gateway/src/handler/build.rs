@@ -1146,6 +1146,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         has_seen_build_paths_with_results,
         active_build_ids,
         tenant_name,
+        build_policy,
         jwt,
         limiter,
         quota_cache,
@@ -1266,8 +1267,13 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         return Ok(());
     }
 
-    let request =
-        translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
+    let request = translate::build_submit_request(
+        nodes,
+        edges,
+        priority_class,
+        tenant_name.as_ref(),
+        *build_policy,
+    );
 
     let mut build_result = match submit_and_process_build(
         stderr,
@@ -1691,6 +1697,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
         drv_cache,
         active_build_ids,
         tenant_name,
+        build_policy,
         jwt,
         limiter,
         quota_cache,
@@ -1721,7 +1728,8 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
-    let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
+    let request =
+        translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref(), *build_policy);
     let result = submit_and_process_build(
         stderr,
         scheduler_client,

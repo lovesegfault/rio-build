@@ -3113,3 +3113,43 @@ async fn test_build_derivation_store_error_during_verification() -> anyhow::Resu
     h.finish().await;
     Ok(())
 }
+
+// r[verify gw.build.per-tenant-policy]
+/// Per-tenant build policy reaches the scheduler: a session whose resolved
+/// per-tenant policy has `keep_going=true` submits with
+/// `SubmitBuildRequest.keep_going=true`. (The policy-less default staying
+/// `false` is covered by the `build_submit_request` unit tests in
+/// `translate.rs`.)
+#[tokio::test]
+async fn test_build_paths_policy_sets_keep_going() -> anyhow::Result<()> {
+    let policy = rio_gateway::config::BuildPolicy { keep_going: true };
+    let mut h = GatewaySession::new_with_tenant_and_policy("parity-leaf", policy).await?;
+    do_handshake(&mut h.stream).await?;
+    send_set_options(&mut h.stream).await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-kg.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,                                  // build_mode = Normal
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+
+    let submits = h.scheduler.submit_calls.read().unwrap().clone();
+    assert_eq!(submits.len(), 1, "scheduler should receive one SubmitBuild");
+    assert!(
+        submits[0].keep_going,
+        "policy keep_going must be on the wire"
+    );
+    assert_eq!(submits[0].tenant_name, "parity-leaf");
+
+    h.finish().await;
+    Ok(())
+}

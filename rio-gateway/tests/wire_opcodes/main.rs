@@ -22,7 +22,8 @@ use rio_nix::protocol::wire;
 use rio_test_support::fixtures::make_nar;
 use rio_test_support::grpc::{SubmitOutcome, WatchOutcome};
 use rio_test_support::wire::{
-    drain_stderr_expecting_error, drain_stderr_until_last, read_path_info,
+    do_handshake, drain_stderr_expecting_error, drain_stderr_until_last, read_path_info,
+    send_set_options,
 };
 use rio_test_support::{wire_bytes, wire_send};
 

@@ -200,7 +200,7 @@ pub struct GatewayServer {
     /// See `r[gw.rate.per-tenant]`.
     limiter: TenantLimiter,
     /// Per-tenant build-policy map from gateway.toml; resolved per
-    /// connection in `channel_exec` and stamped onto SubmitBuildRequest.
+    /// channel in `exec_request` and stamped onto SubmitBuildRequest.
     build_policy: Arc<crate::config::BuildPolicyMap>,
     /// Per-tenant store-quota cache (30s TTL). Clones share state
     /// — a quota reading fetched by one connection is warm for all.
