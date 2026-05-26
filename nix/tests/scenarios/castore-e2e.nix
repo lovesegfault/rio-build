@@ -308,22 +308,29 @@ let
 
   # eio-circuit-breaker: mount + prefetch happen while the store is up;
   # the 60 s pre-read window gives the test time to scale the store to 0
-  # (observed ~10-25 s); the six never-before-read inputs then all fail
-  # their fetches — each open is bounded by jit_fetch_timeout, and after
-  # 5 consecutive failures the breaker opens (swallowed failures, the
-  # script itself never fails). The test scrapes during the second tail
-  # and cancels.
+  # (observed ~10-25 s); the six never-before-read inputs are then read
+  # CONCURRENTLY — with the store gone each open fails at its own
+  # jit_fetch_timeout, so running them in parallel keeps the whole
+  # failure burst at ~one fetch budget of wall time (sequential reads
+  # would stack five 60 s budgets and push the build past the
+  # scheduler's 300 s client-less-build reaping). Six consecutive
+  # failures open the breaker; the seventh, sequential read then hits
+  # the OPEN breaker. All failures are swallowed — the script itself
+  # never fails; the test scrapes during the tail and cancels.
   eioBreakerDrv = pkgs.writeText "castore-eio-breaker.nix" ''
-    { busybox, e1, e2, e3, e4, e5, e6 }:
+    { busybox, e1, e2, e3, e4, e5, e6, e7 }:
     derivation {
       name = "rio-castore-eio-breaker";
       system = builtins.currentSystem;
       builder = "''${busybox}/bin/sh";
       extras = "''${e1} ''${e2} ''${e3} ''${e4} ''${e5} ''${e6}";
+      late = "''${e7}";
       args = [ "-c" '''
         echo CASTORE-MOUNTED
         for i in $(''${busybox}/bin/busybox seq 1 12); do ''${busybox}/bin/busybox sleep 5; done
-        for f in $extras; do ''${busybox}/bin/busybox cat $f > /dev/null || true; done
+        for f in $extras; do ''${busybox}/bin/busybox cat $f > /dev/null 2>&1 & done
+        wait || true
+        ''${busybox}/bin/busybox cat $late > /dev/null 2>&1 || true
         echo CASTORE-EIO-DONE
         for i in $(''${busybox}/bin/busybox seq 1 36); do ''${busybox}/bin/busybox sleep 5; done
         echo ok > $out
@@ -356,7 +363,8 @@ let
   # digest. Both inputs are cache hits by construction (chunk-warm read
   # them), so no whole-file miss promote can land in the restart
   # window. The build must COMPLETE (the test waits for it instead of
-  # cancelling).
+  # cancelling), so its 90 s hold window keeps the whole build well
+  # under the scheduler's 300 s client-less-build reaping.
   mountdRestartDrv = pkgs.writeText "castore-mountd-restart.nix" ''
     { busybox, small1m, warm4k }:
     derivation {
@@ -367,7 +375,7 @@ let
         exec 3<''${small1m}
         ''${busybox}/bin/busybox dd of=/dev/null bs=64k count=1 <&3 2>/dev/null || exit 1
         echo CASTORE-FD-HELD
-        for i in $(''${busybox}/bin/busybox seq 1 30); do ''${busybox}/bin/busybox sleep 5; done
+        for i in $(''${busybox}/bin/busybox seq 1 18); do ''${busybox}/bin/busybox sleep 5; done
         ''${busybox}/bin/busybox dd of=/dev/null bs=1M <&3 2>/dev/null || exit 1
         ''${busybox}/bin/busybox cat ''${warm4k} > /dev/null || exit 2
         echo ok > $out
@@ -617,53 +625,19 @@ let
 
     ${common.mkSubmitHelpers "k3s-server"}
 
-    # ── Build watchers ────────────────────────────────────────────────
-    # The scheduler's orphan watcher (sched.backstop.orphan-watcher)
-    # auto-cancels an Active build that has had no WatchBuild subscriber
-    # for ORPHAN_BUILD_GRACE (300 s). Real clients always watch their
-    # builds (the gateway holds the stream for every ssh-ng submission);
-    # the gRPC-direct submits here must behave the same or any build
-    # whose evidence window outlives the grace (eio-circuit-breaker,
-    # eio-infra-retry, mountd-restart) is reaped mid-test. One
-    # backgrounded grpcurl WatchBuild per async build over its own
-    # long-lived port-forward; the stream ends on its own when the build
-    # reaches a terminal state, and release_watch reaps the processes.
-    _watch_ports = iter(range(19450, 19490))
-    _build_watch_tags = {}
-
-    def watch_build(build_id):
-        tag = f"watch-{build_id[:8]}"
-        port = next(_watch_ports)
-        pf_open(leader_pod(), port, 9001, tag=tag)
-        payload = json.dumps({"buildId": build_id})
-        k3s_server.succeed(
-            f"${grpcurl} ${grpcurlTls} -max-time 1700 "
-            f"-H 'x-rio-tenant-token: {tenant_jwt}' "
-            f"-protoset ${protoset}/rio.protoset "
-            f"-d '{payload}' localhost:{port} "
-            "rio.scheduler.SchedulerService/WatchBuild "
-            f"> /tmp/{tag}.events 2>&1 & echo $! > /tmp/{tag}.grpcurl.pid"
-        )
-        _build_watch_tags[build_id] = tag
-        return tag
-
-    def release_watch(build_id):
-        tag = _build_watch_tags.pop(build_id, None)
-        if tag is None:
-            return
-        k3s_server.execute(
-            f"kill $(cat /tmp/{tag}.grpcurl.pid) 2>/dev/null; "
-            f"rm -f /tmp/{tag}.grpcurl.pid /tmp/{tag}.events"
-        )
-        pf_close(tag)
-
     def submit_drv(drv_file, extra_args="", **req):
-        """Async build driver for every sleep-tail subtest. Holds a
-        WatchBuild stream for the build so the orphan watcher never
-        reaps it mid-evidence."""
-        drv_path, build_id = submit_single_drv(drv_file, extra_args=extra_args, **req)
-        watch_build(build_id)
-        return drv_path, build_id
+        """Async build driver for every sleep-tail subtest.
+
+        These submissions have no watching client (a real client — the
+        gateway for ssh-ng builds — holds a WatchBuild stream), and the
+        scheduler's orphan watcher (sched.backstop.orphan-watcher)
+        cancels a client-less Active build after 300 s. Every subtest
+        therefore keeps its evidence window WELL under that: scrape
+        early, cancel early, and never let an async build's interesting
+        phase stack multiple fetch budgets sequentially (the breaker
+        subtest reads its failing inputs concurrently for exactly this
+        reason)."""
+        return submit_single_drv(drv_file, extra_args=extra_args, **req)
 
     def cancel_build(build_id, reason="castore-e2e: evidence captured"):
         payload = json.dumps({"buildId": build_id, "reason": reason})
@@ -677,11 +651,10 @@ let
 
     def finish_async(build_id, ctx=""):
         """Reclaim a sleep-tail build once its evidence is captured:
-        cancel (tolerating an already-terminal build), drop its watcher,
-        and wait for the executor pod to leave Running so the next
-        subtest starts with a quiet pool."""
+        cancel (tolerating an already-terminal build) and wait for the
+        executor pod to leave Running so the next subtest starts with a
+        quiet pool."""
         cancel_build(build_id)
-        release_watch(build_id)
         wait_no_running_builders()
         print(f"castore: {ctx or build_id} reclaimed (cancelled + pool quiet)")
 

@@ -5,9 +5,10 @@ scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
   #   big_f       24 MiB — the streaming subject for chunk-warm /
   #                        integrity-fail (>8 MiB threshold, 3× margin).
-  #   eio_extra_1..6 64 KiB — never-read inputs whose fetches all fail
-  #                        once the store is scaled away (≥5 consecutive
-  #                        failures trip the breaker).
+  #   eio_extra_1..7 64 KiB — never-read inputs whose fetches all fail
+  #                        once the store is scaled away (six concurrent
+  #                        reads trip the breaker, the seventh hits the
+  #                        already-open breaker).
   #   eio-builder script  — a busybox-shebang script used as a drv's
   #                        BUILDER; its store-side chunk is taken offline
   #                        so the daemon's execve gets EIO from the
@@ -16,7 +17,7 @@ scope: with scope; ''
   with subtest("seed-faults: generate + push fault-injection inputs as vm-castore"):
       client.succeed(
           "dd if=/dev/urandom of=/tmp/castore-big-f.bin bs=1M count=24 2>/dev/null && "
-          "for i in 1 2 3 4 5 6; do "
+          "for i in 1 2 3 4 5 6 7; do "
           "  dd if=/dev/urandom of=/tmp/castore-eio-extra-$i.bin bs=64k count=1 2>/dev/null; "
           "done && "
           "dd if=/dev/urandom of=/tmp/castore-post-seed.bin bs=64k count=1 2>/dev/null"
@@ -44,13 +45,14 @@ scope: with scope; ''
           "/tmp/castore-eio-extra-4.bin",
           "/tmp/castore-eio-extra-5.bin",
           "/tmp/castore-eio-extra-6.bin",
+          "/tmp/castore-eio-extra-7.bin",
           "/tmp/castore-eio-builder",
           "/tmp/castore-post-seed.bin",
       )
       p_big_f = seeded[0]
-      p_eio_extras = seeded[1:7]
-      p_eio_builder = seeded[7]
-      p_post_seed = seeded[8]
+      p_eio_extras = seeded[1:8]
+      p_eio_builder = seeded[8]
+      p_post_seed = seeded[9]
 
       assert_not_cached(b3_big_f, "big_f before any build")
       assert_not_cached(b3_eio_builder, "eio builder before any build")

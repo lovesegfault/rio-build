@@ -5,20 +5,20 @@ scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
   # The build mounts and prefetches while the store is up, then sleeps a
   # 60 s window during which the test scales rio-store to 0 (observed
-  # ~10-25 s). The six never-before-read 64 KiB inputs it cats
-  # afterwards all fail their fetches. With the deployment scaled away
-  # the ClusterIP has no endpoints and connects hang rather than reset,
-  # so each failed open is bounded by jit_fetch_timeout (60 s) — not
-  # instant, but never an unbounded hang — and after 5 consecutive
-  # failures the fetch breaker opens (circuit_open = 1) so everything
-  # after fails fast. The script swallows the failures — the build
-  # itself is reclaimed by cancel, and the store is scaled back up
-  # before the next subtest.
+  # ~10-25 s). The six never-before-read 64 KiB inputs it then reads
+  # CONCURRENTLY all fail their fetches: with the deployment scaled away
+  # the connections hang rather than reset, so each open is bounded by
+  # its own jit_fetch_timeout (60 s) — never an unbounded hang — and
+  # because the reads run in parallel the whole burst costs ~one fetch
+  # budget of wall time. Six consecutive failures open the breaker
+  # (circuit_open = 1); the script's seventh, sequential read then hits
+  # the already-open breaker. All failures are swallowed — the build is
+  # reclaimed by cancel and the store scaled back up before the next
+  # subtest.
   #
-  # The wait budget on the breaker gate is the EIO-bounded proof:
-  # 60 s window + 5 × jit_fetch_timeout ≈ 360 s worst case before the
-  # breaker opens; 540 s covers it with headroom, while a true hang
-  # (an open that never returns) would still blow the gate.
+  # The breaker-gate budget is the bounded-EIO proof: 60 s pre-read
+  # window + ~one concurrent fetch budget (60 s) + headroom = 300 s. An
+  # open that hung past its budget would blow the gate.
   with subtest("eio-circuit-breaker: store outage trips the fetch breaker, opens stay bounded"):
       extras_args = " ".join(
           f"--arg e{i + 1} '(builtins.storePath {p})'" for i, p in enumerate(p_eio_extras)
@@ -43,13 +43,12 @@ scope: with scope; ''
       print(f"eio-circuit-breaker: store scaled away in {time.time() - t_down:.0f}s "
             "(must be well under the script's 60s pre-read window)")
 
-      # The breaker opening is the structural "five consecutive reads
-      # failed, each within its fetch budget" signal. 540 s = 60 s
-      # pre-read window + 5 × 60 s jit_fetch_timeout + headroom.
+      # The breaker opening is the structural "the concurrent reads all
+      # failed within their fetch budgets" signal.
       wait_worker_metric(
           pod,
           "grep -Eq '^rio_builder_castore_fuse_circuit_open 1(\\.0+)?$'",
-          timeout=540,
+          timeout=300,
           ctx="eio-circuit-breaker breaker open",
       )
 
@@ -61,9 +60,9 @@ scope: with scope; ''
       assert n_circuit == 1, (
           f"eio-circuit-breaker: circuit_open gauge = {n_circuit}, expected 1"
       )
-      assert n_eio >= 5, (
-          f"eio-circuit-breaker: only {n_eio} EIO replies for six failed opens "
-          f"(expected ≥ 5)"
+      assert n_eio >= 6, (
+          f"eio-circuit-breaker: only {n_eio} EIO replies for six concurrently "
+          f"failed opens (expected ≥ 6)"
       )
       assert n_miss_small >= 5, (
           f"eio-circuit-breaker: only {n_miss_small} miss_small opens recorded; "

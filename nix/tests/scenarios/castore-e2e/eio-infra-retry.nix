@@ -74,7 +74,6 @@ scope: with scope; ''
       # retryable: the same derivation must now complete, and the
       # builder script's digest lands in the node cache on the way.
       wait_drv_status(drv_eio, ["completed"], timeout=600, ctx="eio-infra-retry recovery")
-      release_watch(build_eio)
       assert_cached(b3_eio_builder, "eio builder after the successful retry", timeout=120)
 
       # Classification evidence: the executor's reclassified error
