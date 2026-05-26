@@ -120,9 +120,10 @@ const WAIT_SLOP: Duration = Duration::from_secs(30);
 /// floor needs ≈127 s; the previous flat 60 s timeout aborted the fetch
 /// mid-stream → daemon ENOENT → PermanentFailure poison.
 ///
-/// Tune DOWN if `rio_builder_input_materialization_failures_total` is
-/// sustained nonzero (means real throughput is below this floor —
-/// cross-AZ builders, S3 throttle).
+/// Tune DOWN if builds keep failing while materializing inputs (fetch
+/// durations pinned at the timeout, ENOENT-on-input infrastructure
+/// failures) — that means real store→builder throughput is below this
+/// floor (cross-AZ builders, S3 throttle).
 pub const JIT_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
 
 /// Per-path JIT fetch timeout: `max(base, nar_size / MIN_THROUGHPUT)`.

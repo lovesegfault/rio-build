@@ -147,13 +147,6 @@ pub fn describe_metrics() {
          limit is undersized for its workload."
     );
     describe_counter!(
-        "rio_builder_input_materialization_failures_total",
-        "Daemon MiscFailure reclassified as InfrastructureFailure because the \
-         missing path is in the build's input closure (I-178). Sustained \
-         nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder \
-         throughput; lower the floor."
-    );
-    describe_counter!(
         "rio_builder_fuse_cache_hits_total",
         "FUSE cache hits (local symlink_metadata succeeded)"
     );

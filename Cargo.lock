@@ -6079,7 +6079,6 @@ dependencies = [
  "metrics",
  "nix 0.31.3",
  "prost-types",
- "regex",
  "reqwest",
  "rio-common",
  "rio-exec",

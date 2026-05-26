@@ -22,9 +22,10 @@
 //! derivation is; everything Nix-specific is resolved HERE into plain
 //! mounts, files, argv and env.
 //!
-//! Not yet wired into `execute_build` — the activation milestone
-//! replaces `run_daemon_lifecycle` with `rio_exec::execute()` and
-//! consumes this module.
+//! This is the live request path: `run_native_lifecycle` calls
+//! [`derivation_into_request`] for every build and hands the resulting
+//! request (or the builtin:fetchurl re-exec plan) to
+//! `rio_exec::execute()`.
 
 pub(crate) mod attrs;
 pub(crate) mod builtin;

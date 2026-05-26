@@ -414,14 +414,6 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   MUST follow the `rio_builder_*` naming prefix.
 ]
 
-#r("obs.metric.input-materialization-failures")[
-  #(refs.metric)("rio_builder_input_materialization_failures_total")
-  (counter): incremented each time a daemon `MiscFailure` is reclassified as
-  `InfrastructureFailure` under #rref("builder.result.input-enoent-is-infra").
-  Sustained nonzero rate indicates `JIT_MIN_THROUGHPUT_BPS` is set above
-  actual store→builder throughput.
-]
-
 #r("obs.metric.transfer-volume")[
   Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop:
   gateway (#(refs.metric)("rio_gateway_bytes_total")`{direction}`), store
