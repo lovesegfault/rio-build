@@ -398,8 +398,8 @@ tracey rule or phase deferral.
     [Sandbox enforcement],
     [Executor],
     [Implemented],
-    [Every build runs inside the rio-exec sandbox (user/mount/PID namespaces,
-      plus a network namespace for everything except fixed-output builds),
+    [Every build runs inside the rio-exec sandbox (mount/PID/IPC/UTS/cgroup
+      namespaces, plus a network namespace for everything except fixed-output builds),
       constructed unconditionally by the executor itself with no unsandboxed
       fallback (#rref("builder.exec.sandbox+2")); the daemon-era
       `sandbox = true` `nix.conf` knob is gone along with the daemon.],
