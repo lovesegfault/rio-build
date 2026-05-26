@@ -123,7 +123,7 @@ See #cross-link("/spec/system/security.typ")[Security: Secrets Management] for r
 - Authorized SSH keys (gateway)
 - @nar signing key (store)
 - Database credentials (scheduler, store)
-- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, expiry_unix} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
+- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both (helm: `assignmentHmac.secretName`, mounted on the scheduler and store Deployments). The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, expiry_unix, tenant} at dispatch; the store verifies on `PutPath` and on castore `DirectoryService`/`BlobService` reads, where the token is the builder's only tenant credential --- without this pair every builder castore read fails closed. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
 #info[
   *SSH key mounting:* On EKS deploys (`xtask k8s -p eks up`), the bootstrap Job generates `rio/gateway-host-key` in AWS Secrets Manager and ESO syncs it to the `rio-gateway-host-key` Secret; deploy sets `gateway.ssh.hostKeySecret` to that name so all replicas present the same host key across restarts. On other deployments, the chart default leaves `hostKeySecret` empty — the gateway then generates an ephemeral key per pod (fine for dev; breaks `known_hosts` on reschedule and across replicas). `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.

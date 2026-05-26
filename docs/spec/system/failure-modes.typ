@@ -56,10 +56,12 @@ Split-brain is bounded by the Kubernetes Lease renew deadline (default 15s):
 
 If rio-store is degraded (slow but not down), all executors' @fuse cache misses
 queue up:
-- Executors' FUSE read operations block, causing build sandboxes to stall
+- Executors' castore-FUSE cold `open()`s (and mid-fill `read()`s) block,
+  causing build sandboxes to stall
 - The scheduler's @backpressure mechanism (actor queue depth > 80%) rejects new
   builds with `RESOURCE_EXHAUSTED`
-- After 5 consecutive `ensure_cached` failures, the FUSE circuit breaker opens
-  and `check()` returns `EIO` immediately (fail-fast). The existing
-  `WAIT_DEADLINE` timeout on each fetch feeds the failure counter. See
-  `builder.fs.fetch-circuit` (ADR-022).
+- After 5 consecutive castore fetch failures (`ReadBlob`/`StatBlob`/chunk
+  fetches on the `open()` path), the castore-FUSE fetch breaker opens and
+  `check()` returns `EIO` immediately (fail-fast). Each fetch's own budget
+  (`jit_fetch_timeout`, the streaming fill's size-aware deadline) bounds it
+  and feeds the failure counter. See `builder.fs.fetch-circuit` (ADR-022).

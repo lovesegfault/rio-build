@@ -327,12 +327,12 @@
   (
     key: "assignment-token",
     short: [assignment token],
-    description: [An HMAC-SHA256-signed token issued by the scheduler when dispatching work to an executor. Claims: `(executor_id, drv_hash, expected_outputs, is_ca, expiry_unix)`. Verified by rio-store on `PutPath`.],
+    description: [An HMAC-SHA256-signed token issued by the scheduler when dispatching work to an executor. Claims: `(executor_id, drv_hash, expected_outputs, is_ca, expiry_unix, tenant)`. Verified by rio-store on `PutPath` and on castore `DirectoryService`/`BlobService` reads, where the signed `tenant` claim is the builder's only tenant credential.],
   ),
   (
     key: "prefetch-hint",
     short: [prefetch hint],
-    description: [A message sent by the scheduler to an executor via the `BuildExecution` stream before assigning a build, listing input closure paths that the executor's FUSE cache should pre-warm. Converts serial "fetch then build" into overlapped execution.],
+    description: [A message sent by the scheduler to an executor via the `BuildExecution` stream before assigning a build, listing the input closure's store paths. Since the ADR-022 castore cutover there is no pod-level cache to pre-warm: the executor acknowledges immediately with `PrefetchComplete` (zero counts) so the scheduler's warm-gate opens, and input materialization happens per-build via the castore mount's DAG prefetch and JIT `open()` fetches. The hint/gate pair survives only as a vestigial handshake slated for post-cutover removal.],
   ),
   (
     key: "poison-derivation",

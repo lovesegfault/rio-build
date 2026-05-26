@@ -8,9 +8,9 @@ Status: **Accepted.** Three earlier candidates (EROFS+fscache, custom `riofs` km
 
 ## 0. Deployment context
 
-Builder nodes run a NixOS-based AMI. Kernel configuration is first-party: `boot.kernelPatches[].extraStructuredConfig` in the AMI flake sets `OVERLAY_FS=y FUSE_FS=y FUSE_PASSTHROUGH=y` and the node module asserts kernel ≥6.9 at boot. No custom Kconfig symbols are required — all are stock-on in distro defconfigs; the patch block is for `=y` over `=m` only.
+Builder nodes run a NixOS-based AMI. Kernel configuration is stock — no rebuild: `CONFIG_FUSE_FS=m` and `CONFIG_OVERLAY_FS=m` come from nixpkgs' `autoModules`, `CONFIG_FUSE_PASSTHROUGH=y` is the upstream Kconfig default, and `nix/nixos-node/kernel.nix` sets `boot.kernelModules = ["fuse" "overlay"]` (loaded before `rio-mountd` starts) and asserts kernel ≥6.9 at module eval. The earlier `boot.kernelPatches[].extraStructuredConfig` `=y` block was dropped — it bought nothing and cost a full kernel rebuild on every nixpkgs bump (see Design Overview §15).
 
-Device exposure: `/dev/fuse` reaches the builder via `rio-mountd` fd-handoff (§2.5); `/dev/kvm` reaches kvm-pool builds via `hostPath` CharDevice + `extra-sandbox-paths`. No device-plugin DaemonSet.
+Device exposure: containerd's `base_runtime_spec` injects `/dev/fuse` into every executor pod — the builder opens and `mount(2)`s it itself and hands `rio-mountd` a dup only for ioctl brokering (§2.5); `/dev/kvm` reaches kvm-pool builds via `hostPath` CharDevice + `extra-sandbox-paths`. No device-plugin DaemonSet.
 
 ---
 
@@ -92,7 +92,7 @@ overlayfs delegates dentry revalidation to the lower's `d_op->d_revalidate` ([`o
 Privilege is split: a node-level **`rio-mountd`** (CAP_SYS_ADMIN, DaemonSet) handles the operations the unprivileged builder cannot: broker `FUSE_DEV_IOC_BACKING_OPEN`/`_CLOSE` (init-ns `CAP_SYS_ADMIN` — [`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c), kernel `TODO: relax once backing files are visible to lsof`) and own the verified-write to the shared node caches. Opening `/dev/fuse` is NOT on that list: executor pods carry the device node (containerd `base_runtime_spec`) and the kernel requires the opening userns to be the mounting userns, so the builder opens it and hands mountd a dup. Per build connection on the UDS:
 
 1. The **builder** opens `/dev/fuse` (executor pods carry the device node via containerd's `base_runtime_spec`) and sends a dup to mountd inside `Mount{build_id}`'s `SCM_RIGHTS`; mountd keeps it as the target for later `BACKING_OPEN`/`_CLOSE` ioctls. mountd does **not** open the device and does **not** mount anything: the kernel only accepts a fuse `mount(2)` from the user namespace that opened the device (`fs/fuse/inode.c`), and the shipped DaemonSet is unprivileged (`CAP_SYS_ADMIN`, not `privileged:true`) so a daemon-side mount could never propagate into builder pods — the builder `mount(2)`s its own fd (step (a′) below), and the mount dies with the builder's mount namespace
-2. `mkdirat(staging_base_dirfd, build_id, 0700)` chown to `SO_PEERCRED.uid`. The UDS socket is mode 0660, group `rio-builder`; mountd verifies `SO_PEERCRED.gid == rio-builder` and rejects others. **`build_id` MUST match `^[A-Za-z0-9_-]{1,64}$`** (`r[builder.mountd.build-id-validated]`) — mountd rejects `Mount{}` with `BadBuildId` otherwise; all per-build path construction is `openat(base_dirfd, build_id, O_NOFOLLOW)` against pre-opened `/var/rio/{castore,staging}` dirfds, never string concat. **One connection per `SO_PEERCRED.uid`** (`r[builder.mountd.uid-bound]`): k8s userns gives each pod a distinct host-uid range, so binding by uid (not gid) prevents a sandbox-escaped build from opening a *second* connection. **One live `build_id` per process** (`r[builder.mountd.build-id-unique]`): mountd holds a process-wide set of in-use `build_id`s and rejects `Mount{}` with `DuplicateBuildId` if present — uid-bound alone does not stop a compromised builder using its *own* (first) connection to `Mount{victim_id}` after enumerating co-tenants via `ls /var/rio/staging/`.
+2. `mkdirat(staging_base_dirfd, build_id, 0700)` chown to `SO_PEERCRED.uid`. The UDS socket is mode 0660, group `rio-builder`; mountd verifies `SO_PEERCRED.gid == rio-builder` and rejects others. **`build_id` MUST match `^[A-Za-z0-9_-]{1,64}$`** (`r[builder.mountd.build-id-validated]`) — mountd rejects `Mount{}` with `BadBuildId` otherwise; all per-build path construction is `openat(base_dirfd, build_id, O_NOFOLLOW)` against the pre-opened `/var/rio/staging` base dirfd, never string concat (mountd creates no per-build castore paths at all — `/var/rio/castore` is touched only by the startup pre-cutover orphan scan). **One connection per `SO_PEERCRED.uid`** (`r[builder.mountd.uid-bound]`): k8s userns gives each pod a distinct host-uid range, so binding by uid (not gid) prevents a sandbox-escaped build from opening a *second* connection. **One live `build_id` per process** (`r[builder.mountd.build-id-unique]`): mountd holds a process-wide set of in-use `build_id`s and rejects `Mount{}` with `DuplicateBuildId` if present — uid-bound alone does not stop a compromised builder using its *own* (first) connection to `Mount{victim_id}` after enumerating co-tenants via `ls /var/rio/staging/`.
 3. Serve `seq`-tagged requests for the build's lifetime (tokio per-conn task; replies echo `seq` so out-of-order `Promote` correlates): **`BackingOpen{fd}`** — `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN, {fd}) → backing_id` (mountd does not inspect the fd — the ioctl rejects depth>0 backing, and `backing_id` is conn-scoped). **`BackingClose{id}`**. **`PromoteChunks{[chunk_digest]}`** (batched ≤64) — verify-copy each `staging/chunks/<hex>` → `/var/rio/chunks/ab/<hex>`. **`Promote{digest}`** (on `spawn_blocking` + `Semaphore(num_cpus)`) — verify-copy the assembled file from staging into cache (§2.6).
 
 The builder, inside its unprivileged userns (continuing with the fd it opened in step 1):
@@ -108,7 +108,7 @@ Teardown — builder unmounts (or its pod exits), then closes the UDS:
 
 r[builder.mountd.orphan-scan]
 
-Crash-safety: `rio-mountd` start-up scans `/var/rio/castore/*` and `/var/rio/staging/*` for orphans from a prior crash and removes them.
+Crash-safety: `rio-mountd` start-up scans `/var/rio/castore/*` (pre-cutover leftovers only) and `/var/rio/staging/*` for orphans from a prior crash and removes them.
 
 r[builder.fs.fd-handoff-ordering+2]
 
@@ -133,7 +133,7 @@ The FUSE `read` op exists only for case (3)'s streaming window; in steady state 
 
 r[builder.fs.shared-backing-cache]
 
-The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`, §2.5) for cross-pod isolation. The **backing cache** (`/var/rio/cache/ab/<digest>`) is shared node-SSD, **owned by `rio-mountd` and read-only to builder pods** (mode 0755/0444). Builders cannot write the cache directly — a sandbox-escaped build writing poisoned bytes there would otherwise be passthrough-read by the next build unverified (the same lateral-movement surface §2.8 rejects for a cluster-wide cache).
+The FUSE **mount point** is per-build and builder-owned (`{overlay_base_dir}/{build_id}.castore`, §2.5; `/var/rio/castore/` remains only as the pre-cutover orphan-scan target) for cross-pod isolation. The **backing cache** (`/var/rio/cache/ab/<digest>`) is shared node-SSD, **owned by `rio-mountd` and read-only to builder pods** (mode 0755/0444). Builders cannot write the cache directly — a sandbox-escaped build writing poisoned bytes there would otherwise be passthrough-read by the next build unverified (the same lateral-movement surface §2.8 rejects for a cluster-wide cache).
 
 r[builder.mountd.promote-verified]
 
@@ -156,7 +156,7 @@ Per-file integrity lives in the FUSE `open()` handler: **verify each chunk's bla
 | **FUSE handler crash** | overlayfs `lookup`/`open()` on the lower → `ENOTCONN`. **Passthrough-opened files keep working** — `fuse_passthrough_read_iter` ([passthrough.c:28-51](https://github.com/torvalds/linux/blob/master/fs/fuse/passthrough.c)) reads `ff->passthrough` directly with no `fc->connected` check; `fuse_abort_conn` ([dev.c:2451-2522](https://github.com/torvalds/linux/blob/master/fs/fuse/dev.c)) never touches `ff->passthrough` or `fc->backing_files_map`. Streaming-mode opens lose their `read` server. | Abort is terminal — the build is failed-infra and re-queued; the next pod issues a fresh `Mount{}` and gets a new `fuse_conn`. The IDR slot for the dead connection's backing-ids leaks until unmount (bounded; reaped at `fuse_conn_put`). **No D-state**, no `restore` dance. |
 | **FUSE handler hung mid-fetch** | `open()` blocks in `S` (interruptible — `request_wait_answer` [dev.c:552/568](https://github.com/torvalds/linux/blob/master/fs/fuse/dev.c) `wait_event_interruptible`/`_killable`). | Per-spawn `tokio::timeout` returns `EIO` to the open; build fails loudly. |
 | **Lookup ENOENT** | overlay caches negative dentry; subsequent probes 0-upcall. | Handler returns ENOENT only for names outside the closure's declared-input tree — correct (JIT fetch imperative). |
-| **Build completes / pod exits** | Builder mount-ns death drops overlay; `castore_mnt` FUSE mount persists in init-ns. | `rio-mountd` detaches it on UDS close (§2.5 teardown); start-up scan reaps orphans from a prior crash. |
+| **Build completes / pod exits** | Builder mount-ns death drops both the overlay and the castore-FUSE mount — the builder mounted both inside its own namespace. | `rio-mountd` on UDS close reaps `staging/{build_id}` and releases the uid/build_id claims (§2.5 teardown); start-up scan reaps staging orphans (plus pre-cutover `/var/rio/castore` leftovers) from a prior crash. |
 
 r[builder.fs.streaming-open-threshold]
 
@@ -166,19 +166,15 @@ r[builder.fs.streaming-open-threshold]
 
 ### 2.9 Kconfig (NixOS)
 
+Stock kernel, no rebuild (see §0 and Design Overview §15): `CONFIG_FUSE_FS=m` / `CONFIG_OVERLAY_FS=m` from nixpkgs `autoModules`, `CONFIG_FUSE_PASSTHROUGH=y` as the upstream Kconfig default, and
+
 ```nix
-boot.kernelPatches = [{
-  name = "overlay-castore-fuse";
-  patch = null;
-  extraStructuredConfig = with lib.kernel; {
-    OVERLAY_FS       = yes;       # nixpkgs default =m
-    FUSE_FS          = yes;
-    FUSE_PASSTHROUGH = yes;
-  };
-}];
+boot.kernelModules = [ "fuse" "overlay" ];
 ```
 
-Requires kernel **≥6.9** (`FUSE_PASSTHROUGH`, [`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a)). The NixOS-node module asserts version + config at boot.
+in `nix/nixos-node/kernel.nix` so the modules are loaded (and `/dev/fuse` exists) before `rio-mountd` starts. The original draft's `boot.kernelPatches[].extraStructuredConfig` `=y` block was dropped — functionally equivalent, but it forced a ~40 min kernel rebuild on every nixpkgs bump.
+
+Requires kernel **≥6.9** (`FUSE_PASSTHROUGH`, [`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a)). The NixOS-node module asserts version + config at module eval.
 
 r[builder.fs.passthrough-stack-depth]
 

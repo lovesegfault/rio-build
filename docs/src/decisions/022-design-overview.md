@@ -37,7 +37,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 │    overlay (rw, userxattr)                                                         │
 │    ├── upper     = local SSD                 ← build outputs + db.sqlite land here │
 │    └── lower     = castore-FUSE              ← lookup/getattr/readdir/readlink     │
-│         at /var/rio/castore/{build_id}/         from in-heap Directory DAG;        │
+│         at {overlay_base}/{build_id}.castore    from in-heap Directory DAG;        │
 │         (Duration::MAX ttl, READDIRPLUS,        open() → file_digest backing cache │
 │          per-digest inodes)                                                        │
 │                  │                                                                 │
@@ -78,7 +78,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 
 The builder assembles `/nix/store` from two layers per build:
 
-1. **castore-FUSE** — a `fuser` filesystem the builder mounts on a per-build mountpoint inside its own mount namespace (under the build's working area; the `/dev/fuse` fd comes from rio-mountd) serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
+1. **castore-FUSE** — a `fuser` filesystem the builder mounts on a per-build mountpoint inside its own mount namespace (under the build's working area; the builder opens `/dev/fuse` itself and hands rio-mountd a dup only for ioctl brokering) serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
 
 r[builder.overlay.castore-lower]
 
@@ -145,7 +145,7 @@ The FUSE `read` op exists only for case (3)'s window; in steady state every open
 
 r[builder.fs.node-digest-cache]
 
-The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`) so one build's mount namespace never exposes another's. The **backing cache** (`/var/rio/cache/`) is node-shared SSD, **owned by `rio-mountd` and read-only to builder pods**. Builders fetch into a per-build **staging dir** (`/var/rio/staging/{build_id}/`, builder-writable); after verify they send `Promote{digest}` to mountd, which stream-copies from staging into a fresh mountd-owned cache file while re-hashing, and renames into place only on `blake3 == digest`. The copy is the integrity boundary — the cache inode is one mountd created and verified; a sandbox-escaped build cannot poison it.
+The FUSE **mount point** is per-build and builder-owned (`{overlay_base_dir}/{build_id}.castore`, a sibling of the build's overlay dir) so one build's mount namespace never exposes another's; `/var/rio/castore/` survives only as the pre-cutover orphan-scan target. The **backing cache** (`/var/rio/cache/`) is node-shared SSD, **owned by `rio-mountd` and read-only to builder pods**. Builders fetch into a per-build **staging dir** (`/var/rio/staging/{build_id}/`, builder-writable); after verify they send `Promote{digest}` to mountd, which stream-copies from staging into a fresh mountd-owned cache file while re-hashing, and renames into place only on `blake3 == digest`. The copy is the integrity boundary — the cache inode is one mountd created and verified; a sandbox-escaped build cannot poison it.
 
 For files > `STREAM_THRESHOLD`, mountd also owns `/var/rio/chunks/ab/<chunk_blake3>`: the streaming fill task `open()`s here before `GetChunks`, writes misses into its own staging, and batches `PromoteChunks{[digest]}` for other builds' benefit (assembly never blocks on it). Chunks are independently content-addressed, so mountd's verify is context-free — concurrent builds share progress at chunk granularity without coordination. The second build to open `libLLVM.so` reads its chunks from local SSD even while the first is mid-fill. Eviction is mountd's LRU sweep over both cache and chunks under disk-pressure watermark.
 
@@ -307,7 +307,7 @@ fs-verity is **not** used. FUSE's fs-verity support (kernel ≥6.10, [`9fe2a036`
 | castore-FUSE hung mid-fetch | `open()` blocks in `S` (interruptible) | per-spawn `tokio::timeout` returns `EIO`; build classified infrastructure-failure (`r[builder.result.input-eio-is-infra]`) and re-queued |
 | `lookup` `ENOENT` | overlay caches negative dentry; subsequent probes 0-upcall | only returned for names outside the declared-input tree — correct behavior |
 | chunk integrity mismatch | n/a (userspace) | fetch aborted, `.partial` discarded, build fails infrastructure-error |
-| rio-mountd crash | existing mounts unaffected; new build-starts block on UDS connect | DaemonSet restarts; start-up orphan scan detaches stale `castore/{build_id}` mounts |
+| rio-mountd crash | existing mounts unaffected; new build-starts block on UDS connect | DaemonSet restarts; start-up orphan scan reaps stale staging trees (plus pre-cutover `/var/rio/castore` leftovers) — live builder-ns mounts need no recovery |
 | Express cache tier unavailable | n/a | `TieredChunkBackend` falls back to direct S3-standard reads; metric `rio_store_tiered_local_hit_ratio` drops |
 | PostgreSQL unavailable | n/a | rio-store gRPC + HTTP surfaces fail (no manifests, no narinfo). With `binary_cache_compat` enabled, clients substitute directly from `s3://bucket` (stock-Nix path); with it disabled, nothing substitutes until PG recovers. |
 | compat S3 write fails post-commit | n/a | `PutPath` succeeds; `rio_store_compat_write_failures_total` increments; reconciler picks the path up on its next sweep |

@@ -526,7 +526,7 @@ requirement and the display-only / no-pod-identity rationale live in
   lower layer. The kernel rejects overlay mounts where upper and lower are on
   the same filesystem when the lower is a FUSE mount. In practice, the
   upper/work directories should be on the builder's local SSD (`emptyDir` or
-  PVC), while the lower is the FUSE mount at `/var/rio/fuse-store`. The upper
+  PVC), while the lower is the per-build castore-FUSE mount. The upper
   also MUST NOT itself be on an overlayfs (containerd root overlay) ---
   overlayfs-as-upperdir cannot create `trusted.*` xattrs and `mount()` returns
   `EINVAL`.
@@ -909,8 +909,9 @@ it.
   Overlayfs and the Nix sandbox both use mounts; the per-build store is
   reached via Nix's chroot-store mechanism, not by bind-mounting at
   `/nix/store`. The ordering is:
-  + Builder sets up the FUSE mount at `/var/rio/fuse-store` and creates the
-    per-build overlayfs (lower: FUSE only; upper: SSD; merged at
+  + Builder sets up the per-build castore-FUSE mount at
+    `{overlay_base_dir}/{build_id}.castore` and creates the per-build
+    overlayfs (lower: castore-FUSE only; upper: SSD; merged at
     `{build_dir}/nix/store`) --- all in the builder's mount namespace.
   + Builder forks `nix-daemon --stdio --store 'local?root={build_dir}'` in a
     thin child mount namespace (`unshare(CLONE_NEWNS)`). The namespace exists
@@ -1133,13 +1134,13 @@ is stable (post Phase 3).
 #r("builder.cancel.pre-cgroup-deferred")[
   A cancel that arrives before the per-build cgroup exists (`cgroup.kill` →
   ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag
-  before the prefetch/register phase and abort with `Cancelled` status without
-  spawning nix-daemon. The pre-cgroup window is overlay setup → resolve →
-  prepare_sandbox → register_inputs + prefetch_manifests --- sub-second since
-  the I-043 redesign deleted the warm phase (which I-165 showed could stall
-  for tens of minutes). The misclassification risk (a later unrelated `Err`
-  reported as `Cancelled`) is the lesser evil vs. an unkillable builder
-  burning `activeDeadlineSeconds` of compute.
+  before spawning nix-daemon and abort with `Cancelled` status. The
+  pre-cgroup window is castore mount (DAG prefetch + serve) → overlay setup →
+  resolve → prepare_sandbox --- bounded by `dag_prefetch_timeout` plus a few
+  RPCs since the I-043 redesign deleted the warm phase (which I-165 showed
+  could stall for tens of minutes). The misclassification risk (a later
+  unrelated `Err` reported as `Cancelled`) is the lesser evil vs. an
+  unkillable builder burning `activeDeadlineSeconds` of compute.
 ]
 
 = Input Materialization
@@ -1150,7 +1151,13 @@ gets a cached negative dentry and never contacts the store), and a cold
 `open()` JIT-fetches the file by digest into the node-shared backing cache
 with a size-aware budget. Fetch failures surface to the build as `EIO`
 (never `ENOENT`) and are classified as infrastructure failures
-(`builder.result.input-eio-is-infra`).
+(`builder.result.input-eio-is-infra`). The daemon-stderr reclassification is
+errno-restricted: for failures *inside* a declared input (the daemon's
+`executing '…'` / `opening file '…'` phrasings) only availability errors
+(`EIO`, `ENOTCONN`, timeouts) reclassify to infrastructure --- `ENOENT` or
+`EACCES` under an existing input (e.g. `<input>/bin/missing`) stays a
+permanent build failure; the input root itself failing to resolve
+reclassifies on any errno.
 
 = Stream Relay & Reconnect
 
@@ -1354,8 +1361,10 @@ with a size-aware budget. Fetch failures surface to the build as `EIO`
       `InfrastructureFailure` classification],
 
     [*Recovery*],
-    [Controller spawns a fresh Job for the re-queued derivation. New pod
-      starts with cold FUSE cache.],
+    [Controller spawns a fresh Job for the re-queued derivation. The new
+      pod's castore mount starts cold (in-heap DAG, dcache), but the
+      node-shared backing cache survives --- files already fetched on that
+      node are served from local SSD, not re-fetched.],
   ),
   caption: [Builder pod failure (from the component failure matrix).],
 )
@@ -1379,13 +1388,15 @@ access potentially hundreds of gigabytes of store paths without
 pre-materializing everything; the store model must support concurrent builds
 with isolation, be Kubernetes-native, and avoid shared mutable state.
 
-Each worker runs a custom FUSE filesystem (the `fuse` module in `rio-builder`)
-mounted at a configurable path (default `/var/rio/fuse-store`). The FUSE
-daemon lazily fetches store path content from rio-store via gRPC on demand,
-caches fetched content on local SSD with LRU eviction, and exploits store path
+Each build mounts a content-addressed castore-FUSE filesystem (the
+`castore_fuse` module in `rio-builder`, ADR-022) at a per-build mountpoint
+(`{overlay_base_dir}/{build_id}.castore`). The handler serves metadata from
+the closure's prefetched Directory DAG and lazily fetches file bytes from
+rio-store via gRPC on first `open()` into a node-shared, mountd-owned SSD
+cache (swept under disk pressure), exploiting store path
 immutability so cached data never needs invalidation. Each build gets a
 per-build overlayfs (#rref("builder.overlay.stacked-lower+2")): the lower
-layer is the FUSE mount only; the upper layer is `{overlay_base_dir}/{build_id}/upper/nix/store/` on a local-disk emptyDir volume (must be a real
+layer is the castore-FUSE mount only; the upper layer is `{overlay_base_dir}/{build_id}/upper/nix/store/` on a local-disk emptyDir volume (must be a real
 filesystem --- overlayfs-as-upperdir cannot create `trusted.*` xattrs and
 fails with `EINVAL`); the merged dir is mounted at `{build_dir}/nix/store` as
 nix-daemon's `realStoreDir` for the chroot store. A synthetic SQLite store DB
