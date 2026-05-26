@@ -609,7 +609,7 @@ in
         # in gen/consts.json so prose must derive. Broad over $typSrc;
         # NARROW over $crossSrc (only the doc-comment shapes that
         # should cite the const — broad would FP `ungracefully` /
-        # daemon_timeout's unrelated `2h` / test literals).
+        # build_timeout's unrelated `2h` / test literals).
         if grep -rn -E '\b2h\b.*grace|grace.*\b2h\b' $typSrc; then
           echo "FAIL: literal '2h' grace-period — use #(refs.const)(\"DEFAULT_GC_GRACE_HOURS\")h" >&2
           fail=1
