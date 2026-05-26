@@ -1660,3 +1660,68 @@ bounded inputs rather than the model's enumerated alphabet; the fold
 unit battery pins concrete hand-computed histories (including every
 divergence-history reproducer); none of the three substitutes for the
 others.
+
+### Model-based testing: reasoned omission
+
+The Phase-2 hand-off lists "MBT replaying model traces against the real
+fold and the in-memory list" (design §4's assurance bullet, §5's
+Phase-2 row). The decision, made after the Kani contract layer landed: **not
+built.** Recorded here with the reasoning rather than implemented,
+because a conformance harness that re-derives what stronger layers
+already prove would be exactly the "harness that proves nothing new"
+the campaign discipline rejects.
+
+What the lease and log MBTs buy is conformance between a model and an
+implementation that have substantial independent machinery: the lease
+MBT drives the real Lease-object CAS/election code, the log MBT drives
+the real PG-backed open-gate / ingest-session / manifest / read-path
+code. In both, the implementation can drift from the model in ways
+neither the model checker (which only sees the model) nor the unit
+tests (which were not derived from the model) would notice.
+
+The retry MBT's subject, as the design itself scopes it, is narrower:
+the pure fold plus the in-memory append-only list — explicitly *not*
+PG, not the appending transactions, not the actor. That subject is
+already covered three ways:
+
+- The load-bearing properties of `decide()` / `classify()` /
+  `placeable()` (verdict partition, cap bounds, exclusion superset,
+  legacy-seed floor, exemption predicate, placement partition,
+  no-overflow) are now proven by the Kani contracts over **all**
+  histories up to the harness bound — strictly more histories than a
+  trace replay samples for those properties.
+- The concrete histories that matter are pinned twice: the 31-test
+  fold unit battery covers every counter, fencepost, the window reset
+  and its exempt fall-through, the resets, the seed, and every
+  documented divergence reproducer; the model's named runs replay the
+  same histories and end in the same adjudicated outcomes.
+- The protocol-level content of the model — observation fan-out and
+  dedup, the two-installment correlation, establishment, the appending
+  transaction's atomicity, failover — is exactly the part a fold-only
+  MBT cannot exercise, by the design's own scoping.
+
+The residual gap a retry MBT would close is transcription drift between
+`retryPolicy.qnt`'s `specApply` and `retry_policy.rs`'s `apply()`: the
+model's invariant verdicts silently ceasing to describe the code. That
+risk is real but second-order here, and it is bounded by the named-run
+reproducers being pinned on both sides, by the unit battery pinning the
+fold's arithmetic on the same histories the model's invariants quantify
+over, and by review of paired model/code changes (the same discipline
+every other model in this repository relies on). Two practical considerations tip the
+balance against building the harness anyway: the post-collapse model
+does not carry an event-level ledger (it carries the folded counters,
+`PgRow.ledger`), so a replay harness would have to reconstruct fold
+events from action labels — more projection code than checked property
+— and the projection itself would become a third transcription of the
+same fold, with its own drift risk.
+
+Reconsideration triggers, recorded so this stays a decision rather than
+a default: build the harness if the fold's event alphabet or input
+surface grows beyond what the unit battery and contracts pin (e.g. the
+executor-lifecycle campaign extends the establishment/correlation
+semantics), if the in-memory list maintenance is ever decoupled from
+the appending transaction, or if a model re-encode introduces an
+event-level ledger that makes the trace projection trivial. The
+quint-connect machinery (`#[quint_run]`, the ITF replay pattern in
+`rio-store/src/logs/mbt_tests.rs` / `rio-lease/src/mbt_tests.rs`)
+transfers directly if so.
