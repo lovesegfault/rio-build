@@ -35,8 +35,11 @@ cargo clippy --all-targets -- --deny warnings
 # Format (uses treefmt: rustfmt + nixfmt + taplo)
 treefmt
 
-# Full CI-equivalent checks (clippy, tests, docs, coverage)
-nix flake check
+# Fast edit-loop checks — clippy/docs/drift/policy for all crates, no tests
+.claude/bin/nixbuild
+
+# Full CI gate (wraps nix-fast-build; serial alternative: nix flake check)
+.claude/bin/nixbuild --checks
 
 # Fuzz a parser (default shell is nightly, so this works directly)
 cd fuzz/rio-nix && cargo fuzz run wire_primitives
@@ -52,21 +55,22 @@ cd fuzz/rio-nix && cargo fuzz run wire_primitives
 
 | Command | What it does |
 |---|---|
-| `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix-fast-build --flake .#checks.x86_64-linux` | Full CI gate: per-member clippy/doc/nextest, pre-commit, 2min fuzz per target, all VM tests, cov-smoke (Linux+KVM only). Streams eval→build. |
-| `nix flake check` | Runs all `checks.*` (same set as nix-fast-build, but serial eval) |
+| `/nixbuild .#default` | Build the workspace (release profile with thin LTO) |
+| `/nixbuild --checks` | Full CI gate (wraps `nix-fast-build --flake .#checks.x86_64-linux`): per-member clippy/doc/nextest, pre-commit, 2min fuzz per target, all VM tests, cov-smoke (Linux+KVM only). Streams eval→build. |
+| `/nixbuild` (= `--quick`) | Edit-loop slice of the gate: clippy/docs/drift/policy for all crates, **no test execution** (vm/nextest/fuzz/golden/mutants/cov-smoke excluded). Untouched crates are cache hits. |
+| `nix flake check` | Runs all `checks.*` (same set as `/nixbuild --checks`, but serial eval) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
-| `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
+| `/nixbuild .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
 | `/nixbuild .#coverage` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
-| `nix build .#checks.x86_64-linux.cov-smoke` | Fast (~5min) one-scenario coverage-infra smoke |
-| `nix build .#coverage.vm-protocol-warm-standalone` | Per-entry lcov (one VM test or one `unit-<crate>`); `.raw` for the underlying coverage-mode VM run |
-| `nix build .#coverage.unit` / `.#coverage.vm` / `.#coverage.html` | Unit-only / VM-only lcov aggregates / HTML report |
+| `/nixbuild .#checks.x86_64-linux.cov-smoke` | Fast (~5min) one-scenario coverage-infra smoke |
+| `/nixbuild .#coverage.vm-protocol-warm-standalone` | Per-entry lcov (one VM test or one `unit-<crate>`); `.raw` for the underlying coverage-mode VM run |
+| `/nixbuild .#coverage.unit` / `.#coverage.vm` / `.#coverage.html` | Unit-only / VM-only lcov aggregates / HTML report |
 
 ### CI gate
 
-`checks.*` is flat and granular: a per-member clippy/clippy-test/doc/nextest matrix for every workspace crate, plus fuzz runs, VM tests, and misc policy checks — each its own derivation. `nix-fast-build` streams evaluation into builds via nix-eval-jobs — VM tests start evaluating in parallel with rust checks instead of after, and individual check failures surface immediately without waiting for the whole graph.
+`checks.*` is flat and granular: a per-member clippy/clippy-test/doc/nextest matrix for every workspace crate, plus fuzz runs, VM tests, and misc policy checks — each its own derivation. `nix-fast-build` (what `/nixbuild --checks` runs) streams evaluation into builds via nix-eval-jobs — VM tests start evaluating in parallel with rust checks instead of after, and individual check failures surface immediately without waiting for the whole graph.
 
 `packages.*` is the minimal set of deployable artifacts (workspace binaries, docker images, AMIs, tfvars). Debug/manual targets (per-test coverage, fuzz builds, helm subcharts) hang off `packages.{coverage,helm,dockerImages,mutants}` as passthru attrs — reachable by attr path, not enumerated by `nix flake show`.
 
@@ -74,8 +78,8 @@ cd fuzz/rio-nix && cargo fuzz run wire_primitives
 
 Three tiers:
 
-- **Cov-smoke** (~5min, in checks): `nix build .#checks.x86_64-linux.cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — `.#coverage` failures were triaged as individual test-gaps instead of a pipeline-level halt.
-- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. HTML alone: `nix build .#coverage.html`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** a check — run on demand.
+- **Cov-smoke** (~5min, in checks): `/nixbuild .#checks.x86_64-linux.cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — `.#coverage` failures were triaged as individual test-gaps instead of a pipeline-level halt.
+- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. HTML alone: `/nixbuild .#coverage.html`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** a check — run on demand.
 
 VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 
@@ -130,9 +134,9 @@ Commit BOTH the regenerated fixture(s) AND `docs/gen/config.json`. The `docs-dat
 
 ## CI gate
 
-**Every change MUST pass `nix-fast-build --flake .#checks.x86_64-linux` before merge.** This is the single gate — it covers per-member clippy, nextest, docs, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
+**Every change MUST pass `/nixbuild --checks` before merge.** This is the single gate — it covers per-member clippy, nextest, docs, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
 
-From agent/subagent context, use `/nixbuild --checks` (which wraps nix-fast-build) over raw invocation — it captures the log to `/tmp/rio-dev/` and emits a JSON report instead of streaming megabytes of build output. For a single check, `/nixbuild .#checks.x86_64-linux.<name>` still works.
+`/nixbuild --checks` wraps `nix-fast-build --flake .#checks.x86_64-linux` — it captures the log to `/tmp/rio-dev/`, emits a short report instead of streaming megabytes of build output, and exits with the underlying nix exit code. For a single check, `/nixbuild .#checks.x86_64-linux.<name>`; any other flake target works the same way (`/nixbuild .#<attr>`). During the edit loop, bare `/nixbuild` (= `--quick`) builds everything except test execution (clippy, docs, drift/policy) with untouched crates served from cache — useful for fast iteration, but **not** a substitute for the full gate. Prefer `/nixbuild` over raw `nix build` / `nix-fast-build` invocations; raw commands are for interactive debugging where you want live streaming output. Budget ~20min+ for `--checks` when the tree has substantive changes (seconds-to-minutes when mostly cached) and run it in the background from agent context — the report prints only at the end.
 
 When the gate is red and the cause isn't obvious from the log, see `.claude/rules/ci-failure-patterns.md` — it catalogs every failure signature that has bitten this project before.
 
@@ -147,7 +151,7 @@ nix develop -c bash -c 'cd fuzz/rio-store && cargo fuzz run manifest_deserialize
 
 CI equivalent:
 ```bash
-nix build .#checks.x86_64-linux.fuzz-wire_primitives  # 2min, in flake check
+.claude/bin/nixbuild .#checks.x86_64-linux.fuzz-wire_primitives  # 2min, part of the checks gate
 ```
 
 When adding a new parser, also add a fuzz target:
@@ -165,7 +169,7 @@ This project has a comprehensive design book in `docs/` (typst sources). When im
 - **Crate structure** (`docs/spec/system/crate-structure.typ`): Expected modules and file layout
 - **Architecture** (`docs/architecture.typ`): System-level design
 
-Render with `nix build .#packages.x86_64-linux.docs` (shiroa HTML, `result/index.html`) or `.#packages.x86_64-linux.docs-pdf` (stitched PDF). The dev shell has `typst` and `shiroa` available for `typst watch docs/book-pdf.typ` / `shiroa serve docs/`.
+Render with `/nixbuild .#docs` (shiroa HTML, `result/index.html`) or `/nixbuild .#docs-pdf` (stitched PDF). The dev shell has `typst` and `shiroa` available for `typst watch docs/book-pdf.typ` / `shiroa serve docs/`.
 
 ### Keeping docs and code in sync
 
