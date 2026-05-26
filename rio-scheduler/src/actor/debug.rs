@@ -125,6 +125,13 @@ impl DagActor {
                 self.tick_sweep_recently_disconnected(advanced).await;
                 let _ = reply.send(n);
             }
+            DebugCmd::QueryAttemptHistory { drv_hash, reply } => {
+                let history = self
+                    .dag
+                    .node(drv_hash.as_str())
+                    .map(|s| s.attempt_history().to_vec());
+                let _ = reply.send(history);
+            }
             DebugCmd::SeedHwTable { factors, reply } => {
                 self.sla_estimator
                     .seed_hw(crate::sla::hw::HwTable::from_map(factors));

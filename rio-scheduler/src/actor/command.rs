@@ -655,6 +655,13 @@ pub enum DebugCmd {
     /// sit on a test's critical path. Replies with the number of
     /// entries swept.
     ForceDisconnectSweep { reply: oneshot::Sender<usize> },
+    /// Read a derivation's in-memory attempt history (the committed
+    /// ledger-suffix mirror). `None` when the node is not in the DAG.
+    /// For the 1a acceptance battery (failover reload comparison).
+    QueryAttemptHistory {
+        drv_hash: String,
+        reply: oneshot::Sender<Option<Vec<crate::state::AttemptRecord>>>,
+    },
     /// Seed the SLA estimator's hw_table. For ref-seconds → wall-seconds
     /// denormalization tests (`min_factor()` needs a non-default table).
     SeedHwTable {

@@ -1695,8 +1695,6 @@ impl DerivationState {
 
     /// Replace the in-memory attempt history wholesale. Recovery-load
     /// only (the suffix loaded from `drv_attempts` after a failover).
-    // TODO: the caller lands with the attempt-history recovery load (T-1a.7).
-    #[allow(dead_code)]
     pub(crate) fn set_attempt_history(&mut self, history: Vec<AttemptRecord>) {
         self.attempt_history = history;
     }
@@ -1728,10 +1726,7 @@ impl DerivationState {
     /// The in-memory attempt history (the committed suffix mirror).
     /// Test-only in Phase 1a — no decision consults it until the
     /// Phase-1b collapse.
-    // TODO: first readers are the 1a append-site tests; drop the allow
-    // when they land.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn attempt_history(&self) -> &[AttemptRecord] {
         &self.attempt_history
     }

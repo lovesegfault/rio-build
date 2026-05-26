@@ -321,8 +321,39 @@ impl DagActor {
             self.dag.insert_recovered_node(state);
         }
 
-        // --- Load edges + add to DAG ---
+        // --- Load the attempt-ledger suffixes (Phase 1a) ---
+        // Rehydrate each loaded node's in-memory attempt history from
+        // `drv_attempts` (the rows since its last reset event), so the
+        // Phase-1b fold has the same input on both sides of a leader
+        // failover. NO decision change here: `from_recovery_row` /
+        // `from_poisoned_row` and the `is_poisoned()` reconcile
+        // re-check stay exactly as-is — the RAM counters remain
+        // authoritative until the 1b collapse. Worst case is
+        // O(rows-since-last-reset × loaded nodes); the per-cycle suffix
+        // is bounded (~70 rows: 50 exempt-infra + 10 infra + 4 timeout
+        // + 2 transient + 3 poison-threshold), so the realistic shape
+        // is ~1 row per node (design §4.3).
         let drv_ids: Vec<Uuid> = id_to_hash.keys().copied().collect();
+        let attempt_suffixes = self.db.load_attempt_suffix(&drv_ids).await?;
+        let mut attempt_rows_loaded = 0usize;
+        for (derivation_id, rows) in attempt_suffixes {
+            let Some(hash) = id_to_hash.get(&derivation_id) else {
+                continue;
+            };
+            let Some(state) = self.dag.node_mut(hash) else {
+                continue;
+            };
+            attempt_rows_loaded += rows.len();
+            state.set_attempt_history(rows.iter().map(|r| r.to_record()).collect());
+        }
+        if attempt_rows_loaded > 0 {
+            info!(
+                rows = attempt_rows_loaded,
+                "loaded attempt-ledger suffixes for recovered derivations"
+            );
+        }
+
+        // --- Load edges + add to DAG ---
         let edge_rows = self.db.load_edges_for_derivations(&drv_ids).await?;
         // r[impl sched.recovery.failed-dep-cascade+2]
         // Parents with a terminal-FAILURE dep: edge_rows above drops

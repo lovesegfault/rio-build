@@ -5357,3 +5357,252 @@ async fn test_leader_lost_invalidates_kept_recovery_completion() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Attempt ledger (drv_attempts, Phase 1a): acceptance battery.
+// A-1a-1: every attempt produces exactly one row (full mixed-channel
+//         scenario, asserted step by step).
+// A-1a-4: the attempt history reloads identically across a failover.
+// A-1a-3 (no row stays disconnected/NULL forever) is covered by
+//         attempt_ledger_unreported_crash_established_by_sweep in
+//         actor/tests/executor.rs.
+// ---------------------------------------------------------------------------
+
+/// A-1a-1: one derivation driven through E1 (transient) → E2 (infra) →
+/// E5+report (disconnect, then controller classification) → E8
+/// (backstop) → threshold poison → TTL clear → resubmit. Every observed
+/// attempt yields exactly one row with the expected class, the reset
+/// becomes the suffix cut, and the resubmit after the clear adds
+/// nothing.
+#[tokio::test]
+async fn attempt_ledger_acceptance_full_scenario() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.backoff_base_secs = 0.0;
+    });
+    let drv_hash = "acc-d";
+    let drv_path = test_drv_path(drv_hash);
+
+    // Step 1 — E1: worker-reported transient failure.
+    let _w1 = connect_executor(&handle, "acc-w1", "x86_64-linux").await?;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    complete_failure(
+        &handle,
+        "acc-w1",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flaky",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(ledger_classes(&db.pool, drv_hash).await, vec!["transient"]);
+
+    // Step 2 — E2: worker-reported infrastructure failure.
+    let mut w2 = connect_executor(&handle, "acc-w2", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut w2).await;
+    complete_failure(
+        &handle,
+        "acc-w2",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "fuse: transport endpoint is not connected",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        ledger_classes(&db.pool, drv_hash).await,
+        vec!["transient", "infra"]
+    );
+
+    // Step 3 — E5 + report: disconnect mid-build, then the controller's
+    // OomKilled report classifies the released attempt's row.
+    let w3 = connect_executor(&handle, "acc-w3", "x86_64-linux").await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Assigned,
+        "step 3 precondition: re-dispatched to acc-w3"
+    );
+    disconnect(&handle, "acc-w3").await?;
+    drop(w3);
+    assert_eq!(
+        ledger_classes(&db.pool, drv_hash).await,
+        vec!["transient", "infra", "disconnected"]
+    );
+    let promoted = report_termination(
+        &handle,
+        "acc-w3",
+        rio_proto::types::TerminationReason::OomKilled,
+    )
+    .await?;
+    let oom_class = if promoted { "exempt_infra" } else { "infra" };
+    assert_eq!(
+        ledger_classes(&db.pool, drv_hash).await,
+        vec!["transient", "infra", oom_class],
+        "the report classifies the disconnect's row in place (no new row)"
+    );
+
+    // Step 4 — E8: the scheduler backstop fires for a wedged worker.
+    let mut w4 = connect_executor(&handle, "acc-w4", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut w4).await;
+    assert!(handle.debug_backdate_running(drv_hash, 200).await?);
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        ledger_classes(&db.pool, drv_hash).await,
+        vec!["transient", "infra", oom_class, "backstop"]
+    );
+
+    // Step 5 — threshold poison: a third distinct worker's transient
+    // failure crosses the default 3-distinct-worker threshold. The
+    // trigger's row is the transient row — no extra row for the verdict.
+    let mut w5 = connect_executor(&handle, "acc-w5", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut w5).await;
+    complete_failure(
+        &handle,
+        "acc-w5",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flaky again",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "third distinct failed worker reaches the poison threshold"
+    );
+    let after_poison = vec!["transient", "infra", oom_class, "backstop", "transient"];
+    assert_eq!(ledger_classes(&db.pool, drv_hash).await, after_poison);
+
+    // Step 6 — TTL clear: the cfg(test) POISON_TTL is 100ms; the next
+    // tick clears the poison and appends the reset row.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    let mut after_clear = after_poison.clone();
+    after_clear.push("poison_cleared");
+    assert_eq!(ledger_classes(&db.pool, drv_hash).await, after_clear);
+
+    // Step 7 — resubmit after the clear: the node was removed from the
+    // DAG by the TTL clear, so the new merge re-inserts it fresh — no
+    // reset row, no attempt row; the ledger is unchanged and the suffix
+    // starts at the poison_cleared reset.
+    let _ev2 =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        ledger_classes(&db.pool, drv_hash).await,
+        after_clear,
+        "a fresh resubmit after the clear appends nothing"
+    );
+    let derivation_id: Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_hash)
+            .fetch_one(&db.pool)
+            .await?;
+    let sdb = crate::db::SchedulerDb::new(db.pool.clone());
+    let suffix = sdb.load_attempt_suffix(&[derivation_id]).await?;
+    let suffix_classes: Vec<&str> = suffix
+        .get(&derivation_id)
+        .map(|rows| rows.iter().map(|r| r.outcome_class.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        suffix_classes,
+        vec!["poison_cleared"],
+        "the fold's input after the clear is just the reset row"
+    );
+    Ok(())
+}
+
+/// A-1a-4: the attempt history of a non-terminal derivation reloads
+/// identically across a leader failover — the recovered in-memory
+/// mirror equals the pre-failover one (both are the committed suffix),
+/// so the 1b fold has the same input on both sides of a flap.
+///
+/// Uses [`RecoveryFixture`] so the phase-2 actor gets the post-claim
+/// confirmation loop (without it the recovery is discarded as
+/// unconfirmed and the DAG comes back empty).
+#[tokio::test]
+async fn attempt_ledger_failover_reloads_identical_history() -> TestResult {
+    let drv_hash = "fo-d";
+    let pre_holder: std::sync::Arc<std::sync::Mutex<Vec<crate::state::AttemptRecord>>> =
+        Default::default();
+    let pre_clone = pre_holder.clone();
+    let f = RecoveryFixture::run(async move |handle, _pool| {
+        let drv_path = test_drv_path(drv_hash);
+        // Mixed-channel history: an infra failure (no backoff, so the
+        // re-dispatch is immediate), then a disconnect classified by
+        // the controller (a two-installment row).
+        let _w1 = connect_executor(&handle, "fo-w1", "x86_64-linux").await?;
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+        complete_failure(
+            &handle,
+            "fo-w1",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            "fuse: transport endpoint is not connected",
+        )
+        .await?;
+        barrier(&handle).await;
+        let w2 = connect_executor(&handle, "fo-w2", "x86_64-linux").await?;
+        barrier(&handle).await;
+        assert_eq!(
+            expect_drv(&handle, drv_hash).await.status,
+            DerivationStatus::Assigned,
+            "re-dispatched to fo-w2 (infra failure has no backoff)"
+        );
+        disconnect(&handle, "fo-w2").await?;
+        drop(w2);
+        let _ = report_termination(
+            &handle,
+            "fo-w2",
+            rio_proto::types::TerminationReason::OomKilled,
+        )
+        .await?;
+
+        // The pre-failover in-memory history (the leader's view).
+        let pre = handle
+            .debug_query_attempt_history(drv_hash)
+            .await?
+            .expect("node present pre-failover");
+        assert_eq!(pre.len(), 2, "two attempts recorded: {pre:?}");
+        assert!(
+            pre[1].termination_reason.is_some(),
+            "the second installment is mirrored in memory pre-failover"
+        );
+        *pre_clone.lock().unwrap() = pre;
+        Ok(())
+    })
+    .await?;
+    let handle2 = f.handle;
+    let pre = pre_holder.lock().unwrap().clone();
+
+    let post = handle2
+        .debug_query_attempt_history(drv_hash)
+        .await?
+        .expect("node present post-failover");
+    // recorded_at is PG-assigned and only known after a read-back, so
+    // the pre-failover mirror carries 0.0 there; compare everything
+    // else field-for-field.
+    assert_eq!(post.len(), pre.len(), "same number of attempts reload");
+    for (a, b) in pre.iter().zip(post.iter()) {
+        assert_eq!(a.attempt_id, b.attempt_id);
+        assert_eq!(a.event_kind, b.event_kind);
+        assert_eq!(a.outcome_class, b.outcome_class);
+        assert_eq!(a.exec_id, b.exec_id);
+        assert_eq!(a.executor_id, b.executor_id);
+        assert_eq!(a.termination_reason, b.termination_reason);
+        assert_eq!(a.reporting_party, b.reporting_party);
+        assert_eq!(a.exempt, b.exempt);
+        assert_eq!(a.floor_promoted, b.floor_promoted);
+        assert_eq!(a.floor_at_cap, b.floor_at_cap);
+        assert_eq!(a.error_msg, b.error_msg);
+        assert_eq!(a.final_line_count, b.final_line_count);
+        assert_eq!(a.resubmit_cycle, b.resubmit_cycle);
+        assert!((a.occurred_at_epoch_secs - b.occurred_at_epoch_secs).abs() < 1.0);
+    }
+    Ok(())
+}

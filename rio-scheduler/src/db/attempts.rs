@@ -414,8 +414,6 @@ impl SchedulerDb {
     /// ANY($1)` — NOT a widening of `load_nonterminal_derivations`,
     /// whose LEFT JOIN must stay one-row-per-derivation. The per-cycle
     /// suffix bound keeps this O(rows-since-last-reset × derivations).
-    // TODO: the recovery-load caller lands with the attempt-history reload (T-1a.7).
-    #[allow(dead_code)]
     pub(crate) async fn load_attempt_suffix(
         &self,
         derivation_ids: &[Uuid],

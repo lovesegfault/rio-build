@@ -323,6 +323,17 @@ impl ActorHandle {
             .await
     }
 
+    /// Read a derivation's in-memory attempt history (the committed
+    /// ledger-suffix mirror). For the 1a acceptance battery.
+    pub async fn debug_query_attempt_history(
+        &self,
+        drv_hash: &str,
+    ) -> Result<Option<Vec<crate::state::AttemptRecord>>, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::QueryAttemptHistory { drv_hash, reply })
+            .await
+    }
+
     /// Backdate an executor's `last_heartbeat`. For heartbeat-timeout
     /// tests. Returns `false` if executor not found.
     pub async fn debug_backdate_heartbeat(
