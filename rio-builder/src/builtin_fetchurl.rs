@@ -439,20 +439,26 @@ async fn download_to(resp: reqwest::Response, dest: &Path) -> anyhow::Result<()>
 /// Turn the downloaded temp file into the final output per the params.
 async fn finalize_output(tmp: &Path, params: &FetchurlParams) -> anyhow::Result<()> {
     if params.unpack {
-        restore_unpacked(tmp, params).await
+        restore_unpacked(tmp, params).await?;
     } else {
         tokio::fs::rename(tmp, &params.output)
             .await
             .with_context(|| format!("renaming download to {}", params.output.display()))?;
-        if params.executable {
-            // Single flat file; 0755 matches Nix's `executable = true`.
-            let perms = std::fs::Permissions::from_mode(0o755);
-            tokio::fs::set_permissions(&params.output, perms)
-                .await
-                .context("chmod 0755 on executable output")?;
-        }
-        Ok(())
     }
+    // CppNix's builtinFetchurl applies the `executable = "1"` chmod 0755
+    // to the output path AFTER either branch (restorePath for unpack,
+    // writeFile for plain) — builtins/fetchurl.cc. Matching that matters
+    // for the FOD hash: when an unpacked NAR's root is a regular file,
+    // the executable bit changes the recursive NAR hash, so a derivation
+    // declaring both `unpack = true` and `executable = true` must get the
+    // same bit Nix would give it.
+    if params.executable {
+        let perms = std::fs::Permissions::from_mode(0o755);
+        tokio::fs::set_permissions(&params.output, perms)
+            .await
+            .context("chmod 0755 on executable output")?;
+    }
+    Ok(())
 }
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -817,6 +823,34 @@ mod tests {
         assert!(
             chain.contains("RIO_CA_BUNDLE"),
             "error should name the CA-bundle knob: {chain}"
+        );
+    }
+
+    /// `unpack = true` + `executable = true`: CppNix chmods the restored
+    /// root 0755 after unpacking (builtins/fetchurl.cc applies the chmod
+    /// after either branch); the FOD hash of a single-file NAR root
+    /// depends on that bit, so rio must do the same.
+    #[tokio::test]
+    async fn unpack_applies_executable_bit_like_cppnix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload"), b"#!/bin/sh\necho hi\n").unwrap();
+        let nar = rio_nix::nar::dump_path(&dir.path().join("payload")).unwrap();
+        let tmp = dir.path().join("download.nar");
+        std::fs::write(&tmp, &nar).unwrap();
+
+        let mut p = params("https://example.org/x.nar", &[]);
+        p.unpack = true;
+        p.executable = true;
+        p.output = dir.path().join("out");
+
+        finalize_output(&tmp, &p).await.unwrap();
+        let meta = std::fs::metadata(&p.output).unwrap();
+        assert!(meta.is_file(), "single-file NAR restores to a regular file");
+        assert_eq!(
+            meta.permissions().mode() & 0o111,
+            0o111,
+            "executable bits must be set after unpack, got {:o}",
+            meta.permissions().mode()
         );
     }
 }
