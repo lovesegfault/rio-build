@@ -5355,3 +5355,91 @@ async fn phase1b_e2_d3_promoted_controller_terminations_charge_exempt_budget() -
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b (T-1b.5): E1 collapsed onto decide()/placeable(). The existing
+// transient/threshold/promotion-exempt tests are the worker-only
+// equivalence battery and pass unchanged; these add the non-distinct
+// threshold mode and the ledger/RAM/mirror agreement.
+// ---------------------------------------------------------------------------
+
+/// Non-distinct threshold mode (`require_distinct_workers = false`):
+/// the flat failure count drives the poison threshold, so the same
+/// worker failing twice poisons at threshold 2 — with the verdict now
+/// computed by the fold over the appended transient rows. The retry arm
+/// before the threshold still arms the backoff and the legacy counters.
+#[tokio::test]
+async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.poison = crate::state::PoisonConfig {
+            threshold: 2,
+            require_distinct_workers: false,
+        };
+    });
+    let _w = connect_builder(&handle, "e1nd-w", "x86_64-linux").await?;
+    let drv = "e1nd";
+    let drv_path = test_drv_path(drv);
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+
+    // Failure 1: under the threshold → retry with backoff.
+    assert!(handle.debug_force_assign(drv, "e1nd-w").await?);
+    complete_failure(
+        &handle,
+        "e1nd-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flaky once",
+    )
+    .await?;
+    barrier(&handle).await;
+    let info = expect_drv(&handle, drv).await;
+    assert_ne!(info.status, DerivationStatus::Poisoned);
+    assert_eq!(info.retry.count, 1, "legacy RAM retry count still tracks");
+    assert_eq!(info.retry.failure_count, 1);
+    assert!(
+        info.retry.backoff_until.is_some(),
+        "the retry arm still arms the backoff at the site"
+    );
+
+    // Failure 2: flat count reaches the threshold → poison.
+    assert!(handle.debug_force_assign(drv, "e1nd-w").await?);
+    complete_failure(
+        &handle,
+        "e1nd-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flaky twice",
+    )
+    .await?;
+    barrier(&handle).await;
+    let info = expect_drv(&handle, drv).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "same-worker repeats reach the flat threshold in non-distinct mode"
+    );
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind(drv)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pg_status, "poisoned");
+    assert_eq!(
+        ledger_classes(&db.pool, drv).await,
+        vec!["transient", "transient"],
+        "one ledger row per observed transient failure"
+    );
+    // The legacy retry_count mirror column kept being written by the
+    // retry arm (rule 1).
+    let retry_count: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM derivations WHERE drv_hash = $1")
+            .bind(drv)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        retry_count, 1,
+        "legacy mirror incremented on the retry arm only"
+    );
+    Ok(())
+}

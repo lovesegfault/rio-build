@@ -859,15 +859,17 @@ pub(crate) fn decide(
 
     let mut initial = Counters::default();
     if let Some(s) = seed {
-        // Set-shaped state seeds up front so the threshold / exclusion
-        // checks inside the fold see both eras (idempotent inserts make
-        // double-counting impossible); `failure_count` is floored at the
-        // legacy set's size (the same derivation recovery uses) so the
-        // non-distinct threshold never reads below what the columns
-        // support. No event in a reset-free suffix touches
+        // Set-shaped state seeds up front so the distinct-worker
+        // threshold / exclusion checks inside the fold see both eras
+        // (idempotent inserts make double-counting impossible). The
+        // flat counters (`count`, `failure_count`) are deliberately NOT
+        // seeded: the still-active legacy writers mirror the current
+        // era into the columns too, so a pre-fold seed would count the
+        // suffix's own rows twice; their floors are applied after the
+        // fold instead (max / merged-set size — the P5 floor
+        // semantics). No event in a reset-free suffix touches
         // `resubmit_cycles`, so seeding it equals the max() floor.
         initial.failed_builders = s.failed_builders.clone();
-        initial.failure_count = s.failed_builders.len() as u32;
         initial.resubmit_cycles = s.resubmit_cycles;
         initial.poisoned_at = s.poisoned_at;
     }
@@ -888,10 +890,13 @@ pub(crate) fn decide(
     let (mut counters, verdict) = fold_events(initial, &events, now, budget, &FleetView::default());
 
     if let Some(s) = seed {
-        // The legacy floor for the per-cycle count (P5): max, not sum —
-        // post-066 rows that the still-active legacy writer also mirrored
-        // into the column must not count twice.
+        // The legacy floors for the flat counters (P5): max, not sum —
+        // post-066 rows that the still-active legacy writers also
+        // mirrored into the columns must not count twice.
         counters.count = counters.count.max(s.retry_count);
+        counters.failure_count = counters
+            .failure_count
+            .max(counters.failed_builders.len() as u32);
     }
 
     Decision {

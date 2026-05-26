@@ -73,10 +73,12 @@ async fn test_completion_db_fault_build_sample_logged() -> TestResult {
     Ok(())
 }
 
-/// Transient failure with pool closed: retry-persist logs error.
+/// Transient failure with pool closed: the appending transaction fails,
+/// the derivation stays in its pre-report state (Phase-1b posture), and
+/// the failure is logged.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
+async fn test_transient_failure_db_fault_keeps_pre_report_state() -> TestResult {
     let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux").await?;
     // Pad worker (statically-eligible — same system) so the fleet-
     // exhaustion clamp doesn't poison after a single failure; we need
@@ -109,11 +111,27 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
     // needs an explicit barrier since no request-reply follows.
     barrier(&handle).await;
 
-    // Transient with retry_count < max → should hit the retry-persist branches.
+    // Phase 1b posture: the appending transaction is the decision
+    // point — when it cannot commit, the failure is not applied and the
+    // derivation stays in its pre-report state (the legacy mirror write
+    // failure is also logged, before the transaction runs).
     assert!(
-        logs_contain("failed to persist derivation status")
-            || logs_contain("failed to persist retry"),
-        "transient-failure DB write failure should be logged"
+        logs_contain("appending transaction failed"),
+        "the failed appending transaction should be logged"
+    );
+    assert!(
+        logs_contain("failed to persist failed_worker"),
+        "the legacy failed_builders mirror failure should be logged"
+    );
+    let post = expect_drv(&handle, "tfault-hash").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Assigned,
+        "pre-report state preserved when the appending transaction fails"
+    );
+    assert_eq!(
+        post.retry.count, 0,
+        "no retry charged without a committed record"
     );
     Ok(())
 }

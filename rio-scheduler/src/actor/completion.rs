@@ -50,6 +50,11 @@ struct CaCutoffVerified {
 /// `handle_timeout_failure`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FailureOutcome {
+    /// Whether the legacy RAM view says the poison threshold is
+    /// reached. Unread since the E1 collapse (T-1b.5) — the verdict now
+    /// comes from `decide()` over the appended suffix — and retired
+    /// together with the legacy mutations in T-1b.13.
+    #[allow(dead_code)]
     pub(super) reached_poison: bool,
 }
 
@@ -116,54 +121,6 @@ impl DagActor {
         row.executor_id = state.assigned_executor.clone();
         row.resubmit_cycle = i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX);
         Some(row)
-    }
-
-    /// The 1a appending transaction for a non-poison status persist:
-    /// append `row` (when there is one) and run
-    /// [`SchedulerDb::update_derivation_status_in_tx`] on the same
-    /// connection, then push the in-memory mirror after the commit.
-    /// `row = None` (unknown node / uncommitted merge) degrades to the
-    /// plain best-effort status persist.
-    pub(super) async fn record_attempt_with_status(
-        &mut self,
-        drv_hash: &DrvHash,
-        row: Option<AttemptRow>,
-        status: DerivationStatus,
-        executor_id: Option<&ExecutorId>,
-    ) {
-        let Some(row) = row else {
-            self.persist_status(drv_hash, status, executor_id).await;
-            return;
-        };
-        #[cfg(test)]
-        self.test_counters
-            .persist_status_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let result: Result<bool, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
-            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
-            crate::db::SchedulerDb::update_derivation_status_in_tx(
-                &mut tx,
-                drv_hash,
-                status,
-                executor_id,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(inserted)
-        }
-        .await;
-        match result {
-            Ok(inserted) => {
-                if inserted && let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.push_attempt_record(row.to_record());
-                }
-            }
-            Err(e) => {
-                error!(drv_hash = %drv_hash, ?status, error = %e,
-                       "failed to persist attempt row + derivation status");
-            }
-        }
     }
 
     /// The 1a appending transaction for a poison persist: append `row`
@@ -1280,15 +1237,30 @@ impl DagActor {
             rio_proto::types::BuildResultStatus::TransientFailure => {
                 // Build ran, exited non-zero. Counts toward poison — 3
                 // workers all seeing this means it's not actually transient.
-                self.handle_transient_failure(
-                    drv_hash,
-                    executor_id,
-                    FailureReportCtx {
-                        final_line_count: report_line_count,
-                        error_msg: &result.error_msg,
-                    },
-                )
-                .await;
+                let handling = self
+                    .handle_transient_failure(
+                        drv_hash,
+                        executor_id,
+                        FailureReportCtx {
+                            final_line_count: report_line_count,
+                            error_msg: &result.error_msg,
+                        },
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        self.requeue_failure_completion(
+                            executor_id,
+                            drv_hash,
+                            status,
+                            &result.error_msg,
+                            final_line_count,
+                        );
+                    }
+                }
             }
             // r[impl sched.retry.per-executor-budget]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
@@ -1439,15 +1411,30 @@ impl DagActor {
                     status = ?result.status,
                     "unknown build result status, treating as transient failure"
                 );
-                self.handle_transient_failure(
-                    drv_hash,
-                    executor_id,
-                    FailureReportCtx {
-                        final_line_count: report_line_count,
-                        error_msg: &result.error_msg,
-                    },
-                )
-                .await;
+                let handling = self
+                    .handle_transient_failure(
+                        drv_hash,
+                        executor_id,
+                        FailureReportCtx {
+                            final_line_count: report_line_count,
+                            error_msg: &result.error_msg,
+                        },
+                    )
+                    .await;
+                match handling {
+                    FailureHandling::Handled => {
+                        self.attempt_record_retries.remove(drv_hash);
+                    }
+                    FailureHandling::RecordFailed => {
+                        self.requeue_failure_completion(
+                            executor_id,
+                            drv_hash,
+                            status,
+                            &result.error_msg,
+                            final_line_count,
+                        );
+                    }
+                }
             }
         }
 
@@ -2728,12 +2715,23 @@ impl DagActor {
     }
 
     // r[impl sched.retry.transient-budget]
+    /// E1, collapsed onto `decide()` (Phase 1b): the threshold /
+    /// per-cycle-cap / retry verdict comes from the fold over the
+    /// appended attempt suffix inside the appending transaction, and the
+    /// fleet-exhaust arm consumes `Decision::exclusion` intersected with
+    /// the live eligible fleet via `placeable()` at this site. The
+    /// legacy RAM and mirror writes (`record_failure_and_check_poison`,
+    /// `increment_retry_count`, the RAM count/backoff) stay until
+    /// T-1b.13 (rule 1); the synthesized poison-reason strings stay
+    /// as-is (A8 is out of scope); transients are never floor-promoted
+    /// and never exempt (P4) — there is deliberately no floor or
+    /// exemption logic on this arm.
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
-    ) {
+    ) -> FailureHandling {
         // Ledger row for this observed attempt (1a): captured before
         // any transition clears the exec_id carrier; appended together
         // with whichever status persist this handler ends in.
@@ -2744,136 +2742,244 @@ impl DagActor {
             row.error_msg = (!report.error_msg.is_empty()).then(|| report.error_msg.to_string());
             row.final_line_count = report.final_line_count;
         }
-        // Record failure (in-mem HashSet insert + PG append,
-        // best-effort) + get poison verdict in one call — same
-        // helper as `reassign_derivations` and
-        // handle_reconcile_assignments (recovery.rs).
-        let FailureOutcome { reached_poison } = self
+        // Legacy RAM + mirror writes (rule 1, until T-1b.13): the
+        // failure still lands in `failed_builders`/`failure_count` and
+        // the `failed_builders` column exactly as before — but the
+        // returned RAM verdict is no longer consulted; the fold over
+        // the appended suffix is the decision input now.
+        let FailureOutcome { reached_poison: _ } = self
             .record_failure_and_check_poison(drv_hash, executor_id)
             .await;
 
-        // r[impl sched.retry.per-executor-budget]
-        // Defense-in-depth: under one-shot semantics (I-188; the only
-        // mode), failed workers are draining and excluded from the
-        // fleet count, and the controller spawns fresh `executor_id`s
-        // that are never in `failed_builders` — so this returns
-        // `false` in practice and poison-on-repeated-failure flows
-        // through `PoisonConfig::is_poisoned(threshold)` (via
-        // `record_failure_and_check_poison` above). The check remains
-        // for any future path where a worker fails WITHOUT draining
-        // (which would otherwise let `best_executor` return None
-        // forever via hard_filter's `failed_builders` exclusion). The
-        // dispatch-time backstop catches the same condition for paths
-        // that bypass this handler (reassign_derivations, recovery
-        // reconcile).
-        //
-        // I-065: the predicate is kind/system/feature-aware AND
-        // excludes draining workers — see
-        // `failed_builders_exhausts_fleet`'s doc-comment for the
-        // poolSize=1 premature-poison scenario the draining-exclusion
-        // fixes.
-        let exhausts_fleet = self.failed_builders_exhausts_fleet(drv_hash);
-        let reached_poison = reached_poison || exhausts_fleet;
+        if self.dag.node(drv_hash).is_none() {
+            return FailureHandling::Handled;
+        }
 
-        let (should_retry, poison_reason) = if let Some(state) = self.dag.node_mut(drv_hash) {
-            if reached_poison {
-                let why = if exhausts_fleet {
-                    "failed on every eligible worker".to_string()
-                } else {
-                    format!(
-                        "poison threshold reached after {} distinct-worker failures",
-                        state.retry.failed_builders.len()
-                    )
-                };
-                (false, why) // poison_and_cascade below does the transition
-            } else if state.retry.count < self.retry_policy.max_retries {
-                state.ensure_running();
-                if let Err(e) = state.transition(DerivationStatus::Failed) {
-                    warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
-                }
-                (true, String::new())
-            } else {
-                let n = state.retry.count;
-                warn!(
-                    drv_hash = %drv_hash,
-                    retry_count = n,
-                    max = self.retry_policy.max_retries,
-                    resource_floor = ?state.sched.resource_floor,
-                    "transient failure: max_retries exhausted, poisoning"
+        // r[impl sched.retry.per-executor-budget]
+        // The live eligible fleet snapshot for the fleet-exhaust arm:
+        // statically-eligible (kind/system/features), non-draining,
+        // registered workers — the same construction as the as-built
+        // `failed_builders_exhausts_fleet` predicate. Under one-shot
+        // semantics (I-188; the only mode) failed workers are draining
+        // and the controller spawns fresh executor ids, so this arm
+        // stays the defense-in-depth backstop it has always been; the
+        // dispatch-time backstop (E9) covers paths that bypass this
+        // handler until its own collapse (T-1b.7).
+        let eligible: HashSet<ExecutorId> = self
+            .dag
+            .node(drv_hash)
+            .map(|state| {
+                self.executors
+                    .values()
+                    .filter(|w| {
+                        !w.is_draining() && crate::assignment::statically_eligible(w, state)
+                    })
+                    .map(|w| w.executor_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The verdict: decide() over the appended suffix plus the
+        // placement check, inside the appending transaction; the
+        // verdict's status is persisted on the same connection
+        // (threshold / cap / fleet-exhaust poison -> Poisoned, retry ->
+        // Ready). The uncommitted-merge edge (no db row) folds the
+        // in-memory history plus a synthetic record for this
+        // observation and persists nothing.
+        let (decision, fleet_exhausted, recorded_row) = if let Some(row) = attempt_row {
+            let result: Result<(crate::retry_policy::Decision, bool), sqlx::Error> = async {
+                let mut tx = self.db.pool().begin().await?;
+                let decision = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let fleet_exhausted = matches!(
+                    crate::retry_policy::placeable(&decision.exclusion, &eligible),
+                    crate::retry_policy::Placement::FleetExhausted
                 );
-                (
-                    false,
-                    format!("max_retries={n} exhausted after transient failures"),
-                )
+                if fleet_exhausted
+                    || matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
+                {
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                } else {
+                    crate::db::SchedulerDb::update_derivation_status_in_tx(
+                        &mut tx,
+                        drv_hash,
+                        DerivationStatus::Ready,
+                        None,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok((decision, fleet_exhausted))
+            }
+            .await;
+            match result {
+                Ok((decision, fleet_exhausted)) => (decision, fleet_exhausted, Some(row)),
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                          "transient failure: appending transaction failed; derivation stays in \
+                           its pre-report state pending re-delivery");
+                    return FailureHandling::RecordFailed;
+                }
             }
         } else {
-            return;
+            let mut history = self
+                .dag
+                .node(drv_hash)
+                .map(|s| s.attempt_history().to_vec())
+                .unwrap_or_default();
+            // Include the current (unrecordable) observation so the
+            // threshold sees it, exactly as the RAM path did.
+            history.push(crate::state::AttemptRecord {
+                attempt_id: Uuid::now_v7(),
+                event_kind: crate::state::AttemptEventKind::Attempt,
+                outcome_class: OutcomeClass::Transient,
+                exec_id: None,
+                executor_id: Some(executor_id.clone()),
+                termination_reason: None,
+                reporting_party: ReportingParty::Worker,
+                exempt: false,
+                floor_promoted: false,
+                floor_at_cap: false,
+                error_msg: None,
+                final_line_count: None,
+                resubmit_cycle: 0,
+                occurred_at_epoch_secs: crate::db::attempts::epoch_now(),
+                recorded_at_epoch_secs: 0.0,
+            });
+            let decision = crate::retry_policy::decide(
+                &history,
+                &self.decision_budget(),
+                crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
+                None,
+            );
+            let fleet_exhausted = matches!(
+                crate::retry_policy::placeable(&decision.exclusion, &eligible),
+                crate::retry_policy::Placement::FleetExhausted
+            );
+            (decision, fleet_exhausted, None)
         };
 
-        if should_retry {
-            // Delayed re-queue: set backoff_until on the state, then
-            // Failed → Ready + push. dispatch_ready checks
-            // backoff_until and defers if not yet elapsed. Stateless
-            // — no timer tasks, no cleanup if the derivation is
-            // cancelled meanwhile (backoff_until is just an Option
-            // on the state, ignored for non-Ready). Cleared on
-            // successful dispatch in assign_to_worker.
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                let backoff = self.retry_policy.backoff_duration(state.retry.count);
-                state.retry.count += 1;
-                state.assigned_executor = None;
-                state.retry.backoff_until = Some(Instant::now() + backoff);
-                debug!(
+        // Push the committed row onto the in-memory history before
+        // acting on the verdict.
+        if let Some(row) = recorded_row
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.push_attempt_record(row.to_record());
+        }
+
+        // Act on the verdict with the as-built reason priority:
+        // fleet-exhaust > threshold > per-cycle cap. The poison reason
+        // stays the synthesized string (the worker's error_msg is
+        // diagnostics the E1 arm has never surfaced here); the report's
+        // line count rides along so the final execution's log reads
+        // complete.
+        if fleet_exhausted {
+            // I-065 operator triage + metric, emitted at the arm that
+            // acts on the placeable() verdict (the as-built emission
+            // inside `failed_builders_exhausts_fleet` keeps serving the
+            // dispatch-time backstop until T-1b.7).
+            if let Some(state) = self.dag.node(drv_hash) {
+                warn!(
                     drv_hash = %drv_hash,
-                    retry_count = state.retry.count,
-                    backoff_secs = backoff.as_secs_f64(),
-                    "scheduling retry after transient failure"
+                    system = %state.system,
+                    declared_features = ?state.required_features(),
+                    effective_features = ?state.effective_features().as_slice(),
+                    failed_on = decision.exclusion.len(),
+                    "failed_builders excludes every statically-eligible worker \
+                     (kind+system+features); poisoning (would otherwise defer \
+                     forever — see I-065)"
                 );
-                if let Err(e) = state.transition(DerivationStatus::Ready) {
-                    warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
-                } else {
-                    self.push_ready(drv_hash.clone());
-                }
             }
-            if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
-            }
-            // PG status: Ready, NOT Failed. The in-mem state machine
-            // goes Failed→Ready (Failed is an intermediate); PG must
-            // match the FINAL in-mem state. Crash in the backoff
-            // window (up to 300s) with PG=Failed → recovery loads it
-            // (Failed not in TERMINAL_STATUS_SQL filter) but only
-            // pushes Ready-status drvs to the queue (seed_ready_queue's
-            // Ready-only filter) → Failed drv sits in DAG forever,
-            // never dispatched.
-            //
-            // 1a: the non-terminal retry is exactly the attempt nothing
-            // used to stamp — append its ledger row in the same
-            // transaction as the Ready persist.
-            self.record_attempt_with_status(drv_hash, attempt_row, DerivationStatus::Ready, None)
-                .await;
-            // C2c: dashboard's WatchBuild showed stale running_count
-            // through the backoff window (up to 300s) — siblings
-            // (`handle_infrastructure_failure`, `handle_timeout_
-            // failure`) get this via `requeue_after_retry`; the inline
-            // here ported persist_status but not the progress emit.
-            for build_id in self.get_interested_builds(drv_hash) {
-                self.emit_progress(build_id);
-            }
-        } else {
-            // The poison reason stays the synthesized string (the
-            // worker's error_msg is diagnostics the E1 arm has never
-            // surfaced here); the report's line count rides along so
-            // the final execution's log reads complete, and the ledger
-            // row joins the poison persist's transaction.
-            self.poison_and_cascade(
+            metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
+            self.poison_already_recorded(
                 drv_hash,
-                &poison_reason,
+                "failed on every eligible worker",
                 report.final_line_count,
-                attempt_row,
             )
             .await;
+            return FailureHandling::Handled;
         }
+        match decision.verdict {
+            crate::retry_policy::Verdict::Poison(
+                crate::retry_policy::PoisonReason::TransientBudget,
+            ) => {
+                let n = decision.counters.count;
+                if let Some(state) = self.dag.node(drv_hash) {
+                    warn!(
+                        drv_hash = %drv_hash,
+                        retry_count = n,
+                        max = self.retry_policy.max_retries,
+                        resource_floor = ?state.sched.resource_floor,
+                        "transient failure: max_retries exhausted, poisoning"
+                    );
+                }
+                self.poison_already_recorded(
+                    drv_hash,
+                    &format!("max_retries={n} exhausted after transient failures"),
+                    report.final_line_count,
+                )
+                .await;
+            }
+            crate::retry_policy::Verdict::Poison(_) => {
+                // The distinct-worker / flat-count poison threshold (or,
+                // defensively, any other reason the fold could produce
+                // for a transient last event).
+                self.poison_already_recorded(
+                    drv_hash,
+                    &format!(
+                        "poison threshold reached after {} distinct-worker failures",
+                        decision.counters.failed_builders.len()
+                    ),
+                    report.final_line_count,
+                )
+                .await;
+            }
+            _ => {
+                // Delayed re-queue: set backoff_until on the state, then
+                // Failed → Ready + push. dispatch_ready checks
+                // backoff_until and defers if not yet elapsed. Stateless
+                // — no timer tasks, no cleanup if the derivation is
+                // cancelled meanwhile (backoff_until is just an Option
+                // on the state, ignored for non-Ready). Cleared on
+                // successful dispatch in assign_to_worker. The RAM
+                // count/backoff writes are the legacy view (rule 1); the
+                // production jitter stays here at the site.
+                if let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.ensure_running();
+                    if let Err(e) = state.transition(DerivationStatus::Failed) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
+                    }
+                    let backoff = self.retry_policy.backoff_duration(state.retry.count);
+                    state.retry.count += 1;
+                    state.assigned_executor = None;
+                    state.retry.backoff_until = Some(Instant::now() + backoff);
+                    debug!(
+                        drv_hash = %drv_hash,
+                        retry_count = state.retry.count,
+                        backoff_secs = backoff.as_secs_f64(),
+                        "scheduling retry after transient failure"
+                    );
+                    if let Err(e) = state.transition(DerivationStatus::Ready) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
+                    } else {
+                        self.push_ready(drv_hash.clone());
+                    }
+                }
+                // Legacy mirror write (kept until T-1b.13): the
+                // retry_count column still feeds the as-built recovery
+                // projection. The Ready persist itself already happened
+                // inside the appending transaction.
+                if let Err(e) = self.db.increment_retry_count(drv_hash).await {
+                    error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
+                }
+                // C2c: dashboard's WatchBuild showed stale running_count
+                // through the backoff window (up to 300s) without the
+                // progress emit.
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.emit_progress(build_id);
+                }
+            }
+        }
+        FailureHandling::Handled
     }
 
     /// InfrastructureFailure: worker-local problem, not the build's fault.
