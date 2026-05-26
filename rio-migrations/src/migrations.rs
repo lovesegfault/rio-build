@@ -1361,6 +1361,37 @@ pub const M_067: () = ();
 /// poison TTL); a real GC policy is a recorded Phase-2 follow-up.
 pub const M_068: () = ();
 
+/// `migrations/070_chunks_last_referenced_at.sql`
+///
+/// Adds `chunks.last_referenced_at TIMESTAMPTZ` (nullable, no
+/// backfill) for the refcount-formal campaign's lazy mark-and-collect
+/// chunk GC (design §4.1): the collector derives chunk liveness from
+/// the durable manifests at collect time, and this timestamp closes
+/// the mark-snapshot race the exact refcount closes today — a manifest
+/// whose upgrade transaction commits after the cycle's mark snapshot
+/// but references an old, otherwise-unreferenced chunk is invisible to
+/// that cycle's mark; the upsert's touch keeps the chunk out of that
+/// cycle's collect via the grace term.
+///
+/// **Single writer:** the chunked-upgrade upsert's `ON CONFLICT DO
+/// UPDATE` arm (`upgrade_manifest_to_chunked` in
+/// `rio-store/src/metadata/chunked.rs`) sets it to `now()`. No cleanup
+/// path (reaper, rollback, sweep, drain) ever writes it, and nothing
+/// reads it until the collector lands — it is a timestamp with no
+/// arithmetic to corrupt, not a counter.
+///
+/// **Why nullable with no backfill:** the collect predicate is
+/// `GREATEST(created_at, last_referenced_at) < cycle_start - grace`,
+/// and PostgreSQL's `GREATEST()` ignores NULL arguments, so a NULL is
+/// semantically identical to "backfilled to created_at" while keeping
+/// the startup-run migration metadata-only on the largest table in the
+/// schema (no full-table rewrite or update).
+///
+/// **Numbering:** 069 is reserved by the retry campaign's deferred
+/// mirror-column drop (see the retry invariant map close-out); the gap
+/// is deliberate, not a missing file.
+pub const M_070: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

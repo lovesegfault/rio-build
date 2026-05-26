@@ -188,13 +188,24 @@ pub(crate) async fn upgrade_manifest_to_chunked(
     // Two concurrent PutPaths sharing a chunk now BOTH upload —
     // S3 PutObject is idempotent (same key, same bytes), so the
     // duplicate write is wasted bandwidth, not a correctness hazard.
+    //
+    // `last_referenced_at = now()` (the touch, migration 068): exists
+    // for the lazy chunk collector's mark-snapshot race — a manifest
+    // that commits after a collect cycle's mark snapshot but
+    // re-references an old chunk is invisible to that cycle's mark;
+    // the touch keeps the chunk inside the cycle's grace term. This
+    // upsert is the column's ONLY writer (no cleanup path touches it),
+    // a fresh INSERT leaves it NULL (NULL ≡ created_at under the
+    // collector's GREATEST predicate), and nothing reads it until the
+    // collector lands.
     let rows: Vec<(Vec<u8>, bool)> = sqlx::query_as(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
         SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
                AS t(hash, one, size)
         ON CONFLICT (blake3_hash) DO UPDATE
-            SET refcount = chunks.refcount + 1, deleted = false
+            SET refcount = chunks.refcount + 1, deleted = false,
+                last_referenced_at = now()
         RETURNING blake3_hash, (uploaded_at IS NULL) AS needs_upload
         "#,
     )
@@ -642,6 +653,116 @@ mod tests {
                 .unwrap();
         assert_eq!(rc, 1, "resurrected: 0→1");
         assert!(!del, "resurrected: deleted flipped false");
+    }
+
+    /// Migration 068 touch: a fresh INSERT leaves `last_referenced_at`
+    /// NULL (NULL ≡ created_at under the collector's GREATEST
+    /// predicate); a conflicting second upgrade referencing the same
+    /// chunk sets it; a third advances it. The touch must not change
+    /// the needs_upload verdict, which stays keyed on `uploaded_at`
+    /// alone (the dedup verdict stays RETURNING-atomic and
+    /// CR-4-shaped).
+    #[tokio::test]
+    async fn upsert_touch_advances_last_referenced_at() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk = vec![0x68u8; 32];
+
+        // --- Fresh insert: last_referenced_at stays NULL ---
+        let sph1 = vec![0x31u8; 32];
+        seed_placeholder(&db.pool, &sph1).await;
+        let (need1, _) = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph1,
+            b"manifest-touch-1",
+            std::slice::from_ref(&chunk),
+            &[1024],
+        )
+        .await
+        .unwrap();
+        assert!(need1.contains(&chunk), "fresh chunk needs upload");
+
+        let touched1: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM last_referenced_at)::float8 \
+             FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            touched1.is_none(),
+            "fresh INSERT leaves last_referenced_at NULL"
+        );
+
+        // Confirm S3 presence so the conflict path's needs_upload
+        // verdict is observable (false) below.
+        mark_chunks_uploaded(&db.pool, std::slice::from_ref(&chunk))
+            .await
+            .unwrap();
+
+        // --- Second upgrade (conflict): touch is set ---
+        let sph2 = vec![0x32u8; 32];
+        seed_placeholder(&db.pool, &sph2).await;
+        let (need2, _) = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph2,
+            b"manifest-touch-2",
+            std::slice::from_ref(&chunk),
+            &[1024],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !need2.contains(&chunk),
+            "uploaded_at set → needs_upload unchanged by the touch"
+        );
+
+        let touched2: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM last_referenced_at)::float8 \
+             FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let touched2 = touched2.expect("conflicting upgrade sets last_referenced_at");
+
+        // --- Third upgrade: touch advances ---
+        let sph3 = vec![0x33u8; 32];
+        seed_placeholder(&db.pool, &sph3).await;
+        upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph3,
+            b"manifest-touch-3",
+            std::slice::from_ref(&chunk),
+            &[1024],
+        )
+        .await
+        .unwrap();
+
+        let touched3: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM last_referenced_at)::float8 \
+             FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let touched3 = touched3.expect("third upgrade keeps the touch set");
+        assert!(
+            touched3 >= touched2,
+            "each conflicting upgrade advances (or repeats, within clock \
+             resolution) the touch; it never regresses"
+        );
+
+        // refcount accounting unchanged by the touch.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 3, "three referencing manifests");
     }
 
     // r[verify store.cas.chunk-upload-committed]
