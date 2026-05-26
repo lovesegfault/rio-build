@@ -4561,3 +4561,152 @@ async fn started_event_carries_exec_id() -> TestResult {
     );
     Ok(())
 }
+
+/// A-1a-2 (the failed-logs defect): a failure-terminal path whose
+/// triggering worker report carries a usable `final_line_count` must
+/// stamp it on the execution's `drv_executions` row — the store's
+/// completeness predicate can then serve the failure log as complete
+/// instead of holding it "incomplete" until the 30-day TTL. The
+/// client-visible failure event keeps surfacing the worker's
+/// `error_msg` (already true for the permanent path — regression pin).
+#[tokio::test]
+async fn failure_terminal_stamps_report_final_line_count() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("flc-w", "x86_64-linux").await?;
+    let drv_hash = "flc-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let mut ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    // Worker report: permanent failure, 37 log lines emitted.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "flc-w".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                error_msg: "missing header: zlib.h".into(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            node_name: None,
+            hw_class: None,
+            final_line_count: 37,
+            final_resources: None,
+        })
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "permanent failure must poison"
+    );
+
+    // The terminal stamp is fire-and-forget (spawn_monitored) — poll.
+    let key = rio_nix::store_path::drv_log_hash(&drv_path);
+    let mut row: Option<(Option<String>, Option<i64>)> = None;
+    for _ in 0..100 {
+        row = sqlx::query_as(
+            "SELECT status, final_line_count FROM drv_executions WHERE drv_hash = $1",
+        )
+        .bind(&key)
+        .fetch_optional(&db.pool)
+        .await?;
+        if matches!(&row, Some((Some(_), _))) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, count) = row.expect("the dispatch-time row must exist");
+    assert_eq!(
+        status.as_deref(),
+        Some(rio_migrations::schema::EXEC_STATUS_FAILED),
+        "failure terminal must stamp the execution failed"
+    );
+    assert_eq!(
+        count,
+        Some(37),
+        "the failing report's final_line_count must land on drv_executions \
+         (A-1a-2: today the failure epilogue stamps NULL)"
+    );
+
+    // The DerivationFailed event carries the worker's error message.
+    let events = drain_derivation_events(&mut ev);
+    assert!(
+        events
+            .iter()
+            .any(|d| d.error_message.contains("missing header: zlib.h")),
+        "the DerivationFailed event must surface the worker's error_msg, got {:?}",
+        events
+            .iter()
+            .map(|d| d.error_message.clone())
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// The symmetric conservative arm of A-1a-2: a REPORTLESS failure
+/// terminal (the scheduler-side backstop driving the poison threshold)
+/// has no line count to stamp — the final execution's row must keep
+/// `final_line_count` NULL ("not reported"), never a fabricated value.
+/// Pinned so the report-threading change (and later the 1b collapse)
+/// cannot accidentally "fix" the reportless arm.
+#[tokio::test]
+async fn reportless_backstop_poison_keeps_final_line_count_null() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let drv_hash = "flc-bs-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    // Three backstop fires on three distinct wedged workers → the
+    // default distinct-worker poison threshold poisons on the third
+    // (same shape as test_backstop_timeout_bounds_retry_loop).
+    for i in 0..3 {
+        let id = format!("flc-bs-w{i}");
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        let ok = handle.debug_backdate_running(drv_hash, 200).await?;
+        assert!(ok, "backdate must succeed for the assigned drv");
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        let _ = rx.try_recv();
+    }
+    assert_eq!(
+        expect_drv(&handle, drv_hash).await.status,
+        DerivationStatus::Poisoned,
+        "third backstopped worker must reach the poison threshold"
+    );
+
+    // The poisoning execution's row is stamped failed — with NO line
+    // count (nothing reported one). Poll for the stamp, then assert the
+    // count column stayed NULL on every row of this derivation.
+    let key = rio_nix::store_path::drv_log_hash(&drv_path);
+    let mut stamped: Option<(Option<String>, Option<i64>)> = None;
+    for _ in 0..100 {
+        stamped = sqlx::query_as(
+            "SELECT status, final_line_count FROM drv_executions \
+             WHERE drv_hash = $1 AND status IS NOT NULL \
+             ORDER BY exec_id DESC LIMIT 1",
+        )
+        .bind(&key)
+        .fetch_optional(&db.pool)
+        .await?;
+        if stamped.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, count) = stamped.expect("the poisoning execution must be stamped terminal");
+    assert_eq!(
+        status.as_deref(),
+        Some(rio_migrations::schema::EXEC_STATUS_FAILED),
+        "the reportless poison still stamps the execution failed"
+    );
+    assert_eq!(
+        count, None,
+        "a reportless terminal must keep final_line_count NULL (conservative arm)"
+    );
+    Ok(())
+}

@@ -52,6 +52,24 @@ pub(super) struct FailureOutcome {
     pub(super) reached_poison: bool,
 }
 
+/// Report-carried context for the worker-reported failure handlers
+/// (E1–E4): the fields of the triggering `CompletionReport` the failure
+/// paths consume, borrowed at the `handle_completion` routing match.
+///
+/// `final_line_count` is already in the stamp's `Option` form (the
+/// proto's `0` "not reported" sentinel and out-of-range values become
+/// `None` — same conversion as the success path), so a failure-terminal
+/// path can hand it straight to the `drv_executions` stamp. Reportless
+/// exit paths (disconnect, controller reports, backstop, recovery)
+/// never construct one — they keep stamping `NULL`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FailureReportCtx<'a> {
+    /// `CompletionReport.final_line_count`, `None` when not reported.
+    pub(super) final_line_count: Option<i64>,
+    /// Worker-provided error message (may be empty).
+    pub(super) error_msg: &'a str,
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Best-effort persist helpers (13 call sites across actor/*)
@@ -888,6 +906,11 @@ impl DagActor {
             s.never_forgive_paths.clear();
         }
 
+        // Report-carried context for the failure handlers. The
+        // line-count sentinel conversion matches the success path's
+        // stamp below: 0 ("not reported") and out-of-range worker
+        // values become None, never a literal/negative count.
+        let report_line_count = i64::try_from(final_line_count).ok().filter(|n| *n > 0);
         match status {
             rio_proto::types::BuildResultStatus::Built
             | rio_proto::types::BuildResultStatus::Substituted
@@ -905,15 +928,30 @@ impl DagActor {
             rio_proto::types::BuildResultStatus::TransientFailure => {
                 // Build ran, exited non-zero. Counts toward poison — 3
                 // workers all seeing this means it's not actually transient.
-                self.handle_transient_failure(drv_hash, executor_id).await;
+                self.handle_transient_failure(
+                    drv_hash,
+                    executor_id,
+                    FailureReportCtx {
+                        final_line_count: report_line_count,
+                        error_msg: &result.error_msg,
+                    },
+                )
+                .await;
             }
             // r[impl sched.retry.per-executor-budget]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
                 // WITHOUT inserting into failed_builders.
-                self.handle_infrastructure_failure(drv_hash, executor_id, &result.error_msg)
-                    .await;
+                self.handle_infrastructure_failure(
+                    drv_hash,
+                    executor_id,
+                    FailureReportCtx {
+                        final_line_count: report_line_count,
+                        error_msg: &result.error_msg,
+                    },
+                )
+                .await;
             }
             rio_proto::types::BuildResultStatus::PermanentFailure
             | rio_proto::types::BuildResultStatus::CachedFailure
@@ -927,8 +965,15 @@ impl DagActor {
             // (deterministic re-dispatch on persisted is_fixed_output).
             // Retry can't help.
             | rio_proto::types::BuildResultStatus::InputRejected => {
-                self.handle_permanent_failure(drv_hash, &result.error_msg, executor_id)
-                    .await;
+                self.handle_permanent_failure(
+                    drv_hash,
+                    executor_id,
+                    FailureReportCtx {
+                        final_line_count: report_line_count,
+                        error_msg: &result.error_msg,
+                    },
+                )
+                .await;
             }
             // TimedOut: I-200 bumps resource_floor.deadline and retries on
             // a larger class (longer activeDeadlineSeconds), bounded by
@@ -937,8 +982,15 @@ impl DagActor {
             // → same timeout, so further auto-retry is a storm.
             // Poisoned's 24h TTL is way too aggressive for a timeout.
             rio_proto::types::BuildResultStatus::TimedOut => {
-                self.handle_timeout_failure(drv_hash, &result.error_msg, executor_id)
-                    .await;
+                self.handle_timeout_failure(
+                    drv_hash,
+                    executor_id,
+                    FailureReportCtx {
+                        final_line_count: report_line_count,
+                        error_msg: &result.error_msg,
+                    },
+                )
+                .await;
             }
             rio_proto::types::BuildResultStatus::Cancelled => {
                 // The early-return at :661 checks the DAG status, NOT
@@ -958,7 +1010,10 @@ impl DagActor {
                 self.handle_infrastructure_failure(
                     drv_hash,
                     executor_id,
-                    "worker reported Cancelled without scheduler-initiated cancel",
+                    FailureReportCtx {
+                        final_line_count: report_line_count,
+                        error_msg: "worker reported Cancelled without scheduler-initiated cancel",
+                    },
                 )
                 .await;
             }
@@ -968,7 +1023,15 @@ impl DagActor {
                     status = ?result.status,
                     "unknown build result status, treating as transient failure"
                 );
-                self.handle_transient_failure(drv_hash, executor_id).await;
+                self.handle_transient_failure(
+                    drv_hash,
+                    executor_id,
+                    FailureReportCtx {
+                        final_line_count: report_line_count,
+                        error_msg: &result.error_msg,
+                    },
+                )
+                .await;
             }
         }
 
@@ -1913,7 +1976,16 @@ impl DagActor {
     /// the reassign path (worker disconnect), the caller checks the
     /// threshold BEFORE reset_to_ready — the drv is still
     /// Assigned/Running then.
-    pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash, error_msg: &str) {
+    pub(super) async fn poison_and_cascade(
+        &mut self,
+        drv_hash: &DrvHash,
+        error_msg: &str,
+        // `CompletionReport.final_line_count` when the poisoning event
+        // is a worker report (E1–E2); `None` for the reportless
+        // triggers (disconnect re-check, controller terminations,
+        // backstop, fleet-exhaust, recovery) — the conservative stamp.
+        final_line_count: Option<i64>,
+    ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -1945,6 +2017,7 @@ impl DagActor {
             drv_hash,
             error_msg,
             rio_proto::types::BuildResultStatus::TransientFailure,
+            final_line_count,
         )
         .await;
     }
@@ -1978,6 +2051,13 @@ impl DagActor {
         drv_hash: &DrvHash,
         error_msg: &str,
         status: rio_proto::types::BuildResultStatus,
+        // The triggering report's `final_line_count` where the failure
+        // path has one (worker-reported E1–E4); `None` on the
+        // reportless paths (disconnect, controller reports, backstop,
+        // substitute revert, recovery), which stays the correct
+        // conservative value — the row reads as incomplete rather than
+        // falsely complete.
+        final_line_count: Option<i64>,
     ) {
         // Stamp + emit use the trigger's interested set (those builds
         // saw THIS drv fail); handle_derivation_failure below uses the
@@ -1988,15 +2068,7 @@ impl DagActor {
         // states — see terminal_log_epilogue's NOT-called-for note.
         // r[impl sched.merge.exec-correlation+7]
         let trigger_builds = self.get_interested_builds(drv_hash);
-        // `None`: this epilogue is reached from poison / retry-budget
-        // exhaustion / permanent failure, where the triggering
-        // CompletionReport (if there even was one — timeouts have
-        // none) is not threaded this far. The row reads as incomplete,
-        // which is the conservative direction for a failed build's
-        // log. Threading the report's final_line_count through the
-        // failure cascade is a possible follow-up if "(log
-        // incomplete)" on fully-uploaded failure logs proves annoying.
-        self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds, None);
+        self.terminal_log_epilogue(drv_hash, "failed", &trigger_builds, final_line_count);
         let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
         for build_id in &trigger_builds {
             // r[impl gw.activity.progress-before-stop]
@@ -2181,6 +2253,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
+        report: FailureReportCtx<'_>,
     ) {
         // Record failure (in-mem HashSet insert + PG append,
         // best-effort) + get poison verdict in one call — same
@@ -2295,7 +2368,12 @@ impl DagActor {
                 self.emit_progress(build_id);
             }
         } else {
-            self.poison_and_cascade(drv_hash, &poison_reason).await;
+            // The poison reason stays the synthesized string (the
+            // worker's error_msg is diagnostics the E1 arm has never
+            // surfaced here); the report's line count rides along so
+            // the final execution's log reads complete.
+            self.poison_and_cascade(drv_hash, &poison_reason, report.final_line_count)
+                .await;
         }
     }
 
@@ -2326,8 +2404,9 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
-        error_msg: &str,
+        report: FailureReportCtx<'_>,
     ) {
+        let error_msg = report.error_msg;
         // I-199: bump resource_floor ONLY on the worker-reported
         // `CgroupOom` infra failure (I-196 OOM watcher: build child
         // hit cgroup memory.max while the pod itself survived). Other
@@ -2412,6 +2491,7 @@ impl DagActor {
                 self.poison_and_cascade(
                     drv_hash,
                     &format!("max_exempt_infra_retries={max} exceeded: {error_msg}"),
+                    report.final_line_count,
                 )
                 .await;
                 return;
@@ -2467,6 +2547,7 @@ impl DagActor {
                 &format!(
                     "max_infra_retries={max} exhausted after infrastructure failures: {error_msg}"
                 ),
+                report.final_line_count,
             )
             .await;
             return;
@@ -2510,9 +2591,10 @@ impl DagActor {
     pub(super) async fn handle_permanent_failure(
         &mut self,
         drv_hash: &DrvHash,
-        error_msg: &str,
         executor_id: &ExecutorId,
+        report: FailureReportCtx<'_>,
     ) {
+        let error_msg = report.error_msg;
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -2546,6 +2628,7 @@ impl DagActor {
             drv_hash,
             error_msg,
             rio_proto::types::BuildResultStatus::PermanentFailure,
+            report.final_line_count,
         )
         .await;
     }
@@ -2577,9 +2660,10 @@ impl DagActor {
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,
-        error_msg: &str,
         executor_id: &ExecutorId,
+        report: FailureReportCtx<'_>,
     ) {
+        let error_msg = report.error_msg;
         // Bump BEFORE the cap check / state transition: even the
         // terminal-path attempt should record that this deadline was
         // inadequate, so an explicit resubmit starts at the doubled
@@ -2657,6 +2741,7 @@ impl DagActor {
             drv_hash,
             error_msg,
             rio_proto::types::BuildResultStatus::TimedOut,
+            report.final_line_count,
         )
         .await;
     }

@@ -516,6 +516,7 @@ impl DagActor {
                 self.poison_and_cascade(
                     drv_hash,
                     "poison threshold reached on worker disconnect after prior failures",
+                    None,
                 )
                 .await;
                 continue;
@@ -672,6 +673,7 @@ impl DagActor {
                 self.poison_and_cascade(
                     &drv_hash,
                     &format!("max_infra_retries={max} exhausted at resource ceiling ({reason:?})"),
+                    None,
                 )
                 .await;
                 return false;
@@ -749,6 +751,7 @@ impl DagActor {
                 self.poison_and_cascade(
                     &drv_hash,
                     &format!("max_timeout_retries={max} exhausted (DeadlineExceeded backstop)"),
+                    None,
                 )
                 .await;
                 return false;
