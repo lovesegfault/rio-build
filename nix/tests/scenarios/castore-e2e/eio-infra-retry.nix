@@ -1,5 +1,13 @@
 # castore-e2e subtest fragment — composed by scenarios/castore-e2e.nix mkTest.
 scope: with scope; ''
+  # NOT WIRED YET (P0560 round 3b finding): on the first run of this
+  # subtest the derivation went terminally `poisoned` after a single
+  # input-read-EIO attempt instead of being re-queued as an
+  # infrastructure failure (builder.result.input-eio-is-infra). The
+  # subtest now dumps the executor message and the scheduler's
+  # classification decision when that happens; wire it back into
+  # vm-castore-e2e-faults once the classification gap is understood
+  # and fixed.
   # ══════════════════════════════════════════════════════════════════
   # eio-infra-retry — EIO on an input read is infra, never a poison
   # ══════════════════════════════════════════════════════════════════

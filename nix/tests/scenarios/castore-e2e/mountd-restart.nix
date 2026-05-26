@@ -1,5 +1,15 @@
 # castore-e2e subtest fragment — composed by scenarios/castore-e2e.nix mkTest.
 scope: with scope; ''
+  # NOT WIRED YET (P0560 round 3b finding): the in-flight build did
+  # not survive the broker force-restart — every attempt failed as an
+  # infrastructure failure right after its hold window and the build
+  # ended `dependency_failed` after the orphan watcher reaped it. The
+  # orphan-scan + cache-survival half of the subtest passed (the
+  # planted staging orphan was reaped, /var/rio/{cache,chunks}
+  # survived, the restarted daemon served new mounts). Wire it back
+  # into vm-castore-e2e-faults once the in-flight-build story is
+  # understood (builder.mountd.orphan-scan stays verified by
+  # vm-mountd in the meantime).
   # ══════════════════════════════════════════════════════════════════
   # mountd-restart — broker restart is non-disruptive + orphan scan
   # ══════════════════════════════════════════════════════════════════

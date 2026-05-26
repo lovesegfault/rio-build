@@ -1,5 +1,13 @@
 # castore-e2e subtest fragment — composed by scenarios/castore-e2e.nix mkTest.
 scope: with scope; ''
+  # NOT WIRED YET (P0560 round 3b finding): with rio-store scaled to
+  # 0 mid-build, the fetch breaker did not open within several
+  # minutes of consecutive failed opens (sequential or concurrent),
+  # and the client-less build was reaped by the scheduler's orphan
+  # watcher (300 s) before the gate could conclude. The subtest now
+  # prints a counters/pod-phase timeline while it waits; wire it back
+  # into vm-castore-e2e-faults once the breaker behavior under a real
+  # outage is understood (builder.fs.fetch-circuit).
   # ══════════════════════════════════════════════════════════════════
   # eio-circuit-breaker — store outage mid-build: bounded EIO + breaker
   # ══════════════════════════════════════════════════════════════════
