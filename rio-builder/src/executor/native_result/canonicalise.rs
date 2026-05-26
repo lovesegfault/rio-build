@@ -449,8 +449,17 @@ mod tests {
         std::fs::write(root.join("tool"), b"x").unwrap();
         // 04555: setuid + r-xr-xr-x. Not group/world-writable, so it passes
         // the writability gate and must be cleaned by the chmod step.
-        std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o4555))
-            .unwrap();
+        // Some environments (notably Nix's own build sandbox, whose seccomp
+        // filter EPERMs setuid/setgid mode bits — the very behavior this
+        // module replicates) refuse to create the precondition; skip there
+        // rather than fail on an unsatisfiable setup.
+        if std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o4555))
+            .is_err()
+            || std::fs::metadata(root.join("tool")).unwrap().mode() & 0o4000 == 0
+        {
+            eprintln!("skipping strips_setuid_bits: cannot create a setuid file here");
+            return;
+        }
 
         canonicalise_output(&root, my_uid(), &mut HashSet::new()).unwrap();
         assert_eq!(
