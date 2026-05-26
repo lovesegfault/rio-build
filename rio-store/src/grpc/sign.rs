@@ -563,7 +563,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_k.clone()];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
+        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[], None)
             .await
             .unwrap();
 
@@ -694,7 +694,7 @@ mod tests {
             .unwrap();
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_chunked(&db.pool, &stored, claim, &[])
+        metadata::complete_manifest_chunked(&db.pool, &stored, claim, &[], None)
             .await
             .unwrap();
         let stored = metadata::query_path_info(&db.pool, &path)
@@ -795,7 +795,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_tenant];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
+        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[], None)
             .await
             .unwrap();
 
@@ -876,7 +876,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            metadata::complete_manifest_chunked(&db.pool, &info, claim, &[])
+            metadata::complete_manifest_chunked(&db.pool, &info, claim, &[], None)
                 .await
                 .unwrap();
         }
@@ -978,7 +978,7 @@ mod tests {
                 vec![]
             };
             info_with_sig.store_path_hash = path_hash.to_vec();
-            metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
+            metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[], None)
                 .await
                 .unwrap();
             paths.push(path);
@@ -1070,7 +1070,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_a];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[])
+        metadata::complete_manifest_chunked(&db.pool, &info_with_sig, claim, &[], None)
             .await
             .unwrap();
 

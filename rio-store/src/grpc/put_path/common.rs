@@ -589,12 +589,22 @@ impl StoreServiceImpl {
     /// here; the caller's drop-guard spawn is then a harmless no-op.
     /// `info.store_path_hash` MUST be populated.
     ///
+    /// `tenant_id` (the session JWT tenant from [`Self::authorize`]) does
+    /// double duty: it selects the narinfo signing key (`maybe_sign`) AND
+    /// is attributed to the path in `path_tenants` inside the same
+    /// transaction that completes the manifest, so a gateway-pushed
+    /// source is readable back by the pushing tenant through the
+    /// tenant-scoped castore/narinfo surfaces
+    /// (`r[store.put.tenant-attribution]`). `None` (dev mode /
+    /// service-token-only with no forwarded JWT) writes no row.
+    ///
     /// `nar_data` is a refcounted `Bytes` (zero-copy from the
     /// accumulation `Vec`) so the post-commit eager `nar_index` pass can
     /// hold the buffer from a spawned task without copying it
     /// (`r[store.index.putpath-eager]`). The eager gate fires only after
     /// a successful persist — an aborted upload never indexes.
     // r[impl obs.metric.transfer-volume]
+    // r[impl store.put.tenant-attribution]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
@@ -603,7 +613,10 @@ impl StoreServiceImpl {
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
-        if let Err(e) = self.persist_nar(&info, claim, &nar_data, "PutPath").await {
+        if let Err(e) = self
+            .persist_nar(&info, claim, &nar_data, tenant_id, "PutPath")
+            .await
+        {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
@@ -668,11 +681,15 @@ impl StoreServiceImpl {
     /// `anyhow::Error` → `tonic::Status` via `storage_error` so
     /// `BackendAuthError` → `FailedPrecondition` and the builder
     /// fails fast instead of retrying forever.
+    ///
+    /// `tenant_id` is forwarded into the completion transaction for
+    /// `path_tenants` attribution (`r[store.put.tenant-attribution]`).
     pub(in crate::grpc) async fn persist_nar(
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: &[u8],
+        tenant_id: Option<uuid::Uuid>,
         ctx_label: &str,
     ) -> Result<(), Status> {
         ingest::persist_nar(
@@ -682,6 +699,7 @@ impl StoreServiceImpl {
             claim,
             nar_data,
             self.chunk_upload_max_concurrent,
+            tenant_id,
             PUTPATH_HOOKS,
         )
         .await

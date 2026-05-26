@@ -945,6 +945,18 @@ impl Substituter {
             // `narinfo.compat_file_hash IS NULL`, so `compat::reconciler`
             // republishes it to our bucket off the hot path
             // (r[store.compat.reconcile+2]).
+            //
+            // `tenant_id: None` — the substituter deliberately writes NO
+            // `path_tenants` attribution. Build-triggered substitutions
+            // are attributed to the requesting build's tenant by the
+            // scheduler when the drv completes (`upsert_path_tenants` at
+            // SubstituteComplete / cache-hit / merge), and the narinfo
+            // visibility of substitution-only paths is signature-based
+            // (`sig_visibility_gate`), which keys on the row being
+            // absent. Attributing here would flip such paths to
+            // "built-by-tenant" semantics for every OTHER tenant (I-217
+            // hides not-owned built paths) and break that gate's
+            // discriminator.
             ingest::persist_nar(
                 &self.pool,
                 &self.chunk_backend,
@@ -952,6 +964,7 @@ impl Substituter {
                 claim,
                 &nar_bytes,
                 self.chunk_upload_max_concurrent,
+                None,
                 SUBSTITUTE_HOOKS,
             )
             .await

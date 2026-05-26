@@ -164,12 +164,25 @@ pub async fn claim_placeholder(
 /// the buffer alive for the post-commit eager `nar_index` pass
 /// (`r[store.index.putpath-eager]`) without cloning a multi-GiB Vec.
 ///
+/// `tenant_id`: when `Some`, the completion transaction also writes a
+/// `path_tenants` row attributing the path to that tenant
+/// (`r[store.put.tenant-attribution]` — the legacy gateway/admin push
+/// path, where the session JWT names the pushing tenant). Substitution
+/// passes `None`: substituted paths are attributed by the scheduler at
+/// substitute-complete, and the narinfo sig-visibility gate keys on the
+/// row being absent for substitution-only paths.
+///
 /// On error the caller maps the [`anyhow::Error`] to its own domain
 /// (`tonic::Status` for gRPC, `SubstituteError` for substitution).
 /// `cas::put_chunked`'s internal rollback
 /// (`delete_manifest_chunked_uploading`) already ran; the placeholder
 /// is GONE (best-effort). Caller's `abort_placeholder` is a harmless
 /// no-op but not required.
+// 8 args: the write-ahead core's full context (pool/backend/info/claim/
+// bytes/concurrency) + per-caller tenant + hooks. Bundling them into a
+// params struct would just move the field list one level down for two
+// call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn persist_nar(
     pool: &PgPool,
     chunk_backend: &Arc<dyn ChunkBackend>,
@@ -177,6 +190,7 @@ pub async fn persist_nar(
     claim: Uuid,
     nar_data: &[u8],
     chunk_upload_max_concurrent: usize,
+    tenant_id: Option<Uuid>,
     hooks: IngestHooks,
 ) -> Result<(), anyhow::Error> {
     let stats = cas::put_chunked(
@@ -186,6 +200,7 @@ pub async fn persist_nar(
         claim,
         nar_data,
         chunk_upload_max_concurrent,
+        tenant_id,
     )
     .await?;
     debug!(

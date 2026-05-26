@@ -356,16 +356,28 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
 /// so `HasChunks`' durable-presence invariant — bit set iff referenced
 /// by ≥1 complete manifest — holds without a window where the manifest
 /// is complete but its chunks still report absent (or vice versa).
+///
+/// `tenant_id`: when `Some`, the same transaction also attributes the
+/// path to that tenant via [`super::upsert_path_tenant_in_conn`]
+/// (`r[store.put.tenant-attribution]` — gateway/admin pushes carry the
+/// session JWT tenant). `None` for flows whose attribution happens
+/// elsewhere (builder `PutPathChunked` commit, scheduler-driven
+/// substitution) or that genuinely have no tenant (dev mode).
 #[instrument(skip(pool, info, chunk_hashes), fields(store_path = %info.store_path.as_str()))]
 pub(crate) async fn complete_manifest_chunked(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
     chunk_hashes: &[Vec<u8>],
+    tenant_id: Option<uuid::Uuid>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     super::complete_manifest_in_conn(&mut tx, info, claim).await?;
     mark_chunks_durable(&mut tx, chunk_hashes).await?;
+    // r[impl store.put.tenant-attribution]
+    if let Some(tid) = tenant_id {
+        super::upsert_path_tenant_in_conn(&mut tx, &info.store_path_hash, tid).await?;
+    }
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
@@ -1266,7 +1278,7 @@ mod tests {
         mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
         let mut info = rio_test_support::fixtures::make_path_info(&path, &[0u8; 1024], [0x55; 32]);
         info.store_path_hash = sph.clone();
-        complete_manifest_chunked(&db.pool, &info, claim_b, std::slice::from_ref(&chunk))
+        complete_manifest_chunked(&db.pool, &info, claim_b, std::slice::from_ref(&chunk), None)
             .await
             .unwrap();
 

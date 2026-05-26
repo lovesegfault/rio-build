@@ -175,43 +175,8 @@ async fn test_putpath_sig_covers_references() -> TestResult {
 // Per-tenant signing — store.tenant.sign-key (store.typ)
 // ===========================================================================
 
-/// Spawn a store server with a fake interceptor that ALWAYS attaches
-/// `jwt::Claims { sub: tenant_id }` to every request's extensions.
-///
-/// The real P0259 interceptor (`rio_auth::jwt_interceptor`) verifies a
-/// signed JWT from the `x-rio-tenant-token` metadata header. Here we skip
-/// all that and inject Claims directly — the handler reads `request
-/// .extensions().get::<jwt::Claims>()`, it doesn't care HOW Claims got
-/// there. This tests the put_path → maybe_sign chain, not the
-/// interceptor's cryptography (that's covered by the interceptor's own
-/// unit tests in rio-common).
-async fn spawn_store_with_fake_jwt(
-    service: StoreServiceImpl,
-    tenant_id: uuid::Uuid,
-) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    let fake_interceptor = move |mut req: tonic::Request<()>| {
-        // Attach Claims exactly as the real interceptor would on
-        // successful verify. Only `sub` is read by put_path — iat/exp/jti
-        // are for audit/expiry/revocation, all scheduler-side concerns.
-        req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
-            sub: tenant_id,
-            iat: 1_700_000_000,
-            exp: 9_999_999_999,
-            jti: "test-session-fake".into(),
-        });
-        Ok(req)
-    };
-
-    let router = Server::builder()
-        .layer(tonic::service::InterceptorLayer::new(fake_interceptor))
-        .add_service(StoreServiceServer::new(service));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
-
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    Ok((StoreServiceClient::new(channel), server))
-}
+// The fake-JWT store harness (`spawn_store_with_fake_jwt`) lives in
+// main.rs — shared with the tenancy attribution tests.
 
 // r[verify store.tenant.sign-key]
 /// End-to-end: PutPath with JWT Claims.sub=TENANT_ID, where TENANT_ID

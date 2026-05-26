@@ -313,6 +313,35 @@ pub(crate) async fn complete_manifest_in_conn(
     Ok(())
 }
 
+// r[impl store.put.tenant-attribution]
+/// Attribute one store path to one tenant inside the caller's
+/// transaction: `INSERT INTO path_tenants … ON CONFLICT DO NOTHING`,
+/// FK-guarded via `SELECT … FROM tenants` so a tenant deleted mid-upload
+/// degrades to "no row" instead of failing the commit (same insert shape
+/// as `PutPathChunked`'s commit).
+///
+/// `path_tenants` is the read-time tenancy join for the castore RPCs
+/// (`r[store.castore.tenant-scope]`) and the narinfo visibility gate, so
+/// callers run this in the same transaction that flips the manifest to
+/// `'complete'` — a committed upload is never visible-but-unattributed,
+/// and a rolled-back commit never leaves a stray attribution row.
+pub(crate) async fn upsert_path_tenant_in_conn(
+    conn: &mut sqlx::PgConnection,
+    store_path_hash: &[u8],
+    tenant_id: uuid::Uuid,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO path_tenants (store_path_hash, tenant_id) \
+         SELECT $1, t.tenant_id FROM tenants t WHERE t.tenant_id = $2 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(store_path_hash)
+    .bind(tenant_id)
+    .execute(conn)
+    .await
+    .map(|_| ())
+}
+
 /// Begin a new upload: insert placeholder narinfo + manifest rows.
 ///
 /// The placeholder narinfo has `nar_hash = [0;32]` and `nar_size = 0`.
@@ -628,7 +657,7 @@ mod tests {
             [0xCCu8; 32],
         );
 
-        let err = complete_manifest_chunked(&db.pool, &info, uuid::Uuid::new_v4(), &[])
+        let err = complete_manifest_chunked(&db.pool, &info, uuid::Uuid::new_v4(), &[], None)
             .await
             .expect_err("should fail without placeholder");
 
@@ -662,7 +691,7 @@ mod tests {
         // with the original claim and narinfo untouched (nar_size=0).
         let mut bad = info.clone();
         bad.signatures = vec!["evil:sig".into()];
-        let err = complete_manifest_chunked(&db.pool, &bad, uuid::Uuid::new_v4(), &[])
+        let err = complete_manifest_chunked(&db.pool, &bad, uuid::Uuid::new_v4(), &[], None)
             .await
             .expect_err("foreign claim must fail");
         assert!(
@@ -683,7 +712,7 @@ mod tests {
         assert_eq!(nar_size, 0, "narinfo untouched (manifests gate runs first)");
 
         // Real claim → Ok; status flipped, OUR signatures landed.
-        complete_manifest_chunked(&db.pool, &info, claim_a, &[])
+        complete_manifest_chunked(&db.pool, &info, claim_a, &[], None)
             .await
             .unwrap();
         let (status, sigs): (String, Vec<String>) = sqlx::query_as(

@@ -152,7 +152,9 @@ impl PutChunkedStats {
 ///    to the existing 'uploading' placeholder. One tx.
 /// 3. **Upload new chunks**: step 2 atomically returns which hashes
 ///    need upload (RETURNING refcount=1). Parallel S3 PUTs for those only.
-/// 5. **Complete**: fill narinfo + flip status='complete'.
+/// 5. **Complete**: fill narinfo + flip status='complete'. When
+///    `tenant_id` is `Some`, the same completion transaction attributes
+///    the path to that tenant (`r[store.put.tenant-attribution]`).
 ///
 /// On error in 3-5: `delete_manifest_chunked_uploading` rolls back
 /// refcounts + placeholders. Caller doesn't need to clean up (we consumed
@@ -168,6 +170,7 @@ pub async fn put_chunked(
     claim: uuid::Uuid,
     nar_data: &[u8],
     max_concurrent: usize,
+    tenant_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<PutChunkedStats> {
     let stats = stage_chunked(pool, backend, info, claim, nar_data, max_concurrent).await?;
 
@@ -175,7 +178,7 @@ pub async fn put_chunked(
     // The `durable = TRUE` flip for the manifest's chunks rides in the
     // same tx as the `'complete'` status flip (ADR-022 §6.2 durable-presence).
     if let Err(e) =
-        metadata::complete_manifest_chunked(pool, info, claim, &stats.chunk_hashes).await
+        metadata::complete_manifest_chunked(pool, info, claim, &stats.chunk_hashes, tenant_id).await
     {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
         // Chunks are uploaded to S3. reap_one decrements refcounts →

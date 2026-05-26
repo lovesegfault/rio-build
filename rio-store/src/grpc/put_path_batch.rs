@@ -200,7 +200,7 @@ impl StoreServiceImpl {
 
         // --- Phase 3: ONE transaction, N completions, one commit ---
         let created = match self
-            .commit_batch(&mut outputs, resolved_signer.as_ref())
+            .commit_batch(&mut outputs, resolved_signer.as_ref(), auth.tenant_id)
             .await
         {
             Ok(c) => c,
@@ -389,12 +389,19 @@ impl StoreServiceImpl {
     /// emit per-output created/bytes metrics. Tx auto-rollback on early
     /// return; caller's `PlaceholderGuard`s reap placeholders on Drop +
     /// staged chunk refcounts (committed in phase-2's separate txs).
+    ///
+    /// `tenant_id` (the session JWT tenant) attributes every committed
+    /// output to the pushing tenant in the same transaction
+    /// (`r[store.put.tenant-attribution]`); `already_complete` outputs
+    /// are skipped — this request proved no content for them.
     // r[impl store.put.wal-manifest]
     // r[impl obs.metric.transfer-volume]
+    // r[impl store.put.tenant-attribution]
     async fn commit_batch(
         &self,
         outputs: &mut BTreeMap<u32, OutputAccum>,
         resolved_signer: Option<&(crate::signing::Signer, bool)>,
+        tenant_id: Option<uuid::Uuid>,
     ) -> Result<Vec<bool>, Status> {
         let mut tx = self
             .pool
@@ -431,6 +438,23 @@ impl StoreServiceImpl {
                 return Err(putpath_metadata_status(
                     "PutPathBatch: mark_chunks_durable",
                     e.into(),
+                ));
+            }
+            // r[impl store.put.tenant-attribution]
+            // Attribute the committed output to the pushing tenant in
+            // the same tx as the 'complete' flip. Gateway-pushed sources
+            // are not derivation outputs, so no scheduler upsert ever
+            // covers them — without this row the pushing tenant's own
+            // builds cannot read the path back through the tenant-scoped
+            // castore surface.
+            if let Some(tid) = tenant_id
+                && let Err(e) =
+                    metadata::upsert_path_tenant_in_conn(&mut tx, &accum.store_path_hash, tid).await
+            {
+                drop(tx);
+                return Err(rio_common::grpc::internal(
+                    "PutPathBatch: path_tenants insert",
+                    e,
                 ));
             }
             // Keep the signed copy: the post-commit compat write

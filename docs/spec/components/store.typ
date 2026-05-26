@@ -387,6 +387,39 @@ whose refcount drops to 0 become eligible for S3 deletion via
   re-uploading. This makes concurrent uploads of the same path safe.
 ]
 
+#r("store.put.tenant-attribution")[
+  When `PutPath` or `PutPathBatch` commits an output and the request carries
+  an authenticated tenant (the gateway-forwarded session JWT, `Claims.sub` ---
+  the same identity narinfo signing uses), the store MUST upsert a
+  `path_tenants (store_path_hash, tenant_id)` row for that output in the same
+  transaction that flips the manifest to `'complete'` (idempotent `ON CONFLICT
+  DO NOTHING`, FK-guarded so a tenant deleted mid-upload degrades to "no row"
+  rather than failing the commit). Requests with no tenant context (dev mode,
+  service-token-only callers with no forwarded JWT) MUST NOT be attributed to
+  any tenant --- no row is written. The already-complete fast path
+  (#rref("store.put.idempotent")) does NOT grant attribution: it commits
+  nothing and the caller has proven possession of no content.
+]
+
+Rationale: `path_tenants` is the read-time tenancy source of truth for the
+castore RPCs (#rref("store.castore.tenant-scope")) and narinfo visibility
+(#rref("store.tenant.narinfo-filter"),
+#rref("store.substitute.tenant-sig-visibility")). Builder uploads are
+attributed by the `PutPathChunked` commit (HMAC claim tenant) and derivation
+outputs by the scheduler (#rref("sched.gc.path-tenants-upsert")), but
+client-pushed *sources* travel only through the legacy buffered RPCs and are
+not derivation outputs --- without upload-time attribution the pushing
+tenant's own builds cannot mount their own sources through the tenant-scoped
+castore surface. Attribution rides the completion transaction (not a
+post-commit write) so a transient failure rolls the whole upload back and the
+client's retry re-attributes, instead of leaving a permanently
+complete-but-invisible path. Granting attribution on the already-complete
+fast path would let any tenant gain read access to any existing path by
+sending a metadata-only probe for its store path --- exactly the
+capability-by-hash-reference the castore design forbids; substituted paths
+keep their scheduler-side attribution and signature-gated visibility
+(#rref("store.substitute.tenant-sig-visibility")) for the same reason.
+
 #r("store.put.placeholder-refs")[
   The `'uploading'` placeholder narinfo MUST carry `references` from the
   instant it commits (same INSERT, same transaction as the `manifests` row).
