@@ -1,8 +1,9 @@
 //! `fuser::Filesystem` impl for the castore-FUSE (ADR-022 §2.4–§2.6).
 //!
 //! Mounted by the builder itself on a per-build mountpoint inside its
-//! own mount namespace ([`super::mount`]; rio-mountd only opens
-//! `/dev/fuse` and hands the fd over). The tree is immutable for the
+//! own mount namespace ([`super::mount`]; the builder opens `/dev/fuse`
+//! and hands rio-mountd a dup purely for backing-open brokering). The
+//! tree is immutable for the
 //! mount's lifetime, so every reply carries `ttl = Duration::MAX` and
 //! `init` advertises every cache-enable flag the kernel offers — the
 //! dcache and icache absorb all repeat metadata traffic, and a cache

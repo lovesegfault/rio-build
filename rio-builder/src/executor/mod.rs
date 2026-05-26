@@ -636,7 +636,7 @@ pub async fn execute_build(
                 castore_circuit,
                 &castore_opts,
             )?;
-            // r[impl builder.fs.fd-handoff-ordering]
+            // r[impl builder.fs.fd-handoff-ordering+2]
             // The castore session is serving (mount_castore_background
             // returned), so the overlay's lower probe gets answered.
             let overlay = overlay::setup_overlay_castore(&castore, &overlay_base, &build_id_owned)?;

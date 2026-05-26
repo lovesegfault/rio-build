@@ -57,7 +57,7 @@
 //! construction the overlay mount (in the caller) cannot start until
 //! the castore session is live.
 // r[impl builder.fs.castore-stack]
-// r[impl builder.fs.fd-handoff-ordering]
+// r[impl builder.fs.fd-handoff-ordering+2]
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};

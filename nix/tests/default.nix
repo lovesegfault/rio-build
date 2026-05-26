@@ -278,7 +278,7 @@ in
   # Subtest map and how the P0578 perf criteria are gated under KVM
   # (regression envelopes) vs printed-only under TCG: the scenario
   # header.
-  # r[verify builder.mountd.fuse-handoff]
+  # r[verify builder.mountd.fuse-handoff+2]
   # r[verify builder.mountd.backing-broker]
   # r[verify builder.mountd.concurrency]
   # r[verify builder.mountd.build-id-validated]

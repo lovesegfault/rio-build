@@ -145,7 +145,7 @@ const FUSE_DEV_MINOR: u64 = 229;
 /// root-held reference to whatever it smuggled in. A wrong fd is a
 /// builder bug, not a transient condition — the rejection is
 /// build-fatal ([`ErrKind::BadFuseFd`]).
-// r[impl builder.mountd.fuse-handoff]
+// r[impl builder.mountd.fuse-handoff+2]
 fn validate_fuse_fd(fd: BorrowedFd<'_>) -> Result<(), ErrKind> {
     let st = nix::sys::stat::fstat(fd).map_err(|e| {
         warn!(error = %e, "Mount fd fstat failed");
@@ -754,8 +754,10 @@ fn list_dir(path: &Path) -> Vec<String> {
 
 // ─── Connection handling ───────────────────────────────────────────────
 
-/// Replies waiting to be written to the peer. `Option<OwnedFd>` is the
-/// single fd a `Mounted` reply carries; everything else sends `None`.
+/// Replies waiting to be written to the peer. No current reply carries
+/// an fd (fds only flow builder → daemon since the P0560 option-(b)
+/// change); the `Option<OwnedFd>` slot is kept so the writer half does
+/// not need reshaping if a future reply ever does.
 type ReplyTx = mpsc::UnboundedSender<(Reply, Option<OwnedFd>)>;
 
 async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
@@ -1112,7 +1114,7 @@ fn reject_reason(kind: &ErrKind) -> &'static str {
 /// device itself, `mount(2)`s it inside its own mount namespace, and
 /// hands the daemon a dup so the privileged `FUSE_DEV_IOC_BACKING_*`
 /// ioctls have a same-connection fd to go through.
-// r[impl builder.mountd.fuse-handoff]
+// r[impl builder.mountd.fuse-handoff+2]
 // r[impl builder.mountd.one-mount]
 // r[impl builder.mountd.build-id-unique]
 // r[impl builder.mountd.staging-quota]
@@ -1279,10 +1281,9 @@ fn teardown(shared: &Arc<Shared>, state: &mut ConnState) {
         .lock()
         .ignore_poison()
         .remove(&state.peer_uid);
-    // Dropping `kept` closes our last reference to the build's
-    // /dev/fuse; if the builder's copy is also gone the kernel aborts
-    // the FUSE connection and the (already lazily-detached) mount
-    // becomes fully dead.
+    // Dropping `kept` releases the daemon's only reference to the
+    // builder's /dev/fuse; once the builder's own fd and mount are gone
+    // too, the kernel aborts the FUSE connection.
     state.kept = None;
     state.staging_dirfd = None;
     state.staging_chunks_dirfd = None;

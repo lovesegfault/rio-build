@@ -21,7 +21,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 | **Cache-hit reads are kernel-direct** | Once a file is in the node-SSD backing cache, `open()` replies `FOPEN_PASSTHROUGH` with the cache fd; all reads go kernel → ext4 with zero FUSE involvement, including after page-cache eviction. The FUSE `read` path is reached only during the streaming-fill window of a large cold miss. |
 | **Structural per-file and per-subtree dedup** | Inode numbers are content-derived (`h(file_digest)` / `h(dir_digest)`). Two store paths containing byte-identical files share one FUSE inode, one fetch, one SSD copy, one page-cache copy. Two paths sharing a subtree share one dcache subtree. No explicit dedup pass. |
 | **Streaming open for large files** | Files above `STREAM_THRESHOLD` (default 8 MiB) return from `open()` after the first chunk arrives; the remainder fills in the background. `read()` of an unfilled range demand-fetches it. A build linking against a 200 MB `libLLVM.so` fetches only the ranges the linker touches. |
-| **Minimal privileged surface** | The only privileged component is `rio-mountd`, a node-level daemon that opens `/dev/fuse` and hands the fd to the unprivileged builder over a Unix socket, then brokers `FUSE_DEV_IOC_BACKING_OPEN` and the verified `Promote` write into the shared node cache. The builder mounts overlay itself inside its own user namespace. The build sandbox has zero device exposure. |
+| **Minimal privileged surface** | The only privileged component is `rio-mountd`, a node-level daemon that brokers `FUSE_DEV_IOC_BACKING_OPEN` and the verified `Promote` write into the shared node cache over a Unix socket. The builder opens its own `/dev/fuse` (injected into executor pods by containerd's `base_runtime_spec`), hands the daemon a dup for that brokering, and mounts both the castore FUSE and the overlay itself inside its own user namespace. The build sandbox has zero device exposure beyond that injected node. |
 | **Declared-input enforcement** | The castore-FUSE handler's tree is exactly the build's declared input closure; `lookup()` of anything outside it returns `ENOENT`. The build cannot read store paths it did not declare. |
 | **Delta-sync distribution** | `nix copy --from rio-store` and inter-region replication walk a Directory merkle DAG. Unchanged subtrees are skipped in one batch RPC; bandwidth scales with change size, not closure size. |
 | **Per-AZ chunk cache** | All rio-store replicas in an availability zone share an S3 Express One Zone directory bucket as a read-through cache. A new replica starts warm; S3 standard GET cost is once per chunk per AZ, not once per replica. |
@@ -237,9 +237,9 @@ With compat enabled and at least one `nix-cache-info` object present at the buck
 
 ## 11. Privilege boundary
 
-r[builder.mountd.fuse-handoff]
+r[builder.mountd.fuse-handoff+2]
 
-The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not openable from the pod and `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN`, so a node-level `rio-mountd` DaemonSet (root, `CAP_SYS_ADMIN`, not `privileged` — `infra/helm/rio-build/templates/mountd-ds.yaml`) does the privileged operations and nothing else:
+The builder pod runs unprivileged. It CAN open `/dev/fuse` (containerd's `base_runtime_spec` injects the node into every executor pod, `r[sec.pod.fuse-device-plugin]`) and MUST be the one to do so — the kernel only accepts a fuse `mount(2)` from the user namespace that opened the device. What it cannot do is call `FUSE_DEV_IOC_BACKING_OPEN`/`_CLOSE` (init-ns `CAP_SYS_ADMIN`) or write the shared node cache, so a node-level `rio-mountd` DaemonSet (root, `CAP_SYS_ADMIN`, not `privileged` — `infra/helm/rio-build/templates/mountd-ds.yaml`) keeps the dup of the builder's fuse fd that `Mount{}` hands it (rejecting anything that is not the fuse character device) and brokers exactly those privileged operations and nothing else:
 
 | Step | Actor | Action |
 |---|---|---|
@@ -378,7 +378,7 @@ r[infra.node.kernel-fuse-passthrough]
 - **Stock kernel, no rebuild.** `CONFIG_FUSE_FS=m`, `CONFIG_OVERLAY_FS=m` from nixpkgs `autoModules = true`; `CONFIG_FUSE_PASSTHROUGH=y` is the upstream Kconfig default (`bool default y depends on FUSE_FS`). The §3 EROFS+cachefiles `_ONDEMAND` symbols were the only off-by-default config and went with §3 — the node kernel is a binary-cache hit. `nix/nixos-node/kernel.nix` MUST be a standalone module (no `pins`/`specialArgs` deps) importable by `nix/tests/fixtures/` so test-VM kernels are the AMI's exact shape.
 - `boot.kernelModules = ["fuse" "overlay"]` — loaded by `systemd-modules-load.service` in `basic.target`, so `/dev/fuse` exists before `rio-mountd` starts and the overlay fs type is registered before any pod mounts. Functionally equivalent to `=y`; saves the ~40 min kernel rebuild a `structuredExtraConfig` override would cost on every nixpkgs bump.
 - `r[builder.fs.passthrough-stack-depth]`: the node-SSD backing cache (`/var/rio/cache/`) must be a non-stacking filesystem (ext4/xfs hostPath). FUSE with `max_stack_depth=1` under overlay reaches `FILESYSTEM_MAX_STACK_DEPTH=2`; a stacking fs as backing would exceed it.
-- `/dev/fuse` reachable by `rio-mountd` (host device); **not** mounted into builder pods.
+- `/dev/fuse` injected into every executor pod by containerd's `base_runtime_spec` (the builder opens and mounts it itself); `rio-mountd` needs no device access at all — it only ever holds the dup the builder hands it.
 
 ## 16. Normative requirements index
 
