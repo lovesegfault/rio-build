@@ -232,26 +232,19 @@ pkgs.testers.runNixOSTest {
         meta = next(iter(shown.values()))
         for name, out_meta in meta["outputs"].items():
             # Input-addressed outputs carry their path in the derivation;
-            # floating-CA outputs do not (and the corpus only compares CA
-            # entries as documented divergences, never path-by-path), so
-            # resolve through `nix-store -q --outputs` only as a fallback
-            # for the single-output case.
+            # floating-CA outputs only exist in the realisation DB after
+            # the build, so resolve those through `nix build --json` on the
+            # already-realised derivation (a cheap lookup). The CA corpus
+            # entries assert full parity, so every output must resolve.
             path = out_meta.get("path", "") or ""
             if path and not path.startswith("/nix/store/"):
                 path = "/nix/store/" + path
             if not path:
-                # Floating-CA outputs have no static path and `nix-store -q
-                # --outputs` refuses CA derivations entirely; those entries
-                # are only ever compared as documented divergences, so skip.
-                # stderr is dropped: the refusal is expected and its error
-                # text in the console log reads like a test failure.
-                rc_out, out_lines = machine.execute(
-                    f"nix-store -q --outputs {drv} 2>/dev/null"
+                built = json.loads(
+                    machine.succeed(f"nix build --json --no-link '{drv}^*'")
                 )
-                lines = out_lines.strip().splitlines() if rc_out == 0 else []
-                if len(lines) == 1:
-                    path = lines[0]
-                else:
+                path = built[0].get("outputs", {}).get(name, "")
+                if not path:
                     continue
             info = json.loads(machine.succeed(f"nix path-info --json {path}"))
             entry = info[path] if isinstance(info, dict) else info[0]
