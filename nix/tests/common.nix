@@ -674,7 +674,11 @@ rec {
   # base64-wrapped; the fixture's hmac-keys files are the raw key
   # bytes). Claims shape mirrors rio-auth's ServiceClaims; the trailing
   # newline trim mirrors rio_auth::hmac::load_key so the signer and the
-  # verifier read the same bytes. Scenarios use it to authenticate
+  # verifier read the same bytes. argv[2] picks the caller identity
+  # (default "rio-cli"); the scheduler's per-RPC allowlists key on it,
+  # so a scenario standing in for the controller (no rio-controller
+  # process in the standalone fixtures) mints a "rio-controller" token
+  # for the controller-surface RPCs. Scenarios use it to authenticate
   # AdminService grpcurl calls when the fixture runs withHmac.
   signServiceTokenFile = pkgs.writeScript "sign-service-token-file" ''
     #!${pkgs.python3}/bin/python3
@@ -684,8 +688,9 @@ rec {
         if key.endswith(suf):
             key = key[: -len(suf)]
             break
+    caller = sys.argv[2] if len(sys.argv) > 2 else "rio-cli"
     claims = json.dumps(
-        {"caller": "rio-cli", "expiry_unix": int(time.time()) + 3600},
+        {"caller": caller, "expiry_unix": int(time.time()) + 3600},
         separators=(",", ":"),
     ).encode()
     tag = hmac.new(key, claims, hashlib.sha256).digest()

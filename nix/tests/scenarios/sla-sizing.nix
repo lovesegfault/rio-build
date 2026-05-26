@@ -144,10 +144,18 @@ let
 
     # withHmac gates AdminService writes behind x-rio-service-token;
     # mint one from the fixture's service key (same claims shape the
-    # gateway/rio-cli use).
+    # gateway/rio-cli use). The controller-surface RPCs
+    # (AppendInterruptSample, AckSpawnedIntents) allowlist only the
+    # "rio-controller" caller — this scenario stands in for the
+    # controller on those (the standalone fixture runs none), so it
+    # carries a second token under that identity.
     service_token = ${gatewayHost}.succeed(
         "${common.signServiceTokenFile} ${fixture.hmacKeys}/service-hmac.key"
     ).strip()
+    controller_token = ${gatewayHost}.succeed(
+        "${common.signServiceTokenFile} ${fixture.hmacKeys}/service-hmac.key rio-controller"
+    ).strip()
+    CONTROLLER_RPCS = {"AppendInterruptSample", "AckSpawnedIntents"}
 
     # The estimator's ModelKey is (pname, system, tenant-UUID): the
     # convergence subtest's REAL builds are attributed to vm-sla, so any
@@ -161,9 +169,10 @@ let
     )
 
     def grpcurl_admin(method: str, payload: dict) -> str:
+        token = controller_token if method in CONTROLLER_RPCS else service_token
         return ${gatewayHost}.succeed(
             f"grpcurl -plaintext -protoset ${protoset}/rio.protoset "
-            f"-H 'x-rio-service-token: {service_token}' "
+            f"-H 'x-rio-service-token: {token}' "
             f"-d '{json.dumps(payload)}' "
             f"localhost:9001 rio.admin.AdminService/{method}"
         )

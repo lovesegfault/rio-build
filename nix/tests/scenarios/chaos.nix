@@ -187,16 +187,17 @@ pkgs.testers.runNixOSTest {
         )
 
         # Wait for the toxic to bite. The 500ms reset_peer fires during
-        # the worker's FIRST worker_store use — input-metadata-fetch
-        # (runtime.rs), not upload. "build execution failed" at ERROR
-        # with ConnectionReset in the error chain. The scheduler
-        # re-dispatches (generation stays 1, same drv re-assigned) so
-        # the overall retry path is scheduler→worker redispatch, not
-        # the upload.rs internal loop. Grep both: if timing jitter lets
-        # metadata-fetch through, the upload-retry path fires instead.
+        # the worker's FIRST worker_store use — under the castore stack
+        # that is the per-build mount's DAG prefetch / input resolve
+        # (surfaced as "build execution failed" with the castore mount
+        # error in the chain), not the upload. The scheduler
+        # re-dispatches (infra-classified, same drv re-assigned) so the
+        # overall retry path is scheduler→worker redispatch, not the
+        # upload.rs internal loop. Grep both: if timing jitter lets the
+        # mount through, the upload-retry path fires instead.
         worker.wait_until_succeeds(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
-            "grep -E 'upload attempt failed|input metadata fetch failed' >/dev/null",
+            "grep -E 'upload attempt failed|build execution failed' >/dev/null",
             timeout=30,
         )
 
