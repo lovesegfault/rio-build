@@ -47,9 +47,13 @@ use crate::hash::{HashAlgo, NixHash};
 /// replaced bytes are not rescanned (matching CppNix
 /// `rewriteStrings`).
 ///
-/// Call [`finish`](Self::finish) (or [`flush`](Write::flush) followed
-/// by dropping) to flush the held-back tail; `finish` returns the
-/// inner writer and the total number of replacements made.
+/// [`finish`](Self::finish) is the only way to terminate the stream:
+/// it drains the held-back tail and returns the inner writer plus the
+/// total number of replacements made. [`flush`](Write::flush) only
+/// flushes the inner writer (a straddling match could still complete
+/// on a later write), and there is no `Drop` glue — dropping the sink
+/// without calling `finish` discards up to `max_from - 1` trailing
+/// bytes.
 pub struct RewritingSink<W> {
     /// `(from, to)` pairs, all the same `from.len() == to.len()`.
     rewrites: Vec<(Vec<u8>, Vec<u8>)>,
