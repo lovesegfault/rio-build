@@ -1190,6 +1190,205 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.merge.wanted-outputs+2]
+/// Top-down negative: a PRE-EXISTING root shared with a live build whose
+/// effective wanted set is NOT satisfiable must refuse the prune, even
+/// when the submitting build's own (narrower) wanted set is.
+///
+/// Build A merges `R → dep` wanting ALL of R's outputs (the empty
+/// sentinel) while R's `debug` output is missing upstream → full merge,
+/// R stays Queued, A stays Active (live). R's `out` output then becomes
+/// substitutable upstream. Build B re-submits the same closure wanting
+/// only `out`: against B's set alone every wanted root output is
+/// available, but post-merge classification evaluates R against the
+/// LIVE effective wanted set (A ∪ B = all), keeping R on the
+/// from-source path — no substitute fetch, no `topdown_pruned`
+/// fail-fast. Pruning B's deps would leave B's progress hostage to A
+/// staying alive: A's cancellation sweeps the sole-interest deps and B
+/// hangs on a Queued root. The prune criterion must therefore union
+/// the submission's wanted set with the pre-existing root's live
+/// effective wanted set and fall through to the full merge here.
+#[tokio::test]
+async fn test_topdown_prune_gated_on_live_effective_wanted_of_preexisting_root() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("tdl-r-out");
+    let r_debug = test_store_path("tdl-r-debug");
+    let mk_root = |wanted: &[&str]| {
+        let mut r = make_node("tdl-r");
+        r.output_names = vec!["out".into(), "debug".into()];
+        r.expected_output_paths = vec![r_out.clone(), r_debug.clone()];
+        r.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        r
+    };
+    let mk_dep = || {
+        let mut d = make_node("tdl-dep");
+        d.expected_output_paths = vec![test_store_path("tdl-dep-out")];
+        d
+    };
+
+    // Build A: R → dep, wanting ALL outputs. Nothing substitutable yet
+    // → no prune, full merge. R Queued (dep incomplete), dep Ready, A
+    // Active (no worker connected).
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![mk_root(&[]), mk_dep()],
+        vec![make_test_edge("tdl-r", "tdl-dep")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        expect_drv(&handle, "tdl-r").await.status,
+        DerivationStatus::Queued,
+        "precondition: R pre-exists non-terminal with A's interest"
+    );
+
+    // Upstream gains R's `out` between the two submissions; `debug`
+    // stays missing and unsubstitutable.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+
+    // Build B: same closure, but wanting only `out` of R.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![mk_root(&["out"]), mk_dep()],
+        vec![make_test_edge("tdl-r", "tdl-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let status_b = query_status(&handle, build_b).await?;
+    assert_eq!(
+        status_b.total_derivations, 2,
+        "live build A still wants R's missing `debug` → the prune must \
+         NOT fire on B's narrower wanted set; B keeps (and registers \
+         interest in) its dependency closure"
+    );
+
+    // The point of refusing the prune: B's own dep interest keeps the
+    // closure schedulable even after A goes away. Cancel A — the dep
+    // must NOT be swept as a sole-interest node.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: build_a,
+            caller_tenant: None,
+            reason: "test: cancel the wide build".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    assert!(reply_rx.await??, "cancel of active build A should apply");
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "tdl-dep").await.status,
+        DerivationStatus::Ready,
+        "B registered interest in the dep, so A's cancel sweep must not \
+         take it down — B can still build R from source"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B stays Active with a schedulable closure after A's cancel"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+4]
+/// Top-down positive companion: a PRE-EXISTING root whose live
+/// effective wanted set IS satisfiable keeps the prune. Same shape as
+/// the negative test above, but build A wants only `out` too — the
+/// union of live contributions resolves to paths that are all
+/// available, so B's submission is still pruned to roots-only and
+/// completes via the detached substitute fetch.
+#[tokio::test]
+async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("tds-r-out");
+    let r_debug = test_store_path("tds-r-debug");
+    let mk_root = |wanted: &[&str]| {
+        let mut r = make_node("tds-r");
+        r.output_names = vec!["out".into(), "debug".into()];
+        r.expected_output_paths = vec![r_out.clone(), r_debug.clone()];
+        r.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        r
+    };
+    let mk_dep = || {
+        let mut d = make_node("tds-dep");
+        d.expected_output_paths = vec![test_store_path("tds-dep-out")];
+        d
+    };
+
+    // Build A: R → dep, wanting only `out`. Nothing substitutable yet
+    // → no prune, full merge, R Queued, A Active (live).
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![mk_root(&["out"]), mk_dep()],
+        vec![make_test_edge("tds-r", "tds-dep")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        expect_drv(&handle, "tds-r").await.status,
+        DerivationStatus::Queued,
+        "precondition: R pre-exists non-terminal with A's interest"
+    );
+
+    // Upstream gains R's `out`; the unwanted `debug` stays missing.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+
+    // Build B: same closure, also wanting only `out`. Every output
+    // wanted by a live build (A ∪ B = {out}) is available → the
+    // optimization is preserved: deps pruned, roots-only merge.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![mk_root(&["out"]), mk_dep()],
+        vec![make_test_edge("tds-r", "tds-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        query_status(&handle, build_b).await?.total_derivations,
+        1,
+        "all live builds' wanted outputs of the pre-existing root are \
+         available → the roots-only prune still fires"
+    );
+
+    // The pruned build still completes via the detached fetch (the
+    // missing-but-unwanted `debug` is forgiven, not a failure).
+    settle_substituting(&handle, &["tds-r"]).await;
+    assert_eq!(
+        query_status(&handle, build_b).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "pruned root substitutes successfully → B succeeds"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+5]
 /// Substitutable nodes go `Substituting` (detached fetch spawned),
 /// not synchronously `Completed` at merge. The closure-invariant

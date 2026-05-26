@@ -13,7 +13,7 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, effective_wanted,
-    verifiable_wanted_paths,
+    union_wanted_saturating, verifiable_wanted_paths,
 };
 
 use super::{ActorError, DagActor, MergeDagRequest};
@@ -249,7 +249,12 @@ impl DagActor {
         // Before merging the full DAG, check if the ROOT derivations'
         // outputs are already available. If ALL roots are cached, the
         // deps are transitively unnecessary — prune the submission to
-        // roots-only before merge.
+        // roots-only before merge. "Available" is judged against the
+        // wanted outputs of this submission UNIONed, for roots already
+        // in the DAG, with the live effective wanted set of the
+        // pre-existing node (see check_roots_topdown) so the prune
+        // never contradicts what post-merge classification will do
+        // with the shared root.
         //
         // This short-circuits the common case `rsb -L p#hello` where
         // hello is in cache.nixos.org: instead of eager-fetching ~700
@@ -2230,12 +2235,26 @@ impl DagActor {
     ///
     /// Returns `None` to fall through to the full bottom-up
     /// `check_cached_outputs`. Reasons: no store client, any root
-    /// is floating-CA (no expected path), any root output missing
-    /// and not substitutable, store error.
+    /// is floating-CA (no expected path), any wanted root output
+    /// missing and not substitutable, store error.
     ///
-    /// Roots are nodes with no parent edge IN THIS SUBMISSION.
-    /// Local computation — doesn't consult the global DAG (parents
-    /// from other builds are irrelevant to what THIS build needs).
+    /// Roots are nodes with no parent edge IN THIS SUBMISSION
+    /// (parents from other builds don't change what THIS build
+    /// needs). The availability criterion, however, is NOT
+    /// submission-local for a root that already exists in the DAG:
+    /// the submission's wanted set is unioned with the pre-existing
+    /// node's LIVE effective wanted set ([`effective_wanted`] over
+    /// live interested builds, stored-union fallback) — the same set
+    /// post-merge classification (`check_cached_outputs`, the
+    /// dispatch-time probes) evaluates the shared node against. If
+    /// another live build wants an output that is missing and not
+    /// substitutable, that classification keeps the root on the
+    /// from-source path; pruning THIS submission's dep closure first
+    /// would leave this build's progress hostage to the other build's
+    /// dep interest staying alive (its cancel/fail sweep takes the
+    /// sole-interest deps down and this build hangs on a Queued
+    /// root). Roots not yet in the DAG keep the submission-only
+    /// criterion (there is nothing else to consult).
     ///
     /// # Circuit breaker interaction
     ///
@@ -2369,18 +2388,30 @@ impl DagActor {
             .filter(|p| !substitutable.contains(p))
             .collect();
         if roots.iter().any(|n| {
+            // The criterion set for a pre-existing root is the
+            // submission's wanted set UNIONed (saturating; empty =
+            // all) with the node's live effective wanted set — the
+            // set step-4/dispatch classification will use. A
+            // narrower, submission-only criterion can prune this
+            // build's dep closure while classification (driven by
+            // another live build's wants) still routes the root
+            // from-source, leaving this build dependent on deps it
+            // never registered interest in. Fresh roots have nothing
+            // else to consult — submission-only criterion.
+            let mut criterion_wanted = n.wanted_output_names.clone();
+            if let Some(existing) = self.dag.node(&n.drv_hash) {
+                let eff = effective_wanted(existing, &self.builds)
+                    .unwrap_or_else(|| existing.wanted_output_names.clone());
+                union_wanted_saturating(&mut criterion_wanted, &eff);
+            }
             // A root whose wanted set resolves to no verifiable path
             // must never vacuously satisfy the all-available
             // criterion: treat it as "unavailable" so the prune
             // doesn't fire and drop a dependency closure the root
             // actually needs. Falling through to the full merge is
             // always safe.
-            verifiable_wanted_paths(
-                &n.output_names,
-                &n.expected_output_paths,
-                &n.wanted_output_names,
-            )
-            .is_none_or(|wanted| wanted.iter().any(|p| truly_missing.contains(*p)))
+            verifiable_wanted_paths(&n.output_names, &n.expected_output_paths, &criterion_wanted)
+                .is_none_or(|wanted| wanted.iter().any(|p| truly_missing.contains(*p)))
         }) {
             debug!(
                 missing = truly_missing.len(),
