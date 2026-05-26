@@ -674,6 +674,10 @@ impl DagActor {
         // reaped. The Substituting branch already batched.
         let mut locally_present = Vec::new();
         let mut to_spawn = Vec::new();
+        // Childless topdown-pruned roots whose wanted set can neither
+        // complete inline nor route to substitution: fail fast instead
+        // of leaving them Ready (see the arm below).
+        let mut to_fail_fast: Vec<DrvHash> = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
             let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
@@ -725,10 +729,33 @@ impl DagActor {
                 // merge.rs. The closure walk's failure path falls
                 // through to build via `substitute_tried`.
                 to_spawn.push((drv_hash, paths));
+            } else if self.dag.node(&drv_hash).is_some_and(|s| s.topdown_pruned)
+                && self.dag.get_children(&drv_hash).is_empty()
+            {
+                // r[impl sched.merge.substitute-topdown+4]
+                // Truly missing (a wanted output is missing upstream and
+                // not substitutable): every other node is left Ready and
+                // dispatches from source. A CHILDLESS topdown-pruned
+                // root must not — its dep closure was never merged, so a
+                // from-source dispatch is doomed (worker ENOENTs on
+                // inputDrvs). This is the post-failover shape: the
+                // recovered wanted union ('{}' = all declared) is wider
+                // than the prune-time criterion, so an output the prune
+                // never vouched for can be definitively missing here.
+                // Fail fast with the resubmit-directing error instead.
+                to_fail_fast.push(drv_hash);
             }
         }
         self.complete_ready_from_store_batch(&locally_present).await;
         self.spawn_substitute_fetches(to_spawn, auth).await;
+        for drv_hash in &to_fail_fast {
+            self.fail_fast_topdown_pruned_root(
+                drv_hash,
+                "wanted output(s) missing upstream and not substitutable at dispatch \
+                 after deps were pruned",
+            )
+            .await;
+        }
         checked
     }
 
@@ -1179,49 +1206,11 @@ impl DagActor {
                 s.topdown_pruned = false;
             }
         } else if topdown_pruned && !forgiven_now_wanted {
-            warn!(%drv_hash,
-                  "topdown-pruned root: detached substitute fetch failed; \
-                   deps were dropped from DAG — failing build (resubmit \
-                   will re-probe or full-merge)");
-            metrics::counter!("rio_scheduler_topdown_substitute_fail_total").increment(1);
-            let msg = format!(
-                "topdown-pruned root {drv_hash}: upstream substitute fetch failed \
-                 after deps were pruned; resubmit to re-probe or full-merge"
-            );
-            // Queued (not Ready): zero DAG deps → vacuous Ready would
-            // re-dispatch on the next Tick. cancel_build_derivations
-            // strips interest below; with zero remaining interest the
-            // node is reaped on the next sweep.
-            if let Some(s) = self.dag.node_mut(drv_hash) {
-                s.substitute_tried = true;
-                // The chain ends here (terminal fail-fast): drop the
-                // chain-scoped spent-forgiveness bookkeeping so it
-                // cannot leak into a later substitution chain for this
-                // node (e.g. after a resubmit re-probes it).
-                s.never_forgive_paths.clear();
-                if let Err(e) = s.transition(DerivationStatus::Queued) {
-                    warn!(%drv_hash, %e, "topdown-fail: Substituting→Queued rejected");
-                }
-            }
-            self.persist_status(drv_hash, DerivationStatus::Queued, None)
-                .await;
-            for build_id in self.get_interested_builds(drv_hash) {
-                if let Some(build) = self.builds.get_mut(&build_id) {
-                    build.error_summary.get_or_insert_with(|| msg.clone());
-                    build
-                        .failed_derivation
-                        .get_or_insert_with(|| drv_hash.to_string());
-                }
-                self.cancel_build_derivations(
-                    build_id,
-                    &format!("build {build_id}: topdown substitute fetch failed"),
-                )
-                .await;
-                if let Err(e) = self.transition_build_to_failed(build_id).await {
-                    error!(%build_id, error = %e,
-                           "failed to persist build-failed after topdown substitute fail");
-                }
-            }
+            self.fail_fast_topdown_pruned_root(
+                drv_hash,
+                "upstream substitute fetch failed after deps were pruned",
+            )
+            .await;
             return;
         }
         // 3-way revert (NOT 2-way Ready|Queued): the I-094 reprobe lane
@@ -1377,6 +1366,73 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.merge.substitute-topdown+4]
+    /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
+    /// from its submission, so a from-source build dispatch cannot
+    /// succeed (the worker ENOENTs on inputDrvs that were never
+    /// merged). Fail every interested build with a resubmit-directing
+    /// error and park the node instead of leaving it dispatchable.
+    ///
+    /// `cause` is the user-facing reason spliced into the build's
+    /// error summary ("topdown-pruned root <hash>: <cause>; resubmit
+    /// to re-probe or full-merge").
+    ///
+    /// Callers (both gate on `topdown_pruned` AND no DAG children —
+    /// a node with children no longer carries the invariant):
+    ///  - `handle_substitute_complete` on a failed/downgraded detached
+    ///    fetch (`SubstituteComplete{ok=false}` after the children
+    ///    gate), the original home of this block;
+    ///  - the dispatch-time probes (`batch_probe_cached_ready`,
+    ///    `ready_check_or_spawn`) when a childless pruned node can
+    ///    neither complete inline nor be routed to substitution — the
+    ///    post-failover shape, where the recovered (wider) wanted union
+    ///    contains an output that is genuinely missing upstream. Pre-
+    ///    fix that outcome left the node Ready and dispatched it from
+    ///    source — the doomed dispatch this arm exists to prevent.
+    async fn fail_fast_topdown_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
+        warn!(%drv_hash, cause,
+              "topdown-pruned root cannot complete via substitution; \
+               deps were dropped from DAG — failing build (resubmit \
+               will re-probe or full-merge)");
+        metrics::counter!("rio_scheduler_topdown_substitute_fail_total").increment(1);
+        let msg =
+            format!("topdown-pruned root {drv_hash}: {cause}; resubmit to re-probe or full-merge");
+        // Queued (not Ready): zero DAG deps → vacuous Ready would
+        // re-dispatch on the next Tick. cancel_build_derivations
+        // strips interest below; with zero remaining interest the
+        // node is reaped on the next sweep.
+        if let Some(s) = self.dag.node_mut(drv_hash) {
+            s.substitute_tried = true;
+            // The chain ends here (terminal fail-fast): drop the
+            // chain-scoped spent-forgiveness bookkeeping so it
+            // cannot leak into a later substitution chain for this
+            // node (e.g. after a resubmit re-probes it).
+            s.never_forgive_paths.clear();
+            if let Err(e) = s.transition(DerivationStatus::Queued) {
+                warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
+            }
+        }
+        self.persist_status(drv_hash, DerivationStatus::Queued, None)
+            .await;
+        for build_id in self.get_interested_builds(drv_hash) {
+            if let Some(build) = self.builds.get_mut(&build_id) {
+                build.error_summary.get_or_insert_with(|| msg.clone());
+                build
+                    .failed_derivation
+                    .get_or_insert_with(|| drv_hash.to_string());
+            }
+            self.cancel_build_derivations(
+                build_id,
+                &format!("build {build_id}: topdown-pruned root: {cause}"),
+            )
+            .await;
+            if let Err(e) = self.transition_build_to_failed(build_id).await {
+                error!(%build_id, error = %e,
+                       "failed to persist build-failed after topdown fail-fast");
+            }
+        }
+    }
+
     // r[impl gw.activity.subst-progress]
     /// Relay byte-progress from a detached substitute fetch to every
     /// interested build via [`Event::SubstituteProgress`]. Display-only
@@ -1523,6 +1579,22 @@ impl DagActor {
                 {
                     self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], auth)
                         .await;
+                    return true;
+                }
+                // r[impl sched.merge.substitute-topdown+4]
+                // Truly missing → the caller dispatches from source. A
+                // childless topdown-pruned root must not be (its dep
+                // closure was never merged) — same fail-fast as the
+                // batch pre-pass above; `true` = handled, don't dispatch.
+                if self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned)
+                    && self.dag.get_children(drv_hash).is_empty()
+                {
+                    self.fail_fast_topdown_pruned_root(
+                        drv_hash,
+                        "wanted output(s) missing upstream and not substitutable at dispatch \
+                         after deps were pruned",
+                    )
+                    .await;
                     return true;
                 }
                 false

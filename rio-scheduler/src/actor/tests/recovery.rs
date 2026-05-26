@@ -3674,3 +3674,110 @@ async fn test_recovery_restores_topdown_pruned_flag() -> TestResult {
     assert_eq!(d.status, DerivationStatus::Ready);
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+4]
+/// Failover regression (the doomed dispatch): a roots-only-pruned root
+/// persisted as `substituting` is recovered CHILDLESS by the new
+/// leader, comes back Ready (no deps in the DAG), and is re-probed
+/// against the stored wanted union — routinely WIDER than the
+/// prune-time criterion (`'{}'` = all declared). When that wider set
+/// contains an output that is genuinely missing and not substitutable,
+/// the dispatch-time probes can neither complete the node inline nor
+/// route it to substitution; pre-fix it was left Ready and dispatched
+/// from source with no input-presence check — a doomed dispatch (its
+/// inputDrvs were never merged), worker ENOENT, eventual wrong-reason
+/// Poisoned, every interested build failed.
+///
+/// Post-fix: the persisted `topdown_pruned` flag is restored at
+/// recovery and the dispatch-time guard takes the same fail-fast arm
+/// as `SubstituteComplete{ok=false}` — no WorkAssignment is ever sent
+/// for the node and the interested build terminates with the
+/// resubmit-directing error.
+///
+/// Staged shape (phase 1): an Active build, its build_derivations
+/// link, a derivations row in status `substituting` with declared
+/// outputs `[out, debug]`, stored wanted `'{}'` (= all declared),
+/// expected paths set, NO edges, and `topdown_pruned = true` seeded by
+/// direct UPDATE — the same shape a pruned merge persists; seeding it
+/// manually keeps the staging independent of the merge-time
+/// persistence path (which has its own test) and of the spawned-fetch
+/// race. Phase 2's store has `out` substitutable and `debug` missing /
+/// not substitutable.
+#[tokio::test]
+async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_source() -> TestResult {
+    let out = test_store_path("fov-root-out");
+    let dbg = test_store_path("fov-root-debug");
+
+    // Phase-2 store: `out` substitutable upstream; `debug` missing and
+    // NOT substitutable — the recovered (wider) all-declared wanted set
+    // is unsatisfiable even though the prune-time criterion was met.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        // Active build + build_derivations link + derivation row:
+        // declared [out, debug], wanted '{}' (= all declared), expected
+        // paths set, no edges.
+        let mut node = make_node("fov-root");
+        node.output_names = vec!["out".into(), "debug".into()];
+        node.expected_output_paths = vec![out.clone(), dbg.clone()];
+        node.wanted_output_names = vec![];
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate to the post-prune persisted shape (see doc comment).
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = 'fov-root'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the restore+guard are missing.
+    let mut worker_rx = connect_executor(&handle, "fov-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+
+    // No WorkAssignment is ever sent for the dep-less node.
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "childless topdown-pruned root must never be dispatched from source \
+             after failover (its inputDrvs were never merged — worker would ENOENT)"
+        );
+    }
+    let d = expect_drv(&handle, "fov-root").await;
+    assert!(
+        !matches!(
+            d.status,
+            DerivationStatus::Assigned | DerivationStatus::Running | DerivationStatus::Ready
+        ),
+        "recovered childless pruned root must not be left dispatchable from \
+         source; got {:?}",
+        d.status
+    );
+    // The interested build terminates with the resubmit-directing error
+    // (same assertions as the SubstituteComplete{ok=false} fail-fast tests).
+    let s = query_status(&handle, build_id).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "interested build must fail fast (resubmit re-probes or full-merges); \
+         got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s.error_summary
+    );
+    Ok(())
+}
