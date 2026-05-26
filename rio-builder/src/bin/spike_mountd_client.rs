@@ -288,6 +288,7 @@ fn kind_name(kind: &ErrKind) -> &'static str {
         ErrKind::AlreadyMounted => "AlreadyMounted",
         ErrKind::DuplicateBuildId => "DuplicateBuildId",
         ErrKind::BatchTooLarge => "BatchTooLarge",
+        ErrKind::BadFuseFd => "BadFuseFd",
     }
 }
 

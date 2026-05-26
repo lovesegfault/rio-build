@@ -145,6 +145,11 @@ pub enum ErrKind {
     DuplicateBuildId,
     /// `PromoteChunks` batch exceeds [`PROMOTE_CHUNKS_MAX`].
     BatchTooLarge,
+    /// `Mount` did not carry a usable `/dev/fuse` fd in its
+    /// `SCM_RIGHTS` (missing, or not the fuse character device).
+    /// Build-fatal: the same client would send the same fd again, so
+    /// retrying cannot succeed — fix the builder, not the request.
+    BadFuseFd,
 }
 
 impl ErrKind {
@@ -168,6 +173,11 @@ impl std::fmt::Display for ErrKind {
             ErrKind::AlreadyMounted => write!(f, "connection already mounted"),
             ErrKind::DuplicateBuildId => write!(f, "build_id is owned by another connection"),
             ErrKind::BatchTooLarge => write!(f, "PromoteChunks batch exceeds the maximum"),
+            ErrKind::BadFuseFd => write!(
+                f,
+                "Mount did not carry a usable /dev/fuse fd (missing from SCM_RIGHTS, or not the \
+                 fuse character device)"
+            ),
         }
     }
 }
@@ -366,6 +376,7 @@ mod tests {
             ErrKind::AlreadyMounted,
             ErrKind::DuplicateBuildId,
             ErrKind::BatchTooLarge,
+            ErrKind::BadFuseFd,
         ] {
             assert!(fatal.is_build_fatal(), "{fatal:?} must be build-fatal");
         }

@@ -132,6 +132,38 @@ pub fn validate_build_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// The fuse misc device's fixed numbers (`Documentation/admin-guide/
+/// devices.txt`): char major 10 (misc), minor 229.
+const FUSE_DEV_MAJOR: u64 = 10;
+const FUSE_DEV_MINOR: u64 = 229;
+
+/// Gate the fd a `Mount{}` frame carries: it must be an open fd for the
+/// `/dev/fuse` character device. The daemon holds this fd for the
+/// connection's lifetime and issues `FUSE_DEV_IOC_BACKING_*` ioctls
+/// against it; accepting an arbitrary fd would at best waste a kept fd
+/// per connection and at worst hand a confused (or malicious) builder a
+/// root-held reference to whatever it smuggled in. A wrong fd is a
+/// builder bug, not a transient condition — the rejection is
+/// build-fatal ([`ErrKind::BadFuseFd`]).
+// r[impl builder.mountd.fuse-handoff]
+fn validate_fuse_fd(fd: BorrowedFd<'_>) -> Result<(), ErrKind> {
+    let st = nix::sys::stat::fstat(fd).map_err(|e| {
+        warn!(error = %e, "Mount fd fstat failed");
+        ErrKind::BadFuseFd
+    })?;
+    let is_char = (st.st_mode & libc::S_IFMT) == libc::S_IFCHR;
+    let rdev = st.st_rdev;
+    let (major, minor) = (libc::major(rdev), libc::minor(rdev));
+    if !is_char || u64::from(major) != FUSE_DEV_MAJOR || u64::from(minor) != FUSE_DEV_MINOR {
+        warn!(
+            is_char,
+            major, minor, "Mount fd is not the /dev/fuse character device"
+        );
+        return Err(ErrKind::BadFuseFd);
+    }
+    Ok(())
+}
+
 // ─── FUSE_DEV_IOC_BACKING_{OPEN,CLOSE} ─────────────────────────────────
 
 /// `<uapi/linux/fuse.h>` `struct fuse_backing_map`.
@@ -1096,13 +1128,20 @@ fn handle_mount(
     if !validate_build_id(&build_id) {
         return Resp::Err(ErrKind::BadBuildId);
     }
-    // The builder's /dev/fuse fd. Cloned out of the frame (not moved):
-    // the daemon never reads or writes it — it is only ever the target
-    // of BACKING_OPEN/CLOSE ioctls, which fail cleanly on a non-fuse fd.
-    let Some(kept) = fds.first().and_then(|fd| fd.try_clone().ok()) else {
-        return Resp::Err(ErrKind::Retryable(
-            "Mount frame carried no /dev/fuse fd".into(),
-        ));
+    // The builder's /dev/fuse fd: required, and gated to actually BE the
+    // fuse character device before the daemon keeps a root-held
+    // reference to it (the only thing it is ever used for is
+    // BACKING_OPEN/CLOSE ioctls). Missing or wrong → build-fatal: the
+    // same client would send the same thing again.
+    let Some(sent) = fds.first() else {
+        warn!(build_id, "Mount frame carried no fd");
+        return Resp::Err(ErrKind::BadFuseFd);
+    };
+    if let Err(kind) = validate_fuse_fd(sent.as_fd()) {
+        return Resp::Err(kind);
+    }
+    let Ok(kept) = sent.try_clone() else {
+        return Resp::Err(ErrKind::Retryable("dup of the Mount fd failed".into()));
     };
     // Claim the build_id process-wide before touching the filesystem so
     // two connections racing on the same id cannot both mkdir.
@@ -1306,6 +1345,135 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::symlink;
+
+    /// Build a minimal [`Shared`] rooted in a tempdir so connection-level
+    /// handlers (`handle_mount`) can run without a daemon, a socket, or
+    /// CAP_SYS_ADMIN. Quota is disabled (0) so no XFS is needed.
+    fn test_shared(tmp: &Path) -> Arc<Shared> {
+        let sub = |name: &str| {
+            let p = tmp.join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            nix::fcntl::open(&p, OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty()).unwrap()
+        };
+        Arc::new(Shared {
+            cfg: MountdConfig {
+                socket_path: tmp.join("mountd.sock"),
+                castore_dir: tmp.join("castore"),
+                staging_dir: tmp.join("staging"),
+                cache_dir: tmp.join("cache"),
+                chunks_dir: tmp.join("chunks"),
+                staging_quota_bytes: 0,
+                max_promote_bytes: DEFAULT_MAX_PROMOTE_BYTES,
+                allowed_gid: nix::unistd::getegid().as_raw(),
+                sweep_interval: Duration::ZERO,
+            },
+            staging_base: sub("staging"),
+            cache_base: sub("cache"),
+            chunks_base: sub("chunks"),
+            live_uids: Mutex::new(HashSet::new()),
+            live_build_ids: Mutex::new(HashSet::new()),
+            next_projid: AtomicU32::new(1),
+            promote_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+        })
+    }
+
+    fn test_conn_state() -> ConnState {
+        ConnState {
+            peer_uid: nix::unistd::geteuid().as_raw(),
+            peer_gid: nix::unistd::getegid().as_raw(),
+            kept: None,
+            build_id: None,
+            staging_dirfd: None,
+            staging_chunks_dirfd: None,
+            projid: None,
+            live_backing_ids: 0,
+        }
+    }
+
+    /// The Mount fd gate: only the /dev/fuse character device passes.
+    /// Regular files, directories, and pipes are exactly the things a
+    /// confused client would send — all rejected as the build-fatal
+    /// [`ErrKind::BadFuseFd`].
+    #[test]
+    fn validate_fuse_fd_rejects_non_fuse_fds() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Regular file.
+        let f = std::fs::File::create(tmp.path().join("plain")).unwrap();
+        assert_eq!(validate_fuse_fd(f.as_fd()), Err(ErrKind::BadFuseFd));
+
+        // Directory.
+        let d = std::fs::File::open(tmp.path()).unwrap();
+        assert_eq!(validate_fuse_fd(d.as_fd()), Err(ErrKind::BadFuseFd));
+
+        // Pipe (not even stat-able as a device).
+        let (r, _w) = nix::unistd::pipe().unwrap();
+        assert_eq!(validate_fuse_fd(r.as_fd()), Err(ErrKind::BadFuseFd));
+
+        // /dev/null is a character device — but not the fuse one.
+        if let Ok(null) = std::fs::File::open("/dev/null") {
+            assert_eq!(validate_fuse_fd(null.as_fd()), Err(ErrKind::BadFuseFd));
+        }
+
+        // The real thing passes, where the environment provides it
+        // (not in the nix build sandbox).
+        if let Ok(fuse) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+        {
+            assert_eq!(validate_fuse_fd(fuse.as_fd()), Ok(()));
+        }
+    }
+
+    /// A Mount frame without an fd (or with a non-fuse fd) is rejected
+    /// build-fatally and leaves no state behind: the build_id is not
+    /// claimed, no staging dir is created, and the same id is still
+    /// claimable by a well-formed Mount afterwards.
+    #[test]
+    fn handle_mount_rejects_missing_or_bogus_fd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared(tmp.path());
+
+        // No fd at all.
+        let mut state = test_conn_state();
+        let resp = handle_mount(&shared, &mut state, "b-nofd".into(), &[]);
+        assert_eq!(resp, Resp::Err(ErrKind::BadFuseFd));
+        assert!(state.kept.is_none() && state.build_id.is_none());
+        assert!(
+            !shared.live_build_ids.lock().unwrap().contains("b-nofd"),
+            "a rejected Mount must not leave the build_id claimed"
+        );
+        assert!(!tmp.path().join("staging/b-nofd").exists());
+
+        // A regular file masquerading as the fuse fd.
+        let bogus: OwnedFd = std::fs::File::create(tmp.path().join("bogus"))
+            .unwrap()
+            .into();
+        let mut state = test_conn_state();
+        let resp = handle_mount(&shared, &mut state, "b-bogus".into(), &[bogus]);
+        assert_eq!(resp, Resp::Err(ErrKind::BadFuseFd));
+        assert!(state.kept.is_none() && state.build_id.is_none());
+        assert!(!shared.live_build_ids.lock().unwrap().contains("b-bogus"));
+        assert!(!tmp.path().join("staging/b-bogus").exists());
+
+        // The id rejected above is still claimable once a real fuse fd
+        // arrives (where the environment provides /dev/fuse).
+        if let Ok(fuse) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+        {
+            let mut state = test_conn_state();
+            let resp = handle_mount(&shared, &mut state, "b-nofd".into(), &[fuse.into()]);
+            assert!(
+                matches!(resp, Resp::Mounted { .. }),
+                "well-formed Mount after a rejected one must succeed, got {resp:?}"
+            );
+            assert!(state.kept.is_some());
+            assert!(tmp.path().join("staging/b-nofd").exists());
+        }
+    }
 
     // r[verify builder.mountd.build-id-validated]
     #[test]
