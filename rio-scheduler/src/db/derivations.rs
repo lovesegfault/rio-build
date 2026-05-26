@@ -85,7 +85,7 @@ impl SchedulerDb {
     /// un-GC-able row (terminal derivation + pending assignment).
     ///
     /// Owns its transaction; appending sites that already hold one use
-    /// [`Self::update_derivation_status_in_tx`] instead.
+    /// `update_derivation_status_in_tx` instead.
     pub async fn update_derivation_status(
         &self,
         drv_hash: &DrvHash,
@@ -99,7 +99,7 @@ impl SchedulerDb {
 
     /// Transaction-joining body of
     /// [`Self::update_derivation_status_batch`] — same split as
-    /// [`Self::update_derivation_status_in_tx`]. Returns the number of
+    /// `update_derivation_status_in_tx`. Returns the number of
     /// derivation rows updated.
     // r[impl sched.db.assignment-terminal-on-status+2]
     pub(crate) async fn update_derivation_status_batch_in_tx(
@@ -153,7 +153,7 @@ impl SchedulerDb {
     /// variant — don't make this one variadic.
     ///
     /// Owns its transaction; appending sites that already hold one use
-    /// [`Self::update_derivation_status_batch_in_tx`] instead.
+    /// `update_derivation_status_batch_in_tx` instead.
     ///
     /// [`update_derivation_status`]: Self::update_derivation_status
     pub async fn update_derivation_status_batch(
@@ -289,7 +289,7 @@ impl SchedulerDb {
     /// assignment. Matches the in-mem semantics the caller should enforce.
     ///
     /// Owns its transaction; appending sites that already hold one use
-    /// [`Self::persist_poisoned_in_tx`] instead.
+    /// `persist_poisoned_in_tx` instead.
     pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         Self::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
@@ -355,7 +355,7 @@ impl SchedulerDb {
     /// `resubmit_cycles` for the resubmit-bound).
     ///
     /// Owns its connection; reset sites that already hold a transaction
-    /// use [`Self::clear_poison_in_tx`] instead.
+    /// use `clear_poison_in_tx` instead.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         Self::clear_poison_in_tx(&mut tx, drv_hash).await?;
