@@ -1195,10 +1195,22 @@ whose target may finish authenticating after the disconnect was queued and
 thereby leave the pre-auth deadline's reach, so the decision itself must
 arm the bound), so the failed read ends russh's session loop (or its drain
 loop) and releases the connection slot and fd through the normal drop
-path. That forced close at grace + slack is what reaps a peer that stalls
-or squats mid-exchange --- long before `keepalive_max` (\~300 s) would ---
-leaving keepalive as the backstop only for connections the gateway has not
-(yet) decided to disconnect.
+path. The wrapper enforces these deadlines on both the read and the write
+path of the transport: once a session is exec'd the gateway streams bulk
+channel data (build logs, NAR bytes) to the client through the same
+stream, and russh awaits that write inline --- a peer that simply stops
+reading at the TCP level parks the session loop in the write, where the
+read-side check would never run again. A deadline armed only after the
+loop is already parked in such a write is beyond every in-process timer
+(none of them get polled any more), so the gateway also sets a
+kernel-level `TCP_USER_TIMEOUT` on every accepted socket, aligned with the
+keepalive bound (\~300 s), and the kernel errors the connection out once
+its data has been undeliverable for that long. That forced close at grace
++ slack is what reaps a peer that stalls or squats mid-exchange --- long
+before `keepalive_max` (\~300 s) would --- leaving keepalive as the
+backstop only for connections the gateway has not (yet) decided to
+disconnect, and `TCP_USER_TIMEOUT` as the equally-sized backstop for a
+peer that wedges the transport itself by refusing to read.
 
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at

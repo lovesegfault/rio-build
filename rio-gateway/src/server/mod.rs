@@ -134,6 +134,24 @@ pub const EMPTY_CONNECTION_GRACE: std::time::Duration = std::time::Duration::fro
 /// socket ever reaches the hard close.
 pub const FORCE_CLOSE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Kernel-level bound on how long transmitted-but-unacknowledged data (or
+/// a persistent zero receive window) may pend on an accepted connection
+/// before the kernel errors the socket out (`TCP_USER_TIMEOUT`, applied at
+/// accept by [`set_tcp_user_timeout`]).
+///
+/// It exists because every in-process bound assumes the session loop keeps
+/// getting polled: a peer that stops reading at the TCP level parks russh
+/// inline in a bulk channel-data write, and from that moment neither the
+/// protocol keepalive nor any timer this process arms afterwards can run —
+/// the kernel is the only clock left holding the connection's fate. Set
+/// equal to the SSH keepalive bound (30 s interval × (9+1) missed replies
+/// ≈ 300 s, see [`build_ssh_config`]), the documented tolerance for an
+/// unresponsive peer the gateway has NOT decided to disconnect, so an
+/// honest-but-flaky client gains no new failure window from this option —
+/// the connection dies at the same point keepalive would have killed it
+/// anyway.
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The SSH server that accepts connections and spawns protocol sessions.
 pub struct GatewayServer {
     store_client: StoreServiceClient<Channel>,
@@ -461,6 +479,14 @@ impl GatewayServer {
                 {
                     warn!(%peer, error = %e, "set_nodelay failed");
                 }
+                // Kernel-level transport bound: undeliverable bytes (or a
+                // peer that holds its receive window at zero) error the
+                // socket out after [`TCP_USER_TIMEOUT`] even when russh is
+                // parked inline in a write and no in-process timer can run.
+                // See the constant for why it equals the keepalive bound.
+                if let Err(e) = set_tcp_user_timeout(&stream, TCP_USER_TIMEOUT) {
+                    warn!(%peer, error = %e, "set TCP_USER_TIMEOUT failed");
+                }
                 // One pre-auth deadline for the whole connection,
                 // measured from accept: a connection that has not
                 // completed authentication by this instant is dropped or
@@ -660,43 +686,46 @@ impl ForceClose {
 }
 
 // r[impl gw.conn.exit-status+3]
-/// Transport wrapper that enforces the gateway's read deadlines at the
-/// stream level — the only lever that works without the peer's
-/// cooperation. russh 0.61 only drains handle messages between key
-/// exchanges (`!kex.active()` gates the `receiver.recv()` arm of its
-/// session loop), offers no way to abort the session loop it spawned
-/// (`RunningSession` wraps a result oneshot, not an abortable
-/// `JoinHandle`), and once a queued disconnect IS processed it parks in a
-/// post-disconnect drain-read loop that has no timeout and arms no
-/// keepalives, waiting for the peer to close. Failing the read ends every
-/// one of those states: both the main loop and the drain loop surface the
-/// error and return, the spawned session task drops the handler and
-/// stream, and the connection permit, fd, and gauges release exactly once
-/// through the existing drop paths.
+/// Transport wrapper that enforces the gateway's deadlines at the stream
+/// level, on both the read and the write path — the only lever that works
+/// without the peer's cooperation. russh 0.61 only drains handle messages
+/// between key exchanges (`!kex.active()` gates the `receiver.recv()` arm
+/// of its session loop), offers no way to abort the session loop it
+/// spawned (`RunningSession` wraps a result oneshot, not an abortable
+/// `JoinHandle`), awaits its writes inline (a peer that stops reading
+/// parks the whole loop in a bulk channel-data write), and once a queued
+/// disconnect IS processed it parks in a post-disconnect drain-read loop
+/// that has no timeout and arms no keepalives, waiting for the peer to
+/// close. Failing the read or write ends every one of those states: both
+/// the main loop and the drain loop surface the error and return, the
+/// spawned session task drops the handler and stream, and the connection
+/// permit, fd, and gauges release exactly once through the existing drop
+/// paths.
 ///
 /// Two deadlines, one mechanism:
 ///
-/// - **Pre-auth:** reads fail once `pre_auth_deadline` (accept + grace +
-///   [`FORCE_CLOSE_SLACK`]) passes with the connection still not
+/// - **Pre-auth:** reads/writes fail once `pre_auth_deadline` (accept +
+///   grace + [`FORCE_CLOSE_SLACK`]) passes with the connection still not
 ///   authenticated. Ignored permanently once the connection reaches
 ///   `ConnStage::Authenticated`; an authenticated session can idle or
 ///   re-key for as long as the post-auth limits allow.
-/// - **Force-close:** reads fail once the shared [`ForceClose`] deadline
-///   passes, regardless of auth state. It is armed the moment the gateway
-///   queues a `Disconnect::ByApplication` for the connection, so a peer
-///   that keeps that disconnect undeliverable (parked key exchange) or
-///   ignores it (never closes its socket) is closed within the slack
+/// - **Force-close:** reads/writes fail once the shared [`ForceClose`]
+///   deadline passes, regardless of auth state. It is armed the moment the
+///   gateway queues a `Disconnect::ByApplication` for the connection, so a
+///   peer that keeps that disconnect undeliverable (parked key exchange)
+///   or ignores it (never closes its socket) is closed within the slack
 ///   anyway.
 ///
 /// Cost on the hot path (authenticated, nothing armed): one relaxed atomic
-/// load per read poll — the pre-auth stage check latches off after the
-/// first authenticated poll, and the internal sleep is only armed/polled
-/// while a deadline is actually pending. Polling the sleep is what wakes a
-/// read that is parked with no inbound bytes (the KEX-parked or
-/// socket-holding peer) when its deadline arrives; a peer whose kill is
-/// armed while its read is already parked mid-key-exchange is picked up on
-/// its next inbound packet or russh's next keepalive tick, both of which
-/// re-poll the read.
+/// load per read/write poll — the pre-auth stage check latches off after
+/// the first authenticated poll, and the internal sleep is only
+/// armed/polled while a deadline is actually pending. Polling the sleep is
+/// what wakes a read or write that is parked with nothing else to wake it
+/// (the KEX-parked or socket-holding peer's read, the zero-window peer's
+/// write) when its deadline arrives; a kill armed only after the poll
+/// already parked is picked up on the next inbound packet or keepalive
+/// tick for a parked read, and by the kernel-level [`TCP_USER_TIMEOUT`]
+/// for a parked write (nothing in-process re-polls a parked write).
 struct ConnDeadline<S> {
     inner: S,
     /// Highest [`connection::ConnStage`] reached, shared with the
@@ -808,20 +837,50 @@ impl<S: AsyncRead + Unpin> AsyncRead for ConnDeadline<S> {
     }
 }
 
-/// Writes delegate untouched: server writes are tiny (banner, KEXINIT,
-/// auth replies, channel bookkeeping) and never park; failing the read
-/// side is what ends russh's session loop.
+/// Write-path enforcement of the same deadlines as the read path. Server
+/// writes are NOT all tiny: once a session is exec'd the gateway streams
+/// bulk CHANNEL_DATA (build logs, NAR bytes) to the client through this
+/// stream, and russh's session loop awaits its write/flush inline rather
+/// than as a select arm — a peer that stops reading at the TCP level (zero
+/// receive window: suspended laptop, wedged client, or deliberate) parks
+/// the loop in the write, after which the read arm, keepalive arm, and
+/// handle queue are never polled again. Checking the deadline here means a
+/// deadline that was already pending when the write parked still fires:
+/// `check_expired` keeps the polled sleep registered with this task's
+/// waker, so the parked write is woken at the deadline and fails with
+/// `TimedOut`, ending russh's session loop exactly like a failed read.
+///
+/// This deliberately does NOT cover a deadline armed only AFTER the write
+/// parked — nothing re-polls the task then, so no in-process timer can run
+/// at all; the kernel-level `TCP_USER_TIMEOUT` set at accept
+/// ([`set_tcp_user_timeout`]) bounds that case. `poll_shutdown` stays
+/// untouched so tearing the connection down is never itself blocked by a
+/// deadline.
 impl<S: AsyncWrite + Unpin> AsyncWrite for ConnDeadline<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        if let Some(reason) = this.check_expired(cx) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                reason,
+            )));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if let Some(reason) = this.check_expired(cx) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                reason,
+            )));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
@@ -833,7 +892,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ConnDeadline<S> {
         cx: &mut TaskContext<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        if let Some(reason) = this.check_expired(cx) {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                reason,
+            )));
+        }
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -868,6 +934,49 @@ fn classify_accept_error(e: &std::io::Error) -> AcceptErrAction {
         }
         _ => AcceptErrAction::Retry,
     }
+}
+
+/// Apply [`TCP_USER_TIMEOUT`] to an accepted connection: tell the kernel to
+/// error the socket out once transmitted data has gone unacknowledged (or a
+/// zero receive window has persisted) for `timeout`. tokio's `TcpStream`
+/// exposes no setter for this option, so it is set through `libc` on the
+/// raw fd; the unsafety is contained here behind a safe signature. Failure
+/// is returned for the caller to warn-and-continue (same handling as a
+/// `set_nodelay` failure): a connection without the option is merely
+/// missing one backstop, not unusable.
+#[cfg(target_os = "linux")]
+fn set_tcp_user_timeout(stream: &tokio::net::TcpStream, timeout: Duration) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let millis: libc::c_uint = timeout.as_millis().try_into().unwrap_or(libc::c_uint::MAX);
+    // SAFETY: the fd is owned by `stream`, which outlives this call; the
+    // option value is a properly-sized, properly-aligned c_uint on the
+    // stack; setsockopt copies it and does not retain the pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            (&raw const millis).cast(),
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `TCP_USER_TIMEOUT` is Linux-specific and the gateway only ships on
+/// Linux; on other targets (local development builds) this is a documented
+/// no-op — the in-process deadlines and the SSH keepalive still apply.
+#[cfg(not(target_os = "linux"))]
+fn set_tcp_user_timeout(
+    _stream: &tokio::net::TcpStream,
+    _timeout: Duration,
+) -> std::io::Result<()> {
+    Ok(())
 }
 
 // r[impl gw.conn.session-error-visible]
@@ -1141,6 +1250,47 @@ mod conn_deadline_tests {
         assert_eq!(&buf[..n], b"post-auth data");
     }
 
+    /// The force-close deadline applies to the WRITE path too, and the
+    /// wrapper's own timer wakes a write that is parked because the peer
+    /// stopped reading (zero receive window). Once a session is exec'd the
+    /// gateway streams bulk channel data through this stream and russh
+    /// awaits the write inline — a parked write means the read arm,
+    /// keepalive arm, and handle queue are never polled again, so a
+    /// deadline that was already pending when the write parked must fire
+    /// from the write poll itself or it never fires at all.
+    #[tokio::test(start_paused = true)]
+    async fn force_close_fails_a_parked_authenticated_write() {
+        const SLACK: Duration = Duration::from_millis(150);
+        // Tiny duplex buffer that the first write fills; the far end never
+        // reads, so the second write parks exactly like a transport whose
+        // peer advertises a zero receive window.
+        let (_far, near) = tokio::io::duplex(8);
+        let force_close = Arc::new(ForceClose::new());
+        let mut wrapped = ConnDeadline::new(
+            near,
+            stage(connection::ConnStage::Authenticated),
+            Arc::clone(&force_close),
+            tokio::time::Instant::now() + Duration::from_secs(600),
+        );
+        wrapped
+            .write_all(&[0u8; 8])
+            .await
+            .expect("filling the duplex buffer must succeed");
+        // Armed BEFORE the write parks — the production shape: the
+        // empty-connection grace timer (or the auth-timeout path) armed the
+        // force-close while russh was already wedged in a bulk write to a
+        // peer that stopped reading.
+        force_close.arm_within(SLACK);
+        // Bounded from the outside so a regression (write parked forever,
+        // deadline never checked on the write path) fails the test instead
+        // of hanging it.
+        let err = tokio::time::timeout(Duration::from_secs(5), wrapped.write(b"y"))
+            .await
+            .expect("force-close must wake the parked write at the deadline")
+            .expect_err("write must fail once the force-close deadline passes");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     /// The force-close deadline applies REGARDLESS of auth state, and the
     /// wrapper's own timer wakes a read that is parked with no inbound
     /// bytes — the post-disconnect "holds the socket" peer parks russh in
@@ -1175,6 +1325,53 @@ mod conn_deadline_tests {
             started.elapsed() >= SLACK,
             "force-close must not fire before its slack elapses"
         );
+    }
+}
+
+/// Linux-only: the option must actually land on the socket, read back via
+/// `getsockopt`, so a refactor that silently stops applying it (or applies
+/// it to the wrong fd/level) is caught here rather than by a peer that
+/// stops reading in production.
+#[cfg(all(test, target_os = "linux"))]
+mod tcp_user_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn helper_sets_tcp_user_timeout_on_accepted_socket() -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let _client = tokio::net::TcpStream::connect(addr).await?;
+        let (accepted, _) = listener.accept().await?;
+
+        set_tcp_user_timeout(&accepted, TCP_USER_TIMEOUT)?;
+
+        let mut value: libc::c_uint = 0;
+        let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
+        // SAFETY: `value` and `len` are valid, properly aligned stack
+        // locations for the duration of the call, and the fd is owned by
+        // `accepted`, which outlives it.
+        let rc = unsafe {
+            libc::getsockopt(
+                accepted.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                (&raw mut value).cast(),
+                &raw mut len,
+            )
+        };
+        anyhow::ensure!(
+            rc == 0,
+            "getsockopt(TCP_USER_TIMEOUT) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            u128::from(value),
+            TCP_USER_TIMEOUT.as_millis(),
+            "the kernel must report the configured TCP_USER_TIMEOUT (in milliseconds)"
+        );
+        Ok(())
     }
 }
 
