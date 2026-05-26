@@ -149,6 +149,17 @@ let
         "${common.signServiceTokenFile} ${fixture.hmacKeys}/service-hmac.key"
     ).strip()
 
+    # The estimator's ModelKey is (pname, system, tenant-UUID): the
+    # convergence subtest's REAL builds are attributed to vm-sla, so any
+    # injected samples that must share their key (the outlier MAD gate
+    # needs the combined >=5 on-curve samples) have to carry the same
+    # UUID. Subtests that only use injected/queried state keep the
+    # tenant="" key and stay self-consistent.
+    sla_tenant_id = psql(
+        ${gatewayHost},
+        "SELECT tenant_id::text FROM tenants WHERE tenant_name = 'vm-sla'",
+    )
+
     def grpcurl_admin(method: str, payload: dict) -> str:
         return ${gatewayHost}.succeed(
             f"grpcurl -plaintext -protoset ${protoset}/rio.protoset "
@@ -245,12 +256,14 @@ let
     outlier = ''
       with subtest("outlier: 100x sample flagged outlier_excluded"):
           # Seed enough on-curve samples that n_eff>=5 (MAD gate). The
-          # fixture builds above gave us 3; inject 3 more on-curve via
-          # InjectBuildSample so the gate opens, then one 100x outlier.
+          # fixture builds above gave us 3 — attributed to vm-sla, so
+          # their estimator key carries the vm-sla UUID — and the 3
+          # injected on-curve samples must land on the SAME key for the
+          # gate to open; then one 100x outlier on that key.
           for c, t in [(4, 530), (16, 155), (64, 61.25)]:
               grpcurl_admin("InjectBuildSample", {
                   "pname": "synth-amdahl", "system": "x86_64-linux",
-                  "tenant": "", "durationSecs": t,
+                  "tenant": sla_tenant_id, "durationSecs": t,
                   "peakMemoryBytes": 1073741824,
                   "cpuLimitCores": c, "cpuSecondsTotal": t * c * 0.95,
               })
@@ -259,7 +272,7 @@ let
           wait_estimator_tick()
           grpcurl_admin("InjectBuildSample", {
               "pname": "synth-amdahl", "system": "x86_64-linux",
-              "tenant": "", "durationSecs": 53000,
+              "tenant": sla_tenant_id, "durationSecs": 53000,
               "peakMemoryBytes": 1073741824,
               "cpuLimitCores": 4, "cpuSecondsTotal": 200000,
           })
@@ -271,11 +284,11 @@ let
               "WHERE pname='synth-amdahl' AND outlier_excluded\") -ge 1",
               timeout=30,
           )
-          # Metric incremented (registered + emitted). The injected
-          # samples carry tenant="" so the counter is labelled tenant="".
+          # Metric incremented (registered + emitted). The samples carry
+          # the vm-sla tenant so the counter is labelled with its UUID.
           assert_metric_ge(${gatewayHost}, 9091,
               "rio_scheduler_sla_outlier_rejected_total", 1.0,
-              labels='{tenant=""}')
+              labels=f'{{tenant="{sla_tenant_id}"}}')
     '';
 
     override-precedence = ''
