@@ -40,6 +40,7 @@ use tracing::{debug, warn};
 
 use rio_exec::ExitOutcome;
 use rio_nix::derivation::{Derivation, DerivationLike};
+use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::BuildResultStatus;
 use rio_proto::validated::ValidatedPathInfo;
@@ -254,6 +255,10 @@ pub(crate) enum OutputRejection {
     )]
     CaUnsupportedAlgo { output: String, algo: String },
     #[error(
+        "fixed-output output '{output}' declares an unusable outputHash/outputHashAlgo: {message}"
+    )]
+    FodDeclaredHashInvalid { output: String, message: String },
+    #[error(
         "floating content-addressed output '{output}' uses flat ingestion but is not a \
          single non-executable regular file"
     )]
@@ -303,7 +308,13 @@ fn process_outputs_inner(
     let candidates = reference_candidates(outputs, input_closure);
 
     // Pass 1: canonicalise + scan each output (one NAR read per output).
-    let processed = canonicalise_and_scan_outputs(outputs, build_uid, &candidates, &policy)?;
+    let mut processed = canonicalise_and_scan_outputs(outputs, build_uid, &candidates, &policy)?;
+
+    // Fixed-output (CAFixed) outputs: record the declared content-address
+    // descriptor so registration carries the `CA:` field exactly like
+    // CppNix. Floating-CA outputs get theirs minted during finalization;
+    // input-addressed outputs carry none.
+    populate_fixed_output_descriptors(&mut processed, drv)?;
 
     // The FOD no-references rule applies before any reordering: a
     // fixed-output derivation's output must not reference the store at
@@ -400,6 +411,59 @@ fn canonicalise_and_scan_outputs(
         });
     }
     Ok(processed)
+}
+
+/// Record the `fixed:[r:]<algo>:<hash>` content-address descriptor for
+/// outputs whose derivation declares a hash (fixed-output / CAFixed
+/// outputs), exactly as CppNix registers them — the descriptor flows
+/// into upload registration and the narinfo `CA:` field, and is what
+/// exempts fetched sources from the store's "non-CA path with zero
+/// references" heuristics.
+///
+/// The declared `outputHash` in a `.drv` is base16; the descriptor uses
+/// the canonical nixbase32 rendering, so the hash is re-encoded here.
+/// Malformed declarations are rejected (fail-closed), consistent with
+/// the FOD hash verification gate.
+fn populate_fixed_output_descriptors(
+    processed: &mut [ProcessedOutput],
+    drv: &Derivation,
+) -> Result<(), OutputRejection> {
+    for o in drv.outputs() {
+        if !o.has_hash_algo() || o.hash().is_empty() {
+            continue;
+        }
+        let raw_algo = o.hash_algo();
+        let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
+            Some(rest) => (true, rest),
+            None => (false, raw_algo),
+        };
+        let algo: HashAlgo =
+            algo_str
+                .parse()
+                .map_err(|_| OutputRejection::FodDeclaredHashInvalid {
+                    output: o.name().to_owned(),
+                    message: format!("unsupported outputHashAlgo '{raw_algo}'"),
+                })?;
+        let digest =
+            hex::decode(o.hash()).map_err(|_| OutputRejection::FodDeclaredHashInvalid {
+                output: o.name().to_owned(),
+                message: format!("outputHash is not valid base16: {}", o.hash()),
+            })?;
+        let hash =
+            NixHash::new(algo, digest).map_err(|e| OutputRejection::FodDeclaredHashInvalid {
+                output: o.name().to_owned(),
+                message: e.to_string(),
+            })?;
+        let descriptor = format!(
+            "fixed:{}{}",
+            if recursive { "r:" } else { "" },
+            hash.to_colon()
+        );
+        if let Some(p) = processed.iter_mut().find(|p| p.name == o.name()) {
+            p.content_address = Some(descriptor);
+        }
+    }
+    Ok(())
 }
 
 /// The FOD no-references rule: a fixed-output derivation's output must
@@ -772,6 +836,62 @@ mod tests {
         assert!(
             matches!(err, OutputRejection::FodHasReferences { .. }),
             "got {err}"
+        );
+    }
+
+    /// Fixed-output (CAFixed) outputs must carry the declared
+    /// content-address descriptor, re-encoded from the .drv's base16
+    /// `outputHash` to the canonical nixbase32 colon form CppNix
+    /// registers (and serves as the narinfo `CA:` field).
+    #[test]
+    fn fixed_output_descriptor_recorded_recursive() {
+        let out_p = sp('a', "src");
+        let (_tmp, outputs) = fake_outputs(&[("out", &out_p, b"fetched bytes")]);
+        let declared_hex = "11".repeat(32);
+        let drv = drv_from_aterm_ca(&[("out", &out_p, "r:sha256", &declared_hex)], &[]);
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+
+        let expected = rio_nix::hash::NixHash::new(
+            rio_nix::hash::HashAlgo::SHA256,
+            hex::decode(&declared_hex).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            processed.outputs[0].content_address.as_deref(),
+            Some(format!("fixed:r:{}", expected.to_colon()).as_str()),
+            "recursive FOD output must carry its declared CA descriptor"
+        );
+        // The store path itself is the declared (input-independent) one.
+        assert_eq!(processed.outputs[0].store_path, out_p);
+    }
+
+    #[test]
+    fn fixed_output_descriptor_recorded_flat() {
+        let out_p = sp('b', "tarball");
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join(out_p.strip_prefix("/nix/store/").unwrap());
+        std::fs::write(&host, b"flat fetched bytes").unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outputs = [OutputToProcess {
+            name: "out".into(),
+            store_path: out_p.clone(),
+            host_path: host,
+        }];
+        let declared_hex = "22".repeat(32);
+        let drv = drv_from_aterm_ca(&[("out", &out_p, "sha256", &declared_hex)], &[]);
+
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+
+        let expected = rio_nix::hash::NixHash::new(
+            rio_nix::hash::HashAlgo::SHA256,
+            hex::decode(&declared_hex).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            processed.outputs[0].content_address.as_deref(),
+            Some(format!("fixed:{}", expected.to_colon()).as_str()),
+            "flat FOD output must carry its declared CA descriptor without the r: prefix"
         );
     }
 
