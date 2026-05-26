@@ -18,6 +18,21 @@ scope: with scope; ''
   with subtest("eio-infra-retry: input-read EIO classifies as infra and recovers"):
       assert_not_cached(b3_eio_builder, "eio builder before the build")
 
+      # Stage the derivation into the store while its data plane is
+      # still healthy: the fault below takes the chunk objects offline,
+      # and the submit's own `nix copy --derivation` must not need to
+      # ingest anything then (copying an already-present .drv is a
+      # no-op).
+      drv_eio_staged = client.succeed(
+          "nix-instantiate "
+          "--arg busybox '(builtins.storePath ${busybox})' "
+          f"--arg eioBuilder '(builtins.storePath {p_eio_builder})' "
+          "${eioInfraDrv} 2>/dev/null"
+      ).strip()
+      client.succeed(
+          f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_eio_staged}"
+      )
+
       # Locate the store's chunk PV on k3s-server (local-path PVC bound
       # to the rio-store-chunks claim; the filesystem backend keeps its
       # objects under <baseDir>/chunks). Depending on the local-path
