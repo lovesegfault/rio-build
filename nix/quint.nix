@@ -1792,5 +1792,478 @@ in
         }
       '';
     };
+
+    # ==================================================================
+    # rio-controller's reconcile protocols (controller-formal Phase 0,
+    # Stage B): two tick-level models of the two reconcile loops.
+    #
+    #   spawnCoherence.qnt (Model J) — the L1 Pool reconciler's
+    #   same-tick coherence protocol (pool/{jobs,job}.rs): the intent
+    #   poll, the 3-valued placeable gate x pool kind, the Job
+    #   LIST/census, the stale/excess/orphan reap arms with their
+    #   fail-closed gates, the headroom arithmetic, the 409-deduped
+    #   spawn pass and the dispatched_cells-arming ack. Six
+    #   configurations: base / fault-rpc / fault-lease / fault-stale on
+    #   the production Builder+CRD shape, plus the crd-absent and
+    #   Fetcher-pool postures (the C1/C2 adjudications in
+    #   docs/spec/models/controller-invariant-map.md).
+    #
+    #   nodeclaimLifecycle.qnt (Model N) — the L10 NodeClaim-pool
+    #   reconciler's mirror lifecycle (nodeclaim_pool/): the lease-edge
+    #   polarity table (prev_idle / recorded_boot / inflight_created /
+    #   the sketches reload latch), the ⊥-streak early-return and
+    #   consolidate-only modes, vanish detection vs the controller's own
+    #   reaps, the recency-gated Registered clears, the placeable-gate
+    #   producer guarantee, and the global / per-class / per-tick cover
+    #   budgets over the hw-class config mirror. Four regimes: base /
+    #   fault-rpc / fault-lease / fault-karpenter.
+    #
+    # The Stage-A invariant map (controller-invariant-map.md) is the
+    # rule <-> invariant ledger for both models; its Stage-B section
+    # records the per-regime verdicts. The two pre-registered as-built
+    # falsifications (the ⊥-tick early-return observation skip) are
+    # wired as expect-violation checks plus a named-run check below —
+    # they stay green only while the documented defect reproduces, and
+    # flip to HOLD checks when the fix lands. State counts, depths and
+    # wall-clocks live in the introducing commit messages and the
+    # checks' transcripts.
+    # ==================================================================
+
+    # ---- Model J: exhaustive regime checks ---------------------------
+
+    # Production shape (Builder pool, CRD present), no faults: the
+    # healthy spawn/reap/ack lifecycle against an environment that moves
+    # between ticks, including the informer-lagged Job.status.ready vs
+    # the live pod phase and arbitrary (stale-allowed) gate publishes.
+    # r[verify ctrl.pool.tick-ordering]
+    # r[verify ctrl.pool.ack-spawned-soundness]
+    quint-spawn-coherence-base = mkQuintCheck {
+      name = "spawn-coherence-base";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceBase";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+      ];
+    };
+
+    # Per-RPC ⊥ faults (GetSpawnIntents / ListExecutors / the ack / the
+    # Job create): the per-consumer degradation matrix — spawn fail-open,
+    # stale+excess reap fail-closed, orphan reap behind its 3-arm gate,
+    # nothing acked on a failed poll.
+    # r[verify ctrl.pool.degraded-polarity]
+    quint-spawn-coherence-fault-rpc = mkQuintCheck {
+      name = "spawn-coherence-fault-rpc";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFaultRpc";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+      ];
+    };
+
+    # Failover faults: the L10 producer unarms the gate (lease loss) and
+    # the scheduler restarts (executor map + dispatched_cells empty,
+    # leader young) — the re-ack of already-Pending Jobs re-arms
+    # dispatched_cells and the orphan gate stays fail-closed against the
+    # young leader's partial executor list.
+    # r[verify ctrl.pool.ack-spawned-soundness]
+    quint-spawn-coherence-fault-lease = mkQuintCheck {
+      name = "spawn-coherence-fault-lease";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFaultLease";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+      ];
+    };
+
+    # Per-read snapshot staleness: the intent poll may read the previous
+    # tick's queue while the Job LIST reads the current state — the
+    # I-183 incoherence direction the channels allow. The reap arms stay
+    # safe under it (the grace windows and membership reaps bound the
+    # damage to churn).
+    # r[verify ctrl.pool.tick-ordering]
+    quint-spawn-coherence-fault-stale = mkQuintCheck {
+      name = "spawn-coherence-fault-stale";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFaultStale";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+      ];
+    };
+
+    # CRD-absent configuration (static-node / k3s without Karpenter):
+    # gate_armed is false every tick — Builder spawns pass through
+    # unfiltered (fail-open) while the excess reap stays suppressed
+    # (fail-closed), the C1 adjudication of the placeable-gate rule.
+    # r[verify ctrl.nodeclaim.placeable-gate+5]
+    quint-spawn-coherence-crd-absent = mkQuintCheck {
+      name = "spawn-coherence-crd-absent";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceCrdAbsent";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+      ];
+    };
+
+    # Fetcher pool with the CRD present: never spawn-filtered, excess
+    # reap keyed only on scheduler reachability — the C2 adjudication.
+    # r[verify ctrl.nodeclaim.placeable-gate+5]
+    quint-spawn-coherence-fetcher = mkQuintCheck {
+      name = "spawn-coherence-fetcher";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFetcher";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+      ];
+    };
+
+    # ---- Model J: non-vacuity witnesses ------------------------------
+    # Each passes only when the checker violates the witness — the
+    # contended scenarios the invariants constrain stay reachable.
+    # Deliberately no tracey markers (same policy as the other models'
+    # witnesses).
+
+    # An excess-pending reap actually fires.
+    quint-spawn-coherence-witness-excess-reap = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-excess-reap";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceBase";
+      witness = "canReachExcessReap";
+    };
+    # An orphan-running reap actually fires (3-arm gate passed).
+    quint-spawn-coherence-witness-orphan-reap = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-orphan-reap";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceBase";
+      witness = "canReachOrphanReap";
+    };
+    # A 409 dedupe occurs (the deterministic-name collision path).
+    quint-spawn-coherence-witness-409 = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-409";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceBase";
+      witness = "canReach409Dedupe";
+    };
+    # An unarmed gate blocks a spawn an armed gate would have made.
+    quint-spawn-coherence-witness-gate-blocked = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-gate-blocked";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceBase";
+      witness = "canReachGateBlockedSpawn";
+    };
+    # A stale-selector (fingerprint drift) reap fires.
+    quint-spawn-coherence-witness-drift-reap = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-drift-reap";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceBase";
+      witness = "canReachDriftReap";
+    };
+    # crd-absent: a Builder spawn proceeds ungated (fail-open half).
+    quint-spawn-coherence-witness-ungated-spawn = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-ungated-spawn";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceCrdAbsent";
+      witness = "canReachUngatedSpawn";
+    };
+    # crd-absent: an excess-pending surplus is left unreaped (fail-closed
+    # half — the documented C1 operational cost).
+    quint-spawn-coherence-witness-suppressed-excess = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-suppressed-excess";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceCrdAbsent";
+      witness = "canReachSuppressedExcess";
+    };
+
+    # ---- Model N: exhaustive regime checks ---------------------------
+
+    # Healthy lifecycle, no faults: create -> register -> busy/idle ->
+    # idle-reap with the FFD reservation respected, the per-class clamp
+    # over the config mirror, and the placeable publish.
+    # r[verify ctrl.nodeclaim.budget.per-class+2]
+    quint-nodeclaim-lifecycle-base = mkQuintCheck {
+      name = "nodeclaim-lifecycle-base";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleBase";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+      ];
+    };
+
+    # Per-RPC ⊥ faults: the ⊥-streak's early-return window and
+    # consolidate-only mode (reap + prune, no create / republish / ack),
+    # ack and create failures (failed creates consume no budget), the
+    # ceilings-not-loaded fail-closed gate and the unknown-cell drop.
+    # idleReapSafety and bootSampleNotLost are deliberately NOT in this
+    # list: their falsification on this regime is the pre-registered
+    # as-built defect (the early-return observation skip) and is pinned
+    # by the expect-violation checks below.
+    # r[verify ctrl.nodeclaim.consolidate-only-degraded]
+    # r[verify ctrl.nodeclaim.budget.per-class+2]
+    quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
+      name = "nodeclaim-lifecycle-fault-rpc";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      invariants = [
+        "boundsOK"
+        "iceMarkSoundness"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+      ];
+    };
+
+    # Lease faults: lose/acquire edges, PG reload failures and the
+    # controller restart — the per-field lease-edge polarity table (the
+    # unconditional prev_idle clear, the Ok-arm-only suppress clears,
+    # the reload latch gating persist) and the producer-side gate
+    # guarantee (unarmed on loss before the consumer's next tick).
+    # r[verify ctrl.nodeclaim.lease-edge-polarity]
+    # r[verify ctrl.nodeclaim.placeable-gate+5]
+    # r[verify ctrl.nodeclaim.ice-mark-clear]
+    quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
+      name = "nodeclaim-lifecycle-fault-lease";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultLease";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+      ];
+    };
+
+    # Karpenter faults: launch failures, the 1s-GC-vs-10s-tick vanish
+    # race and spot termination edges — NodeClaim conservation (the
+    # controller's own reaps are removed from inflight_created before
+    # detect_vanished, so an ICE mark is only ever emitted for a claim
+    # that genuinely vanished or launch-failed).
+    # r[verify ctrl.nodeclaim.inflight-conservation]
+    # r[verify ctrl.nodeclaim.ice-mark-clear]
+    quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
+      name = "nodeclaim-lifecycle-fault-karpenter";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultKarpenter";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+      ];
+    };
+
+    # ---- Model N: pre-registered as-built falsifications -------------
+    # The ⊥-tick early-return observation skip (the documented TODO in
+    # reconcile_once's ⊥ arm; entry 1 of the invariant map's
+    # expected-as-built-falsifications list). Each check passes only
+    # while the checker still falsifies the invariant on the as-built
+    # encoding — when the skip is fixed, these flip to HOLD invariants
+    # in the fault-rpc regime check above (the same flip protocol the
+    # retry campaign used). The deterministic reproducer traces are
+    # pinned by the named-run check below.
+
+    # prev_idle is not pruned across an unobserved busy period: a stale
+    # entry conflates two idle spells and reaps a freshly-idle claim.
+    quint-nodeclaim-falsification-idle-conflation = mkQuintWitnessCheck {
+      name = "nodeclaim-falsification-idle-conflation";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "idleReapSafety";
+    };
+    # A Registered edge inside the early-return window ages past the
+    # recency gate before any observation runs: the boot sample and its
+    # ICE clear are lost although the edge happened under this tenure.
+    quint-nodeclaim-falsification-boot-sample-lost = mkQuintWitnessCheck {
+      name = "nodeclaim-falsification-boot-sample-lost";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "bootSampleNotLost";
+    };
+    # The deterministic reproducer runs for both falsifications
+    # (idleConflationRun, bootSampleLostRun) — the precise documented
+    # traces stay pinned even though TLC's BFS may report a different
+    # counterexample first.
+    quint-nodeclaim-runs-fault-rpc = mkQuintRunCheck {
+      name = "nodeclaim-runs-fault-rpc";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+    };
+
+    # ---- Model N: non-vacuity witnesses ------------------------------
+
+    # An idle claim is actually reaped (past threshold, unreserved).
+    quint-nodeclaim-witness-idle-reap = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-idle-reap";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleBase";
+      witness = "canReachIdleReap";
+    };
+    # A deficit cover actually creates a NodeClaim.
+    quint-nodeclaim-witness-create = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-create";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleBase";
+      witness = "canReachCreate";
+    };
+    # The per-class budget binds while the global budget still has room.
+    quint-nodeclaim-witness-class-budget = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-class-budget";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleBase";
+      witness = "canReachClassBudgetBound";
+    };
+    # A claim vanishes between ticks (Karpenter fast-GC) and is detected
+    # as an ICE mark.
+    quint-nodeclaim-witness-vanish = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-vanish";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultKarpenter";
+      witness = "canReachVanishMark";
+    };
+    # An ICE mark is emitted and a recency-gated Registered clear for
+    # the same (still-masked) cell is emitted on a later tick.
+    quint-nodeclaim-witness-clear-after-mark = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-clear-after-mark";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultKarpenter";
+      witness = "canReachClearAfterMark";
+    };
+    # The ⊥-streak reaches the threshold and consolidate-only reaps
+    # something.
+    quint-nodeclaim-witness-consolidate-only-reap = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-consolidate-only-reap";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "canReachConsolidateOnlyReap";
+    };
+    # A NodeClaim create fails (and consumes no budget).
+    quint-nodeclaim-witness-create-failure = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-create-failure";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "canReachCreateFailure";
+    };
+    # A tick with unplaced demand and unknown ceilings performs no
+    # creates (the fail-closed half)…
+    quint-nodeclaim-witness-ceilings-fail-closed = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-ceilings-fail-closed";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "canReachCeilingsFailClosed";
+    };
+    # …and creates resume once the ceilings are present (the resume
+    # half, in the same regime whose init starts without them).
+    quint-nodeclaim-witness-create-resumes = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-create-resumes";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "canReachCreate";
+    };
+    # An intent is dropped solely because its cell is unconfigured.
+    quint-nodeclaim-witness-unknown-cell = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-unknown-cell";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultRpc";
+      witness = "canReachUnknownCellDrop";
+    };
+    # A lease handoff occurs with a non-empty inflight_created.
+    quint-nodeclaim-witness-handoff-inflight = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-handoff-inflight";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultLease";
+      witness = "canReachAcquireWithInflight";
+    };
+    # The acquire-with-failed-reload path runs a degraded tick (persist
+    # gated, latch still set).
+    quint-nodeclaim-witness-degraded-reload = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-degraded-reload";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultLease";
+      witness = "canReachDegradedReloadTick";
+    };
+    # After an acquire, a fresh registration edge still emits a
+    # Registered clear…
+    quint-nodeclaim-witness-fresh-clear-after-acquire = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-fresh-clear-after-acquire";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultLease";
+      witness = "canReachFreshClearAfterAcquire";
+    };
+    # …while an old registration is recorded without one (the mass-clear
+    # the recency gate prevents).
+    quint-nodeclaim-witness-stale-record-only = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-stale-record-only";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleFaultLease";
+      witness = "canReachStaleRecordOnly";
+    };
   };
 }
