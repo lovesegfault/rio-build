@@ -30,7 +30,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// paths. Sizes the `try_acquire`-only semaphore — a 5th concurrent
 /// upload skips eager indexing and falls back to [`spawn_indexer_loop`]
 /// instead of queueing. Also bounds the post-handler RSS of retained
-/// NAR buffers to `4 × NAR size`.
+/// NAR buffers to 4 × the accumulation buffer's CAPACITY — the `Bytes`
+/// keeps the upload Vec's whole allocation alive, which growth-doubling
+/// can leave at up to ~2× the NAR length, so the worst case is ~8 ×
+/// NAR bytes, not 4 ×.
 pub const DEFAULT_NAR_INDEX_CONCURRENCY: usize = 4;
 
 /// Drain batch size. `compute()` runs serially so peak RAM is one NAR;
