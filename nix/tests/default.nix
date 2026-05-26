@@ -1672,12 +1672,6 @@ in
       #   integrity_fail_total == 1, the reader gets EIO, nothing is
       #   promoted, and the store layer never sees it.
       "integrity-fail"
-      # r[verify builder.fs.fetch-circuit]
-      #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
-      #   never-cached opens all fail within their per-open fetch budget
-      #   (bounded EIO, not hangs) and the fetch breaker opens after 5
-      #   consecutive failures so everything after fails fast.
-      "eio-circuit-breaker"
       # r[verify builder.result.input-eio-is-infra]
       #   eio-infra-retry: with the store's chunk objects offline, the
       #   daemon's execve of a castore-served builder gets EIO; the
@@ -1692,6 +1686,14 @@ in
       #   staging orphan while /var/rio/{cache,chunks} survive, and a
       #   follow-up build promotes through the new daemon.
       "mountd-restart"
+      # r[verify builder.fs.fetch-circuit]
+      #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
+      #   never-cached opens, read concurrently, all fail within their
+      #   per-open fetch budget (bounded EIO, not hangs) and the fetch
+      #   breaker opens so everything after fails fast. Last in the
+      #   split: it scales the store away and carries the longest
+      #   evidence window.
+      "eio-circuit-breaker"
     ];
     globalTimeout = 1800;
   };

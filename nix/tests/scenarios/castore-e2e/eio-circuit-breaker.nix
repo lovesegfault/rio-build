@@ -44,15 +44,55 @@ scope: with scope; ''
             "(must be well under the script's 60s pre-read window)")
 
       # The breaker opening is the structural "the concurrent reads all
-      # failed within their fetch budgets" signal.
-      wait_worker_metric(
-          pod,
-          "grep -Eq '^rio_builder_castore_fuse_circuit_open 1(\\.0+)?$'",
-          timeout=300,
-          ctx="eio-circuit-breaker breaker open",
-      )
+      # failed within their fetch budgets" signal. Polled with a visible
+      # timeline (counters + pod phase every poll) so a failure here
+      # documents exactly what the fetch path did during the outage
+      # instead of a bare timeout.
+      breaker_deadline = time.time() + 360
+      m = {}
+      while True:
+          phase = k3s_server.execute(
+              f"k3s kubectl -n ${nsBuilders} get pod {pod} "
+              "-o jsonpath='{.status.phase}' 2>/dev/null"
+          )[1].strip() or "Gone"
+          rc_m, raw_m = k3s_server.execute(
+              "k3s kubectl get --raw "
+              f"'/api/v1/namespaces/${nsBuilders}/pods/{pod}:9093/proxy/metrics' "
+              "2>/dev/null"
+          )
+          m = parse_prometheus(raw_m) if rc_m == 0 else {}
+          n_circuit = series(m, "rio_builder_castore_fuse_circuit_open")
+          tl_opens = series(m, "rio_builder_castore_fuse_upcalls_total", must=('op="open"',))
+          tl_miss = series(m, "rio_builder_castore_fuse_open_case_total", must=('case="miss_small"',))
+          tl_eio = series(m, "rio_builder_castore_fuse_eio_total")
+          tl_retries = series(m, "rio_builder_castore_fuse_fetch_retries_total")
+          print(
+              "eio-circuit-breaker timeline: "
+              f"t={int(time.time() - t_down)}s pod={phase} opens={tl_opens} "
+              f"miss_small={tl_miss} eio={tl_eio} retries={tl_retries} "
+              f"circuit_open={n_circuit}"
+          )
+          if n_circuit == 1:
+              break
+          if time.time() > breaker_deadline or phase not in ("Running", "Pending"):
+              k3s_server.execute(
+                  "echo '=== eio-circuit-breaker DIAG: scheduler view ===' >&2; "
+                  "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
+                  "--tail=4000 --since=10m 2>/dev/null "
+                  "| grep -aiE 'cancel|orphan|backstop|reassign|quarantine|infra' "
+                  "| grep -av '\"level\":\"DEBUG\"' | tail -30 >&2; "
+                  "k3s kubectl -n ${nsBuilders} get events --sort-by=.lastTimestamp "
+                  "2>/dev/null | tail -20 >&2"
+              )
+              dump_castore_diag("eio-circuit-breaker breaker open", pod=pod)
+              raise AssertionError(
+                  f"eio-circuit-breaker: breaker never opened (pod={phase}, "
+                  f"metrics={fam(m, 'rio_builder_castore_fuse_eio_total')!r} eio, "
+                  f"{fam(m, 'rio_builder_castore_fuse_open_case_total')!r} open_case) — "
+                  "see the timeline prints above for the failure pacing"
+              )
+          time.sleep(15)
 
-      m = worker_metrics(pod)
       n_eio = series(m, "rio_builder_castore_fuse_eio_total")
       n_miss_small = series(m, "rio_builder_castore_fuse_open_case_total", must=('case="miss_small"',))
       n_retries = series(m, "rio_builder_castore_fuse_fetch_retries_total")

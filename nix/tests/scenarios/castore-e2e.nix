@@ -812,9 +812,14 @@ let
         msg = "mountd-restart needs the inputs chunk-warm pre-warmed";
       }
       {
-        name = "mountd-restart";
+        before = "mountd-restart";
+        after = "eio-circuit-breaker";
+        msg = "eio-circuit-breaker scales the store away and has the longest evidence window — keep it after the mountd bounce, last in the split";
+      }
+      {
+        name = "eio-circuit-breaker";
         last = true;
-        msg = "mountd-restart bounces the mountd DaemonSet — keep it last";
+        msg = "eio-circuit-breaker leaves the store scaled away on failure — keep it last";
       }
     ];
   };
