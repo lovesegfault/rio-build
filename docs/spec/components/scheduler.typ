@@ -858,7 +858,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+5")[
+#r("sched.merge.substitute-topdown+6")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -871,9 +871,11 @@ submitted after the failover record contributions as usual).
   with the pre-existing node's live effective wanted set
   (#rref("sched.merge.wanted-outputs")) when the node already exists in the
   DAG. The prune is all-or-nothing over the demand set; when it fires, the
-  kept submission is the demand set: kept nodes are merged dep-less, routed
-  to the deferred upstream fetch (#rref("sched.substitute.detached"), no
-  inline `QueryPathInfo`), and marked `topdown_pruned` --- a mark that MUST
+  kept submission is the demand set: kept nodes are merged dep-less,
+  completed inline when their wanted outputs are already present in the
+  store and otherwise routed to the deferred upstream fetch
+  (#rref("sched.substitute.detached"), no inline `QueryPathInfo`), and
+  marked `topdown_pruned` --- a mark that MUST
   be applied only after the merge has committed, MUST be persisted and
   restored at leader-failover recovery, and MUST be cleared (in PG and in
   memory) when a later merge gives the node children. The scheduler MUST
