@@ -34,6 +34,14 @@ use super::{
 /// collide with (or be confused for) an input or an output.
 pub(crate) const SANDBOX_BUILDER_BIN: &str = "/rio/rio-builder";
 
+/// In-sandbox directory the fetched output is written into for builtin
+/// builds. The host `/nix/store` is mounted read-only at `/nix/store`
+/// (see `prepare_fetchurl`), so the output cannot be written there;
+/// this directory's mount source is the per-build merged store, which
+/// is exactly where the host-side collection and the FOD hash gate
+/// already look for produced outputs.
+pub(crate) const SANDBOX_BUILTIN_OUT_DIR: &str = "/rio/out";
+
 /// In-sandbox path of the netrc file when the operator configured one.
 const SANDBOX_NETRC: &str = "/build/.netrc";
 
@@ -56,6 +64,16 @@ pub(crate) fn prepare_fetchurl(
     // else by fetching into the first declared output (parity with the
     // daemon, which only ever looked at "out").
     let output = outputs.first().ok_or(GlueError::FetchurlMissingUrl)?;
+    // The subcommand writes the fetched bytes into the dedicated writable
+    // mount, NOT the in-store path: the sandbox's `/nix/store` is the host
+    // store mounted read-only (required so the dynamically linked
+    // re-exec'd binary can resolve its interpreter and libraries). The
+    // file lands in the overlay upper under the output's basename, which
+    // is where collection and the FOD hash gate already look.
+    let out_basename = std::path::Path::new(&output.path)
+        .file_name()
+        .expect("planned output paths always carry a store basename");
+    let sandbox_out = PathBuf::from(SANDBOX_BUILTIN_OUT_DIR).join(out_basename);
 
     let builder_binary = opts
         .builder_binary
@@ -81,7 +99,7 @@ pub(crate) fn prepare_fetchurl(
 
     let mut env: Vec<(OsString, OsString)> = vec![
         (env_vars::URL.into(), url.into()),
-        (env_vars::OUTPUT.into(), output.path.clone().into()),
+        (env_vars::OUTPUT.into(), sandbox_out.as_os_str().to_owned()),
         (
             env_vars::UNPACK.into(),
             if unpack { "1" } else { "0" }.into(),
@@ -112,9 +130,23 @@ pub(crate) fn prepare_fetchurl(
             writable: true,
             optional: false,
         },
+        // The HOST store, read-only: the re-exec'd rio-builder binary is
+        // dynamically linked, so its ELF interpreter and libraries (host
+        // store paths) must resolve inside the sandbox. Builtin builds run
+        // no tenant code, and the FOD hash gate — not input invisibility —
+        // is their integrity boundary, so exposing the store read-only is
+        // acceptable (the daemon-era equivalent ran builtins in a child of
+        // the daemon with the real store visible).
+        Mount {
+            source: PathBuf::from("/nix/store"),
+            target: PathBuf::from(SANDBOX_STORE_DIR),
+            writable: false,
+            optional: false,
+        },
+        // Where the fetched output is actually written (see SANDBOX_BUILTIN_OUT_DIR).
         Mount {
             source: paths.merged_store.clone(),
-            target: PathBuf::from(SANDBOX_STORE_DIR),
+            target: PathBuf::from(SANDBOX_BUILTIN_OUT_DIR),
             writable: true,
             optional: false,
         },
@@ -167,7 +199,7 @@ pub(crate) fn prepare_fetchurl(
         mounts,
         extra_devices: Vec::new(),
         inline_files,
-        declared_outputs: vec![PathBuf::from(&output.path)],
+        declared_outputs: vec![sandbox_out.clone()],
         capture: OutputCapture::MergedPty,
         isolation: Isolation {
             network: true,
@@ -282,9 +314,12 @@ mod tests {
             })
             .collect();
         assert_eq!(env[env_vars::URL], "https://example.org/src.tar.xz");
+        // The fetch target lives in the dedicated writable mount, keyed by
+        // the output's store basename — NOT the in-store path, which is
+        // read-only inside a builtin sandbox.
         assert_eq!(
             env[env_vars::OUTPUT],
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src"
+            "/rio/out/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src"
         );
         assert_eq!(env[env_vars::UNPACK], "1");
         assert_eq!(env[env_vars::EXECUTABLE], "1");
@@ -292,8 +327,10 @@ mod tests {
         assert_eq!(env[env_vars::HASH_ALGO], "sha256");
         assert_eq!(env[env_vars::NETRC], "/build/.netrc");
 
-        // The binary is mounted read-only at the program path; the
-        // store scratch is writable; network is on; CA bundle present.
+        // The binary is mounted read-only at the program path; the host
+        // store is read-only at /nix/store (so the dynamically linked
+        // re-exec can resolve its interpreter); the merged store backs the
+        // writable output dir; network is on; CA bundle present.
         let bin_mount = pb
             .request
             .mounts
@@ -302,11 +339,27 @@ mod tests {
             .expect("builder binary mount");
         assert!(!bin_mount.writable);
         assert_eq!(bin_mount.source, PathBuf::from("/host/bin/rio-builder"));
-        assert!(
-            pb.request
-                .mounts
-                .iter()
-                .any(|m| m.target.as_path() == Path::new(SANDBOX_STORE_DIR) && m.writable)
+        let store_mount = pb
+            .request
+            .mounts
+            .iter()
+            .find(|m| m.target.as_path() == Path::new(SANDBOX_STORE_DIR))
+            .expect("host store mount");
+        assert!(!store_mount.writable, "host store must be read-only");
+        assert_eq!(store_mount.source, PathBuf::from("/nix/store"));
+        let out_mount = pb
+            .request
+            .mounts
+            .iter()
+            .find(|m| m.target.as_path() == Path::new(SANDBOX_BUILTIN_OUT_DIR))
+            .expect("writable output mount");
+        assert!(out_mount.writable);
+        assert_eq!(out_mount.source, PathBuf::from("/host/builds/b1/merged"));
+        assert_eq!(
+            pb.request.declared_outputs,
+            vec![PathBuf::from(
+                "/rio/out/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src"
+            )]
         );
         assert!(
             pb.request
