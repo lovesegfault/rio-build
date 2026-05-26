@@ -20,15 +20,18 @@ scope: with scope; ''
 
       # Locate the store's chunk PV on k3s-server (local-path PVC bound
       # to the rio-store-chunks claim; the filesystem backend keeps its
-      # objects under <baseDir>/chunks).
+      # objects under <baseDir>/chunks). Depending on the local-path
+      # provisioner version the PV is a `local:` or a `hostPath:` volume
+      # — query both fields, whichever is set wins.
       pv_name = kubectl(
           "get pvc rio-store-chunks -o jsonpath='{.spec.volumeName}'", ns="${nsStore}"
       ).strip()
       pv_path = k3s_server.succeed(
-          f"k3s kubectl get pv {pv_name} -o jsonpath='{{.spec.hostPath.path}}'"
+          f"k3s kubectl get pv {pv_name} "
+          "-o jsonpath='{.spec.local.path}{.spec.hostPath.path}'"
       ).strip()
       assert pv_path.startswith("/var/"), (
-          f"eio-infra-retry: unexpected rio-store-chunks PV hostPath {pv_path!r}"
+          f"eio-infra-retry: unexpected rio-store-chunks PV path {pv_path!r}"
       )
       k3s_server.succeed(f"test -d {pv_path}/chunks")
       k3s_server.succeed(f"mv {pv_path}/chunks {pv_path}/chunks-offline")
