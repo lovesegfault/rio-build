@@ -408,17 +408,23 @@ fn serve_prepared(
         nix::unistd::geteuid().as_raw(),
         nix::unistd::getegid().as_raw(),
     );
-    mount(
+    if let Err(source) = mount(
         Some("rio-castore"),
         mount_point,
         Some("fuse.rio-castore"),
         MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
         Some(data.as_str()),
-    )
-    .map_err(|source| CastoreMountError::Mount {
-        path: mount_point.to_path_buf(),
-        source,
-    })?;
+    ) {
+        // Nothing got mounted — remove the mountpoint dir we just
+        // created so a retry (or the overlay-base sweep) doesn't find a
+        // stray empty `<build_id>.castore` left behind. Mirrors the
+        // from_fd/spawn error arms below.
+        let _ = std::fs::remove_dir(mount_point);
+        return Err(CastoreMountError::Mount {
+            path: mount_point.to_path_buf(),
+            source,
+        });
+    }
 
     // ── (4) Serve. `Session::from_fd` answers the FUSE_INIT request the
     // mount(2) above queued before it returns; `spawn()` starts the
@@ -482,9 +488,13 @@ pub struct CastoreMount {
     /// The fuser worker threads serving the handed-off fd. `None` only
     /// after teardown.
     session: Option<fuser::BackgroundSession>,
-    /// The mountd UDS connection. Dropping it is the daemon's cue to
-    /// reap this build's staging dir and release its build_id/uid
-    /// claims. `None` only after teardown.
+    /// A handle on the mountd UDS connection. The daemon reaps this
+    /// build's staging dir and releases its build_id/uid claims when
+    /// the connection CLOSES — i.e. when the *last* clone of this
+    /// client drops, not when this field is taken: the serve session's
+    /// `OpenPath` and any still-running streaming-fill thread hold
+    /// clones, so the reap can lag teardown by however long those take
+    /// to wind down. `None` only after teardown.
     client: Option<MountdClient>,
     /// fusectl `abort` control file for this connection, captured at
     /// mount time (statting the mountpoint at teardown time would queue
@@ -506,9 +516,10 @@ impl CastoreMount {
         self.staging_quota_bytes
     }
 
-    /// Tear the mount down: detach the mountpoint, drop the mountd
-    /// connection (the daemon reaps staging and releases the build's
-    /// claims on conn-drop), then abort the FUSE connection so any
+    /// Tear the mount down: detach the mountpoint, release our handle on
+    /// the mountd connection (the daemon reaps staging and releases the
+    /// build's claims once the connection's last clone drops — see the
+    /// `client` field doc), then abort the FUSE connection so any
     /// kernel-side waiter unblocks with `ENOTCONN` instead of parking in
     /// D-state — the same I-165 abort discipline the pre-cutover FUSE
     /// shutdown used.
@@ -535,9 +546,14 @@ impl CastoreMount {
         }
         let _ = std::fs::remove_dir(&self.mount_point);
 
-        // 2. Drop the UDS connection: mountd reaps staging/{build_id},
-        // releases the build_id and uid claims, and closes its kept
-        // /dev/fuse dup.
+        // 2. Release this handle on the UDS connection. The daemon's
+        // teardown (reap staging/{build_id}, release the build_id and
+        // uid claims, close its kept /dev/fuse dup) fires when the
+        // connection actually closes — that is, once the LAST clone of
+        // the client drops: the serve session's OpenPath (released at
+        // step 3 / when the worker threads exit) and any detached
+        // streaming-fill thread also hold clones, so the daemon-side
+        // reap is prompt but not synchronous with this line.
         drop(self.client.take());
 
         // 3. Abort the FUSE connection. Pending kernel-side requests get
