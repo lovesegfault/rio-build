@@ -695,12 +695,16 @@ failure after a flap instead of granting it a fresh budget). The code-side
 half landed with the Phase-1b collapse: the verdict sites fold the durable
 suffix and recovery rebuilds the retry view from the same seeded fold
 (#rref("sched.retry.recovery-projection")), so a leader change no longer
-refreshes any budget. This rule still deliberately carries no
-implementation marker of its own --- it is the acceptance rule whose
-machine-checked verification arrives when the model is re-checked over the
-post-collapse fold (Phase 1c); the companion amendments (with their
-version bumps) of the two rules whose prose previously pinned the
-forgiveness (#rref("sched.timeout.promote-on-exceed"),
+refreshes any budget --- the implementing site is the recovery-time ledger
+fold rebuild (`rebuild_retry_view_from_ledger`). The machine-checked
+verification landed with the Phase-1c model flip: the post-collapse
+`retryPolicy.qnt` failover regime checks `failoverPreservesHistory` (the
+recovered budget counters equal the durable ledger fold --- nothing
+forgiven, nothing fabricated) exhaustively, alongside the
+counter/verdict refinement and durability invariants. The companion
+amendments (with their version bumps) of the two rules whose prose
+previously pinned the forgiveness
+(#rref("sched.timeout.promote-on-exceed"),
 #rref("sched.retry.per-executor-budget")) landed with the Phase-1b
 recovery change, as this rule required.
 

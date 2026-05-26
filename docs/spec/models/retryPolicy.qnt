@@ -351,6 +351,7 @@ module retryPolicy {
     lateInstallment: bool,  // controller report correlated through an rd entry
     raceAhead: bool,        // controller report used the still-live executor
     terminal: bool,         // the event produced a terminal state
+    dropped: bool,          // the status guard dropped the observation (already terminal)
   }
 
   // --- 2. constants (const = overridable per regime) --------------------
@@ -425,7 +426,7 @@ module retryPolicy {
   pure val noObs: LastObs = {
     kind: ONone, chargedAny: false, doubleCharge: false, windowReset: false,
     exemptFallthrough: false, promoted: false, atCap: false,
-    lateInstallment: false, raceAhead: false, terminal: false,
+    lateInstallment: false, raceAhead: false, terminal: false, dropped: false,
   }
 
   /// RetryPolicy::backoff_duration without the jitter: min(base*mult^n, cap).
@@ -753,14 +754,25 @@ module retryPolicy {
   }
 
   /// sched.retry.attempts-bounded+2, the per-event clauses: a single
-  /// accounting observation never charges the same budget twice, and
-  /// every worker-reported failure or backstop observation either
-  /// charges at least one budget or produces a terminal state.
+  /// accounting observation never charges the same budget twice, and the
+  /// charge-or-terminal discipline is total over the post-collapse event
+  /// alphabet (the Stage-B clause-coverage audit's narrowing is closed):
+  /// every worker-reported failure or backstop observation charges or is
+  /// terminal; every controller-report or establishment observation
+  /// charges, is terminal, or was dropped by the status guard because
+  /// the derivation had already left the poison-able statuses; and the
+  /// bare disconnect observation never charges (its charge vehicle is
+  /// the establishment -- sched.retry.per-executor-budget+2's
+  /// established-crash clause -- so an uncharged disconnect is the spec'd
+  /// behaviour, not a leak).
   val attemptsChargedOnce = and {
     not(last.doubleCharge),
     (last.kind == OE1 or last.kind == OE2 or last.kind == OE3 or
      last.kind == OE4 or last.kind == OE8)
       implies (last.chargedAny or last.terminal),
+    (last.kind == OE6 or last.kind == OE7 or last.kind == OEstablish)
+      implies (last.chargedAny or last.terminal or last.dropped),
+    (last.kind == OE5) implies not(last.chargedAny),
   }
 
   /// sched.retry.attempts-bounded+2, the boundedness clause: the number
@@ -858,6 +870,32 @@ module retryPolicy {
         dStatus != DCompleted,
       } implies dStatus == DPoisoned
     )
+
+  /// The Phase-1 acceptance property (sched.retry.failover-budget;
+  /// design-§3 FailoverPreservesHistory): the post-failover decision
+  /// inputs are never more permissive than the pre-failover ones. In
+  /// this encoding the recovered view IS the durable ledger fold and the
+  /// appending-transaction discipline keeps the pre-failover cached view
+  /// equal to that same fold, so the budget counters must come back
+  /// exactly -- per counter, not merely no-smaller: any forgiveness
+  /// re-introduced into the failover arm, or any charge that stops being
+  /// durable at its observation, falsifies this. backoff_until is
+  /// excluded (pacing, not a budget: the dispatch-time clear has no
+  /// ledger row, so the recovered deadline may be stricter than the
+  /// pre-failover RAM one); poisoned_at is owned by
+  /// recoveryPreservesPoisonStatus and the dispatch-poison carve-out;
+  /// terminal/absent rows are not reloaded and carry no decision inputs.
+  val failoverPreservesHistory =
+    (justFailedOver and (dStatus == DReady or dStatus == DPoisoned)) implies and {
+      live.count == pg.ledger.count,
+      live.resubmitCycles == pg.ledger.resubmitCycles,
+      live.infraCount == pg.ledger.infraCount,
+      live.timeoutCount == pg.ledger.timeoutCount,
+      live.exemptInfraCount == pg.ledger.exemptInfraCount,
+      live.failureCount == pg.ledger.failureCount,
+      live.failedBuilders == pg.ledger.failedBuilders,
+      live.lastInfraAt == pg.ledger.lastInfraAt,
+    }
 
   // --- 6b. expect-violation witnesses (non-vacuity probes) ---------------
   // Each states "the interesting thing never happens"; the wired check
@@ -1491,7 +1529,7 @@ module retryPolicy {
         depStatus' = depStatus,
         everFailureTerminal' = everFailureTerminal,
         last' = { ...noObs, kind: OE6, atCap: atCap, promoted: promoted,
-          lateInstallment: true },
+          lateInstallment: true, dropped: true },
       },
     },
     attempt' = attempt,
@@ -1566,7 +1604,7 @@ module retryPolicy {
         depStatus' = depStatus,
         everFailureTerminal' = everFailureTerminal,
         last' = { ...noObs, kind: OE6, atCap: atCap, promoted: promoted,
-          raceAhead: true },
+          raceAhead: true, dropped: true },
       },
     },
     attempt' = attempt,
@@ -1640,7 +1678,7 @@ module retryPolicy {
         pg' = pg,
         depStatus' = depStatus,
         everFailureTerminal' = everFailureTerminal,
-        last' = { ...noObs, kind: OE7, lateInstallment: true },
+        last' = { ...noObs, kind: OE7, lateInstallment: true, dropped: true },
       },
     },
     attempt' = attempt,
@@ -1741,7 +1779,7 @@ module retryPolicy {
         pg' = pg,
         depStatus' = depStatus,
         everFailureTerminal' = everFailureTerminal,
-        last' = { ...noObs, kind: OEstablish },
+        last' = { ...noObs, kind: OEstablish, dropped: true },
       },
     },
     attempt' = attempt,
@@ -2636,6 +2674,7 @@ module retryPolicyFailover {
         live.infraCount == 1,
         live.timeoutCount == 1,
         live.lastInfraAt == At(0),
+        failoverPreservesHistory,
         countersRefineHistory,
         durableMirrorsCharges,
         recoveryNeverFabricatesFailures,

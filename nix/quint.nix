@@ -151,25 +151,22 @@ let
       sleep 1
     done
 
-    # The gRPC port opens well before the server can actually serve a
-    # quint->TLA+ conversion: for the first ~30-60 s after startup the
-    # conversion endpoint returns empty-details INTERNAL errors (measured
-    # against retryPolicy.qnt's regime modules; the window is long enough
-    # that three back-to-back retries can all land inside it). Warm the
-    # server with a trivial conversion until it answers, so the real
-    # model's first attempt runs against a known-working server instead
-    # of racing the warm-up.
-    cat > warmup.qnt <<'WARMUP'
-    module warmup {
-      var x: int
-      action init = x' = 0
-      action step = x' = x + 1
-      val warmInv = x >= 0
-    }
-    WARMUP
+    # The gRPC port opens well before the server can serve a LARGE
+    # quint->TLA+ conversion: for roughly the first 30-60 s after startup
+    # the conversion of a regime-sized module returns an empty-details
+    # INTERNAL error while small modules convert fine, and the window is
+    # long enough that three back-to-back verify attempts can all land
+    # inside it (measured against retryPolicy.qnt's regime modules:
+    # requests at +8/+14/+21 s after port-open fail, +58 s succeeds; the
+    # server log shows no error — the request is simply not served yet).
+    # Warm the server by running THE model conversion this check is about
+    # to need, retrying until it succeeds, so quint verify below starts
+    # against a server that has already proven it can convert this exact
+    # module. $MODEL/$MAIN are the env attrs every check sets; $src is
+    # the staged model fileset.
     for _ in $(seq 1 30); do
-      if quint compile --target tlaplus --server-endpoint=localhost:8822 \
-          warmup.qnt > /dev/null 2>&1; then
+      if quint compile --target tlaplus --main=$MAIN \
+          --server-endpoint=localhost:8822 "$src/$MODEL.qnt" > /dev/null 2>&1; then
         break
       fi
       sleep 5
@@ -1091,14 +1088,19 @@ in
     # post-collapse recovery contract is load-bearing here: the recovered
     # retry view is the fold over the durable attempt ledger -- budgets,
     # the window anchor, the exclusion set and the poison set all survive
-    # a leader change, nothing is forgiven and nothing is fabricated --
-    # and a failed appending transaction charges nothing at all (the
-    # event is re-delivered) instead of leaving the durable view behind
-    # the in-memory one. The as-built selective-forgiveness projection
-    # invariant (recoveryIsTheDocumentedProjection) is retired with the
-    # as-built encoding; T-1c.3 adds the failoverPreservesHistory
-    # acceptance invariant and the failover-budget / recovery-projection
-    # verify markers to this check.
+    # a leader change (failoverPreservesHistory, the Phase-1 acceptance
+    # property of sched.retry.failover-budget), nothing is forgiven and
+    # nothing is fabricated, the recovered view never diverges from the
+    # durable fold (the seeded-fold recovery contract of
+    # sched.retry.recovery-projection+2; the transitional pre-066 legacy
+    # seed is code-level and covered by the rio-scheduler recovery
+    # tests), and a failed appending transaction charges nothing at all
+    # (the event is re-delivered) instead of leaving the durable view
+    # behind the in-memory one. Reset events stay enabled in this regime
+    # and the failover-with-history witness below keeps the contended
+    # state's reachability machine-checked.
+    # r[verify sched.retry.failover-budget]
+    # r[verify sched.retry.recovery-projection+2]
     quint-retry-policy-failover = mkQuintCheck {
       name = "retry-policy-failover";
       spec = "retryPolicy";
@@ -1112,6 +1114,7 @@ in
         "noDoubleCount"
         "poisonIsTerminalUntilCleared"
         "cascadeReachesExactlyTheDependents"
+        "failoverPreservesHistory"
         "recoveryNeverFabricatesFailures"
         "placementSound"
         "clearedPoisonClearsDurably"

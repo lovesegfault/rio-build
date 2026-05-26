@@ -173,19 +173,22 @@ property; the Phase-0 adjudication that scopes it is now a spec rule:
 |---|---|---|
 | `sched.retry.failover-budget` *(new; the Phase-0 failover-budget adjudication)* | **COVERS** (the Phase-1 contract) | Records design §6's pre-committed adjudication (b), made at the Phase-0 exit: budgets are per-poison-cycle and SURVIVE leader failover — the new leader's fold over the durable attempt history yields the same remaining budgets the old leader would have enforced, and only the explicit reset events (admin/TTL poison clear, bounded resubmit, cache-hit clear), themselves durable history events, refresh a budget; a leader change is not a reset event. The as-built code does NOT satisfy it (the selective forgiveness `sched.retry.recovery-projection` pins is exactly the budget refresh this rule forbids), so the rule deliberately carries no `r[impl]` marker — it is a Phase-1 acceptance rule, not an as-built claim, and it joins the rules whose `verify` arrives with the Phase-1 model re-check over the ledger fold (the Phase-1b gate). The companion amendments + `tracey bump` of the two rules whose prose pins today's forgiveness (`sched.timeout.promote-on-exceed+2`, `sched.retry.per-executor-budget`) land with the Phase-1 change that makes the code satisfy it. Dependents: the D4 disposition, `sched.retry.recovery-projection` (which keeps pinning the as-built contract until then), and the Phase-1a ledger's recovery semantics. |
 
-**Status (Phase 1b, T-1b.12a): code-side landed, model verify in 1c.** The
-collapsed verdict sites fold the durable suffix (T-1b.2…T-1b.11) and
-recovery now rebuilds every loaded node's retry view from the same seeded
-fold (`sched.retry.recovery-projection+2`), so a leader change no longer
-refreshes any budget; the companion forgiveness-prose amendments landed
-with that change (`sched.timeout.promote-on-exceed+3`,
-`sched.retry.per-executor-budget+2`). The rule's own machine-checked
-`verify` (and the model-side `FailoverPreservesHistory` check) still
-arrives with the Phase-1c re-encode; until then the failover-regime check
-in `nix/quint.nix` continues to verify the as-built model's selective
-forgiveness and its `r[verify]` marker deliberately stays on the previous
-`sched.retry.recovery-projection` revision (re-pointed in T-1c.3 with the
-failover-regime re-wiring).
+**Status (Phase 1c, T-1c.3): landed.** The collapsed verdict sites fold
+the durable suffix (T-1b.2…T-1b.11), recovery rebuilds every loaded
+node's retry view from the same seeded fold
+(`sched.retry.recovery-projection+2`), and the companion
+forgiveness-prose amendments landed with that change
+(`sched.timeout.promote-on-exceed+3`,
+`sched.retry.per-executor-budget+2`). The rule now carries its
+implementation marker on the recovery-time ledger fold rebuild
+(`DerivationState::rebuild_retry_view_from_ledger`) and its
+machine-checked `verify` on the post-collapse model's failover regime
+(`failoverPreservesHistory` in `quint-retry-policy-failover`, checked
+exhaustively together with the counter/verdict refinement and
+durability invariants); the model-side
+`sched.retry.recovery-projection+2` verify marker returned to the same
+check with the Phase-1c re-wiring, alongside the Rust recovery/failover
+tests that verify the seeded-fold contract end to end.
 
 ## Contradiction records
 

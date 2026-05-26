@@ -1803,6 +1803,7 @@ impl DerivationState {
     }
 
     // r[impl sched.retry.recovery-projection+2]
+    // r[impl sched.retry.failover-budget]
     /// Rebuild the in-memory retry view from the attempt-ledger fold
     /// over [`Self::attempt_history`], seeded by the carried legacy
     /// floor (`legacy_retry_floor`, decision P5). Recovery calls this
