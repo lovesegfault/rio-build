@@ -5,7 +5,7 @@
 # environment through the native executor instead of an inline busybox
 # script. Far too heavy for the merge gate; runs in the nightly tier:
 #
-#   nix build .#vm-differential-nightly
+#   nix build .#nightly.vm-differential
 #
 # Evaluated twice from this same file so the two sides can never drift:
 #

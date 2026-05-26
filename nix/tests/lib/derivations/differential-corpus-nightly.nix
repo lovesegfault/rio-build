@@ -2,17 +2,19 @@
 #
 # Companion to differential-corpus.nix (the merge-gate corpus) — same
 # in-VM evaluation model, same inline-script rules, but the builder and
-# every PATH utility here is a *static i686 busybox*, so every syscall
-# the build makes goes through the 32-bit (i386) ABI. That is the whole
-# point: the multi-ABI seccomp filter and 32-bit personality handling in
-# rio-exec get no coverage from the x86_64 merge-gate corpus.
+# every PATH utility here is an *i686 busybox* (pkgsi686Linux — glibc,
+# non-static; chosen because its toolchain is substitutable, unlike the
+# from-source musl32 static variants), so every syscall the build makes
+# goes through the 32-bit (i386) ABI. That is the whole point: the
+# multi-ABI seccomp filter and 32-bit personality handling in rio-exec
+# get no coverage from the x86_64 merge-gate corpus.
 #
 # These entries are NOT part of the per-PR merge gate. They run in the
 # nightly tier together with the real-stdenv probe (which lives in
 # differential-stdenv-probe.nix, not here, because it needs the full
 # stdenv closure rather than a single busybox):
 #
-#   nix build .#vm-differential-nightly
+#   nix build .#nightly.vm-differential
 #
 # Evaluated IN THE VM via `nix-instantiate --impure --arg busybox32
 # 'builtins.storePath "<i686 busybox>"'`. Keep every builder script

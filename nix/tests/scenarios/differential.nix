@@ -26,7 +26,7 @@
   rio-workspace,
   # Nightly tier: adds the 32-bit (i686) corpus and a real stdenv build
   # on top of the merge-gate corpus. Too heavy for the per-PR gate —
-  # exposed as `packages.vm-differential-nightly` (see flake.nix), run
+  # exposed as `packages.nightly.vm-differential` (see flake.nix), run
   # by .github/workflows/nightly.yml or manually.
   nightly ? false,
 }:

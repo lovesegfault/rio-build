@@ -21,9 +21,9 @@
 #
 # Nightly-tier entries (stdenv, i686) are deliberately absent: they are
 # not viable in the per-PR merge gate. They live in
-# differential-corpus-nightly.nix (i686) plus a host-instantiated stdenv
-# probe in scenarios/differential.nix, wired as `nix build
-# .#vm-differential-nightly`.
+# differential-corpus-nightly.nix (i686) plus a host-evaluated stdenv
+# probe (differential-stdenv-probe.nix, instantiated in the VM), wired
+# as `nix build .#nightly.vm-differential`.
 {
   busybox,
   bash,

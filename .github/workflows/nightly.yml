@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   differential-nightly:
-    name: vm-differential-nightly
+    name: nightly.vm-differential
     runs-on: rio-ci-kvm
     timeout-minutes: 240
     steps:
@@ -31,4 +31,4 @@ jobs:
       - name: Verify KVM
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
       - name: Build the nightly differential harness
-        run: nix build --print-build-logs .#vm-differential-nightly
+        run: nix build --print-build-logs .#nightly.vm-differential

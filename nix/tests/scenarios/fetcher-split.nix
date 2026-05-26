@@ -553,16 +553,29 @@ pkgs.testers.runNixOSTest {
             f"that cannot match the declared outputHash:\n{out}"
         )
         lowered = out.lower()
-        assert "hash mismatch" in lowered or "hash verification failed" in lowered, (
+        assert "hash" in lowered and (
+            "mismatch" in lowered or "verification failed" in lowered
+        ), (
             f"fod-bad-hash failed for a reason other than the FOD hash gate "
             f"(expected a hash-mismatch rejection):\n{out}"
         )
+        # Absence must be positively confirmed: path-info has to fail
+        # WITH an invalid-path error. A bare non-zero rc could also be a
+        # transport/ssh failure, which would vacuously "pass".
         rc_info, info_out = client.execute(
             f"nix path-info --store ssh-ng://k3s-server {bad_out} 2>&1"
         )
-        assert rc_info != 0, (
-            f"fod-bad-hash: rejected output {bad_out} IS PRESENT in the rio "
-            f"store — the FOD hash gate must reject before upload.\n{info_out}"
+        info_lowered = info_out.lower()
+        path_absent = rc_info != 0 and (
+            "is not valid" in info_lowered
+            or "does not exist" in info_lowered
+            or "invalid path" in info_lowered
+        )
+        assert path_absent, (
+            f"fod-bad-hash: expected {bad_out} to be ABSENT from the rio store "
+            f"(path-info must fail with an invalid-path error, rc={rc_info}) — "
+            f"either the rejected output reached the store or the query failed "
+            f"for an unrelated reason.\n{info_out}"
         )
         print(f"fod-bad-hash PASS: rejected (rc={rc}), {bad_out} absent from store")
 
