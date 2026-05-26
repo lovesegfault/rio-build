@@ -897,6 +897,124 @@ pub(crate) struct Decision {
 /// the dispatch-time fleet-exhaust check pass the floor carried on the
 /// node (`DerivationState::legacy_retry_floor`), so all of them apply
 /// exactly the same P5 semantics (`sched.retry.recovery-projection+2`).
+//
+// ── Kani contracts ───────────────────────────────────────────────────
+// No requires clause: the contract holds over the full input domain.
+// Counter arithmetic cannot overflow at any reachable suffix length
+// (every per-event charge is +1 onto a u32 and the clock arithmetic is
+// saturating), so the harness bound on history length is a solver
+// budget, not a soundness precondition. The four ensures clauses are,
+// in order: the verdict partition is consistent with the counters it
+// was computed from (each terminal verdict names a budget that really
+// is at its bound, the TTL downgrade only fires on a stamped expired
+// poison, and the fleet-exhaust reason is unreachable from decide() —
+// placement is placeable()'s job); a Requeue verdict never exceeds a
+// budget cap (the per-cycle/infra/timeout caps hold over every history,
+// the exempt cap over every history whose last event is exempt-charging
+// — the global form additionally needs the writer discipline that
+// poisoned nodes get no further attempt rows, which is upstream of the
+// fold); the exclusion set contains the executor of every charged
+// threshold attempt after the last reset row plus everything the legacy
+// seed holds; and the legacy-seed merge never drops a counter below
+// what the frozen mirror columns support (decision P5 / design
+// amendment A1). Verified by `check_decide_contract` in
+// `#[cfg(kani)] mod proofs`; the two-call properties (determinism,
+// seed-vs-unseeded monotonicity, the reset-row seed bypass) are the
+// `check_decide_deterministic` and `check_legacy_seed_merge_monotone`
+// harnesses.
+#[cfg_attr(kani, kani::ensures(|d: &Decision| {
+    match d.verdict {
+        Verdict::Requeue => true,
+        Verdict::Poison(PoisonReason::Threshold) => {
+            d.counters.poisoned_at.is_some() && d.counters.poison_threshold_reached(budget)
+        }
+        Verdict::Poison(PoisonReason::TransientBudget) => {
+            d.counters.poisoned_at.is_some() && d.counters.count >= budget.max_retries
+        }
+        Verdict::Poison(PoisonReason::InfraBudget) => {
+            d.counters.poisoned_at.is_some() && d.counters.infra_count >= budget.max_infra_retries
+        }
+        Verdict::Poison(PoisonReason::ExemptInfraBudget) => {
+            d.counters.poisoned_at.is_some()
+                && d.counters.exempt_infra_count >= budget.max_exempt_infra_retries
+        }
+        Verdict::Poison(PoisonReason::Permanent) => d.counters.poisoned_at.is_some(),
+        Verdict::Poison(PoisonReason::FleetExhausted) => false,
+        Verdict::Cancel => d.counters.timeout_count >= budget.max_timeout_retries,
+        Verdict::TtlExpire => matches!(
+            d.counters.poisoned_at,
+            Some(p) if now.saturating_sub(p) > budget.poison_ttl_secs
+        ),
+    }
+}))]
+#[cfg_attr(kani, kani::ensures(|d: &Decision| {
+    let has_reset = history
+        .iter()
+        .any(|r| r.event_kind == AttemptEventKind::Reset);
+    let seeded_count_floor = match legacy_seed {
+        Some(s) if !has_reset && !s.is_empty() => s.retry_count,
+        _ => 0,
+    };
+    let last_is_exempt_charge = history.last().is_some_and(|r| {
+        r.event_kind == AttemptEventKind::Attempt
+            && ((r.reporting_party == ReportingParty::Worker
+                && r.outcome_class == OutcomeClass::ExemptInfra)
+                || (r.reporting_party != ReportingParty::Worker
+                    && !r.floor_at_cap
+                    && (r.outcome_class == OutcomeClass::ExemptInfra
+                        || (r.outcome_class == OutcomeClass::Infra && r.floor_promoted))))
+    });
+    d.counters.count <= budget.max_retries.max(seeded_count_floor)
+        && d.counters.infra_count <= budget.max_infra_retries
+        && d.counters.timeout_count <= budget.max_timeout_retries
+        && (!matches!(d.verdict, Verdict::Requeue)
+            || !last_is_exempt_charge
+            || d.counters.exempt_infra_count < budget.max_exempt_infra_retries)
+}))]
+#[cfg_attr(kani, kani::ensures(|d: &Decision| {
+    let last_reset = history
+        .iter()
+        .rposition(|r| r.event_kind == AttemptEventKind::Reset);
+    let start = last_reset.map_or(0, |i| i + 1);
+    let charged_ok = history[start..].iter().all(|r| {
+        let charges_threshold = r.event_kind == AttemptEventKind::Attempt
+            && matches!(
+                r.outcome_class,
+                OutcomeClass::Transient
+                    | OutcomeClass::Permanent
+                    | OutcomeClass::Backstop
+                    | OutcomeClass::ExecutorCrash
+            );
+        !charges_threshold
+            || r.executor_id
+                .as_ref()
+                .is_none_or(|e| d.exclusion.contains(e))
+    });
+    let seed_ok = match legacy_seed {
+        Some(s) if last_reset.is_none() && !s.is_empty() => s
+            .failed_builders
+            .iter()
+            .all(|w| d.exclusion.contains(&ExecutorId::from(w.as_str()))),
+        _ => true,
+    };
+    charged_ok && seed_ok
+}))]
+#[cfg_attr(kani, kani::ensures(|d: &Decision| {
+    let has_reset = history
+        .iter()
+        .any(|r| r.event_kind == AttemptEventKind::Reset);
+    match legacy_seed {
+        Some(s) if !has_reset && !s.is_empty() => {
+            d.counters.count >= s.retry_count
+                && d.counters.resubmit_cycles >= s.resubmit_cycles
+                && d.counters.failure_count >= s.failed_builders.len() as u32
+                && s.failed_builders
+                    .iter()
+                    .all(|w| d.counters.failed_builders.contains(w))
+        }
+        _ => true,
+    }
+}))]
 pub(crate) fn decide(
     history: &[AttemptRecord],
     budget: &Budget,
@@ -1102,6 +1220,44 @@ pub(crate) enum ObservedFailure<'a> {
 /// attempt" (divergence D3's adjudicated side; the charge becomes
 /// decision-visible as the sites collapse). A transient failure never
 /// consults the floor (P4).
+//
+// ── Kani contract ────────────────────────────────────────────────────
+// The single ensures clause is the classification partition stated as
+// an iff per observed-event variant: each trigger maps to exactly the
+// ledger class its entry point appends, the exemption predicate is
+// precisely `floor.promoted || CONCURRENT_PUTPATH` on the worker
+// channel and `floor.promoted` on the controller channel (the
+// `sched.retry.exempt-infra-cap` definition of an exempt attempt, on
+// both channels — D3's adjudicated side), a transient failure never
+// classifies as exempt regardless of the floor outcome (P4), and no
+// reset/cascade/fleet class is ever produced for an observed failure.
+// Verified over the full type domain (with representative error
+// messages) by `check_classify_contract` in `#[cfg(kani)] mod proofs`.
+#[cfg_attr(kani, kani::ensures(|c: &OutcomeClass| {
+    match event {
+        ObservedFailure::WorkerTransient => *c == OutcomeClass::Transient,
+        ObservedFailure::WorkerInfra { error_msg } => {
+            if floor.promoted || error_msg.contains(rio_proto::CONCURRENT_PUTPATH_MSG) {
+                *c == OutcomeClass::ExemptInfra
+            } else {
+                *c == OutcomeClass::Infra
+            }
+        }
+        ObservedFailure::WorkerPermanent => *c == OutcomeClass::Permanent,
+        ObservedFailure::WorkerTimeout => *c == OutcomeClass::Timeout,
+        ObservedFailure::Disconnect => *c == OutcomeClass::Disconnected,
+        ObservedFailure::ControllerResourceTermination => {
+            if floor.promoted {
+                *c == OutcomeClass::ExemptInfra
+            } else {
+                *c == OutcomeClass::Infra
+            }
+        }
+        ObservedFailure::ControllerDeadlineExceeded => *c == OutcomeClass::Timeout,
+        ObservedFailure::BackstopTimeout => *c == OutcomeClass::Backstop,
+        ObservedFailure::UnreportedCrash => *c == OutcomeClass::ExecutorCrash,
+    }
+}))]
 pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> OutcomeClass {
     match event {
         ObservedFailure::WorkerTransient => OutcomeClass::Transient,
@@ -1154,6 +1310,28 @@ pub(crate) enum Placement {
 /// registered fleet. Mirrors [`exhausts_fleet`] (and the as-built
 /// `failed_builders_exhausts_fleet`): an empty exclusion set or an empty
 /// eligible fleet never reads as exhausted.
+//
+// ── Kani contract ────────────────────────────────────────────────────
+// The ensures clause is the placement partition stated as an iff per
+// variant: an empty eligible fleet always defers (never poisons — the
+// empty-fleet clause of `sched.dispatch.fleet-exhaust+3`), exhaustion
+// requires a non-empty fleet every member of which is excluded AND a
+// non-empty exclusion set, and anything else is placeable. Verified by
+// `check_placeable_contract` in `#[cfg(kani)] mod proofs`.
+#[cfg_attr(kani, kani::ensures(|p: &Placement| {
+    match p {
+        Placement::NoEligibleWorkers => eligible.is_empty(),
+        Placement::FleetExhausted => {
+            !eligible.is_empty()
+                && !excluded.is_empty()
+                && eligible.iter().all(|w| excluded.contains(w))
+        }
+        Placement::Placeable => {
+            !eligible.is_empty()
+                && (excluded.is_empty() || eligible.iter().any(|w| !excluded.contains(w)))
+        }
+    }
+}))]
 pub(crate) fn placeable(
     excluded: &BTreeSet<ExecutorId>,
     eligible: &BTreeSet<ExecutorId>,
@@ -2147,5 +2325,393 @@ mod tests {
             placeable(&ex(&["gone-1", "gone-2"]), &ex(&["w-fresh"])),
             Placement::Placeable
         );
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    //! CBMC proof harnesses for the decision kernels (`decide` /
+    //! `classify` / `placeable` and the fold's counter arithmetic).
+    //!
+    //! Domain bounds, stated once: histories are bounded at 3–4 records
+    //! over a three-executor universe, budgets are scaled to 0..=2 (so
+    //! every cap, threshold, and TTL terminal is reachable inside the
+    //! bound — the same scaling `retryPolicy.qnt`'s regimes use), and
+    //! the abstract clock is bounded at small values. The record domain
+    //! is a strict superset of what the appending sites can write
+    //! (arbitrary class/kind/flag/party combinations, including
+    //! malformed ones the fold treats as no-ops), so proving over it is
+    //! sound for the reachable subset. Counter arithmetic is +1 per
+    //! event onto u32 with saturating clock math, so the length bound
+    //! is a solver budget, not a hidden precondition — overflow within
+    //! the bound is rejected by CBMC's overflow checks, and exceeding
+    //! u32 in production would need ~4 × 10⁹ rows in one suffix, which
+    //! the per-cycle suffix bound (≤ ~70 rows) excludes structurally.
+    //!
+    //! The tracey verify markers for these harnesses live at the
+    //! `kani-rio-scheduler` wiring point in nix/kani.nix, not here —
+    //! same discipline as the VM-test subtests list.
+
+    use super::*;
+    use crate::state::{AttemptEventKind, AttemptRecord, ExecutorId, OutcomeClass, ReportingParty};
+
+    /// The executor-identity universe. Three distinct ids: enough to
+    /// reach the distinct-worker threshold at its scaled bound (2) with
+    /// one spare so exclusion ⊂ fleet and exclusion ⊇ fleet are both
+    /// reachable in `check_placeable_contract`.
+    const EXECUTORS: [&str; 3] = ["w0", "w1", "w2"];
+
+    fn any_executor() -> &'static str {
+        let i: u8 = kani::any();
+        kani::assume(i < 3);
+        EXECUTORS[i as usize]
+    }
+
+    fn any_outcome_class() -> OutcomeClass {
+        let i: u8 = kani::any();
+        kani::assume(i < 13);
+        match i {
+            0 => OutcomeClass::Transient,
+            1 => OutcomeClass::Infra,
+            2 => OutcomeClass::ExemptInfra,
+            3 => OutcomeClass::Timeout,
+            4 => OutcomeClass::Permanent,
+            5 => OutcomeClass::Cascade,
+            6 => OutcomeClass::Backstop,
+            7 => OutcomeClass::Disconnected,
+            8 => OutcomeClass::ExecutorCrash,
+            9 => OutcomeClass::FleetExhaust,
+            10 => OutcomeClass::ResubmitReset,
+            11 => OutcomeClass::CacheHitClear,
+            _ => OutcomeClass::PoisonCleared,
+        }
+    }
+
+    fn any_reporting_party() -> ReportingParty {
+        let i: u8 = kani::any();
+        kani::assume(i < 4);
+        match i {
+            0 => ReportingParty::Worker,
+            1 => ReportingParty::Controller,
+            2 => ReportingParty::Scheduler,
+            _ => ReportingParty::Admin,
+        }
+    }
+
+    /// One arbitrary ledger record: every decision-relevant field free
+    /// (class, kind, flags, party, executor, cycle, timestamp), every
+    /// field `decide()` ignores pinned to a cheap concrete value.
+    fn any_record(max_at: u64) -> AttemptRecord {
+        let at: u64 = kani::any();
+        kani::assume(at <= max_at);
+        let cycle: i32 = kani::any();
+        kani::assume((0..=3).contains(&cycle));
+        AttemptRecord {
+            attempt_id: uuid::Uuid::nil(),
+            event_kind: if kani::any() {
+                AttemptEventKind::Attempt
+            } else {
+                AttemptEventKind::Reset
+            },
+            outcome_class: any_outcome_class(),
+            exec_id: None,
+            executor_id: if kani::any() {
+                Some(ExecutorId::from(any_executor()))
+            } else {
+                None
+            },
+            termination_reason: None,
+            reporting_party: any_reporting_party(),
+            exempt: kani::any(),
+            floor_promoted: kani::any(),
+            floor_at_cap: kani::any(),
+            error_msg: None,
+            final_line_count: None,
+            resubmit_cycle: cycle,
+            occurred_at_epoch_secs: at as f64,
+            recorded_at_epoch_secs: 0.0,
+        }
+    }
+
+    /// A bounded arbitrary suffix: up to `max_len` records.
+    fn any_history(max_len: usize) -> Vec<AttemptRecord> {
+        let n: usize = kani::any();
+        kani::assume(n <= max_len);
+        let mut h = Vec::new();
+        let mut i = 0;
+        while i < n {
+            h.push(any_record(8));
+            i += 1;
+        }
+        h
+    }
+
+    /// Budgets scaled so every terminal is reachable within the history
+    /// bound. The contract must hold for every configuration, so zero
+    /// caps and both threshold modes are included.
+    fn any_small_budget() -> Budget {
+        let small_u32 = |bound: u32| -> u32 {
+            let v: u32 = kani::any();
+            kani::assume(v <= bound);
+            v
+        };
+        let small_u64 = |bound: u64| -> u64 {
+            let v: u64 = kani::any();
+            kani::assume(v <= bound);
+            v
+        };
+        Budget {
+            max_retries: small_u32(2),
+            max_infra_retries: small_u32(2),
+            max_timeout_retries: small_u32(2),
+            max_exempt_infra_retries: small_u32(2),
+            infra_retry_window_secs: small_u64(3),
+            backoff_base_secs: small_u64(3),
+            backoff_multiplier: small_u64(2),
+            backoff_max_secs: small_u64(4),
+            poison_threshold: small_u32(2),
+            require_distinct_workers: kani::any(),
+            poison_resubmit_retry_limit: small_u32(2),
+            poison_ttl_secs: small_u64(3),
+        }
+    }
+
+    /// An arbitrary frozen-mirror-column row (the P5 legacy seed). The
+    /// flat counters are unconstrained u32 — the SQL loader bounds them
+    /// at `i32::MAX`, but the proof does not need that bound.
+    fn any_seed() -> PersistedRetryColumns {
+        let mut failed_builders = BTreeSet::new();
+        if kani::any() {
+            failed_builders.insert(EXECUTORS[0].to_string());
+        }
+        if kani::any() {
+            failed_builders.insert(EXECUTORS[1].to_string());
+        }
+        let poisoned_at = if kani::any() {
+            let p: u64 = kani::any();
+            kani::assume(p <= 8);
+            Some(p)
+        } else {
+            None
+        };
+        PersistedRetryColumns {
+            retry_count: kani::any(),
+            resubmit_cycles: kani::any(),
+            failed_builders,
+            poisoned_at,
+        }
+    }
+
+    /// Verify [`decide`] against its four `kani::ensures` contracts —
+    /// the verdict partition, the Requeue cap bounds, the
+    /// exclusion-set superset, and the legacy-seed floor — for every
+    /// suffix of up to 4 arbitrary records, every scaled budget, every
+    /// clock value up to 16, and every (or no) legacy seed. With
+    /// overflow checks on, the same run is the no-overflow proof for
+    /// the fold's counter arithmetic over that domain.
+    #[kani::proof_for_contract(decide)]
+    #[kani::unwind(9)]
+    fn check_decide_contract() {
+        let history = any_history(4);
+        let budget = any_small_budget();
+        let now: AbsTime = kani::any();
+        kani::assume(now <= 16);
+        let seed = if kani::any() { Some(any_seed()) } else { None };
+        let _ = decide(&history, &budget, now, seed.as_ref());
+    }
+
+    /// The verdict partition is deterministic: two calls on the same
+    /// (history, budget, now, seed) quadruple return the same Decision
+    /// — no hidden state, no clock other than `now`, no dependence on
+    /// set iteration order.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn check_decide_deterministic() {
+        let history = any_history(2);
+        let budget = any_small_budget();
+        let now: AbsTime = kani::any();
+        kani::assume(now <= 16);
+        let seed = if kani::any() { Some(any_seed()) } else { None };
+        let a = decide(&history, &budget, now, seed.as_ref());
+        let b = decide(&history, &budget, now, seed.as_ref());
+        assert_eq!(a, b);
+    }
+
+    /// The P5 legacy-seed merge, two-call form. With a reset-free
+    /// suffix and a non-empty seed: the merge never drops legacy
+    /// evidence (count / resubmit_cycles / failure_count are floored at
+    /// the legacy projection and the exclusion set keeps every legacy
+    /// member — re-checked here against `Counters::recovery_projection`
+    /// so the floor and the projection stay in lockstep), never drops
+    /// suffix evidence (the unseeded fold's exclusion set, failure
+    /// count, and resubmit cycles are preserved), and never inflates a
+    /// channel budget (infra / timeout / exempt counts are exactly the
+    /// unseeded fold's). With a reset-bearing suffix or an empty legacy
+    /// row, the seed is ignored entirely. The per-cycle `count` is NOT
+    /// claimed monotone against the unseeded fold: a merged exclusion
+    /// set can reach the poison threshold earlier, and the threshold
+    /// arm poisons before the per-cycle charge — the evidence lands in
+    /// `failed_builders` instead (the design's "never below what either
+    /// era supports" floor is the legacy-projection half plus the
+    /// preserved suffix exclusions, which are asserted).
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn check_legacy_seed_merge_monotone() {
+        let history = any_history(3);
+        let budget = any_small_budget();
+        let now: AbsTime = kani::any();
+        kani::assume(now <= 16);
+        let seed = any_seed();
+        let seeded = decide(&history, &budget, now, Some(&seed));
+        let unseeded = decide(&history, &budget, now, None);
+        let has_reset = history
+            .iter()
+            .any(|r| r.event_kind == AttemptEventKind::Reset);
+        if has_reset || seed.is_empty() {
+            assert_eq!(seeded, unseeded);
+        } else {
+            // Legacy floor (the decide() ensures states this too; the
+            // projection cross-check is what this harness adds).
+            let proj = Counters::recovery_projection(&seed);
+            assert!(seeded.counters.count >= proj.count);
+            assert!(seeded.counters.resubmit_cycles >= proj.resubmit_cycles);
+            assert!(seeded.counters.failure_count >= proj.failure_count);
+            for w in proj.failed_builders.iter() {
+                assert!(seeded.counters.failed_builders.contains(w));
+            }
+            // Suffix evidence preserved.
+            assert!(seeded.counters.resubmit_cycles >= unseeded.counters.resubmit_cycles);
+            assert!(seeded.counters.failure_count >= unseeded.counters.failure_count);
+            for w in unseeded.counters.failed_builders.iter() {
+                assert!(seeded.counters.failed_builders.contains(w));
+            }
+            // Channel budgets are seed-independent.
+            assert_eq!(seeded.counters.infra_count, unseeded.counters.infra_count);
+            assert_eq!(
+                seeded.counters.timeout_count,
+                unseeded.counters.timeout_count
+            );
+            assert_eq!(
+                seeded.counters.exempt_infra_count,
+                unseeded.counters.exempt_infra_count
+            );
+        }
+    }
+
+    /// Verify [`classify`] against its partition contract for every
+    /// observed-failure variant, every floor outcome, and four
+    /// representative error messages (empty, unrelated, the
+    /// CONCURRENT_PUTPATH marker verbatim, the marker embedded
+    /// mid-string) — the shapes the substring predicate distinguishes.
+    #[kani::proof_for_contract(classify)]
+    fn check_classify_contract() {
+        let floor = FloorOutcomeView {
+            promoted: kani::any(),
+            at_cap: kani::any(),
+        };
+        let msg_sel: u8 = kani::any();
+        kani::assume(msg_sel < 4);
+        let error_msg = match msg_sel {
+            0 => "",
+            1 => "store error: connection reset by peer",
+            2 => rio_proto::CONCURRENT_PUTPATH_MSG,
+            _ => "remote: concurrent PutPath in progress (path locked)",
+        };
+        let ev_sel: u8 = kani::any();
+        kani::assume(ev_sel < 9);
+        let event = match ev_sel {
+            0 => ObservedFailure::WorkerTransient,
+            1 => ObservedFailure::WorkerInfra { error_msg },
+            2 => ObservedFailure::WorkerPermanent,
+            3 => ObservedFailure::WorkerTimeout,
+            4 => ObservedFailure::Disconnect,
+            5 => ObservedFailure::ControllerResourceTermination,
+            6 => ObservedFailure::ControllerDeadlineExceeded,
+            7 => ObservedFailure::BackstopTimeout,
+            _ => ObservedFailure::UnreportedCrash,
+        };
+        let _ = classify(&event, floor);
+    }
+
+    /// One arbitrary subset of the executor universe.
+    fn any_id_set() -> BTreeSet<ExecutorId> {
+        let mut s = BTreeSet::new();
+        if kani::any() {
+            s.insert(ExecutorId::from(EXECUTORS[0]));
+        }
+        if kani::any() {
+            s.insert(ExecutorId::from(EXECUTORS[1]));
+        }
+        if kani::any() {
+            s.insert(ExecutorId::from(EXECUTORS[2]));
+        }
+        s
+    }
+
+    /// Verify [`placeable`] against its partition contract for every
+    /// (exclusion, fleet) pair over the three-executor universe —
+    /// including the empty fleet (defer, never poison), the empty
+    /// exclusion set (always placeable), full overlap (exhausted), and
+    /// every partial overlap.
+    #[kani::proof_for_contract(placeable)]
+    #[kani::unwind(5)]
+    fn check_placeable_contract() {
+        let excluded = any_id_set();
+        let eligible = any_id_set();
+        let _ = placeable(&excluded, &eligible);
+    }
+
+    /// The fleet-exhaust arm of the fold itself (E1's check, which
+    /// `decide()` deliberately never exercises — it folds against an
+    /// empty fleet): over histories of up to 3 worker-reported events
+    /// and every fleet subset, a `FleetExhausted` poison requires a
+    /// non-empty eligible fleet whose every member has already failed
+    /// this derivation, and an empty fleet never produces one (the
+    /// empty-fleet defer clause of `sched.dispatch.fleet-exhaust+3`).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_fold_fleet_exhaust_arm() {
+        let n: usize = kani::any();
+        kani::assume(n <= 3);
+        let mut history = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let at: u64 = kani::any();
+            kani::assume(at <= 8);
+            let ev = if kani::any() {
+                AttemptEvent::Transient {
+                    at,
+                    executor: any_executor().to_string(),
+                }
+            } else {
+                AttemptEvent::Infra {
+                    at,
+                    executor: any_executor().to_string(),
+                    exempt: kani::any(),
+                    at_cap: kani::any(),
+                }
+            };
+            history.push(ev);
+            i += 1;
+        }
+        let mut fleet = FleetView::default();
+        if kani::any() {
+            fleet.eligible.insert(EXECUTORS[0].to_string());
+        }
+        if kani::any() {
+            fleet.eligible.insert(EXECUTORS[1].to_string());
+        }
+        let now: AbsTime = kani::any();
+        kani::assume(now <= 16);
+        let (counters, verdict) = reference_fold(&history, now, &Budget::default(), &fleet);
+        if verdict == Verdict::Poison(PoisonReason::FleetExhausted) {
+            assert!(!fleet.eligible.is_empty());
+            for w in fleet.eligible.iter() {
+                assert!(counters.failed_builders.contains(w));
+            }
+        }
+        if fleet.eligible.is_empty() {
+            assert!(verdict != Verdict::Poison(PoisonReason::FleetExhausted));
+        }
     }
 }

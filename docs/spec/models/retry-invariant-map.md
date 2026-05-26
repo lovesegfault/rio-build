@@ -1529,3 +1529,134 @@ condition (restoring `decide()`'s frozen 3-argument shape); a real
 ledger GC policy to replace the P8 retention assertion; and the
 deferred policy questions left open on purpose (A7 uniform backoff, A10
 fencepost unification, A8 poison-reason strings).
+
+## Phase-2 assurance layer
+
+The Phase-1 close-out above is the campaign record at the moment the
+nine-site collapse landed. This section records the Phase-2
+deliverables (design §5, Phase-2 row, plus amendment A1's removal
+clause): the Kani contracts on the decision kernels, the
+model-based-testing decision, the acceptance table over the historical
+fix corpus, the mirror-column retirement decision, and the retirement
+of the frozen as-built model. The campaign close-out is the final
+section of this document.
+
+### Kani contracts on the decision kernels
+
+`rio-scheduler/src/retry_policy.rs` carries function contracts
+(`#[kani::ensures]`, instrumented under `cfg(kani)` only) on
+`decide()`, `classify()` and `placeable()`, plus six proof harnesses in
+its `#[cfg(kani)] mod proofs`, wired as the `kani-rio-scheduler` target
+in nix/kani.nix (run with
+`nix build .#kani-toolchain.kani-checks.kani-rio-scheduler`; exact
+harness-count tripwire included).
+
+**Verification status — manual target, not yet in the merge gate.**
+CBMC on these harnesses inside rio-scheduler's artifact context did not
+converge within a merge-gate-compatible budget when they were
+introduced: the per-harness goto model inherits the crate's full
+reachable code plus the Arc-backed executor identifiers, the
+f64 timestamp conversions and the ordered-set machinery, and every
+harness (including the trivially small placement one) was still running
+after tens of minutes of CBMC. The introducing commit's message records
+the measured numbers; the first cut on hash-set kernels was strictly
+worse (the ordered-set refactor that precedes the contracts commit was
+made for exactly this reason). The contracts and harnesses are landed,
+compile under `cfg(kani)`, and state the intended properties precisely;
+gating the check in `checks.*` (and adding the corresponding
+`r[verify]` markers at the wiring point) is deferred until the
+counter-arithmetic kernels are extracted into a dependency-light
+context the way the log campaign's `rio-store/src/logs/kernel.rs` was —
+that extraction is the recorded remediation, listed with the campaign's
+deferrals in the close-out. Until then the properties below are stated,
+not machine-proven; the load-bearing coverage for the affected rules
+stays with the fold unit battery, the per-site tests, and the
+`quint-retry-policy-*` regimes.
+
+What the contracts state and the harnesses are built to prove, over
+every attempt suffix of up to 4 arbitrary records (arbitrary class /
+kind / flag / party / executor / timestamp combinations — a strict
+superset of what the appending sites can write), every budget with caps
+scaled to 0..=2 (both threshold modes), every clock value in bound, and
+every (or no) frozen-mirror-column seed:
+
+- **The verdict partition is total, deterministic, and consistent with
+  the counters it is computed from** (`check_decide_contract`,
+  `check_decide_deterministic`): no input in the domain panics; two
+  calls on the same inputs return the same `Decision`; each terminal
+  verdict names a budget that really is at its bound in the final
+  counter view (threshold reached for `Poison(Threshold)`, the named
+  cap reached for the budget poisons, the timeout cap reached for
+  `Cancel`, a stamped expired poison for `TtlExpire`); and
+  `Poison(FleetExhausted)` is unreachable from `decide()` — placement
+  is `placeable()`'s job, fed by the exclusion set.
+- **No counter arithmetic overflows** (same harnesses, CBMC overflow
+  checks on, the ensures closures recompute the comparisons): every
+  charge is `+1` onto a `u32` and the clock arithmetic is saturating,
+  so the harness length bound is a solver budget, not a hidden
+  precondition; exceeding `u32` in production would need ~4 × 10⁹ rows
+  in one suffix, which the per-cycle suffix bound (≤ ~70 rows) excludes
+  structurally.
+- **The budget caps are never exceeded by a Requeue verdict**
+  (`check_decide_contract`): the per-cycle transient, non-exempt infra
+  and timeout counters are at or below their caps after *every*
+  history (the seed can lift `count` above `max_retries` only with
+  evidence the frozen legacy column already holds), and an
+  exempt-infra attempt that reaches the exemption's own cap never
+  produces Requeue. The global exempt-cap form additionally relies on
+  the writer discipline that poisoned nodes get no further attempt
+  rows, which is upstream of the fold (the sites' status guards).
+- **The exclusion set contains the executor of every charged threshold
+  attempt** (`check_decide_contract`): every post-reset attempt row
+  whose class charges `failed_builders` (transient, permanent,
+  backstop, executor-crash) has its executor in `Decision::exclusion`,
+  plus every member of the legacy seed when the seed applies.
+- **The legacy-seed merge never lowers a counter below what the frozen
+  mirror columns support** (`check_decide_contract`,
+  `check_legacy_seed_merge_monotone`): with a reset-free suffix the
+  merge is floored at the legacy projection
+  (`Counters::recovery_projection`, cross-checked in the harness so
+  the floor and the projection cannot drift apart), preserves the
+  unseeded fold's exclusion set / failure count / resubmit cycles, and
+  leaves the channel budgets (infra / timeout / exempt) exactly the
+  unseeded fold's; a reset-bearing suffix or an empty legacy row
+  ignores the seed entirely. The per-cycle `count` is deliberately NOT
+  claimed monotone against the *unseeded* fold: a merged exclusion set
+  can reach the poison threshold earlier, and the threshold arm
+  poisons before the per-cycle charge — the evidence lands in
+  `failed_builders` instead. This is the P5 floor semantics as
+  specified, not a weakening.
+- **The classification partition** (`check_classify_contract`): each
+  observed failure maps to exactly the ledger class its entry point
+  appends; the exemption predicate is precisely
+  promoted-or-CONCURRENT_PUTPATH on the worker channel and promoted on
+  the controller channel (the `sched.retry.exempt-infra-cap`
+  definition on both channels — D3's adjudicated side); a transient
+  failure never classifies as exempt regardless of the floor outcome
+  (P4); no reset / cascade / fleet class is ever produced for an
+  observed failure.
+- **The placement partition** (`check_placeable_contract`,
+  `check_fold_fleet_exhaust_arm`): an empty eligible fleet always
+  defers and never poisons (the empty-fleet clause of
+  `sched.dispatch.fleet-exhaust+3`), exhaustion requires a non-empty
+  fleet every member of which has already failed the derivation, and
+  the fold-side fleet arm (E1) obeys the same predicate.
+
+Domain honesty: the contracts are stated over bounded suffixes and
+scaled budgets (the same scaling the quint regimes use), not over the
+production budget values; the no-overflow argument for production
+values is the structural one above. The harness domain is a superset
+of the writer-reachable row shapes, so malformed rows (which the fold
+treats as no-ops) are inside the domain. The CBMC cost evidence lives
+in the introducing commit's message; per-harness verdicts and check
+counts will live in the target's transcript once the extraction
+remediation lands and the target runs in CI.
+
+Layer separation: the model (`quint-retry-policy-*`) checks the
+protocol — which observations arrive, what the appending transaction
+does with them, failover, establishment, dedup; the Kani contracts
+check the decision arithmetic the collapsed sites call, over all
+bounded inputs rather than the model's enumerated alphabet; the fold
+unit battery pins concrete hand-computed histories (including every
+divergence-history reproducer); none of the three substitutes for the
+others.

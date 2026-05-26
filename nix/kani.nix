@@ -39,7 +39,17 @@
 }:
 let
   mkKaniCheck =
-    { name, crate }:
+    {
+      name,
+      crate,
+      # Exact harness-count tripwire: when non-null, the check fails
+      # unless kani-driver's summary reports exactly this many verified
+      # harnesses — so a harness silently dropping out of the artifact
+      # set (a cfg/module-path regression, an accidental delete) is a
+      # red check, not a quieter green one. `null` keeps the weaker
+      # at-least-one guard only.
+      expectedHarnesses ? null,
+    }:
     pkgs.runCommand "kani-${name}"
       {
         nativeBuildInputs = [
@@ -52,6 +62,7 @@ let
         src = crate.lib or crate;
         # Surfaced in `nix log` and error messages.
         env.MEMBER = name;
+        env.EXPECTED_HARNESSES = if expectedHarnesses == null then "" else toString expectedHarnesses;
       }
       ''
         set -euo pipefail
@@ -101,6 +112,18 @@ let
           echo "either the #[cfg(kani)] proofs module stopped being compiled into the kani build, or the crateBuildKani / kani-compiler-defaults plumbing changed (flake.nix, nix/kani-toolchain.nix)." >&2
           exit 1
         fi
+
+        # Exact harness-count tripwire (per-member, opt-in): a harness
+        # that silently stops being compiled or discovered must fail the
+        # check, not shrink it.
+        if [ -n "$EXPECTED_HARNESSES" ]; then
+          if ! grep -qE "Complete - $EXPECTED_HARNESSES successfully verified harnesses" "$out"; then
+            echo "kani-$MEMBER: expected exactly $EXPECTED_HARNESSES verified harnesses; summary line disagrees:" >&2
+            grep -E 'Complete - [0-9]+ successfully verified harnesses' "$out" >&2 || true
+            echo "If a harness was deliberately added or removed, update expectedHarnesses at this member's entry in nix/kani.nix." >&2
+            exit 1
+          fi
+        fi
       '';
 in
 {
@@ -138,5 +161,60 @@ in
   kani-rio-store = mkKaniCheck {
     name = "rio-store";
     crate = crateBuildKani.members.rio-store;
+  };
+
+  # rio-scheduler: the retry/poison decision kernels
+  # (rio-scheduler/src/retry_policy.rs — decide()/classify()/placeable()
+  # and the reference fold's counter arithmetic).
+  #
+  # MANUAL TARGET for now — run with
+  #   nix build .#kani-toolchain.kani-checks.kani-rio-scheduler
+  # It is deliberately NOT gated in checks.*: CBMC on these harnesses
+  # inside rio-scheduler's artifact context (the goto model inherits the
+  # crate's full reachable code, Arc-backed identifiers, and the
+  # f64 timestamp conversions) did not complete inside a merge-gate
+  # budget when introduced (>18 min per harness without convergence;
+  # numbers in the introducing commit's message). Gate it once the
+  # counter-arithmetic kernels are extracted into a dependency-light
+  # context the way rio-store's logs/kernel.rs was (the recorded Phase-2
+  # deferral in docs/spec/models/retry-invariant-map.md), and add the
+  # r[verify] markers for the covered sched.retry.* rules at this wiring
+  # point at the same time (markers are deliberately absent until the
+  # check actually runs in CI — the rules keep their existing
+  # unit-test / model-check verify sites meanwhile).
+  #
+  # Six harnesses:
+  #   - check_decide_contract: #[kani::proof_for_contract] over bounded
+  #     arbitrary attempt suffixes, scaled budgets, and optional legacy
+  #     seeds — the verdict partition is consistent with the final
+  #     counters (each terminal verdict names a budget really at its
+  #     bound; fleet-exhaust is unreachable from decide()), a Requeue
+  #     verdict never exceeds a budget cap, the exclusion set contains
+  #     the executor of every charged threshold attempt plus the legacy
+  #     seed's members, the seed floor never drops below the frozen
+  #     mirror columns, and (overflow checks on) the fold's counter
+  #     arithmetic cannot overflow over the domain.
+  #   - check_decide_deterministic: same inputs, two calls, equal
+  #     Decisions.
+  #   - check_legacy_seed_merge_monotone: the P5 seed-vs-unseeded
+  #     two-call form — legacy and suffix evidence both preserved,
+  #     channel budgets seed-independent, reset-bearing suffixes ignore
+  #     the seed (the `sched.retry.recovery-projection+2` floor
+  #     semantics).
+  #   - check_classify_contract: the classification partition iff per
+  #     observed-failure variant; the exemption predicate is exactly
+  #     promoted-or-CONCURRENT_PUTPATH on the worker channel and
+  #     promoted on the controller channel (the exempt-infra-cap
+  #     definition, both channels).
+  #   - check_placeable_contract: the placement partition iff — empty
+  #     fleet defers, exhaustion requires every eligible worker
+  #     excluded.
+  #   - check_fold_fleet_exhaust_arm: the fold-side fleet-exhaust arm
+  #     (E1) needs a non-empty fully-failed fleet; an empty fleet never
+  #     poisons.
+  kani-rio-scheduler = mkKaniCheck {
+    name = "rio-scheduler";
+    crate = crateBuildKani.members.rio-scheduler;
+    expectedHarnesses = 6;
   };
 }
