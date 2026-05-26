@@ -1389,6 +1389,91 @@ async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.merge.wanted-outputs+2]
+/// Top-down negative: the submission's OWN root selector resolving to
+/// no declared output (`drv^bogus`) blocks the prune even when the
+/// root pre-exists and its STORED wanted union is fully available.
+///
+/// The pre-existing root's only prior interested build is gone
+/// (cancelled), so the prune criterion's effective-wanted lookup falls
+/// back to the stored union — which resolves and is substitutable.
+/// But post-merge classification evaluates the root against the
+/// now-live submitter's own contribution, and an unresolvable set is
+/// unclassifiable: nothing would substitute, while the submitter had
+/// already pruned away its own dependency closure. The own-set
+/// resolvability guard must keep the fall-through-to-full-merge
+/// behavior of `test_topdown_unresolvable_wanted_set_falls_through`
+/// for pre-existing roots too.
+#[tokio::test]
+async fn test_topdown_unresolvable_wanted_set_falls_through_on_preexisting_root() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("tdo-r-out");
+    let mk_root = |wanted: &[&str]| {
+        let mut r = make_node("tdo-r");
+        r.output_names = vec!["out".into()];
+        r.expected_output_paths = vec![r_out.clone()];
+        r.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        r
+    };
+
+    // Build A seeds R into the DAG wanting `out` (the stored union),
+    // then is cancelled: R keeps its stored wanted set but no live
+    // interested build is left on it.
+    let build_a = Uuid::new_v4();
+    merge_dag(&handle, build_a, vec![mk_root(&["out"])], vec![], false).await?;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: build_a,
+            caller_tenant: None,
+            reason: "test: drop the prior build".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    assert!(reply_rx.await??, "cancel of active build A should apply");
+    barrier(&handle).await;
+
+    // The stored union's only output becomes substitutable upstream.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+
+    // Build B re-submits R with a selector matching NO declared
+    // output, plus its dependency closure.
+    let mut dep = make_node("tdo-dep");
+    dep.expected_output_paths = vec![test_store_path("tdo-dep-out")];
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![mk_root(&["bogus"]), dep],
+        vec![make_test_edge("tdo-r", "tdo-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The dependency closure must survive into the merge.
+    assert_eq!(
+        query_status(&handle, build_b).await?.total_derivations,
+        2,
+        "an unresolvable submission selector must refuse the prune even \
+         when the pre-existing root's stored wanted union is available"
+    );
+    assert_eq!(
+        expect_drv(&handle, "tdo-dep").await.status,
+        DerivationStatus::Ready,
+        "the dep survived into the merged DAG and is schedulable"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.substitute.detached+5]
 /// Substitutable nodes go `Substituting` (detached fetch spawned),
 /// not synchronously `Completed` at merge. The closure-invariant
