@@ -1081,6 +1081,154 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
 }
 
 // r[verify sched.merge.substitute-topdown+4]
+/// A prune-led merge that fails at the PG-persist step (step 5) must
+/// not leave `topdown_pruned=true` on a pre-existing childless root
+/// shared with an unrelated live build. `cleanup_failed_merge` →
+/// `rollback_merge` reverts only the fields tracked in `MergeResult`;
+/// the stamp is not among them and its only clearing site requires the
+/// node to HAVE children — so a stamp applied before the fallible
+/// persist steps would leak the rejected build's prune verdict onto
+/// B1's root R, and a later routine `SubstituteComplete{ok=false}` for
+/// R would take `handle_substitute_complete`'s fail-fast arm and
+/// terminally fail B1 with the "deps were pruned; resubmit" error
+/// instead of the normal revert-to-Ready fallback.
+///
+/// Step 5 is failed deterministically without a fault hook: the new
+/// node S carries a NUL byte in `pname`. PG rejects NUL in text
+/// values, so `batch_upsert_derivations` (the first write inside
+/// `persist_and_activate`) errors; nothing in steps 0–4 reads pname,
+/// so the merge reaches step 5 intact (the Database-error assertion
+/// plus the prune counter pin that down).
+#[tokio::test]
+async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // B1: single-node submission containing only root R. Nothing is
+    // substitutable yet → no prune, no detached fetch; R seeds Ready
+    // (no executors connected) and B1 stays Active.
+    let r_out = test_store_path("tds-r-out");
+    let mut r_b1 = make_node("tds-r");
+    r_b1.expected_output_paths = vec![r_out.clone()];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![r_b1], vec![], false).await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "precondition: B1 live and Active"
+    );
+    assert!(
+        !expect_drv(&handle, "tds-r").await.topdown_pruned,
+        "precondition: B1's plain merge does not stamp R"
+    );
+
+    // Stage the store so B2's submission satisfies the roots-only
+    // prune criterion: R's and S's wanted outputs substitutable.
+    let s_out = test_store_path("tds-s-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(r_out.clone());
+        subs.push(s_out.clone());
+    }
+
+    // B2: {R, S, S-dep} with S→S-dep. The prune fires (drops S-dep),
+    // then persist fails on S's NUL pname.
+    let mut r_b2 = make_node("tds-r");
+    r_b2.expected_output_paths = vec![r_out.clone()];
+    let mut s = make_node("tds-s");
+    s.expected_output_paths = vec![s_out.clone()];
+    s.pname = "tds-s\0pg-rejects-nul".into();
+    let mut s_dep = make_node("tds-s-dep");
+    s_dep.expected_output_paths = vec![test_store_path("tds-s-dep-out")];
+
+    let b2 = Uuid::new_v4();
+    let reply = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: b2,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![r_b2, s, s_dep],
+            edges: vec![make_test_edge("tds-s", "tds-s-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            reply.as_ref().err().and_then(|e| e.downcast_ref()),
+            Some(ActorError::Database(_))
+        ),
+        "B2's merge must be rejected by the step-5 persist failure, got {reply:?}"
+    );
+    // Guard against the scenario silently degrading: the prune must
+    // actually have fired before the persist failure.
+    assert_eq!(
+        recorder.get("rio_scheduler_topdown_prune_total{}"),
+        1,
+        "B2's submission should have taken the roots-only prune path"
+    );
+
+    // The failed merge rolled back: S gone, B2 unknown, B1 untouched.
+    assert!(
+        handle.debug_query_derivation("tds-s").await?.is_none(),
+        "rollback removes B2's newly-inserted node"
+    );
+    assert!(
+        matches!(
+            try_query_status(&handle, b2).await?,
+            Err(ActorError::BuildNotFound(_))
+        ),
+        "rejected B2 should be unknown after rollback"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B1 unaffected by B2's failed merge"
+    );
+
+    // Load-bearing: the rejected merge's prune verdict must not survive
+    // on the shared pre-existing root.
+    let r_post = expect_drv(&handle, "tds-r").await;
+    assert!(
+        !r_post.topdown_pruned,
+        "failed merge must not leave topdown_pruned on pre-existing root R \
+         (rollback_merge does not revert the stamp)"
+    );
+
+    // The harm a leaked stamp causes: a later substitute failure for R
+    // (fetched on behalf of B1) would hit the topdown fail-fast arm —
+    // R is childless — and terminally fail B1 with the resubmit error.
+    // Stage R mid-fetch and deliver ok=false; B1 must survive via the
+    // normal revert.
+    handle
+        .debug_force_status("tds-r", DerivationStatus::Substituting)
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tds-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B1 must not be terminally failed by the topdown fail-fast arm \
+         after B2's rejected merge; error_summary={:?}",
+        s1.error_summary
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+4]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]

@@ -321,19 +321,6 @@ impl DagActor {
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
-        // r[impl sched.merge.substitute-topdown+4]
-        // Stamp topdown_pruned on roots AFTER dag.merge (node didn't
-        // exist before). Idempotent if a root pre-existed in the DAG.
-        // handle_substitute_complete reads this on
-        // SubstituteComplete{ok=false} and fails the build instead of
-        // dispatching (deps were dropped — worker would ENOENT).
-        if topdown_fired {
-            for n in &nodes {
-                if let Some(s) = self.dag.node_mut(&n.drv_hash) {
-                    s.topdown_pruned = true;
-                }
-            }
-        }
         phase!("2-dag-merge-inmem");
 
         // === Step 3: In-memory map inserts ============================
@@ -430,6 +417,32 @@ impl DagActor {
         }
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
+
+        // r[impl sched.merge.substitute-topdown+4]
+        // Stamp topdown_pruned on roots only now that the merge is
+        // committed (steps 4–5 can no longer fail). The stamp is a
+        // cross-build-visible mutation of possibly PRE-EXISTING nodes
+        // that rollback_merge does not revert (it is not tracked in
+        // MergeResult, and the only clearing site requires the node to
+        // have children) — stamping before the fallible cache-check /
+        // persist steps would leak a rejected build's prune verdict
+        // onto a shared childless root, and a later routine
+        // SubstituteComplete{ok=false} for that root would take the
+        // fail-fast arm and terminally fail innocent builds. Nothing
+        // reads the flag between dag.merge and this point: its only
+        // consumer is handle_substitute_complete, and detached fetches
+        // are spawned in reconcile_merged_state, after this returns.
+        // Idempotent if a root pre-existed in the DAG.
+        // handle_substitute_complete reads this on
+        // SubstituteComplete{ok=false} and fails the build instead of
+        // dispatching (deps were dropped — worker would ENOENT).
+        if topdown_fired {
+            for n in &nodes {
+                if let Some(s) = self.dag.node_mut(&n.drv_hash) {
+                    s.topdown_pruned = true;
+                }
+            }
+        }
 
         Ok(MergeIngest {
             build_id,
