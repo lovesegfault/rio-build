@@ -320,9 +320,7 @@ pub(super) async fn collect_outputs(
 /// `input_paths`. So: strip ANSI escapes first, then match by BASENAME
 /// only — `<hash>-<name>` is unique (the nixbase32 hash makes
 /// collisions practically impossible) and is the trailing path component
-/// in both overlay and store-path forms. The errno suffix is NOT
-/// matched: ENOENT (`No such file or directory`) and EIO (`Input/output
-/// error`, see I-179) are both worker-local materialization failures.
+/// in both overlay and store-path forms.
 ///
 /// P0560 (castore-FUSE lower): every `EIO` the castore lower surfaces on
 /// an input read — JIT fetch timeout, chunk/whole-file integrity
@@ -332,6 +330,23 @@ pub(super) async fn collect_outputs(
 /// the matcher below classifies them as infrastructure without caring
 /// which FUSE implementation served the lower. The closure-membership
 /// check stays the load-bearing guard either way.
+///
+/// Errno handling depends on WHERE the quoted path sits relative to the
+/// closure entry:
+///
+/// - the quoted path IS the closure entry (or its overlay-mounted copy):
+///   any errno reclassifies — the input itself failing to resolve is
+///   exactly the materialization failure this matcher exists for
+///   (ENOENT = not served by the lower, EIO = fetch failure).
+/// - the quoted path is a file INSIDE a closure entry (the `executing
+///   '<input>/bin/sh'` / `opening file '<input>/share/x'` shapes): only
+///   *availability* errnos (EIO, FUSE-dead ENOTCONN/ECONNABORTED,
+///   timeouts) reclassify. ENOENT/EACCES on a path inside an input that
+///   IS materialized means the file genuinely isn't there (wrong
+///   interpreter path, bad mode baked into the derivation) — a build
+///   defect that must stay `PermanentFailure`, otherwise a permanently
+///   broken (or adversarial) derivation rides the infrastructure-retry
+///   loop forever.
 ///
 // r[impl builder.result.input-eio-is-infra]
 pub(crate) fn is_input_materialization_failure(
@@ -374,12 +389,26 @@ pub(crate) fn is_input_materialization_failure(
         "opening file '",
         "executing '",
     ];
-    let Some(rest) = MARKERS.iter().find_map(|m| stripped.split(m).nth(1)) else {
+    // The two phrasings whose quoted path routinely points INSIDE an
+    // input rather than at the input itself — the ones that get the
+    // errno-restricted treatment for inside-the-input matches.
+    const INSIDE_RESTRICTED: &[&str] = &["opening file '", "executing '"];
+    let Some((marker, rest)) = MARKERS
+        .iter()
+        .find_map(|m| stripped.split(m).nth(1).map(|rest| (*m, rest)))
+    else {
         return false;
     };
     let Some(path) = rest.split('\'').next() else {
         return false;
     };
+    // The strerror suffix after the quoted path ("': No such file or
+    // directory"). Missing/odd framing → empty → treated as
+    // non-availability (conservative for the inside-an-input case).
+    let strerror = rest
+        .split_once("': ")
+        .map(|(_, s)| s.trim())
+        .unwrap_or_default();
     // Membership by path COMPONENT: the daemon may quote the store path
     // itself, the overlay-mounted copy of it (I-178b:
     // `/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), or a file
@@ -390,13 +419,55 @@ pub(crate) fn is_input_materialization_failure(
     // An empty component list (shouldn't happen, but defensive) must not
     // vacuously match every closure entry.
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    if components.is_empty() {
+    let Some(&last_component) = components.last() else {
+        return false;
+    };
+    let mut matched_root = false;
+    let mut matched_inside = false;
+    for p in input_paths {
+        let basename = p.rsplit('/').next().unwrap_or(p);
+        if basename.is_empty() {
+            continue;
+        }
+        if last_component == basename {
+            matched_root = true;
+        } else if components.contains(&basename) {
+            matched_inside = true;
+        }
+    }
+    if matched_root {
+        return true;
+    }
+    if !matched_inside {
         return false;
     }
-    input_paths.iter().any(|p| {
-        let basename = p.rsplit('/').next().unwrap_or(p);
-        !basename.is_empty() && components.contains(&basename)
-    })
+    // Inside an existing input: restrict the open/execve phrasings to
+    // availability errnos (see the doc comment). The stat/readdir
+    // phrasings keep the original any-errno behavior — sandbox setup
+    // only touches closure roots, so an inside-path there is already
+    // unusual and erring towards retry is the safer default.
+    if INSIDE_RESTRICTED.contains(&marker) {
+        return is_availability_strerror(strerror);
+    }
+    true
+}
+
+/// Whether a strerror suffix indicates the castore lower failed to
+/// *serve* content (availability) rather than the content genuinely not
+/// being there. Only these reclassify an inside-an-input open/execve
+/// failure to `InfrastructureFailure`; everything else (ENOENT, EACCES,
+/// ENOTDIR, unknown phrasings) stays a permanent build failure.
+fn is_availability_strerror(strerror: &str) -> bool {
+    const AVAILABILITY: &[&str] = &[
+        // EIO — the castore lower's generic fetch/integrity/breaker signal.
+        "Input/output error",
+        // ENOTCONN / ECONNABORTED — FUSE session died or was aborted.
+        "Transport endpoint is not connected",
+        "Software caused connection abort",
+        // ETIMEDOUT — slow store surfaced as a timeout.
+        "Connection timed out",
+    ];
+    AVAILABILITY.iter().any(|a| strerror.starts_with(a))
 }
 
 #[cfg(test)]
@@ -498,6 +569,40 @@ mod tests {
         assert!(
             !is_input_materialization_failure(Nix::MiscFailure, exec_foreign, &closure),
             "execve failure outside the closure must NOT reclassify"
+        );
+
+        // Errno restriction for inside-an-input matches: the input IS
+        // materialized, the file inside it genuinely is not there (or
+        // not readable). That is a derivation defect — wrong
+        // interpreter path, bad mode — and reclassifying it would let a
+        // permanently broken (or adversarial) derivation ride the
+        // infrastructure-retry loop forever instead of being poisoned.
+        let exec_missing_inside =
+            format!("error: executing '{input}/bin/missing': No such file or directory");
+        assert!(
+            !is_input_materialization_failure(Nix::MiscFailure, &exec_missing_inside, &closure),
+            "execve ENOENT on a file inside an existing input must stay permanent"
+        );
+        let open_denied_inside = format!("opening file '{input}/etc/conf': Permission denied");
+        assert!(
+            !is_input_materialization_failure(Nix::MiscFailure, &open_denied_inside, &closure),
+            "open EACCES on a file inside an existing input must stay permanent"
+        );
+        // FUSE-session-death errnos on an inside path are availability
+        // failures and keep reclassifying.
+        let exec_notconn_inside =
+            format!("error: executing '{input}/bin/sh': Transport endpoint is not connected");
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, &exec_notconn_inside, &closure),
+            "execve ENOTCONN (dead FUSE session) inside an input must reclassify"
+        );
+        // Root-path failures keep the original any-errno behavior: the
+        // input itself not resolving IS the materialization failure,
+        // whether the lower reports ENOENT or EIO.
+        let exec_root_enoent = format!("error: executing '{input}': No such file or directory");
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, &exec_root_enoent, &closure),
+            "execve ENOENT on the closure input itself must still reclassify"
         );
 
         // MiscFailure + path NOT in closure → false (genuine missing
