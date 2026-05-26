@@ -151,9 +151,34 @@ let
       sleep 1
     done
 
+    # The gRPC port opens well before the server can actually serve a
+    # quint->TLA+ conversion: for the first ~30-60 s after startup the
+    # conversion endpoint returns empty-details INTERNAL errors (measured
+    # against retryPolicy.qnt's regime modules; the window is long enough
+    # that three back-to-back retries can all land inside it). Warm the
+    # server with a trivial conversion until it answers, so the real
+    # model's first attempt runs against a known-working server instead
+    # of racing the warm-up.
+    cat > warmup.qnt <<'WARMUP'
+    module warmup {
+      var x: int
+      action init = x' = 0
+      action step = x' = x + 1
+      val warmInv = x >= 0
+    }
+    WARMUP
+    for _ in $(seq 1 30); do
+      if quint compile --target tlaplus --server-endpoint=localhost:8822 \
+          warmup.qnt > /dev/null 2>&1; then
+        break
+      fi
+      sleep 5
+    done
+
     # Run `quint verify "$@"`, retrying while the transcript carries no
-    # verdict line (the cold-conversion failure shape). Sets
-    # quint_status; the transcript of the accepted attempt is in $out.
+    # verdict line (the residual cold-conversion failure shape, should
+    # the warm-up above have raced the server). Sets quint_status; the
+    # transcript of the accepted attempt is in $out.
     run_quint_verify() {
       quint_status=0
       for attempt in 1 2 3; do
@@ -166,6 +191,7 @@ let
           return 0
         fi
         echo "attempt $attempt produced no TLC verdict (cold-server conversion failure?); retrying" >&2
+        sleep 10
       done
       return 0
     }
@@ -925,47 +951,53 @@ in
     };
 
     # ------------------------------------------------------------------
-    # rio-scheduler's retry/poison/cascade machinery: the as-built model
-    # (retry-formal Stage B). The model encodes the nine cap-check entry
-    # points as the code implements them -- including the divergent arms
-    # the invariant map catalogs (D1-D4) -- and carries the reference
-    # fold (rio-scheduler/src/retry_policy.rs) as a specification ghost
-    # the refinement invariants compare the live counters and verdicts
-    # against. Checks come in three flavours:
-    #   - the per-regime HOLD checks below (exhaustive TLC; the
-    #     invariants nobody has documented a violation of);
-    #   - the expect-violation DIVERGENCE checks (the invariant map's
-    #     pre-registered Stage-B falsifications: D1 / D2+D3 / D4 / C2 --
-    #     each passes only while the documented as-built defect is still
-    #     reproducible; Phase 1's fixes flip them into HOLD checks);
+    # rio-scheduler's retry/poison/cascade machinery: the post-collapse
+    # model (retry-formal Phase 1c). retryPolicy.qnt encodes the code as
+    # it exists after the Phase-1b nine-site collapse -- every entry
+    # point's verdict is the reference fold (decide()) over the durable
+    # attempt ledger, evaluated and persisted in the appending
+    # transaction -- and the Stage-B as-built encoding is frozen at
+    # retryPolicyAsBuilt.qnt, imported only by the calibration corpus
+    # below. Checks come in three flavours:
+    #   - the per-regime HOLD checks below (exhaustive TLC), now
+    #     including the invariants whose as-built falsifications were
+    #     pre-registered at Stage B and fixed by Phase 1b: the D1
+    #     verdict-channel divergence, the D2/D3 controller-channel
+    #     counter divergences, the D4 unmirrored backstop charge and the
+    #     C2 unbounded no-report crash loop (their former
+    #     expect-violation checks are retired -- the flip is the Phase-1
+    #     acceptance evidence, not a silent edit);
     #   - the witness checks (non-vacuity: every cap, reset, channel
-    #     race and fault the invariants quantify over is reachable).
+    #     race, establishment and fault the invariants quantify over is
+    #     reachable);
+    #   - the calibration checks (the historical-fix corpus replayed
+    #     against the FROZEN as-built encoding).
     # The named-run checks replay the deterministic reproducer runs (one
-    # per documented divergence) so the precise documented shape stays
-    # pinned even though TLC's BFS may report a different counterexample
-    # first. State counts, depths and wall-clocks live in the introducing
-    # commits' messages and the checks' transcripts.
+    # per formerly-documented divergence, now ending in the adjudicated
+    # outcomes) so the precise documented shape stays pinned even though
+    # TLC's BFS may report a different counterexample first. State
+    # counts, depths and wall-clocks live in the introducing commits'
+    # messages and the checks' transcripts.
     #
-    # Marker scope: the four sched.retry.* rules whose verification the
+    # Marker scope: the sched.retry.* rules whose verification the
     # invariant map defers to this model are marked on the regime that
     # makes each load-bearing; counters-refine-history / attempts-bounded
     # / transient-budget gain the model-checked form here on top of the
     # reference fold's unit-test markers. sched.retry.verdict-channel-
-    # invariant is marked on its expect-violation check: the rule is
-    # added marker-first and the as-built code violates it (divergence
-    # D1) -- the check verifies the documented violation is still exactly
-    # the one on record, and flips to a HOLD check when Phase 1 lands the
-    # adjudicated fix.
+    # invariant is marked on the dual regime, the regime whose
+    # mixed-channel alphabet exercises it (it moved here from the retired
+    # expect-violation D1 check when Phase 1b landed the adjudicated fix
+    # and Phase 1c flipped the check).
     # ------------------------------------------------------------------
 
     # The worker-channel regime: every failure is worker-reported, two
-    # executor slots, resets enabled. The live counters and the fold
-    # share the whole alphabet here, so the refinement invariants HOLD:
-    # this is the exhaustive proof that the scattered per-entry-point
-    # increments (fencepost conventions, the I-127 window reset and its
-    # exempt fall-through, the backoff arming, the record-then-check
-    # threshold/fleet/cap ordering) equal the reference fold, and that
-    # the budget verdicts match the fold's.
+    # executor slots, resets enabled. This is the exhaustive re-proof of
+    # the fold-backed entry points over the full worker alphabet
+    # (fencepost conventions, the I-127 window reset and its exempt
+    # fall-through, the backoff arming, the threshold/fleet/cap
+    # ordering), of the refinement tripwires (the cached view, the
+    # durable ledger fold and the reference fold advance together), and
+    # of the placement/threshold scenarios that need a second slot.
     # r[verify sched.retry.counters-refine-history+2]
     # r[verify sched.retry.transient-budget]
     # r[verify sched.retry.attempts-bounded+2]
@@ -990,16 +1022,23 @@ in
     };
 
     # The dual-channel regime: pod deaths, the controller report channel
-    # (race-ahead / late-installment / loss), the wedge backstop and the
-    # no-report crash on one slot. The HOLD set here is the dedup and
-    # terminal-state discipline: one physical death counts at most once
-    # across every observation subset and order, poison stays terminal,
-    # the cascade reaches exactly the dependent, and nothing fabricates
-    # failures. The refinement invariants are deliberately NOT in this
-    # list -- their falsification on this regime is pre-registered and
-    # carried by the divergence checks below.
+    # (race-ahead / late-installment / loss), the establishment of
+    # never-classified deaths, the wedge backstop and the no-report crash
+    # on one slot. The HOLD set here is the dedup and terminal-state
+    # discipline (one physical death counts at most once across every
+    # observation subset and order, poison stays terminal, the cascade
+    # reaches exactly the dependent, nothing fabricates failures) PLUS
+    # the refinement invariants whose falsification on this regime was
+    # pre-registered against the as-built code and fixed by Phase 1b:
+    # verdictMatchesFold (D1 -- the controller-observed timeout cap now
+    # ends Cancelled), countersRefineHistory (D2/D3 -- the at-cap anchor
+    # stamp and the promoted exempt charge on the controller channel) and
+    # durableMirrorsCharges (D4 -- the backstop charge is a durable
+    # ledger row). Their former expect-violation checks
+    # (quint-retry-policy-divergence-*) are retired by this flip.
     # r[verify sched.retry.no-double-count]
     # r[verify sched.poison.cascade-dependents]
+    # r[verify sched.retry.verdict-channel-invariant]
     quint-retry-policy-dual = mkQuintCheck {
       name = "retry-policy-dual";
       spec = "retryPolicy";
@@ -1007,6 +1046,9 @@ in
       invariants = [
         "boundsOK"
         "attemptsChargedOnce"
+        "countersRefineHistory"
+        "verdictMatchesFold"
+        "durableMirrorsCharges"
         "noDoubleCount"
         "poisonIsTerminalUntilCleared"
         "cascadeReachesExactlyTheDependents"
@@ -1017,10 +1059,14 @@ in
       ];
     };
 
-    # The crash regime: the C2 no-report hard-crash loop in isolation.
-    # Everything except the boundedness clause holds (and the refinement
-    # invariants hold trivially -- nothing ever charges); the boundedness
-    # falsification is the expect-violation check below.
+    # The crash regime: the C2 no-report hard-crash loop in isolation,
+    # now with the establishment charge (Phase 1b T-1b.11). Every crash
+    # is established and charged, so the loop terminates and the
+    # boundedness clause HOLDS: attemptsBoundedGlobal joins this regime's
+    # invariant list (the former expect-violation
+    # quint-retry-policy-crash-unbounded check is retired by the flip;
+    # the establishment-charge and crash-terminal witnesses below keep
+    # the regime's reachability evidence).
     quint-retry-policy-crash = mkQuintCheck {
       name = "retry-policy-crash";
       spec = "retryPolicy";
@@ -1028,6 +1074,7 @@ in
       invariants = [
         "boundsOK"
         "attemptsChargedOnce"
+        "attemptsBoundedGlobal"
         "countersRefineHistory"
         "verdictMatchesFold"
         "noDoubleCount"
@@ -1039,23 +1086,19 @@ in
       ];
     };
 
-    # The fault-persist / failover regime: the dual-channel alphabet plus
-    # one leader failover and one silently-lost best-effort PG mirror
-    # write. The recovery invariants are load-bearing here: the
-    # post-failover state is exactly the PRE-LEDGER documented
-    # 4-recovered / 1-derived / 5-defaulted projection of whatever PG
-    # actually holds (poisoned rows via from_poisoned_row, non-terminal
-    # rows via from_recovery_row, TTL-expired poison cleared, the orphan
-    # reconcile's threshold re-check), and lost writes only ever make
-    # recovery more forgiving, never fabricate history.
-    #
-    # NOTE (Phase 1b, T-1b.12a): this regime still checks the AS-BUILT
-    # model's selective forgiveness, which is no longer the production
-    # recovery contract — sched.retry.recovery-projection+2 (the seeded
-    # ledger fold) is verified by the recovery/failover tests in
-    # rio-scheduler/src/actor/tests/recovery.rs; the model-side verify
-    # marker returns here with the Phase-1c failover-regime re-wiring
-    # (T-1c.3), once the re-encoded model checks the new contract.
+    # The fault / failover regime: the dual-channel alphabet plus one
+    # leader failover and one appending-transaction failure. The
+    # post-collapse recovery contract is load-bearing here: the recovered
+    # retry view is the fold over the durable attempt ledger -- budgets,
+    # the window anchor, the exclusion set and the poison set all survive
+    # a leader change, nothing is forgiven and nothing is fabricated --
+    # and a failed appending transaction charges nothing at all (the
+    # event is re-delivered) instead of leaving the durable view behind
+    # the in-memory one. The as-built selective-forgiveness projection
+    # invariant (recoveryIsTheDocumentedProjection) is retired with the
+    # as-built encoding; T-1c.3 adds the failoverPreservesHistory
+    # acceptance invariant and the failover-budget / recovery-projection
+    # verify markers to this check.
     quint-retry-policy-failover = mkQuintCheck {
       name = "retry-policy-failover";
       spec = "retryPolicy";
@@ -1063,10 +1106,12 @@ in
       invariants = [
         "boundsOK"
         "attemptsChargedOnce"
+        "countersRefineHistory"
+        "verdictMatchesFold"
+        "durableMirrorsCharges"
         "noDoubleCount"
         "poisonIsTerminalUntilCleared"
         "cascadeReachesExactlyTheDependents"
-        "recoveryIsTheDocumentedProjection"
         "recoveryNeverFabricatesFailures"
         "placementSound"
         "clearedPoisonClearsDurably"
@@ -1100,54 +1145,17 @@ in
       main = "retryPolicyFailover";
     };
 
-    # Pre-registered expected falsifications (the invariant map's Stage-B
-    # list). Each check passes only while the checker still finds the
-    # documented as-built defect; when Phase 1 lands the adjudicated fix,
-    # the corresponding check is REMOVED and the invariant joins the
-    # regime's HOLD list above (that flip is part of the Phase-1
-    # acceptance criteria, not a silent edit).
-
-    # D1: the same exhausted timeout budget lands as Cancelled (worker
-    # report, E4) or Poisoned (controller report, E7) depending on which
-    # observer reports first; the fold says Cancelled, so the live
-    # verdict diverges from it on the controller-observed history.
-    # r[verify sched.retry.verdict-channel-invariant]
-    quint-retry-policy-divergence-verdict = mkQuintWitnessCheck {
-      name = "retry-policy-divergence-verdict";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "verdictMatchesFold";
-    };
-
-    # D2 + D3 (and the D1 history's poisoned_at): the controller-reported
-    # OOM path's counter charges diverge from the fold -- the at-cap
-    # increment never stamps the window anchor and the promoted arm
-    # charges nothing.
-    quint-retry-policy-divergence-counters = mkQuintWitnessCheck {
-      name = "retry-policy-divergence-counters";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "countersRefineHistory";
-    };
-
-    # D4: the backstop's failed_builders charge has no PG mirror, so the
-    # durable view permanently under-counts the exclusion set.
-    quint-retry-policy-divergence-durable = mkQuintWitnessCheck {
-      name = "retry-policy-divergence-durable";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "durableMirrorsCharges";
-    };
-
-    # C2: the no-report hard-crash loop charges no budget and never
-    # reaches the backstop, so the attempt count exceeds anything the
-    # budgets justify.
-    quint-retry-policy-crash-unbounded = mkQuintWitnessCheck {
-      name = "retry-policy-crash-unbounded";
-      spec = "retryPolicy";
-      main = "retryPolicyCrash";
-      witness = "attemptsBoundedGlobal";
-    };
+    # The pre-registered Stage-B falsification checks
+    # (quint-retry-policy-divergence-{verdict,counters,durable} and
+    # quint-retry-policy-crash-unbounded) are retired: Phase 1b fixed the
+    # documented defects they reproduced (D1/D2/D3/D4/C2) and the
+    # corresponding invariants joined the dual and crash regime HOLD
+    # lists above -- the flip the invariant map's Stage-B section
+    # pre-registered as the Phase-1 acceptance criterion. The
+    # deterministic reproducer runs survive in the named-run checks with
+    # their post-collapse (adjudicated) outcomes, and the establishment /
+    # crash-terminal / tx-failure witnesses below replace the retired
+    # checks' reachability evidence.
 
     # Non-vacuity witnesses for the retryPolicy regimes. Each check
     # passes only when the checker violates its witness -- machine-checked
@@ -1219,16 +1227,19 @@ in
     };
 
     # The controller channel's interesting interleavings are reachable in
-    # the dual regime: the E7 cap poison (the D1 arm), the promoted and
-    # at-cap controller terminations (the D3 / D2 arms), the late
-    # installment (a report correlated through recently_disconnected
+    # the dual regime: the controller-observed timeout cap ending
+    # terminal Cancelled (the post-collapse D1 shape -- the as-built
+    # poison witness has no producer any more, so this witness was
+    # re-pointed at the Cancelled terminal with the Phase-1c flip), the
+    # promoted and at-cap controller terminations (the D3 / D2 arms), the
+    # late installment (a report correlated through recently_disconnected
     # after the disconnect already requeued the derivation), the
     # race-ahead report, and the dispatch-time fleet-exhaust poison.
     quint-retry-policy-witness-controller-cap = mkQuintWitnessCheck {
       name = "retry-policy-witness-controller-cap";
       spec = "retryPolicy";
       main = "retryPolicyDual";
-      witness = "noControllerCapPoison";
+      witness = "noControllerCapCancelled";
     };
     quint-retry-policy-witness-promoted-termination = mkQuintWitnessCheck {
       name = "retry-policy-witness-promoted-termination";
@@ -1261,20 +1272,44 @@ in
       witness = "noFleetExhaustPoison";
     };
 
-    # The failover regime's contended states are reachable: a failover
-    # lands on a non-empty under-budget history, and a best-effort PG
-    # mirror write is actually lost.
+    # The establishment charge is reachable and the crash loop now
+    # terminates: the C2 fix's two non-vacuity probes in the crash
+    # regime, replacing the retired quint-retry-policy-crash-unbounded
+    # expect-violation check's reachability role (that check's
+    # boundedness claim itself is now the attemptsBoundedGlobal HOLD in
+    # the crash regime above).
+    quint-retry-policy-witness-crash-charge = mkQuintWitnessCheck {
+      name = "retry-policy-witness-crash-charge";
+      spec = "retryPolicy";
+      main = "retryPolicyCrash";
+      witness = "noEstablishedCrashCharge";
+    };
+    quint-retry-policy-witness-crash-terminal = mkQuintWitnessCheck {
+      name = "retry-policy-witness-crash-terminal";
+      spec = "retryPolicy";
+      main = "retryPolicyCrash";
+      witness = "noCrashLoopTerminal";
+    };
+
+    # The failover / fault regime's contended states are reachable: a
+    # failover lands on a non-empty under-budget history, and an
+    # appending transaction actually fails (the bounded re-delivery
+    # path). The latter replaces the as-built lost-mirror-write witness
+    # (quint-retry-policy-witness-pg-write-lost, retired): post-066 the
+    # charge, the verdict and the status persist commit or fail as one
+    # transaction, so the independently-lost mirror write it probed is
+    # structurally impossible.
     quint-retry-policy-witness-failover-history = mkQuintWitnessCheck {
       name = "retry-policy-witness-failover-history";
       spec = "retryPolicy";
       main = "retryPolicyFailover";
       witness = "noFailoverWithHistory";
     };
-    quint-retry-policy-witness-pg-write-lost = mkQuintWitnessCheck {
-      name = "retry-policy-witness-pg-write-lost";
+    quint-retry-policy-witness-tx-failure = mkQuintWitnessCheck {
+      name = "retry-policy-witness-tx-failure";
       spec = "retryPolicy";
       main = "retryPolicyFailover";
-      witness = "noPgWriteLost";
+      witness = "noAttemptTxFailure";
     };
 
     # Stage-C calibration witnesses (the historical-fix corpus replayed

@@ -70,3 +70,4 @@ mutants.out*/
 *.qcow2
 .stress-test/
 docs/dist/
+_apalache-out/
