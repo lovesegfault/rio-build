@@ -323,6 +323,24 @@ pub async fn setup(
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,
+        // Native-executor sandbox knobs, resolved once from config. The
+        // host system for the personality decision is the first
+        // advertised system (the native platform by convention).
+        sandbox: Arc::new(crate::executor::SandboxEnvConfig {
+            sandbox_shell: cfg.sandbox_shell.clone(),
+            ca_bundle: cfg.ca_bundle.clone(),
+            extra_sandbox_paths: cfg
+                .extra_sandbox_paths
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            hashed_mirrors: cfg.hashed_mirrors.clone(),
+            host_system: cfg
+                .systems
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "x86_64-linux".to_string()),
+        }),
         hw_bench: Arc::new(std::sync::Mutex::new(Some(hw_bench))),
         completion_pending: Arc::clone(&completion_pending),
     };

@@ -72,7 +72,12 @@ pub(super) async fn upload_outputs_batch(
             let idx = idx as u32;
 
             // Metadata message (trailer mode — empty hash/size).
-            let info = trailer_mode_path_info(&p.store_path, &deriver_owned, &p.references);
+            let info = trailer_mode_path_info(
+                &p.store_path,
+                &deriver_owned,
+                &p.references,
+                p.content_address.as_deref(),
+            );
             tx.send(PutPathBatchRequest {
                 output_index: idx,
                 inner: Some(PutPathRequest {
@@ -154,6 +159,7 @@ pub(super) async fn upload_outputs_batch(
             nar_size,
             p.references.clone(),
             deriver,
+            p.content_address.clone(),
         )?);
     }
 

@@ -175,6 +175,22 @@
           "type": "string"
         },
         "default": []
+      },
+      "sandbox_shell": {
+        "description": "Host path of a static POSIX shell exposed as `/bin/sh` inside\nevery build sandbox. nixpkgs builds assume `/bin/sh` exists (the\ndaemon-era sandbox provided busybox baked into the Nix binary;\nthe native executor must be told where one lives in the worker\nimage). Empty disables the mount — only viable for corpora whose\nbuilders never invoke `/bin/sh`. Env: `RIO_SANDBOX_SHELL`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "ca_bundle": {
+        "description": "Host path of the CA bundle exposed read-only at\n`/etc/ssl/certs/ca-certificates.crt` for network (fixed-output)\nbuilds. The mount is optional-if-missing, so the default points\nat the conventional location in the worker image. Env:\n`RIO_CA_BUNDLE`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": "/etc/ssl/certs/ca-certificates.crt"
       }
     },
     "$defs": {
@@ -242,6 +258,8 @@
     "max_silent_time_secs": 0,
     "idle_secs": 120,
     "hashed_mirrors": [],
-    "extra_sandbox_paths": []
+    "extra_sandbox_paths": [],
+    "sandbox_shell": null,
+    "ca_bundle": "/etc/ssl/certs/ca-certificates.crt"
   }
 }

@@ -213,8 +213,32 @@ pub struct Config {
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     #[schemars(with = "Vec<String>")]
     pub extra_sandbox_paths: Vec<String>,
+    /// Host path of a static POSIX shell exposed as `/bin/sh` inside
+    /// every build sandbox. nixpkgs builds assume `/bin/sh` exists (the
+    /// daemon-era sandbox provided busybox baked into the Nix binary;
+    /// the native executor must be told where one lives in the worker
+    /// image). Empty disables the mount — only viable for corpora whose
+    /// builders never invoke `/bin/sh`. Env: `RIO_SANDBOX_SHELL`.
+    #[serde(default)]
+    pub sandbox_shell: Option<std::path::PathBuf>,
+    /// Host path of the CA bundle exposed read-only at
+    /// `/etc/ssl/certs/ca-certificates.crt` for network (fixed-output)
+    /// builds. The mount is optional-if-missing, so the default points
+    /// at the conventional location in the worker image. Env:
+    /// `RIO_CA_BUNDLE`.
+    #[serde(default = "default_ca_bundle")]
+    pub ca_bundle: Option<std::path::PathBuf>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
+}
+
+/// Default CA bundle location in the worker image (Debian/NixOS
+/// convention). The sandbox mount is `optional`, so a missing file
+/// simply omits the mount instead of failing the build.
+fn default_ca_bundle() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(
+        "/etc/ssl/certs/ca-certificates.crt",
+    ))
 }
 
 impl Default for Config {
@@ -252,6 +276,8 @@ impl Default for Config {
             idle_timeout: std::time::Duration::from_secs(120),
             hashed_mirrors: Vec::new(),
             extra_sandbox_paths: Vec::new(),
+            sandbox_shell: None,
+            ca_bundle: default_ca_bundle(),
         }
     }
 }

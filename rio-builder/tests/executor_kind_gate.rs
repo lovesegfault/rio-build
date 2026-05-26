@@ -37,6 +37,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         fuse_cache: None,
         fuse_fetch_timeout: std::time::Duration::from_secs(60),
         cancelled: Arc::new(AtomicBool::new(false)),
+        sandbox: Arc::new(rio_builder::executor::SandboxEnvConfig::default()),
     }
 }
 

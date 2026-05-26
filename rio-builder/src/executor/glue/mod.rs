@@ -196,8 +196,12 @@ pub(crate) struct PlannedOutput {
 pub(crate) struct PreparedBuild {
     pub request: ExecutionRequest,
     /// Placeholder → in-sandbox path map used while constructing the
-    /// request. The result glue needs it again for floating-CA
-    /// finalization (scratch → final rewrites compose with it).
+    /// request. The floating-CA finalization derives its own
+    /// scratch→final rewrites from the planned outputs, so nothing
+    /// reads this yet; it is kept because the upload-threading
+    /// follow-up (TODO(M8) in `collect_native_outputs`) needs the same
+    /// map to translate placeholder references in failure diagnostics.
+    #[allow(dead_code)]
     pub input_rewrites: BTreeMap<String, String>,
     /// Outputs in derivation declaration order.
     pub outputs: Vec<PlannedOutput>,

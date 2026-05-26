@@ -169,6 +169,9 @@ pub struct BuildSpawnContext {
     /// `relay_loop`. The drain machinery gates exit on this (NOT
     /// `slot.is_busy()` alone) — see `wait_build_flushed`. bug_472.
     pub completion_pending: Arc<AtomicBool>,
+    /// Worker-level sandbox configuration for the native executor
+    /// (shell, CA bundle, extra mounts, hashed mirrors, host system).
+    pub sandbox: Arc<executor::SandboxEnvConfig>,
 }
 
 impl BuildSpawnContext {
@@ -241,6 +244,7 @@ impl BuildSpawnContext {
             fuse_cache: Some(Arc::clone(&self.fuse_cache)),
             fuse_fetch_timeout: self.fuse_fetch_timeout,
             cancelled,
+            sandbox: Arc::clone(&self.sandbox),
         }
     }
 }

@@ -630,6 +630,18 @@
         "type": "list<string>",
         "default": "[]",
         "description": "Extra host paths bind-mounted read-only into every build sandbox (same path inside and outside)."
+      },
+      {
+        "key": "sandbox_shell",
+        "type": "string",
+        "default": "",
+        "description": "Host path of a static POSIX shell exposed as `/bin/sh` inside every build sandbox. nixpkgs builds assume `/bin/sh` exists (the daemon-era sandbox provided busybox baked into the Nix binary; the native executor must be told where one lives in the worker image)."
+      },
+      {
+        "key": "ca_bundle",
+        "type": "string",
+        "default": "/etc/ssl/certs/ca-certificates.crt",
+        "description": "Host path of the CA bundle exposed read-only at `/etc/ssl/certs/ca-certificates.crt` for network (fixed-output) builds."
       }
     ],
     "controller": [

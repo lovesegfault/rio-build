@@ -70,6 +70,7 @@ pub(super) async fn upload_output(
         store_path,
         parsed: parsed_path,
         references,
+        content_address,
         ..
     } = prepared;
 
@@ -100,6 +101,7 @@ pub(super) async fn upload_output(
             assignment_token,
             deriver,
             &references,
+            content_address.as_deref(),
         )
         .await
         {
@@ -112,7 +114,14 @@ pub(super) async fn upload_output(
                     nar_hash = %hex::encode(nar_hash),
                     "upload complete"
                 );
-                return uploaded_info(parsed_path, nar_hash, nar_size, references, deriver);
+                return uploaded_info(
+                    parsed_path,
+                    nar_hash,
+                    nar_size,
+                    references,
+                    deriver,
+                    content_address,
+                );
             }
             // r[impl builder.upload.aborted-poll]
             Err(e) if is_concurrent_put_path(&e) => {
@@ -239,6 +248,7 @@ async fn do_upload_streaming(
     assignment_token: &str,
     deriver: &str,
     references: &[String],
+    content_address: Option<&str>,
 ) -> Result<([u8; 32], u64), tonic::Status> {
     // Channel bridges sync `dump_path_streaming` (spawn_blocking) to async
     // gRPC. Backpressure: when full, `blocking_send` inside the writer
@@ -248,7 +258,7 @@ async fn do_upload_streaming(
     // First message: metadata with EMPTY hash/size → trailer mode. Send
     // this from the async side BEFORE spawning the blocking task, so the
     // message order is guaranteed (metadata must be first; chunks follow).
-    let info = trailer_mode_path_info(store_path, deriver, references);
+    let info = trailer_mode_path_info(store_path, deriver, references, content_address);
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),

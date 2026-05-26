@@ -38,13 +38,13 @@ use crate::log_stream::{LogBatcher, LogLimits};
 use crate::overlay;
 use crate::upload;
 
+// Daemon-era execution path (nix-daemon spawn + worker-protocol drive).
+// Unreferenced since the native-executor activation; kept compiling (its
+// unit tests still run) until the teardown milestone deletes it.
+#[allow(dead_code)] // removed in the teardown milestone (M8)
 mod daemon;
 // Native-executor request glue: Derivation → rio_exec::ExecutionRequest
-// + the `@nix` log filter. Not yet wired into execute_build — the
-// activation milestone replaces run_daemon_lifecycle with
-// rio_exec::execute() and consumes this module; until then it is
-// compiled + unit-tested standalone.
-#[allow(dead_code)] // removed at activation (M7)
+// + the `@nix` log filter.
 pub(crate) mod glue;
 mod inputs;
 mod monitors;
@@ -56,13 +56,15 @@ mod native_result;
 #[doc(hidden)]
 pub mod differential;
 mod outputs;
+// Daemon-era synthetic store DB + nix.conf generation. Unreferenced
+// since the native-executor activation; deleted in the teardown
+// milestone together with `daemon/`.
+#[allow(dead_code)] // removed in the teardown milestone (M8)
 mod sandbox;
 
-use daemon::{DaemonBuildOpts, run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests};
 use monitors::{drain_build_cgroup, spawn_cgroup_monitors};
-use outputs::{BuildOutputs, collect_outputs};
-use sandbox::prepare_sandbox;
+use outputs::{BuildOutputs, collect_native_outputs};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -150,6 +152,30 @@ pub struct ExecutorEnv {
     /// one in `BuildSlot.cancel` and the one `spawn_build_task` reads to
     /// classify the final `Err`.
     pub cancelled: Arc<AtomicBool>,
+    /// Worker-level sandbox configuration shared by every build on this
+    /// pod (shell, CA bundle, operator extra mounts, hashed mirrors).
+    /// Bundled so a new sandbox knob is one field here + one line in
+    /// `runtime::setup` instead of churn at every construction site.
+    pub sandbox: Arc<SandboxEnvConfig>,
+}
+
+/// Worker-level inputs to [`glue::SandboxOptions`], resolved once at
+/// startup from [`crate::config::Config`].
+#[derive(Debug, Default)]
+pub struct SandboxEnvConfig {
+    /// Static shell exposed as `/bin/sh` inside the sandbox
+    /// (`Config.sandbox_shell`).
+    pub sandbox_shell: Option<std::path::PathBuf>,
+    /// CA bundle for network (fixed-output) builds (`Config.ca_bundle`).
+    pub ca_bundle: Option<std::path::PathBuf>,
+    /// Operator extra read-only bind mounts (`Config.extra_sandbox_paths`).
+    pub extra_sandbox_paths: Vec<std::path::PathBuf>,
+    /// Hashed-mirror base URLs for `builtin:fetchurl`
+    /// (`Config.hashed_mirrors`).
+    pub hashed_mirrors: Vec<String>,
+    /// The worker's own platform (first entry of the advertised
+    /// `systems` list), for the 32-bit `personality(2)` decision.
+    pub host_system: String,
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -220,6 +246,21 @@ pub enum ExecutorError {
     /// variant just makes the pre-cgroup abort explicit in logs.
     #[error("build cancelled before cgroup creation")]
     Cancelled,
+    /// The request glue rejected the derivation (unsupported builtin,
+    /// malformed structuredAttrs, exportReferencesGraph outside the
+    /// closure, …). Per `GlueError`'s contract these are all input
+    /// problems — deterministic per-derivation, so they map to
+    /// `InputRejected` (see [`ExecutorError::is_permanent`]) instead of
+    /// burning fleet retries.
+    #[error("derivation rejected by the request glue: {0}")]
+    Glue(String),
+    /// The native sandbox failed to set up (host-side skeleton build,
+    /// fork/pipe plumbing, or an in-child setup phase reported over the
+    /// status pipe). The build itself never ran. Worker-local and
+    /// usually transient (FS race, FUSE hiccup while bind-mounting an
+    /// input) — retried locally like the daemon-era spawn failures.
+    #[error("native sandbox setup failed: {0}")]
+    SandboxSetup(String),
 }
 
 impl ExecutorError {
@@ -242,6 +283,12 @@ impl ExecutorError {
         match self {
             ExecutorError::DaemonSpawn(_) => true,
             ExecutorError::Handshake(_) => true,
+            // Native-executor sandbox setup failures occupy the same
+            // slot the daemon spawn/handshake failures did: the build
+            // never ran, the cause is worker-local (mount race, FUSE
+            // blip while binding an input), and a bounded local retry
+            // is far cheaper than a scheduler round-trip.
+            ExecutorError::SandboxSetup(_) => true,
             ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(e)) => {
                 e.kind() == std::io::ErrorKind::UnexpectedEof
             }
@@ -273,6 +320,11 @@ impl ExecutorError {
             // .drv content failed UTF-8/ATerm/BasicDerivation parse.
             // The bytes are what they are; every pod parses identically.
             | ExecutorError::InvalidDerivation(_)
+            // The request glue's rejections are all derivation-shaped
+            // input problems (unsupported builtin, bad structuredAttrs,
+            // graph reference outside the closure, …) — identical on
+            // every pod by construction.
+            | ExecutorError::Glue(_)
         )
     }
 }
@@ -412,11 +464,12 @@ enum PreDaemon {
     /// stays exhaustive in both feature configurations.
     #[cfg(feature = "test-fixtures")]
     Fixture(ExecutionResult),
-    /// Daemon ran; carry locals needed for the post-daemon section.
+    /// The build ran (natively); carry locals needed for the
+    /// post-build section.
     Ran {
         overlay_mount: overlay::OverlayMount,
         input_paths: Vec<String>,
-        outcome: DaemonOutcome,
+        outcome: NativeOutcome,
     },
 }
 
@@ -651,16 +704,10 @@ pub async fn execute_build(
                 return Ok(PreDaemon::Fixture(r));
             }
 
-            // 4. Populate sandbox: synth DB, nix.conf.
-            prepare_sandbox(
-                &overlay_mount,
-                &drv,
-                drv_path,
-                input_metadata,
-                effective_cores,
-                &env.systems,
-            )
-            .await?;
+            // 4. (native executor) No synthetic store DB and no nix.conf:
+            // the request glue + rio-exec sandbox replace the daemon-era
+            // scaffolding. `input_metadata` flows into the glue (env/refs
+            // planning) and the result pipeline (closure policy checks).
 
             // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
             // closure as the FUSE `lookup()` allowlist. The daemon's first
@@ -703,30 +750,26 @@ pub async fn execute_build(
                 prefetch_manifests(store_client, cache, &input_paths).await;
             }
 
-            // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
-            //
-            // The daemon reads/writes the chroot store at the per-build dir:
-            //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
-            //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
-            //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
-            //
-            // Its OWN binary + libs come from host `/nix/store` (the builder's
-            // namespace) — structurally separate from the per-build store, so a
-            // build whose `$out` collides with the daemon's runtime closure
-            // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
-            // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
-            // canonical `/nix/store/...`.
+            // 5. Run the build natively: request glue → rio-exec sandbox →
+            // exit classification → output pipeline. The sandbox's
+            // `/nix/store` is the overlay *merged* view (FUSE-backed inputs
+            // ∪ upper layer); outputs written through it land in the upper
+            // layer where `collect_native_outputs` reads them.
             let opts = resolve_build_opts(assignment, env, effective_cores, batcher_seed);
 
-            let outcome = run_daemon_lifecycle(
-                &overlay_mount,
+            let outcome = run_native_lifecycle(NativeLifecycleArgs {
+                overlay_mount: &overlay_mount,
                 env,
-                &build_id,
+                build_id: &build_id,
                 drv_path,
-                &basic_drv,
+                drv: &drv,
+                basic_drv: &basic_drv,
+                input_paths: &input_paths,
+                input_metadata: &input_metadata,
                 opts,
+                is_fod,
                 log_tx,
-            )
+            })
             .await?;
 
             Ok(PreDaemon::Ran {
@@ -752,7 +795,7 @@ pub async fn execute_build(
             overlay_mount,
             input_paths,
             outcome:
-                DaemonOutcome {
+                NativeOutcome {
                     build_result,
                     peak_memory_bytes,
                     peak_cpu_cores,
@@ -786,7 +829,7 @@ pub async fn execute_build(
     // output. If NO attempt ran a daemon, the runtime sends no footer:
     // header with no output and no footer is the documented signal
     // that the build never started.
-    let footer_result = footer_result_str(&build_result);
+    let footer_result = footer_result_native(&build_result);
 
     // ── Post-daemon: peaks now in scope; carry across every Err. ──────
     // r[impl builder.cgroup.memory-peak+2]
@@ -815,20 +858,36 @@ pub async fn execute_build(
     // is `is_daemon_transient()` → the retry loop at runtime/mod.rs calls
     // back in instead of exiting, so the worker would block across the
     // retry and starve heartbeats.
-    let collect_result = match build_result {
+    let collect_result: Result<BuildOutputs, ExecutorError> = match build_result {
         Err(e) => Err(e),
-        Ok(br) => collect_outputs(
-            &br,
-            store_client,
-            &overlay_mount,
-            &drv,
-            drv_path,
-            is_fod,
-            &input_paths,
-            &assignment.assignment_token,
-        )
-        .await
-        .map(|o| (br, o)),
+        // The build ran and failed: the status was already classified by
+        // the native pipeline (exit classification or output rejection);
+        // nothing to upload.
+        Ok(NativeBuild::Failed {
+            status, error_msg, ..
+        }) => {
+            tracing::warn!(drv_path = %drv_path, ?status, error = %error_msg, "build failed");
+            Ok(outputs::native_failed(status, error_msg))
+        }
+        Ok(NativeBuild::Succeeded {
+            processed,
+            start_time,
+            stop_time,
+        }) => {
+            collect_native_outputs(
+                &processed,
+                store_client,
+                &overlay_mount,
+                &drv,
+                drv_path,
+                is_fod,
+                &input_paths,
+                &assignment.assignment_token,
+                start_time,
+                stop_time,
+            )
+            .await
+        }
     };
 
     // 11. Tear down overlay UNCONDITIONALLY via spawn_blocking — covers
@@ -859,8 +918,8 @@ pub async fn execute_build(
 
     // Propagate any daemon/collect error AFTER teardown ran — WITH peaks
     // attached, not via `?`.
-    let (_build_result, BuildOutputs { proto_result }) = match collect_result {
-        Ok(pair) => pair,
+    let BuildOutputs { proto_result } = match collect_result {
+        Ok(outputs) => outputs,
         Err(e) => return post_err(e),
     };
 
@@ -974,6 +1033,7 @@ fn resolve_build_opts(
 /// Result of [`run_daemon_lifecycle`]: the inner build result (NOT yet
 /// `?`-propagated — cgroup teardown must run regardless) plus the
 /// resource samples read from the per-build cgroup before it was dropped.
+#[allow(dead_code)] // daemon-era path; removed in the teardown milestone (M8)
 struct DaemonOutcome {
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
     peak_memory_bytes: u64,
@@ -995,6 +1055,7 @@ struct DaemonOutcome {
 /// daemon for those). Any error from `run_daemon_build` itself is carried
 /// in `DaemonOutcome.build_result` so the caller can propagate it AFTER
 /// the cgroup has been torn down.
+#[allow(dead_code)] // daemon-era path; removed in the teardown milestone (M8)
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 async fn run_daemon_lifecycle(
     overlay_mount: &overlay::OverlayMount,
@@ -1005,6 +1066,7 @@ async fn run_daemon_lifecycle(
     opts: BuildOpts,
     log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<DaemonOutcome, ExecutorError> {
+    use daemon::{DaemonBuildOpts, run_daemon_build, spawn_daemon_in_namespace};
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
     let mut daemon = spawn_daemon_in_namespace(overlay_mount).await?;
     tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
@@ -1151,6 +1213,7 @@ async fn run_daemon_lifecycle(
 /// (drv isn't broken). `Ok` → kept; metric still emitted because the
 /// OOM is a real sizing signal.
 // r[impl builder.oom.cgroup-watch+3]
+#[allow(dead_code)] // daemon-era path; the native lifecycle folds the OOM signal into classify_exit
 fn apply_oom_override(
     oom_detected: bool,
     build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
@@ -1169,6 +1232,480 @@ fn apply_oom_override(
             build_result
         }
         (false, _) => build_result,
+    }
+}
+
+/// Arguments for [`run_native_lifecycle`] — bundled to stay under
+/// `clippy::too_many_arguments` (same convention as [`BuildOpts`]).
+struct NativeLifecycleArgs<'a> {
+    overlay_mount: &'a overlay::OverlayMount,
+    env: &'a ExecutorEnv,
+    build_id: &'a str,
+    drv_path: &'a str,
+    drv: &'a Derivation,
+    basic_drv: &'a rio_nix::derivation::BasicDerivation,
+    input_paths: &'a [String],
+    input_metadata: &'a [ValidatedPathInfo],
+    opts: BuildOpts,
+    is_fod: bool,
+    log_tx: &'a mpsc::Sender<ExecutorMessage>,
+}
+
+/// What the native pipeline produced for one build attempt.
+enum NativeBuild {
+    /// The builder exited 0 and the output pipeline (canonicalise, scan,
+    /// policy checks, floating-CA finalization) accepted every output.
+    Succeeded {
+        processed: native_result::ProcessedOutputs,
+        start_time: u64,
+        stop_time: u64,
+    },
+    /// The build ran (or was prevented from running by an
+    /// already-classified condition) and failed. `status`/`error_msg`
+    /// are final — `collect` only wraps them into the proto result.
+    Failed {
+        status: rio_proto::types::BuildResultStatus,
+        error_msg: String,
+        #[allow(dead_code)] // kept for symmetry / future failed-build telemetry
+        start_time: u64,
+        #[allow(dead_code)]
+        stop_time: u64,
+    },
+}
+
+/// Result of [`run_native_lifecycle`]: same contract as the daemon-era
+/// [`DaemonOutcome`] — the inner result is NOT yet `?`-propagated so the
+/// caller can tear down the overlay first, and the cgroup peaks are
+/// already sampled because the cgroup is gone by the time this returns.
+struct NativeOutcome {
+    build_result: Result<NativeBuild, ExecutorError>,
+    peak_memory_bytes: u64,
+    peak_cpu_cores: f64,
+    final_line_count: u64,
+}
+
+/// Run one build through the native executor stack:
+/// request glue → `rio_exec::execute` → exit classification → output
+/// pipeline. Owns the per-build cgroup and the log-message bookkeeping
+/// (batcher, `@nix` phase frames, flush ticks) for the duration.
+///
+/// Returns `Err` only for failures BEFORE the cgroup kill-guard is in
+/// place (cgroup create). Everything after — including sandbox setup
+/// failures reported by rio-exec — is carried in
+/// `NativeOutcome.build_result` so the caller tears down the overlay
+/// before propagating.
+// r[impl builder.cores.cgroup-clamp+2]
+// r[impl builder.silence.timeout-kill+2]
+// r[impl builder.stderr.forward-set-phase]
+#[instrument(skip_all, fields(drv_path = %args.drv_path))]
+async fn run_native_lifecycle(
+    args: NativeLifecycleArgs<'_>,
+) -> Result<NativeOutcome, ExecutorError> {
+    let NativeLifecycleArgs {
+        overlay_mount,
+        env,
+        build_id,
+        drv_path,
+        drv,
+        basic_drv,
+        input_paths,
+        input_metadata,
+        opts,
+        is_fod,
+        log_tx,
+    } = args;
+
+    // ── Per-build cgroup (same name the cancel registry predicts). ──────
+    let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, build_id)
+        .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
+    let cgroup_kill_path = build_cgroup.path().to_path_buf();
+    let cgroup_kill_guard = scopeguard::guard(cgroup_kill_path.clone(), |p| {
+        let _ = std::fs::write(p.join("cgroup.kill"), "1");
+    });
+    let monitors = spawn_cgroup_monitors(&build_cgroup, &env.cgroup_parent);
+
+    // ── Host-side directories for the sandbox. ──────────────────────────
+    // Both live under the overlay root so `teardown_overlay`'s
+    // remove_dir_all reclaims them with everything else.
+    let build_dir = overlay_mount.root_dir().join("build");
+    let chroot_dir = overlay_mount.root_dir().join("chroot");
+    for d in [&build_dir, &chroot_dir] {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return Err(ExecutorError::SandboxSetup(format!(
+                "creating {} failed: {e}",
+                d.display()
+            )));
+        }
+    }
+
+    // ── Request glue. ────────────────────────────────────────────────────
+    let paths = glue::SandboxPaths {
+        build_dir: build_dir.clone(),
+        merged_store: overlay_mount.merged_dir().to_path_buf(),
+    };
+    let sandbox_cfg = &env.sandbox;
+    let glue_opts = glue::SandboxOptions {
+        build_cores: u32::try_from(opts.build_cores).unwrap_or(u32::MAX),
+        // The sandbox identity is fixed (single build per pod); the
+        // numeric values match the design and the rio-exec defaults.
+        uid: SANDBOX_BUILD_UID,
+        gid: SANDBOX_BUILD_GID,
+        sandbox_shell: sandbox_cfg.sandbox_shell.clone(),
+        extra_sandbox_paths: sandbox_cfg.extra_sandbox_paths.clone(),
+        // Operator-scoped impurities for FOD `impureEnvVars`. Not yet a
+        // config surface — the daemon-era nix.conf never carried one
+        // either; revisit when an operator asks.
+        impure_env: std::collections::BTreeMap::new(),
+        ca_bundle: sandbox_cfg.ca_bundle.clone(),
+        extra_devices: if std::path::Path::new("/dev/kvm").exists() {
+            vec![std::path::PathBuf::from("/dev/kvm")]
+        } else {
+            Vec::new()
+        },
+        host_system: sandbox_cfg.host_system.clone(),
+        timeout: Some(opts.timeout),
+        max_silent: (opts.max_silent_time > 0).then(|| Duration::from_secs(opts.max_silent_time)),
+        // Log-volume limits stay with the LogBatcher (bytes) and the
+        // NixLogFilter (lines) so the native path keeps the daemon-era
+        // semantics exactly; rio-exec's own byte cap stays off.
+        max_log_bytes: None,
+        cgroup: Some(cgroup_kill_path.clone()),
+        hashed_mirrors: sandbox_cfg.hashed_mirrors.clone(),
+        builder_binary: std::env::current_exe().ok(),
+        netrc: None,
+    };
+
+    let plan = match glue::derivation_into_request(
+        drv_path,
+        basic_drv,
+        input_paths,
+        input_metadata,
+        &paths,
+        &glue_opts,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            // Input-shaped rejection: report through the normal result
+            // channel (the caller maps Glue → InputRejected) after the
+            // cgroup has been drained below.
+            monitors.stop();
+            drain_build_cgroup(build_cgroup).await;
+            scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            return Ok(NativeOutcome {
+                build_result: Err(ExecutorError::Glue(e.to_string())),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                final_line_count: opts.batcher_seed,
+            });
+        }
+    };
+    let prepared = match plan {
+        glue::GluePlan::Sandbox(p) | glue::GluePlan::BuiltinFetchurl(p) => *p,
+    };
+
+    // ── Execute + stream logs. ───────────────────────────────────────────
+    let host = rio_exec::HostLayout {
+        chroot_dir: chroot_dir.clone(),
+    };
+    let batcher = LogBatcher::new(
+        drv_path.to_owned(),
+        env.executor_id.clone(),
+        env.log_limits,
+        opts.batcher_seed,
+    );
+    let (event_tx, event_rx) = mpsc::channel::<rio_exec::ExecEvent>(256);
+    let log_task = tokio::spawn(native_log_loop(
+        event_rx,
+        batcher,
+        log_tx.clone(),
+        cgroup_kill_path.clone(),
+    ));
+
+    let start_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exec_result = rio_exec::execute(&prepared.request, &host, event_tx).await;
+    let stop_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let LogLoopResult {
+        final_line_count,
+        log_limit_exceeded,
+    } = log_task.await.unwrap_or(LogLoopResult {
+        final_line_count: opts.batcher_seed,
+        log_limit_exceeded: false,
+    });
+
+    // ── Resource samples + cgroup teardown. ──────────────────────────────
+    let (peak_cpu_cores, oom_detected) = monitors.stop();
+    let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
+    drain_build_cgroup(build_cgroup).await;
+    scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+
+    // ── Classify + process outputs. ──────────────────────────────────────
+    let build_result: Result<NativeBuild, ExecutorError> = match exec_result {
+        Err(rio_exec::ExecError::InvalidRequest(msg)) => {
+            // The glue validates before returning, so this is unreachable
+            // in practice; classify as an input problem if it ever fires.
+            Err(ExecutorError::InvalidDerivation(format!(
+                "execution request rejected: {msg}"
+            )))
+        }
+        Err(
+            e @ (rio_exec::ExecError::Skeleton(_)
+            | rio_exec::ExecError::Spawn(_)
+            | rio_exec::ExecError::Setup(_)),
+        ) => {
+            if oom_detected {
+                metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+                Err(ExecutorError::CgroupOom)
+            } else {
+                Err(ExecutorError::SandboxSetup(e.to_string()))
+            }
+        }
+        Ok(outcome) => {
+            // Disk-full probe on the scratch space the build writes to.
+            let disk_full =
+                native_result::disk_full_probe(&[&overlay_mount.upper_store(), &build_dir]);
+            let exit = if log_limit_exceeded {
+                rio_exec::ExitOutcome::LogLimitExceeded
+            } else {
+                outcome.exit
+            };
+            match native_result::classify_exit(exit, is_fod, disk_full, oom_detected) {
+                native_result::ExitClassification::Failed { status, error_msg } => {
+                    if oom_detected
+                        && status != rio_proto::types::BuildResultStatus::InfrastructureFailure
+                    {
+                        // Keep the daemon-era CgroupOom semantics: an OOM
+                        // plus any failure is the worker being undersized,
+                        // not the derivation being broken.
+                        metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+                        Err(ExecutorError::CgroupOom)
+                    } else {
+                        Ok(NativeBuild::Failed {
+                            status,
+                            error_msg,
+                            start_time,
+                            stop_time,
+                        })
+                    }
+                }
+                native_result::ExitClassification::Success => {
+                    // Output pipeline does sync filesystem walks + NAR
+                    // streaming; keep it off the async workers.
+                    let to_process: Vec<native_result::OutputToProcess> = prepared
+                        .outputs
+                        .iter()
+                        .map(|po| {
+                            let basename =
+                                rio_nix::store_path::basename(&po.path).unwrap_or(po.path.as_str());
+                            native_result::OutputToProcess {
+                                name: po.name.clone(),
+                                store_path: po.path.clone(),
+                                host_path: overlay_mount.upper_store().join(basename),
+                            }
+                        })
+                        .collect();
+                    let drv_owned = drv.clone();
+                    let metadata_owned: Vec<ValidatedPathInfo> = input_metadata.to_vec();
+                    let processed = tokio::task::spawn_blocking(move || {
+                        native_result::process_outputs(
+                            &drv_owned,
+                            &to_process,
+                            SANDBOX_BUILD_UID,
+                            &metadata_owned,
+                        )
+                    })
+                    .await;
+                    match processed {
+                        Err(join_err) => Err(ExecutorError::SandboxSetup(format!(
+                            "output processing task panicked: {join_err}"
+                        ))),
+                        Ok(Ok(processed)) => Ok(NativeBuild::Succeeded {
+                            processed,
+                            start_time,
+                            stop_time,
+                        }),
+                        Ok(Err(rejection)) => {
+                            // Every rejection (policy violation, FOD with
+                            // references, canonicalisation failure, …)
+                            // reports as OutputRejected — the proto has no
+                            // finer-grained hash-mismatch status; the
+                            // distinction lives in the error message.
+                            Ok(NativeBuild::Failed {
+                                status: rio_proto::types::BuildResultStatus::OutputRejected,
+                                error_msg: rejection.to_string(),
+                                start_time,
+                                stop_time,
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Cancellation: the cancel path SIGKILLs the cgroup, which surfaces
+    // here as a failed/killed build. Convert to the dedicated error so
+    // the runtime reports `Cancelled` instead of a spurious failure.
+    let build_result = if env.cancelled.load(Ordering::Acquire)
+        && !matches!(build_result, Ok(NativeBuild::Succeeded { .. }))
+    {
+        Err(ExecutorError::Cancelled)
+    } else {
+        build_result
+    };
+
+    Ok(NativeOutcome {
+        build_result,
+        peak_memory_bytes,
+        peak_cpu_cores,
+        final_line_count,
+    })
+}
+
+/// uid/gid the sandboxed builder runs as. Single build per pod, so a
+/// fixed identity is sufficient; the values match the design (and what
+/// nixpkgs' own sandbox tests assume).
+const SANDBOX_BUILD_UID: u32 = 1000;
+const SANDBOX_BUILD_GID: u32 = 100;
+
+/// What [`native_log_loop`] reports back to the lifecycle.
+struct LogLoopResult {
+    final_line_count: u64,
+    log_limit_exceeded: bool,
+}
+
+/// Consume the rio-exec event stream: classify each captured line with
+/// the `@nix` filter, batch ordinary lines, forward `setPhase` frames,
+/// and enforce the line/byte caps — the message-side bookkeeping that
+/// lived in the daemon-era stderr loop.
+///
+/// Daemon-era semantics preserved (normative):
+/// - phase frames flush pending log lines first and never reset the
+///   silence deadline (the deadline lives in rio-exec, which never sees
+///   the frame);
+/// - the byte cap (`LogLimits.total_bytes`) and the line cap
+///   (`MAX_BUILD_LOG_LINES`) abort the build by killing the cgroup; the
+///   lifecycle then reports `LogLimitExceeded`.
+async fn native_log_loop(
+    mut events: mpsc::Receiver<rio_exec::ExecEvent>,
+    mut batcher: LogBatcher,
+    log_tx: mpsc::Sender<ExecutorMessage>,
+    cgroup_path: std::path::PathBuf,
+) -> LogLoopResult {
+    use crate::log_stream::AddLineResult;
+    use rio_proto::types::executor_message;
+
+    let mut filter = glue::log::NixLogFilter::new();
+    let mut log_limit_exceeded = false;
+    let mut flush_tick = tokio::time::interval(Duration::from_millis(100));
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let send = |msg: ExecutorMessage, log_tx: &mpsc::Sender<ExecutorMessage>| {
+        let log_tx = log_tx.clone();
+        async move { log_tx.send(msg).await.is_ok() }
+    };
+
+    loop {
+        tokio::select! {
+            ev = events.recv() => {
+                let Some(ev) = ev else { break };
+                let rio_exec::ExecEvent::Log { line, .. } = ev else {
+                    continue;
+                };
+                if log_limit_exceeded {
+                    // Already aborting; drain the channel so rio-exec's
+                    // reader threads never block on a full channel.
+                    continue;
+                }
+                match filter.handle(&line) {
+                    glue::log::LineAction::Forward(l) => match batcher.add_line(l) {
+                        AddLineResult::Buffered => {}
+                        AddLineResult::BatchReady(batch) => {
+                            let msg = ExecutorMessage {
+                                msg: Some(executor_message::Msg::LogBatch(batch)),
+                            };
+                            if !send(msg, &log_tx).await {
+                                break;
+                            }
+                        }
+                        AddLineResult::LimitExceeded { .. } => {
+                            log_limit_exceeded = true;
+                            let _ = std::fs::write(cgroup_path.join("cgroup.kill"), "1");
+                        }
+                    },
+                    glue::log::LineAction::Phase(phase) => {
+                        // r[impl builder.stderr.forward-set-phase]
+                        if batcher.has_pending() {
+                            let msg = ExecutorMessage {
+                                msg: Some(executor_message::Msg::LogBatch(batcher.flush())),
+                            };
+                            if !send(msg, &log_tx).await {
+                                break;
+                            }
+                        }
+                        let msg = ExecutorMessage {
+                            msg: Some(executor_message::Msg::Phase(rio_proto::types::BuildPhase {
+                                derivation_path: batcher.drv_path().to_owned(),
+                                phase,
+                            })),
+                        };
+                        if !send(msg, &log_tx).await {
+                            break;
+                        }
+                    }
+                    glue::log::LineAction::Consumed => {}
+                    glue::log::LineAction::CapExceeded => {
+                        log_limit_exceeded = true;
+                        let _ = std::fs::write(cgroup_path.join("cgroup.kill"), "1");
+                    }
+                }
+            }
+            _ = flush_tick.tick() => {
+                if let Some(batch) = batcher.maybe_flush() {
+                    let msg = ExecutorMessage {
+                        msg: Some(executor_message::Msg::LogBatch(batch)),
+                    };
+                    if !send(msg, &log_tx).await {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Final flush: whatever is still buffered when the build's capture
+    // stream closes.
+    if batcher.has_pending() {
+        let msg = ExecutorMessage {
+            msg: Some(executor_message::Msg::LogBatch(batcher.final_flush())),
+        };
+        let _ = log_tx.send(msg).await;
+    }
+
+    LogLoopResult {
+        final_line_count: batcher.line_count(),
+        log_limit_exceeded,
+    }
+}
+
+/// One-line footer summary for the native pipeline (the `rio: result`
+/// banner line). Mirrors the daemon-era [`footer_result_str`] domain.
+fn footer_result_native(build_result: &Result<NativeBuild, ExecutorError>) -> String {
+    use rio_proto::types::BuildResultStatus;
+    match build_result {
+        Ok(NativeBuild::Succeeded { .. }) => "ok".to_string(),
+        Ok(NativeBuild::Failed { status, .. }) => match status {
+            BuildResultStatus::TimedOut => "failed (timed out)".to_string(),
+            BuildResultStatus::LogLimitExceeded => "failed (log limit exceeded)".to_string(),
+            other => format!("failed ({other:?})"),
+        },
+        Err(_) => "failed (executor error)".to_string(),
     }
 }
 
@@ -1451,6 +1988,7 @@ pub(crate) async fn send_banner_batch(
 /// daemon protocol only reports a status enum), so `failed (exit N)`
 /// from the design spec maps to the closest available signal: the
 /// status discriminant.
+#[allow(dead_code)] // daemon-era path; removed in the teardown milestone (M8)
 fn footer_result_str(
     build_result: &Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
 ) -> String {
@@ -1699,6 +2237,7 @@ mod tests {
             fuse_cache: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
+            sandbox: Arc::new(SandboxEnvConfig::default()),
         }
     }
 
@@ -1857,5 +2396,58 @@ mod tests {
         // And it must not be Unspecified (which ALSO reassigns per
         // completion.rs:176-183).
         assert_ne!(mapped, Proto::Unspecified);
+    }
+    /// Native-path retry classification: sandbox setup failures retry
+    /// locally (the daemon-spawn slot), glue rejections are permanent
+    /// (deterministic per-derivation), and a plain build failure is
+    /// neither.
+    #[test]
+    fn native_error_retry_classification() {
+        assert!(ExecutorError::SandboxSetup("mount race".into()).is_daemon_transient());
+        assert!(!ExecutorError::SandboxSetup("mount race".into()).is_permanent());
+        assert!(ExecutorError::Glue("unsupported builtin".into()).is_permanent());
+        assert!(!ExecutorError::Glue("unsupported builtin".into()).is_daemon_transient());
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_permanent());
+    }
+
+    /// `footer_result_native` covers the same domain the daemon-era
+    /// footer did: ok / timed out / log limit / generic failure /
+    /// executor error.
+    #[test]
+    fn footer_result_native_domain() {
+        use rio_proto::types::BuildResultStatus;
+        let failed = |status| NativeBuild::Failed {
+            status,
+            error_msg: String::new(),
+            start_time: 0,
+            stop_time: 0,
+        };
+        assert_eq!(
+            footer_result_native(&Ok(NativeBuild::Succeeded {
+                processed: native_result::ProcessedOutputs {
+                    outputs: Vec::new()
+                },
+                start_time: 0,
+                stop_time: 0,
+            })),
+            "ok"
+        );
+        assert_eq!(
+            footer_result_native(&Ok(failed(BuildResultStatus::TimedOut))),
+            "failed (timed out)"
+        );
+        assert_eq!(
+            footer_result_native(&Ok(failed(BuildResultStatus::LogLimitExceeded))),
+            "failed (log limit exceeded)"
+        );
+        assert!(
+            footer_result_native(&Ok(failed(BuildResultStatus::PermanentFailure)))
+                .starts_with("failed (")
+        );
+        assert_eq!(
+            footer_result_native(&Err(ExecutorError::SandboxSetup("x".into()))),
+            "failed (executor error)"
+        );
     }
 }

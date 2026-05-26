@@ -114,6 +114,13 @@
     },
     {
       "enum": "ExecutorError",
+      "name": "Glue",
+      "crate": "rio-builder",
+      "msg": "derivation rejected by the request glue: {0}",
+      "doc": "The request glue rejected the derivation (unsupported builtin, malformed structuredAttrs, exportReferencesGraph outside the closure, …). Per `GlueError`'s contract these are all input problems — deterministic per-derivation, so they map to `InputRejected` (see [`ExecutorError::is_permanent`]) instead of burning fleet retries."
+    },
+    {
+      "enum": "ExecutorError",
       "name": "Grpc",
       "crate": "rio-builder",
       "msg": "gRPC error: {0}",
@@ -160,6 +167,13 @@
       "crate": "rio-builder",
       "msg": "overlay setup task panicked: {0}",
       "doc": ""
+    },
+    {
+      "enum": "ExecutorError",
+      "name": "SandboxSetup",
+      "crate": "rio-builder",
+      "msg": "native sandbox setup failed: {0}",
+      "doc": "The native sandbox failed to set up (host-side skeleton build, fork/pipe plumbing, or an in-child setup phase reported over the status pipe). The build itself never ran. Worker-local and usually transient (FS race, FUSE hiccup while bind-mounting an input) — retried locally like the daemon-era spawn failures."
     },
     {
       "enum": "ExecutorError",

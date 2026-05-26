@@ -38,6 +38,11 @@
       "doc": "Differential-harness driver binary."
     },
     {
+      "path": "builtin_fetchurl.rs",
+      "depth": 0,
+      "doc": "Native `builtin:fetchurl` — the in-sandbox half."
+    },
+    {
       "path": "cgroup.rs",
       "depth": 0,
       "doc": "Per-build cgroup v2 resource tracking."
@@ -83,6 +88,11 @@
       "doc": "`__structuredAttrs` materialization: `.attrs.json` and `.attrs.sh`."
     },
     {
+      "path": "executor/glue/builtin.rs",
+      "depth": 2,
+      "doc": "Request construction for `builtin:fetchurl` derivations."
+    },
+    {
       "path": "executor/glue/env.rs",
       "depth": 2,
       "doc": "Builder environment materialization and placeholder rewriting."
@@ -111,6 +121,11 @@
       "path": "executor/native_result/",
       "depth": 1,
       "doc": "Native-executor result processing: everything nix-daemon does between"
+    },
+    {
+      "path": "executor/native_result/ca.rs",
+      "depth": 2,
+      "doc": "Floating content-addressed output finalization."
     },
     {
       "path": "executor/native_result/canonicalise.rs",

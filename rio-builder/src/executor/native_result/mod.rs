@@ -221,8 +221,9 @@ pub(crate) struct ProcessedOutputs {
 ///
 /// Variants map to `BuildResultStatus::OutputRejected` — the build
 /// *ran*, but what it produced is not acceptable — except
-/// [`FodHasReferences`](Self::FodHasReferences), which the activation
-/// maps to `HashMismatch` (it is a content-integrity failure of a
+/// [`FodHasReferences`](Self::FodHasReferences), which reports as
+/// `OutputRejected` like the rest (the proto status has no separate
+/// hash-mismatch variant; it is still a content-integrity failure of a
 /// fixed-output derivation, not a policy rejection). The distinction
 /// the variants carry is for tests and precise tenant-facing messages.
 #[derive(Debug, thiserror::Error)]
@@ -282,7 +283,11 @@ pub(crate) fn process_outputs(
 ) -> Result<ProcessedOutputs, OutputRejection> {
     let result = process_outputs_inner(drv, outputs, build_uid, input_closure);
     if let Err(rejection) = &result {
-        warn!(error = %rejection, "build outputs rejected");
+        warn!(
+            output = %outputs.first().map(|o| o.store_path.as_str()).unwrap_or("<none>"),
+            error = %rejection,
+            "build outputs rejected"
+        );
     }
     result
 }

@@ -136,6 +136,7 @@ pub async fn upload_all_outputs(
     assignment_token: &str,
     deriver: &str,
     ref_candidates: &[String],
+    content_addresses: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<ValidatedPathInfo>, UploadError> {
     let outputs = scan_new_outputs(upper_store)?;
     if outputs.is_empty() {
@@ -185,7 +186,12 @@ pub async fn upload_all_outputs(
     // at scale (see worker.md § pre-scan cost). Deferred P0181 remainder.
     let mut prepared = Vec::with_capacity(to_upload.len());
     for b in &to_upload {
-        prepared.push(prepare_output(upper_store, b, &candidates).await?);
+        let mut p = prepare_output(upper_store, b, &candidates).await?;
+        // Floating-CA outputs carry their content-address descriptor so
+        // the store records the narinfo `CA:` field; everything else
+        // stays input-addressed (`None`).
+        p.content_address = content_addresses.get(&p.store_path).cloned();
+        prepared.push(p);
     }
 
     // Branch: ≥2 outputs TO UPLOAD → atomic batch; ≤1 → independent
@@ -623,7 +629,7 @@ mod tests {
         fs::write(store_dir.join(&b2), b"two")?;
         fs::write(store_dir.join(&b3), b"three")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default())
             .await
             .expect("all uploads succeed");
 
@@ -849,6 +855,7 @@ mod tests {
             "",
             &deriver,
             &[dep_a.clone(), dep_b.clone()],
+            &Default::default(),
         )
         .await?;
 
@@ -961,7 +968,8 @@ mod tests {
             "precondition: seeded vs disk NARs must differ, else this test proves nothing"
         );
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results =
+            upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default()).await?;
 
         // Zero PutPath calls — the skip fired.
         assert_eq!(
@@ -998,7 +1006,8 @@ mod tests {
         fs::write(store_dir.join(&b_present), b"disk present")?;
         fs::write(store_dir.join(&b_missing), b"disk missing")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results =
+            upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default()).await?;
 
         // Exactly one PutPath: the missing output.
         let puts = store.calls.put_calls.read().unwrap();
@@ -1044,7 +1053,8 @@ mod tests {
         fs::create_dir_all(&store_dir)?;
         fs::write(store_dir.join(&basename), b"disk fallback")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
+        let results =
+            upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default()).await?;
 
         // FindMissingPaths failed → fell back to upload → PutPath called.
         // (MockStore's put_path doesn't implement the idempotent no-op;
@@ -1081,8 +1091,15 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         // upper_store doesn't exist — scan_new_outputs returns empty.
 
-        let results =
-            upload_all_outputs(&client, &tmp.path().join("nonexistent"), "", "", &[]).await?;
+        let results = upload_all_outputs(
+            &client,
+            &tmp.path().join("nonexistent"),
+            "",
+            "",
+            &[],
+            &Default::default(),
+        )
+        .await?;
         assert!(results.is_empty());
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
@@ -1131,7 +1148,7 @@ mod tests {
         }
         let _restore = Restore(bad_dir);
 
-        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let err = upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default())
             .await
             .expect_err("prep must fail on the unreadable output");
         assert!(matches!(err, UploadError::UploadExhausted { .. }));
@@ -1161,7 +1178,7 @@ mod tests {
         fs::write(store_dir.join(&b1), b"one")?;
         fs::write(store_dir.join(&b2), b"two")?;
 
-        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default())
             .await
             .expect("batch upload should succeed on 3rd attempt");
 
@@ -1195,7 +1212,7 @@ mod tests {
         fs::write(store_dir.join(format!("{DEP_HASH_A}-a")), b"a")?;
         fs::write(store_dir.join(format!("{DEP_HASH_B}-b")), b"b")?;
 
-        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
+        let err = upload_all_outputs(&client, &store_dir, "", "", &[], &Default::default())
             .await
             .expect_err("batch should exhaust retries");
         assert!(matches!(err, UploadError::UploadExhausted { .. }));
@@ -1250,5 +1267,30 @@ mod tests {
             common::DUMP_JOIN_SLACK,
             "post-rx-drop join must NOT re-wait the gRPC budget"
         );
+    }
+    /// The content-address descriptor reaches both the PutPath metadata
+    /// (what the store records as the narinfo `CA:` field) and the
+    /// returned `ValidatedPathInfo`.
+    #[test]
+    fn content_address_threads_into_path_info() {
+        let store_path = format!("/nix/store/{}", test_store_basename("ca-out"));
+        let parsed = rio_nix::store_path::StorePath::parse(&store_path).unwrap();
+        let ca = "fixed:r:sha256:1abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
+
+        let info = common::trailer_mode_path_info(&store_path, "drv", &[], Some(ca));
+        assert_eq!(info.content_address, ca);
+        let info_none = common::trailer_mode_path_info(&store_path, "drv", &[], None);
+        assert!(info_none.content_address.is_empty());
+
+        let validated = common::uploaded_info(
+            parsed,
+            [0u8; 32],
+            1,
+            Vec::new(),
+            "drv",
+            Some(ca.to_string()),
+        )
+        .unwrap();
+        assert_eq!(validated.content_address.as_deref(), Some(ca));
     }
 }

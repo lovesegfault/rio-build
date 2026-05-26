@@ -139,6 +139,7 @@ pub(super) fn uploaded_info(
     nar_size: u64,
     references: Vec<String>,
     deriver: &str,
+    content_address: Option<String>,
 ) -> Result<ValidatedPathInfo, UploadError> {
     let references = references
         .into_iter()
@@ -154,7 +155,7 @@ pub(super) fn uploaded_info(
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
-        content_address: None,
+        content_address,
     })
 }
 
@@ -210,6 +211,12 @@ pub(super) struct PreparedOutput {
     pub parsed: StorePath,
     /// Sorted resolved references from [`scan_references`].
     pub references: Vec<String>,
+    /// Content-address descriptor (`fixed:[r:]<algo>:<base32>`) for
+    /// floating-CA outputs, recorded by the native result pipeline.
+    /// `None` for input-addressed outputs. Threaded into both the
+    /// PutPath metadata and the returned `ValidatedPathInfo` so
+    /// substituting clients see the `CA:` narinfo field.
+    pub content_address: Option<String>,
 }
 
 /// Single prep chokepoint: parse → scan_references (timeout-bounded) →
@@ -245,6 +252,7 @@ pub(super) async fn prepare_output(
         store_path,
         parsed,
         references,
+        content_address: None,
     })
 }
 
@@ -256,6 +264,7 @@ pub(super) fn trailer_mode_path_info(
     store_path: &str,
     deriver: &str,
     references: &[String],
+    content_address: Option<&str>,
 ) -> PathInfo {
     PathInfo {
         store_path: store_path.to_string(),
@@ -267,7 +276,7 @@ pub(super) fn trailer_mode_path_info(
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
-        content_address: String::new(),
+        content_address: content_address.unwrap_or_default().to_string(),
     }
 }
 
