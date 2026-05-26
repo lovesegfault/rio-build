@@ -1,12 +1,17 @@
 //! `rio-mountd` — the privileged per-node broker for castore-FUSE.
 //!
-//! The unprivileged builder pod cannot (a) open `/dev/fuse`, (b) call
+//! The unprivileged builder pod cannot (a) call
 //! `FUSE_DEV_IOC_BACKING_OPEN`/`_CLOSE` (init-namespace `CAP_SYS_ADMIN`
-//! checks in `fs/fuse/backing.c`), or (c) write the node-shared backing
+//! checks in `fs/fuse/backing.c`) or (b) write the node-shared backing
 //! cache (integrity boundary). One DaemonSet per node with
-//! `CAP_SYS_ADMIN` brokers exactly those three operations and nothing
-//! else — no overlay mount, no FUSE upcall relay; the builder serves
-//! FUSE and assembles its own overlay.
+//! `CAP_SYS_ADMIN` brokers exactly those operations and nothing else —
+//! it opens no devices and mounts nothing. The builder opens
+//! `/dev/fuse` itself, `mount(2)`s it inside its own mount namespace
+//! (the kernel requires opener-userns == mounter-userns, and a
+//! daemon-side mount could not propagate to builder pods anyway — the
+//! P0560 option-(b) decision), serves FUSE on it, assembles its own
+//! overlay, and hands the daemon a dup of the fd so the backing-open
+//! broker has a same-connection target.
 //!
 //! See [`super::mountd_proto`] for the wire protocol and ADR-022 §11
 //! (the design overview) for the privilege analysis. `bin/rio-mountd.rs`
@@ -33,7 +38,7 @@ use std::time::Duration;
 use anyhow::Context;
 use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::libc;
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::mount::{MntFlags, umount2};
 use nix::sys::socket::{
     AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept4, bind, getsockopt, listen,
     socket, sockopt,
@@ -85,7 +90,10 @@ pub struct MountdConfig {
     /// created if missing (it lives on a tmpfs `/run` that is wiped
     /// every boot).
     pub socket_path: PathBuf,
-    /// Per-build FUSE mountpoints: `{castore_dir}/{build_id}`.
+    /// Legacy per-build FUSE mountpoint root (`/var/rio/castore`). The
+    /// daemon no longer mounts anything here — the builder mounts the
+    /// handed-off fd inside its own mount namespace — but the startup
+    /// orphan scan still sweeps leftovers from pre-cutover daemons.
     pub castore_dir: PathBuf,
     /// Per-build staging: `{staging_dir}/{build_id}` (0700, chowned to
     /// the connection's peer uid).
@@ -453,7 +461,6 @@ fn wait_for_concurrent_promote(
 
 struct Shared {
     cfg: MountdConfig,
-    castore_base: OwnedFd,
     staging_base: OwnedFd,
     cache_base: OwnedFd,
     chunks_base: OwnedFd,
@@ -477,9 +484,10 @@ struct Shared {
 struct ConnState {
     peer_uid: libc::uid_t,
     peer_gid: libc::gid_t,
-    /// `dup()` of the build's `/dev/fuse` fd, held for the lifetime of
-    /// the connection so `BACKING_OPEN` can be issued after the
-    /// original was handed to the builder.
+    /// The builder's `/dev/fuse` fd (received in `Mount{}`'s
+    /// `SCM_RIGHTS`), held for the lifetime of the connection so
+    /// `BACKING_OPEN`/`BACKING_CLOSE` can be issued against the
+    /// connection the builder mounted from it.
     kept: Option<OwnedFd>,
     build_id: Option<String>,
     staging_dirfd: Option<Arc<OwnedFd>>,
@@ -524,7 +532,6 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
     reap_orphans(&cfg, &castore_base);
 
     let shared = Arc::new(Shared {
-        castore_base,
         staging_base,
         cache_base,
         chunks_base,
@@ -658,9 +665,11 @@ fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
 
 /// Reap leftovers from a previous daemon incarnation. No connection can
 /// be live before the listener exists, so everything found here is an
-/// orphan: castore mountpoints (lazily unmounted then removed), staging
-/// trees (removed), and `.promoting`/`.tmp` placeholders in the shared
-/// caches (removed — their owning copy loop is gone).
+/// orphan: castore mountpoints (lazily unmounted then removed — only
+/// pre-cutover daemons created these; the current protocol never
+/// mounts host-side), staging trees (removed), and `.promoting`/`.tmp`
+/// placeholders in the shared caches (removed — their owning copy loop
+/// is gone).
 /// The scan walks the configured *paths* rather than the pre-opened
 /// base dirfds: it runs once at startup before any connection exists,
 /// so there is no concurrent attacker to race — the openat-only
@@ -885,8 +894,8 @@ async fn handle_frame(
 
     match req.req {
         Req::Mount { build_id } => {
-            let (resp, fd) = handle_mount(shared, state, build_id);
-            reply(resp, fd);
+            let resp = handle_mount(shared, state, build_id, &frame.fds);
+            reply(resp, None);
         }
         Req::BackingOpen => {
             let resp = if state.live_backing_ids >= MAX_LIVE_BACKING_IDS {
@@ -1058,9 +1067,19 @@ fn reject_reason(kind: &ErrKind) -> &'static str {
     }
 }
 
-/// `Mount{build_id}`: claim the id, fuse-mount the per-build castore
-/// mountpoint, set up staging with a kernel-enforced quota, and hand
-/// the `/dev/fuse` fd back.
+/// `Mount{build_id}`: claim the id, set up staging with a
+/// kernel-enforced quota, and keep the builder's `/dev/fuse` fd (sent
+/// in the request's `SCM_RIGHTS`) for later `BackingOpen` brokering.
+///
+/// The daemon neither opens `/dev/fuse` nor creates/mounts any castore
+/// mountpoint (P0560 option (b)): the kernel requires a fuse mount to
+/// happen from the same user namespace that opened the device
+/// (`fs/fuse/inode.c` "Require mount to happen from the same user
+/// namespace which opened /dev/fuse"), and a daemon-side mount could
+/// never propagate into builder pods anyway — so the builder opens the
+/// device itself, `mount(2)`s it inside its own mount namespace, and
+/// hands the daemon a dup so the privileged `FUSE_DEV_IOC_BACKING_*`
+/// ioctls have a same-connection fd to go through.
 // r[impl builder.mountd.fuse-handoff]
 // r[impl builder.mountd.one-mount]
 // r[impl builder.mountd.build-id-unique]
@@ -1069,13 +1088,22 @@ fn handle_mount(
     shared: &Arc<Shared>,
     state: &mut ConnState,
     build_id: String,
-) -> (Resp, Option<OwnedFd>) {
+    fds: &[OwnedFd],
+) -> Resp {
     if state.kept.is_some() {
-        return (Resp::Err(ErrKind::AlreadyMounted), None);
+        return Resp::Err(ErrKind::AlreadyMounted);
     }
     if !validate_build_id(&build_id) {
-        return (Resp::Err(ErrKind::BadBuildId), None);
+        return Resp::Err(ErrKind::BadBuildId);
     }
+    // The builder's /dev/fuse fd. Cloned out of the frame (not moved):
+    // the daemon never reads or writes it — it is only ever the target
+    // of BACKING_OPEN/CLOSE ioctls, which fail cleanly on a non-fuse fd.
+    let Some(kept) = fds.first().and_then(|fd| fd.try_clone().ok()) else {
+        return Resp::Err(ErrKind::Retryable(
+            "Mount frame carried no /dev/fuse fd".into(),
+        ));
+    };
     // Claim the build_id process-wide before touching the filesystem so
     // two connections racing on the same id cannot both mkdir.
     if !shared
@@ -1084,18 +1112,16 @@ fn handle_mount(
         .ignore_poison()
         .insert(build_id.clone())
     {
-        return (Resp::Err(ErrKind::DuplicateBuildId), None);
+        return Resp::Err(ErrKind::DuplicateBuildId);
     }
     // From here on, every failure must release the claim.
     match mount_build(shared, state, &build_id) {
-        Ok((fuse_fd, quota)) => {
+        Ok(quota) => {
+            state.kept = Some(kept);
             state.build_id = Some(build_id);
-            (
-                Resp::Mounted {
-                    staging_quota_bytes: quota,
-                },
-                Some(fuse_fd),
-            )
+            Resp::Mounted {
+                staging_quota_bytes: quota,
+            }
         }
         Err(e) => {
             shared
@@ -1106,55 +1132,16 @@ fn handle_mount(
             // Best-effort cleanup of whatever mount_build got through.
             cleanup_build_dirs(shared, &build_id);
             warn!(build_id, error = %e, "Mount failed");
-            (Resp::Err(ErrKind::Retryable(format!("mount: {e}"))), None)
+            Resp::Err(ErrKind::Retryable(format!("mount: {e}")))
         }
     }
 }
 
-/// The fallible body of `Mount`. Returns the fd to send and the applied
-/// quota. The caller owns claim-release and directory cleanup on error.
-fn mount_build(
-    shared: &Arc<Shared>,
-    state: &mut ConnState,
-    build_id: &str,
-) -> anyhow::Result<(OwnedFd, u64)> {
+/// The fallible body of `Mount`: staging dir + chunks subdir + project
+/// quota. Returns the applied quota. The caller owns claim-release and
+/// directory cleanup on error.
+fn mount_build(shared: &Arc<Shared>, state: &mut ConnState, build_id: &str) -> anyhow::Result<u64> {
     let cfg = &shared.cfg;
-
-    // ── /dev/fuse + mountpoint.
-    let fuse_fd: OwnedFd = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fuse")
-        .context("open /dev/fuse")?
-        .into();
-    let kept = fuse_fd.try_clone().context("dup /dev/fuse")?;
-    match mkdirat(
-        &shared.castore_base,
-        build_id,
-        Mode::from_bits_truncate(0o755),
-    ) {
-        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
-        Err(e) => return Err(e).context("mkdir castore mountpoint"),
-    }
-    let mnt = cfg.castore_dir.join(build_id);
-    // rootmode=40555: directory, world-readable. allow_other +
-    // default_permissions so processes in the build's user namespace
-    // (not just the FUSE server's uid) can traverse it and the kernel
-    // enforces the mode bits the server reports.
-    let data = format!(
-        "fd={},rootmode=40555,user_id={},group_id={},allow_other,default_permissions",
-        fuse_fd.as_raw_fd(),
-        state.peer_uid,
-        state.peer_gid,
-    );
-    mount(
-        Some("rio-castore"),
-        &mnt,
-        Some("fuse.rio-castore"),
-        MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
-        Some(data.as_str()),
-    )
-    .with_context(|| format!("mount fuse at {}", mnt.display()))?;
 
     // ── Staging: 0700, owned by the build's uid, kernel-quota'd.
     match mkdirat(
@@ -1210,24 +1197,22 @@ fn mount_build(
         applied_quota = cfg.staging_quota_bytes;
     }
 
-    state.kept = Some(kept);
     state.staging_dirfd = Some(Arc::new(staging_dirfd));
     state.staging_chunks_dirfd = Some(Arc::new(staging_chunks_dirfd));
     info!(
         build_id,
         uid = state.peer_uid,
         quota = applied_quota,
-        "mounted castore FUSE, fd handed off"
+        "staging ready, builder's /dev/fuse fd kept for backing brokering"
     );
-    Ok((fuse_fd, applied_quota))
+    Ok(applied_quota)
 }
 
-/// Best-effort removal of the per-build castore mountpoint and staging
-/// tree. Used by both the Mount error path and connection teardown.
+/// Best-effort removal of the per-build staging tree. Used by both the
+/// Mount error path and connection teardown. (The daemon creates no
+/// castore mountpoint since the P0560 option-(b) protocol change — the
+/// builder's mount dies with the builder's own mount namespace.)
 fn cleanup_build_dirs(shared: &Arc<Shared>, build_id: &str) {
-    let mnt = shared.cfg.castore_dir.join(build_id);
-    let _ = umount2(&mnt, MntFlags::MNT_DETACH);
-    let _ = unlinkat(&shared.castore_base, build_id, UnlinkatFlags::RemoveDir);
     let _ = std::fs::remove_dir_all(shared.cfg.staging_dir.join(build_id));
 }
 

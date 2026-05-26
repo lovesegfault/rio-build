@@ -58,9 +58,21 @@ pub struct Reply {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Req {
-    /// Claim `build_id`, fuse-mount `/var/rio/castore/{build_id}`, and
-    /// hand the `/dev/fuse` fd back via `SCM_RIGHTS`. Must be the first
-    /// request on a connection; exactly one per connection lifetime.
+    /// Claim `build_id` and create the build's staging dir
+    /// (`staging/{build_id}`, owned by the connection's peer uid, with
+    /// the kernel project quota applied). The frame's `SCM_RIGHTS`
+    /// carries the **builder's own `/dev/fuse` fd**, which the daemon
+    /// keeps for the connection's lifetime as the target of later
+    /// `BackingOpen`/`BackingClose` ioctls. Must be the first request
+    /// on a connection; exactly one per connection lifetime.
+    ///
+    /// The daemon neither opens `/dev/fuse` nor mounts anything (P0560
+    /// option (b)): the kernel requires a fuse mount to come from the
+    /// same user namespace that opened the device, and a mount made
+    /// inside the unprivileged DaemonSet container could never
+    /// propagate into builder pods — so the builder opens the device
+    /// and `mount(2)`s it on a mountpoint it owns inside its own mount
+    /// namespace, where the build can actually see it.
     Mount { build_id: String },
     /// Register the fd in this frame's `SCM_RIGHTS` cmsg as a FUSE
     /// passthrough backing file: the daemon issues
@@ -83,9 +95,11 @@ pub enum Req {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Resp {
-    /// [`Req::Mount`] succeeded. The `/dev/fuse` fd is in this frame's
-    /// `SCM_RIGHTS` cmsg. `staging_quota_bytes` is the kernel-enforced
-    /// XFS project quota on the build's staging directory.
+    /// [`Req::Mount`] succeeded: the staging dir exists with
+    /// `staging_quota_bytes` of kernel-enforced XFS project quota, and
+    /// the daemon kept the builder's `/dev/fuse` fd for backing-open
+    /// brokering. Carries no fds and reports no host-side mountpoint:
+    /// the daemon stopped mounting at the P0560 option-(b) change.
     Mounted { staging_quota_bytes: u64 },
     /// [`Req::BackingOpen`] succeeded.
     BackingId(u32),

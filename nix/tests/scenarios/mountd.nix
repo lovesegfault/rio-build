@@ -2,13 +2,26 @@
 #
 # Boots the real `rio-mountd` binary against an XFS-with-prjquota
 # staging loopback and drives it over the SOCK_SEQPACKET protocol with
-# `spike_mountd_client` (the builder-side stand-in until P0559's
-# in-process client exists). Carries the P0578 mountd-protocol subtests
-# (v-vii, x-xv) that were deferred to P0567:
+# `spike_mountd_client` (the standalone stand-in for the builder's
+# in-process castore_fuse client, runnable as arbitrary uids). Carries
+# the P0578 mountd-protocol subtests (v-vii, x-xv) that were deferred
+# to P0567.
 #
-#   fd-handoff        Mount → /dev/fuse fd over SCM_RIGHTS → unprivileged
-#                     client serves FUSE on it → mountpoint readable
-#   teardown          conn close → umount + staging removed + build_id
+# P0560 option (b): the daemon neither opens /dev/fuse nor mounts — the
+# CLIENT opens its own /dev/fuse, sends a dup in Mount{}'s SCM_RIGHTS
+# (the daemon keeps it as the BackingOpen ioctl target), and mounts the
+# fd inside its own user+mount namespace (exactly what the production
+# builder does in its pod userns; the kernel requires the opening
+# userns to be the mounting userns). Mount{} itself only claims the
+# build_id and sets up staging + quota. The mount-side assertions are
+# made by the client and reported through its ready file; the host-side
+# assertions are that the daemon created NOTHING under /var/rio/castore.
+#
+#   fd-handoff        client opens /dev/fuse → Mount{} hands the daemon a
+#                     dup over SCM_RIGHTS → client mounts + serves FUSE in
+#                     its own userns → client's own mountpoint readable;
+#                     no daemon-side mountpoint exists
+#   teardown          conn close → staging removed + build_id
 #                     and uid released for reuse
 #   gid-gate          socket file perms reject non-group connect();
 #                     SO_PEERCRED rejects a wrong-gid peer that can
@@ -181,13 +194,24 @@ pkgs.testers.runNixOSTest {
 
     def serve(user, build_id, tag):
         # Background a `serve` client and wait for its ready file: the
-        # FUSE handshake is complete and the mountpoint is safe to touch.
+        # FUSE handshake is complete and the client has mounted + read
+        # its own (namespace-private) mountpoint.
         machine.succeed(
             f"runuser -u {user} -- bash -c "
             f"'{CLIENT} serve --build-id {build_id} --ready-file /tmp/{tag}.ready "
+            f"--mount-point /tmp/{tag}-castore "
             f">/tmp/{tag}.log 2>&1 & echo $! > /tmp/{tag}.pid'"
         )
-        machine.wait_until_succeeds(f"test -f /tmp/{tag}.ready", timeout=30)
+        # Stop waiting early if the client died — and surface its log
+        # instead of a bare timeout.
+        machine.wait_until_succeeds(
+            f"test -f /tmp/{tag}.ready || ! kill -0 $(cat /tmp/{tag}.pid) 2>/dev/null",
+            timeout=30,
+        )
+        rc, _ = machine.execute(f"test -f /tmp/{tag}.ready")
+        if rc != 0:
+            log = machine.succeed(f"cat /tmp/{tag}.log 2>/dev/null || true")
+            raise Exception(f"serve client for {build_id} exited before ready:\n{log}")
 
     def wait_idle():
         # Every registered connection has been torn down (uids and
@@ -239,6 +263,10 @@ pkgs.testers.runNixOSTest {
         machine.succeed("kill -9 $(cat /run/rio-mountd.pid)")
         machine.succeed("kill -9 $(cat /tmp/orphan.pid) || true")
         machine.succeed("test -d /var/rio/staging/b-orphan")
+        # The current protocol never creates daemon-side castore
+        # mountpoints; plant one to stand in for a pre-cutover daemon's
+        # leftover so the scan's mountpoint arm stays covered.
+        machine.succeed("mkdir -p /var/rio/castore/b-orphan")
         machine.succeed("mkdir -p /var/rio/cache/zz && touch /var/rio/cache/zz/0000.promoting")
         start_mountd(8 * 1024 * 1024)
         machine.succeed(
@@ -264,32 +292,36 @@ pkgs.testers.runNixOSTest {
     # ═══ Phase 2: protocol + broker (one 256 MiB instance) ═════════════
     start_mountd(256 * 1024 * 1024)
 
-    # ── fd-handoff: Mount → SCM_RIGHTS → unprivileged FUSE server ──────
-    with subtest("fd-handoff: builder serves FUSE on the handed-off fd"):
+    # ── fd-handoff: Mount → SCM_RIGHTS → builder-side mount + serve ────
+    with subtest("fd-handoff: client mounts + serves FUSE on the handed-off fd"):
         serve("build1", "b-alpha", "alpha")
-        fstype = machine.succeed("findmnt -rn -o FSTYPE /var/rio/castore/b-alpha").strip()
-        assert fstype == "fuse.rio-castore", f"fstype={fstype}"
-        # The mount works for the build uid and (allow_other) for root.
-        machine.succeed("runuser -u build1 -- ls /var/rio/castore/b-alpha")
-        machine.succeed("ls /var/rio/castore/b-alpha")
+        # The mount lives in the client's own user+mount namespace, so
+        # the client makes the mount-side assertions and reports them in
+        # its ready file: the handed-off fd is a live fuse.rio-castore
+        # connection and the mounting uid can read through it.
+        ready = machine.succeed("cat /tmp/alpha.ready")
+        assert "quota=268435456" in ready, f"ready file: {ready!r}"
+        assert "fstype=fuse.rio-castore" in ready, f"ready file: {ready!r}"
+        assert "readable=yes" in ready, f"ready file: {ready!r}"
+        # Protocol change (P0560 option b): the daemon creates NO
+        # host-side mountpoint — /var/rio/castore stays empty.
+        machine.succeed("test ! -e /var/rio/castore/b-alpha")
         # Staging dir: 0700, owned by the connection's peer uid.
         st = machine.succeed("stat -c '%a %U' /var/rio/staging/b-alpha").strip()
         assert st == "700 build1", f"staging dir is {st}"
-        ready = machine.succeed("cat /tmp/alpha.ready")
-        assert "quota=268435456" in ready, f"ready file: {ready!r}"
 
     # ── teardown: conn close undoes everything Mount set up ────────────
-    with subtest("teardown: close → umount, staging removed, ids released"):
+    with subtest("teardown: close → staging removed, ids released"):
         machine.succeed("kill $(cat /tmp/alpha.pid)")
         machine.wait_until_succeeds(
-            "! mountpoint -q /var/rio/castore/b-alpha"
-            " && test ! -e /var/rio/castore/b-alpha"
-            " && test ! -e /var/rio/staging/b-alpha",
+            "test ! -e /var/rio/staging/b-alpha",
             timeout=30,
         )
         wait_idle()
-        # Same uid, same build_id, immediately reusable — and a second
-        # Mount on one connection is AlreadyMounted (one-mount).
+        # The client's castore mount died with its mount namespace; the
+        # daemon side never had one. Same uid, same build_id,
+        # immediately reusable — and a second Mount on one connection is
+        # AlreadyMounted (one-mount).
         machine.succeed(client("build1", "double-mount --build-id b-alpha"))
         machine.succeed("test ! -e /var/rio/castore/b-alpha-second")
         wait_idle()
@@ -328,7 +360,7 @@ pkgs.testers.runNixOSTest {
         st = machine.succeed("stat -c '%a %U' /var/rio/staging/shared").strip()
         assert st == "700 build1", f"holder staging dir is {st}"
         machine.succeed("kill $(cat /tmp/shared.pid)")
-        machine.wait_until_succeeds("test ! -e /var/rio/castore/shared", timeout=30)
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/shared", timeout=30)
         wait_idle()
 
     # ── Promote: integrity boundary for the shared cache ───────────────
@@ -385,11 +417,14 @@ pkgs.testers.runNixOSTest {
     # ── BackingOpen broker ─────────────────────────────────────────────
     def backing_bench(build_id):
         # The backing file is a real published cache entry, opened
-        # read-only by the build uid the way the castore-FUSE will.
+        # read-only by the build uid the way the castore-FUSE will. The
+        # client mounts the handed-off fd in its own userns first —
+        # BACKING_OPEN needs a live, passthrough-negotiated connection.
         out = machine.succeed(
             client(
                 "build2",
-                f"backing-bench --build-id {build_id} --backing-file {backing_file} --iters 2000",
+                f"backing-bench --build-id {build_id} --backing-file {backing_file}"
+                f" --iters 2000 --mount-point /tmp/{build_id}-castore",
             )
         )
         print(out)
@@ -413,7 +448,8 @@ pkgs.testers.runNixOSTest {
             client(
                 "build1",
                 f"concurrency --build-id {build_id} --staging-root /var/rio/staging"
-                f" --backing-file {backing_file} --promote-mib 64 --iters 100",
+                f" --backing-file {backing_file} --promote-mib 64 --iters 100"
+                f" --mount-point /tmp/{build_id}-castore",
             )
         )
         print(out)

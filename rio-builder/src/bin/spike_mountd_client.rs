@@ -1,12 +1,16 @@
 //! VM-test client for the production `rio-mountd` daemon (P0567).
 //!
-//! Stands in for the builder side of the UDS protocol until P0559's
-//! `castore_fuse/mount.rs` exists: connects to the daemon's
-//! `SOCK_SEQPACKET` socket, speaks `mountd_proto`, and serves a minimal
-//! FUSE filesystem on the handed-off `/dev/fuse` fd so `BACKING_OPEN`
-//! has a passthrough-negotiated connection to register against. Each
-//! subcommand is one `vm-mountd` subtest; results are printed as
-//! `RESULT key=value` / `PERF key=value` lines the test driver greps.
+//! Drives the daemon's UDS protocol the way the in-process builder
+//! client (`castore_fuse/mount.rs`) does, but as a standalone binary the
+//! `vm-mountd` scenario can run as arbitrary uids: connects to the
+//! daemon's `SOCK_SEQPACKET` socket, speaks `mountd_proto`, opens its
+//! own `/dev/fuse` (handing the daemon a dup for the backing broker),
+//! mounts it inside its own user+mount namespace (the daemon neither
+//! opens nor mounts — P0560 option (b)), and serves a minimal FUSE
+//! filesystem on it so `BACKING_OPEN` has a passthrough-negotiated
+//! connection to register against. Each subcommand is one `vm-mountd`
+//! subtest; results are printed as `RESULT key=value` / `PERF
+//! key=value` lines the test driver greps.
 //!
 //! NOT production code. The real client is in-process in the builder.
 
@@ -21,6 +25,8 @@ use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, INodeNo, InitFlags, KernelConfig,
     ReplyAttr, ReplyDirectory, Request as FuseRequest, Session, SessionACL,
 };
+use nix::mount::MsFlags;
+use nix::sched::CloneFlags;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 use rio_builder::castore_fuse::mountd_proto::{self as proto, ErrKind, Reply, Req, Request, Resp};
 
@@ -138,24 +144,135 @@ impl Conn {
     }
 }
 
-/// `Mount{build_id}` and unpack the success reply into the quota and the
-/// handed-off `/dev/fuse` fd.
-fn mount(conn: &mut Conn, build_id: &str) -> anyhow::Result<(u64, OwnedFd)> {
-    let (resp, mut fds) = conn.call(
+/// Open this process's own `/dev/fuse` (the protocol requires the
+/// builder side to open the device — the kernel only lets the opening
+/// user namespace mount it; the daemon merely keeps a dup for the
+/// backing-open broker).
+fn open_dev_fuse() -> anyhow::Result<OwnedFd> {
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .context("open /dev/fuse")?
+        .into())
+}
+
+/// `Mount{build_id}` carrying `fuse_fd` in `SCM_RIGHTS`; unpack the
+/// success reply into the staging quota.
+fn mount(conn: &mut Conn, build_id: &str, fuse_fd: &OwnedFd) -> anyhow::Result<u64> {
+    let (resp, _fds) = conn.call(
         Req::Mount {
             build_id: build_id.to_owned(),
         },
-        &[],
+        &[fuse_fd.as_raw_fd()],
     )?;
     match resp {
         Resp::Mounted {
             staging_quota_bytes,
-        } => {
-            let fd = fds.pop().context("Mounted reply carried no fd")?;
-            Ok((staging_quota_bytes, fd))
-        }
+        } => Ok(staging_quota_bytes),
         other => bail!("Mount failed: {other:?}"),
     }
+}
+
+// ─── Builder-side mount(2) of the handed-off fd ────────────────────────
+//
+// The daemon no longer mounts anything (P0560 option (b)); the builder
+// mounts the received fd inside its own mount namespace. The production
+// builder already holds CAP_SYS_ADMIN in its pod user namespace; this
+// test client manufactures the equivalent by unsharing a user+mount
+// namespace of its own before connecting.
+
+/// Enter a private user+mount namespace, identity-mapping the current
+/// uid/gid so files this process creates (staging writes) and reads
+/// (published cache entries, the staging dir mountd chowned to us) keep
+/// their ownership semantics. MUST run before any thread is spawned —
+/// `unshare(CLONE_NEWUSER)` fails with EINVAL on multithreaded
+/// processes.
+fn enter_userns() -> anyhow::Result<()> {
+    let euid = nix::unistd::geteuid().as_raw();
+    let egid = nix::unistd::getegid().as_raw();
+    nix::sched::unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
+        .context("unshare(CLONE_NEWUSER | CLONE_NEWNS)")?;
+    std::fs::write("/proc/self/setgroups", "deny").context("write /proc/self/setgroups")?;
+    std::fs::write("/proc/self/gid_map", format!("{egid} {egid} 1"))
+        .context("write /proc/self/gid_map")?;
+    std::fs::write("/proc/self/uid_map", format!("{euid} {euid} 1"))
+        .context("write /proc/self/uid_map")?;
+    // Keep every mount we make private to this namespace (the systemd
+    // host marks / shared; without this the castore mount would try to
+    // propagate back out).
+    nix::mount::mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .context("mount --make-rprivate /")?;
+    Ok(())
+}
+
+/// `mount(2)` the handed-off `/dev/fuse` fd at `mount_point` — the same
+/// option string the production builder uses (`fuse.rio-castore`,
+/// nodev/nosuid, default_permissions, no allow_other).
+fn mount_castore_fd(fuse_fd: &OwnedFd, mount_point: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(mount_point)
+        .with_context(|| format!("mkdir {}", mount_point.display()))?;
+    let data = format!(
+        "fd={},rootmode=40555,user_id={},group_id={},default_permissions",
+        fuse_fd.as_raw_fd(),
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    );
+    nix::mount::mount(
+        Some("rio-castore"),
+        mount_point,
+        Some("fuse.rio-castore"),
+        MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
+        Some(data.as_str()),
+    )
+    .with_context(|| format!("mount(fuse.rio-castore) at {}", mount_point.display()))?;
+    Ok(())
+}
+
+/// The fstype `/proc/self/mounts` reports for `mount_point` (only this
+/// namespace can see the mount, so the assertion has to be made here,
+/// not by the test driver).
+fn fstype_of(mount_point: &Path) -> anyhow::Result<String> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").context("read /proc/self/mounts")?;
+    let want = mount_point
+        .to_str()
+        .context("mount point is not valid UTF-8")?;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let _src = fields.next();
+        let (Some(target), Some(fstype)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if target == want {
+            return Ok(fstype.to_string());
+        }
+    }
+    bail!("{} not found in /proc/self/mounts", mount_point.display())
+}
+
+/// Mount + serve in one step: the dance every FUSE-needing subcommand
+/// repeats — open our own /dev/fuse, register with the daemon (which
+/// keeps a dup), mount(2) the fd ourselves, then serve it. Returns the
+/// live session (keep it alive) and the fstype the mount table reports.
+fn mount_and_serve(
+    conn: &mut Conn,
+    build_id: &str,
+    mount_point: &Path,
+) -> anyhow::Result<(u64, fuser::BackgroundSession, String)> {
+    let fuse_fd = open_dev_fuse()?;
+    let quota = mount(conn, build_id, &fuse_fd)?;
+    // Order is load-bearing: mount(2) first (queues FUSE_INIT), then
+    // Session::from_fd (answers it) — from_fd on an unattached fd fails.
+    mount_castore_fd(&fuse_fd, mount_point)?;
+    let bg = start_fuse(fuse_fd)?;
+    let fstype = fstype_of(mount_point)?;
+    Ok((quota, bg, fstype))
 }
 
 /// The variant name of an error reply, for `--expect` matching and
@@ -224,15 +341,21 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Mount, serve an empty FUSE fs on the handed-off fd, write the
-    /// ready file, hold the connection until killed.
+    /// Mount{build_id}, mount(2) the handed-off fd at --mount-point
+    /// inside a private user+mount namespace, serve an empty FUSE fs on
+    /// it, write the ready file, hold the connection until killed.
     Serve {
         #[arg(long)]
         build_id: String,
-        /// Written (with `quota=<bytes>`) once the FUSE handshake is
-        /// done and the mountpoint is safe to touch.
+        /// Written (with `quota=<bytes> fstype=<fs> readable=<yes|no>`)
+        /// once the FUSE handshake is done and the client has read its
+        /// own mountpoint.
         #[arg(long)]
         ready_file: PathBuf,
+        /// Where this client mounts the handed-off fd (only visible
+        /// inside its own mount namespace).
+        #[arg(long, default_value = "/tmp/castore-serve")]
+        mount_point: PathBuf,
     },
     /// Mount and assert the daemon replies `Err(<expect>)`.
     ExpectMountErr {
@@ -274,8 +397,8 @@ enum Cmd {
         #[arg(long, default_value_t = 32)]
         size_mib: usize,
     },
-    /// Mount + serve FUSE, then `--iters` × (open backing file,
-    /// BackingOpen, BackingClose). Prints RTT percentiles.
+    /// Mount + serve FUSE (own userns mount), then `--iters` × (open
+    /// backing file, BackingOpen, BackingClose). Prints RTT percentiles.
     BackingBench {
         #[arg(long)]
         build_id: String,
@@ -283,10 +406,12 @@ enum Cmd {
         backing_file: PathBuf,
         #[arg(long, default_value_t = 1000)]
         iters: usize,
+        #[arg(long, default_value = "/tmp/castore-backing")]
+        mount_point: PathBuf,
     },
-    /// Mount + serve FUSE, fire one large `Promote`, then run
-    /// BackingOpen/Close pairs while it is in flight. Asserts the
-    /// promote does not serialize ahead of the inline ops.
+    /// Mount + serve FUSE (own userns mount), fire one large `Promote`,
+    /// then run BackingOpen/Close pairs while it is in flight. Asserts
+    /// the promote does not serialize ahead of the inline ops.
     Concurrency {
         #[arg(long)]
         build_id: String,
@@ -298,6 +423,8 @@ enum Cmd {
         promote_mib: usize,
         #[arg(long, default_value_t = 100)]
         iters: usize,
+        #[arg(long, default_value = "/tmp/castore-conc")]
+        mount_point: PathBuf,
     },
     /// Mount, then write 1 MiB blocks into the staging dir until the
     /// kernel project quota returns ENOSPC (or `--give-up-mib` is
@@ -318,7 +445,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Serve {
             build_id,
             ready_file,
-        } => serve(&args.socket, &build_id, &ready_file),
+            mount_point,
+        } => serve(&args.socket, &build_id, &ready_file, &mount_point),
         Cmd::ExpectMountErr { build_id, expect } => {
             expect_mount_err(&args.socket, &build_id, &expect)
         }
@@ -339,13 +467,15 @@ fn main() -> anyhow::Result<()> {
             build_id,
             backing_file,
             iters,
-        } => backing_bench(&args.socket, &build_id, &backing_file, iters),
+            mount_point,
+        } => backing_bench(&args.socket, &build_id, &backing_file, iters, &mount_point),
         Cmd::Concurrency {
             build_id,
             staging_root,
             backing_file,
             promote_mib,
             iters,
+            mount_point,
         } => concurrency(
             &args.socket,
             &build_id,
@@ -353,6 +483,7 @@ fn main() -> anyhow::Result<()> {
             &backing_file,
             promote_mib,
             iters,
+            &mount_point,
         ),
         Cmd::FillStaging {
             build_id,
@@ -376,12 +507,31 @@ fn start_fuse(fuse_fd: OwnedFd) -> anyhow::Result<fuser::BackgroundSession> {
     session.spawn().context("spawn FUSE session")
 }
 
-fn serve(socket: &Path, build_id: &str, ready_file: &Path) -> anyhow::Result<()> {
+fn serve(
+    socket: &Path,
+    build_id: &str,
+    ready_file: &Path,
+    mount_point: &Path,
+) -> anyhow::Result<()> {
+    // Before any thread exists: the userns this client will mount in.
+    enter_userns()?;
     let mut conn = Conn::connect(socket)?;
-    let (quota, fuse_fd) = mount(&mut conn, build_id)?;
-    let bg = start_fuse(fuse_fd)?;
-    println!("RESULT mount=ok quota={quota}");
-    std::fs::write(ready_file, format!("quota={quota}\n")).context("write ready file")?;
+    let (quota, bg, fstype) = mount_and_serve(&mut conn, build_id, mount_point)?;
+    // The mount lives only in this namespace, so the readability check
+    // has to happen here; the driver greps the ready file for it.
+    let readable = match std::fs::read_dir(mount_point) {
+        Ok(_) => "yes",
+        Err(e) => {
+            eprintln!("read_dir({}) failed: {e}", mount_point.display());
+            "no"
+        }
+    };
+    println!("RESULT mount=ok quota={quota} fstype={fstype} readable={readable}");
+    std::fs::write(
+        ready_file,
+        format!("quota={quota} fstype={fstype} readable={readable}\n"),
+    )
+    .context("write ready file")?;
     // Hold the UDS connection (teardown fires when it closes) and the
     // FUSE session until the test driver kills us.
     bg.join()?;
@@ -390,11 +540,14 @@ fn serve(socket: &Path, build_id: &str, ready_file: &Path) -> anyhow::Result<()>
 
 fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
+    // A well-formed Mount (fd attached) so the only thing the daemon
+    // can object to is what the test scripted (bad id, duplicate id).
+    let fuse_fd = open_dev_fuse()?;
     let (resp, _) = conn.call(
         Req::Mount {
             build_id: build_id.to_owned(),
         },
-        &[],
+        &[fuse_fd.as_raw_fd()],
     )?;
     match resp {
         Resp::Err(kind) if kind_name(&kind) == expect => {
@@ -432,9 +585,10 @@ fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
 
 fn double_mount(socket: &Path, build_id: &str) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
-    let (_, _fuse_fd) = mount(&mut conn, build_id)?;
+    let fuse_fd = open_dev_fuse()?;
+    let _ = mount(&mut conn, build_id, &fuse_fd)?;
     let second = format!("{build_id}-second");
-    let (resp, _) = conn.call(Req::Mount { build_id: second }, &[])?;
+    let (resp, _) = conn.call(Req::Mount { build_id: second }, &[fuse_fd.as_raw_fd()])?;
     match resp {
         Resp::Err(ErrKind::AlreadyMounted) => {
             println!("RESULT second_mount=AlreadyMounted");
@@ -452,7 +606,8 @@ fn promote(
     corrupt: bool,
 ) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
-    let (_, _fuse_fd) = mount(&mut conn, build_id)?;
+    let fuse_fd = open_dev_fuse()?;
+    let _ = mount(&mut conn, build_id, &fuse_fd)?;
     let content = gen_content(0, size_mib << 20);
     // A corrupted stage claims a digest the content does not hash to:
     // the digest of the content with its first byte flipped.
@@ -507,7 +662,8 @@ fn append_promote(
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let mut conn = Conn::connect(socket)?;
-    let (_, _fuse_fd) = mount(&mut conn, build_id)?;
+    let fuse_fd = open_dev_fuse()?;
+    let _ = mount(&mut conn, build_id, &fuse_fd)?;
     let content = gen_content(0xA99E4D, size_mib << 20);
     let digest = *blake3::hash(&content).as_bytes();
     let path = stage(staging_root, build_id, &digest, &content)?;
@@ -558,10 +714,11 @@ fn backing_bench(
     build_id: &str,
     backing_file: &Path,
     iters: usize,
+    mount_point: &Path,
 ) -> anyhow::Result<()> {
+    enter_userns()?;
     let mut conn = Conn::connect(socket)?;
-    let (_, fuse_fd) = mount(&mut conn, build_id)?;
-    let _bg = start_fuse(fuse_fd)?;
+    let (_, _bg, _fstype) = mount_and_serve(&mut conn, build_id, mount_point)?;
 
     let mut rtts = Vec::with_capacity(iters);
     for _ in 0..iters {
@@ -597,10 +754,11 @@ fn concurrency(
     backing_file: &Path,
     promote_mib: usize,
     iters: usize,
+    mount_point: &Path,
 ) -> anyhow::Result<()> {
+    enter_userns()?;
     let mut conn = Conn::connect(socket)?;
-    let (_, fuse_fd) = mount(&mut conn, build_id)?;
-    let _bg = start_fuse(fuse_fd)?;
+    let (_, _bg, _fstype) = mount_and_serve(&mut conn, build_id, mount_point)?;
 
     let content = gen_content(0xC04C44, promote_mib << 20);
     let digest = *blake3::hash(&content).as_bytes();
@@ -686,7 +844,8 @@ fn fill_staging(
     use std::io::Write;
 
     let mut conn = Conn::connect(socket)?;
-    let (quota, _fuse_fd) = mount(&mut conn, build_id)?;
+    let fuse_fd = open_dev_fuse()?;
+    let quota = mount(&mut conn, build_id, &fuse_fd)?;
     let path = staging_root.join(build_id).join("fill");
     let mut f =
         std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;

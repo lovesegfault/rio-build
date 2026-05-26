@@ -70,8 +70,9 @@ impl MountdError {
 }
 
 /// One reply as delivered to a waiting caller: the decoded `Resp` plus
-/// any fds that arrived in the datagram's `SCM_RIGHTS` cmsg (only
-/// `Mounted` carries one).
+/// any fds that arrived in the datagram's `SCM_RIGHTS` cmsg (no current
+/// reply carries one — fds only flow builder → daemon — but the demux
+/// keeps them owned so a misbehaving daemon cannot leak fds into us).
 type Delivery = Result<(Resp, Vec<OwnedFd>), MountdError>;
 
 struct Inner {
@@ -96,8 +97,8 @@ struct Inner {
 /// otherwise dropping every client handle would leave the reader
 /// parked in `recvmsg` holding the last strong reference forever, the
 /// socket would never shut down, and the daemon would never see the
-/// EOF that triggers its conn-drop teardown (umount the castore mount,
-/// reap the staging dir).
+/// EOF that triggers its conn-drop teardown (reap the staging dir,
+/// release the build_id/uid claims).
 struct Conn {
     shared: Arc<Inner>,
     /// Joined on drop, after the shutdown that guarantees it exits.
@@ -133,8 +134,8 @@ impl Drop for Conn {
 ///
 /// Dropping the last handle disconnects: the socket is shut down, the
 /// reader thread is joined, and the daemon observes EOF — which is its
-/// signal to umount the build's castore mount and reap its staging
-/// dir. There is deliberately no force-close that yanks the socket out
+/// signal to reap the build's staging dir and release its build_id/uid
+/// claims. There is deliberately no force-close that yanks the socket out
 /// from under live clones: the FUSE callbacks hold a clone for
 /// `BackingOpen`/`BackingClose`/`Promote`, and the connection must
 /// outlive the last of them.
@@ -254,27 +255,30 @@ impl MountdClient {
         }
     }
 
-    /// `Mount{build_id}`: claim the build id, fuse-mount
-    /// `/var/rio/castore/{build_id}`, and receive the `/dev/fuse` fd.
+    /// `Mount{build_id}`: claim the build id, hand the daemon a dup of
+    /// `fuse_fd` (this build's own `/dev/fuse`, which the caller mounts
+    /// itself — see [`super::mount::mount_castore_background`]) so it
+    /// can broker `BackingOpen`/`BackingClose` against that connection,
+    /// and have the daemon set up this build's staging dir + quota.
     /// Must be the first request on a connection; exactly one per
-    /// connection lifetime. Returns `(staging_quota_bytes, fuse_fd)`.
-    pub fn mount(&self, build_id: &str, timeout: Duration) -> Result<(u64, OwnedFd), MountdError> {
-        let (resp, mut fds) = self.call(
+    /// connection lifetime. Returns `staging_quota_bytes`.
+    pub fn mount(
+        &self,
+        build_id: &str,
+        fuse_fd: RawFd,
+        timeout: Duration,
+    ) -> Result<u64, MountdError> {
+        let (resp, _) = self.call(
             Req::Mount {
                 build_id: build_id.to_owned(),
             },
-            &[],
+            &[fuse_fd],
             timeout,
         )?;
         match resp {
             Resp::Mounted {
                 staging_quota_bytes,
-            } => {
-                let fd = fds.pop().ok_or_else(|| {
-                    MountdError::Disconnected("Mounted reply carried no fuse fd".into())
-                })?;
-                Ok((staging_quota_bytes, fd))
-            }
+            } => Ok(staging_quota_bytes),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
             other => Err(MountdError::UnexpectedReply(other)),
         }
@@ -423,8 +427,8 @@ mod tests {
     const T: Duration = Duration::from_secs(5);
 
     /// Dropping the last client handle disconnects: the daemon observes
-    /// EOF (its cue to umount the build's castore mount and reap its
-    /// staging dir) and the reader thread exits and releases its
+    /// EOF (its cue to reap the build's staging dir and release its
+    /// claims) and the reader thread exits and releases its
     /// resources. A surviving clone keeps the connection open — only
     /// the LAST drop disconnects. This is the contract P0560's whole
     /// teardown path hangs off; a reader thread holding a strong
