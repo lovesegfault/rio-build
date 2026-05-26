@@ -260,19 +260,24 @@ store:
     #
     # A Deployment-level value is only correct when every store pod is
     # in the bucket's AZ (single-AZ cluster, an explicit zone
-    # nodeSelector, or a VM test's minio stand-in). For multi-AZ
-    # clusters leave this empty and populate expressBucketByAzId.
+    # nodeSelector, or a VM test's Garage stand-in). For multi-AZ
+    # clusters leave this empty and populate expressBucketByZone; when
+    # both are set, expressBucket wins.
     expressBucket: ""
-    # kind=tiered only: per-AZ Express bucket map keyed by physical
-    # AZ-ID, from `tofu output express_bucket_by_az_id`
-    # (xtask --set-json). NOT rendered into the pod env: the per-pod
-    # "which AZ am I in" resolution cannot be done by helm (the
-    # downward API exposes pod fields, not node labels) and is not yet
-    # implemented store-side — until it is, multi-AZ tiered deployments
-    # run every replica with local=None. Recorded here so the terraform
-    # output has a stable landing spot and the selection mechanism only
-    # has to read values, not re-plumb them.
-    expressBucketByAzId: {}
+    # kind=tiered only: per-AZ Express bucket map keyed by zone NAME
+    # (topology.kubernetes.io/zone values, e.g. us-east-2a), from
+    # `tofu output -json express_bucket_by_zone` (xtask --set-json).
+    # Rendered as ONE JSON env var on the whole Deployment
+    # (RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE); each pod selects its
+    # own AZ's bucket at startup by matching RIO_NODE_ZONE — rendered
+    # from the pod's topology.kubernetes.io/zone label via the downward
+    # API, which the PodTopologyLabelsAdmission plugin (KEP-4742, beta
+    # in k8s 1.35) copies from the node at binding. If that plugin is
+    # not enabled the zone label is missing and every replica logs the
+    # missing piece and runs with local=None — same behaviour as
+    # leaving this map empty. Empty (default) → env var omitted → no
+    # per-pod selection.
+    expressBucketByZone: {}
   # Stock-Nix binary-cache compatibility layer (ADR-022 §10). When
   # enabled (the default), every committed path is ALSO written to
   # S3-standard as a stock-Nix `.narinfo` + `nar/*.nar.zst` pair, so

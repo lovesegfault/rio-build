@@ -119,6 +119,36 @@ spec:
             - name: RIO_CHUNK_BACKEND__EXPRESS_BUCKET
               value: {{ .expressBucket | quote }}
             {{- end }}
+            {{- if eq .kind "tiered" }}
+            # Per-pod Express bucket selection (P0554): the store reads
+            # its own zone from this var and picks the matching bucket
+            # from EXPRESS_BUCKET_BY_ZONE below at startup. The value is
+            # the POD's topology.kubernetes.io/zone label, which the
+            # PodTopologyLabelsAdmission plugin (KEP-4742, beta in
+            # Kubernetes 1.35) copies from the node at binding — no
+            # IMDS, no nodes/get RBAC, no SA token. If the plugin is
+            # not enabled the label is absent, this resolves to "", and
+            # the store logs the missing piece and runs with local=None
+            # (direct S3-standard reads — degraded, never down).
+            - name: RIO_NODE_ZONE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['topology.kubernetes.io/zone']
+            {{- end }}
+            {{- if and (eq .kind "tiered") .expressBucketByZone }}
+            # Zone→bucket map for per-pod selection, one JSON value for
+            # the whole Deployment (the per-pod input is RIO_NODE_ZONE
+            # above; helm cannot resolve per-pod placement, the store
+            # does). Values flow from `tofu output -json
+            # express_bucket_by_zone` via xtask --set-json. Rendered as
+            # a single env var rather than a mounted TOML fragment: the
+            # store has no config file mount today, and one JSON value
+            # keeps the whole chunk-backend config in env form (a file
+            # layer could not be partially overridden by env — env can
+            # override a key but never unset one). Omitted when empty.
+            - name: RIO_CHUNK_BACKEND__EXPRESS_BUCKET_BY_ZONE
+              value: {{ .expressBucketByZone | toJson | quote }}
+            {{- end }}
             {{- end }}
             {{- with $s.binaryCacheCompat }}
             # Stock-Nix binary-cache compat (ADR-022 §10). ENABLED is

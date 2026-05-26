@@ -34,12 +34,12 @@ output "chunk_bucket_name" {
 }
 
 output "express_bucket_by_az_id" {
-  description = "Per-AZ S3 Express directory bucket names keyed by physical AZ-ID (use2-az1 → rio-build-chunk-cache--use2-az1--x-s3). Empty map = cache tier disabled. xtask passes as --set-json store.chunkBackend.expressBucketByAzId; the store-side per-pod selection resolves its own AZ-ID against this map (P0554)."
+  description = "Per-AZ S3 Express directory bucket names keyed by physical AZ-ID (use2-az1 → rio-build-chunk-cache--use2-az1--x-s3). Empty map = cache tier disabled. Informational (and the keyspace an IMDS-based selection would need); the deployed path consumes express_bucket_by_zone — P0554 selected the zone-label mechanism."
   value       = { for az_id, b in aws_s3_directory_bucket.cache : az_id => b.bucket }
 }
 
 output "express_bucket_by_zone" {
-  description = "Same buckets keyed by AZ NAME (us-east-2a → ...--x-s3). The name→ID mapping is account-specific and terraform is the only layer that knows it; this is the map to use if the per-pod selection keys off the node's topology.kubernetes.io/zone label instead of IMDS placement/availability-zone-id."
+  description = "Same buckets keyed by AZ NAME (us-east-2a → ...--x-s3) — the map xtask deploy passes as --set-json store.chunkBackend.expressBucketByZone. Each store pod matches its own topology.kubernetes.io/zone pod label (KEP-4742 downward API) against it at startup and uses that AZ's bucket as its cache tier (P0554). The name→ID mapping is account-specific and terraform is the only layer that knows it, so it emits both keyspaces."
   value       = { for az_id, b in aws_s3_directory_bucket.cache : local.zone_name_by_az_id[az_id] => b.bucket }
 }
 
