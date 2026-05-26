@@ -1213,10 +1213,14 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         }
         Err(e) => {
             debug!(error = %e, "full derivation not available, using single-node DAG");
-            (
-                vec![translate::build_node(&drv_path_str, &basic_drv)],
-                Vec::new(),
-            )
+            // Single-node fallback skips reconstruct_dag (which is
+            // where the BFS root gets flagged), so mark the requested
+            // target here. Behaviour-neutral for a 1-node submission
+            // (it is trivially a structural root) but keeps the
+            // "client named it" marker consistent across opcodes.
+            let mut node = translate::build_node(&drv_path_str, &basic_drv);
+            node.explicitly_requested = true;
+            (vec![node], Vec::new())
         }
     };
 
@@ -1382,19 +1386,23 @@ async fn enrich_build_result_with_outputs(
 /// (MergeDag is idempotent; `derivation_edges` PK is `(parent,child)` so
 /// dups are `ON CONFLICT DO NOTHING`) but they waste bytes + PG RTTs.
 ///
-/// Duplicates are identical EXCEPT for `wanted_output_names` — that is
-/// the one field computed from the *consumers reachable in one root's
-/// BFS* rather than from the `.drv` itself, so each root's copy carries
-/// only that root's demand. Retain-first must therefore UNION the
-/// dropped duplicate's wanted set into the retained node: dropping it
-/// un-wants whatever the other root asked for (root A wants `child^out`,
+/// Duplicates are identical EXCEPT for the demand fields —
+/// `wanted_output_names` and `explicitly_requested` are computed from
+/// the *request target / consumers reachable in one root's BFS* rather
+/// than from the `.drv` itself, so each root's copy carries only that
+/// root's demand. Retain-first must therefore UNION the dropped
+/// duplicate's wanted set into the retained node: dropping it un-wants
+/// whatever the other root asked for (root A wants `child^out`,
 /// root B wants `child^dev` — keeping only A's copy would let the
 /// scheduler treat a missing `dev` output as ignorable). The union is
 /// [`rio_common::wanted_outputs::union_wanted_saturating`] — the same
 /// saturating union (empty = "all declared outputs wanted", all ∪ X =
 /// all) that `DerivationState::union_wanted` and the PG upsert's
 /// union-on-conflict apply when the duplicates arrive as separate
-/// submissions instead.
+/// submissions instead. `explicitly_requested` is ORed for the same
+/// reason: a target requested in ANY copy stays a requested target
+/// (this is exactly the copy that records "the client also named this
+/// dependency as a target of its own").
 fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::DerivationEdge>) {
     let mut keep: HashMap<String, usize> = HashMap::new();
     let mut deduped: Vec<types::DerivationNode> = Vec::with_capacity(nodes.len());
@@ -1405,10 +1413,12 @@ fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::Deri
                 deduped.push(node);
             }
             std::collections::hash_map::Entry::Occupied(e) => {
+                let kept = &mut deduped[*e.get()];
                 rio_common::wanted_outputs::union_wanted_saturating(
-                    &mut deduped[*e.get()].wanted_output_names,
+                    &mut kept.wanted_output_names,
                     &node.wanted_output_names,
                 );
+                kept.explicitly_requested |= node.explicitly_requested;
             }
         }
     }
@@ -1821,6 +1831,129 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].wanted_output_names, vec!["out"]);
         assert_eq!(nodes[1].wanted_output_names, vec!["dev"]);
+    }
+
+    /// Retain-first dedup must OR `explicitly_requested` across
+    /// duplicates: a node the client named as a build target in ANY
+    /// per-target walk stays flagged, no matter which copy is retained.
+    /// Dropping the flag would re-expose the requested target to the
+    /// scheduler's roots-only prune (it is a non-root of the combined
+    /// submission, so only the flag keeps it in the demand set).
+    #[test]
+    fn dedup_dag_ors_explicitly_requested() {
+        let mk = |requested: bool| types::DerivationNode {
+            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+            drv_hash: "x".into(),
+            explicitly_requested: requested,
+            ..Default::default()
+        };
+
+        // Flagged copy is the DROPPED duplicate — flag must survive.
+        let mut nodes = vec![mk(false), mk(true)];
+        dedup_dag(&mut nodes, &mut Vec::new());
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            nodes[0].explicitly_requested,
+            "flag set on a dropped duplicate must be ORed into the retained node"
+        );
+
+        // Flagged copy is the RETAINED one — stays flagged.
+        let mut nodes = vec![mk(true), mk(false)];
+        dedup_dag(&mut nodes, &mut Vec::new());
+        assert!(nodes[0].explicitly_requested);
+
+        // No copy flagged — stays unflagged (no spurious promotion).
+        let mut nodes = vec![mk(false), mk(false)];
+        dedup_dag(&mut nodes, &mut Vec::new());
+        assert!(!nodes[0].explicitly_requested);
+    }
+
+    /// Multi-target request where one requested target lies INSIDE the
+    /// other's inputDrv closure (`nix build .#app .#lib^dev` with
+    /// app → lib): the combined, deduped submission must carry exactly
+    /// one `lib` node that (a) is marked `explicitly_requested`, (b)
+    /// wants the union of the client's selector and the consumer-derived
+    /// names, and (c) keeps its incoming edge — i.e. the request's
+    /// "build lib too" intent survives even though lib is not a
+    /// structural root of the combined DAG.
+    #[tokio::test]
+    async fn multi_target_dedup_keeps_inner_target_flagged_and_wanted() {
+        let app_path = StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app.drv")
+            .expect("valid test store path");
+        let lib_path = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-lib.drv")
+            .expect("valid test store path");
+
+        // lib declares out+dev; app's inputDrvs entry names only {out}.
+        let lib_drv = Derivation::parse(
+            r#"Derive([("dev","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-lib-dev","",""),("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-lib-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+        )
+        .expect("test ATerm parses");
+        let app_drv = Derivation::parse(
+            r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app-out","","")],[("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-lib.drv",["out"])],[],"x86_64-linux","/bin/sh",[],[])"#,
+        )
+        .expect("test ATerm parses");
+
+        // Both targets resolved into the per-session cache (production
+        // does this via resolve_derivation before reconstruct_dag).
+        let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+        let mut cache = HashMap::new();
+        cache.insert(app_path.clone(), app_drv.clone());
+        cache.insert(lib_path.clone(), lib_drv.clone());
+
+        // Per-target loop of handle_build_paths{,_with_results}: one
+        // resolved sub-DAG per Built target, concatenated…
+        let (mut nodes, mut edges) = translate::reconstruct_dag(
+            &app_path,
+            &app_drv,
+            Some(&OutputSpec::All),
+            &mut store,
+            &mut cache,
+        )
+        .await
+        .expect("app DAG reconstructs");
+        let (lib_nodes, lib_edges) = translate::reconstruct_dag(
+            &lib_path,
+            &lib_drv,
+            Some(&OutputSpec::Names(vec!["dev".into()])),
+            &mut store,
+            &mut cache,
+        )
+        .await
+        .expect("lib DAG reconstructs");
+        nodes.extend(lib_nodes);
+        edges.extend(lib_edges);
+
+        // …then deduped into ONE submission (submit_dag's first step).
+        dedup_dag(&mut nodes, &mut edges);
+
+        assert_eq!(nodes.len(), 2, "app + lib, lib's two copies collapsed");
+        let lib = nodes
+            .iter()
+            .find(|n| n.drv_path == lib_path.to_string())
+            .expect("lib node present");
+        assert!(
+            lib.explicitly_requested,
+            "the client named lib as a build target — the combined \
+             submission must keep it marked even though it is not a \
+             structural root"
+        );
+        assert_eq!(
+            lib.wanted_output_names,
+            vec!["dev", "out"],
+            "lib's wanted set = client selector (^dev) ∪ consumer-derived (out)"
+        );
+        let app = nodes
+            .iter()
+            .find(|n| n.drv_path == app_path.to_string())
+            .expect("app node present");
+        assert!(app.explicitly_requested, "app is a requested target too");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.parent_drv_path == app_path.to_string()
+                    && e.child_drv_path == lib_path.to_string()),
+            "lib keeps its incoming edge from app in the combined submission"
+        );
     }
 
     /// Wire helper: read one full `STDERR_START_ACTIVITY` frame and

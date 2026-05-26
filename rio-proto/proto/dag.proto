@@ -94,6 +94,17 @@ message DerivationNode {
   // EMPTY MEANS "ALL DECLARED OUTPUTS WANTED" (the BasicDerivation
   // fallback, pre-migration recovery rows, and ^* roots).
   repeated string wanted_output_names = 18;
+
+  // Set by the gateway on every node that a client named as a build
+  // target in the originating request (each Built target of
+  // wopBuildPaths / wopBuildPathsWithResults, the wopBuildDerivation
+  // root). A multi-target request whose targets overlap can fold one
+  // requested target INSIDE another target's inputDrv closure, making
+  // it a non-root of the combined submission — the scheduler's
+  // roots-only prune must verify and retain such nodes even when they
+  // are not structural roots. False (the proto3 default) means "only
+  // demanded as a dependency", which is the pre-addition behaviour.
+  bool explicitly_requested = 19;
 }
 
 // A dependency edge in the derivation DAG.

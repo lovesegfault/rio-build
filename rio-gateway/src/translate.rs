@@ -318,6 +318,13 @@ fn populate_needs_resolve(
 /// `OutputSpec` for the root node. EMPTY means "all declared outputs
 /// wanted" — the conservative pre-existing behaviour.
 ///
+/// Also marks the root node `explicitly_requested`: it is the node the
+/// client named as a build target, and a multi-target request can fold
+/// it inside another target's closure where it is no longer a
+/// structural root of the combined submission — the scheduler's
+/// roots-only prune keys on the flag to keep verifying and retaining
+/// it (`dedup_dag` ORs the flag across duplicate copies).
+///
 /// - A `^*` root (`OutputSpec::All`) and a root with no spec at all
 ///   (`wopBuildDerivation` carries no output selection) keep the empty
 ///   sentinel. Empty SATURATES the union: "all" ∪ X = "all", so a node
@@ -380,6 +387,12 @@ fn populate_wanted_outputs(
     }
 
     for node in nodes.iter_mut() {
+        if node.drv_path == root_path {
+            // The client named this node as a build target. The flag —
+            // not root-ness of the combined submission — is what the
+            // scheduler's prune treats as authoritative demand.
+            node.explicitly_requested = true;
+        }
         if root_wants_all && node.drv_path == root_path {
             // Already empty from build_node, but be explicit: the
             // saturated "all wanted" sentinel wins over anything.
@@ -623,6 +636,11 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // single-node fallback never runs the pass, so it keeps the
         // conservative all-wanted sentinel.
         wanted_output_names: Vec::new(),
+        // False here — populate_wanted_outputs() flags the BFS root
+        // (the node the client named as a build target); every other
+        // node is demanded only as a dependency. The BasicDerivation
+        // fallback's caller flags its single node directly.
+        explicitly_requested: false,
         drv_content: Vec::new(),
         is_content_addressed: drv.is_content_addressed(),
         // Empty here — populate_ca_modular_hashes() fills AFTER the
@@ -2232,6 +2250,49 @@ mod tests {
             Vec::<String>::new(),
             "no root spec → empty sentinel (all declared outputs wanted)"
         );
+    }
+
+    /// The BFS root — the node the client named as a build target — is
+    /// marked `explicitly_requested` for every OutputSpec shape (Names,
+    /// All, and the spec-less wopBuildDerivation path); dependency
+    /// nodes are not. The scheduler's roots-only prune keys on this
+    /// flag to retain a requested target that another requested
+    /// target's closure swallowed (it is then NOT a structural root of
+    /// the combined submission).
+    #[test]
+    fn populate_wanted_outputs_marks_root_explicitly_requested() {
+        let parent_path = sp("/nix/store/pppppppppppppppppppppppppppppppp-parent.drv");
+        let child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv");
+
+        let child = make_test_derivation("/nix/store/aaa-glibc-out", &[]);
+        let parent = make_test_derivation(
+            "/nix/store/ppp-parent-out",
+            &[(child_path.as_str(), &["out"])],
+        );
+
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(parent_path.clone(), parent.clone());
+        drv_cache.insert(child_path.clone(), child.clone());
+
+        for spec in [
+            Some(OutputSpec::Names(vec!["out".into()])),
+            Some(OutputSpec::All),
+            None,
+        ] {
+            let mut nodes = vec![
+                build_node(parent_path.as_str(), &parent),
+                build_node(child_path.as_str(), &child),
+            ];
+            populate_wanted_outputs(&mut nodes, &drv_cache, parent_path.as_str(), spec.as_ref());
+            assert!(
+                nodes[0].explicitly_requested,
+                "the requested root must be flagged for spec {spec:?}"
+            );
+            assert!(
+                !nodes[1].explicitly_requested,
+                "a node demanded only as a dependency must NOT be flagged (spec {spec:?})"
+            );
+        }
     }
 
     /// `reconstruct_dag` wires the pass: the post-BFS node list carries
