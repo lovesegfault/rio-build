@@ -125,6 +125,14 @@ narinfo.
   and surfaces `NotFound` as a clear error, not silent corruption. A separate
   `FindMissingChunks` gRPC batch-query exists for external callers (e.g.,
   executor-side pre-upload checks).
+  _Stale description (predates the `uploaded_at` migration): the shipped
+  dedup decision is keyed on confirmed backend presence via the upsert's
+  `RETURNING (uploaded_at IS NULL)` --- #rref("store.cas.upsert-inserted"),
+  #rref("store.chunk.liveness-not-presence") --- never on the refcount, and
+  the `FindMissingChunks` RPC has been removed (`grpc/chunk.rs` now serves
+  only the test-only `GetChunk`). Retained unrewritten until the
+  refcount-prose retirement pass; flagged here so it is not read as current
+  behavior._
 - *S3 backend requirements:* Strong read-after-write consistency is required.
   AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph
   RADOS GW) must be validated for consistency.
@@ -197,14 +205,100 @@ table schema:
   its increment. (Sibling to #rref("store.chunk.refcount-txn").)
 ]
 
-*Refcount decrement:* In the same PostgreSQL transaction that deletes a
-manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of
-unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount =
-refcount - 1 WHERE blake3_hash = ANY($1)` --- atomic batch decrement.
+#r("store.chunk.refcount-decrement")[
+  *Refcount decrement:* every transaction that deletes a manifest row --- the
+  reclaim of a stale `'uploading'` manifest, the in-process `put_chunked`
+  rollback, or the GC sweep of an unreachable `'complete'` path --- MUST
+  decrement `chunks.refcount` in that same transaction, using the chunk list
+  taken from the deleted manifest's own `manifest_data.chunk_list`: one
+  decrement per unique hash per deleted manifest, summed by count when one
+  statement covers several deleted manifests sharing a chunk. Chunks that
+  reach `refcount = 0` are never deleted from the backend by the deleting
+  transaction: the GC/reap paths soft-delete them (`deleted = true`,
+  `uploaded_at` cleared) and enqueue their keys to `pending_s3_deletes` in
+  the same transaction (#rref("store.gc.pending-deletes")); the in-process
+  rollback leaves them at zero for the orphan-chunk sweep to collect after
+  the grace TTL (#rref("store.chunk.grace-ttl")).
+]
 
-Chunks with `refcount = 0` are not immediately deleted from S3; they become
-eligible for GC sweep, which soft-deletes them and enqueues S3 key deletion via
-the `pending_s3_deletes` table.
+As-built rule, slated for retirement together with the counter: it exists to
+keep #rref("store.chunk.refcount-meaning") true and has no meaning without
+the column. Known deviation, accepted as-built: a `chunk_list` that fails to
+deserialize at deletion time is logged and the decrement skipped --- the
+affected chunks' refcounts never return to zero and the chunks are never
+collected (the carve-out under #rref("store.gc.bounded-garbage-retention")).
+
+#r("store.chunk.refcount-meaning")[
+  Counter meaning: at every point where no chunk-mutating transaction is in
+  flight, `chunks.refcount(h)` MUST equal the number of existing manifests
+  --- `'uploading'` and `'complete'` alike --- whose
+  `manifest_data.chunk_list` references `h`, counting each manifest once
+  regardless of how many times `h` repeats inside its chunk list. The
+  increment (#rref("store.chunk.refcount-txn")) and decrement
+  (#rref("store.chunk.refcount-decrement")) exist solely to maintain this
+  equality; nothing else writes the counter. Sanctioned deviations: transient
+  over-counts left by a crash between the write-ahead upsert and the upload's
+  completion or cleanup, repaired when the stale placeholder is reclaimed
+  (#rref("store.put.stale-reclaim"), the orphan scanner); and the permanent
+  over-count left by a manifest whose `chunk_list` could not be deserialized
+  at deletion time (#rref("store.chunk.refcount-decrement")). Under-counts
+  are never sanctioned.
+]
+
+As-built rule, slated for retirement together with the counter: the planned
+replacement derives chunk liveness from the manifests at collect time, makes
+this equality true by construction, and then deletes the column. The
+`CHECK (refcount >= 0)` constraint added by migration 023 is the only runtime
+enforcement of (one side of) this rule; the spec carries the full equality.
+
+#r("store.chunk.no-live-collect")[
+  No live chunk is ever collected: if any existing `'complete'` manifest's
+  `chunk_list` references chunk `h`, the chunk-backend object for `h` MUST
+  exist. A backend DeleteObject for `h` MUST be issued only from a state in
+  which no existing manifest of any status references `h` at the instant of
+  the delete. `'uploading'` manifests are excluded from the presence clause
+  (their backend PUTs may still be in flight --- the write-ahead upsert
+  deliberately precedes the upload); their chunks are protected by the same
+  no-references condition on the delete action, the grace TTL
+  (#rref("store.chunk.grace-ttl")), and the re-upload discipline of
+  #rref("store.chunk.liveness-not-presence").
+]
+
+This is the chunk store's data-loss invariant, stated mechanism-neutrally:
+today it is enforced by the write-ahead increment
+(#rref("store.chunk.refcount-txn")), the same-transaction
+decrement-and-zero-detect (#rref("store.chunk.refcount-decrement")), the
+upsert's resurrect arm (`deleted = false`), the soft-delete clearing
+`uploaded_at` (#rref("store.cas.chunk-upload-committed")), and the drain's
+`FOR UPDATE` re-check immediately before the irreversible backend delete
+(#rref("store.gc.pending-deletes")). It survives unchanged if the counter is
+replaced by manifest-derived collection.
+
+#r("store.gc.bounded-garbage-retention")[
+  No dead chunk is retained forever: an existing chunk row referenced by no
+  existing manifest, and staying unreferenced, MUST eventually be
+  soft-deleted and have its backend object deleted --- or have its
+  `pending_s3_deletes` row parked at the attempts cap and surfaced by the
+  stuck-deletes alerting (#rref("store.gc.pending-deletes")) --- within one
+  full pass of the applicable reclamation path (the GC sweep for swept paths,
+  the stale-placeholder reclaim for crashed uploads, the orphan-chunk sweep
+  for never-referenced chunks) plus the grace TTL plus drain lag. Carve-out:
+  a chunk whose references-on-record were carried by a manifest whose
+  `chunk_list` cannot be deserialized MAY outlive this bound while that
+  condition persists; the suspension MUST be observable (logged or alerted),
+  never a silent exemption.
+]
+
+As-built, the bound is conditional on the counter being correct: a refcount
+left above zero by a crash is repaired when the stale placeholder is
+reclaimed, but a refcount left above zero by a missed decrement (including
+the corrupt-`chunk_list` skip recorded under
+#rref("store.chunk.refcount-decrement")) never returns to zero and the chunk
+is retained indefinitely --- today the carve-out is a permanent,
+warning-level-only exemption. A manifest-derived collector replaces the
+conditionality: liveness is recomputed from the manifests each cycle, so a
+missed decrement cannot occur, and the carve-out narrows to a fail-closed,
+alerted pause of chunk collection while an unparseable `chunk_list` exists.
 
 = Key Operations
 
@@ -355,6 +449,13 @@ the `pending_s3_deletes` table.
   BLAKE3 verification on every read (see #rref("store.integrity.verify-on-get")).
 + *Complete:* Flip manifest status to `'complete'` in a single PG transaction
   (also fills real narinfo fields, references, content index entries).
+
+_Steps 4--5 above are a stale description (pre-`uploaded_at`): the shipped
+flow has no separate dedup query --- the step-3 UPSERT itself returns
+`needs_upload = (uploaded_at IS NULL)` per #rref("store.cas.upsert-inserted"),
+and the upload set is that returned subset, never a `refcount == 1` filter
+(#rref("store.chunk.liveness-not-presence")). Retained unrewritten until the
+refcount-prose retirement pass._
 
 *On graceful error (steps 4--6 return `Err`):* `put_chunked` rolls back
 refcounts and deletes the `'uploading'` placeholder before returning. Chunks
@@ -928,6 +1029,14 @@ drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3
 enumeration needed. A weekly full orphan scan remains as a safety net for any
 leaked chunks not covered by manifest-based cleanup.
 
+_The last sentence is a stale claim: no weekly full orphan scan exists. The
+only standalone chunk reaper is the hourly orphan-chunk sweep, and it
+collects only rows already at `refcount = 0`
+(#rref("store.chunk.grace-ttl")); a refcount left above zero by a missed or
+skipped decrement has no repair path today --- see the carve-out and
+as-built note under #rref("store.gc.bounded-garbage-retention"). Retained
+unrewritten until the refcount-prose retirement pass._
+
 #r("store.gc.sweep-path-tenants")[
   Sweep MUST delete `path_tenants` rows for each swept `store_path_hash` in the
   same transaction as the `narinfo` DELETE. `path_tenants` has no FK CASCADE to
@@ -1028,6 +1137,28 @@ leaked chunks not covered by manifest-based cleanup.
   idempotent for identical content); the first to reach `mark_chunks_uploaded`
   wins the timestamp.
 ]
+
+#r("store.chunk.liveness-not-presence")[
+  The chunk-liveness signal (today the `chunks.refcount` counter; under a
+  manifest-derived collector, the mark set) MUST NOT be used to decide
+  whether a chunk's bytes are present in the chunk backend. A writer MAY skip
+  the backend PUT for a chunk only when `chunks.uploaded_at` is non-NULL
+  (#rref("store.cas.upsert-inserted")), and `uploaded_at` is non-NULL only if
+  a backend put for that hash has succeeded since the chunk was last
+  soft-deleted (#rref("store.cas.chunk-upload-committed")). Probes and
+  operator tooling that ask "should this chunk's object exist?" MUST key on
+  `uploaded_at` (as #rref("store.admin.verify-chunks") does), never on the
+  liveness signal.
+]
+
+Lesson of the M_033 production data loss: using `refcount` as a "someone
+already uploaded this" signal turned a SIGKILLed uploader into a permanently
+missing chunk --- the loser of the dedup race skipped its PUT against an
+object that never arrived. The rule is mechanism-neutral and survives the
+counter's replacement (a manifest-derived mark set is no more a presence
+signal than the counter was); together with
+#rref("store.chunk.no-live-collect") it is the pair of obligations any chunk
+GC redesign must preserve.
 
 = Crash-Safe S3 Deletion (`pending_s3_deletes`)
 
@@ -1379,7 +1510,9 @@ CREATE INDEX idx_pending_s3_deletes_drain
   - `put_path.rs` --- PutPath handler (buffer, verify, branch inline/chunked)
   - `get_path.rs` --- GetPath handler (manifest load, parallel reassembly
     stream)
-  - `chunk.rs` --- FindMissingChunks batch query RPC
+  - `chunk.rs` --- FindMissingChunks batch query RPC _(stale: the RPC was
+    removed; the module now serves only the test-only `GetChunk` retrieval
+    surface)_
 - `rio-store/src/metadata/` --- narinfo + manifest persistence (PostgreSQL)
   - `mod.rs` --- re-exports + shared types
   - `inline.rs` --- inline-blob fast path (write `manifests.inline_blob` BYTEA)
