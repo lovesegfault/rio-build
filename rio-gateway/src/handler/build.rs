@@ -1929,7 +1929,7 @@ mod tests {
         assert_eq!(nodes.len(), 2, "app + lib, lib's two copies collapsed");
         let lib = nodes
             .iter()
-            .find(|n| n.drv_path == lib_path.to_string())
+            .find(|n| n.drv_path == lib_path.as_str())
             .expect("lib node present");
         assert!(
             lib.explicitly_requested,
@@ -1944,14 +1944,14 @@ mod tests {
         );
         let app = nodes
             .iter()
-            .find(|n| n.drv_path == app_path.to_string())
+            .find(|n| n.drv_path == app_path.as_str())
             .expect("app node present");
         assert!(app.explicitly_requested, "app is a requested target too");
         assert!(
             edges
                 .iter()
-                .any(|e| e.parent_drv_path == app_path.to_string()
-                    && e.child_drv_path == lib_path.to_string()),
+                .any(|e| e.parent_drv_path == app_path.as_str()
+                    && e.child_drv_path == lib_path.as_str()),
             "lib keeps its incoming edge from app in the combined submission"
         );
     }
