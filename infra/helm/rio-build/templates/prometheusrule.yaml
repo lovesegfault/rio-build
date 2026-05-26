@@ -469,7 +469,8 @@ spec:
         # failing — but the cause is corrupt store content or transport
         # corruption, which never self-heals. Any single occurrence is
         # page-worthy (the metric help says "investigate immediately").
-        # No `for:`: increase() over 5m already debounces scrape jitter.
+        # `for: 0m` (fire on the first evaluation): increase() over 5m
+        # already debounces scrape jitter, so no extra hold is needed.
         - alert: RioBuilderCastoreIntegrityFail
           expr: increase(rio_builder_castore_fuse_integrity_fail_total[5m]) > 0
           for: 0m

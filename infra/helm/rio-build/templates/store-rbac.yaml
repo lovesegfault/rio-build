@@ -20,6 +20,14 @@ Until those two are deliberately relaxed for tiered deployments
 logs "kube client init failed; lease loop exiting" and never sweeps —
 the directory bucket's age-based lifecycle expiration
 (infra/eks/s3-express.tf) is the growth backstop.
+
+Also deliberate: no pods get/patch verbs. rio-lease's leader loop tries
+to annotate its own Pod with controller.kubernetes.io/pod-deletion-cost
+on acquire/release; without the verbs that patch gets a 403 and is only
+warn-logged ("rollout still works, k8s will pick arbitrarily") — benign
+for a sweeper whose replicas are interchangeable. Granting the verbs is
+part of the same P0554 prod-Express enablement decision as the
+SA-token/netpol relaxation above.
 */ -}}
 {{- if and .Values.store.enabled (eq .Values.store.chunkBackend.kind "tiered") .Values.store.chunkBackend.expressBucket }}
 {{- $bucket := .Values.store.chunkBackend.expressBucket -}}

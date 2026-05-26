@@ -89,6 +89,16 @@ if test "$(yq 'select(.kind=="PersistentVolumeClaim" and .metadata.name=="rio-st
   echo "FAIL: kind=tiered rendered the filesystem PVC" >&2
   exit 1
 fi
+# The express-sweep lease Role (store-rbac.yaml, rendered for
+# tiered+expressBucket) scopes get/update to the ONE per-AZ Lease whose
+# name embeds the az-id parsed from the bucket suffix
+# (...--use2-az1--x-s3 → use2-az1), mirroring express_sweep.rs. A drift
+# in that parse silently strands the sweeper on a 403 against a Lease
+# the Role doesn't name.
+test "$(yq 'select(.kind=="Role" and .metadata.name=="rio-store-express-sweep-lease") | .rules[1].resourceNames[0]' "$tiered")" = "rio-store-express-sweep-use2-az1" || {
+  echo "FAIL: express-sweep Role resourceNames did not embed the az-id parsed from the bucket name" >&2
+  exit 1
+}
 
 # ── tiered without expressBucket/map: local=None degraded mode ───────
 deg=$TMPDIR/cb-degraded.yaml

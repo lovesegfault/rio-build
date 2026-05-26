@@ -328,6 +328,80 @@
         "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Node objects cache: hits & disk-pressure sweeps",
+      "description": "rate(rio_builder_objects_cache_hit_total[5m]) — open()s served straight from the node-shared backing cache (/var/rio/cache), no fetch. rio_mountd_sweep_removed_total by tier and rio_mountd_sweep_low_space_total — the P0571 disk-pressure sweep evicting staging orphans, then chunks, then cache entries when min(free%) drops below the low-water mark. Sustained sweep activity alongside a falling hit rate means the node SSD is undersized for the working set.",
+      "gridPos": {"x": 0, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_builder_objects_cache_hit_total[5m]))",
+          "legendFormat": "cache-hit opens/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (tier) (rate(rio_mountd_sweep_removed_total[5m]))",
+          "legendFormat": "swept {{tier}} entries/s",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(rio_mountd_sweep_low_space_total[1h]))",
+          "legendFormat": "low-space sweep activations (1h)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Node objects cache: bytes served, free & reclaimed",
+      "description": "rio_builder_objects_cache_bytes — bytes served from the node cache on open() hits (1h increase = re-fetch traffic avoided). rio_mountd_cache_free_bytes — statvfs free space on the cache filesystem, min over nodes (the sweep trigger input). rio_mountd_sweep_bytes_freed_total by tier — what the disk-pressure sweep reclaimed. Free bytes pinned near the low-water mark with little reclaimed means everything left is live staging.",
+      "gridPos": {"x": 12, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(increase(rio_builder_objects_cache_bytes[1h]))",
+          "legendFormat": "served from cache (1h)",
+          "refId": "A"
+        },
+        {
+          "expr": "min(rio_mountd_cache_free_bytes)",
+          "legendFormat": "cache fs free bytes (worst node)",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (tier) (increase(rio_mountd_sweep_bytes_freed_total[1h]))",
+          "legendFormat": "reclaimed {{tier}} (1h)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ]
 }

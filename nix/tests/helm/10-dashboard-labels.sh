@@ -3,8 +3,9 @@
 # Each dashboards/*.json panel `expr` references labels via `sum by (k,…)`
 # clauses or `{k="v"}` selectors. This fragment extracts every (metric,
 # label-key) pair and asserts it appears in the allowlist below, which is
-# sourced from the `describe_*!` HELP text in each component's lib.rs and
-# the tables in docs/spec/system/observability.typ.
+# sourced from the `describe_*!` HELP text in each component's lib.rs plus
+# the metric tables in docs/spec/system/observability.typ and (for the
+# ADR-022 castore/mountd/compat metrics) design-overview §14.
 #
 # A label-key drift (e.g. `reason` vs `result`) is invisible to `helm
 # template`: PromQL with an absent label collapses series to one
@@ -12,7 +13,8 @@
 # (`{absent="x"}` → "No data"). bug_141/460/483 shipped exactly this.
 #
 # Adding a new (metric,label) pair: extend ALLOW below AND make sure the
-# emission site + observability.typ agree.
+# emission site + the relevant spec table (observability.typ or
+# design-overview §14) agree.
 
 # metric:label, one per line. `le` is the implicit Prometheus histogram
 # bucket label and is allowed on every *_bucket metric below.
@@ -36,6 +38,8 @@ rio_builder_castore_fuse_chunk_source_total:src
 rio_builder_upload_chunks_total:kind
 rio_mountd_request_seconds_bucket:op
 rio_mountd_promote_reject_total:reason
+rio_mountd_sweep_removed_total:tier
+rio_mountd_sweep_bytes_freed_total:tier
 rio_store_nar_index_eager_total:outcome
 rio_store_directory_has_batch_size_bucket:rpc
 rio_store_hmac_rejected_total:reason
