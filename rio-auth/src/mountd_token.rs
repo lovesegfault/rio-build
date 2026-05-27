@@ -477,6 +477,26 @@ impl MountdSigningKey {
         )
     }
 
+    /// This key's `name:base64(seed ‖ pubkey)` signing-key-file line —
+    /// what the keygen tooling (the bootstrap Job's keypair block,
+    /// `spike_mountd_client keygen` for VM tests/standalone) writes to
+    /// the file [`Self::load`] reads. The 64-byte form is emitted so the
+    /// embedded-pubkey consistency check applies on every load.
+    ///
+    /// This is the PRIVATE key serialization: callers must treat the
+    /// returned string with the same care as the signing-key file
+    /// itself (0600, scheduler/control-plane only, never logged).
+    pub fn secret_key_entry(&self) -> String {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(self.key.as_bytes());
+        bytes.extend_from_slice(&self.key.verifying_key().to_bytes());
+        format!(
+            "{}:{}",
+            self.key_name,
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        )
+    }
+
     /// Sign claims into an `rmt2` token string.
     ///
     /// The signature is computed over the literal ASCII prefix
@@ -501,7 +521,10 @@ impl MountdSigningKey {
 /// Multiple entries are the rotation-overlap state — verification tries
 /// every root, so tokens signed by either the outgoing or the incoming
 /// key stay valid until the operator drops the old line and restarts the
-/// DaemonSet. Public material only; holding it mints nothing.
+/// DaemonSet. Public material only; holding it mints nothing — this is
+/// the only mountd-side credential material the rmt2 scheme ever places
+/// on a builder/fetcher node.
+// r[impl builder.mountd.token-no-node-mint]
 #[derive(Clone)]
 pub struct MountdTrustRoots {
     /// `(name, key)` in file order. Names are unique (load rejects
@@ -575,22 +598,14 @@ impl MountdTrustRoots {
         self.roots.iter().map(|(n, _)| n.as_str())
     }
 
-    // TODO: add a fuzz target for the rmt2 token parser — a new
-    // fuzz/rio-auth workspace with a target driving
-    // `MountdVerifier::verify_for_build` on arbitrary token bytes (plus
-    // `MountdSigningKey::sign` outputs as seed corpus), wired into
-    // `fuzzTargets` in nix/fuzz.nix. Deferred to the ADR-022
-    // mountd-admission-credentials Phase-2 daemon wiring: until
-    // rio-mountd consumes these tokens off its UDS nothing
-    // attacker-reachable parses this format, and the fuzz workspace
-    // belongs in the same change that makes it reachable (tracked as a
-    // Phase-2 row in the §P0590 implementation-plan table).
     /// Verify the envelope of an `rmt2` token: shape, signature (against
     /// every root), then claims decode. Claim-level checks (expiry,
     /// audience, build_id, node) belong to
     /// [`MountdVerifier::verify_for_build`], the only public entry point
     /// — keeping this private means no caller can accidentally accept a
-    /// token on signature alone.
+    /// token on signature alone. Attacker-reachable via the rio-mountd
+    /// UDS in token mode; fuzzed by `fuzz/rio-auth`'s
+    /// `mountd_token_verify` target.
     fn verify_envelope(
         &self,
         token: &str,
@@ -738,6 +753,7 @@ impl MountdVerifier {
             if claims.build_id != build_id {
                 return Err(MountdVerifyError::BuildIdMismatch);
             }
+            // r[impl builder.mountd.token-node-scoped]
             if let Some(expected) = expected_node {
                 if claims.node.is_empty() {
                     return Err(MountdVerifyError::NodeMissing);
@@ -1047,6 +1063,7 @@ mod tests {
     // Node matrix (match / mismatch / missing / no expected node)
     // ------------------------------------------------------------------
 
+    // r[verify builder.mountd.token-node-scoped]
     #[test]
     fn rmt2_node_matrix() {
         let signer = key(1, &SEED_1);
@@ -1241,6 +1258,7 @@ mod tests {
     /// The two mountd schemes never verify each other's tokens — even
     /// when the same key bytes are mistakenly configured for both (an
     /// HMAC key file whose bytes equal the Ed25519 seed).
+    // r[verify builder.mountd.token-no-node-mint]
     #[test]
     fn mountd_v1_and_v2_tokens_cross_rejected_even_with_same_key_bytes() {
         // Deliberate worst case: the HMAC secret IS the Ed25519 seed.

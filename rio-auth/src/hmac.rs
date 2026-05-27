@@ -302,7 +302,7 @@ const MOUNTD_BUILD_ID_MAX_LEN: usize = 64;
 /// divergent serde shape (`deny_unknown_fields`, no
 /// `drv_hash`/`expected_outputs`/`intent_id`) keep the token families
 /// mutually unverifiable even under key mix-ups.
-// r[impl builder.mountd.token-key-separate]
+// r[impl builder.mountd.token-key-separate+2]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MountdClaims {
@@ -390,7 +390,7 @@ impl MountdClaims {
     /// [`MOUNTD_TOKEN_AUDIENCE`], and the signed `build_id` equals the
     /// requested one. Returns the claims so callers can log/attribute
     /// the admitted build.
-    // r[impl builder.mountd.token-admission]
+    // r[impl builder.mountd.token-admission+2]
     pub fn verify(
         verifier: &HmacVerifier,
         token: &str,
@@ -1218,7 +1218,7 @@ mod tests {
     /// Mountd-token happy path plus every rejection the daemon's
     /// admission gate relies on: wrong key, expiry, tampering, audience
     /// mismatch, and build_id mismatch.
-    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-admission+2]
     #[test]
     fn mountd_token_verify_matrix() {
         let signer = HmacSigner::from_key(TEST_KEY.to_vec());
@@ -1274,7 +1274,7 @@ mod tests {
     /// mountd token is not a store upload/read credential. In
     /// production the keys are also separate — this is the second,
     /// independent defence.
-    // r[verify builder.mountd.token-key-separate]
+    // r[verify builder.mountd.token-key-separate+2]
     #[test]
     fn mountd_and_assignment_tokens_are_mutually_unverifiable() {
         let signer = HmacSigner::from_key(TEST_KEY.to_vec());
