@@ -26,10 +26,12 @@ pub struct VersionSuffix {
 /// — the regex `pre(\d+)\.([0-9a-f]{7,40})`. Names without a version
 /// suffix (plain packages, VM tests) yield `None`.
 pub fn recover_version_suffix(name: &str) -> Option<VersionSuffix> {
-    // Compiled on every call; callers invoke this a handful of times
-    // per eval set, so a cached regex is not worth a once_cell dep.
-    let re = regex::Regex::new(r"pre(\d+)\.([0-9a-f]{7,40})").expect("static regex");
-    let caps = re.captures(name)?;
+    use std::sync::LazyLock;
+
+    static VERSION_SUFFIX: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"pre(\d+)\.([0-9a-f]{7,40})").expect("static regex"));
+
+    let caps = VERSION_SUFFIX.captures(name)?;
     Some(VersionSuffix {
         rev_count: caps[1].parse().ok()?,
         short_rev: caps[2].to_string(),
@@ -52,6 +54,16 @@ pub struct NixpkgsArg {
 }
 
 impl NixpkgsArg {
+    /// Render the attrset as a Nix expression.
+    ///
+    /// The fields are interpolated verbatim (this function cannot
+    /// fail), so the caller must guarantee they are inert in a Nix
+    /// string/expression context: `rev` and `short_rev` must be bare
+    /// lowercase hex (as Hydra's revision field and
+    /// [`recover_version_suffix`] produce), and `source_store_path`
+    /// must be a plain `/nix/store/...` path with no quotes, spaces,
+    /// `\`, or `${`. [`selection_expr`] re-checks the hex shape before
+    /// embedding the rendering into a generated file.
     pub fn to_nix_expr(&self) -> String {
         format!(
             "{{ outPath = builtins.storePath {}; rev = \"{}\"; shortRev = \"{}\"; revCount = {}; }}",
@@ -64,7 +76,9 @@ impl NixpkgsArg {
 /// onto `--arg <name> <nix literal>` pairs. Only the input types the
 /// release expressions actually consume are supported; anything else
 /// (a second git input, path inputs, …) is an error so we never
-/// silently evaluate with a missing argument.
+/// silently evaluate with a missing argument. String values are escaped
+/// for Nix string syntax (`\`, `"`, and the `${` interpolation opener);
+/// `nix` values are already Nix expressions and pass through verbatim.
 pub fn jobset_extra_args(jobset: &HydraJobset) -> anyhow::Result<Vec<(String, String)>> {
     let expr_input = jobset.nixexprinput.as_deref().unwrap_or_default();
     let mut out = Vec::new();
@@ -78,7 +92,13 @@ pub fn jobset_extra_args(jobset: &HydraJobset) -> anyhow::Result<Vec<(String, St
                 "true" | "false" => value,
                 other => anyhow::bail!("jobset input {name}: boolean with value {other:?}"),
             },
-            "string" => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
+            "string" => format!(
+                "\"{}\"",
+                value
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace("${", "\\${")
+            ),
             "nix" => value,
             other => anyhow::bail!(
                 "jobset input {name} has unsupported type {other:?}; \
@@ -168,6 +188,13 @@ pub fn evaluator_argv_scoped(
 /// Generate the scoped selection expression: one shared evaluation of
 /// the jobset entry point, exposing exactly the requested jobs as a
 /// flat attrset keyed by Hydra job name.
+///
+/// Job names and the nixpkgs rev/shortRev are interpolated into the
+/// generated Nix source, so they are validated first: each `.`-separated
+/// job component must stay within `[A-Za-z0-9_+-]` (every Hydra job name
+/// observed in the nixos jobsets does) and the revisions must be bare
+/// lowercase hex, otherwise the generated expression could mean
+/// something other than the requested selection.
 pub fn selection_expr(
     entry_point: &Path,
     nixpkgs: &NixpkgsArg,
@@ -175,6 +202,23 @@ pub fn selection_expr(
     jobs: &[String],
 ) -> anyhow::Result<String> {
     use std::fmt::Write as _;
+
+    let is_bare_hex = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    };
+    anyhow::ensure!(
+        is_bare_hex(&nixpkgs.rev),
+        "nixpkgs rev {:?} is not bare lowercase hex",
+        nixpkgs.rev
+    );
+    anyhow::ensure!(
+        is_bare_hex(&nixpkgs.short_rev),
+        "nixpkgs shortRev {:?} is not bare lowercase hex",
+        nixpkgs.short_rev
+    );
+
     let mut expr = String::new();
     writeln!(
         expr,
@@ -199,6 +243,16 @@ pub fn selection_expr(
             !components.is_empty() && components.iter().all(|c| !c.is_empty()),
             "job name {job:?} has an empty attr-path component"
         );
+        for component in &components {
+            anyhow::ensure!(
+                component
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+')),
+                "job name {job:?} component {component:?} contains characters outside \
+                 [A-Za-z0-9_+-]; such attribute names cannot be embedded in the generated \
+                 selection expression"
+            );
+        }
         let path_list = components
             .iter()
             .map(|c| format!("\"{c}\""))
@@ -210,7 +264,11 @@ pub fn selection_expr(
     Ok(expr)
 }
 
-/// `(short_rev, full_rev)` consistency check used after recovery.
+/// `(short_rev, full_rev)` consistency check used after recovery: it
+/// rejects a `pre<digits>.<hex>` match that came from a package's own
+/// version string instead of the nixpkgs versionSuffix, since such a
+/// false positive recovers hex that is not a prefix of the evaluation's
+/// real nixpkgs revision.
 pub fn short_rev_matches(short_rev: &str, full_rev: &str) -> bool {
     !short_rev.is_empty() && full_rev.starts_with(short_rev)
 }
@@ -285,6 +343,34 @@ mod tests {
         .unwrap();
         let err = jobset_extra_args(&js).unwrap_err();
         assert!(err.to_string().contains("other"), "got: {err:#}");
+    }
+
+    #[test]
+    fn jobset_string_and_nix_inputs_render_as_nix_literals() {
+        // The recorded nixos-unstable jobset only exercises the boolean
+        // branch, so cover the string-escaping and nix-passthrough
+        // branches with a synthetic jobset: the string value carries a
+        // quote, a backslash, and a `${` that must all come out inert.
+        let js: crate::hydra::HydraJobset = serde_json::from_str(
+            r#"{"project":"p","name":"j","nixexprinput":"src","nixexprpath":"release.nix",
+                "inputs":{"src":{"type":"git","value":"https://example.com/x.git"},
+                          "label":{"type":"string","value":"say \"hi\" \\ ${notInterpolated}"},
+                          "overrides":{"type":"nix","value":"{ allowUnfree = true; }"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            jobset_extra_args(&js).unwrap(),
+            vec![
+                (
+                    "label".to_string(),
+                    "\"say \\\"hi\\\" \\\\ \\${notInterpolated}\"".to_string()
+                ),
+                (
+                    "overrides".to_string(),
+                    "{ allowUnfree = true; }".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -409,5 +495,51 @@ in
         )
         .unwrap_err();
         assert!(err.to_string().contains("nixpkgs..hello"));
+    }
+
+    #[test]
+    fn selection_expression_rejects_unsupported_component_characters() {
+        // A component outside [A-Za-z0-9_+-] (here a quote) could break
+        // out of the generated attribute-path strings.
+        let err = selection_expr(
+            std::path::Path::new("/e.nix"),
+            &sample_arg(),
+            &[],
+            &["nixpkgs.\"weird attr\".x86_64-linux".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("characters outside"),
+            "got: {err:#}"
+        );
+
+        // Non-hex rev/shortRev never come from a real Hydra eval; refuse
+        // to embed them rather than emit a corrupted expression.
+        let bad_rev = NixpkgsArg {
+            rev: "68d8aa3d\" ++ injected".to_string(),
+            ..sample_arg()
+        };
+        let err = selection_expr(
+            std::path::Path::new("/e.nix"),
+            &bad_rev,
+            &[],
+            &["nixpkgs.hello.x86_64-linux".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not bare lowercase hex"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn short_rev_match_guards_against_foreign_version_suffixes() {
+        // Recovered from the real nixpkgs versionSuffix → prefix of the
+        // evaluation's full revision.
+        assert!(short_rev_matches("68d8aa3d661f", REV));
+        // Recovered from some package's own pre<digits>.<hex> version →
+        // unrelated hex, must be rejected by the caller.
+        assert!(!short_rev_matches("0f33ab1aaaaa", REV));
+        assert!(!short_rev_matches("", REV));
     }
 }
