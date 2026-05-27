@@ -193,6 +193,11 @@
       "doc": "PrefetchHint handling: warm the FUSE cache and ACK the scheduler."
     },
     {
+      "path": "runtime/pull.rs",
+      "depth": 1,
+      "doc": "Pull-mode client loop (`dispatch_mode = pull`)."
+    },
+    {
       "path": "runtime/result.rs",
       "depth": 1,
       "doc": "`ExecutorError` / `ExecutionResult` → `CompletionReport` mapping."

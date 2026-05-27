@@ -159,6 +159,11 @@
         "format": "uint64",
         "minimum": 0,
         "default": 120
+      },
+      "dispatch_mode": {
+        "description": "Dispatch mode: `stream` (default — the session protocol) or\n`pull` (the additive `PullAssignment`/`ReportOutcome` unary\npath; the pod pulls the derivation it was spawned for and\nreports its outcome, with no registration, heartbeat, or\nstream). Env: `RIO_DISPATCH_MODE=stream|pull`. Selected per\npool by the controller; flipping a production pool is a\ndeployment-time operator action.",
+        "$ref": "#/$defs/DispatchMode",
+        "default": "stream"
       }
     },
     "$defs": {
@@ -188,6 +193,21 @@
             "default": 0
           }
         }
+      },
+      "DispatchMode": {
+        "description": "How this pod gets its work from the scheduler.\n\n`Stream` is the as-built session protocol (register, heartbeat,\nbidi `BuildExecution` stream) and stays the default everywhere.\n`Pull` is the additive unary path: the pod is born knowing its\nderivation (`RIO_INTENT_ID`) and asks for it with\n`ExecutorService.PullAssignment`, reporting the outcome with\n`ReportOutcome` — no registration, no heartbeat, no stream. Selected\nper pool (the controller renders the pod env); production pools stay\non `stream` until a pool template is flipped at deployment time.",
+        "oneOf": [
+          {
+            "description": "Session protocol (register/heartbeat/stream) — the default.",
+            "type": "string",
+            "const": "stream"
+          },
+          {
+            "description": "Pull-mode unaries (`PullAssignment` / `ReportOutcome`).",
+            "type": "string",
+            "const": "pull"
+          }
+        ]
       }
     }
   },
@@ -224,6 +244,7 @@
     "executor_token": "",
     "daemon_timeout_secs": 7200,
     "max_silent_time_secs": 0,
-    "idle_secs": 120
+    "idle_secs": 120,
+    "dispatch_mode": "stream"
   }
 }

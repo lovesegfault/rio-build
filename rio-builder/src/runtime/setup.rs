@@ -224,15 +224,26 @@ pub async fn setup(
     let completion_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let completion_cleared = Arc::new(tokio::sync::Notify::new());
 
-    rio_common::task::spawn_monitored(
-        "stream-relay",
-        relay_loop(
-            sink_rx,
-            relay_target_rx,
-            Arc::clone(&completion_pending),
-            Arc::clone(&completion_cleared),
-        ),
-    );
+    // Pull mode (`dispatch_mode = pull`): the pull loop consumes the
+    // sink directly — there is no gRPC stream to relay into, so the
+    // relay task is not started (and no heartbeat below). Stream mode
+    // is untouched.
+    let pull_mode = cfg.dispatch_mode == crate::config::DispatchMode::Pull;
+    let pull_sink_rx = if pull_mode {
+        drop(relay_target_rx);
+        Some(sink_rx)
+    } else {
+        rio_common::task::spawn_monitored(
+            "stream-relay",
+            relay_loop(
+                sink_rx,
+                relay_target_rx,
+                Arc::clone(&completion_pending),
+                Arc::clone(&completion_cleared),
+            ),
+        );
+        None
+    };
 
     // P0537: one build per pod. The slot tracks both occupancy and
     // the running drv_path (heartbeat reads it). `try_claim` is
@@ -269,7 +280,7 @@ pub async fn setup(
     // Shared with BuildSpawnContext below so the per-build daemon's
     // `extra-platforms` matches what the heartbeat advertises.
     let systems: std::sync::Arc<[String]> = systems.into();
-    let heartbeat_handle = spawn_heartbeat(HeartbeatCtx {
+    let hb_ctx = HeartbeatCtx {
         executor_id: executor_id.clone(),
         executor_kind: cfg.executor_kind,
         systems: systems.to_vec(),
@@ -286,7 +297,16 @@ pub async fn setup(
         draining: Arc::clone(&draining),
         generation: Arc::clone(&latest_generation),
         client: scheduler_client.clone(),
-    });
+    };
+    // Pull mode: no registration, no heartbeat task — liveness is the
+    // Job's lifecycle and readiness flips when the pull lands
+    // (pull.rs). Stream mode keeps the heartbeat exactly as before.
+    let heartbeat_handle = if pull_mode {
+        drop(hb_ctx);
+        None
+    } else {
+        Some(spawn_heartbeat(hb_ctx))
+    };
 
     // Shared context for spawning build tasks (clones done once per assignment
     // inside spawn_build_task, not here).
@@ -344,6 +364,10 @@ pub async fn setup(
         latest_generation,
         heartbeat_handle,
         build_ctx,
+        dispatch_mode: cfg.dispatch_mode,
+        intent_id: cfg.intent_id.clone(),
+        ready,
+        pull_sink_rx,
         executor_token: cfg.executor_token,
         prefetch: PrefetchDeps {
             cache: prefetch_cache,

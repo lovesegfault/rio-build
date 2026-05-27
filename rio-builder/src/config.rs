@@ -24,6 +24,28 @@ fn executor_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ExecutorKind,
     }
 }
 
+/// How this pod gets its work from the scheduler.
+///
+/// `Stream` is the as-built session protocol (register, heartbeat,
+/// bidi `BuildExecution` stream) and stays the default everywhere.
+/// `Pull` is the additive unary path: the pod is born knowing its
+/// derivation (`RIO_INTENT_ID`) and asks for it with
+/// `ExecutorService.PullAssignment`, reporting the outcome with
+/// `ReportOutcome` — no registration, no heartbeat, no stream. Selected
+/// per pool (the controller renders the pod env); production pools stay
+/// on `stream` until a pool template is flipped at deployment time.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchMode {
+    /// Session protocol (register/heartbeat/stream) — the default.
+    #[default]
+    Stream,
+    /// Pull-mode unaries (`PullAssignment` / `ReportOutcome`).
+    Pull,
+}
+
 /// Serde serializer for ExecutorKind as string. Needed for the
 /// compiled-defaults base layer of the config loader.
 fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::Ok, S::Error> {
@@ -196,6 +218,14 @@ pub struct Config {
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
+    /// Dispatch mode: `stream` (default — the session protocol) or
+    /// `pull` (the additive `PullAssignment`/`ReportOutcome` unary
+    /// path; the pod pulls the derivation it was spawned for and
+    /// reports its outcome, with no registration, heartbeat, or
+    /// stream). Env: `RIO_DISPATCH_MODE=stream|pull`. Selected per
+    /// pool by the controller; flipping a production pool is a
+    /// deployment-time operator action.
+    pub dispatch_mode: DispatchMode,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -233,6 +263,7 @@ impl Default for Config {
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
+            dispatch_mode: DispatchMode::Stream,
         }
     }
 }

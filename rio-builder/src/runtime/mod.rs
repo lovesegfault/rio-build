@@ -11,10 +11,12 @@
 //! - `prefetch`: PrefetchHint handling + warm-gate ACK
 //! - `setup`: cold-start wiring (identity, cgroup, connect, FUSE)
 //! - `drain`: SIGTERM drain gate + build-flushed wait
+//! - `pull`: the pull-mode client loop (`dispatch_mode = pull`)
 
 mod drain;
 mod heartbeat;
 mod prefetch;
+pub mod pull;
 mod result;
 mod setup;
 mod slot;
@@ -787,7 +789,9 @@ pub struct BuilderRuntime {
     /// Notified by [`relay_loop`] when it clears `completion_pending`.
     completion_cleared: Arc<Notify>,
     latest_generation: Arc<AtomicU64>,
-    heartbeat_handle: tokio::task::JoinHandle<()>,
+    /// `None` in pull mode (no heartbeat task — liveness is the Job's
+    /// lifecycle, readiness is set by the pull loop).
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     build_ctx: BuildSpawnContext,
     /// `RIO_EXECUTOR_TOKEN` — attached as `x-rio-executor-token` on
     /// every `build_execution` open. Empty in dev mode → omitted.
@@ -797,6 +801,22 @@ pub struct BuilderRuntime {
     /// [`handle_prefetch_hint`] without 7 loose fields.
     prefetch: PrefetchDeps,
     idle_timeout: Duration,
+    /// How this pod gets its work ([`crate::config::DispatchMode`]):
+    /// `Stream` runs the `'reconnect` loop below; `Pull` hands off to
+    /// [`pull::run_pull`].
+    dispatch_mode: crate::config::DispatchMode,
+    /// `RIO_INTENT_ID` — the derivation this pod was spawned for (the
+    /// pull-mode work key). Empty outside k8s / in stream mode.
+    intent_id: String,
+    /// Readiness flag shared with the health server. Stream mode: set
+    /// by the heartbeat loop on first accepted heartbeat. Pull mode:
+    /// set by the pull loop once an assignment is pulled (building).
+    ready: Arc<AtomicBool>,
+    /// Pull mode only: the receive half of the permanent sink
+    /// (`build_ctx.stream_tx`'s counterpart). The pull loop consumes it
+    /// directly — there is no gRPC stream to relay into. `None` in
+    /// stream mode (the relay task owns the receiver).
+    pull_sink_rx: Option<mpsc::Receiver<ExecutorMessage>>,
     /// Probe-loop guards for both balanced channels. Held for process
     /// lifetime (dropping a `BalancedChannel` stops its probe loop).
     _balance_guard: BalanceGuards,
@@ -812,6 +832,11 @@ pub struct BuilderRuntime {
 /// messages. K8s sends SIGTERM then starts the grace period clock; we
 /// want to react immediately, not after the next gap in assignments.
 pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
+    // Pull mode: a different (much smaller) lifecycle — pull, build,
+    // report, exit. The stream machinery below is not started.
+    if rt.dispatch_mode == crate::config::DispatchMode::Pull {
+        return pull::run_pull(rt).await;
+    }
     // Spawn the build-done watcher task exactly ONCE (on the first
     // assignment). AtomicBool swap(true) returns the previous value —
     // only the first caller sees false. Lives outside the reconnect
@@ -913,7 +938,11 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         rt.relay_target_tx.send_replace(Some(grpc_tx));
 
         let stream_end = loop {
-            if rt.heartbeat_handle.is_finished() {
+            if rt
+                .heartbeat_handle
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
                 // bail! not exit(1): unwind the stack so fuse_session
                 // (above) drops → Mount::drop → fusermount -u.
                 // exit(1) would leak the mount → next start EBUSY.
@@ -1147,7 +1176,10 @@ fn run_teardown(rt: BuilderRuntime) {
     // the executor in its map (undispatchable zombie). Abort is
     // fire-and-forget: the task holds only Arcs (no Drop ordering
     // hazards), and any in-flight HeartbeatRequest is harmless.
-    rt.heartbeat_handle.abort();
+    // (`None` in pull mode — no heartbeat task ever existed.)
+    if let Some(hb) = &rt.heartbeat_handle {
+        hb.abort();
+    }
     info!("drain complete, exiting");
 
     // r[impl builder.shutdown.fuse-abort]
