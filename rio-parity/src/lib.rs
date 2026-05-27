@@ -1,14 +1,16 @@
 //! rio-parity — nixpkgs-parity campaign engine.
 //!
-//! This crate hosts the eval-set builder (design §5) and, in a later
-//! change, the campaign runner. The binary entry point is
-//! `src/main.rs`; everything else is a library module so it can be
-//! unit-tested against recorded fixtures.
+//! This crate hosts the eval-set builder and, in a later change, the
+//! campaign runner. The binary entry point is `src/main.rs`; everything
+//! else is a library module so it can be unit-tested against recorded
+//! fixtures.
 
 pub mod cmd;
+pub mod hydra;
 
-/// Descriptive User-Agent for every engine-originated HTTP request
-/// (hydra.nixos.org politeness requirement, design §11).
+/// Descriptive User-Agent for every engine-originated HTTP request, so
+/// hydra.nixos.org and cache.nixos.org operators can tell this traffic
+/// apart from anonymous crawlers.
 ///
 /// `contact` is appended when provided so hydra.nixos.org operators can
 /// reach whoever is running a campaign.

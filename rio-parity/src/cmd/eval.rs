@@ -1,9 +1,14 @@
-//! `rio-parity eval` — build an eval set (design §5).
+//! `rio-parity eval` — build an eval set from a Hydra evaluation: the
+//! job manifest, the drvPath fidelity report, the dependency closure,
+//! and the packed derivation archive.
 
 use clap::Args;
 
-/// Placeholder argument set; the full surface lands with the
-/// orchestration in a later change.
+// TODO: grow this placeholder into the full argument surface (scope
+// selection, output directory, S3 destination, politeness-budget
+// overrides) when the eval-set orchestration lands; until then only
+// `--hydra-eval` exists so the binary has a parseable subcommand.
+/// Placeholder argument set for `rio-parity eval`.
 #[derive(Debug, Args)]
 pub struct EvalArgs {
     /// Hydra evaluation id (e.g. 1824219).

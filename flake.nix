@@ -863,7 +863,13 @@
                     excludes = [ "^Cargo\\.json$" ];
                   };
                   check-merge-conflicts.enable = true;
-                  end-of-file-fixer.enable = true;
+                  end-of-file-fixer = {
+                    enable = true;
+                    # Recorded hydra.nixos.org responses are committed as
+                    # byte-exact fixtures (rio-parity provenance contract);
+                    # appending a trailing newline would break that.
+                    excludes = [ "^rio-parity/tests/fixtures/hydra/" ];
+                  };
                   trim-trailing-whitespace.enable = true;
                   deadnix.enable = true;
                   nil.enable = true;
