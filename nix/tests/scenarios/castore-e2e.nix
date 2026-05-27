@@ -404,6 +404,34 @@ let
     }
   '';
 
+  # mountd-restart phase E: a build that takes a COLD whole-file miss
+  # while the broker is down/restarting (the round-3b reconnect-or-
+  # degrade follow-up). cold_gate is read first — its promote is the
+  # host-visible "the script is past its first read" signal the test
+  # keys the second broker kill on; the 30 s sleep is the kill window;
+  # cold_miss is then opened cold, so its Promote can only land via the
+  # client's reconnect (re-dial + re-Mount against the restarted
+  # daemon) or be served from the verified staged copy (degraded) if
+  # the broker is still away — either way the build must COMPLETE. The
+  # 90 s tail is the metric-scrape window (one-shot pod); submission to
+  # completion stays well under the scheduler's 300 s client-less-build
+  # reaping.
+  coldMissRestartDrv = pkgs.writeText "castore-cold-miss-restart.nix" ''
+    { busybox, coldGate, coldMiss }:
+    derivation {
+      name = "rio-castore-cold-miss-restart";
+      system = builtins.currentSystem;
+      builder = "''${busybox}/bin/sh";
+      args = [ "-c" '''
+        ''${busybox}/bin/busybox cat ''${coldGate} > /dev/null || exit 1
+        for i in $(''${busybox}/bin/busybox seq 1 6); do ''${busybox}/bin/busybox sleep 5; done
+        ''${busybox}/bin/busybox cat ''${coldMiss} > /dev/null || exit 2
+        for i in $(''${busybox}/bin/busybox seq 1 18); do ''${busybox}/bin/busybox sleep 5; done
+        echo ok > $out
+      ''' ];
+    }
+  '';
+
   # ── testScript prelude ────────────────────────────────────────────────
   prelude = ''
     ${common.assertions}
@@ -738,6 +766,7 @@ let
       eioInfraDrv
       mountdRestartDrv
       postRestartDrv
+      coldMissRestartDrv
       ;
   };
   fragments = builtins.mapAttrs (_: f: f scope) (common.importDir ./castore-e2e);

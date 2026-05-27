@@ -1677,6 +1677,8 @@ in
       #   promoted, and the store layer never sees it.
       "integrity-fail"
       # r[verify builder.mountd.orphan-scan]
+      # r[verify builder.fs.mountd-reconnect]
+      # r[verify builder.fs.promote-degrade-staged]
       #   mountd-restart: a build holding a passthrough fd survives the
       #   broker force-restart and completes; the restarted daemon's
       #   startup scan reaps a planted orphan staging dir while leaving
@@ -1686,6 +1688,11 @@ in
       #   (Round 3b finding (c) was the empty expected_outputs HMAC
       #   claim on gRPC-direct submissions failing every upload, plus
       #   the orphan scan reaping the live build's staging — both fixed.)
+      #   The cold-miss phase then kills the broker again mid-build so a
+      #   COLD whole-file miss meets a dead connection: the build must
+      #   complete via the client's reconnect (re-dial + re-Mount +
+      #   retried Promote) or the degraded staged serve, with zero EIO
+      #   (the round-3b reconnect-or-degrade follow-up).
       "mountd-restart"
       # r[verify builder.result.input-eio-is-infra]
       #   eio-infra-retry: with the store's chunk objects offline the
