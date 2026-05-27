@@ -211,7 +211,7 @@ pub struct ServiceClaims {
     pub caller: String,
     /// Unix seconds. Gateway sets `now + 60`; store rejects past
     /// expiry. No nonce — replay-within-60s is a no-op given
-    /// idempotent PutPath (`r[store.put.idempotent]`).
+    /// idempotent PutPath (`r[store.put.idempotent+2]`).
     pub expiry_unix: u64,
 }
 
