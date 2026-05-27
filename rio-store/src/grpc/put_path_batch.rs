@@ -177,21 +177,9 @@ impl StoreServiceImpl {
                 Ok(PlaceholderClaim::AlreadyComplete) => {
                     accum.already_complete = true;
                     n_exists_emitted += 1;
-                    // r[impl store.put.tenant-attribution+2]
-                    // A tenant that lacks attribution for an
-                    // already-complete output gets the content-verified
-                    // re-upload: mark it for phase-3 verification +
-                    // attribution instead of silently skipping it.
-                    if let Some(tid) = auth.tenant_id {
-                        match self
-                            .tenant_has_attribution(&accum.store_path_hash, tid)
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => accum.attribute_only = true,
-                            Err(e) => bail!(e),
-                        }
-                    }
+                    // Attribution for already-complete outputs is
+                    // resolved in ONE batched probe after this loop —
+                    // see the `tenant_attribution_batch` pass below.
                     continue;
                 }
                 Ok(PlaceholderClaim::Owned(c)) => c,
@@ -218,6 +206,34 @@ impl StoreServiceImpl {
                 Err(e) => bail!(e),
             }
             accum.nar_bytes = Some(nar);
+        }
+
+        // r[impl store.put.tenant-attribution+2]
+        // Already-complete outputs: a tenant that lacks attribution for
+        // one gets the content-verified re-upload (phase-3 verification
+        // + attribution) instead of being silently skipped. Resolved
+        // here as ONE batched `path_tenants` probe for the whole
+        // already-complete set — per-output outcomes are identical to
+        // the previous one-PK-probe-per-output form, this just collapses
+        // N round-trips into one. Tenant-less requests probe nothing
+        // (no attribution route exists for them).
+        if let Some(tid) = auth.tenant_id {
+            let complete_hashes: Vec<Vec<u8>> = outputs
+                .values()
+                .filter(|a| a.already_complete)
+                .map(|a| a.store_path_hash.clone())
+                .collect();
+            if !complete_hashes.is_empty() {
+                let attributed = match self.tenant_attribution_batch(&complete_hashes, tid).await {
+                    Ok(set) => set,
+                    Err(e) => bail!(e),
+                };
+                for accum in outputs.values_mut() {
+                    if accum.already_complete && !attributed.contains(&accum.store_path_hash) {
+                        accum.attribute_only = true;
+                    }
+                }
+            }
         }
 
         let resolved_signer = self.resolve_batch_signer(auth.tenant_id).await;

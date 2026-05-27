@@ -22,6 +22,7 @@
 //! chunked support). Factoring here keeps both impls thin wrappers
 //! around the same state machine.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -759,6 +760,35 @@ impl StoreServiceImpl {
         .fetch_one(&self.pool)
         .await
         .status_internal("PutPath: path_tenants attribution probe")
+    }
+
+    /// Batch counterpart of [`Self::tenant_has_attribution`]: of the
+    /// given `store_path_hash`es, return the subset `tenant_id` already
+    /// holds a `path_tenants` row for. One UNNEST-join round-trip
+    /// regardless of batch size — PutPathBatch phase 2 uses this so a
+    /// batch of N already-complete outputs costs one probe, not N.
+    /// Per-hash semantics are identical to the single-path probe
+    /// (no `.drv` exemption, no sig-trust input — attribution only).
+    pub(in crate::grpc) async fn tenant_attribution_batch(
+        &self,
+        store_path_hashes: &[Vec<u8>],
+        tenant_id: uuid::Uuid,
+    ) -> Result<HashSet<Vec<u8>>, Status> {
+        if store_path_hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let attributed: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pt.store_path_hash \
+               FROM path_tenants pt \
+               JOIN UNNEST($1::bytea[]) AS k(h) ON pt.store_path_hash = k.h \
+              WHERE pt.tenant_id = $2",
+        )
+        .bind(store_path_hashes)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .status_internal("PutPathBatch: path_tenants attribution probe")?;
+        Ok(attributed.into_iter().collect())
     }
 
     /// Drain the remainder of a single-output PutPath stream for the

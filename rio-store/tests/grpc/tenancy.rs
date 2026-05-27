@@ -616,6 +616,127 @@ async fn put_path_batch_repush_attributes_verified_output() -> TestResult {
     Ok(())
 }
 
+/// One `PutPathBatch` mixing the three shapes a pushing tenant can hit
+/// per output: already complete AND already attributed to it, already
+/// complete but attributed only to another tenant, and absent. The
+/// per-output outcomes must match the single-output semantics exactly —
+/// idempotent fast path (`created=false`, no new row) for the
+/// attributed one, content-verified re-upload (`created=true`, new
+/// `path_tenants` row) for the unattributed one, fresh upload
+/// (`created=true`, new row) for the absent one. This is the shape that
+/// exercises the batched `path_tenants` probe (one query for the whole
+/// already-complete set) replacing the per-output PK probe.
+// r[verify store.put.tenant-attribution+2]
+// r[verify store.put.idempotent+2]
+#[tokio::test]
+async fn put_path_batch_mixed_attribution_outcomes() -> TestResult {
+    use rio_proto::types::PutPathBatchRequest;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "mixed-batch-a").await;
+    let tenant_b = seed_tenant(&db.pool, "mixed-batch-b").await;
+
+    // outputs[0]: complete + attributed to B (B re-pushes it below).
+    // outputs[1]: complete, attributed to A only.
+    // outputs[2]: absent until the batch.
+    let outputs = [
+        make_source_nar("mixed-attributed", b"already mine"),
+        make_source_nar("mixed-unattributed", b"someone else's source"),
+        make_source_nar("mixed-absent", b"brand new source"),
+    ];
+
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (mut store_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+
+    // A seeds the two already-complete outputs.
+    for (nar, nar_hash, path) in &outputs[..2] {
+        assert!(
+            put_path(
+                &mut store_a,
+                make_path_info(path, nar, *nar_hash),
+                nar.clone()
+            )
+            .await?,
+            "seed push of {path} creates"
+        );
+    }
+    // B's verified re-upload of outputs[0] earns its attribution row
+    // BEFORE the batch, so the batch sees one attributed and one
+    // unattributed already-complete output.
+    let (nar0, hash0, path0) = &outputs[0];
+    assert!(
+        put_path(
+            &mut store_b,
+            make_path_info(path0, nar0, *hash0),
+            nar0.clone()
+        )
+        .await?,
+        "B's pre-batch re-upload attributes outputs[0]"
+    );
+    assert_eq!(attribution_count(&db.pool, path0, tenant_b).await, 1);
+    assert_eq!(
+        attribution_count(&db.pool, &outputs[1].2, tenant_b).await,
+        0
+    );
+
+    // B sends ONE batch carrying all three outputs.
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    for (i, (nar, nar_hash, path)) in outputs.iter().enumerate() {
+        let mut info: PathInfo = make_path_info(path, nar, *nar_hash).into();
+        info.nar_hash = Vec::new();
+        let trailer = PutPathTrailer {
+            nar_hash: nar_hash.to_vec(),
+            nar_size: std::mem::take(&mut info.nar_size),
+        };
+        for msg in [
+            put_path_request::Msg::Metadata(PutPathMetadata { info: Some(info) }),
+            put_path_request::Msg::NarChunk(nar.clone()),
+            put_path_request::Msg::Trailer(trailer),
+        ] {
+            tx.send(PutPathBatchRequest {
+                output_index: i as u32,
+                inner: Some(PutPathRequest { msg: Some(msg) }),
+            })
+            .await
+            .expect("fresh channel");
+        }
+    }
+    drop(tx);
+    let resp = store_b
+        .put_path_batch(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.created,
+        vec![false, true, true],
+        "attributed → idempotent fast path; unattributed → verified re-upload; absent → fresh"
+    );
+
+    // B holds exactly one row per output it can now read; A's rows are
+    // untouched and A gains nothing from B's batch.
+    for (_, _, path) in &outputs {
+        assert_eq!(
+            attribution_count(&db.pool, path, tenant_b).await,
+            1,
+            "B must hold exactly one path_tenants row for {path}"
+        );
+    }
+    assert_eq!(attribution_count(&db.pool, path0, tenant_a).await, 1);
+    assert_eq!(
+        attribution_count(&db.pool, &outputs[1].2, tenant_a).await,
+        1
+    );
+    assert_eq!(
+        attribution_count(&db.pool, &outputs[2].2, tenant_a).await,
+        0
+    );
+    Ok(())
+}
+
 /// Tenant-scoped source visibility on FindMissingPaths
 /// (`require_tenant_attribution`): an unattributed tenant is told the
 /// path is missing (so `nix copy` re-pushes it and the verified
