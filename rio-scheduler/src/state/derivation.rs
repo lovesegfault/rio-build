@@ -895,7 +895,7 @@ pub struct DerivationState {
     /// (which would dispatch a doomed build); the dispatch-time probes
     /// take the same fail-fast arm for a childless flagged node whose
     /// wanted outputs turn out missing and unsubstitutable.
-    /// r[sched.merge.substitute-topdown+8]. Persisted (`migrations/063`,
+    /// r[sched.merge.substitute-topdown+9]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
     /// cleared once its children are all produced, or when the
     /// fail-fast consumes it) and restored by

@@ -858,7 +858,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+8")[
+#r("sched.merge.substitute-topdown+9")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -880,7 +880,9 @@ submitted after the failover record contributions as usual).
   drop, is not marked) are marked `topdown_pruned` --- a mark that MUST
   be applied only after the merge has committed, MUST be persisted and
   restored at leader-failover recovery, and MUST be cleared (in PG and in
-  memory) when a later merge gives the node children. The scheduler MUST
+  memory) only once the node's children are all already produced in the
+  DAG or when the fail-fast below consumes it --- a merge that gives it
+  only unbuilt children leaves the mark in place. The scheduler MUST
   fall through to the full merge and the bottom-up `check_cached_outputs`
   when any demanded node's criterion set contains a wanted output that is
   missing and not substitutable, when a demanded node's own selector
@@ -916,8 +918,9 @@ it: stamping before the fallible cache-check and persist steps would leak a
 rejected build's prune verdict onto a shared pre-existing childless node, and
 a later routine fetch failure would terminally fail innocent builds through
 the fail-fast arm. The flag is persisted (migration 063, OR-on-conflict on
-upsert, cleared in the same transaction that inserts the edges giving the
-node children) because the post-failover shape is exactly where the
+upsert, cleared in the edge-insert transaction only when those children are
+already produced (otherwise the mark stays until they produce or the
+fail-fast consumes it)) because the post-failover shape is exactly where the
 from-source hazard bites: the recovered node is childless and re-probed
 against the stored wanted union (migration 062, empty = all declared) ---
 routinely wider than the prune-time criterion --- so an output the prune

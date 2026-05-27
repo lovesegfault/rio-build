@@ -3630,7 +3630,7 @@ async fn test_recovery_rearms_prefix_state_for_spared_ready_entry() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+8]
+// r[verify sched.merge.substitute-topdown+9]
 /// `topdown_pruned` must survive leader failover: a derivations row
 /// persisted with the flag set is restored with the flag set (not
 /// reset to false) so the new leader keeps honoring the "must complete
@@ -3675,7 +3675,7 @@ async fn test_recovery_restores_topdown_pruned_flag() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+8]
+// r[verify sched.merge.substitute-topdown+9]
 /// Failover regression (the doomed dispatch): a roots-only-pruned root
 /// persisted as `substituting` is recovered CHILDLESS by the new
 /// leader, comes back Ready (no deps in the DAG), and is re-probed
@@ -3782,7 +3782,7 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+8]
+// r[verify sched.merge.substitute-topdown+9]
 /// The fail-fast must CONSUME the `topdown_pruned` marker (clear it in
 /// memory and in PG) when it parks a node: the flag can be stale (a
 /// committed merge whose activation failed, a node stamped while its
