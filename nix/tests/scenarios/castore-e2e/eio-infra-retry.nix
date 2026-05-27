@@ -124,32 +124,37 @@ scope: with scope; ''
           )
           print("eio-infra-retry: store chunk objects restored")
 
+      # Classification evidence: the executor's reclassified error
+      # message ("input materialization failed (I-043/I-178): …
+      # executing '<builder>': Input/output error") flows into the
+      # scheduler's infrastructure-failure handler log line, which also
+      # carries drv_hash (the .drv basename) — so the check is scoped
+      # to THIS subtest's derivation and an unrelated reclassification
+      # cannot satisfy it. It distinguishes the infra path from an
+      # ordinary retry, which the PG status alone cannot. Checked HERE,
+      # right after the re-queue was observed, while the line is seconds
+      # old and inside any tail window: a post-recovery check flaked
+      # once when the relative --since window dropped it (guest clock
+      # skew), and there is no durable structural source to query
+      # instead — the scheduler's infra-retry counter is in-memory
+      # state, and the builder-side
+      # rio_builder_input_materialization_failures_total counter dies
+      # with the one-shot worker pod.
+      drv_base_eio = drv_eio.rsplit("/", 1)[-1]
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
+          "--tail=20000 2>/dev/null | "
+          f"grep -aF '{drv_base_eio}' | "
+          "grep -aq 'input materialization failed'",
+          timeout=90,
+      )
+      print("eio-infra-retry: scheduler logged the input-materialization reclassification")
+
       # Recovery on retry is the strongest proof the failure was
       # retryable: the same derivation must now complete, and the
       # builder script's digest lands in the node cache on the way.
       wait_drv_status(drv_eio, ["completed"], timeout=600, ctx="eio-infra-retry recovery")
       assert_cached(b3_eio_builder, "eio builder after the successful retry", timeout=120)
 
-      # Classification evidence: the executor's reclassified error
-      # message ("input materialization failed (I-043/I-178): …
-      # executing '<builder>': Input/output error") flows into the
-      # scheduler's infrastructure-failure handler log line, which also
-      # carries drv_hash (the .drv basename) — so the count is scoped
-      # to THIS subtest's derivation and an unrelated reclassification
-      # cannot satisfy it. One bounded fetch after the fact — the line
-      # distinguishes the infra path from a permanent-failure retry,
-      # which the PG status alone cannot.
-      drv_base_eio = drv_eio.rsplit("/", 1)[-1]
-      sched_tail = k3s_server.succeed(
-          "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
-          "--tail=20000 --since=20m 2>/dev/null | "
-          f"grep -aF '{drv_base_eio}' | "
-          "grep -c 'input materialization failed' || true"
-      ).strip()
-      assert int(sched_tail or "0") >= 1, (
-          "eio-infra-retry: the scheduler never logged the input-materialization "
-          f"reclassification for {drv_base_eio} — the EIO was not classified "
-          "as an infrastructure failure for this derivation"
-      )
       print("eio-infra-retry PASS: EIO classified as infra, re-queued, recovered")
 ''
