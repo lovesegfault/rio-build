@@ -23,18 +23,31 @@
 //! The daemon is a per-node DaemonSet; a restart (upgrade, crash,
 //! force-delete) kills every UDS connection while the builds it served
 //! keep running. A client built by [`MountdClient::connect`] therefore
-//! re-establishes its session when an RPC fails because the connection
-//! is gone: re-dial the socket, re-issue `Mount{build_id}` (the daemon
-//! requires it as the first request on every connection, and a
-//! restarted daemon's per-connection state died with the old process —
-//! its EEXIST-tolerant staging setup re-adopts the surviving dir), and
-//! retry the failed request. Attempts are bounded and backoff-jittered
-//! ([`MOUNTD_RECONNECT_ATTEMPTS`], [`MOUNTD_RECONNECT_BACKOFF`]); after
-//! an exhausted cycle a cooldown ([`MOUNTD_RECONNECT_COOLDOWN`]) makes
-//! further RPCs fail fast so a long outage degrades exactly like the
-//! pre-reconnect behavior instead of stalling every FUSE callback.
-//! Test clients built by [`MountdClient::from_fd`] (socketpairs) have
-//! nothing to re-dial and keep the old fail-fast behavior.
+//! re-establishes its session when a `Promote`/`PromoteChunks` fails
+//! because the connection is gone: re-dial the socket, re-issue
+//! `Mount{build_id}` (the daemon requires it as the first request on
+//! every connection, and a restarted daemon's per-connection state died
+//! with the old process — its EEXIST-tolerant staging setup re-adopts
+//! the surviving dir), and retry the failed request. Attempts are
+//! bounded and backoff-jittered ([`MOUNTD_RECONNECT_ATTEMPTS`],
+//! [`MOUNTD_RECONNECT_BACKOFF`], re-Mount capped at
+//! [`MOUNTD_RECONNECT_MOUNT_TIMEOUT`]); after an exhausted cycle a
+//! cooldown ([`MOUNTD_RECONNECT_COOLDOWN`]) makes further attempts fail
+//! fast so a long outage degrades exactly like the pre-reconnect
+//! behavior instead of stalling every FUSE callback.
+//!
+//! `BackingOpen`/`BackingClose` deliberately do NOT enter the cycle
+//! ([`OnConnLoss::FailFast`]): their callers already have a cheap
+//! per-open degradation (keep-cache reads; a deferred close), and
+//! `open()` issues BackingOpen while holding the per-build
+//! backing-table lock — paying the backoff schedule there would stall
+//! every concurrent open of the build for seconds when the
+//! pre-reconnect behavior (instant keep-cache fallback) is perfectly
+//! serviceable. A successful Promote-driven reconnect swaps the shared
+//! connection, so later opens regain passthrough automatically. Test
+//! clients built by [`MountdClient::from_fd`] (socketpairs) have
+//! nothing to re-dial and keep the old fail-fast behavior for every
+//! request.
 // r[impl builder.fs.mountd-reconnect]
 
 use std::collections::HashMap;
@@ -51,10 +64,14 @@ use super::mountd_proto::{self as proto, ErrKind, Reply, Req, Request, Resp};
 use crate::IgnorePoison;
 
 /// Re-dial attempts per RPC after a connection-loss failure. Each
-/// attempt is one `connect(2)` (fails in microseconds while the daemon
-/// is away) plus, on success, one `Mount` round-trip bounded by the
-/// caller's own request timeout — so the whole cycle stays inside a
-/// couple of `mountd_request_timeout` budgets even in the worst case.
+/// attempt is one backoff sleep plus one `connect(2)` (fails in
+/// microseconds while the daemon is away) plus, on success, one
+/// re-`Mount` round-trip capped at [`MOUNTD_RECONNECT_MOUNT_TIMEOUT`].
+/// Worst case — a daemon that accepts connections but never replies —
+/// is therefore 4 × (≤2.5 s jittered backoff + 5 s re-Mount) ≈ 30 s,
+/// about one `mountd_request_timeout`, before the RPC's original error
+/// surfaces; the typical restart outage (connection refused) costs only
+/// the ≈5.5 s of backoff sleeps.
 const MOUNTD_RECONNECT_ATTEMPTS: u32 = 4;
 
 /// Backoff slept before each re-dial attempt: 500 ms → 1 s → 2 s → 2 s
@@ -68,14 +85,38 @@ const MOUNTD_RECONNECT_BACKOFF: rio_common::backoff::Backoff = rio_common::backo
     jitter: rio_common::backoff::Jitter::Proportional(0.25),
 };
 
+/// Budget for the re-`Mount` issued inside one reconnect attempt. The
+/// daemon answers `Mount` inline (mkdir + chown + quota ioctls — no
+/// copy/hash), so a healthy daemon replies in milliseconds; capping the
+/// wait well below the configured `mountd_request_timeout` keeps the
+/// whole bounded cycle (see [`MOUNTD_RECONNECT_ATTEMPTS`]) inside about
+/// one request budget even against a daemon that accepts connections
+/// but never replies, and bounds how long `reconnect()` can hold the
+/// connection slot lock.
+const MOUNTD_RECONNECT_MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// After a reconnect cycle exhausts every attempt without reaching the
-/// daemon, further RPCs skip reconnection (failing fast with their
+/// daemon, further attempts are skipped (the RPC fails fast with its
 /// original error, exactly like the pre-reconnect behavior) until this
 /// much time has passed — a long mountd outage must not turn every
-/// cache-hit open into a multi-second stall when the keep-cache
-/// fallback serves it just fine. The next RPC after the cooldown
+/// promote into a multi-second stall when the degraded staged serve
+/// handles it just fine. The next eligible RPC after the cooldown
 /// re-probes.
 const MOUNTD_RECONNECT_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// What [`MountdClient::call`] does when the connection turns out to be
+/// gone: re-establish the session, or surface the error immediately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnConnLoss {
+    /// Re-dial + re-`Mount` + retry, bounded — for `Promote`/
+    /// `PromoteChunks`, where giving up costs a re-fetch (and, before
+    /// the degrade path, used to cost the build).
+    Reconnect,
+    /// Surface the error immediately — for `BackingOpen`/`BackingClose`,
+    /// whose callers already degrade cheaply (keep-cache reads; a
+    /// deferred close) and may hold per-build locks across the call.
+    FailFast,
+}
 
 /// A mountd request failure, classified for the build-vs-infra
 /// decision.
@@ -119,12 +160,22 @@ impl MountdError {
 /// daemon went away or the socket died) — the class of failure a
 /// re-dial can fix. Daemon-side rejections, unexpected replies, local
 /// encode errors, and timeouts (the request may still be executing
-/// daemon-side; re-sending could double-execute it) are NOT in it.
+/// daemon-side; re-sending could double-execute it) are NOT in it; nor
+/// are send-side errors other than the peer-gone trio (EPIPE,
+/// ECONNRESET, ENOTCONN) — an ENOBUFS/EMSGSIZE against a healthy daemon
+/// must not trigger a pointless re-dial cycle that ends in the
+/// duplicate-uid rejection.
 fn is_connection_loss(err: &MountdError) -> bool {
-    matches!(
-        err,
-        MountdError::Disconnected(_) | MountdError::Send(proto::FrameError::Io(_))
-    )
+    match err {
+        MountdError::Disconnected(_) => true,
+        MountdError::Send(proto::FrameError::Io(io)) => matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
 }
 
 /// One reply as delivered to a waiting caller: the decoded `Resp` plus
@@ -445,10 +496,21 @@ impl MountdClient {
     ///
     /// The restarted daemon accepts the re-`Mount` for the surviving
     /// staging dir: its staging setup tolerates the existing directory
-    /// (EEXIST), re-chowns it to the same peer uid, and assigns a fresh
-    /// project id seeded above any survivor's, while the builder's
-    /// flock'd `.rio-live` sentinel keeps the startup orphan scan and
-    /// the disk-pressure sweep away from the dir in the meantime.
+    /// (EEXIST), re-chowns it to the same peer uid, and re-applies the
+    /// staging quota to the project id the dir already carries, while
+    /// the builder's flock'd `.rio-live` sentinel keeps the startup
+    /// orphan scan and the disk-pressure sweep away from the dir in the
+    /// meantime.
+    ///
+    /// The sentinel itself is NOT re-planted here. The recreated-without-
+    /// a-sentinel case only arises when THIS daemon (no restart) tore
+    /// the old connection down on a socket-level error and deleted the
+    /// dir — at which point the staged content is already gone and the
+    /// only cost of the missing sentinel is that a *later* restart's
+    /// scan may reap the recreated dir, sending the affected fill down
+    /// the input-EIO → infra-retry path (the pre-sentinel status quo,
+    /// not data loss). Re-planting would require this client to know
+    /// the staging path, which it deliberately does not.
     fn reconnect(&self, failed: &Arc<Conn>) -> Result<Arc<Conn>, MountdError> {
         let Some(socket_path) = self.inner.socket_path.as_deref() else {
             return Err(MountdError::Disconnected(
@@ -471,10 +533,14 @@ impl MountdClient {
                 MountdError::Disconnected(format!("re-dial {} failed: {e}", socket_path.display()))
             })?;
             let conn = Arc::new(conn);
+            // The capped timeout (not the original Mount's): a healthy
+            // daemon answers Mount in milliseconds, and this round-trip
+            // both holds the connection-slot lock and multiplies into
+            // the worst-case cycle bound.
             conn.mount(
                 &session.build_id,
                 session.fuse_fd.as_raw_fd(),
-                session.mount_timeout,
+                session.mount_timeout.min(MOUNTD_RECONNECT_MOUNT_TIMEOUT),
             )?;
             Ok(conn)
         })();
@@ -507,15 +573,17 @@ impl MountdClient {
         }
     }
 
-    /// Send `req` and block for its reply, re-dialing and re-mounting
-    /// (bounded, backoff-jittered) when the connection turns out to be
-    /// gone. Non-connection failures (rejections, timeouts) surface
-    /// unchanged.
+    /// Send `req` and block for its reply. When the connection turns
+    /// out to be gone, either re-dial + re-Mount + retry (bounded,
+    /// backoff-jittered — `OnConnLoss::Reconnect`) or surface the error
+    /// immediately (`OnConnLoss::FailFast`). Non-connection failures
+    /// (rejections, timeouts) surface unchanged either way.
     fn call(
         &self,
         req: &Req,
         fds: &[RawFd],
         timeout: Duration,
+        on_loss: OnConnLoss,
     ) -> Result<(Resp, Vec<OwnedFd>), MountdError> {
         let mut conn = self.current_conn();
         let mut redials = 0u32;
@@ -524,7 +592,7 @@ impl MountdClient {
                 Ok(ok) => return Ok(ok),
                 Err(e) => e,
             };
-            if !is_connection_loss(&err) {
+            if !is_connection_loss(&err) || on_loss == OnConnLoss::FailFast {
                 return Err(err);
             }
             if redials >= MOUNTD_RECONNECT_ATTEMPTS {
@@ -606,8 +674,12 @@ impl MountdClient {
     /// `BackingOpen`: register `fd` as a FUSE passthrough backing file
     /// via the daemon's privileged `FUSE_DEV_IOC_BACKING_OPEN` ioctl.
     /// Returns the connection-scoped `backing_id`.
+    ///
+    /// Fails fast on connection loss (no reconnect cycle): the caller
+    /// degrades the open to keep-cache reads on the spot, and it may be
+    /// holding the per-build backing-table lock across this call.
     pub fn backing_open(&self, fd: RawFd, timeout: Duration) -> Result<u32, MountdError> {
-        let (resp, _) = self.call(&Req::BackingOpen, &[fd], timeout)?;
+        let (resp, _) = self.call(&Req::BackingOpen, &[fd], timeout, OnConnLoss::FailFast)?;
         match resp {
             Resp::BackingId(id) => Ok(id),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -616,9 +688,16 @@ impl MountdClient {
     }
 
     /// `BackingClose{id}`: release a backing id from a prior
-    /// [`Self::backing_open`].
+    /// [`Self::backing_open`]. Fails fast on connection loss — the
+    /// close is best-effort (the kernel-side registration dies with the
+    /// connection anyway).
     pub fn backing_close(&self, backing_id: u32, timeout: Duration) -> Result<(), MountdError> {
-        let (resp, _) = self.call(&Req::BackingClose { backing_id }, &[], timeout)?;
+        let (resp, _) = self.call(
+            &Req::BackingClose { backing_id },
+            &[],
+            timeout,
+            OnConnLoss::FailFast,
+        )?;
         match resp {
             Resp::Ok => Ok(()),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -628,8 +707,15 @@ impl MountdClient {
 
     /// `Promote{digest}`: ask the daemon to verify-copy
     /// `staging/{build_id}/{hex(digest)}` into the shared backing cache.
+    /// Survives a daemon restart via the bounded reconnect cycle (see
+    /// the module docs).
     pub fn promote(&self, digest: [u8; 32], timeout: Duration) -> Result<(), MountdError> {
-        let (resp, _) = self.call(&Req::Promote { digest }, &[], timeout)?;
+        let (resp, _) = self.call(
+            &Req::Promote { digest },
+            &[],
+            timeout,
+            OnConnLoss::Reconnect,
+        )?;
         match resp {
             Resp::Ok => Ok(()),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -641,13 +727,21 @@ impl MountdClient {
     /// `staging/{build_id}/chunks/{hex}` into the shared chunk cache.
     /// Used by the P0575 streaming fill so other builds on this node
     /// can source those chunks locally; the caller's own assembly never
-    /// depends on the outcome.
+    /// depends on the outcome. Survives a daemon restart via the
+    /// bounded reconnect cycle (it runs on the fill thread, holds no
+    /// per-build locks, and a successful reconnect heals the session
+    /// for the fill's eventual whole-file `Promote`).
     pub fn promote_chunks(
         &self,
         chunk_digests: Vec<[u8; 32]>,
         timeout: Duration,
     ) -> Result<(), MountdError> {
-        let (resp, _) = self.call(&Req::PromoteChunks { chunk_digests }, &[], timeout)?;
+        let (resp, _) = self.call(
+            &Req::PromoteChunks { chunk_digests },
+            &[],
+            timeout,
+            OnConnLoss::Reconnect,
+        )?;
         match resp {
             Resp::Ok => Ok(()),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -1144,5 +1238,73 @@ mod tests {
              (took {:?})",
             second_started.elapsed()
         );
+    }
+
+    /// During an outage, `BackingOpen` must NOT pay the reconnect
+    /// cycle: its caller (a cache-hit `open()` holding the per-build
+    /// backing-table lock) degrades to keep-cache reads on the spot, so
+    /// the call has to surface the connection loss promptly and without
+    /// touching the daemon. A `Promote` afterwards DOES reconnect, and
+    /// once it has healed the session a later `BackingOpen` succeeds on
+    /// the new connection — passthrough comes back without the open
+    /// path ever stalling.
+    // r[verify builder.fs.mountd-reconnect]
+    #[test]
+    fn backing_open_fails_fast_during_an_outage_and_heals_via_promote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mountd.sock");
+
+        let log1 = Arc::new(DaemonLog::default());
+        let daemon1 = serve_one_connection(bind_listener(&sock), Arc::clone(&log1));
+        let client = MountdClient::connect(&sock).expect("connect");
+        let fuse_stub = tempfile::tempfile().unwrap();
+        client
+            .mount("b-fastfail", fuse_stub.as_raw_fd(), T)
+            .expect("initial mount");
+
+        // The daemon dies; its replacement is ALREADY listening, so a
+        // BackingOpen that (wrongly) entered the reconnect cycle would
+        // succeed against it instead of failing.
+        log1.kill();
+        daemon1.join().unwrap();
+        let log2 = Arc::new(DaemonLog::default());
+        let daemon2 = serve_one_connection(bind_listener(&sock), Arc::clone(&log2));
+
+        let backing_file = tempfile::tempfile().unwrap();
+        let started = std::time::Instant::now();
+        let err = client
+            .backing_open(backing_file.as_raw_fd(), T)
+            .expect_err("BackingOpen on a dead connection must fail, not reconnect");
+        assert!(matches!(
+            err,
+            MountdError::Disconnected(_) | MountdError::Send(_)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "BackingOpen must fail promptly (no backoff schedule), took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            log2.requests.lock().unwrap().is_empty(),
+            "BackingOpen must not have re-dialed the daemon: {:?}",
+            log2.requests.lock().unwrap()
+        );
+
+        // A Promote takes the reconnect path, heals the session…
+        client
+            .promote([0x33; 32], T)
+            .expect("promote reconnects to the new daemon");
+        // …and BackingOpen works again on the healed connection.
+        let id = client
+            .backing_open(backing_file.as_raw_fd(), T)
+            .expect("BackingOpen succeeds once the session is healed");
+        assert_eq!(id, 1);
+        assert_eq!(
+            log2.requests.lock().unwrap().as_slice(),
+            ["mount:b-fastfail", "promote", "backing_open"],
+            "the heal happens via the Promote-driven re-Mount, never via BackingOpen"
+        );
+        drop(client);
+        daemon2.join().unwrap();
     }
 }
