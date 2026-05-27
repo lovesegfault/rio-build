@@ -1207,15 +1207,17 @@ impl DagActor {
         //
         // Gate on `get_children().is_empty()`: a backstop for stale
         // flags. The stamp is conditional (closure-dropped nodes whose
-        // existing children are not already produced) and merges that
-        // add children clear it (in memory and in the edge-insert
-        // transaction), but a flag can still be live here while R has
-        // children — e.g. the children-adding merge landed while R's
-        // fetch was in flight, or the children are unbuilt deps kept by
-        // design. If R has children the "deps were dropped" invariant
-        // no longer holds — clear the flag and fall through to normal
-        // Ready/Queued handling instead of collaterally failing a
-        // build whose R IS buildable.
+        // existing children are not already produced) and a clear only
+        // happens once a node's children are all produced (merge-time,
+        // in memory and in the edge-insert transaction, or lazily
+        // here), so a live flag alongside children — typically unbuilt
+        // ones kept by design — is normal. If R has children the "deps
+        // were dropped" invariant no longer holds for routing —
+        // suppress the fail-fast and fall through to normal
+        // Ready/Queued handling instead of collaterally failing a build
+        // whose R IS buildable; the flag itself is only cleared (in
+        // memory and, best-effort, in PG) once those children are all
+        // produced.
         //
         // Also gate on `!forgiven_now_wanted`: that downgrade means
         // the fetch did NOT definitively fail — it forgave a seed
@@ -1225,11 +1227,30 @@ impl DagActor {
         // set. A genuine failure on that second walk lands back here
         // with `forgiven_now_wanted = false` and fails the build then.
         if topdown_pruned && !self.dag.get_children(drv_hash).is_empty() {
-            debug!(%drv_hash,
-                   "topdown-pruned root gained DAG children via later \
-                    full-merge; invariant moot, clearing flag");
-            if let Some(s) = self.dag.node_mut(drv_hash) {
-                s.topdown_pruned = false;
+            if self.children_all_produced(drv_hash) {
+                debug!(%drv_hash,
+                       "topdown-pruned root's children are all produced; \
+                        invariant moot, clearing flag (memory + PG)");
+                if let Some(s) = self.dag.node_mut(drv_hash) {
+                    s.topdown_pruned = false;
+                }
+                // Best-effort PG counterpart of the in-memory clear:
+                // this lazy clear is the only clearing site for the
+                // children-produced-later case, and the column is what
+                // a failover restores — left set, a new leader would
+                // resurrect the mark onto a node whose closure IS
+                // produced and a later walk failure would wrongly
+                // fail-fast. Same error posture as the fail-fast's
+                // clear: warn and continue, never fail the handler.
+                if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
+                    warn!(%drv_hash, error = %e,
+                          "failed to clear persisted topdown_pruned after lazy clear (continuing)");
+                }
+            } else {
+                debug!(%drv_hash,
+                       "topdown-pruned root has unbuilt DAG children; \
+                        suppressing the fail-fast but keeping the mark \
+                        (children can still be reaped unbuilt)");
             }
         } else if topdown_pruned && !forgiven_now_wanted {
             self.fail_fast_topdown_pruned_root(
@@ -1245,6 +1266,11 @@ impl DagActor {
         // Queued (Queued with a Poisoned dep is stuck forever — see
         // `revert_target_for`).
         let to = self.dag.revert_target_for(drv_hash);
+        // Childlessness for the downgrade re-spawn's topdown leg below:
+        // the flag now survives merges that add unbuilt children, so
+        // "flagged" no longer implies "childless" — only the childless
+        // shape is the hazardous doomed-from-source one.
+        let childless = self.dag.get_children(drv_hash).is_empty();
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -1308,7 +1334,7 @@ impl DagActor {
         // DAG and Completed). Falls through to that plain revert if the
         // store/self handles are gone (shutdown) — pre-fix behaviour.
         if forgiven_now_wanted
-            && (to == DerivationStatus::DependencyFailed || state.topdown_pruned)
+            && (to == DerivationStatus::DependencyFailed || (state.topdown_pruned && childless))
             && !state.output_paths.is_empty()
             && self.store_client.is_some()
             && self.self_tx.is_some()
@@ -1404,7 +1430,8 @@ impl DagActor {
     /// to re-probe or full-merge").
     ///
     /// Callers (both gate on `topdown_pruned` AND no DAG children —
-    /// a node with children no longer carries the invariant):
+    /// unbuilt children suppress the fail-fast but no longer shed the
+    /// mark; only children that are all produced clear it):
     ///  - `handle_substitute_complete` on a failed/downgraded detached
     ///    fetch (`SubstituteComplete{ok=false}` after the children
     ///    gate), the original home of this block;

@@ -491,15 +491,22 @@ impl DagActor {
                 }
             }
         }
-        // The inverse: any node that gained children in THIS merge no
-        // longer carries the childless-pruned invariant — its deps are
-        // in the DAG now. Clear the in-memory flag to mirror the PG
-        // clear that ran in the edge-insert transaction
-        // (clear_topdown_pruned_for_parents); the lazy children-gated
-        // clear in handle_substitute_complete stays as a backstop. A
-        // pruned merge has no edges, so this is a no-op there.
+        // The inverse, with the SAME criterion as the stamp: a node may
+        // only lose the mark when its children (in the post-merge DAG)
+        // are all already produced — its closure is then in the store,
+        // so a from-source dispatch is no longer doomed. A merge that
+        // adds only unbuilt children keeps the mark: those children can
+        // belong to another build and be reaped unbuilt later (see
+        // `children_all_produced`), and while they exist the mark is
+        // inert (every consumer also requires childlessness). Mirrors
+        // the PG clear in the edge-insert transaction
+        // (clear_topdown_pruned_for_parents, gated the same way); the
+        // lazy clear in handle_substitute_complete handles the
+        // children-produced-later case. A pruned merge has no edges, so
+        // this is a no-op there.
         for e in &edges {
             if let Some(hash) = self.dag.hash_for_path(&e.parent_drv_path).cloned()
+                && self.children_all_produced(&hash)
                 && let Some(s) = self.dag.node_mut(&hash)
             {
                 s.topdown_pruned = false;
@@ -1709,7 +1716,10 @@ impl DagActor {
     /// preferable to the unbounded doomed-dispatch corner. Used by both
     /// the in-memory stamping loop in `validate_and_ingest` and the
     /// row-level bind in `persist_merge_to_db` so the two always agree.
-    fn children_all_produced(&self, drv_hash: &str) -> bool {
+    /// Also gates every clear site (the merge-time clears and the lazy
+    /// clear in `handle_substitute_complete`) so stamp and clear always
+    /// use the same criterion.
+    pub(super) fn children_all_produced(&self, drv_hash: &str) -> bool {
         let children = self.dag.get_children(drv_hash);
         !children.is_empty()
             && children.iter().all(|c| {
@@ -1844,21 +1854,35 @@ impl DagActor {
         let edge_rows = edge_rows?;
         crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
 
-        // Batch 3b: any node that just gained children (it is the
-        // parent of an edge inserted above) no longer needs the
-        // topdown_pruned guard — its deps are now in the DAG, so a
-        // from-source dispatch is no longer doomed. Clearing in the
-        // SAME transaction as the edges guarantees a failover never
-        // observes THIS merge's edges without its clear. It does NOT
-        // make "pruned ∧ has-children" impossible in PG outright —
-        // edges written by other merges (e.g. to children that have
-        // since completed and dropped out of recovery's edge loading)
-        // can coexist with a stale flag, which the fail-fast clear
-        // mops up. In-memory analogues: the post-commit edge-parent
-        // clear in `validate_and_ingest` and the children-gate clear
-        // in `handle_substitute_complete`. A pruned merge has no
-        // edges, so this is a no-op there.
-        let mut edge_parents: Vec<Uuid> = edge_rows.iter().map(|(p, _)| *p).collect();
+        // Batch 3b: clear topdown_pruned only for edge-parents whose
+        // children (in the post-merge in-memory DAG — the same view the
+        // row bind above used) are all already produced: the closure is
+        // then in the store and the substitution-only guard is moot. A
+        // parent whose new children are unbuilt keeps the mark — they
+        // can be reaped unbuilt later, and the mark is inert while they
+        // exist. Clearing in the SAME transaction as the edges keeps
+        // the failover guarantee for the produced case: a failover can
+        // never observe THIS merge's edges without its clear. The
+        // fail-fast clear still mops up stale flags (e.g. children that
+        // completed and dropped out of recovery's edge loading).
+        // In-memory analogues: the post-commit edge-parent clear in
+        // `validate_and_ingest` and the lazy clear in
+        // `handle_substitute_complete` (both gated the same way). A
+        // pruned merge has no edges, so this is a no-op there.
+        let mut edge_parents: Vec<Uuid> = Vec::with_capacity(edge_rows.len());
+        for (e, (parent_id, _)) in edges.iter().zip(edge_rows.iter()) {
+            let parent_hash: Option<String> = path_to_hash
+                .get(e.parent_drv_path.as_str())
+                .map(|h| (*h).to_string())
+                .or_else(|| {
+                    self.dag
+                        .hash_for_path(&e.parent_drv_path)
+                        .map(|h| h.to_string())
+                });
+            if parent_hash.is_some_and(|h| self.children_all_produced(&h)) {
+                edge_parents.push(*parent_id);
+            }
+        }
         edge_parents.sort_unstable();
         edge_parents.dedup();
         crate::db::SchedulerDb::clear_topdown_pruned_for_parents(&mut tx, &edge_parents).await?;

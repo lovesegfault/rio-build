@@ -897,7 +897,8 @@ pub struct DerivationState {
     /// wanted outputs turn out missing and unsubstitutable.
     /// r[sched.merge.substitute-topdown+8]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
-    /// cleared when the node gains children) and restored by
+    /// cleared once its children are all produced, or when the
+    /// fail-fast consumes it) and restored by
     /// `from_recovery_row` — unlike `substitute_tried`, losing it
     /// across failover re-arms the doomed from-source dispatch.
     pub topdown_pruned: bool,

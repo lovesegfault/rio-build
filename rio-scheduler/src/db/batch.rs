@@ -116,9 +116,10 @@ impl SchedulerDb {
         // an unrelated, non-pruned merge of the same drv elsewhere must
         // never clear a prior pruned merge's marker through the upsert.
         // Clearing happens elsewhere: `clear_topdown_pruned_for_parents`
-        // in the same transaction as the edges that give the node
-        // children, and `clear_topdown_pruned_by_hash` when the topdown
-        // fail-fast consumes the marker.
+        // in the edge-insert transaction (only for parents whose
+        // children are all already produced), and
+        // `clear_topdown_pruned_by_hash` when the topdown fail-fast
+        // consumes the marker.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
@@ -155,8 +156,9 @@ impl SchedulerDb {
             --
             -- topdown_pruned: OR — set by pruned merges; this upsert
             -- never clears it. Cleared by clear_topdown_pruned_for_parents
-            -- (same tx as the edges that give the node children) and by
-            -- clear_topdown_pruned_by_hash (fail-fast consumed it).
+            -- (same tx as the edges, only once the children are all
+            -- produced) and by clear_topdown_pruned_by_hash (fail-fast
+            -- consumed it).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -259,19 +261,20 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Clear `topdown_pruned` for derivations that just gained children
-    /// (`derivation_ids` = the parent side of edges inserted in THIS
-    /// transaction). A node with children no longer needs the
-    /// "must complete via substitution" guard — its deps are in the
-    /// DAG, so a from-source dispatch is no longer doomed. Run in the
+    /// Clear `topdown_pruned` for derivations whose just-gained
+    /// children are all already produced (`derivation_ids` = the parent
+    /// side of edges inserted in THIS transaction, pre-filtered by the
+    /// caller with `children_all_produced`). A node whose closure is
+    /// produced no longer needs the "must complete via substitution"
+    /// guard — a from-source dispatch is no longer doomed. Run in the
     /// SAME transaction as `batch_insert_edges`, so a failover can
     /// never observe THIS merge's edges without its clear. (That is
     /// the whole guarantee: a row may still carry the flag alongside
     /// edges written by other merges — e.g. edges to already-completed
     /// children that recovery no longer loads — which is why the
     /// fail-fast also clears the flag it consumed.) Mirrors the
-    /// in-memory clear at merge time and the lazy children-gated clear
-    /// in `handle_substitute_complete`.
+    /// in-memory clear at merge time and the lazy children-all-produced
+    /// clear in `handle_substitute_complete`.
     pub(crate) async fn clear_topdown_pruned_for_parents(
         tx: &mut PgConnection,
         derivation_ids: &[Uuid],

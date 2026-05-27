@@ -1172,9 +1172,10 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
 /// The roots-only prune's `topdown_pruned` stamp must survive a leader
 /// failover, so it is persisted: once a pruned merge commits, the kept
 /// (demanded) node's PG row carries `topdown_pruned = true`; a later
-/// full merge that gives that node children (its deps are then in the
-/// DAG) clears the column in the same transaction that persists those
-/// edges.
+/// full merge that gives that node children **that are already
+/// produced** clears the column in the same transaction that persists
+/// those edges (a merge adding only unbuilt children keeps it — see
+/// the reap-hazard test below).
 #[tokio::test]
 async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1224,10 +1225,30 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
     // Let B1's detached fetch settle so it can't interleave with B2.
     settle_substituting(&handle, &["tdpg-root"]).await;
 
+    // BC: dep gets built/substituted to completion by an unrelated
+    // build, so when B2 later re-adds the edge R → dep, R's child is
+    // already produced — the only children shape that may clear the
+    // mark.
+    let dep_out = test_store_path("tdpg-dep-out");
+    store.seed_with_content(&dep_out, b"dep-out");
+    let bc = Uuid::new_v4();
+    let mut dep_c = make_node("tdpg-dep");
+    dep_c.expected_output_paths = vec![dep_out.clone()];
+    let _evc = merge_dag(&handle, bc, vec![dep_c], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdpg-dep").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep is produced before B2 re-adds the edge"
+    );
+
     // B2: a full merge that gives root its dep back: app → root → dep,
     // app's output NOT substitutable → no prune → the edges persist →
-    // root now has a child in PG → the flag is cleared in the same
-    // transaction that inserted the edges.
+    // root now has a child in PG that is already produced (BC settled
+    // it) → the flag is cleared in the same transaction that inserted
+    // the edges.
     let mut app = make_node("tdpg-app");
     app.expected_output_paths = vec![test_store_path("tdpg-app-out")];
     let mut root_b2 = make_node("tdpg-root");
@@ -1455,8 +1476,10 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
 /// `topdown_pruned` flag persists. Fetch then fails. Before the fix:
 /// `handle_substitute_complete` saw `topdown_pruned=true` and failed
 /// EVERY interested build — including B2, whose deps ARE in the DAG.
-/// After: gate on `get_children(R).is_empty()`; R has children → flag
-/// cleared, fall through to normal Queued handling.
+/// After: gate on `get_children(R).is_empty()`; R has children →
+/// fail-fast suppressed and R falls through to normal Queued handling;
+/// the flag itself is only cleared once those children are all
+/// produced.
 ///
 /// Race staged deterministically via `debug_force_status`/
 /// `debug_set_topdown_pruned` + injected `SubstituteComplete{ok=false}`
@@ -1532,10 +1555,261 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
         "R falls through to normal Substituting→Queued (deps not done)"
     );
     assert!(
-        !post.topdown_pruned,
-        "flag cleared once R gained children (invariant moot)"
+        post.topdown_pruned,
+        "flag retained while R's children are unbuilt — they can still be \
+         reaped unbuilt; suppression of the fail-fast (not a clear) is what \
+         protects B2 here"
     );
     assert!(post.substitute_tried, "one-shot fall-through still applies");
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+8]
+/// The reap hazard, end to end: B1's prune stamps childless R and parks
+/// its detached fetch; B2 full-merges app→R→dep, which previously
+/// cleared the stamp even though dep was UNBUILT; B2 is cancelled and
+/// its sole-interest nodes are reaped, scrubbing dep out of
+/// `children[R]`; R's fetch then fails. With the stamp eagerly cleared
+/// the flag-keyed protections are all skipped and R is dispatched from
+/// source (worker ENOENT — the doomed dispatch this machinery exists to
+/// prevent). The clear must therefore use the same
+/// `children_all_produced` criterion as the stamp: B2's unbuilt dep
+/// must NOT clear the mark, in memory or in PG, and after the reap the
+/// walk failure must take the designed resubmit-directing fail-fast.
+#[tokio::test]
+async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park B1's detached fetch: QueryPathInfo waits on the gate (never
+    // released), so R stays Substituting for the whole test and the
+    // injected SubstituteComplete below is accepted.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep with root's wanted output substitutable upstream →
+    // the prune fires, keeps {R} (stamped, childless), drops dep.
+    let r_out = test_store_path("tdreap-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdreap-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep = || {
+        let mut n = make_node("tdreap-dep");
+        n.expected_output_paths = vec![test_store_path("tdreap-dep-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep()],
+        vec![make_test_edge("tdreap-r", "tdreap-dep")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdreap-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // B2: a full merge that gives R an UNBUILT child (app's output not
+    // substitutable → no prune). The mark must survive this merge.
+    let mut app = make_node("tdreap-app");
+    app.expected_output_paths = vec![test_store_path("tdreap-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep()],
+        vec![
+            make_test_edge("tdreap-app", "tdreap-r"),
+            make_test_edge("tdreap-r", "tdreap-dep"),
+        ],
+        false,
+    )
+    .await?;
+    assert!(
+        expect_drv(&handle, "tdreap-r").await.topdown_pruned,
+        "a merge that adds only UNBUILT children must keep the in-memory \
+         mark — those children can be reaped unbuilt later"
+    );
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdreap-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_pruned,
+        "the PG mark must survive an edge-insert whose children are unbuilt \
+         (clear_topdown_pruned_for_parents must skip such parents)"
+    );
+
+    // Cancel B2 and reap its sole-interest nodes (dep, app). R is shared
+    // with B1, so it survives — childless again, mark intact.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdreap-dep").await?.is_none(),
+        "B2's sole-interest dep must be reaped (scrubbed from children[R])"
+    );
+    assert!(
+        handle.debug_query_derivation("tdreap-app").await?.is_none(),
+        "B2's sole-interest app must be reaped"
+    );
+    assert!(
+        expect_drv(&handle, "tdreap-r").await.topdown_pruned,
+        "R survives (B1's interest) with the mark intact after the reap"
+    );
+
+    // R's parked walk now genuinely fails.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdreap-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Designed outcome: the fail-fast, not a from-source dispatch.
+    let r = expect_drv(&handle, "tdreap-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Assigned | DerivationStatus::Running | DerivationStatus::Ready
+        ),
+        "childless topdown-pruned R with a failed substitute must not be \
+         dispatchable from source; got {:?}",
+        r.status
+    );
+    assert!(
+        !r.topdown_pruned,
+        "the fail-fast consumes (clears) the mark it acted on"
+    );
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B1 must fail via the resubmit-directing fail-fast (was: doomed \
+         from-source dispatch after the eager clear lost the mark)"
+    );
+    assert!(
+        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s1.error_summary
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+8]
+/// The lazy clear in `handle_substitute_complete`: when a pruned root's
+/// children are ALL produced by the time its own walk fails, the mark is
+/// moot — cleared in memory AND in PG (best-effort, so a failover cannot
+/// resurrect it) — and the node takes the normal revert, not the
+/// fail-fast.
+#[tokio::test]
+async fn test_topdown_pruned_lazy_clear_when_children_produced_at_walk_failure() -> TestResult {
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Full merge: R → dep (nothing substitutable → no prune).
+    let mut r = make_node("tdlazy-r");
+    r.expected_output_paths = vec![test_store_path("tdlazy-r-out")];
+    let mut dep = make_node("tdlazy-dep");
+    dep.expected_output_paths = vec![test_store_path("tdlazy-dep-out")];
+    let b = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        b,
+        vec![r, dep],
+        vec![make_test_edge("tdlazy-r", "tdlazy-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Stage: R was pruned by an earlier build and is mid-fetch; its
+    // child has since been produced; the persisted flag is still set
+    // (as it would be after a pruned merge whose children arrived
+    // unbuilt and completed later).
+    handle
+        .debug_force_status("tdlazy-dep", DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_force_status("tdlazy-r", DerivationStatus::Substituting)
+        .await?;
+    handle.debug_set_topdown_pruned("tdlazy-r", true).await?;
+    sqlx::query("UPDATE derivations SET topdown_pruned = true WHERE drv_hash = 'tdlazy-r'")
+        .execute(&db.pool)
+        .await?;
+
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdlazy-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, "tdlazy-r").await;
+    assert!(
+        !post.topdown_pruned,
+        "children all produced → the lazy clear must drop the mark"
+    );
+    assert!(
+        matches!(
+            post.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
+        "normal revert (closure is produced, building is legitimate); got {:?}",
+        post.status
+    );
+    let s = query_status(&handle, b).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Active as i32,
+        "no fail-fast — the closure is produced"
+    );
+    let (pg,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdlazy-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg,
+        "the lazy clear must also clear the persisted flag so a failover \
+         cannot resurrect the doomed-dispatch guard for a produced closure"
+    );
     Ok(())
 }
 
