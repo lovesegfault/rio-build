@@ -849,52 +849,59 @@ mod tests {
         let signer = key(1, &SEED_1);
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+        // Key sets are compared SORTED so the assertions hold regardless
+        // of serde_json's preserve_order feature (a workspace-level flag
+        // this crate does not control).
+        let sorted_keys = |json: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+            keys.sort_unstable();
+            keys
+        };
+
         let bound = signer.sign(&admission_claims("b-alpha_drv", "node-a", 3600));
         let parts: Vec<&str> = bound.split('.').collect();
         assert_eq!(parts.len(), 3, "rmt2 token is three '.'-separated parts");
         assert_eq!(parts[0], "rmt2");
         let json: serde_json::Value =
             serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
-        let keys: Vec<&str> = json
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
         assert_eq!(
-            keys,
+            sorted_keys(&json),
             [
                 "aud",
                 "build_id",
-                "tenant",
-                "issued_unix",
                 "expiry_unix",
-                "node"
+                "issued_unix",
+                "node",
+                "tenant"
             ],
-            "bound token carries node; node_fp elided when unset"
+            "bound token carries node"
+        );
+        assert!(
+            !json.as_object().unwrap().contains_key("node_fp"),
+            "unset node_fp must be elided"
         );
         // 64-byte ed25519 signature.
         assert_eq!(b64.decode(parts[2]).unwrap().len(), 64);
 
         // Unbound token (node empty, no tenant): the optional fields are
-        // elided entirely — same five keys as a legacy claims body.
+        // elided entirely — same key set as a legacy claims body.
         let mut unbound_claims = admission_claims("b-alpha_drv", "", 3600);
         unbound_claims.tenant = None;
         let unbound = signer.sign(&unbound_claims);
         let parts: Vec<&str> = unbound.split('.').collect();
         let json: serde_json::Value =
             serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
-        let keys: Vec<&str> = json
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
         assert_eq!(
-            keys,
-            ["aud", "build_id", "issued_unix", "expiry_unix"],
-            "unbound token elides node/node_fp/tenant"
+            sorted_keys(&json),
+            ["aud", "build_id", "expiry_unix", "issued_unix"],
+            "unbound token carries exactly the legacy key set"
         );
+        for elided in ["node", "node_fp", "tenant"] {
+            assert!(
+                !json.as_object().unwrap().contains_key(elided),
+                "{elided}: empty/unset field must be elided"
+            );
+        }
     }
 
     /// `node_fp` is reserved: carried, signature-covered, round-tripped,
@@ -1255,19 +1262,20 @@ mod tests {
 
     /// The Dual contingency verifier accepts both envelopes, routing by
     /// shape: legacy tokens go to the HMAC arm (no node check — they
-    /// cannot carry one), rmt2 tokens to the trust roots.
+    /// cannot carry one), rmt2 tokens to the trust roots — and neither
+    /// arm's key material can be smuggled across to the other envelope.
     #[test]
     fn dual_verifier_accepts_both_schemes_during_overlap() {
         let hmac_key_bytes = HMAC_TEST_KEY.to_vec();
         let ed_signer = key(1, &SEED_1);
+        let hmac_signer = HmacSigner::from_key(hmac_key_bytes.clone());
         let dual = MountdVerifier::from_parts(
-            Some(HmacKey::from_key(hmac_key_bytes.clone())),
+            Some(HmacKey::from_key(hmac_key_bytes)),
             Some(roots_of(&[&ed_signer])),
         )
         .expect("both parts configured");
 
-        let v1_token =
-            HmacSigner::from_key(hmac_key_bytes).sign(&legacy_claims("b-alpha_drv", 3600));
+        let v1_token = hmac_signer.sign(&legacy_claims("b-alpha_drv", 3600));
         let got = dual
             .verify_for_build(&v1_token, "b-alpha_drv", Some("node-a"))
             .expect("legacy token admitted by the HMAC arm");
@@ -1287,6 +1295,58 @@ mod tests {
         assert!(matches!(
             dual.verify_for_build(&foreign, "b-alpha_drv", Some("node-a")),
             Err(MountdVerifyError::InvalidSignature)
+        ));
+
+        // A forged rmt2 envelope whose third segment is a real HMAC tag,
+        // computed with the dual verifier's own HMAC key over the exact
+        // bytes an Ed25519 signature would cover. Routing by envelope
+        // means the legacy arm is never consulted for it, and the trust
+        // roots reject the 32-byte tag — holding the symmetric key never
+        // mints an rmt2 credential, even where both arms are configured.
+        use hmac::{KeyInit as _, Mac as _};
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims_json =
+            serde_json::to_vec(&admission_claims("b-alpha_drv", "node-a", 3600)).unwrap();
+        let message = format!("rmt2.{}", b64.encode(&claims_json));
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(HMAC_TEST_KEY)
+            .expect("any key length works");
+        mac.update(message.as_bytes());
+        let forged = format!("{message}.{}", b64.encode(mac.finalize().into_bytes()));
+        assert!(matches!(
+            dual.verify_for_build(&forged, "b-alpha_drv", Some("node-a")),
+            Err(MountdVerifyError::SignatureLength(32))
+        ));
+
+        // The reverse smuggling direction: a legacy two-segment token
+        // whose claims body carries a `node` field (what a confused
+        // signer bolting node scoping onto the symmetric scheme would
+        // mint). The legacy arm's `deny_unknown_fields` claims shape
+        // rejects it — node scoping exists only in the rmt2 scheme.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyClaimsWithNode {
+            aud: String,
+            build_id: String,
+            issued_unix: u64,
+            expiry_unix: u64,
+            node: String,
+        }
+        impl crate::hmac::HmacClaims for LegacyClaimsWithNode {
+            fn expiry_unix(&self) -> u64 {
+                self.expiry_unix
+            }
+        }
+        let node_bearing_legacy = hmac_signer.sign(&LegacyClaimsWithNode {
+            aud: MOUNTD_TOKEN_AUDIENCE.into(),
+            build_id: "b-alpha_drv".into(),
+            issued_unix: now(),
+            expiry_unix: now() + 3600,
+            node: "node-a".into(),
+        });
+        assert!(matches!(
+            dual.verify_for_build(&node_bearing_legacy, "b-alpha_drv", Some("node-a")),
+            Err(MountdVerifyError::Legacy(MountdTokenError::Token(
+                crate::hmac::HmacError::Json(_)
+            )))
         ));
     }
 
