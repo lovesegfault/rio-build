@@ -206,4 +206,35 @@ mod tests {
             "after the cache TTL the probe must observe the terminal status"
         );
     }
+
+    /// A Postgres error on the probe fails open (allow) and the error
+    /// verdict is NOT cached: the very next probe against a healthy
+    /// pool sees the real (terminal) status.
+    // r[verify store.castore.terminal-revocation]
+    #[tokio::test]
+    async fn probe_error_fails_open_and_is_not_cached() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        seed_derivation(&db.pool, "rev-err", "completed").await;
+
+        // A pool whose connections can never be established: nothing
+        // speaks Postgres on 127.0.0.1:1. `connect_lazy` defers the
+        // failure to the first acquire, i.e. inside `is_terminal`; the
+        // short acquire_timeout bounds the test even if the connect
+        // attempt doesn't fail fast.
+        let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://rio:rio@127.0.0.1:1/rio")
+            .expect("lazy pool construction never connects");
+
+        let probe = BuildTerminalProbe::new(Duration::from_secs(30));
+        assert!(
+            !probe.is_terminal(&broken, "rev-err").await,
+            "a failed status probe must fail open (allow)"
+        );
+        assert!(
+            probe.is_terminal(&db.pool, "rev-err").await,
+            "the fail-open verdict must not be cached — the next probe against a \
+             healthy pool must see the terminal status"
+        );
+    }
 }
