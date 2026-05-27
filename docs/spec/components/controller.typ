@@ -160,17 +160,24 @@ gone.
   `ttlSecondsAfterFinished` reaps.
 ]
 
-#r("ctrl.terminated.deadline-exceeded+2")[
+#r("ctrl.terminated.deadline-exceeded+3")[
   The Job-mode reconciler MUST report each Job with `status.conditions`
-  containing `type=Failed, reason=DeadlineExceeded` to the scheduler via
-  `AdminService.ReportExecutorTermination{executor_id = job.metadata.name,
-  reason = DeadlineExceeded}`. With `restartPolicy:Never` + `backoffLimit:0` +
+  containing `type=Failed, reason=DeadlineExceeded` to the scheduler via the
+  unified idempotent `AdminService.ReportAttemptOutcome{job_name =
+  job.metadata.name, reason = DEADLINE_EXCEEDED}` (the C4/C5 unification ---
+  the controller no longer calls `ReportExecutorTermination` for any pod;
+  that RPC stays served for the stream path until it retires). With
+  `restartPolicy:Never` + `backoffLimit:0` +
   the `job-tracking` finalizer the SIGKILL'd Pod IS listable with
   `terminated.reason="Error"` for the grace window, but `Error` is
   non-promoting so `report_terminated_pods` skips it; the Job condition is
   observable for `JOB_TTL_SECS=600` (\~60 reconcile ticks). The scheduler
-  prefix-matches the Job name against its `recently_disconnected` map
-  (#rref("sched.termination.deadline-exceeded")). Iterates the already-listed
+  resolves a report that matches no open pull-mode attempt through the same
+  legacy path as before: it prefix-matches the Job name against its
+  `recently_disconnected` map
+  (#rref("sched.termination.deadline-exceeded")), so the classification,
+  dedup, and floor arithmetic are unchanged behind the new RPC. Iterates the
+  already-listed
   `jobs.items` --- no extra apiserver call. Best-effort (RPC error logged,
   reconcile continues). Defense-in-depth behind the worker-side `daemon_timeout`
   → `TimedOut` primary path.

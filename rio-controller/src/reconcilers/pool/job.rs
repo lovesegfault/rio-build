@@ -13,7 +13,7 @@ use kube::CustomResourceExt;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 use tracing::{debug, info, warn};
 
-use rio_proto::types::{ReportExecutorTerminationRequest, SpawnIntent, TerminationReason};
+use rio_proto::types::{SpawnIntent, TerminationReason};
 
 use crate::error::Result;
 use crate::reconcilers::{Ctx, KubeErrorExt, admin_call};
@@ -1331,6 +1331,26 @@ fn termination_reason_label(reason: TerminationReason) -> &'static str {
     }
 }
 
+/// Map the controller's k8s pod-terminal classification onto the
+/// unified `AttemptTerminalReason` vocabulary (the C4/C5 unification:
+/// one idempotent `ReportAttemptOutcome` carries what
+/// `ReportExecutorTermination` used to). The mapping is 1:1 — the
+/// scheduler routes stream-mode identities through the same legacy
+/// classification path, so the wire vocabulary is the only thing that
+/// changes.
+fn unified_attempt_reason(reason: TerminationReason) -> rio_proto::types::AttemptTerminalReason {
+    use rio_proto::types::AttemptTerminalReason as A;
+    match reason {
+        TerminationReason::Unknown => A::Unspecified,
+        TerminationReason::OomKilled => A::OomKilled,
+        TerminationReason::EvictedDiskPressure => A::EvictedDiskPressure,
+        TerminationReason::EvictedOther => A::EvictedOther,
+        TerminationReason::Completed => A::Completed,
+        TerminationReason::Error => A::Error,
+        TerminationReason::DeadlineExceeded => A::DeadlineExceeded,
+    }
+}
+
 /// How long a sampled Pod/Job name stays in `Ctx::terminal_report_sampled`
 /// before pruning: 2× the Job TTL, by which point the object is no
 /// longer listable so the entry can never suppress a legitimate new
@@ -1362,8 +1382,12 @@ pub(super) fn first_terminal_report_sample(
 ///
 /// Lists Pods (not Jobs — JobStatus doesn't carry per-container
 /// termination reason) by `POOL_LABEL` selector. For each Pod with a
-/// terminated container or Evicted status, calls `AdminService.
-/// ReportExecutorTermination(executor_id = pod name, reason)`.
+/// terminated container or Evicted status, calls the unified
+/// `AdminService.ReportAttemptOutcome(job_name = pod name, reason)`
+/// (the C4/C5 unification — `ReportExecutorTermination` is no longer
+/// called by the controller; the scheduler routes stream identities
+/// through the same legacy classification path behind the unified
+/// RPC).
 ///
 /// Idempotent: the scheduler's `recently_disconnected` map dedups
 /// (first-report-wins, `remove()` on hit), so re-reporting the same
@@ -1415,15 +1439,38 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         let Some(name) = pod.metadata.name.as_deref() else {
             continue;
         };
-        match admin_call(
-            admin.report_executor_termination(ReportExecutorTerminationRequest {
-                executor_id: name.to_owned(),
-                reason: reason.into(),
-            }),
-        )
+        // C4/C5 unification: the classification rides the unified
+        // idempotent ReportAttemptOutcome, keyed by the pod/Job name
+        // (the legacy correlation the scheduler already speaks) plus
+        // the pod's intent annotation and kube-authoritative node when
+        // known (the AD2c attribution for pull-mode attempts; inert
+        // for stream ones). `ReportExecutorTermination` is no longer
+        // called by the controller for any pod; the scheduler keeps
+        // serving it untouched until the stream path retires.
+        let intent_id = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(super::jobs::INTENT_ID_ANNOTATION))
+            .cloned()
+            .unwrap_or_default();
+        let node_name = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.clone())
+            .unwrap_or_default();
+        match admin_call(admin.report_attempt_outcome(
+            rio_proto::types::ReportAttemptOutcomeRequest {
+                intent_id,
+                job_name: name.to_owned(),
+                exec_id: String::new(),
+                reason: unified_attempt_reason(reason).into(),
+                node_name,
+            },
+        ))
         .await
         {
-            Ok(resp) => {
+            Ok(_) => {
                 // OA1 interval (i): Pod terminal-condition timestamp →
                 // report acked, sampled once per Pod (the same Pod is
                 // re-reported every tick for the TTL window — see
@@ -1442,17 +1489,11 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
                     )
                     .record(latency);
                 }
-                if resp.into_inner().promoted {
-                    info!(
-                        pool, executor_id = %name, ?reason,
-                        "reported pod termination → scheduler bumped resource_floor"
-                    );
-                }
             }
             Err(e) => {
                 warn!(
                     pool, executor_id = %name, ?reason, error = %e,
-                    "ReportExecutorTermination failed; skipping (best-effort)"
+                    "ReportAttemptOutcome(pod-terminal) failed; skipping (best-effort)"
                 );
                 // Scheduler unreachable → no point retrying the rest
                 // this tick. Next tick re-lists and retries.
@@ -1482,20 +1523,21 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 /// Report each `DeadlineExceeded` Job to the scheduler so the
 /// `activeDeadlineSeconds` backstop still climbs the resource_floor
 /// ladder when the worker is too wedged to fire its own `daemon_timeout`
-/// (`r[ctrl.terminated.deadline-exceeded+2]`). Defense-in-depth behind
+/// (`r[ctrl.terminated.deadline-exceeded+3]`). Defense-in-depth behind
 /// the worker-side `BuildResultStatus::TimedOut` primary path.
 ///
 /// Iterates the already-listed `jobs` (no extra apiserver call). For
-/// each Job with a `Failed/DeadlineExceeded` condition, sends
-/// `ReportExecutorTermination{executor_id = JOB name, reason =
+/// each Job with a `Failed/DeadlineExceeded` condition, sends the
+/// unified `ReportAttemptOutcome{job_name = JOB name, reason =
 /// DeadlineExceeded}`. The Job controller deletes the Pod when the
 /// deadline fires, so the scheduler prefix-matches the Job name
-/// against `recently_disconnected` keys (pod name = `{job}-{5char}`).
+/// against `recently_disconnected` keys (pod name = `{job}-{5char}`)
+/// exactly as it did behind `ReportExecutorTermination`.
 ///
 /// Idempotent per the same dedup as [`report_terminated_pods`]. Best-
 /// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
 /// keeps the Job observable for ~60 reconcile ticks.
-// r[impl ctrl.terminated.deadline-exceeded+2]
+// r[impl ctrl.terminated.deadline-exceeded+3]
 pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
     let mut admin = ctx.admin.clone();
     for job in jobs {
@@ -1505,15 +1547,22 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         let Some(name) = job.metadata.name.as_deref() else {
             continue;
         };
-        match admin_call(
-            admin.report_executor_termination(ReportExecutorTerminationRequest {
-                executor_id: name.to_owned(),
-                reason: TerminationReason::DeadlineExceeded.into(),
-            }),
-        )
+        // C4/C5 unification: keyed by the JOB name (the pod is already
+        // deleted by the Job controller when the deadline fires); the
+        // scheduler's legacy prefix-match against recently_disconnected
+        // is unchanged behind the unified RPC.
+        match admin_call(admin.report_attempt_outcome(
+            rio_proto::types::ReportAttemptOutcomeRequest {
+                intent_id: job_intent_id(job).unwrap_or_default().to_owned(),
+                job_name: name.to_owned(),
+                exec_id: String::new(),
+                reason: rio_proto::types::AttemptTerminalReason::DeadlineExceeded.into(),
+                node_name: String::new(),
+            },
+        ))
         .await
         {
-            Ok(resp) => {
+            Ok(_) => {
                 // OA1 interval (i): the Job's Failed/DeadlineExceeded
                 // condition transition → report acked, sampled once per
                 // Job (see `Ctx::terminal_report_sampled`).
@@ -1531,17 +1580,11 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
                     )
                     .record(latency);
                 }
-                if resp.into_inner().promoted {
-                    info!(
-                        executor_id = %name,
-                        "reported Job DeadlineExceeded → scheduler bumped resource_floor"
-                    );
-                }
             }
             Err(e) => {
                 warn!(
                     executor_id = %name, error = %e,
-                    "ReportExecutorTermination(DeadlineExceeded) failed; skipping (best-effort)"
+                    "ReportAttemptOutcome(DeadlineExceeded) failed; skipping (best-effort)"
                 );
                 return;
             }
@@ -1602,6 +1645,30 @@ mod tests {
             c["lastTransitionTime"], "2020-01-01T00:00:00Z",
             "True→False transition must stamp fresh lastTransitionTime"
         );
+    }
+
+    /// The C4/C5 wire-vocabulary bridge is total and 1:1 — every k8s
+    /// pod-terminal classification has exactly one unified spelling, so
+    /// nothing the legacy RPC could express is lost behind the
+    /// re-point.
+    // r[verify ctrl.terminated.deadline-exceeded+3]
+    #[test]
+    fn unified_attempt_reason_is_total() {
+        use rio_proto::types::AttemptTerminalReason as A;
+        for (legacy, unified) in [
+            (TerminationReason::Unknown, A::Unspecified),
+            (TerminationReason::OomKilled, A::OomKilled),
+            (
+                TerminationReason::EvictedDiskPressure,
+                A::EvictedDiskPressure,
+            ),
+            (TerminationReason::EvictedOther, A::EvictedOther),
+            (TerminationReason::Completed, A::Completed),
+            (TerminationReason::Error, A::Error),
+            (TerminationReason::DeadlineExceeded, A::DeadlineExceeded),
+        ] {
+            assert_eq!(unified_attempt_reason(legacy), unified);
+        }
     }
 
     /// OA1 interval-(i) instrument helpers: endpoint-A extraction from
@@ -1817,7 +1884,7 @@ mod tests {
     /// `activeDeadlineSeconds` fires (live: `kubectl get job -o
     /// jsonpath` showed `cond=FailureTarget Failed/DeadlineExceeded
     /// DeadlineExceeded`).
-    // r[verify ctrl.terminated.deadline-exceeded+2]
+    // r[verify ctrl.terminated.deadline-exceeded+3]
     #[test]
     fn job_deadline_exceeded_condition() {
         use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};

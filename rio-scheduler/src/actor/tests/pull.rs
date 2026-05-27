@@ -985,3 +985,88 @@ async fn reconcile_assignments_skips_open_pull_attempts() -> TestResult {
     );
     Ok(())
 }
+
+// ─── C4/C5 unification: stream identities behind the unified RPC ────────
+
+/// Send one `ReportAttemptOutcome` keyed by Job/pod name only (the
+/// re-pointed controller's stream-mode shape).
+async fn report_attempt_outcome_job(
+    handle: &ActorHandle,
+    job_name: &str,
+    reason: rio_proto::types::AttemptTerminalReason,
+) -> Result<(), PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: None,
+                job_name: Some(job_name.into()),
+                exec_id: None,
+            },
+            reason,
+            node_name: None,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+// r[verify ctrl.report.attempt-outcome]
+// r[verify ctrl.terminated.deadline-exceeded+3]
+/// C4/C5 unification: a unified pod-terminal report whose identity is a
+/// stream-mode executor routes through the same classification path
+/// `ReportExecutorTermination` serves — the fill lands as the second
+/// installment on the disconnect's row (the same row, never a new one)
+/// and a duplicate report is a no-op (the dedup entry was consumed).
+#[tokio::test]
+async fn attempt_outcome_stream_identity_routes_through_legacy_path() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("w-uni", "x86_64-linux").await?;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "uni-a", PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+    disconnect(&handle, "w-uni").await?;
+    drop(rx);
+
+    // The stream disconnect appended the first installment.
+    let rows = ledger_rows(&db.pool, "uni-a").await;
+    assert_eq!(rows.len(), 1, "the disconnect row exists");
+    assert_eq!(rows[0].outcome_class, "disconnected");
+    assert!(rows[0].termination_reason.is_none());
+
+    // The re-pointed controller reports the classification through the
+    // unified RPC, keyed by the pod name.
+    report_attempt_outcome_job(
+        &handle,
+        "w-uni",
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("unified stream-mode report acked");
+    let rows = ledger_rows(&db.pool, "uni-a").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the fill lands on the same row, never a new one"
+    );
+    assert_eq!(
+        rows[0].termination_reason.as_deref(),
+        Some("oom_killed"),
+        "the second installment carries the controller classification"
+    );
+    assert_ne!(
+        rows[0].outcome_class, "disconnected",
+        "the row is reclassified exactly as the legacy path does"
+    );
+    let classified_as = rows[0].outcome_class.clone();
+
+    // Duplicate report: acknowledged, nothing changes (first-report-wins).
+    report_attempt_outcome_job(
+        &handle,
+        "w-uni",
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("duplicate unified report acked");
+    let rows = ledger_rows(&db.pool, "uni-a").await;
+    assert_eq!(rows.len(), 1, "no second row");
+    assert_eq!(rows[0].outcome_class, classified_as, "no reclassification");
+    Ok(())
+}
