@@ -22,6 +22,12 @@ use crate::evalset::Scope;
 ///   `jobs:<job1,job2,…>`
 ///   `jobs-file:<path>`               (one job name per line, `#` comments)
 ///
+/// Explicit job lists (`jobs:`/`jobs-file:`) are sorted and
+/// deduplicated here, so listing the same jobs in a different order or
+/// with repetitions cannot fork the eval-set key digest, issue
+/// duplicate per-job Hydra requests, or define the same selection.nix
+/// attribute twice (a Nix "attribute already defined" eval failure).
+///
 /// Aggregate jobs (e.g. `tested`) must be requested via
 /// `constituents:<job>`, never listed under `jobs:`/`jobs-file:`:
 /// scoped evaluations run nix-eval-jobs without `--constituents`, so a
@@ -39,25 +45,29 @@ pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
         });
     }
     if let Some(list) = s.strip_prefix("jobs:") {
-        let jobs: Vec<String> = list
+        let mut jobs: Vec<String> = list
             .split(',')
             .map(str::trim)
             .filter(|j| !j.is_empty())
             .map(String::from)
             .collect();
         anyhow::ensure!(!jobs.is_empty(), "jobs: needs at least one job name");
+        jobs.sort();
+        jobs.dedup();
         return Ok(Scope::Jobs { jobs });
     }
     if let Some(path) = s.strip_prefix("jobs-file:") {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read jobs file {path}: {e}"))?;
-        let jobs: Vec<String> = text
+        let mut jobs: Vec<String> = text
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(String::from)
             .collect();
         anyhow::ensure!(!jobs.is_empty(), "jobs file {path} contains no job names");
+        jobs.sort();
+        jobs.dedup();
         return Ok(Scope::Jobs { jobs });
     }
     anyhow::bail!(
@@ -118,9 +128,13 @@ pub struct EvalArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Hydra instance base URL (every request to it counts against the
+    /// politeness budget).
     #[arg(long, default_value = "https://hydra.nixos.org")]
     pub hydra_url: String,
 
+    /// Binary cache base URL (reserved; unused for scoped eval sets —
+    /// building an eval set never queries the binary cache).
     #[arg(long, default_value = "https://cache.nixos.org")]
     pub cache_url: String,
 
@@ -149,15 +163,24 @@ pub struct EvalArgs {
     #[arg(long)]
     pub version_job: Option<String>,
 
+    /// `nix` binary used for the store-add, derivation-show, and copy
+    /// subprocesses.
     #[arg(long, default_value = "nix")]
     pub nix_bin: String,
+    /// `nix-eval-jobs` binary used for the scoped evaluation.
     #[arg(long, default_value = "nix-eval-jobs")]
     pub nix_eval_jobs_bin: String,
+    /// Number of nix-eval-jobs evaluation worker processes.
     #[arg(long, default_value_t = 4)]
     pub eval_workers: u32,
+    /// Per-worker memory threshold (MiB) passed to nix-eval-jobs as
+    /// `--max-memory-size`: a worker exceeding it is restarted after
+    /// finishing its current job — it is not a hard cap on evaluation
+    /// memory.
     #[arg(long, default_value_t = 4096)]
     pub eval_max_memory_mb: u64,
-    /// Sample size for full-scope fidelity (scoped sets are exhaustive).
+    /// Sample size for full-scope fidelity (reserved; unused for scoped
+    /// eval sets, whose fidelity gate compares every job).
     #[arg(long, default_value_t = 100)]
     pub fidelity_samples: usize,
 }
@@ -318,20 +341,28 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     };
     let tarball_path = work.join("nixpkgs.tar.gz");
     recipe::download_tarball(&tarball_url, &ua, &tarball_path).await?;
+    tracing::info!(tarball = %tarball_path.display(), "unpacking nixpkgs tarball");
     let tree = recipe::unpack_tarball(&tarball_path, &work.join("src")).await?;
+    tracing::info!(
+        tree = %tree.display(),
+        "adding the source tree to the local nix store (hashes the whole nixpkgs tree; takes a few minutes)"
+    );
     let source_store_path = recipe::store_add_source(&args.nix_bin, &tree).await?;
 
     // revCount/shortRev: explicit overrides → recovered from the scoped
-    // builds' names → recovered from --version-job → error.
+    // builds' names → recovered from --version-job → error. During the
+    // scan, candidates whose recovered shortRev is not a prefix of the
+    // eval's nixpkgs revision are skipped: a `pre<digits>.<hex>` match
+    // in some package's own version string must not shadow a real
+    // versionSuffix carried by another in-scope build (or fail the run
+    // late at the consistency check below).
+    let recover_matching = |name: Option<&str>| {
+        name.and_then(recipe::recover_version_suffix)
+            .filter(|v| recipe::short_rev_matches(&v.short_rev, &revision))
+    };
     let recovered = sampled_builds.iter().find_map(|b| {
-        b.releasename
-            .as_deref()
-            .and_then(recipe::recover_version_suffix)
-            .or_else(|| {
-                b.nixname
-                    .as_deref()
-                    .and_then(recipe::recover_version_suffix)
-            })
+        recover_matching(b.releasename.as_deref())
+            .or_else(|| recover_matching(b.nixname.as_deref()))
     });
     let recovered = match recovered {
         Some(v) => Some(v),
@@ -477,14 +508,26 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         // One `nix derivation show -r` per manifest target: emits the
         // dep-closure record and backfills the manifest record's
         // requiredFeatures from the derivation's requiredSystemFeatures.
+        let total = manifest.len();
+        tracing::info!(
+            targets = total,
+            "enumerating dependency closures (one `nix derivation show -r` per manifest record)"
+        );
         let mut dep_records = Vec::with_capacity(manifest.len());
-        for rec in &mut manifest {
+        for (idx, rec) in manifest.iter_mut().enumerate() {
             let show = depclosure::run_derivation_show(&args.nix_bin, &rec.drv_path).await?;
             let (dep, features) =
                 depclosure::dep_closure_from_show_json(&show, &rec.drv_path, &rec.job)?;
             rec.required_features = features;
             stats.ca_outputs += dep.ca_outputs.len();
             dep_records.push(dep);
+            // Each record is one subprocess, so a large scope spends a
+            // long time in this loop; log every 25 records (and at the
+            // end) so an operator can see it is still moving.
+            let done = idx + 1;
+            if done % 25 == 0 || done == total {
+                tracing::info!(done, total, job = %rec.job, "dep-closure progress");
+            }
         }
         dir.write_jsonl(DEP_CLOSURE_FILE, &dep_records)?;
         // Re-write the manifest now that requiredFeatures is backfilled.
@@ -582,6 +625,42 @@ mod tests {
         assert!(parse_scope("constituents:").is_err());
         assert!(parse_scope("jobs:").is_err());
         assert!(parse_scope("bogus").is_err());
+    }
+
+    #[test]
+    fn job_list_scopes_are_sorted_and_deduplicated() {
+        // Repetition or ordering of the same job list must not fork the
+        // eval-set key digest, double up per-job Hydra requests, or
+        // define the same selection.nix attribute twice.
+        assert_eq!(
+            parse_scope(
+                "jobs:nixpkgs.jq.x86_64-linux,nixpkgs.hello.x86_64-linux,nixpkgs.jq.x86_64-linux"
+            )
+            .unwrap(),
+            Scope::Jobs {
+                jobs: vec![
+                    "nixpkgs.hello.x86_64-linux".into(),
+                    "nixpkgs.jq.x86_64-linux".into()
+                ]
+            }
+        );
+        // jobs-file goes through the same normalization.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("jobs.txt");
+        std::fs::write(
+            &f,
+            "nixpkgs.jq.x86_64-linux\nnixpkgs.hello.x86_64-linux\nnixpkgs.jq.x86_64-linux\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_scope(&format!("jobs-file:{}", f.display())).unwrap(),
+            Scope::Jobs {
+                jobs: vec![
+                    "nixpkgs.hello.x86_64-linux".into(),
+                    "nixpkgs.jq.x86_64-linux".into()
+                ]
+            }
+        );
     }
 
     #[test]

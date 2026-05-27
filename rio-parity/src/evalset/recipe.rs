@@ -346,9 +346,11 @@ pub async fn unpack_tarball(tarball: &Path, unpack_dir: &Path) -> anyhow::Result
         .collect();
     anyhow::ensure!(
         dirs.len() == 1,
-        "expected exactly one unpacked top-level directory in {}, found {}",
-        unpack_dir.display(),
-        dirs.len()
+        "expected exactly one unpacked top-level directory in {dir}, found {n}; \
+         a previous revision's unpack is probably still there — clean {dir} or \
+         use a fresh --work-dir",
+        dir = unpack_dir.display(),
+        n = dirs.len()
     );
     Ok(dirs.remove(0))
 }

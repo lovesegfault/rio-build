@@ -34,6 +34,12 @@ pub struct EvalSetKey {
     pub nix_eval_jobs_version: String,
     /// SHA-256 (hex) of the generated argv + selection expression — the
     /// "hash of the generated entry-point/args expression" component.
+    ///
+    /// Both inputs embed absolute paths under the chosen work/output
+    /// directories (the unpacked source tree, selection.nix, the
+    /// gc-roots dir), so the digest is reproducible only for runs using
+    /// the same work and output directories — not across machines or
+    /// operators.
     pub args_expr_sha256: String,
     /// Set by `--force`: salts the digest so a forced rebuild lands in
     /// a NEW prefix instead of overwriting the write-once one.
