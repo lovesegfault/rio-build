@@ -67,6 +67,7 @@
     #chapter("ops/gc-enablement.typ")[GC Enablement]
     #chapter("ops/eks-smoke.typ")[EKS Smoke Test]
     #chapter("ops/sla-model.typ")[SLA Model Runbook]
+    #chapter("ops/hung-node-manual-reap.typ")[Hung-Node Manual Reap]
     = Appendix
     #chapter("glossary.typ")[Glossary]
     #chapter("contributing.typ")[Contributing]

@@ -58,6 +58,33 @@ spec:
               idle for 5m. Check system/kind routing and ghost-executor
               accumulation.
 
+        # executor-formal OA2 interim control (option C): pull-mode
+        # attempts carry no per-pod heartbeat, so a wedged-but-Ready
+        # node (kubelet/containerd hung while the Node object stays
+        # Ready) surfaces as its builds silently running out their
+        # attempt deadlines and being established by the sweep as
+        # unreported executor crashes instead of reporting. Fleet-wide
+        # >=2 establishments inside 30m is the tripwire (the
+        # establishment histogram is labeled by cause only, not node);
+        # the per-node clustering discrimination is the ledger query in
+        # the runbook, and the permanent controller-side per-node
+        # aggregation replaces this alert's job at the 1c slice.
+        - alert: RioSchedulerAttemptEstablishmentCluster
+          expr: increase(rio_scheduler_attempt_requeue_seconds_count{cause="establishment"}[30m]) >= 2
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: ">=2 pull-mode attempts established (unreported) in 30m"
+            description: >-
+              {{`{{ $value | humanize }}`}} pull-mode attempt(s) were
+              established as unreported executor crashes by the
+              establishment sweep in the last 30m. If the ledger query
+              shows them clustering on one source node this is the OA2
+              hung-node signature: follow the manual NodeClaim reap
+              procedure in docs/ops/hung-node-manual-reap.typ. Never
+              bulk-reap Ready nodes without that per-node confirmation.
+
         {{- if .Values.buildScheduler.enabled }}
         # ADR-023 §13b: kube-build-scheduler second kube-scheduler.
         # Builder pods set `schedulerName: kube-build-scheduler`; if
