@@ -1,6 +1,6 @@
 //! Build event → STDERR translation and build opcode handlers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
 use rio_nix::derivation::Derivation;
@@ -1335,7 +1335,11 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
 /// Populate `build_result.built_outputs` from `drv` + Realisations lookup.
 ///
-/// Shared by opcodes 36 and 46. Floating-CA outputs have `path=""` in the
+/// Used by opcode 36 (`wopBuildDerivation`), which has no per-target output
+/// selection — all declared outputs are reported. Opcode 46 goes through
+/// [`check_targets_against_store`] + [`result_with_wanted_outputs`] instead,
+/// which add the store-validity check and the wanted-outputs filter.
+/// Floating-CA outputs have `path=""` in the
 /// `.drv` — the real store path is computed post-build from the NAR hash.
 /// Queries the store's Realisations table (scheduler's `insert_realisation`
 /// wrote it before the `Completed` event). Without this, the client
@@ -1377,6 +1381,251 @@ async fn enrich_build_result_with_outputs(
         }
     };
     Ok(build_result.with_outputs_from_drv(drv, &hex::encode(hash), &realized))
+}
+
+/// One requested `DerivedPath::Built` target of a `wopBuildPaths` /
+/// `wopBuildPathsWithResults` batch: the resolved `.drv` plus the output
+/// selection the client sent for it (`!out,dev` / `!*`). Carried from
+/// request parsing to result reporting so the per-target store verification
+/// knows exactly which outputs the client is owed.
+struct TargetDemand {
+    drv_path: String,
+    drv: Derivation,
+    spec: OutputSpec,
+}
+
+/// Store-verified view of one target's wanted outputs, produced by
+/// [`check_targets_against_store`].
+struct TargetOutputsCheck {
+    /// Wanted outputs the store confirms are NOT available: missing store
+    /// paths, or floating-CA outputs with no realisation. Human-readable,
+    /// used verbatim in the client-facing error message.
+    missing: Vec<String>,
+    /// Positive evidence that EVERY wanted output resolved to a concrete
+    /// store path the store reports as present. Required to report a target
+    /// successful when the aggregate outcome was a failure — absence of
+    /// evidence (an unverifiable path) is not enough to override it.
+    confirmed_present: bool,
+    /// Output name → realized store path for floating-CA outputs (from the
+    /// Realisations table). Reused to build `builtOutputs` without a second
+    /// round of store queries.
+    realized: HashMap<String, String>,
+    /// The wanted output names this target's spec resolves to
+    /// (`Names` as sent, `All` → every declared output name).
+    wanted_names: Vec<String>,
+    /// `(output name, expected store path)` pairs awaiting the batched
+    /// FindMissingPaths answer. Drained when the verdict is finalized.
+    checkable: Vec<(String, String)>,
+    /// At least one wanted output could not be mapped to a queryable store
+    /// path (a name the `.drv` does not declare, or a declared path that is
+    /// not a parseable store path — the store rejects the whole
+    /// FindMissingPaths batch on such a path, and it can never have been
+    /// ingested either). Unverifiable outputs never count as missing (the
+    /// target defers to the scheduler outcome, exactly the pre-verification
+    /// behavior) but they block `confirmed_present`.
+    unverifiable: bool,
+}
+
+// r[impl gw.opcode.build-results-honest]
+/// Resolve every target's wanted outputs to concrete store paths and ask the
+/// store — ONE batched `FindMissingPaths` over the union, tenant-scoped via
+/// the session JWT like `wopQueryValidPaths` — which of them actually exist.
+///
+/// Expected paths: the declared `.drv` path for input-addressed / fixed-CA
+/// outputs, the Realisations row for floating-CA outputs. A wanted
+/// floating-CA output with NO realisation is recorded as missing
+/// immediately — the alternative (today's behavior before this check) is a
+/// "successful" entry whose `builtOutputs` carry an empty `outPath`, which
+/// stock clients reject (`Realisation JSON has empty 'outPath'` /
+/// nix-build.cc:722 assert).
+///
+/// Store errors (realisation lookup or FindMissingPaths failure/timeout)
+/// abort the whole opcode via `stderr_err!` — the gateway never falls back
+/// to trusting the scheduler's word about what is in the store. Callers run
+/// this BEFORE `stderr.finish()` (r[gw.stderr.error-before-return+2]).
+async fn check_targets_against_store<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    ctx: &mut SessionContext,
+    targets: &HashMap<usize, TargetDemand>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> anyhow::Result<HashMap<usize, TargetOutputsCheck>> {
+    let SessionContext {
+        store_client,
+        drv_cache,
+        jwt,
+        ..
+    } = ctx;
+
+    let mut checks: HashMap<usize, TargetOutputsCheck> = HashMap::new();
+    // Deduplicated union of every target's checkable paths — one store
+    // round-trip for the whole batch. BTreeSet for a deterministic request.
+    let mut to_query: BTreeSet<String> = BTreeSet::new();
+
+    // Deterministic per-target order so log/error output is stable.
+    let mut indices: Vec<usize> = targets.keys().copied().collect();
+    indices.sort_unstable();
+
+    for idx in indices {
+        let demand = &targets[&idx];
+        // Floating-CA outputs: declared path is "" and the real path lives
+        // in the Realisations table (the scheduler wrote it before emitting
+        // Completed). Non-NotFound store errors abort the opcode.
+        let (_, realized) = match resolve_floating_outputs(
+            &demand.drv,
+            &demand.drv_path,
+            store_client,
+            jwt.token(),
+            drv_cache,
+            hash_cache,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => stderr_err!(
+                stderr,
+                "store error querying realisation for {}: {e}",
+                demand.drv_path
+            ),
+        };
+
+        let wanted_names: Vec<String> = match &demand.spec {
+            OutputSpec::All => demand
+                .drv
+                .outputs()
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect(),
+            OutputSpec::Names(names) => names.clone(),
+        };
+
+        let mut missing = Vec::new();
+        let mut checkable = Vec::new();
+        let mut unverifiable = false;
+        for name in &wanted_names {
+            let Some(output) = demand
+                .drv
+                .outputs()
+                .iter()
+                .find(|o| o.name() == name.as_str())
+            else {
+                // Requested output name the .drv does not declare. Nothing
+                // to ask the store about — defer to the scheduler outcome.
+                unverifiable = true;
+                continue;
+            };
+            let expected = if output.path().is_empty() {
+                match realized.get(name) {
+                    Some(p) => p.clone(),
+                    None => {
+                        missing.push(format!(
+                            "floating-CA output '{name}' of {} has no realisation",
+                            demand.drv_path
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                output.path().to_string()
+            };
+            if StorePath::parse(&expected).is_err() {
+                unverifiable = true;
+                continue;
+            }
+            to_query.insert(expected.clone());
+            checkable.push((name.clone(), expected));
+        }
+
+        checks.insert(
+            idx,
+            TargetOutputsCheck {
+                missing,
+                confirmed_present: false,
+                realized,
+                wanted_names,
+                checkable,
+                unverifiable,
+            },
+        );
+    }
+
+    let missing_set: HashSet<String> = if to_query.is_empty() {
+        HashSet::new()
+    } else {
+        // Tenant-scoped like wopQueryValidPaths: dropping the JWT would
+        // bypass the cross-tenant visibility gate and could "verify" a
+        // path the requesting tenant cannot actually fetch.
+        let req = with_jwt(
+            types::FindMissingPathsRequest {
+                store_paths: to_query.into_iter().collect(),
+            },
+            jwt.token(),
+        )?;
+        match rio_common::grpc::with_timeout(
+            "FindMissingPaths",
+            super::opcodes_read::GATEWAY_FMP_TIMEOUT,
+            store_client.find_missing_paths(req),
+        )
+        .await
+        {
+            Ok(r) => r.into_inner().missing_paths.into_iter().collect(),
+            Err(e) => stderr_err!(stderr, "store error verifying build outputs: {e}"),
+        }
+    };
+
+    for check in checks.values_mut() {
+        for (name, path) in std::mem::take(&mut check.checkable) {
+            if missing_set.contains(&path) {
+                check.missing.push(format!(
+                    "output '{name}' ({path}) is not valid in the store"
+                ));
+            }
+        }
+        // Promotion over a failed aggregate needs positive evidence for
+        // every wanted output; an empty wanted set or any unverifiable
+        // output leaves the scheduler outcome authoritative.
+        check.confirmed_present =
+            check.missing.is_empty() && !check.unverifiable && !check.wanted_names.is_empty();
+    }
+
+    Ok(checks)
+}
+
+// r[impl gw.opcode.build-results-honest]
+/// Build the success-side `BuildResult` for ONE verified target: status and
+/// timing from `base`, `builtOutputs` covering exactly the wanted outputs
+/// (drvHashModulo ids; floating-CA paths from the realisations resolved
+/// during verification — no further store I/O). If the modular hash is
+/// uncomputable (already `warn!`-logged) the result is returned without
+/// builtOutputs, the same degrade as [`enrich_build_result_with_outputs`].
+fn result_with_wanted_outputs(
+    base: BuildResult,
+    demand: &TargetDemand,
+    check: &TargetOutputsCheck,
+    drv_cache: &HashMap<StorePath, Derivation>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> BuildResult {
+    let Some(hash) = translate::compute_modular_hash_cached(
+        &demand.drv,
+        &demand.drv_path,
+        drv_cache,
+        hash_cache,
+    ) else {
+        return base;
+    };
+    let hash_hex = hex::encode(hash);
+    let mut result = base.with_outputs_from_drv(&demand.drv, &hash_hex, &check.realized);
+    // builtOutputs honesty: cover exactly the outputs the client asked for.
+    // Membership is decided on the DrvOutput ids ("sha256:<hash>!<name>")
+    // rather than re-parsing names back out of them.
+    let wanted_ids: HashSet<String> = check
+        .wanted_names
+        .iter()
+        .map(|n| format!("sha256:{hash_hex}!{n}"))
+        .collect();
+    result
+        .built_outputs
+        .retain(|o| wanted_ids.contains(&o.drv_output_id));
+    result
 }
 
 /// Dedup DAG nodes by `drv_path` and edges by `(parent, child)`.
@@ -1557,8 +1806,12 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     // Collect all derivation paths and reconstruct a combined DAG
     let mut all_nodes = Vec::new();
     let mut all_edges = Vec::new();
+    // Per-target demand for the post-build store verification — opcode 9
+    // returns no per-path results, but its bare success word makes the same
+    // promise that every requested output now exists.
+    let mut targets: HashMap<usize, TargetDemand> = HashMap::new();
 
-    for raw in &raw_paths {
+    for (idx, raw) in raw_paths.iter().enumerate() {
         let dp = match DerivedPath::parse(raw) {
             Ok(dp) => dp,
             Err(e) => stderr_err!(stderr, "invalid DerivedPath '{raw}': {e}"),
@@ -1576,9 +1829,17 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
             }
             DerivedPath::Built { drv, outputs } => {
                 match resolve_built_dag(drv, outputs, ctx).await {
-                    Ok((nodes, edges, _)) => {
+                    Ok((nodes, edges, drv_obj)) => {
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
+                        targets.insert(
+                            idx,
+                            TargetDemand {
+                                drv_path: drv.to_string(),
+                                drv: drv_obj,
+                                spec: outputs.clone(),
+                            },
+                        );
                     }
                     Err(e) => stderr_err!(stderr, "DAG reconstruction failed for '{drv}': {e}"),
                 }
@@ -1595,7 +1856,29 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
             Ok(DagSubmitOutcome::Built(r)) if !r.status.is_success() => {
                 stderr_err!(stderr, "build failed: {}", r.error_msg)
             }
-            Ok(DagSubmitOutcome::Built(_)) => {}
+            Ok(DagSubmitOutcome::Built(_)) => {
+                // r[impl gw.opcode.build-results-honest]
+                // The scheduler says the DAG completed; gate the success
+                // word on the store actually holding every requested
+                // output (same verification as wopBuildPathsWithResults).
+                let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+                let checks =
+                    check_targets_against_store(stderr, ctx, &targets, &mut hash_cache).await?;
+                let mut indices: Vec<usize> = checks.keys().copied().collect();
+                indices.sort_unstable();
+                let missing: Vec<String> = indices
+                    .iter()
+                    .filter_map(|i| checks.get(i))
+                    .flat_map(|c| c.missing.iter().cloned())
+                    .collect();
+                if !missing.is_empty() {
+                    stderr_err!(
+                        stderr,
+                        "build completed but requested outputs are not in the store: {}",
+                        missing.join("; ")
+                    );
+                }
+            }
             Err(e) => stderr_err!(stderr, "build failed: {e}"),
         }
     }
@@ -1626,11 +1909,12 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     let mut all_nodes = Vec::new();
     let mut all_edges = Vec::new();
     let mut opaque_results: HashMap<usize, BuildResult> = HashMap::new();
-    // Track idx → (drvPath, Derivation) for successful Built paths so we can
-    // populate builtOutputs per-derivation after the build completes.
+    // Track idx → TargetDemand (drvPath, Derivation, OutputSpec) for Built
+    // paths so the per-target store verification and builtOutputs
+    // population after the build know exactly what each entry asked for.
     // Without builtOutputs, the client can't map the derivation to its outputs
     // and falls back to some NAR-based verification → "error: no sink".
-    let mut drv_for_idx: HashMap<usize, (String, Derivation)> = HashMap::new();
+    let mut drv_for_idx: HashMap<usize, TargetDemand> = HashMap::new();
 
     for (idx, raw) in raw_paths.iter().enumerate() {
         let dp = match DerivedPath::parse(raw) {
@@ -1671,7 +1955,14 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     Ok((nodes, edges, drv_obj)) => {
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
-                        drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
+                        drv_for_idx.insert(
+                            idx,
+                            TargetDemand {
+                                drv_path: drv.to_string(),
+                                drv: drv_obj,
+                                spec: outputs.clone(),
+                            },
+                        );
                     }
                     Err(e) => {
                         opaque_results.insert(
@@ -1702,36 +1993,64 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             }
         };
 
-        // Apply the build result to all derivation paths, enriching each with
-        // its builtOutputs (drvHashModulo!outputName → Realisation JSON).
-        // Uses drv_cache as the resolver for hash_derivation_modulo's transitive deps.
+        // r[impl gw.opcode.build-results-honest]
+        // Honest per-target results: a target is reported successful only
+        // when the store confirms the outputs the client asked for actually
+        // exist (defense in depth on top of the scheduler-side guarantees),
+        // and a target whose outputs ARE all present is not blanket-failed
+        // by an unrelated failure elsewhere in the batch. One batched
+        // FindMissingPaths; store errors abort the opcode (stderr_err!
+        // inside, before stderr.finish()).
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        let mut checks =
+            check_targets_against_store(stderr, ctx, &drv_for_idx, &mut hash_cache).await?;
+
         for (idx, _raw) in raw_paths.iter().enumerate() {
             if let Some(opaque) = opaque_results.remove(&idx) {
                 results.push(opaque);
-            } else if build_result.status.is_success()
-                && let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx)
-            {
-                match enrich_build_result_with_outputs(
-                    build_result.clone(),
-                    drv_obj,
-                    drv_path,
-                    ctx,
-                    &mut hash_cache,
-                )
-                .await
-                {
-                    Ok(r) => results.push(r),
-                    // Non-NotFound store error during realisation lookup
-                    // — this is one batch-wide store outage, aborting is
-                    // correct (the next opcode would hit the same dead
-                    // store anyway). We're before stderr.finish().
-                    Err(e) => stderr_err!(
-                        stderr,
-                        "store error querying realisation for {drv_path}: {e}"
-                    ),
+                continue;
+            }
+            let (Some(demand), Some(check)) = (drv_for_idx.get(&idx), checks.remove(&idx)) else {
+                results.push(build_result.clone());
+                continue;
+            };
+            if build_result.status.is_success() {
+                if check.missing.is_empty() {
+                    // Verified (or unverifiable — defer to the scheduler):
+                    // success, with builtOutputs covering exactly the
+                    // wanted outputs.
+                    results.push(result_with_wanted_outputs(
+                        build_result.clone(),
+                        demand,
+                        &check,
+                        &ctx.drv_cache,
+                        &mut hash_cache,
+                    ));
+                } else {
+                    // Wrong-success: the aggregate says Built but this
+                    // target's requested outputs are not in the store.
+                    results.push(BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!(
+                            "build completed but requested outputs are not in the store: {}",
+                            check.missing.join("; ")
+                        ),
+                    ));
                 }
+            } else if check.confirmed_present {
+                // Partial outcome: the aggregate failed, but every output
+                // THIS target asked for is present in the store — report
+                // the target honestly as built.
+                results.push(result_with_wanted_outputs(
+                    BuildResult::success(),
+                    demand,
+                    &check,
+                    &ctx.drv_cache,
+                    &mut hash_cache,
+                ));
             } else {
+                // Unverified target under a failed aggregate: keep the
+                // mapped failure status + error message.
                 results.push(build_result.clone());
             }
         }

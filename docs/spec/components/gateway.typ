@@ -632,6 +632,43 @@ Response (after STDERR loop):
   [(per entry) `buildResult`], [BuildResult], [See `BuildResult` format below],
 )
 
+=== Per-Target Result Honesty
+
+#r("gw.opcode.build-results-honest")[
+  A derivation (`Built`) target in a `wopBuildPathsWithResults` batch MUST be
+  reported successful only if every output the client requested for that
+  target is valid in the rio store (tenant-scoped) at completion time, and a
+  successful entry's `builtOutputs` MUST cover exactly the requested outputs
+  with paths reflecting store reality (declared paths for input-addressed and
+  fixed-CA outputs, the registered realisation for floating-CA outputs). A
+  target that fails this verification MUST carry a failure status whose
+  `errorMsg` names the missing store paths or unrealized outputs, while the
+  remaining entries of the batch are still reported normally (one entry per
+  requested path, in request order, no batch-wide `STDERR_ERROR` for an
+  individual target's failure). The same verification MUST gate the success
+  reply (`u64(1)`) of `wopBuildPaths`.
+]
+
+This is defense in depth on top of the scheduler-side completion guarantees:
+the gateway submits all targets of a batch as one combined @dag and receives
+a single aggregate outcome, so without a per-target check every entry would
+inherit that outcome — a target whose outputs were never produced could be
+reported `Built` with fabricated `builtOutputs` (wrong-success), and a target
+whose outputs are all present would be reported failed because an unrelated
+target in the batch failed (partial outcome). Reporting an unrealized
+floating-CA output as successful is also a client-crash bug, not just a
+truthfulness one: the entry would carry an empty `outPath`, which stock Nix
+rejects (`Realisation::fromJSON` parse failure / `nix-build.cc:722` assert).
+Verification consults the store (one batched `FindMissingPaths` over the
+union of wanted paths, plus the Realisations table for floating-CA outputs)
+rather than the build-event stream because the store is what the client will
+actually fetch from — events describe what the scheduler believes happened
+and may be replayed across failover, while store validity at reporting time
+is the contract the success status hands to the client. When the aggregate
+outcome was a failure, a target is promoted to success only on positive
+store evidence for every requested output; outputs that cannot be mapped to
+a queryable store path leave the scheduler's outcome authoritative.
+
 === BuildResult Wire Format
 
 All fields below are present for 1.35+ except `cpu_user`/`cpu_system`, which

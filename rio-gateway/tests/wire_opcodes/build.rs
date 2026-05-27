@@ -2614,3 +2614,305 @@ async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ===========================================================================
+// Per-target build-result honesty — gw.opcode.build-results-honest
+// ===========================================================================
+//
+// wopBuildPathsWithResults submits all Built targets as ONE combined DAG and
+// historically cloned the single aggregate outcome to every requested path,
+// fabricating builtOutputs from the .drv's declared outputs. These tests pin
+// the honest behavior: a target is reported successful only if the store
+// confirms the outputs the client asked for actually exist, builtOutputs
+// cover exactly the wanted outputs, and a target whose outputs ARE present
+// is not blanket-failed by an unrelated failure elsewhere in the batch.
+//
+// Fixtures use REALISTIC (parseable) output store paths — unlike
+// TEST_DRV_ATERM's `/nix/store/zzz-output`, which is not a valid store path
+// and therefore cannot be asked of the store at all (verification defers to
+// the scheduler outcome for such paths, which is what keeps the older tests
+// above byte-for-byte unchanged).
+
+use rio_nix::protocol::build::{BuildResult, BuildStatus, read_build_result};
+use rio_nix::protocol::handshake::PROTOCOL_VERSION;
+
+/// Single-output IA derivation "honest-a" with a parseable output path.
+const HONEST_A_OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out";
+const HONEST_A_DRV: &str = "/nix/store/00000000000000000000000000000111-honest-a.drv";
+const HONEST_A_ATERM: &str = r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo a"],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out")])"#;
+
+/// Single-output IA derivation "honest-b" with a parseable output path.
+const HONEST_B_OUT: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out";
+const HONEST_B_DRV: &str = "/nix/store/00000000000000000000000000000222-honest-b.drv";
+const HONEST_B_ATERM: &str = r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo b"],[("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out")])"#;
+
+/// Two-output (dev, out) IA derivation for the wanted-only builtOutputs test.
+const MULTI_OUT: &str = "/nix/store/ffffffffffffffffffffffffffffffff-multi-out";
+const MULTI_DRV: &str = "/nix/store/00000000000000000000000000000333-multi.drv";
+const MULTI_ATERM: &str = r#"Derive([("dev","/nix/store/dddddddddddddddddddddddddddddddd-multi-dev","",""),("out","/nix/store/ffffffffffffffffffffffffffffffff-multi-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("dev","/nix/store/dddddddddddddddddddddddddddddddd-multi-dev"),("out","/nix/store/ffffffffffffffffffffffffffffffff-multi-out")])"#;
+
+/// Floating-CA derivation (declared output path empty) for the
+/// no-realisation case.
+const CA_DRV: &str = "/nix/store/00000000000000000000000000000444-ca-results.drv";
+const CA_ATERM: &str = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","")])"#;
+
+/// Read one `(DerivedPath, BuildResult)` entry of a wopBuildPathsWithResults
+/// response with the client-side parser (the same parser a Rust ssh-ng
+/// client would use — it rejects empty outPath exactly like stock Nix).
+async fn read_keyed_result(
+    stream: &mut tokio::io::DuplexStream,
+) -> anyhow::Result<(String, BuildResult)> {
+    let path = wire::read_string(stream).await?;
+    let result = read_build_result(stream, PROTOCOL_VERSION).await?;
+    Ok((path, result))
+}
+
+// r[verify gw.opcode.build-results-honest]
+/// Wrong-success: the scheduler reports the combined DAG as completed, but
+/// only target A's wanted output is actually in the store. A must be Built
+/// with builtOutputs for exactly its wanted output; B must be a failure
+/// naming the missing path — not a fabricated Built.
+#[tokio::test]
+async fn test_build_paths_with_results_missing_output_fails_only_that_target() -> anyhow::Result<()>
+{
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store
+        .seed_with_content(HONEST_B_DRV, HONEST_B_ATERM.as_bytes());
+    // A's output exists in the store; B's does NOT.
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    let path_b = format!("{HONEST_B_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: &[path_a.clone(), path_b.clone()],
+        u64: 0,                                  // build_mode = Normal
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 2, "one result per requested path");
+
+    let (echoed_a, result_a) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed_a, path_a);
+    assert_eq!(
+        result_a.status,
+        BuildStatus::Built,
+        "target A's wanted output is in the store — it must report success: {result_a:?}"
+    );
+    assert_eq!(
+        result_a.built_outputs.len(),
+        1,
+        "A's builtOutputs must cover exactly its wanted output: {result_a:?}"
+    );
+    assert!(result_a.built_outputs[0].drv_output_id.ends_with("!out"));
+    assert_eq!(result_a.built_outputs[0].out_path, HONEST_A_OUT);
+
+    let (echoed_b, result_b) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed_b, path_b);
+    assert_eq!(
+        result_b.status,
+        BuildStatus::MiscFailure,
+        "target B's wanted output is NOT in the store — it must not report Built: {result_b:?}"
+    );
+    assert!(
+        result_b.error_msg.contains(HONEST_B_OUT),
+        "B's error must name the missing path, got: {:?}",
+        result_b.error_msg
+    );
+    assert!(
+        result_b.built_outputs.is_empty(),
+        "no fabricated builtOutputs for an unverified target: {result_b:?}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest]
+/// Partial outcome, the other direction: the aggregate build FAILS, but
+/// target A's wanted output is present in the store. A must report success;
+/// B keeps the mapped failure status + message.
+#[tokio::test]
+async fn test_build_paths_with_results_failure_keeps_verified_target_built() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 2,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Failed(types::BuildFailed {
+            error_message: "boom".into(),
+            failed_derivation: HONEST_B_DRV.into(),
+            status: types::BuildResultStatus::PermanentFailure as i32,
+        })),
+    ]));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store
+        .seed_with_content(HONEST_B_DRV, HONEST_B_ATERM.as_bytes());
+    // A's output exists (e.g. built before the batch fell over); B's does not.
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    let path_b = format!("{HONEST_B_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[path_a.clone(), path_b.clone()],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 2);
+
+    let (_, result_a) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(
+        result_a.status,
+        BuildStatus::Built,
+        "A's wanted output is in the store — the unrelated batch failure must not mask it: {result_a:?}"
+    );
+    assert!(result_a.error_msg.is_empty(), "{result_a:?}");
+    assert_eq!(
+        result_a.built_outputs.len(),
+        1,
+        "verified target still carries its builtOutputs: {result_a:?}"
+    );
+    assert_eq!(result_a.built_outputs[0].out_path, HONEST_A_OUT);
+
+    let (_, result_b) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(
+        result_b.status,
+        BuildStatus::PermanentFailure,
+        "B keeps the scheduler's mapped failure status: {result_b:?}"
+    );
+    assert!(
+        result_b.error_msg.contains("boom"),
+        "B keeps the scheduler's error message, got: {:?}",
+        result_b.error_msg
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest]
+/// wopBuildPaths (9): the bare success word is gated on the same store
+/// verification. Aggregate success but the wanted output path is missing
+/// from the store ⇒ STDERR_ERROR naming the path, not u64(1).
+#[tokio::test]
+async fn test_build_paths_success_word_gated_on_outputs_present() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // .drv resolvable, but its declared output path is NOT in the store.
+    h.store
+        .seed_with_content(HONEST_B_DRV, HONEST_B_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{HONEST_B_DRV}!out")],
+        u64: 0,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains(HONEST_B_OUT),
+        "error must name the missing output path, got: {:?}",
+        err.message
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest]
+/// Single fully-valid target: still reports Built, and builtOutputs cover
+/// ONLY the wanted output — the unrequested `dev` output of a multi-output
+/// derivation is not echoed back.
+#[tokio::test]
+async fn test_build_paths_with_results_built_outputs_cover_only_wanted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    h.store.seed_with_content(MULTI_DRV, MULTI_ATERM.as_bytes());
+    // Only the wanted output needs to be (and is) in the store.
+    h.store.seed_with_content(MULTI_OUT, b"multi-out");
+
+    let derived_path = format!("{MULTI_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, derived_path);
+    assert_eq!(
+        result.status,
+        BuildStatus::Built,
+        "fully-valid single target stays Built: {result:?}"
+    );
+    assert_eq!(
+        result.built_outputs.len(),
+        1,
+        "builtOutputs must cover exactly the requested outputs (out), not the \
+         unrequested dev: {result:?}"
+    );
+    assert!(result.built_outputs[0].drv_output_id.ends_with("!out"));
+    assert_eq!(result.built_outputs[0].out_path, MULTI_OUT);
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest]
+/// A wanted floating-CA output with no realisation row must fail that
+/// target's verification — not ship a Built result whose builtOutputs carry
+/// an empty outPath (which stock clients reject / assert on).
+#[tokio::test]
+async fn test_build_paths_with_results_unrealized_floating_ca_fails_target() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Seed the .drv but do NOT register any realisation for its output.
+    h.store.seed_with_content(CA_DRV, CA_ATERM.as_bytes());
+
+    let derived_path = format!("{CA_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    // Pre-fix this read fails with "Realisation JSON has empty 'outPath'" —
+    // exactly the malformed payload a stock client would choke on.
+    let (_, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(
+        result.status,
+        BuildStatus::MiscFailure,
+        "unrealized floating-CA output must fail verification: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains("out"),
+        "error must name the unrealized output, got: {:?}",
+        result.error_msg
+    );
+    assert!(result.built_outputs.is_empty(), "{result:?}");
+
+    h.finish().await;
+    Ok(())
+}

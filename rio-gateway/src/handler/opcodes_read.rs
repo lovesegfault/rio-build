@@ -29,7 +29,11 @@ use crate::drv_cache::resolve_derivation;
 /// to-dispatch result, not a gateway-side `DeadlineExceeded` that the
 /// Nix client renders as a hard error. Matches the scheduler's
 /// `MERGE_FMP_TIMEOUT`.
-const GATEWAY_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+///
+/// `pub(super)` because the build handlers' post-build output
+/// verification (`build.rs::check_targets_against_store`) issues the
+/// same RPC and must share the same budget.
+pub(super) const GATEWAY_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// JWT for store lookups — but NOT for `.drv` paths.
 ///
