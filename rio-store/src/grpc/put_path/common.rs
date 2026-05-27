@@ -492,7 +492,9 @@ pub(in crate::grpc) fn verify_ca_store_path(
             )
             .increment(1);
             return Err(Status::permission_denied(format!(
-                "{ctx_label}: fixed-output upload must carry a `fixed:`                  content-address descriptor so the store can verify the                  content against the path"
+                "{ctx_label}: fixed-output upload must carry a `fixed:` \
+                 content-address descriptor so the store can verify the \
+                 content against the path"
             )));
         }
         // Input-addressed (or daemon-era descriptor-less) worker upload:
@@ -1597,7 +1599,8 @@ mod verify_nar_tests {
             .expect_err("descriptor-less upload under FOD-flagged claims must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(
-            err.message().contains("fixed-output upload must carry"),
+            err.message()
+                .contains("must carry a `fixed:` content-address descriptor"),
             "unexpected error: {err}"
         );
     }
