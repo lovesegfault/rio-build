@@ -118,8 +118,9 @@ pub(crate) async fn grpc_query_path_info(
 /// QueryRealisation with NotFound→None mapping. Any non-NotFound status
 /// is returned as Err — caller MUST `stderr_err!` it. Never swallow.
 ///
-/// Chokepoint for the four CA-aware opcode handlers (40, 41, 43, 46) and
-/// opcode 36's output-enrichment. `NotFound` is the *only* store status
+/// Chokepoint for the CA-aware opcode handlers (40, 41, 43) and the
+/// build-result store verification (`check_targets_against_store`,
+/// reached by opcodes 9/36/46). `NotFound` is the *only* store status
 /// that maps to wire-level "no result"; `Unavailable` / `DeadlineExceeded`
 /// / `Internal` are infrastructure errors that the client must see via
 /// `STDERR_ERROR` — otherwise (per the doc-comment on
@@ -167,7 +168,8 @@ pub(super) async fn grpc_query_realisation(
 ///
 /// Non-NotFound store errors propagate as `Err` — caller `stderr_err!`s.
 ///
-/// Shared resolver for opcodes 36/40/41/46; before this extraction each
+/// Shared resolver for opcodes 9/36/40/41/46 (the build opcodes reach it
+/// via `check_targets_against_store`); before this extraction each
 /// caller open-coded the same `compute_modular_hash_cached → per-output
 /// QueryRealisation` loop with inconsistent error handling (two of the
 /// four swallowed non-NotFound — see [`grpc_query_realisation`]).

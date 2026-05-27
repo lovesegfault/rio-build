@@ -1023,7 +1023,7 @@ pub(super) async fn handle_query_derivation_output_map<
     };
 
     // Floating-CA: .drv has path="" — resolve via Realisations. Shared
-    // helper with opcodes 36/40/46; nix-build uses the legacy
+    // helper with opcodes 9/36/40/46; nix-build uses the legacy
     // wopBuildPaths path which doesn't return builtOutputs, so it
     // comes back here instead. Non-NotFound store errors propagate
     // to STDERR_ERROR (we're before stderr.finish()) — passing ""
