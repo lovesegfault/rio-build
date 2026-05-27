@@ -1975,3 +1975,306 @@ two genuinely new race surfaces the replacement introduces (the
 mark-snapshot race and the writer-transaction overrun) are not corpus
 rows but carry the §4.6 required-falsification pairs as wired CI
 checks, recorded in the chunkCollect section above.
+
+## Campaign close-out — chunk refcount replacement (refcount-formal)
+
+The refcount-formal campaign is complete in the development sense
+defined by the 2026-05-27 owner directive: every code wave is landed
+and gate-green, the verification evidence and reviews are recorded,
+and everything that requires a deployment to observe is handed off as
+the deployment-time validation checklist rather than claimed. This
+section is the campaign-level record, in the same shape as the retry
+and log campaigns' close-outs; the per-phase evidence lives in the
+sections above, the introducing commits, and the CI transcripts.
+
+### What was delivered, phase by phase
+
+- **Phase 0 — the as-built protocol made checkable.** Stage A mapped
+  CR-1..CR-4 and the supporting invariants onto the `store.*` rule
+  set, added the five missing rules (the two as-built counter rules
+  plus the three invariant-level rules), recorded the contradiction
+  and consumer audits (0 class-(a) consumers; 13 class-(b) rows with
+  fates), and confirmed the blast-radius claim. Stage B encoded the
+  as-built protocol as `chunkLiveness.qnt` (one action per SQL
+  transaction, the C1–C12 fault alphabet) and established the
+  full-invariant HOLDS baseline across four exhaustive regimes with
+  the two pre-registered corrupt-regime falsifications. Stage C
+  replayed the ~35-fix corpus: every encodable family falsified
+  through a representative override, every non-encodable row carries
+  its pre-registered disposition, five permanent calibration guards
+  were wired, and the late-mark window was found and dispositioned.
+  (Sections: the rule map through "Stage-C calibration".)
+- **Phase 1-pre — hardening that stands alone.** The late-mark guard
+  (`mark_chunks_uploaded` gains `AND deleted = FALSE`, red-first), the
+  fallible chunk_list parse with its corrupt-class unit tests (the
+  Kani contract attempted and recorded as not wired), and the i201
+  probe re-point off the counter (consumer-audit row 1, contradiction
+  T1 closed).
+- **Wave A1 — measurements, additive schema, shadow collector,
+  replacement model.** The §5a mark measurement returned NO-GO on the
+  prescribed shape and was re-entered to the server-side set-based
+  mark (v3); the gate-(c) collect measurement breached the combined
+  budget and was re-entered to the capped, cursor-resumable collect
+  (v4, `COLLECT_CYCLE_VICTIM_CAP = 500_000`); the capped cycle then
+  passed gate (c) at 278.3 s against the 300 s budget (T-1a.1c).
+  Migration 068 and the upsert touch, the shadow collector with the
+  fail-closed mark and capped-collect scaffolding, the upgrade-tx
+  histogram and the three alerts, `chunkCollect.qnt` with its 33
+  wired checks and the four falsification pairs, the acceptance
+  re-run, and the three-reviewer collector code review (11 confirmed
+  findings, 6 deduplicated issues, all fixed or adjudicated) closed
+  the wave. The v5 owner directive re-scoped gate (a) and every
+  soak-style observation to the deployment-time checklist.
+- **Wave A2 / Release A — the collector becomes the deletion
+  authority.** The live collect arm landed red-first behind the full
+  start condition; the path sweep's chunk block, the hourly
+  orphan-chunk sweep, and the reap zero-detect plus the drain's
+  counter conjunct were retired; four rules were amended with the
+  code; the counter became write-only; `vm-lifecycle-gc-k3s` stayed
+  green across the cutover. (Section: "Wave A2 cutover record".)
+- **Release B — the counter machinery deleted.** Migration 069
+  dropped the M_023 CHECK and `idx_chunks_gc`; the writers, the
+  token, DEC-1/DEC-2, the chunk-aware reap obligations, and the P5
+  drift pair were deleted; the two as-built rules were retired and
+  the counter prose rewritten; the i040 selector was re-pointed; the
+  G1/G2 calibration guards were retired with the machinery they
+  guarded. Production rio-store issues no SQL that names
+  `chunks.refcount`. (Section: "Release B record".)
+- **Phase 2 — assurance close-out.** The acceptance table over the
+  full corpus, the two Kani dispositions (reasoned omissions with
+  named compensating coverage and reconsideration triggers), the
+  stale-prose sweep, and this close-out. The Phase-2 items this
+  campaign defers are listed below with owners.
+
+### Outcome against the design's two committed goals (§1)
+
+Both hold, with the §4.6 Kani slot discharged by reasoned omission
+rather than by proof. The as-built protocol's safety properties are
+an exhaustively checked invariant set calibrated against its own fix
+history (Stage B verdicts, Stage C calibration). The replacement is
+proven against the same invariant list minus CR-3 — which it makes
+true by construction and then deletes — across the same regimes plus
+the two new-surface regimes, with the four required falsification
+pairs demonstrating that the genuinely new mechanisms (the touch and
+grace term, the writer-transaction bound, the fail-closed mark, the
+late-mark guard) are each load-bearing, and the acceptance re-run
+demonstrating the surviving mechanisms still falsify when reverted.
+The collector is the only producer of chunk soft-deletes and outbox
+rows; eligibility is derived from the durable manifests at collect
+time; no production code reads or writes a chunk reference counter.
+
+### Final verification inventory (at this close-out)
+
+- **Models.** `chunkLiveness.qnt` (as-built, retained): 4 exhaustive
+  TLC regimes, last recorded distinct-state counts 7,791 / 2,964,717
+  / 1,332,821 / 3,307,725 (base/crash/contend/corrupt), 28 wired CI
+  checks (4 regimes, 4 named-run replays, 16 non-vacuity witnesses,
+  2 pre-registered corrupt falsifications, the corrupt-leak witness,
+  the threshold-order inversion). `chunkCollect.qnt` (replacement,
+  the model of record for the landed code): 6 exhaustive regimes,
+  last recorded distinct-state counts 26,335 / 14,918,067 /
+  5,174,327 / 17,603,367 / 329,689 / 6,365,559 (base/crash/contend/
+  corrupt/writer-bounded/latemark-guarded), 33 wired CI checks
+  (6 exhaustive, 4 named-run replays, 18 expect-violation checks,
+  4 falsify-halves of the required pairs, the threshold-order
+  inversion).
+- **Calibration.** 3 wired `quint-refcount-calib-*` checks survive
+  (G3 counter-presence, G4a drain-recheck, G5 no-heartbeat — all
+  guarding mechanisms that survive the replacement, still pointed at
+  the as-built model); the G1/G2 guards were retired with their
+  machinery at Release B. 13 override/evidence modules remain
+  committed and re-runnable under `docs/spec/models/calibration/`
+  (10 as-built Stage-C modules, 3 replacement-model acceptance
+  modules).
+- **Spec.** Seven rules added over the campaign (five at Stage A, the
+  two collector rules with the replacement model); the two as-built
+  counter rules retired at Release B; the surviving chunk/GC rules
+  amended in place (`tracey bump`) in the same commits as the code
+  they license. tracey snapshot at close-out: 578 of 586 requirements
+  carry an impl reference; the two collector rules
+  (`store.chunk.liveness-derived`, `store.gc.chunk-collect`) are
+  impl- and verify-covered; the three invariant-level rules
+  (`store.chunk.no-live-collect`, `store.gc.bounded-garbage-retention+2`,
+  `store.chunk.liveness-not-presence`) are verify-only by the
+  recorded Stage-A decision (model checks verify them; no single code
+  site is "the implementation" of an invariant), and they are the
+  only campaign entries in `tracey query uncovered`; `tracey query
+  untested` lists no rule this campaign added or whose text it
+  amended — its `store.*` entries (the admin/db/realisation rows and
+  the GC serialize-lock/shutdown-abort rows) all predate the
+  campaign.
+- **Tests.** 142 test functions across the chunk-GC neighborhood at
+  close (85 in `gc/` including the 22 collector tests and the 5
+  bench-housed structural/EXPLAIN guards; 26 in `metadata/`; 15 in
+  `cas.rs`; 16 in `tests/grpc/chunked.rs`), postgres-backed where
+  they touch the DB; the as-built ~86-test counter corpus was
+  re-pointed or retired with per-test justifications in the landing
+  commits (P13). The `fuzz-manifest_deserialize` target is unchanged
+  and remains the parser's input-surface coverage.
+- **Kani.** No proof harness for this subsystem: the two §4.6
+  candidates are closed as reasoned omissions (Phase-2 section above)
+  because their load-bearing logic lives in SQL or in test-only
+  oracles after the v3/v4 re-entries. `kani-rio-store` continues to
+  carry the five log-kernel harnesses, unaffected.
+- **Schema and instrumentation.** Migrations 068 (additive
+  `last_referenced_at`) and 069 (drop the M_023 CHECK and
+  `idx_chunks_gc`) are landed and PINNED; 070 is reserved and
+  deferred (below). Nine collector/upgrade-tx metric series, the
+  three wired alerts (`RioStoreGcCollectParseFailure`,
+  `RioStoreGcCollectStalled`, `RioStoreChunkUpgradeTxSlow`), and the
+  operator runbook copy of the deployment checklist
+  (`docs/ops/gc-enablement.typ`) ship with the code.
+- **Reviews and adjudications.** The design review (v1→v2, 16
+  findings incorporated); the three re-entry/amendment records (v3
+  server-side mark, v4 capped collect, v5 owner directive); the
+  Wave-A1 three-reviewer collector code review with recorded
+  dispositions; red-first captures for the late-mark guard and the
+  live collect arm; four full-gate landings (Phase 1-pre, Wave A1,
+  Wave A2, Release B) integrated serially onto `formal-sprint`, each
+  recorded gate-green in its landing record above.
+
+### The design-§5 exit gates, assessed honestly
+
+- **Phase 0 / 1a / 1b gates: met**, as recorded in their sections
+  (the as-built HOLDS baseline and calibration; the replacement-model
+  verdicts, witnesses, falsification pairs, acceptance re-run, gates
+  (b)/(c), and the code-review pass; the cutover and deletion
+  landings behind green gates with the mixed-fleet construction
+  review).
+- **Phase 1c "net-negative diff for rio-store/src + schema": NOT
+  met**, and recorded as such rather than reinterpreted — see the
+  next subsection for the measured numbers and where the growth went.
+- **Phase 1c tracey/test hygiene: met.** `tracey query untested` is
+  clean for the two collector rules, the two retired rules appear in
+  no query output, and every retired or re-pointed test carries its
+  P13 justification in the landing commit messages.
+- **Phase 2 "Kani proofs in the gate": not met as stated, by
+  decision.** The two candidates are reasoned omissions (above) with
+  named compensating coverage; nothing is claimed as machine-proved
+  for this subsystem.
+- **Phase 2 "acceptance table complete": met** (the table above; no
+  row without a disposition).
+- **Phase 2 "closing bughunter rounds": not executed.** No
+  refcount-specific closing bug-sweep rounds were run. The
+  adversarial-review evidence for this campaign is the Wave-A1
+  collector code review plus the per-landing gates; a closing sweep
+  over the landed `rio-store/src/gc` + `metadata/chunked.rs` surface
+  remains open work for whoever picks up the deferred Phase-2 items.
+
+### Net code delta for the core files
+
+The design's §4.3 estimate was ~500–700 production lines deleted
+against ~150–250 added, "net negative by ~400 lines or better", and
+the Phase-1c exit gate asked for a net-negative diff. Measured against
+the pre-campaign baseline (the parent of the first Phase-1-pre
+commit), production code only (trailing `#[cfg(test)]` test modules
+and the test-only `mark_scan_bench.rs` excluded; `cas.rs` counted
+whole-file because its tests are interleaved):
+
+| File | Baseline | Now | Δ |
+|---|---|---|---|
+| `gc/mod.rs` | 563 | 536 | −27 |
+| `gc/sweep.rs` | 904 | 641 | −263 |
+| `gc/drain.rs` | 284 | 296 | +12 |
+| `gc/orphan.rs` | 381 | 367 | −14 |
+| `gc/collect.rs` | 0 | 880 | +880 |
+| `gc/mark.rs` | 142 | 142 | 0 |
+| `metadata/chunked.rs` | 406 | 273 | −133 |
+| `metadata/mod.rs` | 360 | 323 | −37 |
+| `cas.rs` | 1,287 | 1,292 | +5 |
+| **Total** | **4,327** | **4,750** | **+423** |
+
+Excluding comment and blank lines the same set moves 2,132 → 2,312
+(+180). The peripheral campaign-touched files (the token plumbing in
+`grpc/put_path*`, `ingest.rs`, `substitute.rs`, `backend.rs`,
+`error.rs`, `main.rs`, `metadata/inline.rs`) net −38. Test and bench
+code grew by roughly +2,400 lines (the `mark_scan_bench` harness with
+its EXPLAIN/structural guards, the collector test set, and the
+enlarged upsert/rollback test modules). Schema: one column added
+(068), one CHECK and one partial index dropped (069), the `refcount`
+column itself still present pending 070.
+
+The deletions the design predicted did land — the decrement/zero/
+enqueue family, the token and its rollback, the chunk-aware reap
+machinery, the path-sweep chunk block, and the hourly orphan-chunk
+sweep are gone, and the counter has no writers — but the collector
+that replaced them is ~880 production lines (≈430 excluding comments)
+against the design's 150–250 estimate, because it absorbed the
+fail-closed validation and offender reporting, the shadow/live
+split, the cap/cursor/backlog machinery, the metrics and outcome
+accounting, the backstop spawn, and the session-state hygiene that
+the v3/v4 re-entries and the Wave-A1 review made explicit. The
+accurate summary of the §1 goal is therefore the same shape the retry
+campaign recorded: the *decision surface* shrank to one producer with
+one predicate, the *schema surface* shrank by the CHECK, the index,
+and (post-070) the column, and the bug classes the campaign targeted
+are gone by construction — but the *code volume* in the core files
+grew, because the replacement carries its own operability machinery
+where the counter's was spread across the deleted paths. Recorded as
+a deviation from the stated goal, not explained away.
+
+### Decisions and sign-off items as exercised
+
+P1–P15 and sign-off items 1–8 shipped as written, with these
+exercised outcomes worth restating: item 1 (the parse Kani contract
+pulled forward) was attempted, not wired, and is now closed as a
+reasoned omission; item 4 (the soak window) was closed by the v5
+directive and its suggested window carried into checklist row D2;
+item 5 (the mark-scan threshold) was exercised twice — the NO-GO and
+the gate-(c) breach — and both re-entries are recorded with their
+adjudications; item 7 kept default (B) (no VM-level collector
+coverage; the chunkCollect checks, the postgres-backed collect tests,
+and the code review carry it); item 8's cap value (500,000) shipped
+as derived. P12's retire-at-deletion reading for the G1/G2
+calibration guards was taken and recorded in the Release B
+disposition.
+
+### Deferred items, owners, and conditions
+
+| Item | Owner | Condition / where recorded |
+|---|---|---|
+| Migration 070 (`DROP COLUMN chunks.refcount`) — authoring and application | Operator/owner at deployment time | Apply only after the Release-B rollout is complete everywhere that shares the database (checklist row D7; M_069 and M_071 commentary record the reservation and ordering). The 070 change set must also drop the column from the test seeders that still name it (`test_helpers.rs::ChunkSeed`, the admin VerifyChunks test seeds) and sweep the comments that describe the still-existing column. |
+| Deployment-time validation checklist D0–D7 | Operator/owner at deployment time | The plan's checklist and its operator copy in `docs/ops/gc-enablement.typ`; D1 (production-class cycle timing, formerly gate (a)), D2 (drift window), D3 (alert quietness), D4 (backlog drain), D5 (integrity spot-checks) precede the Release-B stage; D6/D7 follow it. The Wave-A1 instrumentation is the deliverable that makes these executable. |
+| Retiring the as-built `chunkLiveness.qnt` (model-of-record flip) and re-pointing the three surviving `quint-refcount-calib-*` checks at `chunkCollect.qnt` | Whoever picks up the deferred Phase-2 items | Do together, after the deployment-time checklist has validated the live collector (retiring the as-built encoding before then would discard the only model of the still-deployable previous release); the retry campaign's retirement section is the template (preserve non-vacuity anchors when removing checks). |
+| MBT-lite trace-derived integration tests (design §5 Phase-2 option) | Same | Optional; revisit only if the collector's PG-side behavior grows beyond what the postgres-backed structural tests pin. |
+| Closing bug-sweep rounds over the landed collector surface | Same | The design's Phase-2 closing-discipline item; not executed in this campaign (recorded above). |
+| The late-mark heartbeat-contract dependency | Standing assumption, monitored | `uploaded_at`-as-presence still leans on the heartbeat contract under the T-pre.1 guard (Stage-C finding; chunkCollect encoding notes); carried by the S5/threshold-order checks and the latemark pair, not by new work. |
+| The upgrade-tx histogram's commit-time blind spot | Operator/owner at deployment time | Recorded at T-1a.4; accept explicitly for the live arm or close with a `pg_stat_activity` long-transaction check / the collector-side snapshot anchor (checklist row D3 is where it surfaces). |
+| The sparse full-pass scan term and the 15 M-path mark extrapolation | Operator/owner, monitored | Not cap-bounded; monitored by the cycle-duration histogram and stalled alert; levers are cadence (backstop-only), parallel-query headroom, lowering the cap, and ultimately the junction fallback (design §5b/§7). |
+| Impl markers for the three invariant-level rules | Optional follow-up | They are verify-only by design (Stage-A record); if the project later wants `tracey query uncovered` clean of them, the candidate impl sites are the drain re-check (`no-live-collect`), the collect cycle/backstop wiring (`bounded-garbage-retention`), and the upsert RETURNING decision (`liveness-not-presence`). |
+
+### What the campaign does NOT claim
+
+Per the 2026-05-27 directive there was no cluster to deploy to during
+the workstream, so nothing in this record is deployment-validated: no
+production-scale mark/cycle timing beyond the tmpfs/fsync-off dev-box
+bench (whose figures are lower bounds), no observed drift window, no
+alert-quietness window, no observed one-time reclamation drain, no
+GetPath/VerifyChunks integrity observation, no mixed-fleet rollout
+exercised (the §4.5 orderings are reviewed at construction level
+only), and no application of migration 070. Those observations are
+exactly rows D0–D7 of the deployment-time validation checklist and
+remain open until the completed workstream deploys. The model
+verdicts hold at the models' stated bounds (3 hashes, 2 paths, 2
+uploaders, scaled clocks), the Kani slot is discharged by reasoned
+omission rather than proof, and the bench's EXPLAIN guard pins plan
+shape, not production cost.
+
+### Spec/docs alignment check
+
+Checked at close-out: the store spec carries no rule or prose that
+presents the counter, the token, the decrement family, the hourly
+orphan-chunk sweep, or the path-sweep chunk handling as live behavior
+(the Release-B prose pass); the two retired rules exist only as
+historical mentions; the runbook and deployment checklist match the
+plan's D0–D7 rows; the generated docs (`docs/gen/*.json`) are fresh
+after the help-string sweep. The remaining intentional references to
+the counter are historical narration (migration history and
+`migrations.rs` commentary, incident records in module docs, the
+Stage-A/B/C sections of this map) and the test seeders that exercise
+the still-existing column until 070 drops it (recorded against 070
+above). The stale production-facing prose found by this check — two
+metric help strings crediting the retired enqueue paths and the
+dropped CHECK, the LogService sweep-cadence comparison, and the
+ChunkSeed helper docs — was fixed in the close-out change set; no
+spec-rule text needed amendment, so no `tracey bump` was required.
