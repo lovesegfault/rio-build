@@ -2973,3 +2973,35 @@ OA1 emission paths exercised by tests. The VM-topology cancel/preempt
 timing bounds planned by T-1b.9 have NOT been measured in this batch
 (no canary VM scenario landed here); when they land they are VM
 numbers only, never the production budget.
+
+### Phase-1b gate evidence table (assembled by the verification batch; close-out input)
+
+Each row is one item of the v3-rescoped 1b gate (Phase-1 plan, slice-1b
+header and gate-plan row G3). "Verdict" is the state at this batch's
+assembly; rows marked PENDING are inputs the close-out (T-1b.11
+landing) must resolve before slice 1c starts. No pool is flipped by
+any row; production observations live in deployment-time checklist
+rows D0–D5.
+
+| Gate item | Artifact | Verdict at assembly |
+|---|---|---|
+| Pull-mode end-to-end VM evidence (T-1a.11) | `pull-mode` subtest in `vm-lifecycle-autoscale-k3s` (no-attempt charge-free death, pull build + report + ListOpenAttempts surface, killed-mid-build charged once + requeued + rebuilt under a fresh exec) | GREEN (wired in checks.*; landed at 1a, re-asserted by the 415d15e6f killed-mid-build update) |
+| 1b canary VM scenario (T-1b.8: establishment window, busy bridge, preempt, NotYetReady, AD2 node key, small-fleet poison, rollback-by-template-flip; retry-feed/fold-input assertions steps 1–4) | NOT DELIVERED in this batch — no `pull-canary` scenario exists in the tree | **PENDING (executor follow-up)**: scenario design, fixture knobs (SLA probe-deadline overlay, controller `RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS` extraEnv, hosting/codecov decision) and budget arithmetic are recorded in the batch hand-off note; the fold-input items already covered by `pull-mode` (one open attempt per pull, second-installment same-row, single charge for a killed exec) stand, the rest are unverified at VM level |
+| Cancel/preempt timing re-baseline (T-1b.9, VM-topology numbers) | NOT DELIVERED in this batch (depends on the T-1b.8 scenario) | **PENDING (executor follow-up)**; production budget remains deployment-time row D1 regardless |
+| Pull-mode retryPolicy regime (T-1b.7) | `retryPolicyPull` in `retryPolicy.qnt`; wired `quint-retry-policy-pull` (exhaustive, 14 invariants) + 5 `quint-retry-policy-pull-witness-*` checks; as-built regime counts bit-identical | GREEN (all invariants HOLD; all five witnesses violate; figures in the introducing commit) |
+| Model J / Model N re-runs (T-1b.10) | Wired `quint-spawn-coherence-*` and `quint-nodeclaim-*` exhaustive checks at this tree | GREEN, counts bit-identical to the recorded baselines (models unchanged at 1b) |
+| Controller-map re-audit (T-1b.10) | `controller-invariant-map.md` "Executor-campaign 1b re-audit" entry | RECORDED; controller-campaign owner counter-signature PENDING at the close-out review |
+| Unit/integration red-first batteries (T-1b.1–T-1b.6) | Per-crate batteries landed with the code batch (exclusion re-key, anti-affinity/NoEligibleSource, C4/C5 re-point, AD5 SIGTERM-abort + cancel/disruption arms, ICE re-trigger, dispatchMode rendering) | GREEN at the code-batch landing (their gates ran with T-1b.1–T-1b.6; re-confirmed by the per-crate checks at this tree) |
+| Code-review pass over the 1a+1b pull-path code (T-1b.11) | Review record (date, scope, finding dispositions) to be added to this map | **PENDING (orchestrator-run)** — placeholder row; not performed by the verification batch |
+| OA5 surface review + OA4 call | Owner review against `ListOpenAttempts` + the VM-demonstrated fleet view (no running canary) | PENDING (owner action at the close-out review; surface notes in the Phase-1b record above) |
+| AD5 numeric budget / OA1 latency comparison / establishment-slack re-baseline / production rollback drill | Deployment-time validation checklist rows D1/D2/D5 | DEFERRED BY DESIGN (v3 directive); explicitly NOT development-time gate items |
+
+Deferral notes carried with the table: the AD5 numeric budget stays
+unsigned until deployment-time row D1; the OA1 baseline only starts
+accumulating at deployment; the rollback-by-template-flip production
+drill is row D5 (the VM demonstration planned in T-1b.8 step 9 is part
+of the PENDING scenario row above); no pool template is flipped during
+development. The two PENDING-executor-follow-up rows and the two
+PENDING-owner rows are the complete list of open 1b gate items at this
+assembly; everything else in the v3 gate list is green in CI-wired
+form at this tree.
