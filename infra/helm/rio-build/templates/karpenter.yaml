@@ -1,5 +1,19 @@
 {{- if .Values.karpenter.enabled }}
 {{- $k := .Values.karpenter -}}
+{{- /* ADR-022 P0564 render guard: a karpenter-enabled release is the
+       NixOS-AMI EKS deploy, and castore-FUSE passthrough needs that
+       AMI's kernel to carry FUSE_PASSTHROUGH (>= 6.9). The chart cannot
+       probe the running kernel — karpenter.amiKernelFeatures is the
+       operator's DECLARATION of what the AMI was built with (the
+       in-tree pipeline, `xtask ami push` + nix/nixos-node/kernel.nix +
+       the node-kernel-config CI check, guarantees it; values.yaml
+       defaults to declaring it). A declaration without FUSE_PASSTHROUGH
+       fails the render instead of shipping a fleet that silently
+       degrades to userspace reads on every open(). Same family as the
+       `required` amiTag/clusterName/nodeRoleName guards below. */}}
+{{- if not (has "FUSE_PASSTHROUGH" $k.amiKernelFeatures) }}
+{{- fail "karpenter.amiKernelFeatures must include FUSE_PASSTHROUGH when karpenter.enabled=true: the node AMI must be built with nix/nixos-node/kernel.nix (kernel >= 6.9, CONFIG_FUSE_PASSTHROUGH=y) — run `cargo xtask k8s -p eks up --ami` and declare the AMI's kernel features" }}
+{{- end }}
 # Karpenter NodePools + EC2NodeClass. In the chart (not terraform) so
 # `helm rollback` takes node config with the rest, and to dodge the
 # kubernetes_manifest plan-time GVK trap (Karpenter CRDs don't exist
