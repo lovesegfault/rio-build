@@ -2431,5 +2431,124 @@ in
       step = "calibStep";
       witness = "provisioningBudget";
     };
+
+    # ------------------------------------------------------------------
+    # Executor-lifecycle campaign (#1), Phase 0 Stage B: non-vacuity
+    # witnesses for Model S (executorSession.qnt, the scheduler's
+    # session state machine) and Model D (executorDelivery.qnt, the
+    # builder's delivery choreography). Each expect-violation check
+    # passes only while the contended state stays reachable in the
+    # named regime; the exhaustive invariant cfgs for the same regimes
+    # are wired separately. The witness pre-registration is the §3.5
+    # list in docs/spec/models/executor-invariant-map.md.
+
+    # Non-vacuity witnesses for Model S (the §3.5 pre-registered list
+    # plus three establishment/rollback/race-ahead probes). Each check
+    # passes only when the contended state is still reachable in the
+    # named regime.
+    quint-executor-session-witness-phantom = mkQuintWitnessCheck {
+      name = "executor-session-witness-phantom";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "noPhantomDrain";
+    };
+    quint-executor-session-witness-drain-pending = mkQuintWitnessCheck {
+      name = "executor-session-witness-drain-pending";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "noDrainWithPendingCompletion";
+    };
+    quint-executor-session-witness-half-dead = mkQuintWitnessCheck {
+      name = "executor-session-witness-half-dead";
+      spec = "executorSession";
+      main = "executorSessionFaultStreamConn";
+      witness = "noHalfDeadStream";
+    };
+    quint-executor-session-witness-stale-epoch = mkQuintWitnessCheck {
+      name = "executor-session-witness-stale-epoch";
+      spec = "executorSession";
+      main = "executorSessionFaultStreamConn";
+      witness = "noStaleEpochDisconnect";
+    };
+    quint-executor-session-witness-rollback = mkQuintWitnessCheck {
+      name = "executor-session-witness-rollback";
+      spec = "executorSession";
+      main = "executorSessionFaultStreamMsg";
+      witness = "noRollback";
+    };
+    quint-executor-session-witness-adopt = mkQuintWitnessCheck {
+      name = "executor-session-witness-adopt";
+      spec = "executorSession";
+      main = "executorSessionFaultLeader";
+      witness = "noAdopt";
+    };
+    quint-executor-session-witness-failover-inflight = mkQuintWitnessCheck {
+      name = "executor-session-witness-failover-inflight";
+      spec = "executorSession";
+      main = "executorSessionFaultLeader";
+      witness = "noFailoverWithInflight";
+    };
+    quint-executor-session-witness-deposed-believer = mkQuintWitnessCheck {
+      name = "executor-session-witness-deposed-believer";
+      spec = "executorSession";
+      main = "executorSessionFaultLeader";
+      witness = "noDeposedBeliever";
+    };
+    quint-executor-session-witness-reap-after-stall = mkQuintWitnessCheck {
+      name = "executor-session-witness-reap-after-stall";
+      spec = "executorSession";
+      main = "executorSessionFaultProcess";
+      witness = "noReapAfterStall";
+    };
+    quint-executor-session-witness-two-channel-death = mkQuintWitnessCheck {
+      name = "executor-session-witness-two-channel-death";
+      spec = "executorSession";
+      main = "executorSessionFaultProcess";
+      witness = "noDeathByTwoChannels";
+    };
+    quint-executor-session-witness-establishment = mkQuintWitnessCheck {
+      name = "executor-session-witness-establishment";
+      spec = "executorSession";
+      main = "executorSessionFaultProcess";
+      witness = "noEstablishment";
+    };
+    quint-executor-session-witness-race-ahead = mkQuintWitnessCheck {
+      name = "executor-session-witness-race-ahead";
+      spec = "executorSession";
+      main = "executorSessionFaultProcess";
+      witness = "noRaceAheadReport";
+    };
+
+    # Non-vacuity witnesses for Model D.
+    quint-executor-delivery-witness-half-close-flush = mkQuintWitnessCheck {
+      name = "executor-delivery-witness-half-close-flush";
+      spec = "executorDelivery";
+      main = "executorDeliveryBase";
+      witness = "noHalfCloseFlush";
+    };
+    quint-executor-delivery-witness-exit-blocked = mkQuintWitnessCheck {
+      name = "executor-delivery-witness-exit-blocked";
+      spec = "executorDelivery";
+      main = "executorDeliveryBase";
+      witness = "noExitBlockedWhileOwed";
+    };
+    quint-executor-delivery-witness-swap-with-owed = mkQuintWitnessCheck {
+      name = "executor-delivery-witness-swap-with-owed";
+      spec = "executorDelivery";
+      main = "executorDeliveryFaultStream";
+      witness = "noSwapWithReportOwed";
+    };
+    quint-executor-delivery-witness-cell-dropped = mkQuintWitnessCheck {
+      name = "executor-delivery-witness-cell-dropped";
+      spec = "executorDelivery";
+      main = "executorDeliveryFaultStream";
+      witness = "noInFlightCellDropped";
+    };
+    quint-executor-delivery-witness-stale-rejected = mkQuintWitnessCheck {
+      name = "executor-delivery-witness-stale-rejected";
+      spec = "executorDelivery";
+      main = "executorDeliveryFaultStream";
+      witness = "noStaleAssignmentRejected";
+    };
   };
 }
