@@ -1733,6 +1733,545 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
 }
 
 // r[verify sched.merge.substitute-topdown+9]
+/// The reap hazard with the ORDERING REVERSED: the walk verdict arrives
+/// while another build's unbuilt children are still attached, and only
+/// then are those children reaped. B1's prune stamps childless R and
+/// parks its detached fetch; B2 full-merges app→R→dep (unbuilt children
+/// — the mark is kept); R's fetch FAILS while dep is still attached, so
+/// the walk-failure handler suppresses the fail-fast (children present)
+/// and parks R Queued with the one-shot `substitute_tried` set; B2 is
+/// then cancelled and its sole-interest nodes reaped, scrubbing dep out
+/// of `children[R]`. R is now a childless, marked, already-walked root
+/// that nothing will ever re-evaluate — `find_newly_ready` only fires on
+/// completions and R has no children left to complete — so B1 would hang
+/// Active forever. The terminal-build reap must re-evaluate the
+/// surviving parent and take the same resubmit-directing fail-fast the
+/// verdict-after-reap ordering (test above) gets.
+#[tokio::test]
+async fn test_topdown_pruned_root_fail_fast_when_children_reaped_after_failed_walk() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park B1's detached fetch: QueryPathInfo waits on the gate (never
+    // released), so R stays Substituting until the verdict is injected.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep with root's wanted output substitutable upstream →
+    // the prune fires, keeps {R} (stamped, childless), drops dep.
+    let r_out = test_store_path("tdvr-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdvr-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep = || {
+        let mut n = make_node("tdvr-dep");
+        n.expected_output_paths = vec![test_store_path("tdvr-dep-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep()],
+        vec![make_test_edge("tdvr-r", "tdvr-dep")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdvr-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // B2: a full merge that gives R an UNBUILT child (app's output not
+    // substitutable → no prune). The mark survives this merge.
+    let mut app = make_node("tdvr-app");
+    app.expected_output_paths = vec![test_store_path("tdvr-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep()],
+        vec![
+            make_test_edge("tdvr-app", "tdvr-r"),
+            make_test_edge("tdvr-r", "tdvr-dep"),
+        ],
+        false,
+    )
+    .await?;
+    assert!(
+        expect_drv(&handle, "tdvr-r").await.topdown_pruned,
+        "fixture premise: a merge that adds only UNBUILT children keeps the mark"
+    );
+
+    // R's parked walk fails WHILE dep is still attached: the handler
+    // suppresses the fail-fast (unbuilt children present), keeps the
+    // mark, and parks R Queued with the one-shot flag set.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdvr-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let mid = expect_drv(&handle, "tdvr-r").await;
+    assert_eq!(
+        mid.status,
+        DerivationStatus::Queued,
+        "fixture premise: the suppressed fail-fast parks R Queued behind its unbuilt child"
+    );
+    assert!(
+        mid.topdown_pruned,
+        "fixture premise: mark kept while children are unbuilt"
+    );
+    assert!(
+        mid.substitute_tried,
+        "fixture premise: the failed walk set the one-shot flag"
+    );
+
+    // Cancel B2 and reap its sole-interest nodes (dep, app). R is shared
+    // with B1, so it survives — childless again, mark intact, walk spent.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdvr-dep").await?.is_none(),
+        "B2's sole-interest dep must be reaped (scrubbed from children[R])"
+    );
+    assert!(
+        handle.debug_query_derivation("tdvr-app").await?.is_none(),
+        "B2's sole-interest app must be reaped"
+    );
+
+    // Designed outcome: the reap re-evaluates the surviving parent and
+    // takes the resubmit-directing fail-fast — not a silent hang.
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B1 must fail via the resubmit-directing fail-fast when the reap \
+         strands its already-walked pruned root (was: left Active forever)"
+    );
+    assert!(
+        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s1.error_summary
+    );
+    let r = expect_drv(&handle, "tdvr-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "childless topdown-pruned R with a spent walk must not be dispatched \
+         from source; got {:?}",
+        r.status
+    );
+    assert!(
+        !r.topdown_pruned,
+        "the fail-fast consumes (clears) the mark it acted on"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+9]
+/// Companion to the test above with the children PRODUCED (not reaped
+/// unbuilt) before the terminal-build reap: the surviving root must NOT
+/// be fail-fasted and the surviving build must not hang.
+///
+/// Reasoning for the expected outcome: when dep completes (here via its
+/// substitute success), the completion-time
+/// `clear_topdown_pruned_for_produced_parents` sees R's children all
+/// produced and drops the mark, and the inline newly-ready promote lifts
+/// R Queued→Ready — R's closure IS in the store, so building it from
+/// source is legitimate. At reap time R is therefore childless but
+/// UNMARKED (and already Ready), so the reap-time re-evaluation must
+/// leave it alone: no fail-fast (that arm requires the mark) and no
+/// re-promotion (already Ready). This pins the hook's gating — a hook
+/// that fail-fasted any childless `substitute_tried` survivor would
+/// wrongly fail B1 here even though R is buildable.
+#[tokio::test]
+async fn test_topdown_pruned_root_not_failed_when_produced_children_reaped_after_failed_walk()
+-> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park detached fetches on the QPI gate (never released): R's walk
+    // stays parked until the failure verdict is injected, dep's until
+    // its success verdict is injected.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep with root's wanted output substitutable upstream →
+    // the prune fires, keeps {R} (stamped, childless), drops dep.
+    let r_out = test_store_path("tdpc-r-out");
+    let dep_out = test_store_path("tdpc-dep-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdpc-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep = || {
+        let mut n = make_node("tdpc-dep");
+        n.expected_output_paths = vec![dep_out.clone()];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep()],
+        vec![make_test_edge("tdpc-r", "tdpc-dep")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdpc-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // B2: full merge app→R→dep. dep's output is substitutable upstream,
+    // so dep is routed to substitution (parked on the same gate); app is
+    // not substitutable → no prune for B2, R keeps the mark.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(dep_out.clone());
+    let mut app = make_node("tdpc-app");
+    app.expected_output_paths = vec![test_store_path("tdpc-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep()],
+        vec![
+            make_test_edge("tdpc-app", "tdpc-r"),
+            make_test_edge("tdpc-r", "tdpc-dep"),
+        ],
+        false,
+    )
+    .await?;
+    assert!(
+        expect_drv(&handle, "tdpc-r").await.topdown_pruned,
+        "fixture premise: a merge that adds only UNBUILT children keeps the mark"
+    );
+    wait_for_status(&handle, "tdpc-dep", DerivationStatus::Substituting).await;
+
+    // R's parked walk fails while dep is still attached and unbuilt: the
+    // fail-fast is suppressed, the mark kept, R parked Queued with the
+    // one-shot flag set (same shape as the unbuilt-children test above).
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdpc-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let mid = expect_drv(&handle, "tdpc-r").await;
+    assert_eq!(
+        mid.status,
+        DerivationStatus::Queued,
+        "fixture premise: the suppressed fail-fast parks R Queued behind its unbuilt child"
+    );
+    assert!(mid.topdown_pruned && mid.substitute_tried);
+
+    // dep is then PRODUCED (its parked fetch succeeds): the completion
+    // clears R's mark (children all produced) and promotes R to Ready.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdpc-dep".into(),
+            ok: true,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "tdpc-dep").await.status,
+        DerivationStatus::Completed,
+        "fixture premise: dep produced via its substitute success"
+    );
+    let produced = expect_drv(&handle, "tdpc-r").await;
+    assert!(
+        !produced.topdown_pruned,
+        "fixture premise: dep completing makes R's children all produced, so \
+         the completion-time clear drops the mark"
+    );
+    assert_eq!(
+        produced.status,
+        DerivationStatus::Ready,
+        "fixture premise: R is promoted Queued→Ready when its last dep completes"
+    );
+
+    // Cancel B2 and reap its sole-interest nodes (dep — produced — and
+    // app). R survives the reap childless, unmarked, already Ready.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdpc-dep").await?.is_none(),
+        "B2's sole-interest dep must be reaped (it was produced, then orphaned)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdpc-app").await?.is_none(),
+        "B2's sole-interest app must be reaped"
+    );
+
+    // Designed outcome: no fail-fast and no hang — R's closure is
+    // produced, so it stays dispatchable from source and B1 stays live.
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B1 must NOT be failed by the reap re-evaluation: R's mark was \
+         legitimately cleared when its children became produced"
+    );
+    let r = expect_drv(&handle, "tdpc-r").await;
+    assert!(
+        matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "R must remain dispatchable from source (closure produced), not \
+         fail-fasted or stranded; got {:?}",
+        r.status
+    );
+    assert!(
+        !r.topdown_pruned,
+        "the completion-time clear stays cleared through the reap"
+    );
+    Ok(())
+}
+
+// r[verify sched.lease.standby-drops-writes]
+/// A `CleanupTerminalBuild` drained by an ex-leader must NOT run the
+/// survivor re-evaluation: the fail-fast arm writes terminal build state
+/// and clears the persisted `topdown_pruned` mark, and the promote arm
+/// persists Ready — leader-class writes that would race the new leader's
+/// recovery (which restores R from PG and owns its verdict). The rest of
+/// the cleanup (in-memory map removal, DAG reap) keeps running on
+/// standby as before. Staging mirrors the verdict-then-reap test above;
+/// the lease is lost between the cancel and the cleanup.
+#[tokio::test]
+async fn test_topdown_pruned_survivor_not_fail_fasted_when_cleanup_drains_on_ex_leader()
+-> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let leader = crate::lease::LeaderState::default(); // starts as leader
+    let leader_for_actor = leader.clone();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_, p| {
+            p.leader = leader_for_actor;
+        });
+
+    // Park B1's detached fetch on the QPI gate so R stays Substituting
+    // until the failure verdict is injected.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless).
+    let r_out = test_store_path("tdsl-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdsl-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep = || {
+        let mut n = make_node("tdsl-dep");
+        n.expected_output_paths = vec![test_store_path("tdsl-dep-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep()],
+        vec![make_test_edge("tdsl-r", "tdsl-dep")],
+        false,
+    )
+    .await?;
+    assert!(
+        expect_drv(&handle, "tdsl-r").await.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+
+    // B2: full merge app→R→dep gives R an unbuilt child.
+    let mut app = make_node("tdsl-app");
+    app.expected_output_paths = vec![test_store_path("tdsl-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep()],
+        vec![
+            make_test_edge("tdsl-app", "tdsl-r"),
+            make_test_edge("tdsl-r", "tdsl-dep"),
+        ],
+        false,
+    )
+    .await?;
+
+    // R's walk fails while dep is attached → fail-fast suppressed, mark
+    // kept, R parked Queued with the one-shot flag set.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdsl-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let mid = expect_drv(&handle, "tdsl-r").await;
+    assert_eq!(
+        mid.status,
+        DerivationStatus::Queued,
+        "fixture premise: suppressed fail-fast parks R Queued"
+    );
+    assert!(mid.topdown_pruned && mid.substitute_tried);
+
+    // Cancel B2 while still leader (the CancelBuild arm is itself
+    // leader-gated), then lose the lease BEFORE the cleanup drains.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    let (pre_b1_pg,): (String,) =
+        sqlx::query_as("SELECT status::text FROM builds WHERE build_id = $1")
+            .bind(b1)
+            .fetch_one(&db.pool)
+            .await?;
+    leader.on_lose();
+
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+
+    // The ungated reap still ran (proves the command was drained, not
+    // silently dropped)…
+    assert!(
+        handle.debug_query_derivation("tdsl-dep").await?.is_none(),
+        "in-memory reap still runs on standby (pre-existing behavior)"
+    );
+    // …but the survivor re-evaluation must not: R untouched, B1 not
+    // failed, nothing written to PG.
+    let r = expect_drv(&handle, "tdsl-r").await;
+    assert_eq!(
+        r.status,
+        DerivationStatus::Queued,
+        "ex-leader must neither fail-fast (Cancelled) nor promote (Ready) the survivor"
+    );
+    assert!(
+        r.topdown_pruned,
+        "ex-leader must not consume the topdown_pruned mark"
+    );
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Active as i32,
+        "ex-leader must not terminally fail B1 from a stale DAG"
+    );
+    let (pg_pruned, pg_status): (bool, String) =
+        sqlx::query_as("SELECT topdown_pruned, status FROM derivations WHERE drv_hash = 'tdsl-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(pg_pruned, "ex-leader must not clear the persisted mark");
+    assert_eq!(
+        pg_status,
+        DerivationStatus::Queued.as_str(),
+        "ex-leader must not persist a status change for the survivor"
+    );
+    let (post_b1_pg,): (String,) =
+        sqlx::query_as("SELECT status::text FROM builds WHERE build_id = $1")
+            .bind(b1)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        post_b1_pg, pre_b1_pg,
+        "ex-leader must not write build state for B1"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+9]
 /// The lazy clear in `handle_substitute_complete`: when a pruned root's
 /// children are ALL produced by the time its own walk fails, the mark is
 /// moot — cleared in memory AND in PG (best-effort, so a failover cannot

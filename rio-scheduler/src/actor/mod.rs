@@ -1215,7 +1215,7 @@ impl DagActor {
                     let _ = reply.send(result);
                 }
                 ActorCommand::CleanupTerminalBuild { build_id } => {
-                    self.handle_cleanup_terminal_build(build_id);
+                    self.handle_cleanup_terminal_build(build_id).await;
                 }
                 ActorCommand::Admin(q) => {
                     self.handle_admin(q);

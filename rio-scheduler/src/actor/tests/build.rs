@@ -374,7 +374,7 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
 
     // build_id isn't in self.builds → is_terminal=true (already
     // removed). The cleanup path short-circuits to "fine".
-    actor.handle_cleanup_terminal_build(build_id);
+    actor.handle_cleanup_terminal_build(build_id).await;
 
     // DELETE is fire-and-forget spawn. Poll until it lands.
     let remaining: i64 = tokio::time::timeout(Duration::from_secs(5), async {
@@ -469,7 +469,7 @@ async fn cleanup_skips_log_buffer_with_deferred_final_pending() -> TestResult {
     // Only A's final flush was deferred (the flusher marked it).
     assert!(bufs.mark_final_pending(path_a, exec_a));
 
-    actor.handle_cleanup_terminal_build(build_id);
+    actor.handle_cleanup_terminal_build(build_id).await;
 
     // Both DAG nodes reaped regardless.
     assert!(actor.dag.node("r14clna").is_none(), "A's node reaped");
@@ -580,7 +580,7 @@ async fn epilogue_marks_enqueued_final_pending_and_cleanup_preserves_it() -> Tes
     );
 
     // Cleanup fires while A's request is still sitting in the queue.
-    actor.handle_cleanup_terminal_build(build_id);
+    actor.handle_cleanup_terminal_build(build_id).await;
 
     // A is preserved for the flusher: entry, lines, stamp, seal all intact.
     assert_eq!(

@@ -84,6 +84,21 @@ pub struct MergeResult {
     pub contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)>,
 }
 
+/// Result of [`DerivationDag::remove_build_interest_and_reap`].
+#[derive(Debug, Default)]
+pub struct ReapOutcome {
+    /// `drv_path`s of the reaped nodes, captured before removal (the
+    /// caller discards their log buffers; `path_for_hash` would no
+    /// longer resolve them afterwards).
+    pub reaped_paths: Vec<String>,
+    /// Deduped surviving parents of the reaped nodes: nodes still in the
+    /// DAG that just lost at least one child to this reap. The caller
+    /// re-evaluates these (fail-fast a stranded topdown-pruned root,
+    /// promote a now-ready Queued parent) — nothing else would, because
+    /// `find_newly_ready` only fires on completions, never on removals.
+    pub surviving_parents: Vec<DrvHash>,
+}
+
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug, Default)]
 pub struct DerivationDag {
@@ -1118,14 +1133,20 @@ impl DerivationDag {
 
     /// Remove a build's interest from all its derivations, and reap (delete)
     /// any nodes that are now orphaned (no builds interested) AND in a terminal
-    /// state. Returns the `drv_path`s of reaped nodes (captured BEFORE
-    /// removal so the caller can discard their log buffers — `path_for_hash`
-    /// would not resolve afterwards).
+    /// state. Returns a [`ReapOutcome`]: the reaped nodes' `drv_path`s
+    /// (captured BEFORE removal so the caller can discard their log buffers —
+    /// `path_for_hash` would not resolve afterwards) plus the deduped
+    /// surviving parents that just lost children to the reap, so the caller
+    /// can re-evaluate them. The survivor collection lives here — NOT in
+    /// [`Self::remove_node`] — because `remove_node` is shared with the
+    /// poison-TTL sweep and admin ClearPoison, where the removal exists to
+    /// reset the node for a fresh re-merge and must not trigger parent
+    /// re-evaluation.
     ///
     /// This prevents unbounded DAG growth for long-running schedulers.
     /// Non-terminal orphaned nodes are preserved (they may be mid-build for
     /// a different code path, though this shouldn't happen in practice).
-    pub fn remove_build_interest_and_reap(&mut self, build_id: Uuid) -> Vec<String> {
+    pub fn remove_build_interest_and_reap(&mut self, build_id: Uuid) -> ReapOutcome {
         let mut to_reap = Vec::new();
 
         for (hash, state) in &mut self.nodes {
@@ -1148,12 +1169,25 @@ impl DerivationDag {
             }
         }
 
+        let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
         for (hash, path) in to_reap {
+            // Capture the parents BEFORE `remove_node` scrubs the edge maps —
+            // afterwards neither the reaped hash nor its former parents are
+            // recoverable from the DAG.
+            if let Some(ps) = self.parents.get(&hash) {
+                surviving_parents.extend(ps.iter().cloned());
+            }
             self.remove_node(&hash);
             reaped_paths.push(path);
         }
-        reaped_paths
+        // Drop entries that were themselves reaped (or otherwise no longer
+        // exist) so only true survivors are reported.
+        surviving_parents.retain(|p| self.nodes.contains_key(p));
+        ReapOutcome {
+            reaped_paths,
+            surviving_parents: surviving_parents.into_iter().collect(),
+        }
     }
 
     /// Remove a single node and scrub all edge references to it.

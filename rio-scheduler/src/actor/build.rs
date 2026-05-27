@@ -705,9 +705,10 @@ impl DagActor {
         });
     }
 
-    /// Handle terminal build cleanup: remove build from in-memory maps and
-    /// reap orphaned+terminal DAG nodes.
-    pub(super) fn handle_cleanup_terminal_build(&mut self, build_id: Uuid) {
+    /// Handle terminal build cleanup: remove build from in-memory maps,
+    /// reap orphaned+terminal DAG nodes, and re-evaluate the surviving
+    /// parents that just lost children to the reap.
+    pub(super) async fn handle_cleanup_terminal_build(&mut self, build_id: Uuid) {
         // Only clean up if build is actually terminal (guard against misdirected
         // cleanup, e.g., if build_id was reused, though UUIDs make this unlikely).
         let is_terminal = self
@@ -764,9 +765,9 @@ impl DagActor {
         // sealed-empty empty-snapshot reap (bookkeeping; reads already
         // fall through to that stored `.partial` once the ring is empty).
         // r[impl obs.log.deferred-final-retry+3]
-        let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
+        let reap = self.dag.remove_build_interest_and_reap(build_id);
         if let Some(bufs) = &self.log_buffers {
-            for path in &reaped_paths {
+            for path in &reap.reaped_paths {
                 if bufs.final_pending(path) {
                     debug!(
                         drv_path = %path,
@@ -778,8 +779,81 @@ impl DagActor {
                 bufs.discard(path);
             }
         }
-        if !reaped_paths.is_empty() {
-            debug!(build_id = %build_id, reaped = reaped_paths.len(), "reaped orphaned terminal DAG nodes");
+        if !reap.reaped_paths.is_empty() {
+            debug!(build_id = %build_id, reaped = reap.reaped_paths.len(), "reaped orphaned terminal DAG nodes");
+        }
+
+        // r[impl sched.merge.substitute-topdown+9]
+        // Re-evaluate the surviving parents that just lost children to this
+        // reap. The hook lives HERE (the terminal-build reap) and not in
+        // `dag::remove_node` because the poison-TTL sweep and admin
+        // ClearPoison also remove nodes — there the removal exists to reset
+        // the node for a fresh re-merge and must not trigger parent
+        // verdicts. Two stranded shapes are closed:
+        //
+        //  - A topdown-pruned root whose own walk already failed
+        //    (`substitute_tried`) while another build's unbuilt children
+        //    were attached: the walk-failure handler suppressed the
+        //    fail-fast (children present) and parked it Queued; with those
+        //    children now reaped, nothing else will ever re-evaluate it
+        //    (`find_newly_ready` only fires on completions), so the
+        //    surviving build would hang Active forever. Take the
+        //    resubmit-directing fail-fast now. The arm requires
+        //    `substitute_tried`: a node whose walk is still in flight keeps
+        //    its chance — its own SubstituteComplete verdict re-evaluates
+        //    it (the reap-before-verdict ordering relies on exactly that),
+        //    and a never-walked node is re-probed by the next dispatch
+        //    pass, which has its own carve-out and fail-fast arms.
+        //  - A Queued parent whose last unbuilt children were reaped: it is
+        //    now vacuously all-deps-completed, but no completion will ever
+        //    promote it. Promote it to Ready here so the next dispatch pass
+        //    picks it up.
+        //
+        // Skipped: vanished nodes, terminal nodes (already settled), and
+        // nodes with no interested builds (no build left to hang — and
+        // `fail_fast_topdown_pruned_root`'s actionable guard would skip
+        // them anyway).
+        //
+        // r[impl sched.lease.standby-drops-writes]
+        // Leader-gated like the `drain_phantoms` slice of the Heartbeat
+        // arm: the rest of this handler stays ungated (in-memory build/
+        // event-map removal, the DAG reap, and log-buffer bookkeeping run
+        // on standby as before; the event-log GC below is its own
+        // fire-and-forget), but this loop performs leader-class writes —
+        // `persist_status`, the fail-fast's PG mark clear, and terminal
+        // build failure — and `CleanupTerminalBuild` can be drained by an
+        // ex-leader (the delayed cleanup timer posts it via `self_tx`
+        // after lease loss). The new leader's recovery owns these
+        // survivors.
+        if self.leader.is_leader() {
+            for parent in reap.surviving_parents {
+                let Some(node) = self.dag.node(&parent) else {
+                    continue;
+                };
+                if node.status().is_terminal() || node.interested_builds.is_empty() {
+                    continue;
+                }
+                let status = node.status();
+                let topdown_pruned = node.topdown_pruned;
+                let substitute_tried = node.substitute_tried;
+                if topdown_pruned && substitute_tried && self.dag.get_children(&parent).is_empty() {
+                    self.fail_fast_topdown_pruned_root(
+                        &parent,
+                        "deps reaped after a failed substitute fetch while the closure \
+                         was never produced",
+                    )
+                    .await;
+                } else if status == DerivationStatus::Queued
+                    && self.dag.all_deps_completed(&parent)
+                    && let Some(s) = self.dag.node_mut(&parent)
+                    && s.transition(DerivationStatus::Ready).is_ok()
+                {
+                    self.push_ready(parent.clone());
+                    self.persist_status(&parent, DerivationStatus::Ready, None)
+                        .await;
+                    self.dispatch_dirty = true;
+                }
+            }
         }
 
         // GC the persisted event log. Fire-and-forget: this is

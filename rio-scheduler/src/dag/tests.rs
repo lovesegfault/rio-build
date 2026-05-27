@@ -1179,7 +1179,7 @@ fn test_path_to_hash_consistency() -> anyhow::Result<()> {
         .transition(DerivationStatus::Completed)?;
     let reaped = dag.remove_build_interest_and_reap(b1);
     assert_eq!(
-        reaped,
+        reaped.reaped_paths,
         vec![p_a.clone()],
         "hashA should be reaped (terminal, no interest); returns drv_path for log-buffer discard"
     );
@@ -1473,7 +1473,11 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
         2000,
         dag.remove_build_interest_and_reap(build_id)
     );
-    assert_eq!(reaped.len(), N, "all sole-interest terminal nodes reaped");
+    assert_eq!(
+        reaped.reaped_paths.len(),
+        N,
+        "all sole-interest terminal nodes reaped"
+    );
     Ok(())
 }
 
@@ -2302,7 +2306,7 @@ fn test_reap_after_prior_remove_interest() -> anyhow::Result<()> {
 
     let reaped = dag.remove_build_interest_and_reap(b);
     assert_eq!(
-        reaped.len(),
+        reaped.reaped_paths.len(),
         1,
         "reap must be idempotent w.r.t. prior interest-strip"
     );
@@ -2330,7 +2334,7 @@ fn test_reap_preserves_poisoned() -> anyhow::Result<()> {
 
     let reaped = dag.remove_build_interest_and_reap(Uuid::new_v4());
     assert!(
-        reaped.is_empty(),
+        reaped.reaped_paths.is_empty(),
         "Poisoned nodes are TTL-tracked, never reaped here"
     );
     assert!(dag.nodes.contains_key("poison-h"));
