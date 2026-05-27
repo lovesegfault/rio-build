@@ -175,6 +175,28 @@ impl SchedulerDb {
         Ok(true)
     }
 
+    /// Backfill the execution row's controller-authoritative node
+    /// attribution when the pull mint lost the race against the
+    /// binding ack (AD2c): NULL-only — an attribution already present
+    /// is never overwritten — and idempotent. Callers pass only
+    /// controller-reported nodes (`ReportAttemptOutcome.node_name` /
+    /// the spawn-ack binding), never worker-supplied identity.
+    pub(crate) async fn fill_open_execution_source_node(
+        &self,
+        exec_id: Uuid,
+        source_node: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE drv_executions SET source_node = $2 \
+             WHERE exec_id = $1 AND source_node IS NULL",
+        )
+        .bind(exec_id)
+        .bind(source_node)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     /// Resolve one attempt by its `exec_id` (the `ReportOutcome`
     /// idempotency key): the assignment row that carries this exec, its
     /// derivation, whether the assignment is still active, and whether

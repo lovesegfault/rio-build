@@ -1137,6 +1137,192 @@ async fn pull_attempt_failure_stamps_source_node_and_excludes_node() -> TestResu
     Ok(())
 }
 
+/// Backdate one attempt's assignment row past any establishment window.
+async fn backdate(pool: &sqlx::PgPool, exec_id: uuid::Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `ReportAttemptOutcome` with an explicit controller-reported node.
+async fn report_attempt_outcome_with_node(
+    handle: &ActorHandle,
+    intent_id: &str,
+    reason: rio_proto::types::AttemptTerminalReason,
+    node: &str,
+) -> Result<(), PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: Some(intent_id.into()),
+                job_name: None,
+                exec_id: None,
+            },
+            reason,
+            node_name: Some(node.into()),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+// r[verify sched.retry.per-executor-budget+3]
+/// Mint-before-binding: when the pull lost the race against the
+/// controller's binding ack, the controller's pod-terminal report
+/// delivers the node and the later establishment charge still carries
+/// the AD2 node key (exclusion + anti-affinity keyed by the node, not
+/// by the intent identity).
+#[tokio::test]
+async fn establishment_charge_carries_node_from_pod_terminal_report() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "psn-b", PriorityClass::Scheduled).await?;
+
+    // The pull happens with NO binding known (the ack lost the race).
+    let assignment = expect_deliver(pull(&handle, "psn-b", Some("psn-b")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    let minted_node: Option<String> =
+        sqlx::query_scalar("SELECT source_node FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(minted_node, None, "the mint-time race was lost");
+
+    // The pod dies; the controller's classification report (a
+    // non-synthesized reason — the establishment sweep stays the
+    // classifier) carries the kube-authoritative node.
+    report_attempt_outcome_with_node(
+        &handle,
+        "psn-b",
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+        "node-8",
+    )
+    .await
+    .expect("pod-terminal report acked");
+
+    backdate(&db.pool, exec_id).await?;
+    tick(&handle).await?;
+
+    assert_eq!(
+        ledger_source_nodes(&db.pool, "psn-b").await,
+        vec![Some("node-8".to_string())],
+        "the establishment charge carries the controller-reported node"
+    );
+    let info = expect_drv(&handle, "psn-b").await;
+    assert!(
+        info.retry.failed_builders.contains("node-8"),
+        "the exclusion entry is keyed by the node, got {:?}",
+        info.retry.failed_builders
+    );
+    assert!(
+        !info.retry.failed_builders.contains("psn-b"),
+        "the intent-identity fallback key must not be used when the node is known"
+    );
+    let intents = spawn_intents(&handle).await;
+    let intent = intents
+        .iter()
+        .find(|i| i.intent_id == "psn-b")
+        .expect("requeued drv re-advertised as a spawn intent");
+    assert_eq!(
+        intent.excluded_nodes,
+        vec!["node-8".to_string()],
+        "the respawned intent advertises the node-keyed exclusion"
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.per-executor-budget+3]
+/// A binding ack that arrives only after the mint still attributes the
+/// establishment charge: the sweep falls back to the in-memory
+/// controller-authoritative binding at establishment time.
+#[tokio::test]
+async fn establishment_charge_falls_back_to_late_binding_ack() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "psn-c", PriorityClass::Scheduled).await?;
+
+    let assignment = expect_deliver(pull(&handle, "psn-c", Some("psn-c")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    // The binding ack lands AFTER the mint (no pod-terminal report is
+    // ever delivered — the establishment sweep is the only observer).
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "psn-c".into(),
+                node_name: "node-10".into(),
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    backdate(&db.pool, exec_id).await?;
+    tick(&handle).await?;
+
+    assert_eq!(
+        ledger_source_nodes(&db.pool, "psn-c").await,
+        vec![Some("node-10".to_string())],
+        "the establishment charge picks up the late binding ack"
+    );
+    let info = expect_drv(&handle, "psn-c").await;
+    assert!(
+        info.retry.failed_builders.contains("node-10"),
+        "the exclusion entry is keyed by the node, got {:?}",
+        info.retry.failed_builders
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.per-executor-budget+3]
+/// The crash→establish→respawn loop is bounded: three unreported
+/// crashes attributed to three distinct nodes reach Poison(Threshold)
+/// instead of collapsing onto one intent-keyed exclusion entry forever.
+#[tokio::test]
+async fn unreported_crash_loop_reaches_poison_threshold_with_node_keys() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "psn-d", PriorityClass::Scheduled).await?;
+
+    for (i, node) in ["node-a1", "node-a2", "node-a3"].iter().enumerate() {
+        let assignment = expect_deliver(pull(&handle, "psn-d", Some("psn-d")).await);
+        let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+        report_attempt_outcome_with_node(
+            &handle,
+            "psn-d",
+            rio_proto::types::AttemptTerminalReason::OomKilled,
+            node,
+        )
+        .await
+        .expect("pod-terminal report acked");
+        backdate(&db.pool, exec_id).await?;
+        tick(&handle).await?;
+        let info = expect_drv(&handle, "psn-d").await;
+        assert_eq!(
+            info.retry.failure_count,
+            u32::try_from(i + 1).unwrap(),
+            "each establishment charges exactly once"
+        );
+    }
+
+    let info = expect_drv(&handle, "psn-d").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Poisoned,
+        "three node-keyed unreported crashes reach the poison threshold (bounded loop)"
+    );
+    assert_eq!(
+        info.retry.failed_builders.len(),
+        3,
+        "three distinct node keys"
+    );
+    Ok(())
+}
+
 // r[verify sched.dispatch.fleet-exhaust+4]
 /// The spawn-gate exhaustion arm: a `NoEligibleSource` report for a
 /// still-Ready derivation poisons it through the fleet-exhaust arm

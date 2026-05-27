@@ -1002,6 +1002,19 @@ impl DagActor {
             return Ok(());
         }
 
+        // AD2c: persist the controller-reported node onto the open
+        // execution row when the mint lost the binding-ack race
+        // (NULL-only fill, best-effort), so a later establishment
+        // charge carries the node key even when this report itself
+        // classifies nothing. Never a worker-supplied value — the
+        // node here comes from the controller's informer view.
+        if let Some(node) = node_name.as_deref().filter(|s| !s.is_empty())
+            && let Err(e) = self.db.fill_open_execution_source_node(exec_id, node).await
+        {
+            debug!(%exec_id, error = %e,
+                   "open-execution source_node fill failed (best-effort)");
+        }
+
         let label = attempt_terminal_reason_label(reason);
         if attempt.attempt_recorded {
             // Second installment on the worker-reported row: fill the

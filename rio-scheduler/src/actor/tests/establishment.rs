@@ -54,6 +54,10 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
 /// charged to failed_builders + failure_count, and the drv requeues.
+/// No node attribution ever arrives here (no binding ack, no
+/// controller report), so the exclusion key is the documented
+/// intent-identity fallback; the node-keyed cases live in the AD2
+/// battery (`establishment_charge_carries_node_*`).
 #[tokio::test]
 async fn establishment_charges_and_requeues_after_window() -> TestResult {
     let (db, handle, _task) = setup().await;
