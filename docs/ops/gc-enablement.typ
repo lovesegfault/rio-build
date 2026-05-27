@@ -183,13 +183,17 @@ unexplained --- stop before the Release-B stage and investigate.
 
 *Staged order (D0).* Deploy the additive/Release-A tree first
 (migration 068, the upsert touch, the live collector); only after rows
-D1--D5 pass deploy the Release-B tree (069 + writer deletion); only
-after rows D6--D7 pass apply migration 070 (the column drop). The
-Release-B image must not contain 070. On a fresh fleet/database with
-no pre-existing pods the additive→A→B stages may be collapsed at the
-operator's discretion, but 070-after-B-rollout-complete always
-applies, and rows D1--D6 are still executed (they validate the
-collector against real data, not against a fleet shape).
+D1--D5 pass deploy the Release-B tree (069 + writer deletion). The
+current tree carries migration 070 (the `chunks.refcount` column drop)
+in-tree per the 2026-05-27 owner clarification (no staged rollout, no
+existing clusters or databases --- deployments are fresh), so a fresh
+deployment simply runs 068--070 with the rest of the migration chain
+at first startup. Staging pre-cutover images against a shared database
+remains possible only by withholding 070 until no pod that names the
+column still serves (row D7). On a fresh fleet/database with no
+pre-existing pods the additive→A→B stages may be collapsed at the
+operator's discretion, and rows D1--D6 are still executed (they
+validate the collector against real data, not against a fleet shape).
 
 + *D1 --- production-class mark/cycle timing.* Watch
   #(refs.metric)("rio_store_gc_collect_cycle_seconds") over the first
@@ -245,13 +249,16 @@ collector against real data, not against a fleet shape).
   steady, no `GetPath` regressions. Lever: redeploy Release-A binaries
   (recorded safe: nothing names the dropped CHECK/index; the column
   still exists until 070); investigate before re-attempting.
-+ *D7 --- migration 070 precondition.* Confirm the Release-B rollout
-  is complete on every environment sharing the database (no Release-A
-  store pod remains) before applying 070 (the `chunks.refcount` column
-  drop). Pass: rollout completion confirmed, then 070 applied. Lever:
-  wait; never bundle 070 into the Release-B image; if an A pod must
-  persist, leave 070 unapplied (harmless --- nothing reads the
-  column).
++ *D7 --- migration 070 (the `chunks.refcount` column drop).* 070
+  ships in-tree (2026-05-27 owner clarification) and runs with the
+  rest of the migration chain at pod startup --- on a fresh
+  fleet/database this row is the ordinary "migrations run on deploy"
+  statement and needs no separate action. It is a precondition only
+  for a staged rollout from pre-cutover images: confirm no Release-A
+  store pod (whose upsert/rollback/reapers name the column) still
+  serves against the shared database before the first 070-bearing pod
+  starts. Lever: stage the pre-cutover images from a tree without 070
+  and let 070 run only once the Release-B rollout is complete.
 
 *Release B go/no-go template.* Proceed to the Release-B stage only
 when: D1 within budget (or an explicit recorded relaxation); D2 zero

@@ -1640,8 +1640,10 @@ runbook copy.
 ### Development-side landing checklist (T-1b.5, v5 scope)
 
 - Migration 069 is append-only, PINNED, and drops exactly the CHECK and
-  the partial index; the column drop remains reserved for 070 with its
-  deployment-time application constraint (checklist row D7).
+  the partial index; the column drop was reserved for 070 at this
+  landing with its deployment-time application constraint (checklist
+  row D7). 070 has since landed in-tree — see the migration 070
+  landing record in the close-out.
 - After the writer deletion, production rio-store issues no SQL that
   names `chunks.refcount`; the only remaining writers anywhere are the
   historical rows the column already holds. Increments, decrements, the
@@ -1656,9 +1658,13 @@ runbook copy.
   surviving calibration checks are wired exactly as before this
   landing (no model file changed in Release B); the two retired G1/G2
   checks are the only check-set change.
-- Rollout, the post-rollout watch, and migration 070's application
-  remain deployment-time obligations (checklist rows D6/D7); no
-  development-time gate reads them.
+- Rollout and the post-rollout watch remain deployment-time
+  obligations (checklist row D6); no development-time gate reads them.
+  Migration 070's application was a deployment-time obligation
+  (checklist row D7) at this landing; 070 has since landed in-tree per
+  the 2026-05-27 owner clarification and row D7 reduces to the
+  ordinary "migrations run on deploy" statement (see the migration 070
+  landing record in the close-out).
 
 ## Phase-2 assurance layer
 
@@ -2119,9 +2125,11 @@ time; no production code reads or writes a chunk reference counter.
   oracles after the v3/v4 re-entries. `kani-rio-store` continues to
   carry the five log-kernel harnesses, unaffected.
 - **Schema and instrumentation.** Migrations 068 (additive
-  `last_referenced_at`) and 069 (drop the M_023 CHECK and
-  `idx_chunks_gc`) are landed and PINNED; 070 is reserved and
-  deferred (below). Nine collector/upgrade-tx metric series, the
+  `last_referenced_at`), 069 (drop the M_023 CHECK and
+  `idx_chunks_gc`), and 070 (drop the column itself; landed after this
+  close-out per the 2026-05-27 owner clarification — see the migration
+  070 landing record below) are landed and PINNED. Nine
+  collector/upgrade-tx metric series, the
   three wired alerts (`RioStoreGcCollectParseFailure`,
   `RioStoreGcCollectStalled`, `RioStoreChunkUpgradeTxSlow`), and the
   operator runbook copy of the deployment checklist
@@ -2193,8 +2201,9 @@ Excluding comment and blank lines the same set moves 2,132 → 2,312
 code grew by roughly +2,400 lines (the `mark_scan_bench` harness with
 its EXPLAIN/structural guards, the collector test set, and the
 enlarged upsert/rollback test modules). Schema: one column added
-(068), one CHECK and one partial index dropped (069), the `refcount`
-column itself still present pending 070.
+(068), one CHECK and one partial index dropped (069), and the
+`refcount` column itself dropped (070, landed after this close-out —
+see the migration 070 landing record below).
 
 The deletions the design predicted did land — the decrement/zero/
 enqueue family, the token and its rollback, the chunk-aware reap
@@ -2235,7 +2244,7 @@ disposition.
 
 | Item | Owner | Condition / where recorded |
 |---|---|---|
-| Migration 070 (`DROP COLUMN chunks.refcount`) — authoring and application | Operator/owner at deployment time | Apply only after the Release-B rollout is complete everywhere that shares the database (checklist row D7; M_069 and M_071 commentary record the reservation and ordering). The 070 change set must also drop the column from the test seeders that still name it (`test_helpers.rs::ChunkSeed`, the admin VerifyChunks test seeds) and sweep the comments that describe the still-existing column. |
+| Migration 070 (`DROP COLUMN chunks.refcount`) — authoring and the seeder/comment sweep | **Landed** (2026-05-27 close-out update) | No longer deferred: the owner clarified (2026-05-27) that there is no staged rollout and no existing cluster or live database — eventual deployments are fresh — so the drop is ordinary development work. The landing carries migration 070 (PINNED), the seeder sweep this row scoped to it (`test_helpers.rs::ChunkSeed`, the admin VerifyChunks test seeds, the bench fixture), and the still-existing-column comment sweep; checklist row D7 reduces to the ordinary "migrations run on deploy" statement. See the migration 070 landing record below. |
 | Deployment-time validation checklist D0–D7 | Operator/owner at deployment time | The plan's checklist and its operator copy in `docs/ops/gc-enablement.typ`; D1 (production-class cycle timing, formerly gate (a)), D2 (drift window), D3 (alert quietness), D4 (backlog drain), D5 (integrity spot-checks) precede the Release-B stage; D6/D7 follow it. The Wave-A1 instrumentation is the deliverable that makes these executable. |
 | Retiring the as-built `chunkLiveness.qnt` (model-of-record flip) and re-pointing the three surviving `quint-refcount-calib-*` checks at `chunkCollect.qnt` | Whoever picks up the deferred Phase-2 items | Do together, after the deployment-time checklist has validated the live collector (retiring the as-built encoding before then would discard the only model of the still-deployable previous release); the retry campaign's retirement section is the template (preserve non-vacuity anchors when removing checks). |
 | MBT-lite trace-derived integration tests (design §5 Phase-2 option) | Same | Optional; revisit only if the collector's PG-side behavior grows beyond what the postgres-backed structural tests pin. |
@@ -2254,7 +2263,8 @@ bench (whose figures are lower bounds), no observed drift window, no
 alert-quietness window, no observed one-time reclamation drain, no
 GetPath/VerifyChunks integrity observation, no mixed-fleet rollout
 exercised (the §4.5 orderings are reviewed at construction level
-only), and no application of migration 070. Those observations are
+only), and no application of migration 070 (landed in-tree at the
+close-out, never applied anywhere). Those observations are
 exactly rows D0–D7 of the deployment-time validation checklist and
 remain open until the completed workstream deploys. The model
 verdicts hold at the models' stated bounds (3 hashes, 2 paths, 2
@@ -2273,10 +2283,61 @@ plan's D0–D7 rows; the generated docs (`docs/gen/*.json`) are fresh
 after the help-string sweep. The remaining intentional references to
 the counter are historical narration (migration history and
 `migrations.rs` commentary, incident records in module docs, the
-Stage-A/B/C sections of this map) and the test seeders that exercise
-the still-existing column until 070 drops it (recorded against 070
-above). The stale production-facing prose found by this check — two
+Stage-A/B/C sections of this map) and the test seeders that exercised
+the still-existing column — the latter were swept when 070 landed
+(see the migration 070 landing record below). The stale
+production-facing prose found by this check — two
 metric help strings crediting the retired enqueue paths and the
 dropped CHECK, the LogService sweep-cadence comparison, and the
 ChunkSeed helper docs — was fixed in the close-out change set; no
 spec-rule text needed amendment, so no `tracey bump` was required.
+
+### Migration 070 landing record (close-out update, 2026-05-27)
+
+Trigger: the campaign owner's 2026-05-27 clarification — there is no
+staged rollout and there are no existing clusters or live databases;
+every eventual deployment is fresh — which makes the column drop
+ordinary development work rather than the operator-gated,
+post-rollout follow-up that the plan's T-1c.1 and checklist row D7
+described. Recorded here as the close-out's one schema addendum; the
+Release B record above is otherwise unchanged.
+
+What landed (one change set on top of the close-out):
+
+- Migration 070 (`ALTER TABLE chunks DROP COLUMN IF EXISTS refcount`,
+  metadata-only), PINNED via the failing-test flow (the red
+  `unpinned migration` panic and its hex-SHA are quoted in the landing
+  commit message). M_070 commentary carries the §4.5 (ii) ordering
+  rationale (why the drop is a separate migration from 069 at all) and
+  the in-tree landing rationale; M_069/M_071 commentary and the PINNED
+  comment no longer describe 070 as reserved.
+- The seeder/comment sweep the deferred-items row above scoped to the
+  070 change set: `ChunkSeed` (field, builder, INSERT), the admin
+  VerifyChunks test seeds, the mark-scan bench fixture INSERTs, the
+  collect-test incidental seeds, the substitute-error doc string (and
+  regenerated `docs/gen/errors.json`), the i201 probe header, and the
+  store-spec prose that still said "until the follow-up migration
+  drops it". Historical incident narration (the I-040 notes, migration
+  history, `migrations.rs` commentary, the Stage-A/B/C sections of
+  this map, and the calibration modules) intentionally keeps its
+  references.
+- Recorded test disposition (the P13 treatment, no quiet deletion):
+  the live-cycle reclamation test formerly named
+  `live_cycle_collects_stale_refcount_leak` is renamed
+  `live_cycle_collects_unreferenced_chunk_exactly_once`; the stale
+  counter value it used to seed is inexpressible without the column,
+  every assertion and both of its `r[verify]` markers are unchanged,
+  and the two citations of the old name in this map are re-pointed at
+  the new name. No test was deleted and no assertion weakened.
+- Checklist row D7 (the plan's deployment-time validation checklist
+  and the runbook copy in `docs/ops/gc-enablement.typ`) reduces to the
+  ordinary "migrations run on deploy" statement, retaining its
+  pre-cutover-image caveat only for a hypothetical staged rollout of
+  pre-Release-B images against a shared database; the runbook's
+  staged-order preamble now describes 070 as in-tree. Rows D0–D6 are
+  unchanged and remain the deployment-time observations this campaign
+  does not claim.
+
+Unchanged claims: nothing is deployment-validated by this update — no
+database has ever applied 070 (or any other migration of this
+campaign); the "What the campaign does NOT claim" section stands.
