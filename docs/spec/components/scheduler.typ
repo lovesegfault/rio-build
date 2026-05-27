@@ -2504,9 +2504,10 @@ machinery as their only establishment vehicle during coexistence.
   `leader_for_secs` with the same fail-closed freshness semantics as
   #rref("sched.admin.list-executors-leader-age"). The RPC is leader-served.
 ]
-The same view feeds the `rio_scheduler_open_attempts` gauge (the pull-mode
-successor of `workers_active`; the stream fleet remains visible via
-`workers_active`) and the establishment sweep.
+The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
+(the pull-mode successor of the stream fleet's
+#(refs.metric)("rio_scheduler_workers_active"), which stays) and the
+establishment sweep.
 
 = Backpressure
 
