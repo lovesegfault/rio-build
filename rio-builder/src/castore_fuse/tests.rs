@@ -1012,6 +1012,48 @@ async fn scope_required_read_represents_and_retries() {
     );
 }
 
+/// Concurrent scope-miss victims share one presentation (the
+/// singleflight property): several opens racing on a replica that
+/// demands the scope produce exactly one `PresentClosure` for that
+/// generation — whichever read fails first presents, every other read
+/// either observes the bumped generation and just retries, or is served
+/// outright because the presentation already landed. All of them
+/// succeed.
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_scope_misses_share_one_presentation() {
+    let h = harness_scoped(scoped_test_closure()).await;
+    h.mock.accept_present();
+    h.mock.require_scope();
+
+    // Distinct digests so each open is its own fill (same-digest opens
+    // would already coalesce on the FillState, which is not the
+    // property under test). Run them the way concurrent fuser threads
+    // would: in parallel on the blocking pool.
+    let mut tasks = Vec::new();
+    for i in 0..4u8 {
+        let content = vec![i; 96];
+        let digest = seeded_blob(&h.mock, &content);
+        let size = content.len() as u64;
+        let op = Arc::clone(&h.open_path);
+        tasks.push(tokio::task::spawn_blocking(move || {
+            op.ensure_backing(&digest, size)
+        }));
+    }
+    for task in tasks {
+        task.await
+            .expect("ensure_backing panicked")
+            .expect("every concurrent open succeeds after the shared re-present");
+    }
+
+    assert_eq!(
+        h.mock.present_closure_calls(),
+        1,
+        "concurrent scope misses must serialize on exactly one PresentClosure"
+    );
+    assert!(!h.open_path.circuit.is_open());
+}
+
 /// The re-present loop is bounded: a store that keeps demanding a
 /// presentation costs at most [`SCOPE_PRESENT_ATTEMPTS`] presents per
 /// operation, then the read fails — and none of it counts against the

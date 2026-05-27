@@ -141,7 +141,12 @@ struct PresenterState {
     /// so only one of several concurrent scope-miss victims re-presents.
     generation: u64,
     /// The store answered `UNIMPLEMENTED`: it predates PresentClosure.
-    /// Never present again on this channel (logged once).
+    /// Never present again on this channel (logged once). Remembered for
+    /// the lifetime of this build's presenter, so a store fleet upgraded
+    /// to an enforcing version mid-build leaves that one in-flight build
+    /// relying on the store's pins+references derivation fallback (its
+    /// reads only EIO if that fallback also misses); the next mount
+    /// constructs a fresh presenter and probes again.
     unsupported: bool,
 }
 
@@ -317,7 +322,13 @@ impl ScopePresenter {
     /// through untouched, so the existing transient-retry, circuit
     /// breaker, and EIO classification see exactly what they saw before
     /// — callers exclude only this scope-required class from their
-    /// breaker record.
+    /// breaker record. That exclusion is deliberately asymmetric: only
+    /// the `CASTORE_SCOPE_REQUIRED` status itself is breaker-exempt; a
+    /// failed re-presentation (`INVALID_ARGUMENT` closure mismatch,
+    /// `UNAVAILABLE` on the PresentClosure unary, …) surfaces as the
+    /// read's error and IS recorded, because a presentation that cannot
+    /// reach or satisfy the store is a real health/correctness signal,
+    /// not a coordination blip.
     ///
     /// The retries run inside whatever budget the caller already wraps
     /// around `op` (`jit_fetch_timeout`, the streaming fill deadline,
