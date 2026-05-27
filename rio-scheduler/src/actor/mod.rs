@@ -132,7 +132,7 @@ pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 256;
 ///
 /// Grounded in what the system enforces elsewhere: executor pods are
 /// one-shot Jobs whose `activeDeadlineSeconds` derives from the
-/// SpawnIntent deadline capped at [`floor::DEADLINE_CAP_SECS`] (24 h),
+/// SpawnIntent deadline capped at `floor::DEADLINE_CAP_SECS` (24 h),
 /// so 48 h = 2× the longest a legitimate k8s holder can exist.
 /// Standalone (non-k8s) workers have no pod deadline; the same 2× slack
 /// covers a ~24 h build plus its post-build upload window. The
