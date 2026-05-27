@@ -88,6 +88,19 @@ pub use rio_migrations::MIGRATOR;
 const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
     &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
 
+/// Histogram bucket boundaries for `rio_store_gc_collect_cycle_seconds`.
+///
+/// A collect cycle (fail-closed mark + prepare + report/collect) is
+/// budgeted at five minutes of GC-lock-held time at the design-point
+/// scale (refcount-formal design §5b); small stores finish in seconds.
+/// Boundaries at 240/300 straddle the budget so threshold queries are
+/// exact, with headroom to 900 s before +Inf so an over-budget cycle's
+/// magnitude is still visible.
+#[cfg(feature = "server")]
+const GC_COLLECT_CYCLE_BUCKETS: &[f64] = &[
+    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 420.0, 600.0, 900.0,
+];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -105,6 +118,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         // 429-retry sleeps).
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
+    ),
+    (
+        "rio_store_gc_collect_cycle_seconds",
+        GC_COLLECT_CYCLE_BUCKETS,
     ),
 ];
 
@@ -217,6 +234,68 @@ pub fn describe_metrics() {
         "rio_store_gc_sweep_paths_remaining",
         "Paths not yet processed by the in-progress GC sweep. Ticks down per \
          batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow."
+    );
+
+    // Lazy chunk collector (gc::collect) — shadow mode in this release:
+    // every cycle reports, nothing is modified until the cutover release.
+    describe_gauge!(
+        "rio_store_gc_chunks_live",
+        "Distinct chunk hashes referenced by at least one existing manifest \
+         (any status) at the last collect cycle's mark snapshot (mark-set size)."
+    );
+    describe_gauge!(
+        "rio_store_gc_chunks_would_collect",
+        "Chunks the collect cycle would soft-delete: not deleted, absent from \
+         the mark set, and older than grace measured from \
+         GREATEST(created_at, last_referenced_at). Shadow mode reports this \
+         without deleting anything."
+    );
+    describe_gauge!(
+        "rio_store_gc_refcount_drift_leaked",
+        "Refcount drift, leak direction: chunks with refcount > 0 that no \
+         existing manifest references (not deleted). Expected to match the \
+         historical leak classes before the cutover and stopped-decrement \
+         artifacts after it; growth beyond those is unexplained drift."
+    );
+    describe_gauge!(
+        "rio_store_gc_refcount_drift_undercount",
+        "Refcount drift, under-count direction: chunks referenced by an \
+         existing manifest while refcount = 0 (not deleted). Never expected \
+         while the increment still fires; any occurrence during the Release A \
+         window is an abort signal for the cutover."
+    );
+    describe_gauge!(
+        "rio_store_gc_collect_backlog_chunks",
+        "Estimate of eligible-but-not-yet-collected chunks (drain visibility \
+         for the capped collect). Shadow mode: equals would-collect. Live \
+         mode: decremented by each cycle's collected count and re-anchored \
+         when a pass completes."
+    );
+    describe_histogram!(
+        "rio_store_gc_collect_cycle_seconds",
+        "Chunk-collect cycle duration (snapshot + fail-closed mark + prepare \
+         + report/collect) — the GC-lock-held window of run_gc phase 3 and \
+         the daily backstop. Completed cycles only; aborted cycles count \
+         toward rio_store_gc_collect_parse_failures_total instead."
+    );
+    describe_counter!(
+        "rio_store_gc_collect_cycles_total",
+        "Chunk-collect cycles by outcome (ok | parse_failure). A cycle that \
+         stops at the per-cycle victim cap counts as ok; staleness of ok \
+         cycles drives the RioStoreGcCollectStalled alert."
+    );
+    describe_counter!(
+        "rio_store_gc_collect_parse_failures_total",
+        "Chunk-collect cycles aborted by the fail-closed mark validation (an \
+         existing manifest's chunk_list failed validation). While this is \
+         increasing and unremediated, ALL chunk collection is suspended; \
+         path GC is unaffected."
+    );
+    describe_counter!(
+        "rio_store_gc_collect_cycles_capped_total",
+        "Chunk-collect cycles that stopped at COLLECT_CYCLE_VICTIM_CAP with \
+         backlog remaining (the keyset cursor carries the remainder to the \
+         next cycle). Sustained increments mean a backlog is draining."
     );
     describe_counter!(
         "rio_store_sign_tenant_key_fallback_total",
@@ -451,4 +530,21 @@ pub fn describe_metrics() {
     // Same pre-register reasoning: between sweeps (or on a store that
     // never GCs) the gauge would be absent. 0.0 = no sweep in progress.
     metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
+    // Chunk-collect gauges: zero until the first cycle (or forever on
+    // a store that never GCs and whose backstop hasn't ticked) — same
+    // pre-register reasoning as the drain gauges above.
+    metrics::gauge!("rio_store_gc_chunks_live").set(0.0);
+    metrics::gauge!("rio_store_gc_chunks_would_collect").set(0.0);
+    metrics::gauge!("rio_store_gc_refcount_drift_leaked").set(0.0);
+    metrics::gauge!("rio_store_gc_refcount_drift_undercount").set(0.0);
+    metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(0.0);
+    // Chunk-collect counters: pre-register at 0 so the staleness alert
+    // (increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h])
+    // == 0) and the parse-failure alert have a series to evaluate from
+    // boot instead of returning empty until the first cycle/failure.
+    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").absolute(0);
+    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "parse_failure")
+        .absolute(0);
+    metrics::counter!("rio_store_gc_collect_parse_failures_total").absolute(0);
+    metrics::counter!("rio_store_gc_collect_cycles_capped_total").absolute(0);
 }

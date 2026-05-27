@@ -494,4 +494,49 @@ spec:
               row(s) referencing missing chunk objects. Check the store
               logs for the s3_key/exec_id (logged at error!) and audit
               the S3 lifecycle rule and any manual deletions under logs/.
+
+        # refcount-formal Wave A1: the chunk collector's mark phase is
+        # fail-closed -- ANY existing manifest whose chunk_list fails
+        # validation aborts the collect cycle before anything is
+        # computed or deleted (treating corrupt input as "references
+        # nothing" would collect live data). While this persists, all
+        # chunk collection is suspended; path GC is unaffected. The
+        # offending store_path_hash values are logged at error level by
+        # the store. Live (and harmless) from the additive release: the
+        # shadow collector runs the same fail-closed mark.
+        - alert: RioStoreGcCollectParseFailure
+          expr: increase(rio_store_gc_collect_parse_failures_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: rio-store chunk-collect cycle aborted on an unparseable chunk_list
+            description: >-
+              {{`{{ $value | humanize }}`}} chunk-collect cycle abort(s) in the
+              last 1h. ALL chunk collection is suspended (path GC is
+              unaffected) until the offending manifest is repaired, deleted,
+              or quarantined; the offending store_path_hash is in the store
+              error logs ("chunk-collect: unparseable chunk_list"). See
+              docs/ops/gc-enablement.typ (chunk collector, parse-failure
+              abort) for the remediation ladder.
+
+        # No successful collect cycle in >25h (daily backstop + slack).
+        # A capped cycle counts as success -- the cap is the designed
+        # backlog-drain behavior, not a failure. The ok-outcome counter
+        # is pre-registered at 0 at startup so this expression has a
+        # series to evaluate from boot (no absent()).
+        - alert: RioStoreGcCollectStalled
+          expr: increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h]) == 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-store chunk-collect cycles are not completing
+            description: >-
+              No successful chunk-collect cycle in the last 25h (the daily
+              backstop should produce at least one). Either GC and the
+              backstop are not running, every cycle is aborting (check
+              RioStoreGcCollectParseFailure and the store error logs), or
+              cycles are failing against PostgreSQL. See
+              docs/ops/gc-enablement.typ (chunk collector, stalled cycles).
 {{- end }}

@@ -12,7 +12,15 @@
 //!    `pending_s3_deletes`. `SELECT FOR UPDATE` on chunk_list guards
 //!    the TOCTOU with concurrent PutPath refcount increment.
 //!
-//! 3. **Drain** ([`drain::spawn_drain_task`]): background task that
+//! 3. **Collect** ([`collect::collect_cycle`]): the lazy chunk
+//!    collector — phase 3 of [`run_gc`] plus a daily backstop timer.
+//!    Shadow mode in this release: derives the live-chunk set from
+//!    every existing manifest's `chunk_list` (fail-closed on any
+//!    unparseable blob) and reports would-collect / drift gauges
+//!    without modifying anything; the collecting arm is a later
+//!    release.
+//!
+//! 4. **Drain** ([`drain::spawn_drain_task`]): background task that
 //!    reads `pending_s3_deletes`, calls `ChunkBackend::delete_by_key`,
 //!    deletes row on success / increments attempts on failure. Max
 //!    attempts = 10 (alert-worthy after that).
@@ -37,6 +45,7 @@
 //! is correct. Better than the reverse (S3 deleted, tx rolled back,
 //! dangling chunk ref → GetPath fails).
 
+pub mod collect;
 pub mod drain;
 mod mark;
 #[cfg(test)]
@@ -292,6 +301,34 @@ pub async fn run_gc(
             return Err(Status::internal(format!("sweep phase: {e}")));
         }
     };
+
+    // --- Phase 3: chunk-collect cycle (shadow mode — mark + report only) ---
+    // Runs while GC_LOCK_ID is still held: the cycle uses its own
+    // pooled connection for the session temp table; the advisory lock
+    // stays on lock_conn (same split the sweep's temp table uses).
+    // Shadow mode writes nothing, so a failure here never affects the
+    // path GC that just committed — log and continue; the daily
+    // backstop (and the next GC run) retries. A parse-failure abort is
+    // reported inside the cycle (counter + error log), not as an Err.
+    match collect::collect_cycle(pool, sweep::CHUNK_GRACE_SECS, collect::CollectMode::Shadow).await
+    {
+        Ok(report) => {
+            info!(
+                outcome = ?report.outcome,
+                mark_set_size = report.mark_set_size,
+                would_collect = report.would_collect,
+                drift_leaked = report.drift_leaked,
+                drift_undercount = report.drift_undercount,
+                victims_collected = report.victims_collected,
+                batches_run = report.batches_run,
+                cap_reached = report.cap_reached,
+                cursor_at_stop = ?report.cursor_at_stop.as_deref().map(hex::encode),
+                cycle_seconds = report.cycle_seconds,
+                "GC: collect phase 3 (shadow) complete"
+            );
+        }
+        Err(e) => warn!(error = %e, "GC: collect phase 3 (shadow) failed"),
+    }
 
     // Final progress: complete with stats. paths_scanned echoes the
     // mid-progress `found_unreachable` so it never goes backward;

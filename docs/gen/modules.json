@@ -1232,6 +1232,11 @@
       "doc": "Two-phase garbage collection: mark reachable, sweep unreachable."
     },
     {
+      "path": "gc/collect.rs",
+      "depth": 1,
+      "doc": "Lazy chunk collector: liveness derived from the durable manifests."
+    },
+    {
       "path": "gc/drain.rs",
       "depth": 1,
       "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_key`."

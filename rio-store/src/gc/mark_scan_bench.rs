@@ -91,6 +91,15 @@ use sqlx::PgPool;
 
 use crate::manifest::{Manifest, ManifestEntry};
 
+// The server-side mark statements are the SHIPPED collector statements
+// (gc::collect), re-imported under the bench's historical names so the
+// EXPLAIN plan-shape guard (re-entry gate (b)), the small-scale
+// equivalence checks, and the chunks-fixture seeding all exercise the
+// production SQL rather than a copy that could drift from it.
+use super::collect::{
+    MARK_EXPANSION_SQL as SERVER_MARK_SQL, mark_validation_sql as server_validate_sql,
+};
+
 /// Deterministic splitmix64 — no external RNG dependency, uniform output.
 struct SplitMix(u64);
 
@@ -664,48 +673,6 @@ async fn run_mark_scan_copy_groupby(
         spill_delta_bytes,
         plan_summary: summarize_plan(&plan),
     }
-}
-
-/// The server-side formulation's mark statement: expand every
-/// `chunk_list` inside the server and deduplicate with one set-based
-/// aggregate. The `OFFSET 0` lateral materializes, once per manifest row,
-/// a detoasted copy of the entry block (version byte dropped) plus the
-/// entry count, so the per-entry `substring` slices an in-memory value
-/// instead of re-fetching TOAST data per entry, and the `generate_series`
-/// lateral is parameterized by the small integer count (any Memoize node
-/// the planner adds then caches series by entry count instead of hashing
-/// whole blobs). Entry `i` (1-based) starts at body offset `36·i − 35`.
-const SERVER_MARK_SQL: &str = "CREATE TEMP TABLE live_chunks AS \
-     SELECT DISTINCT substring(d.body FROM 36 * g.i - 35 FOR 32) AS blake3_hash \
-       FROM manifest_data md \
-       JOIN manifests m USING (store_path_hash) \
-       CROSS JOIN LATERAL \
-         (SELECT substring(md.chunk_list FROM 2) AS body, \
-                 (octet_length(md.chunk_list) - 1) / 36 AS n \
-          OFFSET 0) AS d \
-       CROSS JOIN LATERAL \
-         generate_series(1, d.n) AS g(i)";
-
-/// The fail-closed validation pass over every joined `chunk_list`,
-/// shared by the server-side mark formulation and the collect-phase
-/// bench. Manifest format invariants enforced server-side: a corrupt
-/// chunk_list must abort the cycle, never read as "references
-/// nothing". 36 = the serialized entry size (32-byte BLAKE3 + u32 LE
-/// size), \x01 = the format version byte; both fixed by
-/// rio_store::manifest. The version probe uses substring (empty on an
-/// empty blob) rather than get_byte so a zero-length blob is reported
-/// as malformed instead of erroring mid-scan.
-fn server_validate_sql() -> String {
-    format!(
-        "SELECT COUNT(*) \
-           FROM manifest_data md \
-           JOIN manifests m USING (store_path_hash) \
-          WHERE octet_length(md.chunk_list) < 1 \
-             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
-             OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
-             OR (octet_length(md.chunk_list) - 1) / 36 > {}",
-        crate::manifest::MAX_CHUNKS
-    )
 }
 
 /// Candidate "server-side expansion": no client round-trip — a

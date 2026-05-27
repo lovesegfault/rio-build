@@ -286,7 +286,8 @@ async fn main() -> anyhow::Result<()> {
     // None for inline-only stores — sweep does CASCADE delete only.
     //
     // Also spawn GC background tasks (orphan scanner + orphan-chunk
-    // sweep + drain). All periodic (15min / 1h / 30s).
+    // sweep + chunk-collect backstop + drain). All periodic
+    // (15min / 1h / daily / 30s).
     // spawn_monitored: if one panics, logged; store keeps serving
     // (degraded GC, not down).
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
@@ -305,6 +306,13 @@ async fn main() -> anyhow::Result<()> {
         chunk_backend_for_gc.clone(),
         shutdown.clone(),
     );
+    // Daily chunk-collect backstop (shadow mode in this release):
+    // covers stores that never trigger GC, so the collect cycle's
+    // shadow report — and, once the live arm ships, bounded garbage
+    // retention — has a worst-case cadence. Takes GC_LOCK_ID
+    // non-blocking and skips when a GC run (which already runs the
+    // cycle as phase 3) is in flight.
+    rio_store::gc::collect::spawn_collect_backstop(pool.clone(), shutdown.clone());
     if let Some(backend) = chunk_backend_for_gc {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }

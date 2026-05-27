@@ -167,9 +167,18 @@
     "rio_store_chunk_dedup_ratio",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
+    "rio_store_gc_chunks_live",
+    "rio_store_gc_chunks_would_collect",
+    "rio_store_gc_collect_backlog_chunks",
+    "rio_store_gc_collect_cycle_seconds",
+    "rio_store_gc_collect_cycles_capped_total",
+    "rio_store_gc_collect_cycles_total",
+    "rio_store_gc_collect_parse_failures_total",
     "rio_store_gc_orphan_reap_failed_total",
     "rio_store_gc_path_resurrected_total",
     "rio_store_gc_path_swept_total",
+    "rio_store_gc_refcount_drift_leaked",
+    "rio_store_gc_refcount_drift_undercount",
     "rio_store_gc_s3_key_enqueued_total",
     "rio_store_gc_sweep_paths_remaining",
     "rio_store_get_path_active",
@@ -1063,6 +1072,41 @@
         "help": "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
       },
       {
+        "name": "rio_store_gc_chunks_live",
+        "kind": "gauge",
+        "help": "Distinct chunk hashes referenced by at least one existing manifest (any status) at the last collect cycle's mark snapshot (mark-set size)."
+      },
+      {
+        "name": "rio_store_gc_chunks_would_collect",
+        "kind": "gauge",
+        "help": "Chunks the collect cycle would soft-delete: not deleted, absent from the mark set, and older than grace measured from GREATEST(created_at, last_referenced_at). Shadow mode reports this without deleting anything."
+      },
+      {
+        "name": "rio_store_gc_collect_backlog_chunks",
+        "kind": "gauge",
+        "help": "Estimate of eligible-but-not-yet-collected chunks (drain visibility for the capped collect). Shadow mode: equals would-collect. Live mode: decremented by each cycle's collected count and re-anchored when a pass completes."
+      },
+      {
+        "name": "rio_store_gc_collect_cycle_seconds",
+        "kind": "histogram",
+        "help": "Chunk-collect cycle duration (snapshot + fail-closed mark + prepare + report/collect) — the GC-lock-held window of run_gc phase 3 and the daily backstop. Completed cycles only; aborted cycles count toward rio_store_gc_collect_parse_failures_total instead."
+      },
+      {
+        "name": "rio_store_gc_collect_cycles_capped_total",
+        "kind": "counter",
+        "help": "Chunk-collect cycles that stopped at COLLECT_CYCLE_VICTIM_CAP with backlog remaining (the keyset cursor carries the remainder to the next cycle). Sustained increments mean a backlog is draining."
+      },
+      {
+        "name": "rio_store_gc_collect_cycles_total",
+        "kind": "counter",
+        "help": "Chunk-collect cycles by outcome (ok | parse_failure). A cycle that stops at the per-cycle victim cap counts as ok; staleness of ok cycles drives the RioStoreGcCollectStalled alert."
+      },
+      {
+        "name": "rio_store_gc_collect_parse_failures_total",
+        "kind": "counter",
+        "help": "Chunk-collect cycles aborted by the fail-closed mark validation (an existing manifest's chunk_list failed validation). While this is increasing and unremediated, ALL chunk collection is suspended; path GC is unaffected."
+      },
+      {
         "name": "rio_store_gc_orphan_reap_failed_total",
         "kind": "counter",
         "help": "Per-row reap_one failures during the orphan scanner's loop (e.g. chunks_refcount_nonneg CHECK violation from a pre-existing accounting bug). The scan continues; sustained nonzero = a poison row needs manual intervention."
@@ -1076,6 +1120,16 @@
         "name": "rio_store_gc_path_swept_total",
         "kind": "counter",
         "help": "Paths deleted by GC sweep (narinfo + CASCADE). Monotonic over store lifetime."
+      },
+      {
+        "name": "rio_store_gc_refcount_drift_leaked",
+        "kind": "gauge",
+        "help": "Refcount drift, leak direction: chunks with refcount > 0 that no existing manifest references (not deleted). Expected to match the historical leak classes before the cutover and stopped-decrement artifacts after it; growth beyond those is unexplained drift."
+      },
+      {
+        "name": "rio_store_gc_refcount_drift_undercount",
+        "kind": "gauge",
+        "help": "Refcount drift, under-count direction: chunks referenced by an existing manifest while refcount = 0 (not deleted). Never expected while the increment still fires; any occurrence during the Release A window is an abort signal for the cutover."
       },
       {
         "name": "rio_store_gc_s3_key_enqueued_total",
