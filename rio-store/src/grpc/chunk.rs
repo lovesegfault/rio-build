@@ -1,8 +1,8 @@
 //! ChunkService gRPC implementation.
 //!
 //! Chunking is server-side only: PutPath drives `cas::put_chunked`
-//! (FastCDC + dedup via the `refcount==1` RETURNING clause), and
-//! GetPath streams whole NARs back. The only chunk-level RPC is
+//! (FastCDC + dedup via the upsert's `RETURNING (uploaded_at IS NULL)`
+//! verdict), and GetPath streams whole NARs back. The only chunk-level RPC is
 //! `GetChunk`; it has no production caller today and is exercised
 //! only by tests, as the chunk-level retrieval surface for future
 //! out-of-process reassembly.

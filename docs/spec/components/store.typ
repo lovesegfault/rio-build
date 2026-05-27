@@ -117,22 +117,17 @@ narinfo.
 - *S3 key schema:* `chunks/{first-2-hex-chars}/{full-blake3-hex}`
   (prefix-partitioned to avoid S3 hotspots)
 - Chunks are stored uncompressed in S3 to maximize dedup across packages
-- Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount
-  UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload
-  and need to go to S3; chunks with refcount > 1 already existed. This has a
-  small TOCTOU window (two concurrent uploaders of the same chunk may both skip
-  upload), but the race is harmless --- `GetPath` #gls("blake3")-verifies every chunk
-  and surfaces `NotFound` as a clear error, not silent corruption. A separate
-  `FindMissingChunks` gRPC batch-query exists for external callers (e.g.,
-  executor-side pre-upload checks).
-  _Stale description (predates the `uploaded_at` migration): the shipped
-  dedup decision is keyed on confirmed backend presence via the upsert's
-  `RETURNING (uploaded_at IS NULL)` --- #rref("store.cas.upsert-inserted"),
-  #rref("store.chunk.liveness-not-presence") --- never on the refcount, and
-  the `FindMissingChunks` RPC has been removed (`grpc/chunk.rs` now serves
-  only the test-only `GetChunk`). Retained unrewritten until the
-  refcount-prose retirement pass; flagged here so it is not read as current
-  behavior._
+- Dedup during `PutPath` is decided inside the chunk-row upsert itself: the
+  step-3 UPSERT returns `needs_upload = (uploaded_at IS NULL)` per row
+  (#rref("store.cas.upsert-inserted")), so a chunk is skipped only when a
+  prior upload was confirmed in the backend
+  (#rref("store.chunk.liveness-not-presence"),
+  #rref("store.cas.chunk-upload-committed")). Two concurrent uploaders of an
+  unconfirmed chunk both upload --- S3 PutObject of identical bytes is
+  idempotent, so the duplicate PUT is wasted bandwidth, never corruption ---
+  and `GetPath` #gls("blake3")-verifies every chunk on read regardless. There
+  is no separate dedup query and no batch "which chunks are missing" RPC
+  (`grpc/chunk.rs` serves only the test-only `GetChunk`).
 - *S3 backend requirements:* Strong read-after-write consistency is required.
   AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph
   RADOS GW) must be validated for consistency.
@@ -154,28 +149,41 @@ narinfo.
 
 = Chunk Lifecycle
 
-Chunk refcounts track how many manifests reference each chunk. The `chunks`
-table schema:
+The `chunks` table holds one row per content-addressed chunk; which manifests
+reference a chunk is derived from `manifest_data.chunk_list` at collect time
+(#rref("store.chunk.liveness-derived")), never maintained as a per-row
+aggregate. The table schema:
 
 #table(
   columns: 3,
   align: (left, left, left),
   table.header([Column], [Type], [Description]),
   [`blake3_hash`], [`BYTEA PRIMARY KEY`], [BLAKE3 digest of chunk content],
-  [`refcount`],
-  [`INTEGER NOT NULL DEFAULT 0`],
-  [Number of manifests referencing this chunk],
-
   [`size`], [`BIGINT NOT NULL`], [Chunk size in bytes],
   [`created_at`], [`TIMESTAMPTZ`], [Insertion timestamp],
+  [`uploaded_at`],
+  [`TIMESTAMPTZ`],
+  [Confirmed-backend-presence timestamp (NULL until a PUT for this hash has
+    been observed to succeed --- #rref("store.cas.chunk-upload-committed"))],
+
+  [`last_referenced_at`],
+  [`TIMESTAMPTZ`],
+  [Re-reference touch set by the upsert's conflict arm; with `created_at` it
+    feeds the collect cycle's grace term (#rref("store.chunk.grace-ttl"))],
+
   [`deleted`],
   [`BOOLEAN NOT NULL DEFAULT FALSE`],
-  [Soft-delete flag (set by GC sweep)],
+  [Soft-delete flag (set by the collect cycle, cleared by the resurrect arm)],
 )
+
+(The historical `chunks.refcount` column, its `CHECK`, and the `idx_chunks_gc`
+partial index belong to the retired counter machinery: the CHECK and index are
+dropped by migration 069 and the column itself by the post-rollout follow-up
+migration; nothing reads or writes them.)
 
 #r("store.chunk.refcount-txn+2")[
   *Chunk-row write-ahead:* In the same PostgreSQL transaction that writes
-  `manifest_data` (step 2 of PutPath), the chunk rows for every hash the
+  `manifest_data` (the write-ahead manifest step of PutPath), the chunk rows for every hash the
   manifest references MUST be upserted --- a single `INSERT ... ON CONFLICT
   (blake3_hash) DO UPDATE` over the full chunk list via `UNNEST`, whose
   conflict arm clears `deleted` (the resurrect) and sets
@@ -492,38 +500,34 @@ treats the live set as a presence signal: presence remains keyed on
   `NarHash`. On mismatch, delete the placeholder row and reject.
 + *Write-ahead manifest (PG):* Chunk the buffered NAR with @fastcdc, then in a
   single PostgreSQL transaction: write `manifest_data` (serialized chunk list)
-  and UPSERT chunk refcounts. This protects chunks from GC sweep immediately
-  --- even if the upload crashes after this point, orphan cleanup will find the
-  stale `'uploading'` row and decrement refcounts correctly.
-+ *Dedup check:* Query `chunks.refcount` for all chunks in the manifest. Chunks
-  with `refcount == 1` were newly inserted by step 3 and need S3 upload; chunks
-  with `refcount > 1` already existed before this upload.
-+ *Upload new chunks:* Parallel S3 PUTs (8-wide) for the `refcount == 1`
-  subset. No post-upload HeadObject verification --- integrity is guaranteed by
-  BLAKE3 verification on every read (see #rref("store.integrity.verify-on-get")).
+  and upsert the chunk rows (#rref("store.chunk.refcount-txn")). The durable
+  reference protects the chunks from collection immediately --- the collect
+  cycle's mark fold counts `'uploading'` manifests --- and the upsert's
+  RETURNING clause is the dedup verdict for the next step.
++ *Upload new chunks:* Parallel S3 PUTs (8-wide) for exactly the hashes the
+  step-3 upsert returned as `needs_upload = (uploaded_at IS NULL)`
+  (#rref("store.cas.upsert-inserted")) --- chunks with confirmed backend
+  presence are skipped; everything else is (re-)uploaded. No post-upload
+  HeadObject verification --- integrity is guaranteed by BLAKE3 verification
+  on every read (see #rref("store.integrity.verify-on-get")). Successful PUTs
+  are then recorded via `mark_chunks_uploaded`
+  (#rref("store.cas.chunk-upload-committed")).
 + *Complete:* Flip manifest status to `'complete'` in a single PG transaction
   (also fills real narinfo fields, references, content index entries).
 
-_Steps 4--5 above are a stale description (pre-`uploaded_at`): the shipped
-flow has no separate dedup query --- the step-3 UPSERT itself returns
-`needs_upload = (uploaded_at IS NULL)` per #rref("store.cas.upsert-inserted"),
-and the upload set is that returned subset, never a `refcount == 1` filter
-(#rref("store.chunk.liveness-not-presence")). Retained unrewritten until the
-refcount-prose retirement pass._
-
-*On graceful error (steps 4--6 return `Err`):* `put_chunked` rolls back
-refcounts and deletes the `'uploading'` placeholder before returning. Chunks
-already uploaded to S3 are *not* deleted (GC sweep's responsibility ---
-deleting now would race with a concurrent uploader that just incremented the
-same chunk).
+*On graceful error (steps 4--6 return `Err`):* `put_chunked` deletes its own
+`'uploading'` placeholder rows (a claim-gated reap) before returning. Chunks
+already uploaded to S3 are *not* deleted --- chunk reclamation is the collect
+cycle + drain's responsibility, and deleting now would race with a concurrent
+uploader that just re-referenced the same chunk.
 
 *On crash (process dies between steps 3 and 6):* the orphan scanner reclaims
 stale `'uploading'` records after a compile-time threshold (`STALE_THRESHOLD`,
 15 minutes --- was 2 hours; tightened because substitution made stale
 placeholders a hot-path blocker, see #rref("store.substitute.stale-reclaim")).
-The chunk list in `manifest_data` is used to decrement refcounts; only chunks
-whose refcount drops to 0 become eligible for S3 deletion via
-`pending_s3_deletes`. No full S3 enumeration needed.
+Reaping deletes the abandoned path rows only; chunks the dead manifest leaves
+unreferenced age past grace and are collected by a later collect cycle
+(#rref("store.gc.chunk-collect")). No full S3 enumeration needed.
 
 #r("store.gc.orphan-heartbeat")[
   Uploaders MUST heartbeat `manifests.updated_at` during long-running chunk
@@ -554,8 +558,8 @@ whose refcount drops to 0 become eligible for S3 deletion via
 #r("store.atomic.multi-output")[
   Multi-output derivation registration MUST be atomic at the DB level: all
   output rows commit in one transaction, or none do. Blob-store writes are NOT
-  rolled back (orphaned blobs are refcount-zero and GC-eligible on the next
-  sweep). The bound is ≤1 NAR-size per failure.
+  rolled back (orphaned blobs are unreferenced and eligible for the next
+  collect cycle). The bound is ≤1 NAR-size per failure.
 ]
 
 #r("store.put.nar-bytes-budget+3")[
@@ -618,8 +622,9 @@ whose refcount drops to 0 become eligible for S3 deletion via
   `abort_upload`, after the orphan scanner reaped our row, or after a fresh
   re-upload took the slot is a harmless no-op
   (#rref("store.put.placeholder-claim")); firing after
-  `upgrade_manifest_to_chunked` correctly decrements the chunk refcounts the
-  inline-only delete would leak. The guard is defused only on success. I-125a:
+  `upgrade_manifest_to_chunked` deletes the staged placeholder rows, leaving
+  the staged chunks unreferenced for the collect cycle. The guard is defused
+  only on success. I-125a:
   pre-fix, a phantom-drained builder leaked the placeholder and the next
   uploader for the same path got `Aborted: concurrent PutPath` until the orphan
   scanner reaped it (15 min); the builder side polls for that case per
@@ -1080,19 +1085,13 @@ content-addressed output mappings independently of narinfo signatures.
 ]
 
 *Orphan cleanup:* Stale `'uploading'` manifests are reclaimed after a
-compile-time threshold (`STALE_THRESHOLD`, 15 minutes). Their chunk lists are
-used to decrement refcounts for referenced chunks; only chunks whose refcount
-drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3
-enumeration needed. A weekly full orphan scan remains as a safety net for any
-leaked chunks not covered by manifest-based cleanup.
-
-_The last sentence is a stale claim: no weekly full orphan scan exists. The
-only standalone chunk reaper is the hourly orphan-chunk sweep, and it
-collects only rows already at `refcount = 0`
-(#rref("store.chunk.grace-ttl")); a refcount left above zero by a missed or
-skipped decrement has no repair path today --- see the carve-out and
-as-built note under #rref("store.gc.bounded-garbage-retention"). Retained
-unrewritten until the refcount-prose retirement pass._
+compile-time threshold (`STALE_THRESHOLD`, 15 minutes); reaping deletes the
+abandoned path rows only. Chunks left unreferenced by any cleanup --- a reaped
+upload, a swept path, or a historical leak --- are picked up by the collect
+cycle (every `run_gc` phase 3 plus the daily backstop,
+#rref("store.gc.chunk-collect")), which recomputes liveness from the manifests
+each cycle and therefore needs no per-row repair path and no separate
+safety-net scan. No full S3 enumeration needed.
 
 #r("store.gc.sweep-path-tenants")[
   Sweep MUST delete `path_tenants` rows for each swept `store_path_hash` in the
@@ -1156,12 +1155,13 @@ unrewritten until the refcount-prose retirement pass._
 
 #r("store.gc.dry-run+2")[
   `GcRequest.dry_run=true` runs mark + sweep with full stats computation but
-  the per-batch transaction's narinfo DELETEs / chunk decrements /
-  `pending_s3_deletes` INSERTs are `ROLLBACK TO SAVEPOINT`ed; the temp-table
+  the per-batch transaction's narinfo DELETEs are
+  `ROLLBACK TO SAVEPOINT`ed (and the chunk-collect phase stays in its
+  report-only shadow arm); the temp-table
   `closure_remove_from_unreachable` mutations COMMIT (so batch N+1 sees Y's
   resurrection of Z and dry-run stats match what a real run would do). The
   operator sees "would delete N paths, free M bytes" without touching narinfo,
-  chunk refcounts, or `pending_s3_deletes`. The final progress message's
+  chunk rows, or `pending_s3_deletes`. The final progress message's
   `current_path` reads `"dry-run: no paths actually deleted"`.
   #(refs.metric)("rio_store_gc_path_swept_total") is NOT incremented on
   dry-run.
@@ -1197,8 +1197,8 @@ unrewritten until the refcount-prose retirement pass._
 ]
 
 #r("store.chunk.liveness-not-presence")[
-  The chunk-liveness signal (today the `chunks.refcount` counter; under a
-  manifest-derived collector, the mark set) MUST NOT be used to decide
+  The chunk-liveness signal (the collect cycle's mark set; historically the
+  `chunks.refcount` counter) MUST NOT be used to decide
   whether a chunk's bytes are present in the chunk backend. A writer MAY skip
   the backend PUT for a chunk only when `chunks.uploaded_at` is non-NULL
   (#rref("store.cas.upsert-inserted")), and `uploaded_at` is non-NULL only if
@@ -1272,9 +1272,10 @@ GC redesign must preserve.
   BY blake3_hash LIMIT batch_size` and calling `ChunkBackend.exists_batch` per
   page. Keyset (NOT OFFSET) so a 100k-chunk store is O(N) overall.
   `batch_size=0` → default; clamped at `VERIFY_BATCH_MAX`. `deleted=TRUE` rows
-  are skipped (awaiting S3-delete drain --- presence is undefined);
-  `refcount=0` IS verified (could be a mid-upload row in grace TTL --- the
-  object SHOULD exist once `uploaded_at` is set). Returns `FAILED_PRECONDITION`
+  are skipped (awaiting S3-delete drain --- presence is undefined); rows no
+  manifest currently references ARE verified (e.g. a mid-upload row inside the
+  grace window --- the object SHOULD exist once `uploaded_at` is set). Returns
+  `FAILED_PRECONDITION`
   for inline-only stores (no chunk backend). Read-only --- no `--repair`
   (deleting the PG row would be wrong if the object is recoverable; the
   operator decides). Aborts on shutdown token per
@@ -1299,7 +1300,7 @@ builder's authenticated bidirectional ingest stream; `LogService.TailLog` is
 the unauthenticated (route-gated) read/follow stream used by the gateway's
 live tail, the dashboard, and the CLI. Log chunks share the chunks bucket
 under the `logs/` prefix but are position-addressed, not content-addressed
---- they do not participate in the CAS, refcounting, or reachability GC, and
+--- they do not participate in the CAS, chunk collection, or reachability GC, and
 are retained on a wall-clock TTL enforced by an hourly sweep plus an S3
 lifecycle rule that collects orphans (objects whose manifest row was never
 written because the replica crashed between the PUT and the INSERT).
@@ -1500,14 +1501,15 @@ action forces creation).
 
 ```sql
 CREATE TABLE chunks (
-    blake3_hash      BYTEA PRIMARY KEY,
-    refcount         INTEGER NOT NULL DEFAULT 0,
-    size             BIGINT NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted          BOOLEAN NOT NULL DEFAULT FALSE
+    blake3_hash        BYTEA PRIMARY KEY,
+    size               BIGINT NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    uploaded_at        TIMESTAMPTZ,            -- confirmed backend presence (M_033)
+    last_referenced_at TIMESTAMPTZ,            -- upsert conflict-arm touch (068)
+    deleted            BOOLEAN NOT NULL DEFAULT FALSE
 );
-CREATE INDEX idx_chunks_gc ON chunks (blake3_hash)
-    WHERE refcount = 0 AND deleted = FALSE;
+-- (the historical refcount column, its CHECK, and idx_chunks_gc are
+-- dropped by migrations 069/070 with the retired counter machinery)
 
 -- CA derivation realisations (populated on CA build completion)
 CREATE TABLE realisations (
@@ -1572,13 +1574,12 @@ CREATE INDEX idx_pending_s3_deletes_drain
   - `put_path.rs` --- PutPath handler (buffer, verify, branch inline/chunked)
   - `get_path.rs` --- GetPath handler (manifest load, parallel reassembly
     stream)
-  - `chunk.rs` --- FindMissingChunks batch query RPC _(stale: the RPC was
-    removed; the module now serves only the test-only `GetChunk` retrieval
-    surface)_
+  - `chunk.rs` --- test-only `GetChunk` retrieval surface (the
+    FindMissingChunks batch RPC was removed)
 - `rio-store/src/metadata/` --- narinfo + manifest persistence (PostgreSQL)
   - `mod.rs` --- re-exports + shared types
   - `inline.rs` --- inline-blob fast path (write `manifests.inline_blob` BYTEA)
-  - `chunked.rs` --- chunked-path manifest + refcount UPSERT
+  - `chunked.rs` --- chunked-path manifest + chunk-row UPSERT
   - `queries.rs` --- narinfo SELECT/UPDATE, QueryPathInfo, FindMissingPaths
 - `rio-store/src/validate.rs` --- NAR hash verification (HashingReader,
   NarDigest, `validate_nar_digest`)

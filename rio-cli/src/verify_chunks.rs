@@ -5,9 +5,9 @@
 //! go to stdout (one hex-encoded BLAKE3 per line — pipeable into
 //! `xargs aws s3api head-object` or whatever).
 //!
-//! I-040 diagnostic: surfaces chunks where PG says exists (refcount>0,
-//! deleted=false) but the backend's HeadObject 404s. The I-007
-//! prefix-normalize fix stranded 3465 objects this way.
+//! I-040 diagnostic: surfaces chunks where PG says exists
+//! (`uploaded_at` set, not deleted) but the backend's HeadObject 404s.
+//! The I-007 prefix-normalize fix stranded 3465 objects this way.
 
 use anyhow::anyhow;
 use rio_proto::types::VerifyChunksRequest;

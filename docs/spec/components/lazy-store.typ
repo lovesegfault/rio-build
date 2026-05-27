@@ -86,7 +86,7 @@ Today (#(refs.gh)("rio-store/src/grpc/put_path/mod.rs")):
 ```text
 PutPath stream → buffer NAR (Vec<u8>) → SHA-256 verify → if ≥INLINE_THRESHOLD:
   cas::put_chunked(): chunker::chunk_nar(&nar)  # FastCDC 16/64/256 KiB over raw NAR bytes
-    → upsert chunk refcounts (PG) → parallel S3 PUT new chunks → manifest row (ChunkRef[]) status=complete
+    → upsert chunk rows (PG) → parallel S3 PUT new chunks → manifest row (ChunkRef[]) status=complete
 ```
 
 No per-file index, no @nar parse on the write path. For EROFS, step 6 grows a
@@ -113,7 +113,7 @@ existing manifests: one-shot `xtask backfill-erofs-boot` (walk
 `manifests WHERE boot_size IS NULL` → GetPath → encode → upload).
 
 *Where:* S3 sibling to chunks, `s3://…/boot/<narhash>.erofs`. GC deletes it
-when the manifest row goes (1:1, no refcount).
+when the manifest row goes (1:1 with its manifest, never shared).
 
 == EROFS image structure — bootstrap vs blobs; can blobs BE our chunks? <a-2>
 

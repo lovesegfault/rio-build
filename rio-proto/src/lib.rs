@@ -129,7 +129,8 @@ pub mod builder {
 /// Also includes `ChunkService` (`GetChunk` only). Chunking is
 /// **server-side**: executors stream full NARs via `StoreService::
 /// PutPath`; rio-store does the FastCDC cut internally and dedupes
-/// chunks via the `chunks` table refcount. Reassembly is also
+/// chunks on confirmed backend presence (`chunks.uploaded_at`).
+/// Reassembly is also
 /// server-side — `StoreService::GetPath` streams whole NARs back, so
 /// `GetChunk` has no production caller today; it is registered and
 /// served as the chunk-level retrieval surface for future
