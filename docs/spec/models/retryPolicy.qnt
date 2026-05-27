@@ -445,7 +445,7 @@ module retryPolicy {
   /// exhausts_fleet (retry_policy.rs / placeable()): every statically
   /// eligible, registered, non-draining worker is in the exclusion set;
   /// an empty exclusion set or an empty eligible fleet never exhausts
-  /// (sched.dispatch.fleet-exhaust+3's empty-fleet defer).
+  /// (sched.dispatch.fleet-exhaust+4's empty-fleet defer).
   pure def exhaustsFleet(failed: Set[str], eligible: Set[str]): bool = and {
     failed != Set(),
     eligible != Set(),
@@ -764,7 +764,7 @@ module retryPolicy {
   /// charges, is terminal, or was dropped by the status guard because
   /// the derivation had already left the poison-able statuses; and the
   /// bare disconnect observation never charges (its charge vehicle is
-  /// the establishment -- sched.retry.per-executor-budget+2's
+  /// the establishment -- sched.retry.per-executor-budget+3's
   /// established-crash clause -- so an uncharged disconnect is the spec'd
   /// behaviour, not a leak).
   val attemptsChargedOnce = and {
@@ -831,7 +831,7 @@ module retryPolicy {
 
   /// The fleet-exhaust poison is sound: it only fires when the exclusion
   /// set covers a non-empty eligible fleet (the empty fleet defers --
-  /// sched.dispatch.fleet-exhaust+3).
+  /// sched.dispatch.fleet-exhaust+4).
   val placementSound =
     (dStatus == DPoisoned and poisonSrc == DispatchPoison) implies
       lastPoisonReason == RFleetExhausted
@@ -1046,7 +1046,7 @@ module retryPolicy {
   /// Poisons without a failure event (the fleet_exhaust marker row is a
   /// fold no-op -- poisonSrc records the scoping); the poison status is
   /// persisted with the marker row. The empty eligible fleet defers
-  /// instead (the action is disabled), per sched.dispatch.fleet-exhaust+3.
+  /// instead (the action is disabled), per sched.dispatch.fleet-exhaust+4.
   // Mirrors: dispatch.rs::dispatch_fleet_exhausted + placeable() +
   //          poison_and_cascade.
   action dispatchFleetExhaust = all {

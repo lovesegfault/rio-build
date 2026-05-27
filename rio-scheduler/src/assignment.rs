@@ -587,7 +587,7 @@ mod tests {
         assert!(hard_filter(&tight, &drv)); // last_intent=None → fits
     }
 
-    // r[verify sched.dispatch.fleet-exhaust+3]
+    // r[verify sched.dispatch.fleet-exhaust+4]
     /// `statically_eligible(w,d)` MUST agree with `rejection_reason(w,d)`
     /// on the static clauses. Guards against a future
     /// `rejection_reason` clause being added without updating

@@ -476,6 +476,12 @@ impl DagActor {
                 ready: Some(ready),
                 hw_class_names: intent.hw_class_names.clone(),
                 disk_headroom_factor: Some(intent.disk_headroom),
+                // AD2: the node-keyed entries of the exclusion set, so
+                // the controller can render anti-affinity and evaluate
+                // the spawn-gate exhaustion check. Empty for histories
+                // with only legacy (pod-name-keyed) failures.
+                // r[impl sched.dispatch.fleet-exhaust+4]
+                excluded_nodes: state.excluded_source_nodes(),
             }
         };
 

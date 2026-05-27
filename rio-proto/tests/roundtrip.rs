@@ -54,6 +54,7 @@ fn spawn_intents_proto_roundtrip() {
                 ready: Some(true),
                 hw_class_names: vec!["intel-8".into()],
                 disk_headroom_factor: Some(1.32),
+                excluded_nodes: vec!["ip-10-0-1-5.internal".into()],
             },
             rio_proto::types::SpawnIntent {
                 intent_id: "i-fod".into(),
@@ -70,6 +71,7 @@ fn spawn_intents_proto_roundtrip() {
                 ready: Some(false),
                 hw_class_names: vec![],
                 disk_headroom_factor: None,
+                excluded_nodes: vec![],
             },
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),

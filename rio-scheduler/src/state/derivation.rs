@@ -639,6 +639,11 @@ pub struct AttemptRecord {
     pub exec_id: Option<Uuid>,
     /// Executor that ran (or was assigned) the attempt.
     pub executor_id: Option<ExecutorId>,
+    /// Controller-authoritative source node (071, AD2c) — stamped only
+    /// for pull-mode attempts. When present the retry fold keys the
+    /// row's exclusion/budget contribution on it instead of the
+    /// executor id, so mixed-era histories carry both key kinds.
+    pub source_node: Option<String>,
     /// Second-installment classification detail (controller reason,
     /// `unreported`, `force_drain`, …). `None` until established.
     pub termination_reason: Option<String>,
@@ -1787,16 +1792,23 @@ impl DerivationState {
     /// report's second installment) onto the in-memory record for
     /// `exec_id`: sets `termination_reason` if it is still empty and
     /// touches nothing else (class and floor flags keep the values the
-    /// classifying append wrote). Returns whether a record was updated.
+    /// classifying append wrote; `source_node` is adopted only when the
+    /// record does not already carry one — mirroring the
+    /// `COALESCE(source_node, …)` the durable fill applies). Returns
+    /// whether a record was updated.
     pub(crate) fn fill_attempt_termination_reason(
         &mut self,
         exec_id: Uuid,
         termination_reason: &str,
+        source_node: Option<&str>,
     ) -> bool {
         for record in self.attempt_history.iter_mut().rev() {
             if record.exec_id == Some(exec_id) {
                 if record.termination_reason.is_none() {
                     record.termination_reason = Some(termination_reason.to_string());
+                    if record.source_node.is_none() {
+                        record.source_node = source_node.map(str::to_owned);
+                    }
                     return true;
                 }
                 return false;
@@ -1813,6 +1825,28 @@ impl DerivationState {
     /// transaction's suffix SELECT.
     pub(crate) fn attempt_history(&self) -> &[AttemptRecord] {
         &self.attempt_history
+    }
+
+    /// The node-keyed subset of the exclusion set (AD2): every
+    /// `source_node` carried by an attempt record in the current
+    /// suffix that the fold actually excluded (it appears in the
+    /// cached `failed_builders` view, which is keyed by node for
+    /// pull-mode rows and by executor id for legacy rows). This is
+    /// what the spawn intent advertises as `excluded_nodes` — legacy
+    /// pod-name keys are never included (they are not schedulable
+    /// constraints), so stream-only histories yield an empty list and
+    /// the controller's pod render stays byte-identical to today.
+    pub(crate) fn excluded_source_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self
+            .attempt_history
+            .iter()
+            .filter_map(|r| r.source_node.as_deref())
+            .filter(|n| self.retry.failed_builders.contains(&ExecutorId::from(*n)))
+            .map(str::to_owned)
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
     }
 
     /// The transitional legacy fold seed (decision P5) carried on the

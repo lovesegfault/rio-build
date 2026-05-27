@@ -72,6 +72,13 @@ pub(crate) struct AttemptRow {
     pub exec_id: Option<Uuid>,
     /// Executor that ran (or was assigned) the attempt.
     pub executor_id: Option<ExecutorId>,
+    /// Controller-authoritative source node the attempt ran on (071,
+    /// AD2c). Stamped only for pull-mode attempts, from the spawn-ack
+    /// binding / the execution row / the controller's report — never
+    /// from worker-supplied identity. The exclusion fold keys the row
+    /// on this when present (the executor id otherwise), so legacy
+    /// stream rows keep their pod-name key.
+    pub source_node: Option<String>,
     /// Attempt event or reset event.
     pub event_kind: AttemptEventKind,
     /// Outcome classification (the `classify()` alphabet; CHECK-bound).
@@ -115,6 +122,7 @@ impl AttemptRow {
             derivation_id,
             exec_id: None,
             executor_id: None,
+            source_node: None,
             event_kind: AttemptEventKind::Attempt,
             outcome_class,
             termination_reason: None,
@@ -155,6 +163,7 @@ impl AttemptRow {
             outcome_class: self.outcome_class,
             exec_id: self.exec_id,
             executor_id: self.executor_id.clone(),
+            source_node: self.source_node.clone(),
             termination_reason: self.termination_reason.clone(),
             reporting_party: self.reporting_party,
             exempt: self.exempt,
@@ -189,6 +198,7 @@ struct RawAttemptRow {
     derivation_id: Uuid,
     exec_id: Option<Uuid>,
     executor_id: Option<String>,
+    source_node: Option<String>,
     event_kind: String,
     outcome_class: String,
     termination_reason: Option<String>,
@@ -217,6 +227,7 @@ impl TryFrom<RawAttemptRow> for AttemptRow {
             derivation_id: raw.derivation_id,
             exec_id: raw.exec_id,
             executor_id: raw.executor_id.map(ExecutorId::from),
+            source_node: raw.source_node,
             event_kind: raw
                 .event_kind
                 .parse()
@@ -262,18 +273,19 @@ impl SchedulerDb {
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO drv_attempts \
-                 (attempt_id, derivation_id, exec_id, executor_id, event_kind, \
+                 (attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
                   outcome_class, termination_reason, reporting_party, exempt, \
                   floor_promoted, floor_at_cap, error_msg, final_line_count, \
                   resubmit_cycle, occurred_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                     to_timestamp($15)) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     to_timestamp($16)) \
              ON CONFLICT (exec_id) WHERE exec_id IS NOT NULL DO NOTHING",
         )
         .bind(row.attempt_id)
         .bind(row.derivation_id)
         .bind(row.exec_id)
         .bind(row.executor_id.as_ref().map(ExecutorId::as_str))
+        .bind(row.source_node.as_deref())
         .bind(row.event_kind.as_str())
         .bind(row.outcome_class.as_str())
         .bind(row.termination_reason.as_deref())
@@ -305,6 +317,7 @@ impl SchedulerDb {
         let mut derivation_id = Vec::with_capacity(rows.len());
         let mut exec_id = Vec::with_capacity(rows.len());
         let mut executor_id = Vec::with_capacity(rows.len());
+        let mut source_node = Vec::with_capacity(rows.len());
         let mut event_kind = Vec::with_capacity(rows.len());
         let mut outcome_class = Vec::with_capacity(rows.len());
         let mut termination_reason = Vec::with_capacity(rows.len());
@@ -321,6 +334,7 @@ impl SchedulerDb {
             derivation_id.push(r.derivation_id);
             exec_id.push(r.exec_id);
             executor_id.push(r.executor_id.as_ref().map(|e| e.as_str().to_string()));
+            source_node.push(r.source_node.clone());
             event_kind.push(r.event_kind.as_str());
             outcome_class.push(r.outcome_class.as_str());
             termination_reason.push(r.termination_reason.clone());
@@ -335,22 +349,22 @@ impl SchedulerDb {
         }
         let result = sqlx::query(
             "INSERT INTO drv_attempts \
-                 (attempt_id, derivation_id, exec_id, executor_id, event_kind, \
+                 (attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
                   outcome_class, termination_reason, reporting_party, exempt, \
                   floor_promoted, floor_at_cap, error_msg, final_line_count, \
                   resubmit_cycle, occurred_at) \
-             SELECT attempt_id, derivation_id, exec_id, executor_id, event_kind, \
+             SELECT attempt_id, derivation_id, exec_id, executor_id, source_node, event_kind, \
                     outcome_class, termination_reason, reporting_party, exempt, \
                     floor_promoted, floor_at_cap, error_msg, final_line_count, \
                     resubmit_cycle, to_timestamp(occurred_at) \
              FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::text[], \
                          $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[], \
                          $11::bool[], $12::text[], $13::bigint[], $14::int[], \
-                         $15::float8[]) \
+                         $15::float8[], $16::text[]) \
                   AS t(attempt_id, derivation_id, exec_id, executor_id, event_kind, \
                        outcome_class, termination_reason, reporting_party, exempt, \
                        floor_promoted, floor_at_cap, error_msg, final_line_count, \
-                       resubmit_cycle, occurred_at) \
+                       resubmit_cycle, occurred_at, source_node) \
              ON CONFLICT (exec_id) WHERE exec_id IS NOT NULL DO NOTHING",
         )
         .bind(&attempt_id)
@@ -368,6 +382,7 @@ impl SchedulerDb {
         .bind(&final_line_count)
         .bind(&resubmit_cycle)
         .bind(&occurred_at)
+        .bind(&source_node)
         .execute(&mut *tx)
         .await?;
         Ok(result.rows_affected())
@@ -420,21 +435,27 @@ impl SchedulerDb {
     /// (`ReportAttemptOutcome`) enriches an already-classified row, it
     /// never reclassifies it. Same first-writer-wins guard as
     /// [`Self::fill_termination`]; returns whether THIS call filled it.
+    /// `source_node` (the controller-reported kube-authoritative node,
+    /// AD2c) is stamped only when the row does not already carry one —
+    /// the pull-mint / worker-report attribution wins when present.
     pub(crate) async fn fill_termination_reason_only(
         &self,
         derivation_id: Uuid,
         exec_id: Uuid,
         termination_reason: &str,
+        source_node: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE drv_attempts \
-             SET termination_reason = $3 \
+             SET termination_reason = $3, \
+                 source_node = COALESCE(source_node, $4) \
              WHERE derivation_id = $1 AND exec_id = $2 \
                AND termination_reason IS NULL",
         )
         .bind(derivation_id)
         .bind(exec_id)
         .bind(termination_reason)
+        .bind(source_node)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -452,7 +473,7 @@ impl SchedulerDb {
         derivation_id: Uuid,
     ) -> Result<Vec<AttemptRow>, sqlx::Error> {
         let raw: Vec<RawAttemptRow> = sqlx::query_as(
-            "SELECT a.attempt_id, a.derivation_id, a.exec_id, a.executor_id, \
+            "SELECT a.attempt_id, a.derivation_id, a.exec_id, a.executor_id, a.source_node, \
                     a.event_kind, a.outcome_class, a.termination_reason, \
                     a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
                     a.error_msg, a.final_line_count, a.resubmit_cycle, \
@@ -505,7 +526,7 @@ impl SchedulerDb {
         // SQL. Timestamps come back as epoch seconds (no chrono/time
         // dependency — same pattern as the recovery rows).
         let raw: Vec<RawAttemptRow> = sqlx::query_as(
-            "SELECT a.attempt_id, a.derivation_id, a.exec_id, a.executor_id, \
+            "SELECT a.attempt_id, a.derivation_id, a.exec_id, a.executor_id, a.source_node, \
                     a.event_kind, a.outcome_class, a.termination_reason, \
                     a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
                     a.error_msg, a.final_line_count, a.resubmit_cycle, \

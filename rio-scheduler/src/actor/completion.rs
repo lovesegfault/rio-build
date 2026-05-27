@@ -90,6 +90,12 @@ impl DagActor {
     /// `None` when the node is unknown or its merge has not committed
     /// (`db_id` is `None`) — there is nothing to key a row on; callers
     /// fall back to the plain status persist.
+    ///
+    /// Pull-mode attempts (the in-flight executor identity is the
+    /// attested intent itself) additionally carry `source_node` from
+    /// the controller-authoritative spawn-ack binding (AD2c) so the
+    /// exclusion fold keys them by node; stream attempts never get the
+    /// stamp here, keeping their pod-name exclusion key untouched.
     pub(super) fn attempt_row_for(
         &self,
         drv_hash: &DrvHash,
@@ -101,8 +107,27 @@ impl DagActor {
         let mut row = AttemptRow::new(db_id, outcome_class, reporting_party);
         row.exec_id = state.exec_id;
         row.executor_id = state.assigned_executor.clone();
+        row.source_node = self.pull_attempt_source_node(drv_hash);
         row.resubmit_cycle = i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX);
         Some(row)
+    }
+
+    /// The controller-authoritative node binding for `drv_hash`, but
+    /// only when the in-flight attempt is pull-mode — i.e. the assigned
+    /// executor identity IS the attested intent (the pull path's
+    /// identity convention; stream executors are pod names). `None` for
+    /// stream attempts and for pull attempts whose binding the
+    /// controller has not reported yet (AD2c: never derived from
+    /// worker-supplied identity).
+    pub(super) fn pull_attempt_source_node(&self, drv_hash: &DrvHash) -> Option<String> {
+        let state = self.dag.node(drv_hash)?;
+        let assigned = state.assigned_executor.as_ref()?;
+        if assigned.as_str() != drv_hash.as_str() {
+            return None;
+        }
+        self.authoritative_binding
+            .get(drv_hash)
+            .map(|b| b.node.clone())
     }
 
     /// The 1a appending transaction for a poison persist: append `row`
@@ -1234,7 +1259,7 @@ impl DagActor {
                     }
                 }
             }
-            // r[impl sched.retry.per-executor-budget+2]
+            // r[impl sched.retry.per-executor-budget+3]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
@@ -2728,7 +2753,7 @@ impl DagActor {
             return FailureHandling::Handled;
         }
 
-        // r[impl sched.retry.per-executor-budget+2]
+        // r[impl sched.retry.per-executor-budget+3]
         // The live eligible fleet snapshot for the fleet-exhaust arm:
         // statically-eligible (kind/system/features), non-draining,
         // registered workers — the same construction as the E9
@@ -2807,6 +2832,7 @@ impl DagActor {
                 outcome_class: OutcomeClass::Transient,
                 exec_id: None,
                 executor_id: Some(executor_id.clone()),
+                source_node: self.pull_attempt_source_node(drv_hash),
                 termination_reason: None,
                 reporting_party: ReportingParty::Worker,
                 exempt: false,

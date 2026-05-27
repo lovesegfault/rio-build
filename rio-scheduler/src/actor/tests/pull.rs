@@ -788,3 +788,200 @@ async fn attempt_outcome_ignores_stream_attempts() -> TestResult {
     );
     Ok(())
 }
+
+// ─── AD2 scheduler half: source-keyed exclusion (T-1b.1) ────────────────
+
+/// `source_node` of every drv_attempts row for one drv hash, in append
+/// order.
+async fn ledger_source_nodes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT a.source_node FROM drv_attempts a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = $1 ORDER BY a.recorded_at, a.attempt_id",
+    )
+    .bind(drv_hash)
+    .fetch_all(pool)
+    .await
+    .expect("drv_attempts source_node query")
+}
+
+/// Spawn intents as the controller would read them (unfiltered).
+async fn spawn_intents(handle: &ActorHandle) -> Vec<rio_proto::types::SpawnIntent> {
+    handle
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(crate::actor::AdminQuery::GetSpawnIntents {
+                req: crate::actor::SpawnIntentsRequest::default(),
+                reply,
+            })
+        })
+        .await
+        .expect("actor alive")
+        .intents
+}
+
+// r[verify sched.retry.per-executor-budget+3]
+/// (a) An attempt appended for a pull-mode pod carries `source_node`
+/// from the controller-authoritative spawn-ack binding, and the
+/// requeued intent advertises that node in `excluded_nodes` (the AD2
+/// node-keyed exclusion, end to end on the scheduler half).
+#[tokio::test]
+async fn pull_attempt_failure_stamps_source_node_and_excludes_node() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "psn-a", PriorityClass::Scheduled).await?;
+
+    // Controller-authoritative pod→node binding for the intent.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "psn-a".into(),
+                node_name: "node-7".into(),
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let assignment = expect_deliver(pull(&handle, "psn-a", Some("psn-a")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    report(
+        &handle,
+        exec_id,
+        Some("psn-a"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure report acked");
+
+    assert_eq!(
+        ledger_source_nodes(&db.pool, "psn-a").await,
+        vec![Some("node-7".to_string())],
+        "the pull-mode attempt row carries the spawn-ack node attribution"
+    );
+    let info = expect_drv(&handle, "psn-a").await;
+    assert!(
+        info.retry.failed_builders.contains("node-7"),
+        "the exclusion view is keyed by the source node, got {:?}",
+        info.retry.failed_builders
+    );
+    let intents = spawn_intents(&handle).await;
+    let intent = intents
+        .iter()
+        .find(|i| i.intent_id == "psn-a")
+        .expect("requeued drv re-advertised as a spawn intent");
+    assert_eq!(
+        intent.excluded_nodes,
+        vec!["node-7".to_string()],
+        "the intent advertises the node-keyed exclusion for the controller's anti-affinity"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fleet-exhaust+4]
+/// The spawn-gate exhaustion arm: a `NoEligibleSource` report for a
+/// still-Ready derivation poisons it through the fleet-exhaust arm
+/// (one `fleet_exhaust` marker row, no charge), and re-reports are
+/// idempotent no-ops.
+#[tokio::test]
+async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "nes-a", PriorityClass::Scheduled).await?;
+
+    report_attempt_outcome(
+        &handle,
+        Some("nes-a"),
+        None,
+        rio_proto::types::AttemptTerminalReason::NoEligibleSource,
+    )
+    .await
+    .expect("spawn-gate report acked");
+
+    let info = expect_drv(&handle, "nes-a").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Poisoned,
+        "excluded ⊇ spawnable maps to the fleet-exhaust poison"
+    );
+    assert_eq!(
+        ledger_classes(&db.pool, "nes-a").await,
+        vec!["fleet_exhaust".to_string()],
+        "one verdict marker row, no charge rows"
+    );
+    let rows = ledger_rows(&db.pool, "nes-a").await;
+    assert!(
+        rows[0].exec_id.is_none() && rows[0].executor_id.is_none(),
+        "a verdict marker is not an execution"
+    );
+    assert_eq!(info.retry.failure_count, 0, "no budget consumption");
+
+    // Idempotent on re-tick: acked, nothing new written.
+    report_attempt_outcome(
+        &handle,
+        Some("nes-a"),
+        None,
+        rio_proto::types::AttemptTerminalReason::NoEligibleSource,
+    )
+    .await
+    .expect("duplicate spawn-gate report acked");
+    assert_eq!(
+        ledger_classes(&db.pool, "nes-a").await.len(),
+        1,
+        "re-report appends nothing"
+    );
+    let info = expect_drv(&handle, "nes-a").await;
+    assert_eq!(info.status, crate::state::DerivationStatus::Poisoned);
+
+    // Unknown intent: acknowledged, nothing written anywhere.
+    report_attempt_outcome(
+        &handle,
+        Some("nes-zzz"),
+        None,
+        rio_proto::types::AttemptTerminalReason::NoEligibleSource,
+    )
+    .await
+    .expect("unknown-intent spawn-gate report acked");
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(total, 1, "only the nes-a marker row exists");
+    Ok(())
+}
+
+// r[verify sched.attempt.establishment-window]
+/// Coexistence: the post-failover orphan reconcile never resets an
+/// open pull-mode attempt — the establishment sweep owns pull
+/// attempts, keyed by the durable `dispatch_mode = 'pull'`
+/// discriminator (the 1a-A hand-off item).
+#[tokio::test]
+async fn reconcile_assignments_skips_open_pull_attempts() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rcl-a", PriorityClass::Scheduled).await?;
+    let _assignment = expect_deliver(pull(&handle, "rcl-a", Some("rcl-a")).await);
+
+    // The pod never registers on the stream, so the liveness check sees
+    // no executor for it; the reconcile must still leave it alone.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, "rcl-a").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Running,
+        "an open pull-mode attempt is not an orphan"
+    );
+    assert_eq!(
+        assignment_status_of(&db.pool, "rcl-a").await,
+        vec!["pending"],
+        "the assignment row stays open for the establishment sweep / the report"
+    );
+    assert!(
+        ledger_rows(&db.pool, "rcl-a").await.is_empty(),
+        "the reconcile charges nothing for the in-flight pull attempt"
+    );
+    Ok(())
+}

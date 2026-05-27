@@ -1492,7 +1492,7 @@ async fn test_distinct_transient_poison_matrix(
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+2]
+// r[verify sched.retry.per-executor-budget+3]
 /// InfrastructureFailure is a worker-local problem (FUSE EIO, cgroup
 /// setup fail, OOM-kill of the build process) — NOT the build's fault.
 /// 3× InfrastructureFailure on distinct workers → failed_builders stays
@@ -3896,7 +3896,7 @@ async fn test_unsolicited_cancelled_resets_to_ready() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+2]
+// r[verify sched.retry.per-executor-budget+3]
 /// `max_infra_retries` is a uniform bound: at-cap cgroup-OOM and
 /// non-floor infra (FUSE EIO) poison at the SAME attempt number.
 /// Previously `bump_floor_or_count` incremented BEFORE the cap check

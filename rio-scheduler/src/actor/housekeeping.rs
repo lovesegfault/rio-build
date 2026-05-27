@@ -1033,6 +1033,10 @@ impl DagActor {
         );
         row.exec_id = Some(attempt.exec_id);
         row.executor_id = Some(executor.clone());
+        // AD2c: the establishment charge carries the pull-mint's
+        // controller-authoritative node attribution so the re-keyed
+        // exclusion survives failover off the ledger row alone.
+        row.source_node = attempt.source_node.clone();
         row.termination_reason = Some("unreported".into());
         type ChargeOutcome = Option<(bool, crate::retry_policy::Decision)>;
         let result: Result<ChargeOutcome, sqlx::Error> = async {

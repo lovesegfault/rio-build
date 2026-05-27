@@ -5173,7 +5173,7 @@ async fn attempt_ledger_unreported_crash_established_by_sweep() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+2]
+// r[verify sched.retry.per-executor-budget+3]
 // r[verify sched.retry.attempts-bounded+2]
 /// Phase 1b (T-1b.11), the C2 adjudication red-first: a derivation that
 /// deterministically kills its worker with no `CompletionReport`, no

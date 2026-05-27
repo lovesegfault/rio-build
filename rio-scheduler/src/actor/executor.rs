@@ -1187,7 +1187,7 @@ impl DagActor {
     /// report deliberately establishes nothing (the classification
     /// window for a promoting or DeadlineExceeded report stays open
     /// until this sweep).
-    // r[impl sched.retry.per-executor-budget+2]
+    // r[impl sched.retry.per-executor-budget+3]
     pub(super) async fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
         let expired: Vec<super::DisconnectedAttempt> = self
             .recently_disconnected

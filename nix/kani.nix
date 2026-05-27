@@ -257,8 +257,8 @@ in
   # r[verify sched.retry.attempts-bounded+2]
   # r[verify sched.retry.exempt-infra-cap]
   # r[verify sched.retry.recovery-projection+2]
-  # r[verify sched.retry.per-executor-budget+2]
-  # r[verify sched.dispatch.fleet-exhaust+3]
+  # r[verify sched.retry.per-executor-budget+3]
+  # r[verify sched.dispatch.fleet-exhaust+4]
   # r[verify sched.state.poisoned-ttl]
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";

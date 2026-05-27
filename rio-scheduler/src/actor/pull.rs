@@ -639,6 +639,7 @@ pub(crate) fn attempt_terminal_reason_label(
         R::Cancelled => "cancelled",
         R::Preempted => "preempted",
         R::Reaped => "reaped",
+        R::NoEligibleSource => "no_eligible_source",
     }
 }
 
@@ -661,10 +662,12 @@ impl DagActor {
         &mut self,
         identity: AttemptIdentity,
         reason: rio_proto::types::AttemptTerminalReason,
-        _node_name: Option<String>,
+        node_name: Option<String>,
         reply: oneshot::Sender<Result<(), PullRejection>>,
     ) {
-        let result = self.report_attempt_outcome_inner(identity, reason).await;
+        let result = self
+            .report_attempt_outcome_inner(identity, reason, node_name)
+            .await;
         let _ = reply.send(result);
     }
 
@@ -672,9 +675,19 @@ impl DagActor {
         &mut self,
         identity: AttemptIdentity,
         reason: rio_proto::types::AttemptTerminalReason,
+        node_name: Option<String>,
     ) -> Result<(), PullRejection> {
         if !self.leader.is_leader() {
             return Err(PullRejection::NotLeader);
+        }
+        // AD2(a): the spawn-gate exhaustion verdict. Not a pod-terminal
+        // classification — there is no pod and no attempt — so it is
+        // handled before attempt resolution: the controller (which owns
+        // the spawnable-source universe) detected excluded ⊇ spawnable
+        // for this intent and the fold maps that to the fleet-exhaust
+        // poison arm, exactly like the dispatch-time E9 backstop.
+        if reason == rio_proto::types::AttemptTerminalReason::NoEligibleSource {
+            return self.handle_no_eligible_source(&identity).await;
         }
         // Resolve the attempt: exec_id first, then the intent's open
         // pull-mode attempt. A Job-name-only report cannot be resolved
@@ -736,13 +749,13 @@ impl DagActor {
             let derivation_id = attempt.derivation_id;
             let won = self
                 .db
-                .fill_termination_reason_only(derivation_id, exec_id, label)
+                .fill_termination_reason_only(derivation_id, exec_id, label, node_name.as_deref())
                 .await
                 .map_err(|e| PullRejection::Internal(format!("installment fill failed: {e}")))?;
             let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
             if won {
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
-                    state.fill_attempt_termination_reason(exec_id, label);
+                    state.fill_attempt_termination_reason(exec_id, label, node_name.as_deref());
                 }
                 // A won fill on an attempt whose derivation is still
                 // in-flight on this attempt means no other observer has
@@ -792,6 +805,77 @@ impl DagActor {
             ?reason,
             "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill target)"
         );
+        Ok(())
+    }
+
+    // r[impl sched.dispatch.fleet-exhaust+4]
+    /// The spawn-gate exhaustion arm of `ReportAttemptOutcome`
+    /// (`reason = NoEligibleSource`, AD2a): the controller holds the
+    /// node informers, so it is the party that can observe "every
+    /// source this intent could be scheduled onto is already excluded".
+    /// The scheduler maps that observation to the same fleet-exhaust
+    /// poison the dispatch-time E9 backstop produces: a `fleet_exhaust`
+    /// marker row (no charge — the fold treats it as a no-op event)
+    /// appended in the same transaction as the poison persist, then the
+    /// cascade. Idempotent: only a currently-Ready derivation is acted
+    /// on — an already-poisoned (or in-flight, or terminal, or unknown)
+    /// drv acknowledges and changes nothing, so controller re-ticks and
+    /// duplicate reports are no-ops.
+    async fn handle_no_eligible_source(
+        &mut self,
+        identity: &AttemptIdentity,
+    ) -> Result<(), PullRejection> {
+        let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) else {
+            debug!(
+                job_name = ?identity.job_name,
+                "NoEligibleSource report without an intent id acknowledged (nothing to act on)"
+            );
+            return Ok(());
+        };
+        let drv_hash = DrvHash::from(intent);
+        let status = self.dag.node(&drv_hash).map(|s| s.status());
+        if status != Some(DerivationStatus::Ready) {
+            debug!(
+                intent_id = %intent,
+                ?status,
+                "NoEligibleSource for a non-Ready derivation acknowledged (already resolved, \
+                 in flight, or unknown)"
+            );
+            return Ok(());
+        }
+        if let Some(state) = self.dag.node(&drv_hash) {
+            warn!(
+                intent_id = %intent,
+                system = %state.system,
+                excluded = state.retry.failed_builders.len(),
+                "controller reported NoEligibleSource: every spawnable source for this \
+                 derivation is excluded; poisoning (AD2 spawn-gate fleet exhaust)"
+            );
+        }
+        metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
+        // Same marker-row discipline as the dispatch-time arm: a verdict
+        // marker is not an execution, so the execution/executor/node
+        // attribution is cleared before the append.
+        let marker = self
+            .attempt_row_for(
+                &drv_hash,
+                crate::state::OutcomeClass::FleetExhaust,
+                crate::state::ReportingParty::Controller,
+            )
+            .map(|mut row| {
+                row.exec_id = None;
+                row.executor_id = None;
+                row.source_node = None;
+                row
+            });
+        self.poison_and_cascade(
+            &drv_hash,
+            "no eligible source: every spawnable node is excluded for this derivation \
+             (controller spawn gate)",
+            None,
+            marker,
+        )
+        .await;
         Ok(())
     }
 }

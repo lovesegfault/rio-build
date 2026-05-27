@@ -1951,7 +1951,35 @@ impl DagActor {
             debug!("reconcile: not leader, skipping");
             return;
         }
-        let (orphaned, deferred) = self.collect_orphaned_assignments();
+        let (mut orphaned, deferred) = self.collect_orphaned_assignments();
+
+        // Pull-mode carve-out (executor campaign, coexistence): a
+        // pull-mode pod never registers on the stream, so its
+        // Assigned/Running drv always looks orphaned to the
+        // executor-liveness check above — but the attempt is durable
+        // (`drv_executions.dispatch_mode = 'pull'`) and owned by the
+        // establishment sweep (deadline + report-slack), not by this
+        // reconcile. Filter those out by the dispatch_mode
+        // discriminator; on a view-read error keep ONLY the orphans we
+        // can prove are not pull-mode (i.e. none) and re-arm the sweep —
+        // resetting a mid-build pull attempt here would strand the pod's
+        // report against a closed assignment.
+        if !orphaned.is_empty() {
+            match self.db.list_open_pull_attempts().await {
+                Ok(open) => {
+                    let pull_open: std::collections::HashSet<&str> =
+                        open.iter().map(|a| a.drv_hash.as_str()).collect();
+                    orphaned.retain(|o| !pull_open.contains(o.drv_hash.as_str()));
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                          "reconcile: open pull-attempt view unavailable; deferring the orphan \
+                           pass (cannot distinguish pull-mode attempts) and re-arming the sweep");
+                    self.schedule_reconcile_timer();
+                    return;
+                }
+            }
+        }
 
         // r[impl sched.executor.repair-precedence]
         // A deferred claim (its worker has a stream entry but no

@@ -203,6 +203,12 @@ enum AttemptTerminalReason {
   ATTEMPT_TERMINAL_REASON_PREEMPTED = 8;
   // Synthesized by the controller when a reap path deletes the Job.
   ATTEMPT_TERMINAL_REASON_REAPED = 9;
+  // Spawn-gate verdict (AD2): every node the intent could currently be
+  // scheduled onto is already in the intent's excluded_nodes set, so no
+  // Job was created. Not a pod-terminal classification — there is no
+  // attempt — and the scheduler maps it to the fleet-exhaust poison arm
+  // (Poison(FleetExhausted)) instead of a column fill.
+  ATTEMPT_TERMINAL_REASON_NO_ELIGIBLE_SOURCE = 10;
 }
 
 message ReportAttemptOutcomeRequest {
@@ -534,6 +540,16 @@ message SpawnIntent {
   // back to the flat 1.5× constant. 0.0 is also treated as
   // absent (proto default for `double`).
   optional double disk_headroom_factor = 15;
+  // AD2: source nodes already excluded for this derivation — the
+  // node-keyed entries of the retry fold's exclusion set (attempt rows
+  // carrying drv_attempts.source_node). The controller renders these as
+  // required node anti-affinity on the spawned pod and evaluates the
+  // spawn-gate exhaustion check (excluded ⊇ spawnable ⇒
+  // ReportAttemptOutcome(NO_ELIGIBLE_SOURCE)) against them. Legacy
+  // pod-name exclusion keys are NOT carried here (they are meaningless
+  // as scheduling constraints); `repeated`, so absence == empty == no
+  // exclusions and no back-compat decode distinction is needed.
+  repeated string excluded_nodes = 16;
 }
 
 // One conjunction of node-match requirements. Mirrors k8s core/v1

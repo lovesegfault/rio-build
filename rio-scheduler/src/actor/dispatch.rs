@@ -413,6 +413,7 @@ impl DagActor {
                         .map(|mut row| {
                             row.exec_id = None;
                             row.executor_id = None;
+                            row.source_node = None;
                             row
                         });
                     self.poison_and_cascade(
@@ -2023,7 +2024,7 @@ impl DagActor {
     /// would brick builds during a deployment rollout). Returns
     /// `Some(excluded_count)` when exhausted; the caller owns the I-065
     /// operator warn + metric at the arm that acts on the verdict.
-    // r[impl sched.dispatch.fleet-exhaust+3]
+    // r[impl sched.dispatch.fleet-exhaust+4]
     pub(super) fn dispatch_fleet_exhausted(&self, drv_hash: &DrvHash) -> Option<usize> {
         let state = self.dag.node(drv_hash)?;
         // The carried node floor (P5, T-1b.12a): a recovered

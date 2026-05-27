@@ -137,11 +137,22 @@ pub(crate) fn decide(
 /// becomes its `String` form, and the occurrence timestamp moves onto
 /// the abstract whole-second clock with the same `as` cast the fold has
 /// always used.
+///
+/// AD2 re-key: a row carrying `source_node` (a pull-mode attempt, 071)
+/// contributes the controller-authoritative *node* as its
+/// exclusion/budget identity; rows without it (every stream-mode /
+/// legacy row) keep contributing their executor (pod-name) key — so a
+/// mixed-era history yields an exclusion set carrying both key kinds
+/// (decision P12) and the fold's invariants are untouched.
+// r[impl sched.retry.per-executor-budget+3]
 fn record_to_row(record: &AttemptRecord) -> rio_retry_kernel::LedgerRow<String> {
     rio_retry_kernel::LedgerRow {
         event_kind: kernel_event_kind(record.event_kind),
         outcome_class: kernel_outcome_class(record.outcome_class),
-        executor: record.executor_id.as_ref().map(|e| e.as_str().to_string()),
+        executor: record
+            .source_node
+            .clone()
+            .or_else(|| record.executor_id.as_ref().map(|e| e.as_str().to_string())),
         reporting_party: kernel_reporting_party(record.reporting_party),
         floor_promoted: record.floor_promoted,
         floor_at_cap: record.floor_at_cap,
@@ -730,6 +741,7 @@ mod tests {
             outcome_class: class,
             exec_id: None,
             executor_id: (!executor.is_empty()).then(|| ExecutorId::from(executor)),
+            source_node: None,
             termination_reason: None,
             reporting_party: party,
             exempt: class == OutcomeClass::ExemptInfra,
@@ -956,7 +968,7 @@ mod tests {
         assert_eq!(d.exclusion.len(), 3);
     }
 
-    // r[verify sched.retry.per-executor-budget+2]
+    // r[verify sched.retry.per-executor-budget+3]
     /// C2 (T-1b.11): an `executor_crash` history charges the
     /// threshold/exclusion budget — each established crash joins
     /// `failed_builders` and increments `failure_count`, the placement
@@ -1195,6 +1207,61 @@ mod tests {
         assert_eq!(
             placeable(&ex(&["gone-1", "gone-2"]), &ex(&["w-fresh"])),
             Placement::Placeable
+        );
+    }
+
+    // r[verify sched.retry.per-executor-budget+3]
+    /// AD2 / decision P12: a mixed-era history (one legacy stream
+    /// failure keyed by pod name, one pull-mode failure carrying
+    /// `source_node`) folds into an exclusion set carrying BOTH keys —
+    /// the node key for the pull row (its executor identity, the
+    /// attested intent, never appears) and the pod-name key for the
+    /// legacy row.
+    #[test]
+    fn mixed_era_history_carries_both_exclusion_keys() {
+        let legacy = worker_rec(OutcomeClass::Transient, "pool-pod-1", 100);
+        let mut pull_row = worker_rec(OutcomeClass::Transient, "drv-hash-x", 200);
+        pull_row.source_node = Some("node-1".into());
+        let d = decide_default(&[legacy, pull_row], 300);
+        assert!(
+            d.exclusion.contains(&ExecutorId::from("pool-pod-1")),
+            "legacy row keeps its pod-name exclusion key"
+        );
+        assert!(
+            d.exclusion.contains(&ExecutorId::from("node-1")),
+            "pull-mode row contributes its source node"
+        );
+        assert!(
+            !d.exclusion.contains(&ExecutorId::from("drv-hash-x")),
+            "the pull identity (the intent) is not an exclusion key once the node is known"
+        );
+        assert_eq!(d.counters.failed_builders.len(), 2);
+    }
+
+    // r[verify sched.dispatch.fleet-exhaust+4]
+    // r[verify sched.retry.per-executor-budget+3]
+    /// AD2 small-fleet clause over the re-keyed inputs: with a single
+    /// spawnable source the exhaustion verdict is reachable after that
+    /// one source fails (min(threshold, |sources|) = 1), and the empty
+    /// universe still defers rather than poisons.
+    #[test]
+    fn re_keyed_exhaustion_fires_with_single_source() {
+        let ex = |ids: &[&str]| -> BTreeSet<ExecutorId> {
+            ids.iter().map(|s| ExecutorId::from(*s)).collect()
+        };
+        // One pull-mode failure on the only node in the universe.
+        let mut row = worker_rec(OutcomeClass::Transient, "drv-hash-y", 100);
+        row.source_node = Some("node-only".into());
+        let d = decide_default(&[row], 200);
+        assert_eq!(
+            placeable(&d.exclusion, &ex(&["node-only"])),
+            Placement::FleetExhausted,
+            "|sources| = 1: exhaustion fires once the single source has failed"
+        );
+        assert_eq!(
+            placeable(&d.exclusion, &ex(&[])),
+            Placement::NoEligibleWorkers,
+            "an empty spawnable universe defers, never poisons"
         );
     }
 

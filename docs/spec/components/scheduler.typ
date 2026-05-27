@@ -406,7 +406,7 @@ epilogue in the success path).
   (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 ]
 
-#r("sched.retry.per-executor-budget+2")[
+#r("sched.retry.per-executor-budget+3")[
   `BuildResultStatus::InfrastructureFailure` does NOT count toward the poison
   threshold. It routes through a separate `handle_infrastructure_failure`
   handler: `reset_to_ready` + retry WITHOUT inserting into `failed_builders`.
@@ -415,10 +415,22 @@ epilogue in the success path).
   non-zero, might succeed elsewhere) DOES count. Executor disconnect DOES count
   --- a build that crashes the daemon 3× is poisoned: an executor crash whose
   classifying report never arrives, once its failure is established (the
-  correlation-TTL sweep or the backstop fills
-  `termination_reason='unreported'`), joins `failed_builders` and counts
+  correlation-TTL sweep, the backstop, or the pull-mode establishment sweep
+  fills `termination_reason='unreported'`), joins `failed_builders` and counts
   toward the poison threshold; false-positives from
-  unrelated executor deaths are cleared by `rio-cli poison-clear`. Both knobs
+  unrelated executor deaths are cleared by `rio-cli poison-clear`. The
+  budget's exclusion key is the attempt's _source_: an attempt row carrying
+  `drv_attempts.source_node` (a pull-mode attempt --- the column is written
+  only from the controller-authoritative binding, never from worker-supplied
+  identity) contributes that node as its exclusion/budget key, and a row
+  without it (every stream-mode/legacy row) contributes its executor (pod
+  name) key --- a mixed-era history therefore carries both key kinds in the
+  exclusion set until the stream path retires. Small-fleet clause: when
+  `0 < |distinct eligible sources| < threshold`, the exhaustion verdict
+  (#rref("sched.dispatch.fleet-exhaust")) MUST still be reachable once every
+  existing source has failed --- the effective bound is
+  `min(threshold, |sources|)`, so a single-node fleet poisons after that one
+  source fails rather than deferring forever. Both knobs
   are configurable via `scheduler.toml`: `threshold` (default 3, the former
   `POISON_THRESHOLD` const), `require_distinct_workers` (default true ---
   HashSet semantics; false = any N failures poison, for single-executor dev
@@ -429,16 +441,20 @@ epilogue in the success path).
   any retry budget.
 ]
 
-#r("sched.dispatch.fleet-exhaust+3")[
-  When `find_executor` returns `None` and every _statically-eligible_
+#r("sched.dispatch.fleet-exhaust+4")[
+  The fleet-exhaust verdict is the structural, immediate "every source this
+  derivation could run on has already failed it" poison --- evaluated over
+  `(excluded_sources, eligible_sources)` by `placeable()`, preserving the
+  empty-universe-defers / exhausted-universe-poisons partition: when the
+  eligible universe is empty the check MUST NOT poison --- the derivation
+  defers, because an empty pool/fleet is a provisioning transient
+  (autoscaler lag, a deployment rollout in progress), and poisoning on it
+  would brick every build submitted during the rollout.
+  Stream-path evaluation point (dispatch time, until that path retires):
+  when `find_executor` returns `None` and every _statically-eligible_
   *non-draining* registered worker (matching kind, `system`, and
   `required_features`) is already in `failed_builders`, the derivation is
-  poisoned immediately rather than deferring. When zero statically-eligible
-  non-draining workers are registered (the eligible fleet is empty), the
-  check MUST NOT poison --- the derivation defers: an empty pool is a
-  provisioning transient (autoscaler lag, a deployment rollout in
-  progress), and poisoning on it would brick every build submitted during
-  the rollout. Draining workers MUST be
+  poisoned immediately rather than deferring. Draining workers MUST be
   excluded: under one-shot semantics
   (#rref("sched.ephemeral.no-redispatch-after-completion")), a just-failed
   worker is draining but still in the executor map at completion-time; counting
@@ -453,6 +469,17 @@ epilogue in the success path).
   filter (e.g. kind-only) lets a drv defer forever in a multi-arch or
   feature-partitioned cluster with no INFO-level signal (the I-065 hang shape
   on the system/features axis).
+  Pull-mode evaluation point (the spawn-intent gate, AD2): the
+  spawnable-source universe is k8s-side knowledge, so the controller ---
+  which holds the node informers and renders the intent's `excluded_nodes`
+  as anti-affinity --- detects `excluded_nodes ⊇ spawnable sources` for an
+  intent and reports it through the idempotent `ReportAttemptOutcome` with
+  the distinct reason `NoEligibleSource` instead of spawning an
+  unschedulable Job; the scheduler MUST map that report for a still-Ready
+  derivation to the same fleet-exhaust poison arm (a `fleet_exhaust` marker
+  row plus `Poison(FleetExhausted)`), and MUST treat it as a no-op for a
+  derivation that is no longer Ready (already poisoned, in flight, or
+  resolved) so controller re-ticks stay idempotent.
 ]
 
 ```toml
