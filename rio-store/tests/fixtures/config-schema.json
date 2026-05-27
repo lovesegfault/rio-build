@@ -103,7 +103,7 @@
         "description": "Closure scoping of assignment-token castore reads —\n`r[store.castore.closure-scope]` (ADR-022 P0591). TOML\n`[castore_read_scope]`, env `RIO_CASTORE_READ_SCOPE__*`. See\n[`CastoreReadScope`].",
         "$ref": "#/$defs/CastoreReadScope",
         "default": {
-          "mode": "log",
+          "mode": "enforce",
           "cache_capacity_bytes": 268435456,
           "cache_idle_ttl_secs": 3600
         }
@@ -422,9 +422,9 @@
         "type": "object",
         "properties": {
           "mode": {
-            "description": "`off` — no scope handling (tenant scoping only, dev parity).\n`log` — resolve and compare scopes but never reject; serve\nout-of-scope reads while counting `would_deny` / `scope_absent`.\n`enforce` — out-of-scope reads answer NOT_FOUND, unattested\ntokens are denied, and an unresolvable scope answers\nFAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder\npresents and retries.\n\nDefault `log` for the store-side phase of P0591: the builder\ndoes not present closures yet, so `enforce` would lean every\nassignment-token read on the pins+references derivation\nfallback alone. The default flips to `enforce` (the ADR-022\nend-state, with `log` as the rollback value) when the\nbuilder-side presentation lands. Set via\n`RIO_CASTORE_READ_SCOPE__MODE`.",
+            "description": "`off` — no scope handling (tenant scoping only, dev parity).\n`log` — resolve and compare scopes but never reject; serve\nout-of-scope reads while counting `would_deny` / `scope_absent`.\n`enforce` — out-of-scope reads answer NOT_FOUND, unattested\ntokens are denied, and an unresolvable scope answers\nFAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder\npresents and retries.\n\nDefault `enforce` (ADR-022 closure-scoped reads, decision 9):\nbuilders present `WorkAssignment.input_closure` at mount and\nre-present on `CASTORE_SCOPE_REQUIRED` (P0591 Phase 2), and the\npins+references derivation fallback carries replicas a\npresentation has not reached. `log` is the rollback value (it\nwas the interim default while only the store-side half existed).\nSet via `RIO_CASTORE_READ_SCOPE__MODE`.",
             "$ref": "#/$defs/ScopeMode",
-            "default": "log"
+            "default": "enforce"
           },
           "cache_capacity_bytes": {
             "description": "Capacity of the per-replica presented-ScopeSet cache, in bytes\nof cached path hashes (~32 B per closure path; ~2 MiB for a\n`MAX_INPUT_CLOSURE`-sized closure). Default 256 MiB. Eviction is\nharmless — the builder re-presents on demand. Set via\n`RIO_CASTORE_READ_SCOPE__CACHE_CAPACITY_BYTES`.",
@@ -451,12 +451,12 @@
             "const": "off"
           },
           {
-            "description": "Resolve and compare scopes but never reject: out-of-scope reads\nare served and counted (`would_deny`), absent scopes are served\nand counted (`scope_absent`). Rollback value once `enforce` is\nthe default.\n\nPhase-1 default: the builder does not present closures yet\n(P0591 Phase 2), so every assignment-token read on a fresh\nreplica would otherwise lean on the derivation fallback alone.",
+            "description": "Resolve and compare scopes but never reject: out-of-scope reads\nare served and counted (`would_deny`), absent scopes are served\nand counted (`scope_absent`). The rollback value now that\n`enforce` is the shipped default (it was the interim default for\nthe store-only Phase 1, before the builder presented closures).",
             "type": "string",
             "const": "log"
           },
           {
-            "description": "Reject out-of-scope reads with `NOT_FOUND`, unattested tokens\nwith `PERMISSION_DENIED`, and unresolvable scopes with\n`FAILED_PRECONDITION` + [`rio_proto::CASTORE_SCOPE_REQUIRED_MSG`].",
+            "description": "Reject out-of-scope reads with `NOT_FOUND`, unattested tokens\nwith `PERMISSION_DENIED`, and unresolvable scopes with\n`FAILED_PRECONDITION` + [`rio_proto::CASTORE_SCOPE_REQUIRED_MSG`].\n\nThe shipped default (ADR-022 closure-scoped reads, decision 9)\nsince the builder-side presentation landed (P0591 Phase 2): the\nbuilder presents `WorkAssignment.input_closure` at mount and\nre-presents on `CASTORE_SCOPE_REQUIRED`, and the pins+references\nderivation fallback carries replicas a presentation has not\nreached.",
             "type": "string",
             "const": "enforce"
           }
@@ -506,7 +506,7 @@
       "cache_ttl_secs": 10
     },
     "castore_read_scope": {
-      "mode": "log",
+      "mode": "enforce",
       "cache_capacity_bytes": 268435456,
       "cache_idle_ttl_secs": 3600
     },

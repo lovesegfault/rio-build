@@ -73,20 +73,21 @@ pub enum ScopeMode {
     Off,
     /// Resolve and compare scopes but never reject: out-of-scope reads
     /// are served and counted (`would_deny`), absent scopes are served
-    /// and counted (`scope_absent`). Rollback value once `enforce` is
-    /// the default.
-    ///
-    /// Phase-1 default: the builder does not present closures yet
-    /// (P0591 Phase 2), so every assignment-token read on a fresh
-    /// replica would otherwise lean on the derivation fallback alone.
-    // TODO: flip the shipped default to `Enforce` when the builder-side
-    // presentation (P0591 Phase 2) lands — the ADR's end-state default
-    // (decision 9); `log` here keeps pre-presentation builders working.
-    #[default]
+    /// and counted (`scope_absent`). The rollback value now that
+    /// `enforce` is the shipped default (it was the interim default for
+    /// the store-only Phase 1, before the builder presented closures).
     Log,
     /// Reject out-of-scope reads with `NOT_FOUND`, unattested tokens
     /// with `PERMISSION_DENIED`, and unresolvable scopes with
     /// `FAILED_PRECONDITION` + [`rio_proto::CASTORE_SCOPE_REQUIRED_MSG`].
+    ///
+    /// The shipped default (ADR-022 closure-scoped reads, decision 9)
+    /// since the builder-side presentation landed (P0591 Phase 2): the
+    /// builder presents `WorkAssignment.input_closure` at mount and
+    /// re-presents on `CASTORE_SCOPE_REQUIRED`, and the pins+references
+    /// derivation fallback carries replicas a presentation has not
+    /// reached.
+    #[default]
     Enforce,
 }
 

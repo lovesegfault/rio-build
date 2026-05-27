@@ -410,13 +410,13 @@ pub struct CastoreReadScope {
     /// FAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder
     /// presents and retries.
     ///
-    /// Default `log` for the store-side phase of P0591: the builder
-    /// does not present closures yet, so `enforce` would lean every
-    /// assignment-token read on the pins+references derivation
-    /// fallback alone. The default flips to `enforce` (the ADR-022
-    /// end-state, with `log` as the rollback value) when the
-    /// builder-side presentation lands. Set via
-    /// `RIO_CASTORE_READ_SCOPE__MODE`.
+    /// Default `enforce` (ADR-022 closure-scoped reads, decision 9):
+    /// builders present `WorkAssignment.input_closure` at mount and
+    /// re-present on `CASTORE_SCOPE_REQUIRED` (P0591 Phase 2), and the
+    /// pins+references derivation fallback carries replicas a
+    /// presentation has not reached. `log` is the rollback value (it
+    /// was the interim default while only the store-side half existed).
+    /// Set via `RIO_CASTORE_READ_SCOPE__MODE`.
     pub mode: crate::grpc::scope::ScopeMode,
     /// Capacity of the per-replica presented-ScopeSet cache, in bytes
     /// of cached path hashes (~32 B per closure path; ~2 MiB for a

@@ -446,7 +446,7 @@
       {
         "key": "castore_read_scope.mode",
         "type": "ScopeMode",
-        "default": "log",
+        "default": "enforce",
         "description": "`off` — no scope handling (tenant scoping only, dev parity). `log` — resolve and compare scopes but never reject; serve out-of-scope reads while counting `would_deny` / `scope_absent`. `enforce` — out-of-scope reads answer NOT_FOUND, unattested tokens are denied, and an unresolvable scope answers FAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder presents and retries."
       },
       {

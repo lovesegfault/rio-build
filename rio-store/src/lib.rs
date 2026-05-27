@@ -302,8 +302,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_castore_scope_would_deny_total",
         "Castore reads that enforce mode WOULD have denied but log mode served, labeled \
-         by reason (out_of_scope | unattested). Must stay at zero before flipping \
-         castore_read_scope.mode to enforce."
+         by reason (out_of_scope | unattested). Only moves under the log rollback mode \
+         (enforce is the shipped default); it must drain back to zero before flipping a \
+         rolled-back cluster to enforce again."
     );
     describe_counter!(
         "rio_store_service_token_accepted_total",

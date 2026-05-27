@@ -17,6 +17,7 @@
     "rio_builder_castore_fuse_open_seconds",
     "rio_builder_castore_fuse_promote_fail_total",
     "rio_builder_castore_fuse_upcalls_total",
+    "rio_builder_castore_scope_present_total",
     "rio_builder_cgroup_leak_total",
     "rio_builder_cgroup_oom_total",
     "rio_builder_cpu_fraction",
@@ -351,6 +352,11 @@
         "name": "rio_builder_castore_fuse_upcalls_total",
         "kind": "counter",
         "help": "Castore-FUSE kernel upcalls by op (lookup/getattr/readdir/readlink/open/read). The single cold-metadata counter: with every cache TTL infinite, lookup/readdir fire ~once per distinct dentry per build (the dcache and FOPEN_CACHE_DIR absorb repeats); op=\"read\">0 means passthrough is not engaging."
+      },
+      {
+        "name": "rio_builder_castore_scope_present_total",
+        "kind": "counter",
+        "help": "PresentClosure calls made by the closure-scope presenter (ADR-022 P0591), labeled by trigger (mount = proactive presentation before the build's first castore read; scope_required = re-presentation after a store replica answered CASTORE_SCOPE_REQUIRED) and outcome (ok / unsupported = the store predates the RPC / error). A steady scope_required rate tracks per-replica presentation churn under L7 balancing; outcome=error means presentations are being rejected — check the store's scope_mismatch counter and the scheduler's closure attestation."
       },
       {
         "name": "rio_builder_cgroup_leak_total",
@@ -1275,7 +1281,7 @@
       {
         "name": "rio_store_castore_scope_would_deny_total",
         "kind": "counter",
-        "help": "Castore reads that enforce mode WOULD have denied but log mode served, labeled by reason (out_of_scope | unattested). Must stay at zero before flipping castore_read_scope.mode to enforce."
+        "help": "Castore reads that enforce mode WOULD have denied but log mode served, labeled by reason (out_of_scope | unattested). Only moves under the log rollback mode (enforce is the shipped default); it must drain back to zero before flipping a rolled-back cluster to enforce again."
       },
       {
         "name": "rio_store_castore_terminal_rejected_total",

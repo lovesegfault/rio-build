@@ -168,13 +168,15 @@
 ]
 
 The closure bound in the read-authorization bullet above is mode-gated
-(#rref("store.castore.closure-scope")): it is enforced once
-`castore_read_scope.mode = "enforce"` — until the builder-side presentation
-lands and flips that default (P0591 Phase 2), the shipped `log` mode observes
-and counts out-of-scope reads without rejecting them, so the leaked-token
-exposure in the interim is the tenant-wide read of
+(#rref("store.castore.closure-scope")) and enforced by default:
+`castore_read_scope.mode = "enforce"` is the shipped default now that the
+builder presents its closure at mount and re-presents on demand
+(#rref("builder.castore.scope-present"), P0591 Phase 2). Setting the `log`
+rollback value re-opens the interim exposure — out-of-scope reads are then
+served (and counted) and a leaked token falls back to the tenant-wide read of
 #rref("store.castore.tenant-scope+2") bounded by
-#rref("store.castore.terminal-revocation").
+#rref("store.castore.terminal-revocation") — so rollbacks should be
+short-lived and watched via the would-deny metrics.
 
 #r("common.hmac.expiry-cap")[
   The scheduler MUST bound the assignment-token lifetime at mint time:
