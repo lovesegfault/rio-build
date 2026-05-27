@@ -5041,3 +5041,68 @@ async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
     );
     Ok(())
 }
+
+/// Post-failover completion of a floating-CA hook-fallback build must
+/// still register its realisation: the recovered node's CA modular hash
+/// is recomputed from the persisted authoritative bytes, so the
+/// consumable-result guarantee of the inline fallback survives scheduler
+/// failover.
+// r[verify sched.recovery.inline-drv-ca-hash]
+#[tokio::test]
+async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+    let drv_path = rio_test_support::fixtures::test_drv_path("hook-ca-realise");
+    let expected_hash = rio_nix::derivation::hash_derivation_modulo(
+        &rio_nix::derivation::Derivation::parse(aterm).unwrap(),
+        &drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let aterm_seed = aterm.as_bytes().to_vec();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        let mut node = make_node("hook-ca-realise");
+        node.drv_content = aterm_seed;
+        node.drv_content_authoritative = true;
+        node.is_content_addressed = true;
+        node.expected_output_paths = vec![String::new()];
+        node.ca_modular_hash = expected_hash.to_vec();
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: dispatch to a worker and complete with a realized
+    // CA output. The recovered node's modular hash was recomputed from
+    // the persisted bytes, so the completion registers the realisation
+    // under the same key the hook client will look up.
+    let mut rx = connect_executor(&handle, "ca-realise-w", "x86_64-linux").await?;
+    let _assignment = recv_assignment(&mut rx).await;
+    complete_ca(
+        &handle,
+        "ca-realise-w",
+        &drv_path,
+        &[(
+            "out",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hook-ca-out",
+            vec![0x42u8; 32],
+        )],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (path,): (String,) = sqlx::query_as(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = 'out'",
+    )
+    .bind(expected_hash.as_slice())
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert_eq!(
+        path, "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hook-ca-out",
+        "post-failover CA completion must register the realisation under the recomputed key"
+    );
+    Ok(())
+}

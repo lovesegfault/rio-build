@@ -531,7 +531,11 @@ impl RetryState {
 /// All fields except `is_ca` are **in-memory only**: recovered CA-on-CA
 /// chains dispatch unresolved (collect_ca_inputs skips None) → worker
 /// fails on placeholder → retry. The gateway recomputes on the NEXT
-/// SubmitBuild that references the derivation.
+/// SubmitBuild that references the derivation. The one exception is
+/// `modular_hash` for authoritative hook-fallback nodes: recovery
+/// recomputes it from the persisted inline content
+/// (`sched.recovery.inline-drv-ca-hash`) so post-failover completion
+/// still registers the realisation.
 #[derive(Debug, Clone, Default)]
 pub struct CaState {
     /// Whether this derivation is content-addressed (fixed-output OR
@@ -561,9 +565,13 @@ pub struct CaState {
     /// For CA derivations: the modular derivation hash
     /// (`hashDerivationModulo` SHA-256). Realisations table PK half.
     /// Set at DAG merge from proto `DerivationNode.ca_modular_hash`
-    /// (the gateway computes it post-BFS from the full drv_cache).
-    /// `None` for IA derivations AND for the single-node
-    /// `BasicDerivation` fallback (no transitive closure to compute over).
+    /// (the gateway computes it post-BFS from the full drv_cache, and
+    /// for the single-node `BasicDerivation` hook fallback from the
+    /// lifted inline derivation). `None` for IA derivations. After a
+    /// scheduler failover it is recomputed from the persisted
+    /// authoritative inline content for hook-fallback nodes
+    /// (`sched.recovery.inline-drv-ca-hash`); ordinary DAG-path CA
+    /// nodes recover with `None` (lossy, see struct doc).
     ///
     /// Consumed by:
     /// - `collect_ca_inputs` ([`crate::actor`] dispatch) — this node
@@ -1137,7 +1145,10 @@ impl DerivationState {
     /// `M_062`) — those bytes exist nowhere else, so the worker could
     /// not fetch them. For every other node it is empty and the
     /// worker fetches the `.drv` from the store via GetPath (fallback
-    /// path, still supported in executor).
+    /// path, still supported in executor). When such a node is
+    /// content-addressed, its CA modular hash is recomputed from the
+    /// restored bytes so post-failover completion still registers the
+    /// realisation (`sched.recovery.inline-drv-ca-hash`).
     ///
     /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
     /// happen (it was validated at merge time before persist) but
@@ -1158,6 +1169,57 @@ impl DerivationState {
             &row.required_features,
             row.pname.as_deref(),
         );
+        // Parse the persisted authoritative content once (when present):
+        // it feeds both the prefetch-hint inputSrcs and — for CA nodes —
+        // the modular-hash recompute below.
+        let parsed_content = row
+            .drv_content
+            .as_deref()
+            .and_then(|c| std::str::from_utf8(c).ok())
+            .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok());
+        // r[impl sched.recovery.inline-drv-ca-hash]
+        // A recovered content-addressed hook-fallback node must regain
+        // its CA modular hash, or its post-failover completion would
+        // silently skip realisation registration (the consumable-result
+        // guarantee of gw.hook.fallback-built-outputs). Recompute it
+        // from the restored bytes — the same
+        // `hash_derivation_modulo(…, |_| None)` computation SubmitBuild
+        // ingress validated at admission — rather than persisting a
+        // second column that could drift from the content. Failure
+        // (pre-validation rows, manual edits) degrades to `None` with a
+        // warning: recovery never fails and the build still completes,
+        // only realisation registration is lost (now visibly).
+        let modular_hash = if row.is_ca && row.drv_content.is_some() {
+            match parsed_content.as_ref() {
+                Some(drv) => rio_nix::derivation::hash_derivation_modulo(
+                    drv,
+                    &row.drv_path,
+                    &|_| None,
+                    &mut std::collections::HashMap::new(),
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        drv_path = %row.drv_path,
+                        error = %e,
+                        "recovery: failed to recompute the CA modular hash from persisted drv_content"
+                    );
+                })
+                .ok(),
+                None => {
+                    tracing::warn!(
+                        drv_path = %row.drv_path,
+                        "recovery: persisted authoritative drv_content did not parse; CA modular hash stays unset"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let recovered_input_srcs: Vec<String> = parsed_content
+            .as_ref()
+            .map(|d| d.input_srcs().iter().cloned().collect())
+            .unwrap_or_default();
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -1176,6 +1238,9 @@ impl DerivationState {
             is_fixed_output: row.is_fixed_output,
             ca: CaState {
                 is_ca: row.is_ca,
+                // Recomputed above for authoritative hook-fallback rows;
+                // None for everything else.
+                modular_hash,
                 // Remaining CA fields lossy on recovery — see CaState doc.
                 ..Default::default()
             },
@@ -1204,20 +1269,14 @@ impl DerivationState {
             // Authoritative inline derivation (hook fallback) is the
             // only copy anywhere — restore it so post-failover
             // dispatch still works; everything else stays empty and
-            // the worker fetches the .drv from the store. Re-run the
-            // same best-effort inputSrcs parse as try_from_node so
-            // prefetch hints are also restored. A row only ever holds
+            // the worker fetches the .drv from the store. The
+            // inputSrcs prefetch hints come from the same parse as the
+            // modular-hash recompute above. A row only ever holds
             // content when the creating submission marked it
             // authoritative (sched.persist.creation-scoped), so the
             // flag is re-derived from presence.
             drv_content_authoritative: row.drv_content.is_some(),
-            input_srcs: row
-                .drv_content
-                .as_deref()
-                .and_then(|c| std::str::from_utf8(c).ok())
-                .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
-                .map(|d| d.input_srcs().iter().cloned().collect())
-                .unwrap_or_default(),
+            input_srcs: recovered_input_srcs,
             drv_content: row.drv_content.unwrap_or_default(),
             retry: RetryState {
                 count: row.retry_count.max(0) as u32,
@@ -2571,6 +2630,71 @@ mod tests {
         .expect("row hydrates");
         assert!(bare.drv_content.is_empty(), "no persisted content → empty");
         assert!(bare.input_srcs.is_empty());
+    }
+
+    /// A recovered CA node carrying authoritative inline content regains
+    /// its modular hash (recomputed from the bytes — identical to what
+    /// ingress validated); rows without content, non-CA rows, and
+    /// unparseable content stay `None`.
+    // r[verify sched.recovery.inline-drv-ca-hash]
+    #[test]
+    fn from_recovery_row_recomputes_ca_modular_hash_for_authoritative_content() {
+        let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+        let row = crate::db::RecoveryDerivationRow {
+            drv_content: Some(aterm.as_bytes().to_vec()),
+            is_ca: true,
+            expected_output_paths: vec![String::new()],
+            ..crate::db::RecoveryDerivationRow::test_default("ca-durable", "x86_64-linux")
+        };
+        let expected = rio_nix::derivation::hash_derivation_modulo(
+            &rio_nix::derivation::Derivation::parse(aterm).unwrap(),
+            &row.drv_path,
+            &|_| None,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let state =
+            DerivationState::from_recovery_row(row, DerivationStatus::Ready).expect("hydrates");
+        assert_eq!(
+            state.ca.modular_hash,
+            Some(expected),
+            "modular hash recomputed from the restored bytes"
+        );
+
+        // CA without persisted content: stays None (ordinary DAG-path CA
+        // node — the documented lossy posture).
+        let bare_ca = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: true,
+                ..crate::db::RecoveryDerivationRow::test_default("ca-bare", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(bare_ca.ca.modular_hash, None);
+
+        // Content on a non-CA row: no hash.
+        let ia = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                drv_content: Some(b"Derive-not-ca".to_vec()),
+                ..crate::db::RecoveryDerivationRow::test_default("ia-durable", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(ia.ca.modular_hash, None);
+
+        // Unparseable content on a CA row: degrades to None, no panic.
+        let broken = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                drv_content: Some(b"not-an-aterm".to_vec()),
+                is_ca: true,
+                ..crate::db::RecoveryDerivationRow::test_default("ca-broken", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(broken.ca.modular_hash, None);
     }
 }
 

@@ -1586,6 +1586,22 @@ leave its persisted content untouched. Rows written before the column existed
 (or by a pre-upgrade scheduler) recover with empty content and keep the
 pre-durability failure mode for that one window.
 
+#r("sched.recovery.inline-drv-ca-hash")[
+  A recovered derivation carrying authoritative inline content that is
+  content-addressed MUST have its CA modular hash rederived from the restored
+  bytes during recovery (`hashDerivationModulo` over the parsed content with
+  no input resolution --- the same computation `SubmitBuild` ingress
+  validated), so a post-failover completion still registers its realisation
+  under the key returned to the hook client and merge-time realisation cache
+  hits still apply. All other recovered derivations keep an unset modular
+  hash.
+]
+Recompute-from-bytes rather than a persisted hash column keeps the
+realisation key inseparable from the content actually persisted: the two
+cannot drift, no migration is needed, and a row whose bytes fail to parse
+degrades to an unset hash (the build still completes; only realisation
+registration is lost, with a warning).
+
 #r("sched.merge.authoritative-conflict")[
   A node whose in-memory state carries authoritative inline derivation
   content MUST NOT be redefined by a later submission for the same
