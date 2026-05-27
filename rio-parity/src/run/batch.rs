@@ -9,19 +9,14 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 /// One submittable job (target drv + its dependency drv closure, from
-/// dep-closure.jsonl).
+/// dep-closure.jsonl). Closure sizing is always done on the merged-batch
+/// union inside [`assemble_batches`], never per job — shared dependencies
+/// must only count once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingJob {
     pub job: String,
     pub drv_path: String,
     pub dep_drvs: Vec<String>,
-}
-
-impl PendingJob {
-    /// Per-job closure size estimate: the target plus its dep drvs.
-    pub fn node_estimate(&self) -> usize {
-        1 + self.dep_drvs.len()
-    }
 }
 
 /// One assembled batch.
@@ -37,7 +32,9 @@ pub struct Batch {
 /// Greedy accumulation in input order, capped on both job count and the
 /// merged node estimate. A single job whose own estimate exceeds `max_nodes`
 /// becomes a singleton batch: it must still be submitted, just never packed
-/// together with anything else.
+/// together with anything else. Pathological caps therefore reduce batching
+/// efficiency but never drop work — `max_nodes = 0` degrades to one batch
+/// per job, and `max_jobs` is clamped to at least 1.
 pub fn assemble_batches(jobs: &[PendingJob], max_jobs: usize, max_nodes: usize) -> Vec<Batch> {
     let max_jobs = max_jobs.max(1);
     let mut batches = Vec::new();
@@ -136,6 +133,9 @@ mod tests {
         // oversized job as its own batch.
         let m1 = assemble_batches(&[big], 50, 4500);
         assert_eq!(m1.len(), 1);
+        // A zero node cap degrades to one batch per job, never dropped work.
+        let zero = assemble_batches(&[job("a", 2), job("b", 0)], 50, 0);
+        assert_eq!(zero.len(), 2);
     }
 
     #[test]

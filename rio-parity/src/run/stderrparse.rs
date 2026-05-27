@@ -28,6 +28,11 @@ static DRV_FAILED_RE: LazyLock<Regex> =
 /// Everything the engine extracts from one batch's stderr.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedStderr {
+    /// Build id from the gateway's `rio: build <uuid>` line. The gateway
+    /// emits exactly one such line per accepted `nix build` invocation, so
+    /// the FIRST id seen wins; a later line carrying a different id is
+    /// ignored (with a warning) rather than re-keying the invocation
+    /// mid-stream.
     pub build_id: Option<String>,
     /// drv path → reason (first occurrence wins; the scheduler emits one
     /// terminal Failed per drv per build).
@@ -37,10 +42,24 @@ pub struct ParsedStderr {
 /// Feed one stderr line into `parsed` (streaming form, used by the live
 /// child-stderr reader).
 pub fn parse_line(parsed: &mut ParsedStderr, line: &str) {
-    if parsed.build_id.is_none()
-        && let Some(c) = BUILD_ID_RE.captures(line)
-    {
-        parsed.build_id = Some(c[1].to_string());
+    if let Some(c) = BUILD_ID_RE.captures(line) {
+        let id = &c[1];
+        match &parsed.build_id {
+            None => parsed.build_id = Some(id.to_string()),
+            // One `nix build` invocation carries exactly one accepted rio
+            // build, so a second DISTINCT id means the stream is not what
+            // the engine assumes (e.g. two invocations' stderr concatenated).
+            // Keep the first id — earlier failure lines belong to it — and
+            // surface the anomaly instead of silently switching handles.
+            Some(existing) if existing != id => {
+                tracing::warn!(
+                    kept = %existing,
+                    ignored = id,
+                    "second distinct `rio: build` id in one stderr stream; keeping the first"
+                );
+            }
+            Some(_) => {}
+        }
     }
     if let Some(c) = DRV_FAILED_RE.captures(line) {
         parsed
@@ -122,7 +141,11 @@ pub fn classify_reason(reason: &str) -> ReasonClass {
 /// failures across jobs, derived from the relayed reason (preferred) or the
 /// captured log tail (fallback). Signatures are raw-evidence-derived — they
 /// make no attempt to explain a failure, only to collapse repeats of the
-/// same one.
+/// same one. The 60-character slugs collapse byte-identical message
+/// prefixes only: the same underlying failure mode worded differently (or
+/// carrying different embedded paths/versions) yields different signatures,
+/// so signature counts are NOT failure-mode counts — folding those together
+/// is a curated-rule-table concern for a later milestone.
 pub fn signature_for(reason: Option<&str>, log_tail: Option<&str>) -> Option<String> {
     if let Some(r) = reason {
         let class = classify_reason(r);
@@ -139,19 +162,8 @@ pub fn signature_for(reason: Option<&str>, log_tail: Option<&str>) -> Option<Str
                 } else if r.starts_with("max_retries=") {
                     "transient-retries-exhausted".to_string()
                 } else {
-                    // Unprefixed worker permanent failure: first 60 chars, normalized.
-                    let mut s: String = r
-                        .chars()
-                        .map(|c| {
-                            if c.is_ascii_alphanumeric() {
-                                c.to_ascii_lowercase()
-                            } else {
-                                '-'
-                            }
-                        })
-                        .collect();
-                    s.truncate(60);
-                    format!("worker:{}", s.trim_matches('-'))
+                    // Unprefixed worker permanent failure.
+                    format!("worker:{}", slug60(r))
                 }
             }
         };
@@ -164,19 +176,26 @@ pub fn signature_for(reason: Option<&str>, log_tail: Option<&str>) -> Option<Str
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
             .trim();
-        let mut s: String = line
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        s.truncate(60);
-        format!("log:{}", s.trim_matches('-'))
+        format!("log:{}", slug60(line))
     })
+}
+
+/// Normalize a free-form message into a short grouping slug: ASCII
+/// alphanumerics are lowercased, everything else becomes `-`, the result is
+/// cut at 60 characters and trimmed of leading/trailing dashes.
+fn slug60(text: &str) -> String {
+    let mut s: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    s.truncate(60);
+    s.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
@@ -232,6 +251,40 @@ mod tests {
         let mut p3 = ParsedStderr::default();
         parse_line(&mut p3, "rio: build of something else");
         assert!(p3.build_id.is_none());
+    }
+
+    #[test]
+    fn second_distinct_build_id_keeps_the_first() {
+        let mut p = ParsedStderr::default();
+        parse_line(&mut p, "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a");
+        parse_line(&mut p, "rio: build ffffffff-ffff-ffff-ffff-ffffffffffff");
+        assert_eq!(
+            p.build_id.as_deref(),
+            Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+    }
+
+    #[test]
+    fn failure_line_with_progress_prefix_still_parses() {
+        let mut p = ParsedStderr::default();
+        parse_line(
+            &mut p,
+            "[31/5/97 built] derivation '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv' failed: builder failed with exit code 2",
+        );
+        assert_eq!(
+            p.reasons["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv"],
+            "builder failed with exit code 2"
+        );
+    }
+
+    #[test]
+    fn duplicate_failure_lines_keep_the_first_reason() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+        let mut p = ParsedStderr::default();
+        parse_line(&mut p, &format!("derivation '{drv}' failed: first reason"));
+        parse_line(&mut p, &format!("derivation '{drv}' failed: second reason"));
+        assert_eq!(p.reasons.len(), 1);
+        assert_eq!(p.reasons[drv], "first reason");
     }
 
     /// Every scheduler terminal-failure reason string maps to the class the

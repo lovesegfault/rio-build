@@ -23,6 +23,7 @@ pub mod plan;
 pub mod spec;
 pub mod state;
 pub mod stderrparse;
+pub mod submitter;
 
 use std::path::PathBuf;
 

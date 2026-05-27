@@ -886,6 +886,11 @@
       "doc": "Parsing of the `nix build -L` child's stderr: the gateway's"
     },
     {
+      "path": "run/submitter.rs",
+      "depth": 1,
+      "doc": "Batch submission to the rio gateway over ssh-ng."
+    },
+    {
       "path": "s3.rs",
       "depth": 0,
       "doc": "Write-once S3 layout writer for eval-set artifacts."
