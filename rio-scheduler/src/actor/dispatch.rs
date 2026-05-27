@@ -1554,35 +1554,42 @@ impl DagActor {
         // §P0590: resolve the node the Mount-admission token will be
         // scoped to BEFORE any state mutation, so the `require` policy
         // can defer the derivation one dispatch pass without anything
-        // to roll back. Only consulted when the Ed25519 mountd signer
-        // is configured — the legacy/HMAC token carries no node claim
-        // and keyless deployments mint nothing.
+        // to roll back. Resolved ONLY when the Ed25519 mountd signer is
+        // configured — the legacy/HMAC token carries no node claim and
+        // keyless deployments mint nothing, so without the signer there
+        // is no resolution, no mismatch/unresolved accounting, and the
+        // `assignments.node_name` audit column stays NULL.
         // r[impl builder.mountd.token-node-scoped]
-        let mountd_node = self.resolve_mountd_node(executor_id);
-        if self.mountd_ed25519_signer.is_some() && mountd_node.is_none() {
-            metrics::counter!("rio_scheduler_node_binding_unresolved_total").increment(1);
-            match self.mountd_node_binding {
-                crate::config::MountdNodeBinding::Require => {
-                    warn!(
-                        drv_hash = %drv_hash,
-                        executor_id = %executor_id,
-                        "mountd node binding unresolved (no controller-attested binding or \
-                         executor report) and mountd_node_binding = require; deferring this \
-                         derivation one dispatch pass"
-                    );
-                    return false;
-                }
-                crate::config::MountdNodeBinding::Prefer => {
-                    warn!(
-                        drv_hash = %drv_hash,
-                        executor_id = %executor_id,
-                        "mountd node binding unresolved; minting an UNBOUND Mount-admission \
-                         token (mountd_node_binding = prefer) — node-checking mountds will \
-                         reject it"
-                    );
+        let mountd_node = if self.mountd_ed25519_signer.is_some() {
+            let resolved = self.resolve_mountd_node(executor_id);
+            if resolved.is_none() {
+                metrics::counter!("rio_scheduler_node_binding_unresolved_total").increment(1);
+                match self.mountd_node_binding {
+                    crate::config::MountdNodeBinding::Require => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            "mountd node binding unresolved (no controller-attested binding or \
+                             executor report) and mountd_node_binding = require; deferring this \
+                             derivation one dispatch pass"
+                        );
+                        return false;
+                    }
+                    crate::config::MountdNodeBinding::Prefer => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            "mountd node binding unresolved; minting an UNBOUND Mount-admission \
+                             token (mountd_node_binding = prefer) — node-checking mountds will \
+                             reject it"
+                        );
+                    }
                 }
             }
-        }
+            resolved
+        } else {
+            None
+        };
         if !self.transition_to_assigned(drv_hash, executor_id) {
             return false;
         }

@@ -235,9 +235,6 @@ async fn main() -> anyhow::Result<()> {
     let mountd_signer = rio_auth::hmac::HmacSigner::load(cfg.mountd_hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("mountd HMAC key load: {e}"))?
         .map(Arc::new);
-    if mountd_signer.is_some() {
-        info!("mountd token signing enabled (WorkAssignment.mountd_token)");
-    }
     // Ed25519 mountd Mount-admission signer (ADR-022 mount-admission
     // credentials, §P0590). The scheduler is the only holder of this
     // key; every rio-mountd holds public trust roots only, so builder
@@ -249,6 +246,10 @@ async fn main() -> anyhow::Result<()> {
         rio_auth::mountd_token::MountdSigningKey::load(cfg.mountd_signing_key_path.as_deref())
             .map_err(|e| anyhow::anyhow!("mountd Ed25519 signing key load: {e}"))?
             .map(Arc::new);
+    // Startup logging only after both knobs are loaded, so the line an
+    // operator sees matches the signer dispatch will actually use: the
+    // legacy "HMAC signing enabled" line never fires when the Ed25519
+    // key wins.
     if let Some(signer) = &mountd_ed25519_signer {
         info!(
             signing_key = signer.key_name(),
@@ -262,6 +263,8 @@ async fn main() -> anyhow::Result<()> {
                  removed in the final ADR-022 §P0590 phase)"
             );
         }
+    } else if mountd_signer.is_some() {
+        info!("mountd token signing enabled (WorkAssignment.mountd_token)");
     }
 
     // ADR-023 phase-13: hw-band cost table. PG-backed (sla_ema_state)

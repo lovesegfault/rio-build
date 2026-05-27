@@ -303,6 +303,12 @@ impl DagActor {
         const BUILDER_NODE_STALE_SWEEP_EVERY: u64 = 360;
 
         if !self.hung_nodes.is_empty() {
+            // Deliberately re-issued every tick while a name sits in the
+            // `hung_nodes` repeat window (≤ HUNG_NODE_REPEAT_TTL, i.e. a
+            // dozen ticks): the UPDATE's `retired_at IS NULL` guard makes
+            // repeats a no-op row-wise, and the repetition is what makes
+            // a retire that raced a concurrent ack-upsert (which clears
+            // `retired_at`) converge instead of being lost.
             let hung: Vec<String> = self.hung_nodes.keys().cloned().collect();
             if let Err(e) = self.db.retire_builder_nodes(&hung).await {
                 debug!(error = %e, nodes = hung.len(),
