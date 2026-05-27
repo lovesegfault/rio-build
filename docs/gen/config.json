@@ -220,6 +220,18 @@
         "description": "HMAC key file for signing rio-mountd Mount-admission tokens (ADR-022 §P0559)."
       },
       {
+        "key": "mountd_signing_key_path",
+        "type": "string",
+        "default": "",
+        "description": "Ed25519 signing key file for rio-mountd Mount-admission tokens (ADR-022 mount-admission credentials, §P0590)."
+      },
+      {
+        "key": "mountd_node_binding",
+        "type": "MountdNodeBinding",
+        "default": "require",
+        "description": "What dispatch does when the target node for an rmt2 Mount-admission token cannot be resolved (no controller-attested binding for the executor, no executor-reported node): `require` (default) defers that derivation one dispatch pass — strict mountds reject unbound tokens, so minting one would only convert a transient knowledge gap into a build failure; `prefer` mints the token without a node claim (operational escape hatch — node-checking mountds will reject it)."
+      },
+      {
         "key": "jwt.required",
         "type": "boolean",
         "default": "false",

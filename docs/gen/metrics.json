@@ -91,6 +91,7 @@
     "rio_mountd_sweep_low_space_total",
     "rio_mountd_sweep_removed_total",
     "rio_mountd_sweep_seconds",
+    "rio_mountd_trust_root",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -145,6 +146,8 @@
     "rio_scheduler_log_unknown_drv_dropped_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_merge_phase_seconds",
+    "rio_scheduler_node_binding_mismatch_total",
+    "rio_scheduler_node_binding_unresolved_total",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
     "rio_scheduler_phases_rejected_total",
@@ -683,7 +686,7 @@
       {
         "name": "rio_mountd_mount_rejected_total",
         "kind": "counter",
-        "help": "Mount admission rejections in token mode (labeled by reason: token-missing/ token-invalid/build-id-mismatch/audience-mismatch)"
+        "help": "Mount admission rejections in token mode (labeled by reason: token-missing/ token-invalid/build-id-mismatch/audience-mismatch/node-mismatch/node-missing)"
       },
       {
         "name": "rio_mountd_promote_bytes_total",
@@ -724,6 +727,11 @@
         "name": "rio_mountd_sweep_seconds",
         "kind": "histogram",
         "help": "Wall-clock duration of one triggered disk-pressure sweep pass (eviction until the high-water mark clears or candidates run out)"
+      },
+      {
+        "name": "rio_mountd_trust_root",
+        "kind": "gauge",
+        "help": "1 per Ed25519 Mount-admission trust root loaded at startup (labeled by key_name). Mandatory rotation precondition: flip the scheduler's signing key only after every mountd reports the incoming key here (ADR-022 mount-admission credentials)"
       }
     ],
     "scheduler": [
@@ -996,6 +1004,16 @@
         "name": "rio_scheduler_merge_phase_seconds",
         "kind": "histogram",
         "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+      },
+      {
+        "name": "rio_scheduler_node_binding_mismatch_total",
+        "kind": "counter",
+        "help": "Mountd-token node-resolution sources (controller-attested by pod name, controller-attested by intent, executor self-report) that disagreed with the resolved value at dispatch (ADR-022 §P0590). The controller-attested value wins; a sustained rate means stale acks or pod-name reuse — check the controller's pod informer."
+      },
+      {
+        "name": "rio_scheduler_node_binding_unresolved_total",
+        "kind": "counter",
+        "help": "Dispatches where no source could resolve the target node for the rmt2 Mount-admission token (ADR-022 §P0590). Under mountd_node_binding=require the derivation was deferred one pass; under prefer an unbound token was minted (node-checking mountds reject it). Brief blips right after pod spawn are normal (controller-ack lag); sustained growth means executors are not reporting RIO_NODE_NAME and controller acks carry no pod_name."
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

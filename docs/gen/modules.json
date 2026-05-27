@@ -1038,6 +1038,11 @@
       "doc": "Batch operations for `persist_merge_to_db` — build-derivation mapping +"
     },
     {
+      "path": "db/builder_nodes.rs",
+      "depth": 1,
+      "doc": "`builder_nodes` registry — §P0590 node-lineage audit (M_069)."
+    },
+    {
       "path": "db/builds.rs",
       "depth": 1,
       "doc": "Build CRUD + status transitions — `builds` table."
