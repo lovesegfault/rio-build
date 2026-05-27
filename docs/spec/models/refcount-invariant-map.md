@@ -1051,6 +1051,18 @@ the mark set once) is fixed by store size; the prepare term is paid
 once per cycle and could be folded into the expansion statement later
 without changing the architecture.
 
+Statement amendment (Wave-A1 review, finding C1/C11): the pinned
+soft-delete template (`COLLECT_BATCH_UPDATE_SQL`) now re-checks the
+collect predicate's row-local conjuncts — `deleted = FALSE` and the
+`GREATEST(created_at, last_referenced_at) < cutoff` grace term — in its
+own WHERE clause, as the T-1a.8 consequence note below requires of the
+live arm; the EXPLAIN gate-(b) guard pins only the candidate scan
+(unaffected), and the cost delta is one `GREATEST` evaluation per
+already-locked row, so the recorded gate-(c) and gate-(c)-v4 figures in
+this entry and T-1a.1c stand. A behavioral + structural regression test
+(`collect_batch_update_rechecks_collect_predicate`) fails if the
+conjunct is dropped again.
+
 #### T-1a.1c — capped-cycle confirmation (re-entry gate (c), v4 form)
 
 The second re-entry redefined gate (c) to the capped cycle (design §4.1

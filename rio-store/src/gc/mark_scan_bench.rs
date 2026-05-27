@@ -1040,15 +1040,30 @@ const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chunks c \
      ORDER BY c.blake3_hash \
      LIMIT $3";
 
-/// One collect batch's soft-delete: the `sweep_orphan_batch` UPDATE
-/// with the predicate swapped (the candidates already passed the
-/// anti-join + grace scan; the `deleted = FALSE` conjunct is the same
-/// re-check-at-execution-time the orphan sweep carries). The bind is
-/// the candidate scan's result, which is already in ascending hash
+/// One collect batch's soft-delete. The UPDATE re-evaluates the collect
+/// predicate's row-local conjuncts — `deleted = FALSE` plus the
+/// `GREATEST(created_at, last_referenced_at) < cutoff` grace term — in
+/// its own WHERE clause, per the T-1a.8 consequence recorded in
+/// `docs/spec/models/refcount-invariant-map.md` (chunkCollect encoding
+/// notes, the row-lock / READ-COMMITTED bullet) and design §4.1's
+/// in-flight-overlap sentence: a READ-COMMITTED row-lock wait re-checks
+/// only the conjuncts present in this WHERE, so the touch/grace
+/// re-check here is what protects a chunk re-referenced and touched
+/// between the candidate scan and this UPDATE; the anti-join is not
+/// re-evaluated. The model's writer-bounded HOLDS verdict is stated
+/// against this predicate-re-checking shape — the live arm (T-1a.8)
+/// MUST NOT ship a hash-only or deleted-only WHERE. This mirrors
+/// `sweep_orphan_batch`, whose UPDATE re-checks its full liveness
+/// predicate (`refcount = 0 AND deleted = FALSE`); this statement is
+/// its predicate-swapped analog. In the bench (no concurrent writers)
+/// the grace conjunct filters nothing — it is pinned here because this
+/// constant is the template the live arm is expected to adopt. The bind
+/// is the candidate scan's result, which is already in ascending hash
 /// order — the `r[store.chunk.lock-order]` discipline for `= ANY`
 /// writers.
 const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL \
      WHERE blake3_hash = ANY($1) AND deleted = FALSE \
+       AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
      RETURNING blake3_hash, size";
 
 /// The candidate-scan statement with literals spliced in place of the
@@ -1371,12 +1386,15 @@ async fn run_collect_phase(
     // ---- Collect (timed): keyset-batched soft-delete loop ----
     // Per batch, one transaction: candidate scan (already hash-ordered
     // by the keyset SELECT), then the sorted `= ANY` soft-delete — the
-    // sweep_orphan_batch shape with the predicate swapped. The loop
-    // ends on the first short candidate scan (pass complete) or when
-    // `victim_cap` victims have been collected (cap stop — the v4
-    // capped collect; the per-batch LIMIT is clamped to the remaining
-    // budget so the cycle never overshoots the cap). The candidate
-    // scan and the soft-delete halves are accumulated separately.
+    // sweep_orphan_batch shape with the predicate swapped; the
+    // soft-delete re-checks `deleted = FALSE` and the grace term in its
+    // own WHERE per the T-1a.8 consequence (see
+    // COLLECT_BATCH_UPDATE_SQL). The loop ends on the first short
+    // candidate scan (pass complete) or when `victim_cap` victims have
+    // been collected (cap stop — the v4 capped collect; the per-batch
+    // LIMIT is clamped to the remaining budget so the cycle never
+    // overshoots the cap). The candidate scan and the soft-delete
+    // halves are accumulated separately.
     let t5 = Instant::now();
     let mut cursor: Vec<u8> = Vec::new();
     let mut batches = 0u64;
@@ -1412,6 +1430,7 @@ async fn run_collect_phase(
         let delete_started = Instant::now();
         let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
             .bind(&candidates)
+            .bind(&cutoff)
             .fetch_all(&mut *tx)
             .await
             .expect("collect soft-delete batch");
@@ -1630,4 +1649,99 @@ async fn mark_scan_bench_collect_phase() {
         sample_deleted, 0,
         "no chunk of the sampled known manifest is collected"
     );
+}
+
+/// The live-arm soft-delete template re-evaluates the row-local collect
+/// predicate — `deleted = FALSE` AND the
+/// `GREATEST(created_at, last_referenced_at) < cutoff` grace term — in
+/// its own WHERE clause (the T-1a.8 consequence recorded in
+/// `docs/spec/models/refcount-invariant-map.md`). A candidate that a
+/// concurrent upgrade re-references (touches) between the candidate
+/// scan and the soft-delete must survive the soft-delete; an untouched
+/// candidate must still be collected (the conjunct filters, it does not
+/// neuter the statement). Dropping either conjunct re-opens the §4.6(i)
+/// mark-stale data-loss window, so the structural pin fails loudly if
+/// the template regresses to a hash-only or deleted-only WHERE.
+#[tokio::test]
+async fn collect_batch_update_rechecks_collect_predicate() {
+    // Structural pin: the template the live arm (T-1a.8) is expected to
+    // adopt must carry both row-local conjuncts in its own WHERE.
+    assert!(
+        COLLECT_BATCH_UPDATE_SQL.contains("deleted = FALSE")
+            && COLLECT_BATCH_UPDATE_SQL
+                .contains("GREATEST(created_at, last_referenced_at) < $2::timestamptz"),
+        "COLLECT_BATCH_UPDATE_SQL must re-check the collect predicate's row-local conjuncts \
+         (deleted = FALSE AND GREATEST(created_at, last_referenced_at) < cutoff) in its own \
+         WHERE clause; got: {COLLECT_BATCH_UPDATE_SQL}"
+    );
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    // Two old, unreferenced, past-grace candidates.
+    let touched = crate::test_helpers::ChunkSeed::new(0xE1)
+        .age_secs(3600)
+        .seed(&db.pool)
+        .await;
+    let untouched = crate::test_helpers::ChunkSeed::new(0xE2)
+        .age_secs(3600)
+        .seed(&db.pool)
+        .await;
+
+    let mut conn = db.pool.acquire().await.expect("acquire");
+    let cutoff: String = sqlx::query_scalar("SELECT (now() - make_interval(secs => $1))::text")
+        .bind(super::sweep::CHUNK_GRACE_SECS)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("grace cutoff");
+    // Empty mark set on this session: both candidates are unmarked.
+    sqlx::query("CREATE TEMP TABLE live_chunks (blake3_hash BYTEA PRIMARY KEY)")
+        .execute(&mut *conn)
+        .await
+        .expect("temp live_chunks");
+
+    let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
+        .bind(Vec::<u8>::new())
+        .bind(&cutoff)
+        .bind(10i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("candidate scan");
+    assert_eq!(candidates.len(), 2, "both seeded chunks are candidates");
+
+    // A concurrent upgrade transaction commits between the candidate
+    // scan and the soft-delete: it re-references (touches) one of the
+    // candidates — the §4.6(i) interleaving the grace re-check closes.
+    sqlx::query("UPDATE chunks SET last_referenced_at = now() WHERE blake3_hash = $1")
+        .bind(&touched[..])
+        .execute(&db.pool)
+        .await
+        .expect("concurrent touch");
+
+    let collected: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
+        .bind(&candidates)
+        .bind(&cutoff)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("soft-delete batch");
+    assert_eq!(
+        collected.len(),
+        1,
+        "exactly the untouched candidate is soft-deleted"
+    );
+    assert_eq!(collected[0].0, untouched.to_vec());
+
+    let (touched_deleted, untouched_deleted): (bool, bool) = sqlx::query_as(
+        "SELECT \
+           (SELECT deleted FROM chunks WHERE blake3_hash = $1), \
+           (SELECT deleted FROM chunks WHERE blake3_hash = $2)",
+    )
+    .bind(&touched[..])
+    .bind(&untouched[..])
+    .fetch_one(&db.pool)
+    .await
+    .expect("post-state probe");
+    assert!(
+        !touched_deleted,
+        "a candidate re-referenced (touched) after the scan must survive the soft-delete"
+    );
+    assert!(untouched_deleted, "the untouched candidate is collected");
 }
