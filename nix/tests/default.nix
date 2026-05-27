@@ -355,6 +355,7 @@ in
   # r[verify builder.mountd.promote-verified]
   # r[verify builder.mountd.promote-bounded-copy]
   # r[verify builder.mountd.orphan-scan]
+  # r[verify builder.mountd.token-admission]
   vm-mountd = mountd { inherit pkgs rio-workspace common; };
 
   # r[verify gw.conn.exit-status]

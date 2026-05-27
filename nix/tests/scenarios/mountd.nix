@@ -47,6 +47,13 @@
 #                     staging trees, and .promoting placeholders
 #   perf-gate         (KVM only) a dedicated 192 MiB Promote stays
 #                     above the gated throughput floor
+#   token-mode        (§P0559) with --token-key-path the socket is
+#                     world-connectable and a peer outside gid 990 is
+#                     admitted iff Mount{} carries a token that
+#                     verifies (scheduler-shaped HMAC MountdClaims);
+#                     missing/invalid/expired/mismatched tokens are
+#                     rejected with no fs trace, and gid-990 peers keep
+#                     working without a token (the standalone path)
 #
 # Perf criteria (P0578 vi `BackingOpen` p99 < 200 µs, vii `Promote`
 # ≥ 1 GiB/s, x concurrent p99 < 1 ms) are gated only when the guest
@@ -98,7 +105,9 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "mountd";
-  globalTimeout = 900 + common.covTimeoutHeadroom;
+  # 900 covered phases 1-2; the §P0559 token-mode phase adds one more
+  # daemon restart plus a handful of small Mounts (~1-2 min under TCG).
+  globalTimeout = 1080 + common.covTimeoutHeadroom;
 
   nodes.machine = _: {
     virtualisation.memorySize = 2048;
@@ -158,10 +167,11 @@ pkgs.testers.runNixOSTest {
     machine.succeed("truncate -s 1G /var/rio-staging.img && mkfs.xfs -q /var/rio-staging.img")
     machine.succeed("mount -o loop,prjquota /var/rio-staging.img /var/rio/staging")
 
-    def start_mountd(quota_bytes):
+    def start_mountd(quota_bytes, extra_args=""):
         # Direct exec rather than a systemd unit so the staging quota can
-        # differ between the crash/quota phase and the main phase. The
-        # stale socket from a killed instance is removed first so the
+        # differ between the crash/quota phase and the main phase (and so
+        # the token-mode phase can add --token-key-path). The stale
+        # socket from a killed instance is removed first so the
         # readiness wait below cannot pass against the old inode.
         # covShellEnv sets LLVM_PROFILE_FILE in coverage mode (empty
         # otherwise); %p keeps the per-instance profraws distinct.
@@ -172,6 +182,7 @@ pkgs.testers.runNixOSTest {
             " --castore-dir /var/rio/castore --staging-dir /var/rio/staging"
             " --cache-dir /var/rio/cache --chunks-dir /var/rio/chunks"
             f" --staging-quota-bytes {quota_bytes} --allowed-gid 990"
+            f" {extra_args}"
             " --metrics-addr 127.0.0.1:9095"
             " >>/var/log/rio-mountd.log 2>&1 & echo $! > /run/rio-mountd.pid"
         )
@@ -192,13 +203,15 @@ pkgs.testers.runNixOSTest {
     def client(user, args):
         return f"runuser -u {user} -- {CLIENT} {args}"
 
-    def serve(user, build_id, tag):
+    def serve(user, build_id, tag, token=""):
         # Background a `serve` client and wait for its ready file: the
         # FUSE handshake is complete and the client has mounted + read
-        # its own (namespace-private) mountpoint.
+        # its own (namespace-private) mountpoint. `token` is the §P0559
+        # Mount-admission credential (empty = rely on the gid gate).
+        token_arg = f"--token {token} " if token else ""
         machine.succeed(
             f"runuser -u {user} -- bash -c "
-            f"'{CLIENT} serve --build-id {build_id} --ready-file /tmp/{tag}.ready "
+            f"'{CLIENT} serve --build-id {build_id} {token_arg}--ready-file /tmp/{tag}.ready "
             f"--mount-point /tmp/{tag}-castore "
             f">/tmp/{tag}.log 2>&1 & echo $! > /tmp/{tag}.pid'"
         )
@@ -531,6 +544,102 @@ pkgs.testers.runNixOSTest {
             "rio_mountd_connections_current",
         ]:
             assert name in metrics, f"{name} missing from /metrics"
+
+    # ═══ Phase 3: token-mode admission (§P0559) ════════════════════════
+    # A third daemon instance with --token-key-path: the socket goes
+    # world-connectable (0666) and a peer outside gid 990 — `outsider`,
+    # who in the gid-gate subtest above could not even connect() — is
+    # admitted iff its Mount{} carries a token that verifies under the
+    # configured key. gid-990 peers keep working without a token (the
+    # standalone/systemd path). Tokens are minted with the spike
+    # client's mint-token subcommand: the same MountdClaims/HMAC
+    # envelope the scheduler signs into WorkAssignment.mountd_token.
+    stop_mountd()
+    machine.succeed(
+        "printf 'vm-mountd-token-key-32-bytes-ok!!' > /run/mountd-token.key"
+        " && chmod 0600 /run/mountd-token.key"
+        " && printf 'a-completely-different-32B-key!!' > /run/mountd-wrong.key"
+        " && chmod 0600 /run/mountd-wrong.key"
+    )
+    start_mountd(64 * 1024 * 1024, "--token-key-path /run/mountd-token.key")
+
+    def mint(args):
+        return machine.succeed(f"{CLIENT} mint-token --key-file /run/mountd-token.key {args}").strip()
+
+    with subtest("token-mode: socket is world-connectable, valid token admits a non-990 peer"):
+        # The socket DAC flipped to 0666 with the key configured.
+        mode = machine.succeed("stat -c '%a' /run/rio-mountd/mountd.sock").strip()
+        assert mode == "666", f"token-mode socket mode is {mode}, want 666"
+        tok = mint("--build-id b-token")
+        serve("outsider", "b-token", "tok", token=tok)
+        # Per-build setup is identical to a gid-admitted Mount: staging
+        # 0700, owned by the connection's peer uid.
+        st = machine.succeed("stat -c '%a %U' /var/rio/staging/b-token").strip()
+        assert st == "700 outsider", f"staging dir is {st}"
+        machine.succeed("kill $(cat /tmp/tok.pid)")
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-token", timeout=30)
+        wait_idle()
+
+    with subtest("token-mode: missing/invalid/expired/mismatched tokens are rejected"):
+        # Missing token from a non-990 peer.
+        machine.succeed(
+            client("outsider", "expect-mount-err --build-id b-tok-miss --expect Unauthorized")
+        )
+        # Garbage token.
+        machine.succeed(
+            client(
+                "outsider",
+                "expect-mount-err --build-id b-tok-bad --token not-a-token --expect Unauthorized",
+            )
+        )
+        # Signed with the wrong key.
+        wrong = machine.succeed(
+            f"{CLIENT} mint-token --key-file /run/mountd-wrong.key --build-id b-tok-key"
+        ).strip()
+        machine.succeed(
+            client(
+                "outsider",
+                f"expect-mount-err --build-id b-tok-key --token {wrong} --expect Unauthorized",
+            )
+        )
+        # Expired.
+        stale = mint("--build-id b-tok-exp --expired")
+        machine.succeed(
+            client(
+                "outsider",
+                f"expect-mount-err --build-id b-tok-exp --token {stale} --expect Unauthorized",
+            )
+        )
+        # Minted for a different build_id than the Mount claims.
+        other = mint("--build-id b-someone-else")
+        machine.succeed(
+            client(
+                "outsider",
+                f"expect-mount-err --build-id b-tok-mm --token {other} --expect Unauthorized",
+            )
+        )
+        # None of the rejected Mounts left any per-build state behind.
+        machine.succeed(
+            "test ! -e /var/rio/staging/b-tok-miss"
+            " && test ! -e /var/rio/staging/b-tok-bad"
+            " && test ! -e /var/rio/staging/b-tok-key"
+            " && test ! -e /var/rio/staging/b-tok-exp"
+            " && test ! -e /var/rio/staging/b-tok-mm"
+        )
+        wait_idle()
+
+    with subtest("token-mode: gid-990 peer still admitted without a token"):
+        serve("build1", "b-gid-still", "gidstill")
+        st = machine.succeed("stat -c '%a %U' /var/rio/staging/b-gid-still").strip()
+        assert st == "700 build1", f"staging dir is {st}"
+        machine.succeed("kill $(cat /tmp/gidstill.pid)")
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-gid-still", timeout=30)
+        wait_idle()
+        # Both admission methods showed up in the daemon's counters.
+        metrics = machine.succeed("curl -sf 127.0.0.1:9095/metrics")
+        assert 'rio_mountd_mount_admission_total{method="token"}' in metrics, metrics
+        assert 'rio_mountd_mount_admission_total{method="gid"}' in metrics, metrics
+        assert "rio_mountd_mount_rejected_total" in metrics, metrics
 
     # collectCoverage below only stops systemd-managed rio services;
     # the raw-exec'd daemon needs an explicit SIGTERM to flush its
