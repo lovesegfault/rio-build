@@ -163,14 +163,16 @@ const SYNCED_FILES: &[&str] = &[
     "markers/report.done",
 ];
 
-/// Tracks last-synced sizes so unchanged files are not re-uploaded.
-/// Size is the change signal: the JSONL streams are append-only and the
-/// JSON documents are full rewrites, so an unchanged length means the
-/// upload can be skipped (a same-length rewrite is picked up on the next
-/// tick that changes its length).
+/// Tracks the last-synced `(length, mtime)` signature per file so
+/// unchanged files are not re-uploaded. The JSONL streams are
+/// append-only and the JSON documents are full rewrites, so a changed
+/// length catches appends and the modification time catches same-length
+/// rewrites; a rewrite that changes neither (same length within the
+/// filesystem's mtime granularity) is picked up on the next tick that
+/// moves either signal.
 #[derive(Debug, Default)]
 pub struct SyncTracker {
-    last_len: HashMap<String, u64>,
+    last_sig: HashMap<String, (u64, Option<std::time::SystemTime>)>,
 }
 
 /// Upload changed state files to `<prefix>/<campaign-id>/<rel>`.
@@ -196,15 +198,19 @@ pub async fn sync_state(
             }
         }
     }
-    rels.sort();
+    // Upload data files first and `markers/*` last: a stage's done-marker
+    // must never be visible in the store before the data it certifies (a
+    // crash mid-tick would otherwise let a restored campaign trust a marker
+    // whose data never made it to S3).
+    rels.sort_by(|a, b| (a.starts_with("markers/"), a).cmp(&(b.starts_with("markers/"), b)));
     let mut uploaded = 0;
     for rel in &rels {
         let path = state.path(rel);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
-        let len = meta.len();
-        if tracker.last_len.get(rel.as_str()) == Some(&len) {
+        let sig = (meta.len(), meta.modified().ok());
+        if tracker.last_sig.get(rel.as_str()) == Some(&sig) {
             continue;
         }
         let bytes = tokio::fs::read(&path)
@@ -213,7 +219,7 @@ pub async fn sync_state(
         store
             .put_bytes(&format!("{prefix}/{campaign_id}/{rel}"), bytes)
             .await?;
-        tracker.last_len.insert(rel.clone(), len);
+        tracker.last_sig.insert(rel.clone(), sig);
         uploaded += 1;
     }
     Ok(uploaded)
@@ -222,7 +228,9 @@ pub async fn sync_state(
 /// Resume support: if the local state dir has no campaign.json but the
 /// store does, download the synced state files so resume can proceed
 /// after a pod reschedule wiped the local volume. Returns true when a
-/// campaign was restored from the store.
+/// campaign was restored from the store. `buckets/*.jsonl` are uploaded
+/// by [`sync_state`] but not restored here — the report stage regenerates
+/// them from results.jsonl.
 pub async fn download_state_if_missing(
     state: &StateDir,
     store: &dyn ArtifactStore,
@@ -367,6 +375,123 @@ mod tests {
                 .exists("parity/campaigns/c1/results.jsonl")
                 .await
                 .unwrap()
+        );
+    }
+
+    /// [`ArtifactStore`] wrapper that records the order of uploaded keys.
+    struct RecordingStore {
+        inner: LocalDirArtifactStore,
+        puts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ArtifactStore for RecordingStore {
+        async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+            self.puts.lock().unwrap().push(key.to_string());
+            self.inner.put_bytes(key, bytes).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_uploads_data_files_before_markers() {
+        let sdir = tempfile::tempdir().unwrap();
+        let adir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(sdir.path()).unwrap();
+        let store = RecordingStore {
+            inner: LocalDirArtifactStore::new(adir.path()),
+            puts: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut tracker = SyncTracker::default();
+
+        state
+            .write_json_atomic("campaign.json", &serde_json::json!({"campaignId": "c1"}))
+            .unwrap();
+        state.append_jsonl(StateFile::Results, &rec("a")).unwrap();
+        state
+            .write_bytes("buckets/match-built.jsonl", b"{}\n")
+            .unwrap();
+        state.set_marker("plan").unwrap();
+        state.set_marker("hydra-truth").unwrap();
+
+        let n = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
+            .await
+            .unwrap();
+        assert_eq!(n, 5, "campaign.json + results + bucket + two markers");
+        let keys = store.puts.lock().unwrap().clone();
+        // A done-marker must never land in the store before the data it
+        // certifies: every marker upload comes after every data upload.
+        let first_marker = keys
+            .iter()
+            .position(|k| k.contains("/markers/"))
+            .expect("markers were uploaded");
+        let last_data = keys
+            .iter()
+            .rposition(|k| !k.contains("/markers/"))
+            .expect("data files were uploaded");
+        assert!(
+            last_data < first_marker,
+            "markers must be uploaded after every data file: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_store_maps_misses_and_round_trips_bytes() {
+        use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+        use aws_sdk_s3::operation::head_object::HeadObjectError;
+        use aws_sdk_s3::primitives::ByteStream;
+        use aws_sdk_s3::types::error::{NoSuchKey, NotFound};
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let get_miss = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|req| req.key() == Some("parity/campaigns/c1/campaign.json"))
+            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+        let head_miss = mock!(aws_sdk_s3::Client::head_object)
+            .match_requests(|req| req.key() == Some("parity/campaigns/c1/campaign.json"))
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let get_hit = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|req| req.key() == Some("parity/campaigns/c1/results.jsonl"))
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .body(ByteStream::from_static(b"{\"job\":\"a\"}\n"))
+                    .build()
+            });
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&get_miss, &head_miss, &get_hit]
+        );
+        let store = S3ArtifactStore::from_client(client, "rio-chunks".into());
+
+        // A missing object is a miss (None / false), not an error.
+        assert!(
+            store
+                .get_bytes("parity/campaigns/c1/campaign.json")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .exists("parity/campaigns/c1/campaign.json")
+                .await
+                .unwrap()
+        );
+        // A present object round-trips its bytes.
+        assert_eq!(
+            store
+                .get_bytes("parity/campaigns/c1/results.jsonl")
+                .await
+                .unwrap()
+                .unwrap(),
+            b"{\"job\":\"a\"}\n"
         );
     }
 

@@ -831,14 +831,29 @@
       "doc": "Campaign artifact storage (S3 or a local directory) plus state sync."
     },
     {
+      "path": "run/evalset_input.rs",
+      "depth": 1,
+      "doc": "Readers for the eval-set artifacts the campaign consumes:"
+    },
+    {
       "path": "run/glob.rs",
       "depth": 1,
       "doc": "Minimal glob matching for job-name filters (`*` = any run of"
     },
     {
+      "path": "run/grpc.rs",
+      "depth": 1,
+      "doc": "Thin trait facades over the rio gRPC surfaces the engine reads, so every"
+    },
+    {
       "path": "run/model.rs",
       "depth": 1,
       "doc": "Shared campaign data model: per-job records (results.jsonl),"
+    },
+    {
+      "path": "run/plan.rs",
+      "depth": 1,
+      "doc": "Plan stage: scope selection, warm / not-attemptable computation, the"
     },
     {
       "path": "run/spec.rs",

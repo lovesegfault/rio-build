@@ -12,8 +12,11 @@
 //! machine once every stage exists.
 
 pub mod artifact;
+pub mod evalset_input;
 pub mod glob;
+pub mod grpc;
 pub mod model;
+pub mod plan;
 pub mod spec;
 pub mod state;
 
