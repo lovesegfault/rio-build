@@ -9,7 +9,7 @@
 //! `GREATEST(created_at, last_referenced_at)`.
 //!
 //! This release ships the cycle in **shadow mode only**
-//! ([`CollectMode::Shadow`]): mark + report, no `UPDATE` anywhere. The
+//! (`CollectMode::Shadow`): mark + report, no `UPDATE` anywhere. The
 //! shadow numbers (mark-set size, would-collect, the refcount drift
 //! pair, cycle duration) are the production calibration the cutover
 //! decision needs; the collecting arm is a separate release.
@@ -24,7 +24,7 @@
 //! Treating corrupt input as "references nothing" would turn a storage
 //! leak into collected live data, which is the polarity the design
 //! forbids; the legacy decrement paths' warn-and-skip behavior
-//! ([`super::parse_unique_chunk_hashes`]) is exactly what the collector
+//! (`super::parse_unique_chunk_hashes`) is exactly what the collector
 //! must NOT do.
 //!
 //! # Capped collect (scaffolding)
@@ -157,7 +157,7 @@ fn mark_validation_offenders_sql() -> String {
 }
 
 /// Which arm of the collector runs. This release ships only
-/// [`CollectMode::Shadow`]; the live (soft-delete + enqueue) arm is
+/// `CollectMode::Shadow`; the live (soft-delete + enqueue) arm is
 /// added by the cutover release — deliberately not pre-built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CollectMode {

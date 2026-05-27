@@ -12,8 +12,8 @@
 //!    `pending_s3_deletes`. `SELECT FOR UPDATE` on chunk_list guards
 //!    the TOCTOU with concurrent PutPath refcount increment.
 //!
-//! 3. **Collect** ([`collect::collect_cycle`]): the lazy chunk
-//!    collector — phase 3 of [`run_gc`] plus a daily backstop timer.
+//! 3. **Collect** (`collect::collect_cycle`): the lazy chunk
+//!    collector — phase 3 of `run_gc` plus a daily backstop timer.
 //!    Shadow mode in this release: derives the live-chunk set from
 //!    every existing manifest's `chunk_list` (fail-closed on any
 //!    unparseable blob) and reports would-collect / drift gauges
@@ -105,7 +105,7 @@ pub struct GcStats {
     pub paths_resurrected: u64,
 }
 
-/// Parameters for [`run_gc`]. Struct (not positional) so the
+/// Parameters for `run_gc`. Struct (not positional) so the
 /// cron caller can express defaults clearly and the gRPC wrapper
 /// can pass everything through without argument-order drift.
 ///
@@ -368,7 +368,7 @@ pub async fn run_gc(
 
 /// Defuse the scopeguard, explicitly release [`GC_LOCK_ID`], return
 /// connection to pool. Cheaper than letting the guard fire (detach
-/// closes the conn). Called on every exit path from [`run_gc`] that
+/// closes the conn). Called on every exit path from `run_gc` that
 /// reaches a `return` AFTER the lock was acquired.
 async fn gc_unlock(
     conn: scopeguard::ScopeGuard<
