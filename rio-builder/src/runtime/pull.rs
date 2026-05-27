@@ -9,7 +9,7 @@
 //! code is simply not started (see `setup.rs`).
 //!
 //! Build execution is the existing machinery, unchanged:
-//! [`spawn_build_task`](super::spawn_build_task) runs the build and
+//! [`spawn_build_task`] runs the build and
 //! sends today's `CompletionReport` into the permanent sink; this loop
 //! consumes the sink directly (there is no relay) and forwards the
 //! report through `ReportOutcome` until it is acknowledged. The
