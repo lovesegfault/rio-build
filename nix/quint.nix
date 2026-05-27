@@ -2460,19 +2460,24 @@ in
     # bounds, encoding notes) are in
     # docs/spec/models/executor-invariant-map.md.
     #
-    # NOTE (stop-and-report): the fault-leader and fault-persist
-    # regimes of Model S falsify unresolvedClaimHasRepairArmed on the
-    # as-built encoding (a post-failover deferred-then-unrevisited
-    # Assigned derivation; see
-    # ~/tmp/rio-formal-verification/executor-0c-falsification-
-    # unresolvedClaimHasRepairArmed.md). Per the campaign's
-    # pre-registered empty falsification list those two exhaustive
-    # invariant cfgs are NOT wired until the campaign owner
-    # adjudicates; their witness checks below stay wired (the
-    # contended states must remain reachable). Wiring them would gate
-    # merges on a known-red check; silently excluding the falsifying
-    # invariant would weaken the gate — neither is acceptable, so the
-    # absence is recorded here and in the invariant map.
+    # NOTE (falsification adjudicated and fixed; held back on budget):
+    # the fault-leader and fault-persist regimes of Model S falsified
+    # unresolvedClaimHasRepairArmed on the AS-BUILT encoding (a
+    # post-failover deferred-then-unrevisited Assigned derivation).
+    # The campaign owner adjudicated it a real defect; the scheduler
+    # now re-arms the reconcile sweep whenever its collection pass
+    # defers a claim (rio-scheduler/src/actor/recovery.rs,
+    # handle_reconcile_assignments), the model encodes the fixed
+    # behavior (reconcileSweep keeps reconcilePending set while any
+    # claim was deferred), and the invariant no longer falsifies in
+    # either regime's re-run. Their exhaustive cfgs stay unwired on
+    # per-check cost grounds only: at the witness-preserving bounds
+    # they exceed the gate budget, the same stop-and-report class as
+    # fault-stream-conn / fault-process below (figures in the
+    # model-flip commit message), so they are documented manual
+    # targets in the invariant map's adjudication record, and their
+    # witness checks below stay wired so the contended states remain
+    # pinned reachable.
 
     # The base regime: no faults — registration, dispatch, builder
     # accept/reject, completion intake, the one-shot drain, SIGTERM /
@@ -2517,7 +2522,7 @@ in
     # here yet; their witness checks below stay in the gate (the
     # contended states remain pinned reachable), and the invariant
     # map's Stage-B record carries the full account alongside the
-    # fault-leader/fault-persist falsification.
+    # fault-leader/fault-persist adjudication record above.
 
     # Model D, base regime: the happy-path delivery choreography plus
     # the SIGTERM drain and idle-exit orderings.

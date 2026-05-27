@@ -1450,7 +1450,12 @@ module executorSession {
   /// when its outputs are in the store (the store-probe arm), else
   /// reset to Ready (no charge); a worker that reconnected and reports
   /// the build keeps it; a stream-connected-but-not-yet-heartbeated
-  /// worker defers to the heartbeat path's two-strike machinery.
+  /// worker is deferred. A sweep that deferred at least one claim
+  /// re-arms itself (handle_reconcile_assignments calls
+  /// schedule_reconcile_timer when its collection pass deferred
+  /// anything), so `reconcilePending` stays set until a sweep completes
+  /// with no deferral — the deferral is a delay, never a terminal
+  /// state.
   action reconcileSweep: bool = {
     val resolved = DRVS.fold(st, (acc, d) => {
       val rec = acc.drv.get(d)
@@ -1471,11 +1476,26 @@ module executorSession {
               resolution: RReturned }) }
       }
     })
+    // The defer condition of the collection pass, re-stated over the
+    // pre-sweep state (the fold mutates only drv records, never the
+    // slots): an in-flight claim whose executor entry exists but is
+    // not yet registered. Any such claim re-arms the sweep
+    // (recovery.rs::handle_reconcile_assignments, deferred > 0 →
+    // schedule_reconcile_timer).
+    val anyDeferred = DRVS.exists(d => {
+      val rec = st.drv.get(d)
+      and {
+        rec.status == DAssigned or rec.status == DRunning,
+        rec.assignedExec != "",
+        st.sched.get(rec.assignedExec).present,
+        not(isRegistered(st.sched.get(rec.assignedExec)))
+      }
+    })
     all {
       st.believedLeader,
       st.recoveryComplete,
       st.reconcilePending,
-      st' = { ...resolved, reconcilePending: false },
+      st' = { ...resolved, reconcilePending: anyDeferred },
       viol' = { ...viol,
         fabricatedCompletion: viol.fabricatedCompletion or
           DRVS.exists(d => and {
