@@ -595,7 +595,7 @@ impl StoreServiceImpl {
     /// transaction that completes the manifest, so a gateway-pushed
     /// source is readable back by the pushing tenant through the
     /// tenant-scoped castore/narinfo surfaces
-    /// (`r[store.put.tenant-attribution]`). `None` (dev mode /
+    /// (`r[store.put.tenant-attribution+2]`). `None` (dev mode /
     /// service-token-only with no forwarded JWT) writes no row.
     ///
     /// `nar_data` is a refcounted `Bytes` (zero-copy from the
@@ -683,7 +683,7 @@ impl StoreServiceImpl {
     /// fails fast instead of retrying forever.
     ///
     /// `tenant_id` is forwarded into the completion transaction for
-    /// `path_tenants` attribution (`r[store.put.tenant-attribution]`).
+    /// `path_tenants` attribution (`r[store.put.tenant-attribution+2]`).
     pub(in crate::grpc) async fn persist_nar(
         &self,
         info: &ValidatedPathInfo,
@@ -771,8 +771,11 @@ impl StoreServiceImpl {
     /// server-computed `(sha256, size)` of the received NAR.
     ///
     /// Deliberately does NOT touch the `nar_bytes_budget` semaphore:
-    /// nothing is accumulated, so there is nothing to bound beyond the
-    /// per-request `MAX_NAR_SIZE` check.
+    /// nothing is accumulated, so the only per-request bounds are the
+    /// `MAX_NAR_SIZE` check on received bytes and the empty-chunk
+    /// rejection — an all-empty-chunk stream never advances `received`,
+    /// so rejecting empties (exactly as the fresh-upload path does) is
+    /// what keeps such a stream from spinning unbounded.
     pub(in crate::grpc) async fn hash_stream_for_verification(
         &self,
         stream: &mut Streaming<PutPathRequest>,

@@ -359,7 +359,7 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
 ///
 /// `tenant_id`: when `Some`, the same transaction also attributes the
 /// path to that tenant via [`super::upsert_path_tenant_in_conn`]
-/// (`r[store.put.tenant-attribution]` — gateway/admin pushes carry the
+/// (`r[store.put.tenant-attribution+2]` — gateway/admin pushes carry the
 /// session JWT tenant). `None` for flows whose attribution happens
 /// elsewhere (builder `PutPathChunked` commit, scheduler-driven
 /// substitution) or that genuinely have no tenant (dev mode).

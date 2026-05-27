@@ -166,7 +166,7 @@ pub async fn claim_placeholder(
 ///
 /// `tenant_id`: when `Some`, the completion transaction also writes a
 /// `path_tenants` row attributing the path to that tenant
-/// (`r[store.put.tenant-attribution]` — the legacy gateway/admin push
+/// (`r[store.put.tenant-attribution+2]` — the legacy gateway/admin push
 /// path, where the session JWT names the pushing tenant). Substitution
 /// passes `None`: substituted paths are attributed by the scheduler at
 /// substitute-complete, and the narinfo sig-visibility gate keys on the

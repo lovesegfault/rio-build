@@ -236,6 +236,17 @@ impl StoreServiceImpl {
                         Some(self.spawn_placeholder_guard(store_path_hash.clone(), c));
                     claim = Some(c);
                 }
+                // Already complete: a concurrent upload of this same
+                // content-addressed path won the race after our ingest.
+                // Not an error — the CA path is derived from the NAR
+                // hash this caller just streamed (verify_ca_store_path),
+                // so the stored bytes are identical by construction and
+                // there is nothing left to commit; `created: false` is
+                // the same idempotent answer the IA pre-ingest arm
+                // gives. No re-upload attribution epilogue here: is_ca
+                // callers authenticate via assignment token, not a
+                // gateway session JWT, so there is no pushing tenant
+                // lacking attribution.
                 None => return Ok(Response::new(PutPathResponse { created: false })),
             }
         }

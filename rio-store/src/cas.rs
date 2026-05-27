@@ -154,7 +154,7 @@ impl PutChunkedStats {
 ///    need upload (RETURNING refcount=1). Parallel S3 PUTs for those only.
 /// 5. **Complete**: fill narinfo + flip status='complete'. When
 ///    `tenant_id` is `Some`, the same completion transaction attributes
-///    the path to that tenant (`r[store.put.tenant-attribution]`).
+///    the path to that tenant (`r[store.put.tenant-attribution+2]`).
 ///
 /// On error in 3-5: `delete_manifest_chunked_uploading` rolls back
 /// refcounts + placeholders. Caller doesn't need to clean up (we consumed
