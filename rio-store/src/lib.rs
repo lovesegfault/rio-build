@@ -101,6 +101,19 @@ const GC_COLLECT_CYCLE_BUCKETS: &[f64] = &[
     1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 420.0, 600.0, 900.0,
 ];
 
+/// Histogram bucket boundaries for `rio_store_chunk_upgrade_tx_seconds`.
+///
+/// The chunked-upgrade transaction is normally milliseconds-to-seconds
+/// (one FOR UPDATE probe, one manifest_data INSERT, one chunks upsert).
+/// The 150 s and 240 s boundaries are exactly the
+/// RioStoreChunkUpgradeTxSlow alert thresholds (grace/2 and
+/// grace − 60 s — the chunk collector's collect-soundness assumption),
+/// so the alert's bucket arithmetic is exact rather than interpolated.
+#[cfg(feature = "server")]
+const CHUNK_UPGRADE_TX_BUCKETS: &[f64] = &[
+    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 150.0, 240.0, 300.0,
+];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -122,6 +135,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     (
         "rio_store_gc_collect_cycle_seconds",
         GC_COLLECT_CYCLE_BUCKETS,
+    ),
+    (
+        "rio_store_chunk_upgrade_tx_seconds",
+        CHUNK_UPGRADE_TX_BUCKETS,
     ),
 ];
 
@@ -296,6 +313,13 @@ pub fn describe_metrics() {
         "Chunk-collect cycles that stopped at COLLECT_CYCLE_VICTIM_CAP with \
          backlog remaining (the keyset cursor carries the remainder to the \
          next cycle). Sustained increments mean a backlog is draining."
+    );
+    describe_histogram!(
+        "rio_store_chunk_upgrade_tx_seconds",
+        "upgrade_manifest_to_chunked transaction duration (begin to commit) — \
+         the single chunk-referencing write transaction. Monitors the chunk \
+         collector's collect-soundness assumption that no such transaction \
+         outlives the collect grace window (alerts at grace/2 and grace-60s)."
     );
     describe_counter!(
         "rio_store_sign_tenant_key_fallback_total",

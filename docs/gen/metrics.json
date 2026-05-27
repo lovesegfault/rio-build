@@ -165,6 +165,7 @@
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
+    "rio_store_chunk_upgrade_tx_seconds",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_chunks_live",
@@ -1060,6 +1061,11 @@
         "name": "rio_store_chunk_dedup_ratio",
         "kind": "gauge",
         "help": "Per-upload dedup ratio (1.0 - missing/total after chunking)"
+      },
+      {
+        "name": "rio_store_chunk_upgrade_tx_seconds",
+        "kind": "histogram",
+        "help": "upgrade_manifest_to_chunked transaction duration (begin to commit) — the single chunk-referencing write transaction. Monitors the chunk collector's collect-soundness assumption that no such transaction outlives the collect grace window (alerts at grace/2 and grace-60s)."
       },
       {
         "name": "rio_store_gc_chunk_orphan_swept_total",

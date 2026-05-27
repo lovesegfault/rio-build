@@ -76,6 +76,16 @@ pub(crate) async fn upgrade_manifest_to_chunked(
     chunk_hashes: &[Vec<u8>], // each is a 32-byte BLAKE3
     chunk_sizes: &[i64],      // parallel to chunk_hashes
 ) -> Result<(HashSet<Vec<u8>>, PlaceholderToken)> {
+    // Collect-soundness assumption (refcount-formal design §4.1): the
+    // chunk collector's grace term protects a manifest that commits
+    // after a mark snapshot only if this transaction — the single
+    // chunk-referencing write transaction — is shorter than the grace
+    // window. The duration is monitored (histogram + alert at grace/2),
+    // not enforced; measured from before begin() so everything from
+    // BEGIN to COMMIT is covered, recorded only on the success path
+    // (an aborted upgrade commits no manifest, so its duration cannot
+    // endanger collect soundness).
+    let tx_started = std::time::Instant::now();
     let mut tx = pool.begin().await?;
 
     // Ownership lock: the manifests row MUST exist with status=
@@ -221,6 +231,7 @@ pub(crate) async fn upgrade_manifest_to_chunked(
         .collect();
 
     tx.commit().await?;
+    metrics::histogram!("rio_store_chunk_upgrade_tx_seconds").record(tx_started.elapsed());
     Ok((needs_upload, token))
 }
 
@@ -763,6 +774,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 3, "three referencing manifests");
+    }
+
+    /// The upgrade-transaction duration histogram — the runtime monitor
+    /// of the chunk collector's collect-soundness assumption (no
+    /// chunk-referencing write transaction outlives the grace window) —
+    /// is recorded on every successful upgrade.
+    #[tokio::test]
+    async fn upgrade_tx_duration_histogram_recorded() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sph = vec![0x71u8; 32];
+        seed_placeholder(&db.pool, &sph).await;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph,
+            b"manifest-tx-histogram",
+            &[vec![0x72u8; 32]],
+            &[1024],
+        )
+        .await
+        .expect("upgrade succeeds");
+
+        assert!(
+            rec.histogram_touched("rio_store_chunk_upgrade_tx_seconds"),
+            "successful upgrade must record the tx-duration histogram"
+        );
     }
 
     // r[verify store.cas.chunk-upload-committed]

@@ -539,4 +539,39 @@ spec:
               RioStoreGcCollectParseFailure and the store error logs), or
               cycles are failing against PostgreSQL. See
               docs/ops/gc-enablement.typ (chunk collector, stalled cycles).
+
+        # refcount-formal Wave A1 (collect-soundness assumption, design
+        # 4.1): the chunk collector's grace term protects post-snapshot
+        # manifests only while no chunk-referencing write transaction
+        # outlives the grace window. The chunked-upgrade transaction is
+        # the single such transaction; its duration is monitored, not
+        # enforced (no statement_timeout). Warning at grace/2, critical
+        # at grace - 60s. Same alert name, two severities/thresholds.
+        - alert: RioStoreChunkUpgradeTxSlow
+          expr: histogram_quantile(0.99, sum by (le) (rate(rio_store_chunk_upgrade_tx_seconds_bucket[15m]))) > 150
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-store chunked-upgrade transactions approaching the collect grace window
+            description: >-
+              p99 upgrade_manifest_to_chunked transaction duration over the
+              last 15m is {{`{{ $value | humanizeDuration }}`}} (above
+              grace/2 = 150s). The chunk collector's soundness margin is
+              eroding; find long transactions in pg_stat_activity and see
+              docs/ops/gc-enablement.typ (slow upgrade transactions).
+        - alert: RioStoreChunkUpgradeTxSlow
+          expr: histogram_quantile(0.99, sum by (le) (rate(rio_store_chunk_upgrade_tx_seconds_bucket[15m]))) > 240
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: rio-store chunked-upgrade transactions near the collect grace window
+            description: >-
+              p99 upgrade_manifest_to_chunked transaction duration over the
+              last 15m is {{`{{ $value | humanizeDuration }}`}} (above
+              grace - 60s = 240s). A transaction that outlives the grace
+              window can defeat the collector's mark-snapshot protection
+              once the live collect arm is enabled. Investigate immediately;
+              see docs/ops/gc-enablement.typ (slow upgrade transactions).
 {{- end }}

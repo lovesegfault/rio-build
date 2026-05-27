@@ -16,6 +16,7 @@
     "RioSlaHwCostStale",
     "RioSlaPredictionDrift",
     "RioSlaPriorDivergenceClamped",
+    "RioStoreChunkUpgradeTxSlow",
     "RioStoreGcCollectParseFailure",
     "RioStoreGcCollectStalled",
     "RioStorePutPathRetries"

@@ -88,3 +88,25 @@ aborting on a parse failure (the parse-failure alert should also be
 firing), or cycles are erroring against PostgreSQL (check the store
 error logs). The collector holds the GC advisory lock for the duration
 of a cycle, so a wedged GC run also blocks backstop cycles.
+
+== Slow upgrade transactions: #(refs.alert)("RioStoreChunkUpgradeTxSlow") (warning / critical)
+
+#(refs.metric)("rio_store_chunk_upgrade_tx_seconds") measures every
+chunked-upgrade transaction (begin to commit) --- the single
+transaction that makes chunks referenced. The collector's soundness
+argument assumes no such transaction outlives the collect grace
+window: a manifest that commits after a cycle's mark snapshot is
+protected by its own upsert touch only if its transaction is shorter
+than grace. The alert fires at warning when the p99 over 15 minutes
+exceeds half the grace window (150 s) and at critical above grace
+minus 60 s (240 s) --- the margin is eroding, not yet gone.
+
+If it fires: find the long transactions
+(`SELECT now() - xact_start, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY xact_start LIMIT 10`)
+and address the cause --- PostgreSQL contention or I/O stalls on the
+store, or pathologically large chunked uploads. If long upgrade
+transactions are legitimate for the deployment, raise the chunk grace
+window (and re-derive the collect predicate's headroom) before
+enabling or keeping the live collect arm; adding a
+`statement_timeout` on the upgrade path is the enforcement
+alternative the design names but does not take by default.

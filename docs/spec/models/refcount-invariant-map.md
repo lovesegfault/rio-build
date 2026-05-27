@@ -1118,3 +1118,45 @@ T-1a.1b: tmpfs-backed PostgreSQL, fsync off, EPYC clocks (absolute
 times are a lower bound on production cost); the sparse full-pass
 scan term is bounded by store size, not by the cap, and stays
 monitored (cycle-duration histogram + stalled alert), not gated.
+
+#### T-1a.4 — collect-soundness enforcement: the monitored-assumption option (closes the second still-open Phase-0 item)
+
+The §4.1 collect-soundness condition — no chunk-referencing write
+transaction outlives `grace − clock slack` — is carried as a **named,
+monitored assumption**, not as enforcement (plan P4 / sign-off
+item 3):
+
+- `rio_store_chunk_upgrade_tx_seconds` (histogram) measures every
+  `upgrade_manifest_to_chunked` transaction from `begin()` to
+  `commit()` — the single chunk-referencing write transaction in the
+  system. Bucket boundaries are placed at the alert thresholds so the
+  threshold queries are exact.
+- The wired alert `RioStoreChunkUpgradeTxSlow`
+  (infra/helm/rio-build/templates/prometheusrule.yaml) fires at
+  warning when the p99 over a 15-minute window exceeds `grace/2`
+  (150 s) and at critical above `grace − 60 s` (240 s). This is the
+  runtime carrier of the assumption, in the same sense that the
+  READ-COMMITTED re-evaluation assumption is carried as a named
+  assumption: a firing alert means the soundness margin is eroding
+  and grace (or the upload path) needs attention before the live
+  collect arm is enabled or kept enabled.
+- No `statement_timeout` is set in Phase 1 (the
+  enforcement-by-timeout option of §4.1): a timeout would add a new
+  writer-failure mode for zero observed need, and the histogram is
+  exactly the data that would justify a timeout value later if one is
+  wanted.
+- The collector-side alternative — anchoring the collect threshold at
+  `least(cycle_started_at, min(xact_start) of transactions open at
+  the snapshot)` — is noted as available but not taken (it
+  complicates the snapshot for a window the grace term already covers
+  whenever the assumption holds).
+
+This closes the second still-open Phase-0 item (the collect-soundness
+enforcement choice; the first — the mark-scan cost measurement — was
+closed by the T-1a.1 records above, and the third — the replacement
+`#r()` rule drafts — lands with the replacement model). The runbook
+section in docs/ops/gc-enablement.typ documents the alert's meaning
+and remediation; the histogram is live from the additive release, so
+the Release-A observation window (re-entry gate (a), T-1a.7) also
+produces the empirical upgrade-transaction-duration distribution this
+assumption is judged against.
