@@ -904,8 +904,8 @@ submissions whose declared output paths cannot be validated (the
 path-squatting shape #rref("gw.reject.output-path-mismatch") exists to
 prevent), while not-trusted steers stock `build-remote` (Nix ≥ 2.16,
 Lix) onto the copy-the-`.drv`-closure + `wopBuildPathsWithResults` flow
-that the gateway fully supports and gates. Clients only display the
-flag (`nix store info`) — no other client-side behavior consumes it.
+that the gateway fully supports and gates. Beyond `build-remote`'s flow
+selection, clients only display the flag (`nix store info`).
 
 #r("gw.handshake.initial-stderr-last")[
   *Phase 4: Initial STDERR_LAST*
