@@ -81,10 +81,6 @@ scheduler:
   replicas: 2
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
-  # Single-version deployment (every image is built from this tree), so
-  # the Phase-2 claims gate is armed: the k3s scenarios exercise the
-  # store's descriptor-required FOD enforcement end-to-end.
-  signFodClaims: true
   # ADR-023 [sla] is mandatory; chart-default values.yaml's block is
   # sized for prod (probe.cpu=4 → 12 GiB cold-start), which the
   # resource-fit gate rejects on a 2 GiB k3s agent VM. Override with a

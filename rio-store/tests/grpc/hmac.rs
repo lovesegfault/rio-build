@@ -378,7 +378,7 @@ fn ca_path_for(name: &str, nar: &[u8]) -> String {
         .to_string()
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 #[tokio::test]
 async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -396,7 +396,7 @@ async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 #[tokio::test]
 async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -420,7 +420,7 @@ async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 /// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
 /// for is_ca tokens, so a compromised worker could open a PutPath stream
 /// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
@@ -519,7 +519,7 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 /// `PutPathBatch` is the multi-output endpoint builders use; the CA
 /// path-derivation gate must apply there too. Same attack as
 /// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
@@ -593,7 +593,7 @@ fn fod_upload_for(name: &str, nar: &[u8]) -> (String, String) {
     (path, format!("fixed:r:{}", h.to_colon()))
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 /// A worker holding a FOD-flagged token cannot skip content
 /// verification by omitting its `fixed:` descriptor: the membership
 /// check alone is not enough for a content-bound output.
@@ -617,7 +617,7 @@ async fn hmac_fod_descriptorless_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 /// The honest FOD flow is unaffected: descriptor present, content
 /// matches it, path re-derives from it → accepted.
 #[tokio::test]
@@ -636,7 +636,7 @@ async fn hmac_fod_with_descriptor_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+7]
+// r[verify sec.authz.ca-path-derived+8]
 /// Same enforcement on the batch ingestion path.
 #[tokio::test]
 async fn hmac_fod_batch_descriptorless_rejected() -> TestResult {

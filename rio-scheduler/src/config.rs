@@ -115,20 +115,6 @@ pub struct Config {
     /// `sla_ema_state`. CLI-only (`--allow-reference-change`); never
     /// set from TOML/env so a stale flag can't survive a rollout.
     pub allow_reference_change: bool,
-    /// Sign `is_fixed_output` into assignment-token claims (Phase 2 of
-    /// the claims rollout). Emitting the field is a forward wire break
-    /// against pre-field stores (`AssignmentClaims` is
-    /// `deny_unknown_fields`) and arms the store's rejection of
-    /// descriptor-less fixed-output uploads, so it must stay off until
-    /// (a) every rio-store replica and (b) every builder/fetcher worker
-    /// image (including warm Pool pods) carry the descriptor-recording
-    /// release; a wipe deploy satisfies both. Env:
-    /// `RIO_SIGN_FOD_CLAIMS`. Helm: `scheduler.signFodClaims`.
-    // TODO: flip the default to true (and eventually retire the knob)
-    // once the store-fleet + worker-image precondition holds in every
-    // deployment — Phase 2 of the procedure in
-    // docs/spec/system/deployment.typ (Upgrades).
-    pub sign_fod_claims: bool,
 }
 
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
@@ -182,7 +168,6 @@ impl Default for Config {
             dashboard: DashboardConfig::default(),
             sla: crate::sla::config::SlaConfig::defaults_baseline(),
             allow_reference_change: false,
-            sign_fod_claims: false,
         }
     }
 }

@@ -68,13 +68,12 @@ mandatory.
   between MergeDag commit and the first `BuildEvent`.
 ]
 
-#r("proto.metadata.assignment-token+1")[
+#r("proto.metadata.assignment-token+2")[
   `x-rio-assignment-token` is the *only* input the store trusts when
   authorizing `PutPath`. The token is minted scheduler-side at dispatch (HMAC
   over the seven-field `AssignmentClaims` tuple --- executor_id, drv_hash,
   expected_outputs, is_ca, is_fixed_output, tenant, expiry_unix; optional
-  fields use serde defaults, and `is_fixed_output` is only emitted while the
-  scheduler's `sign_fod_claims` gate is armed --- see
+  fields use serde defaults --- see
   #rref("common.hmac.claims+1")) and carried through
   the executor verbatim. The store MUST reject uploads with a missing,
   expired, or mismatched-output token. Builder pods are airgapped and

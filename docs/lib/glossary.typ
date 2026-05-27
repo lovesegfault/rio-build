@@ -332,7 +332,7 @@
   (
     key: "assignment-token",
     short: [assignment token],
-    description: [An HMAC-SHA256-signed token issued by the scheduler when dispatching work to an executor. Claims: `(executor_id, drv_hash, expected_outputs, is_ca, is_fixed_output, tenant, expiry_unix)` — the optional fields use serde defaults, and `is_fixed_output` is only emitted when the scheduler's `sign_fod_claims` rollout gate is armed. Verified by rio-store on `PutPath`.],
+    description: [An HMAC-SHA256-signed token issued by the scheduler when dispatching work to an executor. Claims: `(executor_id, drv_hash, expected_outputs, is_ca, is_fixed_output, tenant, expiry_unix)` — the optional fields use serde defaults. Verified by rio-store on `PutPath`.],
   ),
   (
     key: "prefetch-hint",

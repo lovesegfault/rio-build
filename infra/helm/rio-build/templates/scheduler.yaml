@@ -11,12 +11,6 @@
 {{- $s := .Values.scheduler -}}
 {{- /* I-213: soft_features string array. */ -}}
 soft_features = [{{ range $i, $f := $s.softFeatures }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
-{{- /* Phase-2 assignment-claims rollout gate (sign_fod_claims): emit the
-       scalar only when armed so default deployments keep the pre-field
-       claims wire shape. Scalars must precede the [sla] table (TOML). */ -}}
-{{- if $s.signFodClaims }}
-sign_fod_claims = true
-{{- end }}
 {{- /* ADR-023 [sla]: scalar block first, then nested tables, then
        array-of-tables — TOML requires tables after the scalars of
        their parent. p50/p90/p99 are optional per-tier. */ -}}

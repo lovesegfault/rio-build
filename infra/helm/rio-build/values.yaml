@@ -357,15 +357,6 @@ scheduler:
   # Per-replica throttling lives in the store: r[store.substitute.admission].
   # RIO_SUBSTITUTE_MAX_CONCURRENT remains an operator escape hatch (env)
   # but is intentionally not chart-set.
-  # Phase-2 rollout gate for the is_fixed_output assignment claim
-  # (scheduler.toml sign_fod_claims). Leave false until every rio-store
-  # replica AND every builder/fetcher worker image (including warm Pool
-  # pods) run the descriptor-recording release: arming it earlier makes
-  # the store reject FOD uploads from old workers, and emits a claims
-  # key that pre-field stores refuse outright. Fresh/wipe installs and
-  # the VM test deployments arm it; flip here once the fleet
-  # precondition holds (Phase 2).
-  signFodClaims: false
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
   # nixpkgs convention: big-parallel = "uses many cores", benchmark =

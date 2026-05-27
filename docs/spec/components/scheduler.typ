@@ -121,8 +121,7 @@ any critical-path value).
    c. Assign to the first eligible executor via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
       executor_id, drv_hash, expected_outputs, is_ca, is_fixed_output, tenant,
-      expiry_unix — the optional fields use serde defaults, and is_fixed_output
-      is emitted only when the scheduler's sign_fod_claims knob is armed). The
+      expiry_unix — the optional fields use serde defaults). The
       store verifies the token on PutPath and rejects uploads for paths not in
       expected_outputs.
 8. As builds complete (reported via BuildExecution stream):

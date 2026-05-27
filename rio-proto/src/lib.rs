@@ -9,7 +9,7 @@
 // Re-exported here so callers across the workspace reference one path
 // (`rio_proto::BUILD_ID_HEADER`) regardless of which crate defines them.
 // r[impl proto.metadata.build-id]
-// r[impl proto.metadata.assignment-token+1]
+// r[impl proto.metadata.assignment-token+2]
 // r[impl proto.metadata.tenant-token]
 pub use rio_common::grpc::{
     ASSIGNMENT_TOKEN_HEADER, BUILD_ID_HEADER, EXECUTOR_TOKEN_HEADER, PROBE_TENANT_ID_HEADER,
