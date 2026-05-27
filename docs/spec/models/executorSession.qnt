@@ -289,7 +289,8 @@ module executorSession {
     halfRecordedAssignment: bool,
     durableWriteWhileDeposed: bool,
     adoptAndReset: bool,
-    unresolvedAfterSweep: bool
+    unresolvedAfterSweep: bool,
+    confirmedPhantomRetained: bool
   }
 
   /// Reachability ghosts feeding the expect-violation witnesses. Only
@@ -524,6 +525,16 @@ module executorSession {
   /// (the store-probe adopt requires outputs; the phantom drain and
   /// orphan reset return work to Ready).
   val noFabricatedCompletion = not(viol.fabricatedCompletion)
+  /// A confirmed phantom is drained by the confirming heartbeat: when
+  /// the worker's second consecutive heartbeat still omits the build
+  /// the scheduler records as running on that slot, the slot does not
+  /// retain the phantom binding past that heartbeat. This is the
+  /// obligation that makes the slot-binding arm of
+  /// unresolvedClaimHasRepairArmed a real repair (the
+  /// heartbeat-reconcile / phantom family acts on what it binds);
+  /// added at Stage C as the unstated property behind the 0127cf854
+  /// two-strike drain (see the invariant map's calibration section).
+  val confirmedPhantomIsDrained = not(viol.confirmedPhantomRetained)
 
   // F3 — liveness calibration.
   /// A slot whose worker heartbeated within the timeout bucket measured
@@ -609,6 +620,7 @@ module executorSession {
     claimedSlotResolvesAtMostOnce,
     unresolvedClaimHasRepairArmed,
     noFabricatedCompletion,
+    confirmedPhantomIsDrained,
     noReapWhileFreshInWorkerTime,
     silentSlotReapArmed,
     correlationEntryLifecycle,
@@ -895,7 +907,13 @@ module executorSession {
       },
       viol' = { ...viol,
         doubleResolution: viol.doubleResolution or
-          (drainPhantom and st.drv.get(suspect).resolution != RUnresolved) },
+          (drainPhantom and st.drv.get(suspect).resolution != RUnresolved),
+        // the confirming heartbeat must not retain the phantom binding
+        // (as-built it never does: confirmedPhantom forces newRunning
+        // to ""; only a Stage-C override that removes the drain can
+        // set this latch)
+        confirmedPhantomRetained: viol.confirmedPhantomRetained or
+          (confirmedPhantom and suspect != "" and newRunning == suspect) },
       reach' = { ...reach,
         adoptHappened: reach.adoptHappened or adoptDrv != "",
         phantomDrained: reach.phantomDrained or confirmedPhantom }
@@ -1572,7 +1590,7 @@ module executorSession {
       offeredUnrunnable: false, offeredUnregistered: false,
       starvedPastBound: false, halfRecordedAssignment: false,
       durableWriteWhileDeposed: false, adoptAndReset: false,
-      unresolvedAfterSweep: false
+      unresolvedAfterSweep: false, confirmedPhantomRetained: false
     },
     reach' = {
       phantomDrained: false, adoptHappened: false,
