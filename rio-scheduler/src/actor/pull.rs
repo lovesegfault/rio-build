@@ -511,7 +511,7 @@ pub(crate) fn fold_report(
 /// set the stream `ProcessCompletion` arm carries, so the intake can
 /// funnel into the identical internal entry point.
 #[derive(Debug)]
-pub(crate) struct PullReportPayload {
+pub struct PullReportPayload {
     pub result: rio_proto::types::BuildResult,
     pub peak_memory_bytes: u64,
     pub peak_cpu_cores: f64,
@@ -616,7 +616,7 @@ impl DagActor {
 /// re-point, which always knows the exec/intent from the open-attempt
 /// view).
 #[derive(Debug, Default)]
-pub(crate) struct AttemptIdentity {
+pub struct AttemptIdentity {
     pub intent_id: Option<String>,
     pub job_name: Option<String>,
     pub exec_id: Option<Uuid>,

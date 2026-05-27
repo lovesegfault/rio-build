@@ -47,6 +47,12 @@ pub struct DagActorConfig {
     /// `Default` uses [`crate::sla::config::SlaConfig::test_default`]
     /// (single best-effort tier, tiny ceilings).
     pub sla: crate::sla::config::SlaConfig,
+    /// Establishment report slack for open pull-mode attempts: how long
+    /// past the intent deadline the establishment sweep waits for a
+    /// terminal report before establishing the attempt as an unreported
+    /// executor crash. main.rs loads from scheduler.toml
+    /// `establishment_report_slack_secs` (default 120 s).
+    pub establishment_report_slack: std::time::Duration,
 }
 
 impl Default for DagActorConfig {
@@ -58,6 +64,7 @@ impl Default for DagActorConfig {
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             soft_features: Vec::new(),
             sla: crate::sla::config::SlaConfig::test_default(),
+            establishment_report_slack: std::time::Duration::from_secs(120),
         }
     }
 }

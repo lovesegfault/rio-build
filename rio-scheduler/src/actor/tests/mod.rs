@@ -15,6 +15,7 @@ pub(crate) use helpers::*; // Re-export for grpc.rs tests
 mod build;
 mod completion;
 mod dispatch;
+mod establishment;
 mod executor;
 mod fault;
 mod integration;

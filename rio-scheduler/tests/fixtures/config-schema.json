@@ -43,6 +43,13 @@
         "minimum": 0,
         "default": 10
       },
+      "establishment_report_slack_secs": {
+        "description": "How long past an open pull-mode attempt's intent deadline the\nestablishment sweep waits for a terminal report before\nestablishing the attempt as an unreported executor crash\n(pull-mode dispatch only; stream-mode attempts keep the as-built\ncorrelation machinery). Provisional default 120 s (about two\ncontroller ticks plus Job terminal-observation margin);\nre-baselined at deployment time against the controller's\nterminal-report latency histogram.\nEnv: `RIO_ESTABLISHMENT_REPORT_SLACK_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 120
+      },
       "soft_features": {
         "description": "I-204: `requiredSystemFeatures` values that are capability HINTS,\nnot hardware gates. Stripped from each derivation at DAG-insert so\nthey don't drive pool spawn or block dispatch. nixpkgs convention:\n`big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.",
         "type": "array",
@@ -287,6 +294,7 @@
     "metrics_addr": "[::]:9091",
     "drain_grace_secs": 6,
     "tick_interval_secs": 10,
+    "establishment_report_slack_secs": 120,
     "soft_features": [],
     "hmac_key_path": null,
     "service_hmac_key_path": null,

@@ -2130,7 +2130,7 @@ impl DagActor {
     /// stalls reconcile at most ONCE (not N×) and doesn't reap
     /// executors that DID reconnect; feeds `cache_breaker` like the
     /// merge-time FMP path so a 30s stall here counts toward opening.
-    async fn batch_probe_orphan_outputs(
+    pub(super) async fn batch_probe_orphan_outputs(
         &mut self,
         store_paths: Vec<String>,
     ) -> Option<HashSet<String>> {
@@ -2176,7 +2176,7 @@ impl DagActor {
     /// the `handle_success_completion` steps that need worker-result
     /// data (build_samples, CA bookkeeping, ancestor priorities —
     /// full_sweep on next tick handles the latter).
-    async fn adopt_orphan_completion(
+    pub(super) async fn adopt_orphan_completion(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &Option<ExecutorId>,

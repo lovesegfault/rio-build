@@ -291,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
             retry_policy: cfg.retry,
             substitute_max_concurrent: cfg.substitute_max_concurrent,
             sla: cfg.sla,
+            establishment_report_slack: cfg.establishment_report_slack,
             ..Default::default()
         },
         rio_scheduler::actor::DagActorPlumbing {

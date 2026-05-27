@@ -27,6 +27,21 @@ pub struct Config {
     #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub tick_interval: std::time::Duration,
+    /// How long past an open pull-mode attempt's intent deadline the
+    /// establishment sweep waits for a terminal report before
+    /// establishing the attempt as an unreported executor crash
+    /// (pull-mode dispatch only; stream-mode attempts keep the as-built
+    /// correlation machinery). Provisional default 120 s (about two
+    /// controller ticks plus Job terminal-observation margin);
+    /// re-baselined at deployment time against the controller's
+    /// terminal-report latency histogram.
+    /// Env: `RIO_ESTABLISHMENT_REPORT_SLACK_SECS`.
+    #[serde(
+        rename = "establishment_report_slack_secs",
+        with = "rio_common::config::secs"
+    )]
+    #[schemars(with = "u64")]
+    pub establishment_report_slack: std::time::Duration,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
@@ -142,6 +157,7 @@ impl Default for Config {
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
+            establishment_report_slack: std::time::Duration::from_secs(120),
             soft_features: Vec::new(),
             hmac_key_path: None,
             service_hmac_key_path: None,

@@ -374,6 +374,11 @@ pub struct DagActor {
     pub(crate) attempt_record_retries: HashMap<DrvHash, u32>,
     /// Retry policy.
     retry_policy: RetryPolicy,
+    /// Establishment report slack for open pull-mode attempts
+    /// (config `establishment_report_slack_secs`, default 120 s): how
+    /// long past the intent deadline the establishment sweep waits for
+    /// a terminal report before establishing the attempt.
+    establishment_report_slack: std::time::Duration,
     /// Poison threshold + distinct-workers config. Replaces the
     /// former `POISON_THRESHOLD` const (3). Default matches prior
     /// behavior: 3 distinct workers.
@@ -800,6 +805,7 @@ impl DagActor {
             attempt_record_retries: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
+            establishment_report_slack: cfg.establishment_report_slack,
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
@@ -894,6 +900,7 @@ impl DagActor {
             // Retained: rationale below.
             executors: _,
             retry_policy: _,
+            establishment_report_slack: _,
             poison_config: _,
             db: _,
             store_client: _,

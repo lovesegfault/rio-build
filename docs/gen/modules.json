@@ -885,6 +885,11 @@
       "doc": "DAG merge handling: SubmitBuild → merge client DAG into global DAG."
     },
     {
+      "path": "actor/pull.rs",
+      "depth": 1,
+      "doc": "Pull-mode dispatch: the `PullAssignment` admission kernel and the"
+    },
+    {
       "path": "actor/recovery.rs",
       "depth": 1,
       "doc": "State recovery on leader acquisition."

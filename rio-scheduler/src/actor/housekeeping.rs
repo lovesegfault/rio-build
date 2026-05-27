@@ -15,7 +15,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS, POISON_TTL,
+    BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS, OutcomeClass,
+    POISON_TTL, ReportingParty, verifiable_wanted_paths,
 };
 
 use super::{DagActor, snapshot};
@@ -180,7 +181,7 @@ impl DagActor {
         self.tick_gc_orphan_derivations().await;
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
-        self.tick_refresh_open_attempts_gauge().await;
+        self.tick_sweep_open_pull_attempts().await;
 
         // r[impl sched.actor.dispatch-decoupled]
         // I-163: coalesced dispatch. Heartbeat sets the flag; we drain
@@ -895,21 +896,238 @@ impl DagActor {
         );
     }
 
-    /// Refresh `rio_scheduler_open_attempts` from the durable
-    /// open-attempt view (pull-mode rows only — the stream fleet stays
-    /// visible via `workers_active`). Durable-backed on purpose: open
-    /// pull-mode attempts have no in-memory session state to count, and
-    /// the gauge must survive failover exactly like the rows it counts.
-    /// Best-effort: a PG error keeps the previous reading and is
-    /// retried next tick. Leader-only via the `handle_tick`
-    /// early-return (same posture as `tick_publish_gauges`).
-    pub(super) async fn tick_refresh_open_attempts_gauge(&self) {
-        match self.db.list_open_pull_attempts().await {
-            Ok(rows) => {
-                metrics::gauge!("rio_scheduler_open_attempts").set(rows.len() as f64);
+    /// Establishment sweep for open pull-mode attempts — the single
+    /// scheduler-side time-based repair the pull path keeps. Every open
+    /// pull-mode attempt (the durable view, `dispatch_mode = 'pull'`
+    /// only) is visited every sweep; one whose age exceeds its intent
+    /// deadline plus `establishment_report_slack` with no terminal row
+    /// is resolved by the store-probe arm (all verifiable wanted
+    /// outputs present → adopted as completed, never charged) or
+    /// established exactly once as an unreported executor crash
+    /// (charged through the same append+decide discipline as every
+    /// other establishment vehicle) and requeued. Stream-mode attempts
+    /// are never visited — the as-built correlation machinery remains
+    /// their only establishment vehicle during coexistence. Also
+    /// refreshes `rio_scheduler_open_attempts` (one query serves both;
+    /// the gauge counts pull-mode attempts only and is durable-backed
+    /// so it survives failover exactly like the rows it counts).
+    /// Leader-only via the `handle_tick` early-return; the establishing
+    /// transaction additionally carries the same generation-floor fence
+    /// as the pull transaction.
+    // r[impl sched.attempt.establishment-window]
+    pub(super) async fn tick_sweep_open_pull_attempts(&mut self) {
+        let opens = match self.db.list_open_pull_attempts().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                debug!(error = %e, "open pull-attempt sweep: view query failed; retrying next tick");
+                return;
+            }
+        };
+        metrics::gauge!("rio_scheduler_open_attempts").set(opens.len() as f64);
+        if opens.is_empty() {
+            return;
+        }
+        let slack_secs = self.establishment_report_slack.as_secs_f64();
+        // The window: the intent deadline (the same solved deadline the
+        // spawn intent advertises and activeDeadlineSeconds is set
+        // from) plus the configured report slack.
+        let (hw, cost, inputs_gen) = self.solve_inputs();
+        let expired: Vec<crate::db::open_attempts::OpenAttemptRow> = opens
+            .into_iter()
+            .filter(|attempt| {
+                let deadline_secs = self
+                    .dag
+                    .node(attempt.drv_hash.as_str())
+                    .map(|state| {
+                        f64::from(
+                            self.solve_intent_for(state, &hw, &cost, inputs_gen)
+                                .deadline_secs,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                attempt.age_secs > deadline_secs + slack_secs
+            })
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        // One store probe for the whole batch (the same recovery probe
+        // the post-failover reconcile uses).
+        let probe_paths: Vec<String> = expired
+            .iter()
+            .filter_map(|a| self.dag.node(a.drv_hash.as_str()))
+            .flat_map(|s| s.expected_output_paths.iter())
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+        let missing = self.batch_probe_orphan_outputs(probe_paths).await;
+        for attempt in expired {
+            self.establish_open_pull_attempt(&attempt, missing.as_ref())
+                .await;
+        }
+    }
+
+    /// Resolve one expired open pull-mode attempt: adopt (store-probe
+    /// arm) or establish + requeue (C2 charge arm). See
+    /// [`Self::tick_sweep_open_pull_attempts`].
+    async fn establish_open_pull_attempt(
+        &mut self,
+        attempt: &crate::db::open_attempts::OpenAttemptRow,
+        missing: Option<&std::collections::HashSet<String>>,
+    ) {
+        // Standby replicas must neither write attempt rows nor decide
+        // from them (the same gate every establishment vehicle carries).
+        if !self.leader.is_leader() {
+            return;
+        }
+        let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+        let executor = ExecutorId::from(attempt.executor_id.as_str());
+
+        // Store-probe arm: every verifiable wanted output present →
+        // adopt as completed; the attempt is closed and never charged.
+        if let Some(state) = self.dag.node(&drv_hash) {
+            let adopt = verifiable_wanted_paths(
+                &state.output_names,
+                &state.expected_output_paths,
+                &state.wanted_output_names,
+            )
+            .is_some_and(|verifiable| {
+                missing.is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)))
+            });
+            if adopt {
+                let expected = state.expected_output_paths.clone();
+                self.adopt_orphan_completion(&drv_hash, &Some(executor.clone()), expected)
+                    .await;
+                if let Err(e) = self
+                    .db
+                    .update_assignment_status(
+                        attempt.derivation_id,
+                        crate::db::AssignmentStatus::Completed,
+                    )
+                    .await
+                {
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "establishment adopt: failed to close the assignment row");
+                }
+                info!(drv_hash = %drv_hash, exec_id = %attempt.exec_id,
+                      "establishment sweep: outputs present in store, adopted as completed (no charge)");
+                return;
+            }
+        }
+
+        // C2 charge arm: exactly one executor-crash/unreported
+        // establishment per attempt (the exec_id partial-unique index
+        // is the arbiter), fenced by the claims floor, closing the
+        // assignments row in the same transaction.
+        let verdict_eligible = self.dag.node(&drv_hash).is_some_and(|s| {
+            matches!(
+                s.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+            )
+        });
+        let serving_generation = self.leader.generation() as i64;
+        let mut row = crate::db::attempts::AttemptRow::new(
+            attempt.derivation_id,
+            OutcomeClass::ExecutorCrash,
+            ReportingParty::Scheduler,
+        );
+        row.exec_id = Some(attempt.exec_id);
+        row.executor_id = Some(executor.clone());
+        row.termination_reason = Some("unreported".into());
+        type ChargeOutcome = Option<(bool, crate::retry_policy::Decision)>;
+        let result: Result<ChargeOutcome, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            // The same generation fence the pull transaction applies:
+            // a below-floor serving generation writes nothing.
+            let floor: Option<i64> = sqlx::query_scalar(
+                "SELECT GREATEST( \
+                     (SELECT MAX(generation) FROM assignments), \
+                     (SELECT MAX(generation) FROM leader_generation_claims))",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if floor.is_some_and(|f| serving_generation < f) {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            let (won, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
+            if won
+                && verdict_eligible
+                && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
+            {
+                crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+            }
+            sqlx::query(
+                "UPDATE assignments SET status = 'failed', completed_at = now() \
+                 WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
+            )
+            .bind(attempt.exec_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some((won, decision)))
+        }
+        .await;
+        let (won, decision) = match result {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                info!(drv_hash = %drv_hash, serving_generation,
+                      "establishment sweep: serving generation below the claims floor; nothing written");
+                return;
             }
             Err(e) => {
-                debug!(error = %e, "open-attempts gauge refresh failed; keeping previous value");
+                warn!(drv_hash = %drv_hash, exec_id = %attempt.exec_id, error = %e,
+                      "establishment sweep: appending transaction failed; the attempt stays open \
+                       for this pass (no charge, no verdict)");
+                return;
+            }
+        };
+        if !won {
+            // Another classifier landed concurrently (its row holds the
+            // verdict); this pass records and changes nothing.
+            return;
+        }
+        // OA1 interval, establishment cause: attempt opened → established.
+        metrics::histogram!(
+            "rio_scheduler_attempt_requeue_seconds",
+            "cause" => "establishment"
+        )
+        .record(attempt.age_secs.max(0.0));
+        if let Some(state) = self.dag.node_mut(&drv_hash) {
+            state.push_attempt_record(row.to_record());
+        }
+        self.refresh_retry_view(&drv_hash);
+        info!(
+            drv_hash = %drv_hash,
+            exec_id = %attempt.exec_id,
+            executor_id = %executor,
+            age_secs = attempt.age_secs,
+            "establishment sweep: open pull-mode attempt established as unreported executor crash"
+        );
+        if !verdict_eligible {
+            return;
+        }
+        match decision.verdict {
+            crate::retry_policy::Verdict::Poison(reason) => {
+                if !matches!(reason, crate::retry_policy::PoisonReason::Threshold) {
+                    error!(drv_hash = %drv_hash, ?reason,
+                           "decide() returned an unexpected poison reason for an established \
+                            pull attempt; poisoning with the threshold message (investigate)");
+                }
+                self.poison_already_recorded(
+                    &drv_hash,
+                    "poison threshold reached after unreported executor crashes",
+                    None,
+                )
+                .await;
+            }
+            _ => {
+                // The C2 requeue: the pod is gone, the charge is
+                // recorded — return the derivation to the queue through
+                // the same chokepoint every other no-report observation
+                // uses.
+                self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                    .await;
             }
         }
     }

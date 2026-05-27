@@ -63,11 +63,6 @@ struct AttemptByExecByHashRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct OpenAttemptRow {
     /// The DAG key (`derivations.derivation_id`).
-    // Consumed by the establishment sweep's fill keying (lands later
-    // in this wave); the RPC handler does not need it. allow (not
-    // expect): the in-crate db tests already read it, so the lint only
-    // fires on the non-test lib target.
-    #[allow(dead_code)]
     pub derivation_id: Uuid,
     /// `derivations.drv_hash` — the intent id (the spawn-intent key).
     pub drv_hash: String,
@@ -82,8 +77,9 @@ pub(crate) struct OpenAttemptRow {
     /// Lease generation the assignment row carries.
     pub generation: i64,
     /// `assignments.assigned_at` as epoch seconds (PG clock).
-    // Consumed by the establishment sweep's window arithmetic (lands
-    // later in this wave); same allow rationale as derivation_id.
+    // The sweep's window math reads age_secs (PG-clock relative); this
+    // absolute stamp is the view-contract column tests assert on.
+    // allow: only the in-crate db tests read it today.
     #[allow(dead_code)]
     pub assigned_at_epoch_secs: f64,
     /// Age of the assignment row in seconds (PG clock, non-negative).

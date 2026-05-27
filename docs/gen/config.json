@@ -184,6 +184,12 @@
         "description": "Tick interval (seconds) for scheduler housekeeping."
       },
       {
+        "key": "establishment_report_slack_secs",
+        "type": "uint64",
+        "default": "120",
+        "description": "How long past an open pull-mode attempt's intent deadline the establishment sweep waits for a terminal report before establishing the attempt as an unreported executor crash (pull-mode dispatch only; stream-mode attempts keep the as-built correlation machinery)."
+      },
+      {
         "key": "soft_features",
         "type": "list<string>",
         "default": "[]",
