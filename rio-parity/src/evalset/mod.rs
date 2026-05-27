@@ -5,6 +5,7 @@
 //! fidelity gate, dependency-closure enumeration, the derivation
 //! archive, and the eval-set key/metadata.
 
+pub mod archive;
 pub mod artifacts;
 pub mod depclosure;
 pub mod evaluator;

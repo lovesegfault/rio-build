@@ -766,6 +766,11 @@
       "doc": "Eval-set construction."
     },
     {
+      "path": "evalset/archive.rs",
+      "depth": 1,
+      "doc": "drvs.tar.zst — the eval set's derivation-closure archive."
+    },
+    {
       "path": "evalset/artifacts.rs",
       "depth": 1,
       "doc": "Local eval-set artifact directory layout and JSON/JSONL writers."

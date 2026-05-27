@@ -28,11 +28,12 @@ pub fn user_agent(contact: Option<&str>) -> String {
     }
 }
 
-/// Clip an HTTP error-response body to a short single-line snippet for
-/// error messages: whitespace is collapsed and the text is cut at 200
-/// characters. Hydra and cache.nixos.org error pages are HTML, so the
-/// snippet keeps the useful part visible without dumping a whole page
-/// into every error chain.
+/// Clip an HTTP error-response body or subprocess stderr to a short
+/// single-line snippet for error messages: whitespace is collapsed and
+/// the text is cut at 200 characters. Hydra and cache.nixos.org error
+/// pages are HTML and nix stderr can run to many lines, so the snippet
+/// keeps the useful part visible without dumping the whole output into
+/// every error chain.
 pub(crate) fn body_snippet(body: &str) -> String {
     const MAX_CHARS: usize = 200;
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");

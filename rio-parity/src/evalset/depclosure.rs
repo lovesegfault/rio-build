@@ -65,6 +65,10 @@ struct ShowOutputEntry {
     path: Option<String>,
 }
 
+/// Prefix a bare store-path basename with `/nix/store/`. Assumes the
+/// standard store dir: paths from a relocated store (`--store
+/// /other/root`) would come out wrong, which is acceptable because the
+/// eval-set builder always evaluates against the standard store.
 fn normalize_store_path(p: &str) -> String {
     if p.starts_with("/nix/store/") {
         p.to_string()
@@ -79,6 +83,15 @@ fn normalize_store_path(p: &str) -> String {
 ///    (fixed-output drvs: nix 2.34's JSON puts hash/method in `outputs`
 ///    and the real path only in the builder env);
 /// 3. else None — floating CA output.
+///
+/// Known mis-fire: `__structuredAttrs` fixed-output drvs have no
+/// per-output `env` key, so their outputs degrade to `caOutputs` (and
+/// the target-level `requiredSystemFeatures` extraction returns None
+/// for structuredAttrs targets). Both degrade conservatively — an
+/// output is reported as not statically resolvable rather than
+/// resolved to a wrong path — and structuredAttrs derivations are rare
+/// in the Hydra jobsets this targets. The `/nix/store/` prefix check
+/// shares `normalize_store_path`'s standard-store-dir assumption.
 fn output_path(drv: &ShowDrv, output_name: &str) -> Option<String> {
     if let Some(p) = drv.outputs.get(output_name).and_then(|o| o.path.as_deref()) {
         return Some(normalize_store_path(p));
@@ -95,7 +108,9 @@ fn output_path(drv: &ShowDrv, output_name: &str) -> Option<String> {
 /// the document as a `serde_json::Value`, take `derivations` when
 /// present (else treat the whole object as the map), then deserialize
 /// each entry — unrelated top-level keys (`version`, future additions)
-/// never break parsing.
+/// never break parsing. Entries are deserialized straight from the
+/// borrowed `Value` (no per-entry clone): each entry carries a
+/// multi-kilobyte `env` map and a closure can hold 10^5+ entries.
 fn parse_show_drvs(show_json: &str) -> anyhow::Result<BTreeMap<String, ShowDrv>> {
     let value: serde_json::Value =
         serde_json::from_str(show_json).context("parse `nix derivation show -r` JSON")?;
@@ -105,7 +120,7 @@ fn parse_show_drvs(show_json: &str) -> anyhow::Result<BTreeMap<String, ShowDrv>>
         .context("`nix derivation show -r` output is not a JSON object")?;
     let mut drvs = BTreeMap::new();
     for (key, drv_value) in map {
-        let drv: ShowDrv = serde_json::from_value(drv_value.clone())
+        let drv = ShowDrv::deserialize(drv_value)
             .with_context(|| format!("parse derivation show entry {key}"))?;
         // Keys may be basenames (nix 2.34) or full paths (older nix).
         drvs.insert(normalize_store_path(key), drv);
@@ -116,15 +131,20 @@ fn parse_show_drvs(show_json: &str) -> anyhow::Result<BTreeMap<String, ShowDrv>>
 /// Build the dep-closure record for `target_drv` from a
 /// `nix derivation show -r <target_drv>` JSON blob. Also returns the
 /// target's `requiredSystemFeatures` so the caller can backfill the
-/// manifest record's `requiredFeatures`.
+/// manifest record's `requiredFeatures`. `target_drv` may be spelled
+/// as a full `/nix/store/…` path or a bare basename; the emitted
+/// record always carries the full path.
 pub fn dep_closure_from_show_json(
     show_json: &str,
     target_drv: &str,
     job: &str,
 ) -> anyhow::Result<(DepClosureRecord, Option<Vec<String>>)> {
+    // Normalize the target to the same canonical form as the map keys
+    // so lookup and the self-exclusion below work for either spelling.
+    let target_drv = normalize_store_path(target_drv);
     let normalized = parse_show_drvs(show_json)?;
     let target = normalized
-        .get(target_drv)
+        .get(&target_drv)
         .with_context(|| format!("target {target_drv} not present in derivation show output"))?;
 
     let required_features = target
@@ -142,7 +162,7 @@ pub fn dep_closure_from_show_json(
     // BTreeMap iteration ⇒ deps come out sorted by drvPath
     // (deterministic artifacts).
     for (drv_path, drv) in &normalized {
-        if drv_path == target_drv {
+        if *drv_path == target_drv {
             continue;
         }
         let mut output_paths = Vec::new();
@@ -166,7 +186,7 @@ pub fn dep_closure_from_show_json(
     Ok((
         DepClosureRecord {
             job: job.to_string(),
-            drv_path: target_drv.to_string(),
+            drv_path: target_drv,
             deps,
             ca_outputs,
         },
@@ -200,9 +220,7 @@ pub async fn run_derivation_show(nix_bin: &str, drv_path: &str) -> anyhow::Resul
         out.status.success(),
         "nix derivation show -r {drv_path} failed ({}): {}",
         out.status,
-        std::str::from_utf8(&out.stderr)
-            .unwrap_or("<non-utf8 stderr>")
-            .trim()
+        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
     );
     String::from_utf8(out.stdout).context("derivation show output is not UTF-8")
 }
@@ -401,6 +419,25 @@ mod tests {
         let err = dep_closure_from_show_json(&fixture(), "/nix/store/zzz-missing.drv", "job")
             .unwrap_err();
         assert!(format!("{err:#}").contains("zzz-missing"), "got: {err:#}");
+    }
+
+    #[test]
+    fn target_drv_basename_spelling_is_accepted() {
+        // Callers may pass the target as a full store path or as the
+        // bare basename `nix derivation show` keys its map with; both
+        // spellings resolve to the same record, carrying the full path.
+        let (rec, _) = dep_closure_from_show_json(
+            &fixture(),
+            "00d529rs5cfj1kwz79sm79qackf9gppk-strncpy.drv",
+            "bootstrap.strncpy.x86_64-linux",
+        )
+        .unwrap();
+        assert_eq!(rec.drv_path, TARGET);
+        assert_eq!(rec.deps.len(), 5);
+        assert!(
+            !rec.deps.iter().any(|d| d.drv_path == TARGET),
+            "the target drv must not appear in its own deps"
+        );
     }
 
     #[test]
