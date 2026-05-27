@@ -671,12 +671,23 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
     // Store is EMPTY — resolve_derivation fails, single-node fallback.
     let drv_path = "/nix/store/00000000000000000000000000000005-inline-fod.drv";
 
+    // The declared path must be the one the declared hash derives to —
+    // the gateway now binds fixed-output declarations exactly like the
+    // builder does, so the fixture computes the honest path instead of
+    // making one up.
+    let digest = hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest)?;
+    let honest_path =
+        rio_nix::store_path::StorePath::make_fixed_output("inline-fod", &nix_hash, false, &[])?
+            .as_str()
+            .to_owned();
+
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
         string: drv_path,
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        string: &honest_path,
         string: "sha256",                        // hash_algo → fixed-output
         string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         strings: wire::NO_STRINGS,               // input_srcs
@@ -685,7 +696,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
         strings: &["-c", "echo hi"],
         u64: 1,                                  // 1 env pair
         string: "out",
-        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        string: &honest_path,
         u64: 0,                                  // build_mode
     );
 
@@ -781,6 +792,53 @@ async fn test_build_derivation_squatted_path_rejected_and_cache_restored() -> an
             .load(std::sync::atomic::Ordering::SeqCst),
         1,
         "the .drv must be fetched exactly once — the session cache survives the binding gate"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline FIXED-OUTPUT derivation whose declared
+/// path is NOT the one its declared hash derives to is rejected before
+/// SubmitBuild — a junk outputHash cannot exempt a victim path from the
+/// trusted-plane binding, even on the single-node fallback.
+#[tokio::test]
+async fn test_build_derivation_inline_fod_squatted_path_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000008-inline-fod-squat.drv";
+    let squatted = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: squatted,                        // parseable, not derived from the hash
+        string: "sha256",                        // hash_algo → fixed-output
+        string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: squatted,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("must match the derivation"),
+        "error should name the binding violation: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "inline FOD squat rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;

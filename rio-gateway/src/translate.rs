@@ -498,6 +498,21 @@ pub fn validate_dag(
         }
     }
 
+    // Declared-hash (fixed-output) outputs: bind the declared path to
+    // the declared hash and enforce CppNix's single-'out' shape rule.
+    // Without this a junk outputHash would exempt an arbitrary declared
+    // path from every trusted-plane binding (the builder-side check is
+    // defense in depth; the store only verifies content the worker
+    // volunteers a descriptor for).
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+        validate_declared_hash_outputs(
+            &node.drv_path,
+            drv.outputs()
+                .iter()
+                .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
+        )?;
+    }
+
     Ok(())
 }
 
@@ -611,6 +626,106 @@ pub(crate) fn validate_output_path_bindings(
         }
     }
 
+    Ok(())
+}
+
+/// Trusted-plane binding of declared-hash (fixed-output) output paths to
+/// their declared hash. Mirrors rio-builder's
+/// `validate_fixed_output_declarations` (the worker-side check is
+/// defense in depth — workers are untrusted) and CppNix:
+/// a CAFixed output's path is never trusted, every consumer recomputes
+/// `makeFixedOutputPath`, and `BasicDerivation::type()` requires that a
+/// derivation with a fixed output consists of exactly one output named
+/// `out` ("only one fixed output is allowed", "can't mix derivation
+/// output types").
+///
+/// `outputs` yields `(name, path, hash_algo, hash)` tuples so both the
+/// cached full [`Derivation`] and the wire `BasicDerivation` can be
+/// checked with one implementation.
+///
+/// Scope: outputs whose declared path does not parse as a store path
+/// are skipped (they cannot alias a real store object — same rule as
+/// the input-addressed binding gate); for parseable declared paths any
+/// malformed algo/hash or any mismatch with
+/// `StorePath::make_fixed_output(declared hash)` is rejected
+/// fail-closed — otherwise a junk outputHash would exempt an arbitrary
+/// declared path from validation.
+///
+/// Keep the accepted algo set in sync with [`fod_algo_verifiable`]
+/// (the algo gate runs first, so unsupported algos already carry their
+/// own error message).
+pub(crate) fn validate_declared_hash_outputs<'a>(
+    drv_path: &str,
+    outputs: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+) -> Result<(), String> {
+    use rio_nix::hash::{HashAlgo, NixHash};
+
+    let outputs: Vec<(&str, &str, &str, &str)> = outputs.collect();
+    let declared_hash: Vec<&(&str, &str, &str, &str)> = outputs
+        .iter()
+        .filter(|(_, _, algo, hash)| !algo.is_empty() && !hash.is_empty())
+        .collect();
+    if declared_hash.is_empty() {
+        return Ok(());
+    }
+
+    // Shape rule (CppNix `BasicDerivation::type()`).
+    if outputs.len() != 1 {
+        let reason = if declared_hash.len() == outputs.len() {
+            "only one fixed output is allowed"
+        } else {
+            "fixed-output and non-fixed outputs cannot be mixed in one derivation"
+        };
+        return Err(format!(
+            "derivation {drv_path} declares a fixed-output hash but has {} outputs — {reason}",
+            outputs.len()
+        ));
+    }
+    let (name, declared_path, raw_algo, raw_hash) = outputs[0];
+    if name != "out" {
+        return Err(format!(
+            "derivation {drv_path}: the single fixed output must be named \"out\", not \"{name}\""
+        ));
+    }
+
+    // Out-of-scope declared paths (empty / not a store path) cannot
+    // alias a real store object; the build keeps failing later exactly
+    // as before.
+    if StorePath::parse(declared_path).is_err() {
+        return Ok(());
+    }
+
+    let drv_sp = StorePath::parse(drv_path)
+        .map_err(|e| format!("derivation path {drv_path} is not a valid store path: {e}"))?;
+    let drv_name = drv_sp
+        .name()
+        .strip_suffix(".drv")
+        .unwrap_or_else(|| drv_sp.name());
+
+    let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
+        Some(rest) => (true, rest),
+        None => (false, raw_algo),
+    };
+    let algo: HashAlgo = algo_str.parse().map_err(|_| {
+        format!(
+            "derivation {drv_path} output '{name}' declares unsupported outputHashAlgo '{raw_algo}'"
+        )
+    })?;
+    let digest = hex::decode(raw_hash).map_err(|_| {
+        format!("derivation {drv_path} output '{name}': outputHash is not valid base16: {raw_hash}")
+    })?;
+    let hash = NixHash::new(algo, digest)
+        .map_err(|e| format!("derivation {drv_path} output '{name}': invalid outputHash: {e}"))?;
+    let expected = StorePath::make_fixed_output(drv_name, &hash, recursive, &[]).map_err(|e| {
+        format!("derivation {drv_path} output '{name}': cannot derive fixed-output path: {e}")
+    })?;
+    if expected.as_str() != declared_path {
+        return Err(format!(
+            "derivation {drv_path} declares fixed output '{name}' at {declared_path} but the \
+             declared hash derives to {} — declared output paths must match the derivation",
+            expected.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -1343,11 +1458,18 @@ mod tests {
     /// never checked.
     #[test]
     fn validate_dag_rejects_unverifiable_fod_algo() {
-        let fod_drv = |algo: &str, hash: &str| -> Derivation {
+        let fod_drv_at = |algo: &str, hash: &str, path: &str| -> Derivation {
             let aterm = format!(
-                r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src")])"#
+                r#"Derive([("out","{path}","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{path}")])"#
             );
             Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let fod_drv = |algo: &str, hash: &str| {
+            fod_drv_at(
+                algo,
+                hash,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src",
+            )
         };
         let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.drv";
         let node = types::DerivationNode {
@@ -1363,10 +1485,24 @@ mod tests {
         let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
         assert!(err.contains("outputHashAlgo 'md5'"), "{err}");
 
-        // sha256 and r:sha512 → accepted.
-        for algo in ["sha256", "r:sha512"] {
+        // sha256 and r:sha512 → accepted, with hash-consistent declared
+        // paths and correctly-sized digests (the declared-hash binding
+        // gate requires both).
+        for (algo, digest_len) in [("sha256", 32usize), ("r:sha512", 64)] {
+            let digest = vec![0xabu8; digest_len];
+            let nix_hash = rio_nix::hash::NixHash::new(
+                algo.strip_prefix("r:").unwrap_or(algo).parse().unwrap(),
+                digest.clone(),
+            )
+            .unwrap();
+            let honest =
+                StorePath::make_fixed_output("src", &nix_hash, algo.starts_with("r:"), &[])
+                    .unwrap();
             let mut cache = HashMap::new();
-            cache.insert(key.clone(), fod_drv(algo, &"ab".repeat(32)));
+            cache.insert(
+                key.clone(),
+                fod_drv_at(algo, &hex::encode(&digest), honest.as_str()),
+            );
             assert!(
                 validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
                 "{algo} must be accepted"
@@ -1426,6 +1562,120 @@ mod tests {
         for bad in ["md5", "r:md5", "blake3", "sha3-256", ""] {
             assert!(!fod_algo_verifiable(bad), "{bad} must not be verifiable");
         }
+    }
+
+    /// Declared-hash (fixed-output) outputs are bound to their declared
+    /// hash at submission: the declared path must equal
+    /// `make_fixed_output(declared hash)`. A junk hash can no longer
+    /// exempt an arbitrary (victim) path from validation.
+    #[test]
+    fn validate_dag_binds_declared_hash_outputs() {
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let fod_at = |algo: &str, hash: &str, path: &str| -> Derivation {
+            let aterm = format!(
+                r#"Derive([("out","{path}","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{path}")])"#
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let digest = vec![0x5au8; 32];
+        let nix_hash =
+            rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest.clone()).unwrap();
+        let hex_hash = hex::encode(&digest);
+
+        // Honest flat-sha256 and r:sha256 declarations → accepted.
+        for recursive in [false, true] {
+            let algo = if recursive { "r:sha256" } else { "sha256" };
+            let honest = StorePath::make_fixed_output("fetch", &nix_hash, recursive, &[]).unwrap();
+            let mut cache = HashMap::new();
+            cache.insert(key.clone(), fod_at(algo, &hex_hash, honest.as_str()));
+            assert!(
+                validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+                "honest {algo} declaration must pass"
+            );
+        }
+
+        // Junk hash + somebody else's well-formed path → rejected,
+        // naming the declared and derived paths.
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha256", &hex_hash, victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation") && err.contains(victim),
+            "squatted FOD path must be rejected naming the path: {err}"
+        );
+
+        // Non-hex hash with a parseable path → rejected fail-closed.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha256", "nothex!", victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("base16"), "{err}");
+
+        // Wrong-length digest (sha512 algo, 32-byte hash) → rejected.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha512", &hex_hash, victim));
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("invalid outputHash"), "{err}");
+
+        // Empty declared path → out of scope for this gate.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), fod_at("sha256", &hex_hash, ""));
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "deferred/empty declared paths are not this gate's concern"
+        );
+    }
+
+    /// CppNix's shape rule for fixed-output derivations, enforced at
+    /// submission: exactly one output, named "out"; hash-declaring and
+    /// plain outputs cannot be mixed.
+    #[test]
+    fn validate_dag_rejects_mixed_declared_hash_shapes() {
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let hex_hash = "5a".repeat(32);
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+
+        // Declared-hash output + IA sibling → rejected (mixing).
+        let mixed = Derivation::parse(&format!(
+            r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch","sha256","{hex_hash}"),("doc","{victim}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out",""),("doc","")])"#
+        ))
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), mixed);
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("cannot be mixed"), "{err}");
+
+        // Two declared-hash outputs → rejected (only one allowed).
+        let two = Derivation::parse(&format!(
+            r#"Derive([("out","","sha256","{hex_hash}"),("src","","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out",""),("src","")])"#
+        ))
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), two);
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("only one fixed output"), "{err}");
+
+        // Single declared-hash output not named "out" → rejected.
+        let misnamed = Derivation::parse(&format!(
+            r#"Derive([("src","","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("src","")])"#
+        ))
+        .expect("test ATerm parses");
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), misnamed);
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("must be named"), "{err}");
     }
 
     #[test]

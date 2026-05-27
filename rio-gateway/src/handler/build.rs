@@ -1266,8 +1266,28 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             }
         }
         Err(e) => {
-            // r[impl gw.reject.nochroot] is the precedent for inline
-            // checks; this one closes the same bypass for output paths.
+            // Declared-hash (fixed-output) outputs on the inline
+            // BasicDerivation get the same trusted-plane binding the
+            // cached path gets via validate_dag: declared path must
+            // derive from the declared hash, single-'out' shape rule.
+            // Without this, a junk outputHash on an inline derivation
+            // would exempt an arbitrary declared path from validation.
+            if let Err(reason) = translate::validate_declared_hash_outputs(
+                &drv_path_str,
+                basic_drv
+                    .outputs()
+                    .iter()
+                    .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
+            ) {
+                warn!(
+                    drv_path = %drv_path_str,
+                    reason = %reason,
+                    "rejecting inline derivation: declared fixed-output path does not bind"
+                );
+                stderr_err!(stderr, "{reason}");
+            }
+            // The precedent for inline checks is the __noChroot check
+            // above; this one closes the same bypass for output paths.
             //
             // CppNix's daemon refuses wopBuildDerivation for
             // input-addressed derivations from untrusted clients
