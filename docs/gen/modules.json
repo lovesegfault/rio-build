@@ -1809,6 +1809,11 @@
       "doc": "pol01: per-tenant keep_going over ssh-ng (`r[gw.build.per-tenant-policy]`)."
     },
     {
+      "path": "k8s/qa/scenarios/pol02_force_build_roots.rs",
+      "depth": 3,
+      "doc": "pol02: per-tenant force_build_roots over ssh-ng"
+    },
+    {
       "path": "k8s/qa/scheduler.rs",
       "depth": 2,
       "doc": "Two-phase scenario scheduler."
