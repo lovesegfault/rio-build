@@ -284,6 +284,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
 }
 
 // r[verify gw.opcode.build-derivation+2]
+// r[verify gw.opcode.build-results-honest+2]
 /// wopBuildDerivation (36): builtOutputs is populated for floating-CA
 /// outputs via the Realisations table — same enrichment as opcode 46.
 /// Before the fix, this handler wrote `BuildResult::success()` with
@@ -318,6 +319,9 @@ async fn test_build_derivation_floating_ca_populates_built_outputs() -> anyhow::
             signatures: vec![],
         },
     );
+    // The realised output must also be PRESENT in the store — the gateway
+    // verifies it via FindMissingPaths before reporting success.
+    h.store.seed_with_content(realised_out, b"ca-out");
 
     wire_send!(&mut h.stream;
         u64: 36,
@@ -2912,6 +2916,199 @@ async fn test_build_paths_with_results_unrealized_floating_ca_fails_target() -> 
         result.error_msg
     );
     assert!(result.built_outputs.is_empty(), "{result:?}");
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// wopBuildDerivation (36): with the .drv resolvable and the declared IA
+/// output present in the store, the reply is Built and builtOutputs covers
+/// exactly the declared output with its store path. Guards the swap from
+/// enrich_build_result_with_outputs to the shared store verification.
+#[tokio::test]
+async fn test_build_derivation_verified_ia_output_built() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // .drv resolvable (full_drv path) and the declared output present.
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: HONEST_A_DRV,
+        // BasicDerivation matching HONEST_A_ATERM:
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: HONEST_A_OUT,
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo a"],
+        u64: 1, string: "out", string: HONEST_A_OUT,  // env
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = read_build_result(&mut h.stream, PROTOCOL_VERSION).await?;
+    assert_eq!(result.status, BuildStatus::Built, "{result:?}");
+    assert!(result.error_msg.is_empty(), "{result:?}");
+    assert_eq!(
+        result.built_outputs.len(),
+        1,
+        "builtOutputs must cover the declared output: {result:?}"
+    );
+    assert!(result.built_outputs[0].drv_output_id.ends_with("!out"));
+    assert_eq!(result.built_outputs[0].out_path, HONEST_A_OUT);
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// wopBuildDerivation (36): a floating-CA output with no realisation row
+/// must produce an honest failure BuildResult — not a Built result whose
+/// builtOutputs carry an empty outPath (which stock clients reject /
+/// assert on at nix-build.cc:722).
+#[tokio::test]
+async fn test_build_derivation_unrealized_floating_ca_fails_result() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Seed the .drv (so full_drv resolves) but register NO realisation and
+    // do NOT seed any output path.
+    h.store.seed_with_content(CA_DRV, CA_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: CA_DRV,
+        // BasicDerivation matching CA_ATERM:
+        u64: 1,                             // 1 output
+        string: "out", string: "",          // floating-CA: path empty
+        string: "r:sha256", string: "",     // hash_algo set, hash empty
+        strings: wire::NO_STRINGS,          // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "true"],
+        u64: 1, string: "out", string: "",  // env
+        u64: 0,                             // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    // Pre-fix this read fails with "Realisation JSON has empty 'outPath'" —
+    // exactly the malformed payload a stock build-hook client chokes on.
+    let result = read_build_result(&mut h.stream, PROTOCOL_VERSION).await?;
+    assert_eq!(
+        result.status,
+        BuildStatus::MiscFailure,
+        "unrealized floating-CA output must fail verification: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains("no realisation"),
+        "error must name the unrealized output, got: {:?}",
+        result.error_msg
+    );
+    assert!(result.built_outputs.is_empty(), "{result:?}");
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// wopBuildDerivation (36): the scheduler says Built but the declared IA
+/// output is not in the store — the result must be an honest failure naming
+/// the missing path, not a wrong-success.
+#[tokio::test]
+async fn test_build_derivation_missing_store_path_fails_result() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // .drv resolvable, but the declared output path is NOT seeded.
+    h.store
+        .seed_with_content(HONEST_B_DRV, HONEST_B_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: HONEST_B_DRV,
+        // BasicDerivation matching HONEST_B_ATERM:
+        u64: 1,
+        string: "out",
+        string: HONEST_B_OUT,
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo b"],
+        u64: 1, string: "out", string: HONEST_B_OUT,
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = read_build_result(&mut h.stream, PROTOCOL_VERSION).await?;
+    assert_eq!(
+        result.status,
+        BuildStatus::MiscFailure,
+        "missing store path must not be reported Built: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains(HONEST_B_OUT),
+        "error must name the missing path, got: {:?}",
+        result.error_msg
+    );
+    assert!(
+        result.built_outputs.is_empty(),
+        "no fabricated builtOutputs for an unverified result: {result:?}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// wopBuildDerivation (36): a store error during the post-build verification
+/// (FindMissingPaths unavailable) aborts the opcode with STDERR_ERROR — the
+/// gateway never reports an unverified success.
+#[tokio::test]
+async fn test_build_derivation_store_error_during_verification() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+    h.store
+        .faults
+        .fail_find_missing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: HONEST_A_DRV,
+        // BasicDerivation matching HONEST_A_ATERM:
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: HONEST_A_OUT,
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo a"],
+        u64: 1, string: "out", string: HONEST_A_OUT,  // env
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("store error verifying build outputs"),
+        "expected the FindMissingPaths verification abort, got: {:?}",
+        err.message
+    );
 
     h.finish().await;
     Ok(())

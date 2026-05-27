@@ -1288,37 +1288,56 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         }
     };
 
-    // Populate builtOutputs (matching opcode 46). Without this, the
-    // ssh-ng:// build-hook path receives `built_outputs=[]` and cannot
-    // locate floating-CA output paths → nix-build.cc:722 assert. Needs
-    // the full Derivation (with inputDrvs) for hash_derivation_modulo;
-    // the inline BasicDerivation lacks inputDrvs so the modular hash
-    // would diverge from CppNix for non-leaf drvs. If full_drv resolve
-    // failed (single-node fallback above), leave builtOutputs empty —
-    // no worse than before, and IA output paths are still recoverable
-    // client-side from the BasicDerivation it sent.
+    // Verify the declared outputs against the store before reporting
+    // success (same machinery as opcodes 9/46): builtOutputs come from
+    // result_with_wanted_outputs — declared paths for IA/fixed-CA outputs,
+    // registered realisations for floating-CA — and a missing or unrealized
+    // output demotes the result to an honest failure instead of shipping an
+    // empty outPath the client asserts on (nix-build.cc:722). Needs the full
+    // Derivation (with inputDrvs) for hash_derivation_modulo; the inline
+    // BasicDerivation lacks inputDrvs so the modular hash would diverge from
+    // CppNix for non-leaf drvs. If full_drv resolve failed (single-node
+    // fallback above), there is nothing to verify against — leave
+    // builtOutputs empty, no worse than before, and IA output paths are
+    // still recoverable client-side from the BasicDerivation it sent.
+    // Store errors during verification abort via stderr_err! inside
+    // check_targets_against_store, before stderr.finish().
+    // r[impl gw.opcode.build-results-honest+2]
     if build_result.status.is_success()
         && let Ok(drv) = &full_drv
     {
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-        match enrich_build_result_with_outputs(
-            build_result.clone(),
-            drv,
-            drv_path.as_str(),
-            ctx,
-            &mut hash_cache,
-        )
-        .await
-        {
-            Ok(r) => build_result = r,
-            // Build succeeded but the store is unreachable for the
-            // realisation lookup. Better to report the store outage
-            // than to write empty builtOutputs and let the client
-            // assert. We're before stderr.finish().
-            Err(e) => stderr_err!(
-                stderr,
-                "store error querying realisation for {drv_path_str}: {e}"
-            ),
+        // wopBuildDerivation has no per-target output selection — every
+        // declared output is wanted.
+        let targets = HashMap::from([(
+            0usize,
+            TargetDemand {
+                drv_path: drv_path_str.clone(),
+                drv: drv.clone(),
+                spec: OutputSpec::All,
+            },
+        )]);
+        let checks = check_targets_against_store(stderr, ctx, &targets, &mut hash_cache).await?;
+        if let Some(check) = checks.get(&0) {
+            if check.missing.is_empty() {
+                build_result = result_with_wanted_outputs(
+                    build_result,
+                    &targets[&0],
+                    check,
+                    &ctx.drv_cache,
+                    &mut hash_cache,
+                );
+            } else {
+                // Wrong-success: the scheduler says Built but the store does
+                // not hold what the client is owed.
+                build_result = BuildResult::failure(
+                    BuildStatus::MiscFailure,
+                    format!(
+                        "build completed but requested outputs are not in the store: {}",
+                        check.missing.join("; ")
+                    ),
+                );
+            }
         }
     }
 
@@ -1331,56 +1350,6 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     stderr.finish().await?;
     write_build_result(stderr.inner_mut(), &build_result, negotiated_version).await?;
     Ok(())
-}
-
-/// Populate `build_result.built_outputs` from `drv` + Realisations lookup.
-///
-/// Used by opcode 36 (`wopBuildDerivation`), which has no per-target output
-/// selection — all declared outputs are reported. Opcode 46 goes through
-/// [`check_targets_against_store`] + [`result_with_wanted_outputs`] instead,
-/// which add the store-validity check and the wanted-outputs filter.
-/// Floating-CA outputs have `path=""` in the
-/// `.drv` — the real store path is computed post-build from the NAR hash.
-/// Queries the store's Realisations table (scheduler's `insert_realisation`
-/// wrote it before the `Completed` event). Without this, the client
-/// receives empty `outPath` → `maybeOutputPath == nullopt` → assert at
-/// nix-build.cc:722.
-///
-/// Non-NotFound store errors propagate as `Err` — caller `stderr_err!`s.
-/// If `compute_modular_hash_cached` fails (already `warn!`-logged), the
-/// result is returned unchanged: IA outputs can't be enriched without the
-/// hash either, and the caller's degrade-gracefully path is to push the
-/// bare `BuildResult`.
-async fn enrich_build_result_with_outputs(
-    build_result: BuildResult,
-    drv: &Derivation,
-    drv_path: &str,
-    ctx: &mut SessionContext,
-    hash_cache: &mut HashMap<String, [u8; 32]>,
-) -> anyhow::Result<BuildResult> {
-    let (hash, realized) = resolve_floating_outputs(
-        drv,
-        drv_path,
-        &mut ctx.store_client,
-        ctx.jwt.token(),
-        &ctx.drv_cache,
-        hash_cache,
-    )
-    .await?;
-    // resolve_floating_outputs only computes the modular hash when the drv
-    // HAS floating outputs. For pure-IA drvs we still need the hash for the
-    // builtOutputs id (`sha256:<hex>!<name>`).
-    let hash = match hash {
-        Some(h) => h,
-        None => {
-            match translate::compute_modular_hash_cached(drv, drv_path, &ctx.drv_cache, hash_cache)
-            {
-                Some(h) => h,
-                None => return Ok(build_result),
-            }
-        }
-    };
-    Ok(build_result.with_outputs_from_drv(drv, &hex::encode(hash), &realized))
 }
 
 /// One requested `DerivedPath::Built` target of a `wopBuildPaths` /
@@ -1596,7 +1565,7 @@ async fn check_targets_against_store<W: AsyncWrite + Unpin>(
 /// (drvHashModulo ids; floating-CA paths from the realisations resolved
 /// during verification — no further store I/O). If the modular hash is
 /// uncomputable (already `warn!`-logged) the result is returned without
-/// builtOutputs, the same degrade as [`enrich_build_result_with_outputs`].
+/// builtOutputs — the same degrade the pre-verification enrichment had.
 fn result_with_wanted_outputs(
     base: BuildResult,
     demand: &TargetDemand,
