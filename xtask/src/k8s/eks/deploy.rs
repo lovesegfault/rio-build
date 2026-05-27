@@ -234,6 +234,18 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set("externalSecrets.enabled", "true")
             .set("externalSecrets.auroraSecretArn", &db_arn)
             .set("externalSecrets.auroraEndpoint", &db_host)
+            // Assignment-token HMAC: the scheduler signs WorkAssignment
+            // tokens, the store verifies them on PutPath and on castore
+            // DirectoryService/BlobService reads — the builder's only
+            // tenant credential there. Point the scheduler+store mounts
+            // at the `rio-hmac` Secret the ExternalSecrets above sync
+            // into BOTH rio-system and rio-store (from the
+            // bootstrap-Job-generated rio/hmac Secrets Manager entry).
+            // The chart default is unset (keyless dev mode), so without
+            // this production would silently run with unsigned tokens
+            // and no store-side verification. helm/30 locks this value
+            // against the chart's ESO target name.
+            .set("assignmentHmac.secretName", "rio-hmac")
             // store-egress CiliumNetworkPolicy admits postgres on this
             // CIDR; the chart default fc00::/7 (ULA) does NOT match a
             // VPC GUA, so without this rio-store→Aurora is dropped.

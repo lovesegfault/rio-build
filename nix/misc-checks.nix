@@ -349,6 +349,12 @@ in
         # nix/tests/helm/*.sh as build inputs — docs/ is unreachable —
         # so stage the runbook it cross-references.
         cp ${../docs/ops/sla-model.typ} $TMPDIR/chart/.runbook-sla-model.typ
+        # 30-eks-assignment-hmac.sh asserts the production EKS deploy
+        # (`xtask k8s -p eks up --deploy`) keeps pointing
+        # assignmentHmac.secretName at the ESO-synced Secret. xtask/ is
+        # likewise outside the sandbox — stage the deploy module the
+        # fragment greps.
+        cp ${../xtask/src/k8s/eks/deploy.rs} $TMPDIR/chart/.eks-deploy.rs
 
         for f in ${fragments}/*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2
