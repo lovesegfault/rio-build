@@ -49,6 +49,22 @@ spec:
               wrapper, KubeSchema handles the schema internals (including
               the JsonSchema impl, so don't derive that separately).
             properties:
+              dispatchMode:
+                description: |-
+                  Executor dispatch mode (the executor-lifecycle replacement's
+                  per-pool selector). `Stream` (the default when the field is absent)
+                  keeps today's register/heartbeat/bidi-stream session protocol;
+                  `Pull` spawns pods that speak the pull/report unaries instead
+                  (`RIO_DISPATCH_MODE=pull`) and carries the AD5 abort semantics
+                  (SIGTERM aborts the build; the pod template renders the small
+                  pull-mode terminationGracePeriodSeconds instead of the 2 h drain
+                  grace). Flipping a pool's template is an operator action executed
+                  at deployment time.
+                enum:
+                - Stream
+                - Pull
+                nullable: true
+                type: string
               features:
                 default: []
                 description: |-

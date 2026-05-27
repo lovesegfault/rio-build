@@ -39,6 +39,7 @@ pub fn test_pool_spec(kind: ExecutorKind) -> PoolSpec {
         privileged: None,
         seccomp_profile: None,
         host_network: None,
+        dispatch_mode: None,
     }
 }
 

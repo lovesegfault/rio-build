@@ -80,7 +80,7 @@ pub(super) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 ///     mid-build eviction protection.
 ///
 /// `termination_grace_period_seconds` is left to
-/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default]`:
+/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default+2]`:
 /// 7200s builders, 600s fetchers, or `PoolSpec` override). The
 /// builder's SIGTERM handler blocks on its single in-flight build, so
 /// "ephemeral" ≠ "fast exit".

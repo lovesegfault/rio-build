@@ -907,7 +907,7 @@ fn disruption_filter_false_or_absent_returns_none() {
     assert_eq!(disruption::is_disruption_target(&healthy), None);
 }
 
-// r[verify ctrl.pod.tgps-default]
+// r[verify ctrl.pod.tgps-default+2]
 #[test]
 fn job_pod_termination_grace() {
     let wp = test_wp();

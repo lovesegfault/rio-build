@@ -330,6 +330,35 @@ pub struct PoolSpec {
     /// CEL-forbidden for `kind=Fetcher`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
+
+    /// Executor dispatch mode. Absent/`Stream` = the as-built session
+    /// protocol (register/heartbeat/stream) — byte-identical pod
+    /// rendering to today. `Pull` = the pull/report unary protocol:
+    /// the pod gets `RIO_DISPATCH_MODE=pull` and the AD5 pull-mode
+    /// `terminationGracePeriodSeconds` (45 s — SIGTERM is an abort,
+    /// not a drain, so the 2 h grace no longer applies and an explicit
+    /// `terminationGracePeriodSeconds` on the spec is overridden for
+    /// pull-mode pools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_mode: Option<DispatchMode>,
+}
+
+/// Executor dispatch mode (the executor-lifecycle replacement's
+/// per-pool selector). `Stream` (the default when the field is absent)
+/// keeps today's register/heartbeat/bidi-stream session protocol;
+/// `Pull` spawns pods that speak the pull/report unaries instead
+/// (`RIO_DISPATCH_MODE=pull`) and carries the AD5 abort semantics
+/// (SIGTERM aborts the build; the pod template renders the small
+/// pull-mode terminationGracePeriodSeconds instead of the 2 h drain
+/// grace). Flipping a pool's template is an operator action executed
+/// at deployment time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum DispatchMode {
+    /// The as-built session protocol (register/heartbeat/stream).
+    #[default]
+    Stream,
+    /// The pull/report unary protocol (one pod, one drv, no session).
+    Pull,
 }
 
 /// Seccomp profile selector — mirrors K8s `SeccompProfile` shape.

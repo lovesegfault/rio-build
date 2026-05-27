@@ -45,16 +45,23 @@ pub(super) const KVM_FEATURE: &str = "kvm";
 /// keys the toleration set on it.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
-/// Pool-CR annotation selecting the executor dispatch mode for the
-/// additive pull slice: `rio.build/dispatch-mode: pull` makes every
-/// executor pod of that Pool spawn with `RIO_DISPATCH_MODE=pull` (the
-/// builder Config flag — `PullAssignment`/`ReportOutcome` instead of
-/// register/heartbeat/stream). Interim, test-fixture-facing seam: the
-/// first-class `PoolSpec.dispatchMode` field replaces it at the 1b
-/// slice; production Pools carry no such annotation, so the env is
-/// never injected outside explicitly opted-in pools. Any value other
-/// than `pull` (case-insensitive) is ignored.
-pub(super) const DISPATCH_MODE_ANNOTATION: &str = "rio.build/dispatch-mode";
+/// AD5 (P8): `terminationGracePeriodSeconds` for pull-mode pools. In
+/// pull mode SIGTERM is an abort (cgroup-kill + one bounded report
+/// attempt + log finalization), not a drain, so the grace is sized to
+/// "kill + one 10 s report attempt + slack" inside the design's
+/// 30–60 s band — never the 2 h drain default. `dispatchMode: Pull`
+/// FORCES this value: an explicit `terminationGracePeriodSeconds` on
+/// the spec is overridden for pull-mode pools (the operator-owned
+/// value applies to stream pools only).
+pub(super) const PULL_MODE_TGPS_SECS: i64 = 45;
+
+/// Whether `pool` selects the pull/report dispatch protocol
+/// (`spec.dispatchMode: Pull`). Absent/`Stream` keeps the as-built
+/// session protocol and byte-identical pod rendering. Replaces the
+/// 1a-era `rio.build/dispatch-mode` annotation seam.
+pub(super) fn is_pull_mode(pool: &Pool) -> bool {
+    pool.spec.dispatch_mode == Some(rio_crds::pool::DispatchMode::Pull)
+}
 
 /// Pod label carrying the executor role. Scheduler routing, network
 /// policies, and `kubectl get pods -l rio.build/role=fetcher` all
@@ -780,13 +787,19 @@ pub fn build_executor_pod_spec(
         // to the right SA without a controller change.
         service_account_name: Some(pool.spec.kind.component_label().into()),
         automount_service_account_token: Some(false),
-        // r[impl ctrl.pod.tgps-default]
-        // Fetchers: 10min — fetches are short. Builders: spec or 2h.
-        termination_grace_period_seconds: Some(
+        // r[impl ctrl.pod.tgps-default+2]
+        // Pull-mode pools: the AD5 abort grace (45 s), forced — the
+        // 2 h drain grace exists for the stream path's
+        // finish-if-you-can semantics, which pull mode does not have.
+        // Stream pools: fetchers 10min — fetches are short; builders:
+        // spec or 2h.
+        termination_grace_period_seconds: Some(if is_pull_mode(pool) {
+            PULL_MODE_TGPS_SECS
+        } else {
             pool.spec
                 .termination_grace_period_seconds
-                .unwrap_or(if fetcher { 600 } else { 7200 }),
-        ),
+                .unwrap_or(if fetcher { 600 } else { 7200 })
+        }),
         node_selector: {
             let mut ns = effective_node_selector(pool).unwrap_or_default();
             // r[impl ctrl.pod.arch-selector+2]
@@ -964,17 +977,10 @@ fn build_executor_container(
                 // returns WrongKind without spawning).
                 env("RIO_EXECUTOR_KIND", pool.spec.kind.as_str()),
             ];
-            // Pull-mode opt-in (the additive slice's interim selector;
-            // see DISPATCH_MODE_ANNOTATION). Absent annotation — the
-            // production default — injects nothing and the builder
-            // stays on its `stream` Config default.
-            if pool
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get(DISPATCH_MODE_ANNOTATION))
-                .is_some_and(|v| v.eq_ignore_ascii_case("pull"))
-            {
+            // Pull-mode opt-in (`spec.dispatchMode: Pull`). Absent /
+            // Stream — the production default — injects nothing and
+            // the builder stays on its `stream` Config default.
+            if is_pull_mode(pool) {
                 e.push(env("RIO_DISPATCH_MODE", "pull"));
             }
             if let Some(host) = &scheduler.balance_host {
@@ -1201,18 +1207,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The `rio.build/dispatch-mode: pull` Pool annotation (the interim
-    /// pull-mode selector for the additive slice) injects
-    /// `RIO_DISPATCH_MODE=pull` into the executor container; an
-    /// unannotated Pool — the production default — injects nothing, so
-    /// the builder stays on its `stream` Config default.
+    // r[verify ctrl.pod.tgps-default+2]
+    /// `spec.dispatchMode: Pull` injects `RIO_DISPATCH_MODE=pull` and
+    /// renders the AD5 pull-mode terminationGracePeriodSeconds (45 s),
+    /// FORCED over an explicit spec value (P8 precedence); everything
+    /// else in the pod spec is unchanged. `Stream`/absent renders
+    /// byte-identical to today (no env, the per-kind/spec grace).
     #[test]
-    fn dispatch_mode_annotation_injects_env() {
+    fn dispatch_mode_pull_renders_env_and_abort_grace() {
         let scheduler = crate::fixtures::test_sched_addrs();
         let store = crate::fixtures::test_store_addrs();
         let hw = crate::reconcilers::node_informer::HwClassConfig::default();
-        let dispatch_env = |pool: &Pool| {
-            build_executor_pod_spec(pool, &scheduler, &store, &hw).containers[0]
+        let render = |pool: &Pool| build_executor_pod_spec(pool, &scheduler, &store, &hw);
+        let dispatch_env = |spec: &PodSpec| {
+            spec.containers[0]
                 .env
                 .as_ref()
                 .unwrap()
@@ -1221,28 +1229,61 @@ mod tests {
                 .and_then(|e| e.value.clone())
         };
 
-        // Default: no annotation → no env (stream stays the default).
-        let pool = crate::fixtures::test_pool("plain", rio_crds::pool::ExecutorKind::Builder);
-        assert_eq!(dispatch_env(&pool), None);
+        // Default (absent): no env, the 2 h builder drain grace —
+        // byte-identical to today.
+        let plain = crate::fixtures::test_pool("plain", rio_crds::pool::ExecutorKind::Builder);
+        let plain_spec = render(&plain);
+        assert_eq!(dispatch_env(&plain_spec), None);
+        assert_eq!(plain_spec.termination_grace_period_seconds, Some(7200));
 
-        // Annotated pull → env injected.
-        let mut pull_pool =
-            crate::fixtures::test_pool("pull", rio_crds::pool::ExecutorKind::Builder);
-        pull_pool.metadata.annotations = Some(
-            [(DISPATCH_MODE_ANNOTATION.to_string(), "pull".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(dispatch_env(&pull_pool), Some("pull".into()));
+        // Explicit Stream: identical to absent.
+        let mut stream =
+            crate::fixtures::test_pool("stream", rio_crds::pool::ExecutorKind::Builder);
+        stream.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Stream);
+        let stream_spec = render(&stream);
+        assert_eq!(dispatch_env(&stream_spec), None);
+        assert_eq!(stream_spec.termination_grace_period_seconds, Some(7200));
 
-        // Any other value is ignored (defensive).
-        let mut other = crate::fixtures::test_pool("other", rio_crds::pool::ExecutorKind::Builder);
-        other.metadata.annotations = Some(
-            [(DISPATCH_MODE_ANNOTATION.to_string(), "stream".to_string())]
-                .into_iter()
-                .collect(),
+        // Pull: env + the AD5 grace; nothing else moves.
+        let mut pull = crate::fixtures::test_pool("pull", rio_crds::pool::ExecutorKind::Builder);
+        pull.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Pull);
+        let pull_spec = render(&pull);
+        assert_eq!(dispatch_env(&pull_spec), Some("pull".into()));
+        assert_eq!(
+            pull_spec.termination_grace_period_seconds,
+            Some(PULL_MODE_TGPS_SECS)
         );
-        assert_eq!(dispatch_env(&other), None);
+        // Everything-else-unchanged: blank out the two fields that are
+        // allowed to differ and the rendered specs must be identical.
+        let mut a = pull_spec.clone();
+        let mut b = plain_spec.clone();
+        for spec in [&mut a, &mut b] {
+            spec.termination_grace_period_seconds = None;
+            if let Some(env) = spec.containers[0].env.as_mut() {
+                env.retain(|e| e.name != "RIO_DISPATCH_MODE");
+            }
+        }
+        assert_eq!(a, b, "pull mode changes only the env flag and the grace");
+
+        // P8 precedence: an explicit spec grace is overridden for
+        // pull-mode pools (the AD5 abort grace wins).
+        let mut pull_with_grace =
+            crate::fixtures::test_pool("pull-g", rio_crds::pool::ExecutorKind::Builder);
+        pull_with_grace.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Pull);
+        pull_with_grace.spec.termination_grace_period_seconds = Some(3600);
+        assert_eq!(
+            render(&pull_with_grace).termination_grace_period_seconds,
+            Some(PULL_MODE_TGPS_SECS),
+            "dispatchMode: Pull forces the AD5 grace over an explicit spec value"
+        );
+        // …while a stream pool keeps honoring the operator's value.
+        let mut stream_with_grace =
+            crate::fixtures::test_pool("stream-g", rio_crds::pool::ExecutorKind::Builder);
+        stream_with_grace.spec.termination_grace_period_seconds = Some(3600);
+        assert_eq!(
+            render(&stream_with_grace).termination_grace_period_seconds,
+            Some(3600)
+        );
     }
 
     #[test]
