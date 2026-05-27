@@ -8,6 +8,7 @@ members = [
   "rio-lease",
   "rio-migrations",
   "rio-nix",
+  "rio-parity",
   "rio-proto",
   "rio-scheduler",
   "rio-store",

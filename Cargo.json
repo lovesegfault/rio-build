@@ -12,6 +12,7 @@
     "rio-lease": "rio-lease",
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
+    "rio-parity": "rio-parity",
     "rio-proto": "rio-proto",
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
@@ -19984,6 +19985,123 @@
       ],
       "resolvedDefaultFeatures": [
         "test-oracle"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-parity": {
+      "crateName": "rio-parity",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-parity"
+      },
+      "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "aws-config",
+          "packageId": "aws-config"
+        },
+        {
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
+        },
+        {
+          "name": "clap",
+          "packageId": "clap"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.11.0"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
+        },
+        {
+          "name": "aws-smithy-mocks",
+          "packageId": "aws-smithy-mocks"
+        },
+        {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-parity",
+          "path": "src/main.rs"
+        }
       ],
       "libCrateTypes": [
         "lib"

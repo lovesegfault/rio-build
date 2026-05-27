@@ -749,6 +749,28 @@
       "doc": "Nix store path types, parsing, and nixbase32 encoding."
     }
   ],
+  "rio-parity": [
+    {
+      "path": "cmd/",
+      "depth": 0,
+      "doc": "Subcommand implementations. Each submodule owns its clap `Args`"
+    },
+    {
+      "path": "cmd/eval.rs",
+      "depth": 1,
+      "doc": "`rio-parity eval` — build an eval set (design §5)."
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "rio-parity — nixpkgs-parity campaign engine."
+    },
+    {
+      "path": "main.rs",
+      "depth": 0,
+      "doc": "rio-parity binary entry point."
+    }
+  ],
   "rio-proto": [
     {
       "path": "client/",

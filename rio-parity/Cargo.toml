@@ -1,0 +1,50 @@
+[package]
+name = "rio-parity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "nixpkgs-parity campaign engine — eval-set builder and (later) campaign runner"
+
+[[bin]]
+name = "rio-parity"
+path = "src/main.rs"
+
+[dependencies]
+# Shared S3 client builder (rio_common::s3::default_client) — same
+# config as rio-store/rio-scheduler so credential/retry resolution
+# doesn't drift.
+rio-common = { workspace = true, features = ["aws"] }
+# narinfo text parsing, StorePath/hash_part, nixbase32 encode/decode.
+rio-nix = { workspace = true }
+# AdminService/StoreService clients for the campaign runner (separate
+# plan). Unused by the eval-set builder; declared now so the crate's
+# dependency surface is stable across the two plans.
+rio-proto = { workspace = true }
+
+anyhow = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+jiff = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# Loopback fake Hydra / fake binary cache for HTTP-client tests (same
+# pattern as rio-store's fake upstream).
+axum = { workspace = true }
+aws-sdk-s3 = { workspace = true, features = ["test-util"] }
+aws-smithy-mocks = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }

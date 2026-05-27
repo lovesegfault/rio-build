@@ -33,6 +33,10 @@
       "description": "Nix protocol types and wire format"
     },
     {
+      "name": "rio-parity",
+      "description": "nixpkgs-parity campaign engine — eval-set builder and (later) campaign runner"
+    },
+    {
       "name": "rio-proto",
       "description": "Protobuf/gRPC service definitions for rio-build"
     },
@@ -149,6 +153,15 @@
     },
     "rio-nix": {
       "prod": [],
+      "optional": [],
+      "dev": []
+    },
+    "rio-parity": {
+      "prod": [
+        "rio-common",
+        "rio-nix",
+        "rio-proto"
+      ],
       "optional": [],
       "dev": []
     },
