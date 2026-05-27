@@ -54,10 +54,7 @@ impl NixCacheClient {
             base.push('/');
         }
         Ok(Self {
-            http: reqwest::Client::builder()
-                .user_agent(user_agent)
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
+            http: crate::http_client(user_agent, std::time::Duration::from_secs(60))
                 .context("build cache HTTP client")?,
             base: reqwest::Url::parse(&base).with_context(|| format!("parse cache URL {base}"))?,
         })

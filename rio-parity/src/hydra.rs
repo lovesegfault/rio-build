@@ -119,10 +119,7 @@ impl HydraClient {
         if !base.ends_with('/') {
             base.push('/');
         }
-        let http = reqwest::Client::builder()
-            .user_agent(user_agent)
-            .timeout(Duration::from_secs(120))
-            .build()
+        let http = crate::http_client(user_agent, Duration::from_secs(120))
             .context("build hydra HTTP client")?;
         Ok(Self {
             http,
@@ -232,10 +229,14 @@ mod tests {
 
     use axum::http::HeaderMap;
 
+    /// Recorded-fixture directory, resolved through the runtime
+    /// manifest dir (see [`crate::test_manifest_dir`]).
+    fn fixture_dir() -> std::path::PathBuf {
+        crate::test_manifest_dir().join("tests/fixtures/hydra")
+    }
+
     fn fixture(name: &str) -> String {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/hydra")
-            .join(name);
+        let p = fixture_dir().join(name);
         std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read fixture {p:?}: {e}"))
     }
 
@@ -243,9 +244,7 @@ mod tests {
     /// check-added-large-files pre-commit hook caps files at 500 KB);
     /// decompress at runtime.
     fn fixture_zst(name: &str) -> Vec<u8> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/hydra")
-            .join(name);
+        let p = fixture_dir().join(name);
         let compressed = std::fs::read(&p).unwrap_or_else(|e| panic!("read fixture {p:?}: {e}"));
         zstd::decode_all(compressed.as_slice())
             .unwrap_or_else(|e| panic!("zstd-decompress fixture {p:?}: {e}"))
@@ -357,7 +356,7 @@ mod tests {
             )
                 .into_response();
         }
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hydra");
+        let dir = fixture_dir();
         // The large eval fixture is committed zstd-compressed; serve it
         // decompressed when the plain file is absent (the real Hydra
         // serves plain JSON, so the client never sees zstd).

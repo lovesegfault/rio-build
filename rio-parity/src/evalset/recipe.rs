@@ -286,10 +286,7 @@ pub fn short_rev_matches(short_rev: &str, full_rev: &str) -> bool {
 /// non-2xx responses are errors carrying a clipped body snippet.
 pub async fn download_tarball(url: &str, user_agent: &str, dest: &Path) -> anyhow::Result<()> {
     tracing::info!(%url, "downloading nixpkgs tarball");
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
+    let client = crate::http_client(user_agent, std::time::Duration::from_secs(600))
         .context("build tarball HTTP client")?;
     let resp = client
         .get(url)
@@ -460,8 +457,7 @@ mod tests {
     fn jobset_inputs_become_extra_args() {
         let js: crate::hydra::HydraJobset = serde_json::from_str(
             &std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/hydra/jobset-nixos-unstable.json"),
+                crate::test_manifest_dir().join("tests/fixtures/hydra/jobset-nixos-unstable.json"),
             )
             .unwrap(),
         )

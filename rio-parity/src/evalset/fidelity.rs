@@ -122,7 +122,7 @@ mod tests {
     fn hydra_truth() -> BTreeMap<String, String> {
         let b: crate::hydra::HydraBuild = serde_json::from_str(
             &std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                crate::test_manifest_dir()
                     .join("tests/fixtures/hydra/job-nixpkgs.hello.x86_64-linux.json"),
             )
             .unwrap(),

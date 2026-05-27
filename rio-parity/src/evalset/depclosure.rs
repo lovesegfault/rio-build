@@ -236,8 +236,7 @@ mod tests {
     /// key preserved.
     fn fixture() -> String {
         std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/derivation-show/strncpy-subset.json"),
+            crate::test_manifest_dir().join("tests/fixtures/derivation-show/strncpy-subset.json"),
         )
         .unwrap()
     }

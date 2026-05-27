@@ -11,6 +11,15 @@ pub mod hydra;
 pub mod nixcache;
 pub mod s3;
 
+/// Canonical public repository URL, embedded in [`user_agent`].
+///
+/// A constant rather than `env!("CARGO_PKG_REPOSITORY")`: the crate2nix
+/// pipeline that builds the release binaries compiles with an empty
+/// `CARGO_PKG_REPOSITORY`, and the User-Agent must always carry a
+/// reachable project URL so hydra.nixos.org / cache.nixos.org operators
+/// can identify this traffic and reach its source.
+const REPOSITORY_URL: &str = "https://github.com/lovesegfault/rio-build";
+
 /// Descriptive User-Agent for every engine-originated HTTP request, so
 /// hydra.nixos.org and cache.nixos.org operators can tell this traffic
 /// apart from anonymous crawlers.
@@ -19,14 +28,60 @@ pub mod s3;
 /// reach whoever is running a campaign.
 pub fn user_agent(contact: Option<&str>) -> String {
     let base = format!(
-        "rio-parity/{} (+{})",
+        "rio-parity/{} (+{REPOSITORY_URL})",
         env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_REPOSITORY"),
     );
     match contact {
         Some(c) if !c.is_empty() => format!("{base} (contact: {c})"),
         _ => base,
     }
+}
+
+/// Build a reqwest client carrying the politeness `User-Agent` and a
+/// request timeout — the shared constructor for every HTTP client in
+/// this crate (Hydra, binary cache, tarball download).
+///
+/// Construction first tries the default TLS configuration (platform
+/// root certificates). When that fails because no system CA bundle is
+/// available — the hermetic nextest sandbox has none — it falls back to
+/// an explicit empty root store, which skips the platform-certificate
+/// load entirely. The offline tests only talk plaintext HTTP to
+/// loopback servers, so the missing roots are irrelevant there; a
+/// production host without a CA bundle still fails clearly, just at the
+/// first HTTPS request instead of at client construction.
+pub(crate) fn http_client(
+    user_agent: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::Client> {
+    use anyhow::Context as _;
+
+    let builder = || {
+        reqwest::Client::builder()
+            .user_agent(user_agent)
+            .timeout(timeout)
+    };
+    match builder().build() {
+        Ok(client) => Ok(client),
+        Err(_) => builder()
+            .tls_certs_only(std::iter::empty())
+            .build()
+            .context("build HTTP client"),
+    }
+}
+
+/// Crate directory for locating committed test fixtures at run time.
+///
+/// Reads the runtime `CARGO_MANIFEST_DIR` (set by cargo and
+/// cargo-nextest for every test process) instead of the compile-time
+/// `env!` value: under the crate2nix test pipeline the compile-time
+/// path names a per-crate build sandbox that no longer exists when the
+/// test binary actually runs, while the runtime value points at the
+/// real (or remapped) crate directory containing `tests/fixtures/`.
+#[cfg(test)]
+pub(crate) fn test_manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo/nextest"),
+    )
 }
 
 /// Clip an HTTP error-response body or subprocess stderr to a short
