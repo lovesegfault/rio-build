@@ -1325,16 +1325,23 @@ fn handle_mount(
     if state.kept.is_some() {
         return Resp::Err(ErrKind::AlreadyMounted);
     }
-    if !validate_build_id(&build_id) {
-        return Resp::Err(ErrKind::BadBuildId);
-    }
-    // ── Admission (ADR-022 §P0559). Peers whose gid matched
-    // `allowed_gid` were admitted at accept time and skip this; a
-    // provisionally-admitted peer must present a token that verifies
-    // (signature with the mountd key, unexpired, audience "rio-mountd")
-    // for EXACTLY the build_id it is claiming. The reply never says
-    // which check failed — the specifics go to the daemon log and the
-    // reject counter only.
+    // ── Admission (ADR-022 §P0559) — before any other validation, so a
+    // provisionally-admitted peer's first frame either authenticates or
+    // closes the connection: replying `BadBuildId` (or anything else)
+    // to an unauthenticated peer would keep the connection open and
+    // hand it a free probing oracle, contradicting the
+    // "authenticate with the FIRST frame" contract. The token check
+    // only needs string equality on the claimed build_id, so it does
+    // not depend on `validate_build_id` (a token-admitted Mount with a
+    // malformed id still gets `BadBuildId` below — but on a connection
+    // that has proven it holds a scheduler-minted credential).
+    //
+    // Peers whose gid matched `allowed_gid` were admitted at accept
+    // time and skip this; a provisionally-admitted peer must present a
+    // token that verifies (signature with the mountd key, unexpired,
+    // audience "rio-mountd") for EXACTLY the build_id it is claiming.
+    // The reply never says which check failed — the specifics go to
+    // the daemon log and the reject counter only.
     // r[impl builder.mountd.token-admission]
     if state.needs_token {
         let verifier = shared
@@ -1377,6 +1384,9 @@ fn handle_mount(
         }
     } else {
         metrics::counter!("rio_mountd_mount_admission_total", "method" => "gid").increment(1);
+    }
+    if !validate_build_id(&build_id) {
+        return Resp::Err(ErrKind::BadBuildId);
     }
     // The builder's /dev/fuse fd: required, and gated to actually BE the
     // fuse character device before the daemon keeps a root-held
@@ -2133,6 +2143,26 @@ mod tests {
             frame(Req::Mount {
                 build_id: "b-close".into(),
                 token: Some("garbage".into()),
+            }),
+            &tx,
+        )
+        .await;
+        assert_eq!(flow, ControlFlow::Break(()));
+        assert_eq!(recv_resp(&mut rx), Resp::Err(ErrKind::Unauthorized));
+
+        // Pre-auth Mount with a malformed build_id and no token →
+        // admission is checked FIRST, so the reply is Unauthorized (not
+        // BadBuildId — that would keep the connection open and hand an
+        // unauthenticated peer a probing oracle) and the connection
+        // closes.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_conn_state_needs_token();
+        let flow = handle_frame(
+            &shared,
+            &mut state,
+            frame(Req::Mount {
+                build_id: "../escape".into(),
+                token: None,
             }),
             &tx,
         )
