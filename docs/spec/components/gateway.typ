@@ -656,8 +656,9 @@ Response (after STDERR loop):
   individual target's failure). The same verification MUST gate the success
   reply (`u64(1)`) of `wopBuildPaths`, and — whenever the gateway holds the
   resolved derivation — the single `BuildResult` of `wopBuildDerivation`;
-  on success its `builtOutputs` MUST cover exactly the declared outputs
-  (the opcode carries no client-side output selection).
+  on a success gated by that verification, its `builtOutputs` MUST cover
+  exactly the declared outputs (the opcode carries no client-side output
+  selection).
 ]
 
 This is defense in depth on top of the scheduler-side completion guarantees:
