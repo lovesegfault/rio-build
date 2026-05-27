@@ -66,6 +66,9 @@
     #chapter("ops/capacity-planning.typ")[Capacity Planning]
     #chapter("ops/gc-enablement.typ")[GC Enablement]
     #chapter("ops/eks-smoke.typ")[EKS Smoke Test]
+    #chapter("ops/tiered-cache-cutover.typ")[Tiered Cache Cutover]
+    #chapter("ops/castore-fuse-cutover.typ")[Castore FUSE Cutover]
+    #chapter("ops/castore-fuse-triage.typ")[Castore FUSE Triage]
     #chapter("ops/sla-model.typ")[SLA Model Runbook]
     = Appendix
     #chapter("glossary.typ")[Glossary]
