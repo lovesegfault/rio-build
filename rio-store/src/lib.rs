@@ -131,6 +131,17 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_compat_write_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
     ),
+    (
+        // CPU-only (sort + blake3 + sha256 over the presented paths,
+        // no Postgres): sub-ms for typical ~800-path closures, low
+        // tens of ms at the MAX_INPUT_CLOSURE cap. The default
+        // [0.005..10] floor would merge the entire typical range into
+        // one bucket.
+        "rio_store_castore_scope_establish_seconds",
+        &[
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0,
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -250,6 +261,47 @@ pub fn describe_metrics() {
          (r[store.castore.terminal-revocation]). A sustained nonzero rate means a \
          builder (or something replaying its token) keeps reading after its build \
          finished."
+    );
+    describe_counter!(
+        "rio_store_castore_scope_established_total",
+        "Closure read scopes established via PresentClosure (verified against the \
+         assignment token's input_closure_digest and cached on this replica, \
+         r[store.castore.scope-establish]). Idempotent re-presents of an already \
+         cached closure are not counted."
+    );
+    describe_histogram!(
+        "rio_store_castore_scope_establish_seconds",
+        "PresentClosure verification latency (sort + digest + keying of the presented \
+         closure; no Postgres)"
+    );
+    describe_counter!(
+        "rio_store_castore_scope_absent_total",
+        "Assignment-token castore reads that arrived without a resolvable closure scope \
+         on this replica, labeled by resolution: served (log mode), derived (rebuilt \
+         from scheduler_live_pins + narinfo.references), denied (enforce mode answered \
+         FAILED_PRECONDITION/CASTORE_SCOPE_REQUIRED so the builder presents and retries). \
+         Sustained nonzero with the builder fleet presenting means presentation churn \
+         (eviction / new replicas)."
+    );
+    describe_counter!(
+        "rio_store_castore_scope_mismatch_total",
+        "PresentClosure rejections: presented closure does not match the token's signed \
+         input_closure_digest (or the token carries no attestation). Nonzero means a \
+         builder presenting a closure it was not dispatched with."
+    );
+    describe_counter!(
+        "rio_store_castore_scope_denied_total",
+        "Castore reads denied by closure scoping under enforce mode \
+         (r[store.castore.closure-scope]), labeled by reason: out_of_scope (digest only \
+         reachable through paths outside the attested closure; wire status NOT_FOUND) or \
+         unattested (token has no input_closure_digest; wire status PERMISSION_DENIED). \
+         The structured deny log carries the drv/executor/digest detail."
+    );
+    describe_counter!(
+        "rio_store_castore_scope_would_deny_total",
+        "Castore reads that enforce mode WOULD have denied but log mode served, labeled \
+         by reason (out_of_scope | unattested). Must stay at zero before flipping \
+         castore_read_scope.mode to enforce."
     );
     describe_counter!(
         "rio_store_service_token_accepted_total",

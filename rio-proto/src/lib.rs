@@ -39,6 +39,21 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 /// emit site and the builder match site.
 pub const CHUNKED_REQUIRES_BACKEND_MSG: &str = "PutPathChunked requires a chunk backend";
 
+/// Substring carried in the `Status::failed_precondition` message when
+/// a castore read presented an assignment token whose closure read
+/// scope is not resolvable on this store replica (never presented,
+/// evicted, and not derivable server-side) under
+/// `castore_read_scope.mode = "enforce"` (ADR-022 P0591). This is a
+/// wire-protocol contract: the builder's fetch path matches it to
+/// present the assignment's `input_closure` via
+/// `DirectoryService.PresentClosure` and retry within the outer fetch
+/// budget, WITHOUT recording a breaker failure. Other
+/// `FailedPrecondition` reasons MUST NOT trigger that present-and-retry
+/// loop. Single source of truth for the store emit site and the
+/// builder match site.
+pub const CASTORE_SCOPE_REQUIRED_MSG: &str =
+    "CASTORE_SCOPE_REQUIRED: present the assignment input closure via PresentClosure and retry";
+
 /// Substring carried in `ExecutorError::CgroupOom`'s Display impl and
 /// matched by rio-scheduler's `handle_infrastructure_failure` to trigger
 /// `r[sched.sla.reactive-floor]`. Single source of truth so the

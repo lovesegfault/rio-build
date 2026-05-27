@@ -51,6 +51,10 @@ mod put_path;
 mod put_path_batch;
 mod put_path_chunked;
 mod queries;
+// pub: config.rs reads the defaults / `ScopeMode`, main.rs constructs
+// the `CastoreScope`, and the gRPC integration tests drive the mode
+// matrix directly.
+pub mod scope;
 mod sign;
 
 pub use admin::StoreAdminServiceImpl;

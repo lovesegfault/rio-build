@@ -99,6 +99,15 @@
           "cache_ttl_secs": 10
         }
       },
+      "castore_read_scope": {
+        "description": "Closure scoping of assignment-token castore reads —\n`r[store.castore.closure-scope]` (ADR-022 P0591). TOML\n`[castore_read_scope]`, env `RIO_CASTORE_READ_SCOPE__*`. See\n[`CastoreReadScope`].",
+        "$ref": "#/$defs/CastoreReadScope",
+        "default": {
+          "mode": "log",
+          "cache_capacity_bytes": 268435456,
+          "cache_idle_ttl_secs": 3600
+        }
+      },
       "jwt": {
         "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (same mount as scheduler — one\ngateway signing key → one pubkey across all verifier services).\nUnset = interceptor inert (dev mode). SIGHUP reloads from the\nsame path. Set via `RIO_JWT__KEY_PATH`.",
         "$ref": "#/$defs/JwtConfig",
@@ -408,6 +417,51 @@
           }
         }
       },
+      "CastoreReadScope": {
+        "description": "Closure scoping of assignment-token castore reads\n(`r[store.castore.closure-scope]`, ADR-022 P0591): a build's token\nmay only read digests reachable through a store path in that\nbuild's attested input closure (presented via\n`DirectoryService.PresentClosure`, or rebuilt server-side from\n`scheduler_live_pins` + `narinfo.references` on a presentation\nmiss). JWT-authenticated callers, the digest-keyed chunk RPCs,\nuploads, FindMissingPaths, and GC are never affected.",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "description": "`off` — no scope handling (tenant scoping only, dev parity).\n`log` — resolve and compare scopes but never reject; serve\nout-of-scope reads while counting `would_deny` / `scope_absent`.\n`enforce` — out-of-scope reads answer NOT_FOUND, unattested\ntokens are denied, and an unresolvable scope answers\nFAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder\npresents and retries.\n\nDefault `log` for the store-side phase of P0591: the builder\ndoes not present closures yet, so `enforce` would lean every\nassignment-token read on the pins+references derivation\nfallback alone. The default flips to `enforce` (the ADR-022\nend-state, with `log` as the rollback value) when the\nbuilder-side presentation lands. Set via\n`RIO_CASTORE_READ_SCOPE__MODE`.",
+            "$ref": "#/$defs/ScopeMode",
+            "default": "log"
+          },
+          "cache_capacity_bytes": {
+            "description": "Capacity of the per-replica presented-ScopeSet cache, in bytes\nof cached path hashes (~32 B per closure path; ~2 MiB for a\n`MAX_INPUT_CLOSURE`-sized closure). Default 256 MiB. Eviction is\nharmless — the builder re-presents on demand. Set via\n`RIO_CASTORE_READ_SCOPE__CACHE_CAPACITY_BYTES`.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 268435456
+          },
+          "cache_idle_ttl_secs": {
+            "description": "Idle TTL (seconds) for presented ScopeSets: an entry no read has\ntouched for this long is evicted. Default 3600. Must be ≥ 1 when\nthe mode is not `off`. Set via\n`RIO_CASTORE_READ_SCOPE__CACHE_IDLE_TTL_SECS`.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 3600
+          }
+        }
+      },
+      "ScopeMode": {
+        "description": "Closure-scope enforcement mode (`[castore_read_scope].mode`).",
+        "oneOf": [
+          {
+            "description": "No scope handling at all: behavior identical to tenant scoping\nalone. Dev parity / emergency escape hatch.",
+            "type": "string",
+            "const": "off"
+          },
+          {
+            "description": "Resolve and compare scopes but never reject: out-of-scope reads\nare served and counted (`would_deny`), absent scopes are served\nand counted (`scope_absent`). Rollback value once `enforce` is\nthe default.\n\nPhase-1 default: the builder does not present closures yet\n(P0591 Phase 2), so every assignment-token read on a fresh\nreplica would otherwise lean on the derivation fallback alone.",
+            "type": "string",
+            "const": "log"
+          },
+          {
+            "description": "Reject out-of-scope reads with `NOT_FOUND`, unattested tokens\nwith `PERMISSION_DENIED`, and unresolvable scopes with\n`FAILED_PRECONDITION` + [`rio_proto::CASTORE_SCOPE_REQUIRED_MSG`].",
+            "type": "string",
+            "const": "enforce"
+          }
+        ]
+      },
       "JwtConfig": {
         "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
         "type": "object",
@@ -450,6 +504,11 @@
     "assignment_revocation": {
       "enabled": true,
       "cache_ttl_secs": 10
+    },
+    "castore_read_scope": {
+      "mode": "log",
+      "cache_capacity_bytes": 268435456,
+      "cache_idle_ttl_secs": 3600
     },
     "jwt": {
       "required": false,

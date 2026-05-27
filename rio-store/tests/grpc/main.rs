@@ -324,6 +324,7 @@ mod put_path_chunked;
 mod realisations;
 mod reassembly;
 mod revocation;
+mod scope;
 mod signing;
 mod tenancy;
 mod trailer;

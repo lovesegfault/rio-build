@@ -102,6 +102,7 @@ repeated bytes missing_hashes = 3;
 repeated bytes nar_hashes = 1;
 repeated bytes novel = 4;
 repeated rio.castore.Directory directories = 3;
+repeated string closure = 1;
 repeated string extra_roots = 3;
 repeated string indeterminate_paths = 3;
 repeated string input_closure = 5;

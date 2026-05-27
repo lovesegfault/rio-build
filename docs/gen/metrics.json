@@ -191,6 +191,12 @@
     "rio_scheduler_warm_prefetch_paths",
     "rio_scheduler_worker_disconnects_total",
     "rio_scheduler_workers_active",
+    "rio_store_castore_scope_absent_total",
+    "rio_store_castore_scope_denied_total",
+    "rio_store_castore_scope_establish_seconds",
+    "rio_store_castore_scope_established_total",
+    "rio_store_castore_scope_mismatch_total",
+    "rio_store_castore_scope_would_deny_total",
     "rio_store_castore_terminal_rejected_total",
     "rio_store_check_available_duration_seconds",
     "rio_store_chunk_cache_hits_total",
@@ -1223,6 +1229,36 @@
       }
     ],
     "store": [
+      {
+        "name": "rio_store_castore_scope_absent_total",
+        "kind": "counter",
+        "help": "Assignment-token castore reads that arrived without a resolvable closure scope on this replica, labeled by resolution: served (log mode), derived (rebuilt from scheduler_live_pins + narinfo.references), denied (enforce mode answered FAILED_PRECONDITION/CASTORE_SCOPE_REQUIRED so the builder presents and retries). Sustained nonzero with the builder fleet presenting means presentation churn (eviction / new replicas)."
+      },
+      {
+        "name": "rio_store_castore_scope_denied_total",
+        "kind": "counter",
+        "help": "Castore reads denied by closure scoping under enforce mode (r[store.castore.closure-scope]), labeled by reason: out_of_scope (digest only reachable through paths outside the attested closure; wire status NOT_FOUND) or unattested (token has no input_closure_digest; wire status PERMISSION_DENIED). The structured deny log carries the drv/executor/digest detail."
+      },
+      {
+        "name": "rio_store_castore_scope_establish_seconds",
+        "kind": "histogram",
+        "help": "PresentClosure verification latency (sort + digest + keying of the presented closure; no Postgres)"
+      },
+      {
+        "name": "rio_store_castore_scope_established_total",
+        "kind": "counter",
+        "help": "Closure read scopes established via PresentClosure (verified against the assignment token's input_closure_digest and cached on this replica, r[store.castore.scope-establish]). Idempotent re-presents of an already cached closure are not counted."
+      },
+      {
+        "name": "rio_store_castore_scope_mismatch_total",
+        "kind": "counter",
+        "help": "PresentClosure rejections: presented closure does not match the token's signed input_closure_digest (or the token carries no attestation). Nonzero means a builder presenting a closure it was not dispatched with."
+      },
+      {
+        "name": "rio_store_castore_scope_would_deny_total",
+        "kind": "counter",
+        "help": "Castore reads that enforce mode WOULD have denied but log mode served, labeled by reason (out_of_scope | unattested). Must stay at zero before flipping castore_read_scope.mode to enforce."
+      },
       {
         "name": "rio_store_castore_terminal_rejected_total",
         "kind": "counter",

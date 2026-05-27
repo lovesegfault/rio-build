@@ -1352,7 +1352,7 @@
     {
       "path": "grpc/directory.rs",
       "depth": 1,
-      "doc": "ADR-022 castore RPC surface (P0573 / P0577 / P0570)."
+      "doc": "ADR-022 castore RPC surface (P0573 / P0577 / P0570 / P0591)."
     },
     {
       "path": "grpc/get_path.rs",
@@ -1393,6 +1393,11 @@
       "path": "grpc/queries.rs",
       "depth": 1,
       "doc": "Read-side StoreService RPCs (QueryPathInfo, FindMissingPaths,"
+    },
+    {
+      "path": "grpc/scope.rs",
+      "depth": 1,
+      "doc": "Closure-scoped castore reads (ADR-022 P0591)."
     },
     {
       "path": "grpc/sign.rs",

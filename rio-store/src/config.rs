@@ -391,6 +391,56 @@ impl Default for AssignmentRevocation {
     }
 }
 
+/// Closure scoping of assignment-token castore reads
+/// (`r[store.castore.closure-scope]`, ADR-022 P0591): a build's token
+/// may only read digests reachable through a store path in that
+/// build's attested input closure (presented via
+/// `DirectoryService.PresentClosure`, or rebuilt server-side from
+/// `scheduler_live_pins` + `narinfo.references` on a presentation
+/// miss). JWT-authenticated callers, the digest-keyed chunk RPCs,
+/// uploads, FindMissingPaths, and GC are never affected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CastoreReadScope {
+    /// `off` — no scope handling (tenant scoping only, dev parity).
+    /// `log` — resolve and compare scopes but never reject; serve
+    /// out-of-scope reads while counting `would_deny` / `scope_absent`.
+    /// `enforce` — out-of-scope reads answer NOT_FOUND, unattested
+    /// tokens are denied, and an unresolvable scope answers
+    /// FAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder
+    /// presents and retries.
+    ///
+    /// Default `log` for the store-side phase of P0591: the builder
+    /// does not present closures yet, so `enforce` would lean every
+    /// assignment-token read on the pins+references derivation
+    /// fallback alone. The default flips to `enforce` (the ADR-022
+    /// end-state, with `log` as the rollback value) when the
+    /// builder-side presentation lands. Set via
+    /// `RIO_CASTORE_READ_SCOPE__MODE`.
+    pub mode: crate::grpc::scope::ScopeMode,
+    /// Capacity of the per-replica presented-ScopeSet cache, in bytes
+    /// of cached path hashes (~32 B per closure path; ~2 MiB for a
+    /// `MAX_INPUT_CLOSURE`-sized closure). Default 256 MiB. Eviction is
+    /// harmless — the builder re-presents on demand. Set via
+    /// `RIO_CASTORE_READ_SCOPE__CACHE_CAPACITY_BYTES`.
+    pub cache_capacity_bytes: u64,
+    /// Idle TTL (seconds) for presented ScopeSets: an entry no read has
+    /// touched for this long is evicted. Default 3600. Must be ≥ 1 when
+    /// the mode is not `off`. Set via
+    /// `RIO_CASTORE_READ_SCOPE__CACHE_IDLE_TTL_SECS`.
+    pub cache_idle_ttl_secs: u64,
+}
+
+impl Default for CastoreReadScope {
+    fn default() -> Self {
+        Self {
+            mode: crate::grpc::scope::ScopeMode::default(),
+            cache_capacity_bytes: crate::grpc::scope::DEFAULT_CACHE_CAPACITY_BYTES,
+            cache_idle_ttl_secs: crate::grpc::scope::DEFAULT_CACHE_IDLE_TTL_SECS,
+        }
+    }
+}
+
 // r[impl store.netpol.egress+2]
 // Egress targets are exactly what's configured here: postgres
 // (`database_url`) and the chunk backend (S3 or filesystem). The
@@ -463,6 +513,11 @@ pub struct Config {
     /// `[assignment_revocation]`, env `RIO_ASSIGNMENT_REVOCATION__*`.
     /// See [`AssignmentRevocation`].
     pub assignment_revocation: AssignmentRevocation,
+    /// Closure scoping of assignment-token castore reads —
+    /// `r[store.castore.closure-scope]` (ADR-022 P0591). TOML
+    /// `[castore_read_scope]`, env `RIO_CASTORE_READ_SCOPE__*`. See
+    /// [`CastoreReadScope`].
+    pub castore_read_scope: CastoreReadScope,
     /// JWT verification. `key_path` → ConfigMap mount at
     /// `/etc/rio/jwt/ed25519_pubkey` (same mount as scheduler — one
     /// gateway signing key → one pubkey across all verifier services).
@@ -565,6 +620,7 @@ impl Default for Config {
             signing_key_path: None,
             hmac_key_path: None,
             assignment_revocation: AssignmentRevocation::default(),
+            castore_read_scope: CastoreReadScope::default(),
             jwt: rio_common::config::JwtConfig::default(),
             service_hmac_key_path: None,
             service_bypass_callers: vec!["rio-gateway".into(), "rio-scheduler".into()],
@@ -743,6 +799,26 @@ impl rio_common::config::ValidateConfig for Config {
              (0 removes the verdict cache and adds a PG probe to every castore read); \
              set RIO_ASSIGNMENT_REVOCATION__CACHE_TTL_SECS or disable revocation"
         );
+        // castore_read_scope: the cache must at least hold one
+        // cap-sized ScopeSet (~2 MiB), otherwise an enforce-mode replica
+        // could never retain a mega-closure's scope and every read of
+        // that build would re-present or re-derive; a zero idle TTL
+        // evicts scopes between the present and the first read. Only
+        // meaningful when scoping is active.
+        if self.castore_read_scope.mode != crate::grpc::scope::ScopeMode::Off {
+            anyhow::ensure!(
+                self.castore_read_scope.cache_capacity_bytes >= 4 * 1024 * 1024,
+                "castore_read_scope.cache_capacity_bytes must be >= 4 MiB when the mode is not \
+                 'off' (a MAX_INPUT_CLOSURE-sized scope is ~2 MiB and must fit); set \
+                 RIO_CASTORE_READ_SCOPE__CACHE_CAPACITY_BYTES or set the mode to 'off'"
+            );
+            anyhow::ensure!(
+                self.castore_read_scope.cache_idle_ttl_secs >= 1,
+                "castore_read_scope.cache_idle_ttl_secs must be >= 1 when the mode is not 'off' \
+                 (0 evicts a presented scope before the first read can use it); set \
+                 RIO_CASTORE_READ_SCOPE__CACHE_IDLE_TTL_SECS or set the mode to 'off'"
+            );
+        }
         // binary_cache_compat.bucket: absent means "use the chunk
         // backend's S3-standard bucket"; present must be a real bucket
         // name. Some("") (e.g. a templating layer rendering an empty

@@ -1,12 +1,20 @@
-//! ADR-022 castore RPC surface (P0573 / P0577 / P0570).
+//! ADR-022 castore RPC surface (P0573 / P0577 / P0570 / P0591).
 //!
 //! `GetDirectory` / `HasDirectories` / `HasBlobs` / `ReadBlob` /
-//! `StatBlob`. All tenant-scoped: every query resolves a digest to the
-//! store path(s) that contain it (`directory_paths` /
-//! `file_blobs.store_path_hash`) and joins `path_tenants` on the
-//! caller's `tenant_id`, so a digest the tenant didn't produce is
-//! invisible (NotFound, or absent from the bitmap). Directory bodies
-//! leak child names/digests — confidentiality, not just isolation.
+//! `StatBlob` / `PresentClosure`. All tenant-scoped: every query
+//! resolves a digest to the store path(s) that contain it
+//! (`directory_paths` / `file_blobs.store_path_hash`) and joins
+//! `path_tenants` on the caller's `tenant_id`, so a digest the tenant
+//! didn't produce is invisible (NotFound, or absent from the bitmap).
+//! Directory bodies leak child names/digests — confidentiality, not
+//! just isolation.
+//!
+//! Assignment-token callers are additionally **closure-scoped**
+//! (P0591, [`crate::grpc::scope`]): the membership predicate
+//! ([`SCOPE_PREDICATE`]) is ANDed with the tenant join, so a build's
+//! token reads exactly the input closure the scheduler signed for it —
+//! JWT (gateway/user) callers keep tenant-wide reads, and the
+//! digest-keyed chunk RPCs are untouched.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,10 +31,12 @@ use rio_proto::DirectoryService;
 use rio_proto::castore::Directory;
 use rio_proto::types::{
     BlobChunk, ChunkMeta, GetDirectoryRequest, HasBitmap, HasBlobsRequest, HasDirectoriesRequest,
-    ReadBlobRequest, StatBlobRequest, StatBlobResponse,
+    PresentClosureRequest, PresentClosureResponse, ReadBlobRequest, StatBlobRequest,
+    StatBlobResponse,
 };
 
 use crate::cas::ChunkCache;
+use crate::grpc::scope::{CastoreScope, ReadScope, ScopeSet};
 
 /// BFS frontier batch cap. ~33 round trips for a chromium-scale
 /// closure (8k dirs); matches PG's parameter limit headroom. This
@@ -71,6 +81,24 @@ const READ_BLOB_PREFETCH_K: usize = 8;
 /// [`GET_DIRECTORY_CHANNEL_DEPTH`].
 const READ_BLOB_CHANNEL_DEPTH: usize = 4;
 
+/// Shared closure-scope membership predicate, appended (with the
+/// existing `WHERE … tenant_id = $2` intact) to every castore read
+/// query. `$3` is the scope bind: `NULL` for unscoped callers (JWT,
+/// `mode = off|log`) — the predicate then passes — or the sorted
+/// `store_path_hash` array of the caller's attested closure under
+/// enforce. One fragment, one bind position, all eight query sites.
+// r[impl store.castore.closure-scope]
+const SCOPE_PREDICATE: &str = " AND ($3::bytea[] IS NULL OR pt.store_path_hash = ANY($3::bytea[]))";
+
+/// Authorization result for one castore read: the caller's tenant plus
+/// the closure-scope decision the query sites must consume. Returned by
+/// [`DirectoryServiceImpl::castore_authz`] so a new query site cannot
+/// compile without deciding what to do with the scope.
+struct CastoreAuthz {
+    tenant: uuid::Uuid,
+    scope: ReadScope,
+}
+
 pub struct DirectoryServiceImpl {
     pool: PgPool,
     /// HMAC verifier for assignment tokens. Same key the dispatch
@@ -86,6 +114,11 @@ pub struct DirectoryServiceImpl {
     /// disabled (`assignment_revocation.enabled = false`, or a test
     /// fixture that doesn't wire it). JWT callers are never probed.
     revocation: Option<crate::revocation::BuildTerminalProbe>,
+    /// Closure read scope state (`[castore_read_scope]`,
+    /// `r[store.castore.closure-scope]`). Constructed `mode = off` by
+    /// default so fixtures keep tenant-only behavior; main.rs replaces
+    /// it from config via [`Self::with_castore_scope`].
+    scope: Arc<CastoreScope>,
 }
 
 impl DirectoryServiceImpl {
@@ -99,6 +132,7 @@ impl DirectoryServiceImpl {
             hmac_verifier,
             chunk_cache,
             revocation: None,
+            scope: Arc::new(CastoreScope::disabled()),
         }
     }
 
@@ -109,66 +143,137 @@ impl DirectoryServiceImpl {
         self
     }
 
-    /// Resolve the caller's tenant: JWT extension (gateway path),
-    /// else HMAC assignment-token `claims.tenant` (builder path). No
+    /// Set the closure read-scope state (main.rs wires this from
+    /// `[castore_read_scope]` config; tests construct the mode they
+    /// exercise).
+    pub fn with_castore_scope(mut self, scope: CastoreScope) -> Self {
+        self.scope = Arc::new(scope);
+        self
+    }
+
+    /// Verify the `x-rio-assignment-token` header, if present and a
+    /// verifier is configured. `Ok(None)` means "no assignment token in
+    /// play" (JWT callers, dev mode); errors are deliberately opaque
+    /// (sig-vs-expiry is an oracle; the legitimate caller's fix is the
+    /// same).
+    fn assignment_claims<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
+        let tok = request
+            .metadata()
+            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        match (&self.hmac_verifier, tok) {
+            (Some(verifier), Some(tok)) => verifier
+                .verify::<rio_auth::hmac::AssignmentClaims>(tok)
+                .map(Some)
+                .map_err(|_| Status::unauthenticated("assignment token rejected")),
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolve the caller's authorization: JWT extension (gateway path,
+    /// tenant-wide by design), else HMAC assignment-token
+    /// `claims.tenant` (builder path, additionally closure-scoped). No
     /// tenant → `UNAUTHENTICATED`; never fall back to anonymous.
     ///
-    /// Assignment-token callers additionally pass the terminal-build
-    /// revocation probe: a verified token whose build already reached a
+    /// Assignment-token callers keep the existing check order: HMAC
+    /// signature/expiry → terminal-build revocation probe → closure
+    /// scope resolution. A verified token whose build already reached a
     /// terminal state is rejected with `PERMISSION_DENIED` before any
-    /// data-plane query runs.
-    // r[impl store.castore.tenant-scope]
-    async fn castore_tenant_id<T>(&self, request: &Request<T>) -> Result<uuid::Uuid, Status> {
+    /// data-plane query runs; scope resolution never widens what the
+    /// tenant join alone would have allowed.
+    // r[impl store.castore.tenant-scope+2]
+    // r[impl store.castore.closure-scope]
+    async fn castore_authz<T>(&self, request: &Request<T>) -> Result<CastoreAuthz, Status> {
         if let Some(jwt) = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
             .map(|c| c.sub)
         {
-            return Ok(jwt);
+            // JWT (user/gateway) callers keep tenant-wide reads.
+            return Ok(CastoreAuthz {
+                tenant: jwt,
+                scope: ReadScope::Unscoped,
+            });
         }
-        let tok = request
-            .metadata()
-            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok());
-        if let (Some(verifier), Some(tok)) = (&self.hmac_verifier, tok) {
-            return match verifier.verify::<rio_auth::hmac::AssignmentClaims>(tok) {
-                Ok(claims) => {
-                    // r[impl store.castore.terminal-revocation]
-                    // Signature + expiry already verified; now check the
-                    // build is still live. Terminal ⇒ the token's only
-                    // legitimate holder is gone — reject like any other
-                    // authorization failure, without saying why (the
-                    // legitimate caller no longer exists; an attacker
-                    // gets no oracle beyond "rejected").
-                    if let Some(probe) = &self.revocation
-                        && probe.is_terminal(&self.pool, &claims.drv_hash).await
-                    {
-                        metrics::counter!("rio_store_castore_terminal_rejected_total").increment(1);
-                        warn!(
-                            drv_hash = %claims.drv_hash,
-                            executor_id = %claims.executor_id,
-                            "castore read with an assignment token for a terminal build"
-                        );
-                        return Err(Status::permission_denied("assignment token rejected"));
-                    }
-                    match claims.tenant.as_deref() {
-                        None => Err(Status::unauthenticated(
-                            "assignment token has no tenant claim",
-                        )),
-                        Some(t) => t.parse().map_err(|_| {
-                            Status::unauthenticated("assignment token tenant is not a UUID")
-                        }),
-                    }
+        if let Some(claims) = self.assignment_claims(request)? {
+            // r[impl store.castore.terminal-revocation]
+            // Signature + expiry already verified; now check the
+            // build is still live. Terminal ⇒ the token's only
+            // legitimate holder is gone — reject like any other
+            // authorization failure, without saying why (the
+            // legitimate caller no longer exists; an attacker
+            // gets no oracle beyond "rejected").
+            if let Some(probe) = &self.revocation
+                && probe.is_terminal(&self.pool, &claims.drv_hash).await
+            {
+                metrics::counter!("rio_store_castore_terminal_rejected_total").increment(1);
+                warn!(
+                    drv_hash = %claims.drv_hash,
+                    executor_id = %claims.executor_id,
+                    "castore read with an assignment token for a terminal build"
+                );
+                return Err(Status::permission_denied("assignment token rejected"));
+            }
+            let tenant = match claims.tenant.as_deref() {
+                None => {
+                    return Err(Status::unauthenticated(
+                        "assignment token has no tenant claim",
+                    ));
                 }
-                // Don't echo why the token failed — sig-vs-expiry is an
-                // oracle. The legitimate caller's fix is the same.
-                Err(_) => Err(Status::unauthenticated("assignment token rejected")),
+                Some(t) => t.parse().map_err(|_| {
+                    Status::unauthenticated("assignment token tenant is not a UUID")
+                })?,
             };
+            let scope = self.scope.resolve(&claims, &self.pool).await?;
+            return Ok(CastoreAuthz { tenant, scope });
         }
         Err(Status::unauthenticated(
             "DirectoryService requires a tenant: send a JWT or an HMAC \
              assignment token",
         ))
+    }
+
+    /// Post-query closure-scope accounting for the single-digest read
+    /// RPCs. Never changes the response — the wire status for an
+    /// out-of-scope digest is the same `NOT_FOUND` an absent digest
+    /// gets; this is where the deny metric/log learn the real reason.
+    ///
+    /// - `Audit` (log mode) + row served: probe membership and count a
+    ///   `would_deny` if every containing path is outside the scope.
+    /// - `Enforce` + no row: probe WITHOUT the scope to distinguish
+    ///   "absent / not tenant-visible" from "denied by closure scope".
+    ///   (The probe ignores `manifests.status`, so an in-flight upload
+    ///   can over-count a deny — metrics-only, accepted.)
+    async fn scope_audit_single(
+        &self,
+        rpc: &'static str,
+        table: HasTable,
+        digest: [u8; 32],
+        tenant: uuid::Uuid,
+        scope: &ReadScope,
+        found: bool,
+    ) -> Result<(), Status> {
+        match scope {
+            ReadScope::Audit(set, ctx) if found => {
+                let in_scope = self
+                    .has_in(table, &[digest], tenant, Some(set.as_ref()))
+                    .await?;
+                if !in_scope.contains(&digest) {
+                    self.scope.record_out_of_scope(false, rpc, ctx, &digest);
+                }
+            }
+            ReadScope::Enforce(_, ctx) if !found => {
+                let visible = self.has_in(table, &[digest], tenant, None).await?;
+                if visible.contains(&digest) {
+                    self.scope.record_out_of_scope(true, rpc, ctx, &digest);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -219,7 +324,8 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<GetDirectoryRequest>,
     ) -> Result<Response<Self::GetDirectoryStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request).await?;
+        let authz = self.castore_authz(&request).await?;
+        let tenant = authz.tenant;
         let req = request.into_inner();
 
         let mut frontier: Vec<[u8; 32]> = Vec::new();
@@ -247,18 +353,31 @@ impl DirectoryService for DirectoryServiceImpl {
                 ));
             }
             let digest = frontier[0];
-            let body: Option<(Vec<u8>,)> = sqlx::query_as(
+            // AssertSqlSafe: the only formatted-in piece is the
+            // compile-time SCOPE_PREDICATE fragment; digest, tenant and
+            // scope are bind parameters.
+            let body: Option<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT d.body FROM directories d \
                   JOIN directory_paths dp ON dp.digest = d.digest \
                   JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
-                 WHERE d.digest = $1 AND pt.tenant_id = $2 \
+                 WHERE d.digest = $1 AND pt.tenant_id = $2{SCOPE_PREDICATE} \
                  LIMIT 1",
-            )
+            )))
             .bind(digest.as_slice())
             .bind(tenant)
+            .bind(authz.scope.sql_bind())
             .fetch_optional(&self.pool)
             .await
             .map_err(internal)?;
+            self.scope_audit_single(
+                "GetDirectory",
+                HasTable::Directories,
+                digest,
+                tenant,
+                &authz.scope,
+                body.is_some(),
+            )
+            .await?;
             let Some((body,)) = body else {
                 return Err(Status::not_found("directory not found"));
             };
@@ -266,6 +385,45 @@ impl DirectoryService for DirectoryServiceImpl {
             let (tx, rx) = tokio::sync::mpsc::channel(2);
             let _ = tx.send(Ok(dir)).await;
             return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+
+        // Closure scope for the recursive walk applies to the seed
+        // frontier only: children discovered during the descent belong
+        // to the same containing store path as their authorized parent
+        // (junction rows are written for every interior digest at
+        // commit), so they inherit scope by containment and the BFS
+        // below keeps today's per-batch tenant-only join.
+        match &authz.scope {
+            ReadScope::Unscoped => {}
+            ReadScope::Enforce(set, ctx) => {
+                let in_scope = self
+                    .has_in(HasTable::Directories, &frontier, tenant, Some(set.as_ref()))
+                    .await?;
+                let visible = self
+                    .has_in(HasTable::Directories, &frontier, tenant, None)
+                    .await?;
+                let denied = visible.iter().filter(|d| !in_scope.contains(*d)).count();
+                if denied > 0 {
+                    self.scope
+                        .record_out_of_scope_batch(true, "GetDirectory", ctx, denied);
+                }
+                // Out-of-scope seeds are simply absent from the stream —
+                // the same silent skip a non-tenant-visible seed gets.
+                frontier.retain(|d| in_scope.contains(d));
+            }
+            ReadScope::Audit(set, ctx) => {
+                let in_scope = self
+                    .has_in(HasTable::Directories, &frontier, tenant, Some(set.as_ref()))
+                    .await?;
+                let visible = self
+                    .has_in(HasTable::Directories, &frontier, tenant, None)
+                    .await?;
+                let denied = visible.iter().filter(|d| !in_scope.contains(*d)).count();
+                if denied > 0 {
+                    self.scope
+                        .record_out_of_scope_batch(false, "GetDirectory", ctx, denied);
+                }
+            }
         }
 
         // Recursive BFS, spawned so the stream can outlive this call.
@@ -396,17 +554,25 @@ impl DirectoryService for DirectoryServiceImpl {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    /// A bit is set iff the digest is present AND tenant-visible AND —
+    /// for enforce-mode assignment-token callers — contained in a path
+    /// of the attested closure (`r[store.castore.closure-scope]`,
+    /// uniform with the other read RPCs so presence can't be used as a
+    /// scope oracle). The gateway's delta-sync calls this with a JWT
+    /// and is unaffected by the mode.
     #[instrument(skip(self, request), fields(rpc = "HasDirectories"))]
     async fn has_directories(
         &self,
         request: Request<HasDirectoriesRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request).await?;
+        let authz = self.castore_authz(&request).await?;
         let digests = parse_digests(&request.into_inner().digests)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasDirectories")
             .record(digests.len() as f64);
-        let present = self.has_in(HasTable::Directories, &digests, tenant).await?;
+        let present = self
+            .has_scoped(HasTable::Directories, "HasDirectories", &digests, &authz)
+            .await?;
         Ok(Response::new(HasBitmap {
             bitmap: build_bitmap(&digests, &present),
         }))
@@ -415,18 +581,21 @@ impl DirectoryService for DirectoryServiceImpl {
     /// Presence bitmap over `file_blobs` × `path_tenants`. The join is
     /// per-path (`store_path_hash`), so a digest is "present" iff at
     /// least one tenant-readable NAR contains it — GC of one referrer
-    /// can't dangle the answer.
+    /// can't dangle the answer. Closure-scoped for enforce-mode
+    /// assignment-token callers, same as `HasDirectories`.
     #[instrument(skip(self, request), fields(rpc = "HasBlobs"))]
     async fn has_blobs(
         &self,
         request: Request<HasBlobsRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request).await?;
+        let authz = self.castore_authz(&request).await?;
         let digests = parse_digests(&request.into_inner().digests)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasBlobs")
             .record(digests.len() as f64);
-        let present = self.has_in(HasTable::FileBlobs, &digests, tenant).await?;
+        let present = self
+            .has_scoped(HasTable::FileBlobs, "HasBlobs", &digests, &authz)
+            .await?;
         Ok(Response::new(HasBitmap {
             bitmap: build_bitmap(&digests, &present),
         }))
@@ -444,35 +613,48 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<ReadBlobRequest>,
     ) -> Result<Response<Self::ReadBlobStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request).await?;
+        let authz = self.castore_authz(&request).await?;
+        let tenant = authz.tenant;
         let digest = parse_digest(&request.into_inner().file_digest)?;
         let started = Instant::now();
 
         // `manifests.status` filter excludes 'uploading' placeholders.
-        // LIMIT 1: any tenant-visible referrer's NAR works; the bytes
-        // are content-addressed. The `path_tenants` join is on the same
-        // `store_path_hash` as `file_blobs`, so the chosen NAR is one
-        // this tenant may read — a digest-only join could pick another
-        // tenant's NAR for a content-shared file. `file_blobs.size`
-        // (M_063) is denormalized so this never decodes
-        // `nar_index.entries` (O(files-in-NAR)) on the FUSE `open()`
-        // fast path.
+        // LIMIT 1: any tenant-visible (and, under enforce, in-closure)
+        // referrer's NAR works; the bytes are content-addressed. The
+        // `path_tenants` join is on the same `store_path_hash` as
+        // `file_blobs`, so the chosen NAR is one this tenant may read —
+        // a digest-only join could pick another tenant's NAR for a
+        // content-shared file; the scope predicate rides the same join,
+        // so a digest shared with an out-of-closure path still resolves
+        // through the in-closure referrer. `file_blobs.size` (M_063) is
+        // denormalized so this never decodes `nar_index.entries`
+        // (O(files-in-NAR)) on the FUSE `open()` fast path.
         type BlobRow = (i64, i64, Option<Vec<u8>>);
-        let row: Option<BlobRow> = sqlx::query_as(
+        let row: Option<BlobRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT f.nar_offset, f.size, md.chunk_list \
                FROM file_blobs f \
                JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                     AND m.status = 'complete' \
                LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
-              WHERE f.digest = $1 AND pt.tenant_id = $2 \
+              WHERE f.digest = $1 AND pt.tenant_id = $2{SCOPE_PREDICATE} \
               LIMIT 1",
-        )
+        )))
         .bind(digest.as_slice())
         .bind(tenant)
+        .bind(authz.scope.sql_bind())
         .fetch_optional(&self.pool)
         .await
         .map_err(internal)?;
+        self.scope_audit_single(
+            "ReadBlob",
+            HasTable::FileBlobs,
+            digest,
+            tenant,
+            &authz.scope,
+            row.is_some(),
+        )
+        .await?;
         let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
@@ -528,7 +710,8 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<StatBlobRequest>,
     ) -> Result<Response<StatBlobResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request).await?;
+        let authz = self.castore_authz(&request).await?;
+        let tenant = authz.tenant;
         let req = request.into_inner();
         let digest = parse_digest(&req.file_digest)?;
 
@@ -536,38 +719,58 @@ impl DirectoryService for DirectoryServiceImpl {
         // (megabytes for a large NAR) and the probe never reads it.
         // `has_in()` would also do, but it skips `m.status = 'complete'`.
         if !req.send_chunks {
-            let exists: Option<(i32,)> = sqlx::query_as(
+            let exists: Option<(i32,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT 1 FROM file_blobs f \
                    JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                    JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                         AND m.status = 'complete' \
-                  WHERE f.digest = $1 AND pt.tenant_id = $2 LIMIT 1",
-            )
+                  WHERE f.digest = $1 AND pt.tenant_id = $2{SCOPE_PREDICATE} LIMIT 1",
+            )))
             .bind(digest.as_slice())
             .bind(tenant)
+            .bind(authz.scope.sql_bind())
             .fetch_optional(&self.pool)
             .await
             .map_err(internal)?;
+            self.scope_audit_single(
+                "StatBlob",
+                HasTable::FileBlobs,
+                digest,
+                tenant,
+                &authz.scope,
+                exists.is_some(),
+            )
+            .await?;
             return exists
                 .map(|_| Response::new(StatBlobResponse::default()))
                 .ok_or_else(|| Status::not_found("file blob not found"));
         }
 
         type StatRow = (i64, i64, Option<Vec<u8>>);
-        let row: Option<StatRow> = sqlx::query_as(
+        let row: Option<StatRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT f.nar_offset, f.size, md.chunk_list \
                FROM file_blobs f \
                JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                     AND m.status = 'complete' \
                LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
-              WHERE f.digest = $1 AND pt.tenant_id = $2 LIMIT 1",
-        )
+              WHERE f.digest = $1 AND pt.tenant_id = $2{SCOPE_PREDICATE} LIMIT 1",
+        )))
         .bind(digest.as_slice())
         .bind(tenant)
+        .bind(authz.scope.sql_bind())
         .fetch_optional(&self.pool)
         .await
         .map_err(internal)?;
+        self.scope_audit_single(
+            "StatBlob",
+            HasTable::FileBlobs,
+            digest,
+            tenant,
+            &authz.scope,
+            row.is_some(),
+        )
+        .await?;
         let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
@@ -601,6 +804,32 @@ impl DirectoryService for DirectoryServiceImpl {
                 })
                 .collect(),
         }))
+    }
+
+    /// Establish the closure read scope for the presenting assignment
+    /// token (ADR-022 P0591): verify the presented list against the
+    /// token's signed `input_closure_digest` and cache the resulting
+    /// ScopeSet on this replica. Idempotent, no Postgres; works in
+    /// every `[castore_read_scope]` mode so a presenting builder never
+    /// has to care what the store enforces.
+    ///
+    /// JWT callers have nothing to present (their reads are tenant-wide
+    /// by design) — an assignment token is required.
+    // r[impl store.castore.scope-establish]
+    #[instrument(skip(self, request), fields(rpc = "PresentClosure"))]
+    async fn present_closure(
+        &self,
+        request: Request<PresentClosureRequest>,
+    ) -> Result<Response<PresentClosureResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let Some(claims) = self.assignment_claims(&request)? else {
+            return Err(Status::unauthenticated(
+                "PresentClosure requires an HMAC assignment token",
+            ));
+        };
+        let closure = request.into_inner().closure;
+        self.scope.establish(&claims, &closure).await?;
+        Ok(Response::new(PresentClosureResponse {}))
     }
 }
 
@@ -774,10 +1003,10 @@ impl HasTable {
             Self::Directories => {
                 "directories d \
                  JOIN directory_paths dp ON dp.digest = d.digest \
-                 JOIN path_tenants t ON t.store_path_hash = dp.store_path_hash"
+                 JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash"
             }
             Self::FileBlobs => {
-                "file_blobs d JOIN path_tenants t ON t.store_path_hash = d.store_path_hash"
+                "file_blobs d JOIN path_tenants pt ON pt.store_path_hash = d.store_path_hash"
             }
         }
     }
@@ -785,27 +1014,37 @@ impl HasTable {
 
 impl DirectoryServiceImpl {
     /// `SELECT DISTINCT d.digest FROM <table×junction> WHERE digest =
-    /// ANY($1) AND tenant_id = $2`.
+    /// ANY($1) AND tenant_id = $2 [AND in-scope]`.
+    ///
+    /// `scope = Some(set)` additionally requires a containing path in
+    /// the closure scope (the same [`SCOPE_PREDICATE`] the read RPCs
+    /// append); `None` binds SQL NULL and the predicate passes.
     async fn has_in(
         &self,
         table: HasTable,
         digests: &[[u8; 32]],
         tenant: uuid::Uuid,
+        scope: Option<&ScopeSet>,
     ) -> Result<HashSet<[u8; 32]>, Status> {
         if digests.is_empty() {
             return Ok(HashSet::new());
         }
         let slices: Vec<&[u8]> = digests.iter().map(|d| d.as_slice()).collect();
+        let scope_bind: Option<Vec<&[u8]>> =
+            scope.map(|s| s.hashes().iter().map(|h| h.as_slice()).collect());
         // AssertSqlSafe: `from` is a `&'static str` from the closed
-        // `HasTable` enum above — no request-derived data reaches the
-        // format string; the digests and tenant id are bind parameters.
+        // `HasTable` enum above and the scope fragment is the
+        // compile-time SCOPE_PREDICATE const — no request-derived data
+        // reaches the format string; the digests, tenant id, and scope
+        // hashes are bind parameters.
         let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT DISTINCT d.digest FROM {from} \
-             WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2",
+             WHERE d.digest = ANY($1::bytea[]) AND pt.tenant_id = $2{SCOPE_PREDICATE}",
             from = table.join_clause(),
         )))
         .bind(&slices)
         .bind(tenant)
+        .bind(scope_bind)
         .fetch_all(&self.pool)
         .await
         .map_err(internal)?;
@@ -813,6 +1052,39 @@ impl DirectoryServiceImpl {
             .into_iter()
             .filter_map(|(d,)| d.try_into().ok())
             .collect())
+    }
+
+    /// `HasDirectories`/`HasBlobs` presence set under the caller's
+    /// scope decision: enforce filters the bitmap (a presence bit means
+    /// present AND tenant-visible AND in-closure); log mode serves
+    /// today's tenant-wide bitmap while counting how many bits enforce
+    /// would have cleared; JWT/off callers are exactly today's query.
+    async fn has_scoped(
+        &self,
+        table: HasTable,
+        rpc: &'static str,
+        digests: &[[u8; 32]],
+        authz: &CastoreAuthz,
+    ) -> Result<HashSet<[u8; 32]>, Status> {
+        match &authz.scope {
+            ReadScope::Unscoped => self.has_in(table, digests, authz.tenant, None).await,
+            ReadScope::Enforce(set, _) => {
+                self.has_in(table, digests, authz.tenant, Some(set.as_ref()))
+                    .await
+            }
+            ReadScope::Audit(set, ctx) => {
+                let all = self.has_in(table, digests, authz.tenant, None).await?;
+                let scoped = self
+                    .has_in(table, digests, authz.tenant, Some(set.as_ref()))
+                    .await?;
+                let denied = all.iter().filter(|d| !scoped.contains(*d)).count();
+                if denied > 0 {
+                    self.scope
+                        .record_out_of_scope_batch(false, rpc, ctx, denied);
+                }
+                Ok(all)
+            }
+        }
     }
 }
 

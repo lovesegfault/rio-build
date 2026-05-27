@@ -432,6 +432,24 @@
         "description": "Per-`drv_hash` verdict cache TTL in seconds."
       },
       {
+        "key": "castore_read_scope.mode",
+        "type": "ScopeMode",
+        "default": "log",
+        "description": "`off` — no scope handling (tenant scoping only, dev parity). `log` — resolve and compare scopes but never reject; serve out-of-scope reads while counting `would_deny` / `scope_absent`. `enforce` — out-of-scope reads answer NOT_FOUND, unattested tokens are denied, and an unresolvable scope answers FAILED_PRECONDITION (`CASTORE_SCOPE_REQUIRED`) so the builder presents and retries."
+      },
+      {
+        "key": "castore_read_scope.cache_capacity_bytes",
+        "type": "uint64",
+        "default": "268435456",
+        "description": "Capacity of the per-replica presented-ScopeSet cache, in bytes of cached path hashes (~32 B per closure path; ~2 MiB for a `MAX_INPUT_CLOSURE`-sized closure)."
+      },
+      {
+        "key": "castore_read_scope.cache_idle_ttl_secs",
+        "type": "uint64",
+        "default": "3600",
+        "description": "Idle TTL (seconds) for presented ScopeSets: an entry no read has touched for this long is evicted."
+      },
+      {
         "key": "jwt.required",
         "type": "boolean",
         "default": "false",

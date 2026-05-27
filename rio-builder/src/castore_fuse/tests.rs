@@ -82,7 +82,7 @@ struct MockState {
     seen_tokens: std::sync::Mutex<Vec<(&'static str, Option<String>)>>,
     /// When set, any castore RPC arriving WITHOUT a token header is
     /// rejected with `UNAUTHENTICATED` — the same shape rio-store's
-    /// tenant gate produces (`store.castore.tenant-scope`).
+    /// tenant gate produces (`store.castore.tenant-scope+2`).
     require_token: AtomicBool,
 }
 
@@ -359,6 +359,17 @@ impl DirectoryService for MockCastore {
             Some(plan) => Ok(Response::new(plan.clone())),
             None => Err(Status::not_found("MockCastore: no such blob")),
         }
+    }
+
+    /// The mock plays an old / minimal store: scope presentation is a
+    /// store-side feature (ADR-022 P0591) these FUSE tests don't model,
+    /// and the (Phase 2) presenting builder must tolerate exactly this
+    /// answer from stores that predate the RPC.
+    async fn present_closure(
+        &self,
+        _request: Request<rio_proto::types::PresentClosureRequest>,
+    ) -> Result<Response<rio_proto::types::PresentClosureResponse>, Status> {
+        Err(Status::unimplemented("MockCastore: PresentClosure"))
     }
 }
 

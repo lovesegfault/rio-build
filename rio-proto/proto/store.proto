@@ -175,6 +175,20 @@ service DirectoryService {
   // tenant-visible row; FailedPrecondition for inline manifests
   // (no chunk list — use ReadBlob).
   rpc StatBlob(rio.types.StatBlobRequest) returns (rio.types.StatBlobResponse);
+
+  // ADR-022 P0591: establish the closure read scope for an assignment
+  // token (see `r[store.castore.scope-establish]`). The builder
+  // presents WorkAssignment.input_closure once per mount / new store
+  // channel; the store verifies it against the token's signed
+  // input_closure_digest and caches the scope in RAM. Subsequent
+  // castore reads with that token are limited to digests reachable
+  // through a store path in that closure (mode-gated by the store's
+  // `[castore_read_scope]` config). INVALID_ARGUMENT on digest
+  // mismatch / over-cap / unattested token, regardless of mode.
+  // Idempotent and cheap — callers re-present whenever the store
+  // answers FAILED_PRECONDITION with the CASTORE_SCOPE_REQUIRED
+  // reason (a replica that never saw, or evicted, the scope).
+  rpc PresentClosure(rio.types.PresentClosureRequest) returns (rio.types.PresentClosureResponse);
 }
 
 // Chunk-level storage service for content-defined chunking.

@@ -300,6 +300,23 @@ async fn main() -> anyhow::Result<()> {
         );
         directory_service
     };
+    // Closure scoping of assignment-token castore reads
+    // (r[store.castore.closure-scope], [castore_read_scope] config).
+    // Wired in every mode: `off` keeps tenant-only behavior but still
+    // answers PresentClosure, so a presenting builder never has to care
+    // what this replica enforces.
+    info!(
+        mode = ?cfg.castore_read_scope.mode,
+        cache_capacity_bytes = cfg.castore_read_scope.cache_capacity_bytes,
+        cache_idle_ttl_secs = cfg.castore_read_scope.cache_idle_ttl_secs,
+        "castore closure read scope"
+    );
+    let directory_service =
+        directory_service.with_castore_scope(rio_store::grpc::scope::CastoreScope::new(
+            cfg.castore_read_scope.mode,
+            cfg.castore_read_scope.cache_capacity_bytes,
+            std::time::Duration::from_secs(cfg.castore_read_scope.cache_idle_ttl_secs),
+        ));
 
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in

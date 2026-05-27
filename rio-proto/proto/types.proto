@@ -311,6 +311,26 @@ message StatBlobResponse {
   uint32 last_chunk_take = 3;
 }
 
+// ADR-022 P0591: present the assignment's input closure so the store
+// can scope this token's castore reads to exactly that closure. The
+// assignment token rides the x-rio-assignment-token header (same as
+// every other DirectoryService call); the store recomputes
+// blake3(sorted(closure)) and requires equality with the token's
+// signed input_closure_digest claim before caching the scope.
+// Idempotent: re-presenting the same closure is a no-op.
+message PresentClosureRequest {
+  // Full /nix/store/... path strings, exactly as carried in
+  // WorkAssignment.input_closure. Order does not matter (the store
+  // sorts before hashing); duplicates are tolerated. Capped at
+  // MAX_INPUT_CLOSURE entries.
+  repeated string closure = 1;
+}
+
+// Empty today. A dedicated message (not google.protobuf.Empty) so a
+// future field (e.g. a negotiated scope hint) slots in without a wire
+// bump. Deliberately echoes nothing the store holds.
+message PresentClosureResponse {}
+
 message GetNarIndexBatchRequest {
   repeated bytes nar_hashes = 1;
 }
