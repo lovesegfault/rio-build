@@ -1383,7 +1383,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     out.path()
                 );
             }
-            // r[impl gw.hook.inline-drv-content+2]
+            // r[impl gw.hook.inline-drv-content+3]
             // Content-bound fallback: the .drv exists in no store (the
             // client never uploaded it), so the worker can only execute
             // this build if the serialized derivation rides along in
@@ -1401,6 +1401,20 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     // (it is trivially a structural root) but keeps the
                     // "client named it" marker consistent across opcodes.
                     node.explicitly_requested = true;
+                    if inline_offender_realized {
+                        // Unverifiable-algo realization exemption: these
+                        // bytes cannot pass — or be bound by — the
+                        // scheduler's authoritative-content ingress
+                        // validation (the declared algo is unparseable),
+                        // nothing is ever legitimately built or replayed
+                        // from this node (it cache-cuts at the
+                        // scheduler), and persisting unvalidatable bytes
+                        // is exactly what
+                        // sched.recovery.inline-drv-durability forbids.
+                        // Keep the content inlined as dispatch payload
+                        // but submit it non-authoritatively.
+                        node.drv_content_authoritative = false;
+                    }
                     (vec![node], Vec::new())
                 }
                 Err(reason) => {

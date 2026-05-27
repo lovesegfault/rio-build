@@ -414,8 +414,10 @@ fn populate_wanted_outputs(
 /// `outputHash`/`outputHashAlgo` the builder cannot verify or finalize:
 /// those are NOT rejected here — the caller must pass them to
 /// [`reject_unrealized_fod_offenders`], which exempts them only when
-/// every declared output is already realized in the store (and rejects
-/// otherwise, fail-closed).
+/// every declared output is already present and visible to the
+/// submitting tenant, or substitutable from that tenant's configured
+/// upstreams (one bounded tenant-scoped probe; rejects otherwise,
+/// fail-closed).
 ///
 /// Checks:
 /// - `__noChroot=1` in any node's env → reject (sandbox escape)
@@ -1178,7 +1180,7 @@ pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = rio_common::limits::MAX_
 /// path cannot work any other way (the worker has nowhere to fetch the
 /// derivation from), so failing fast at submission is the only honest
 /// answer.
-// r[impl gw.hook.inline-drv-content+2]
+// r[impl gw.hook.inline-drv-content+3]
 pub fn build_fallback_node(
     drv_path: &str,
     basic: &rio_nix::derivation::BasicDerivation,
@@ -2101,7 +2103,7 @@ mod tests {
 
     /// The content-bound single-node fallback carries the serialized
     /// derivation; oversized derivations are rejected with remediation.
-    // r[verify gw.hook.inline-drv-content+2]
+    // r[verify gw.hook.inline-drv-content+3]
     #[test]
     fn build_fallback_node_inlines_the_basic_derivation() {
         use rio_nix::derivation::BasicDerivation;

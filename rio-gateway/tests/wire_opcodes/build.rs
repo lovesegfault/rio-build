@@ -7,7 +7,7 @@
 // r[verify gw.reject.output-path-mismatch]
 // r[verify gw.reject.unsupported-hash-algo+3]
 // r[verify gw.hook.ifd-detection+3]
-// r[verify gw.hook.inline-drv-content+2]
+// r[verify gw.hook.inline-drv-content+3]
 // r[verify gw.stderr.activity+2]
 
 use super::*;
@@ -724,7 +724,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
             1,
             "the content-bound inline fallback is submitted"
         );
-        // r[verify gw.hook.inline-drv-content+2]
+        // r[verify gw.hook.inline-drv-content+3]
         // The submitted node carries the serialized derivation (the .drv
         // exists in no store for the worker to fetch) and it parses back
         // to the same fixed-output derivation.
@@ -732,6 +732,13 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
         assert!(
             !node.drv_content.is_empty(),
             "inline fallback must carry drv_content"
+        );
+        // Pins the boundary of the realization-exemption carve-out: an
+        // ordinary (verifiable-algo) content-bound fallback stays
+        // authoritative so the scheduler persists it for recovery.
+        assert!(
+            node.drv_content_authoritative,
+            "non-exempted content-bound fallback must stay authoritative"
         );
         let reparsed =
             rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
@@ -751,7 +758,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
 /// wopBuildDerivation (36): an inline floating-CA derivation (algo set,
 /// hash and path empty) with no uploaded .drv is accepted, and the
 /// submitted node carries parseable drv_content with needs_resolve set.
-/// r[verify gw.hook.inline-drv-content+2]
+/// r[verify gw.hook.inline-drv-content+3]
 #[tokio::test]
 async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
 -> anyhow::Result<()> {
@@ -898,7 +905,7 @@ async fn test_build_derivation_inline_floating_ca_fallback_returns_built_outputs
 
 /// wopBuildDerivation (36): an inline content-bound derivation whose
 /// serialized form exceeds the 1 MiB fallback cap is rejected with
-/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content+2]
+/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content+3]
 #[tokio::test]
 async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -948,7 +955,7 @@ async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::R
 /// submitted node carries the full drv_content — the producer cap and
 /// the SubmitBuild ingress bound are the same shared constant, so the
 /// (256 KiB, 1 MiB] window cannot be rejected downstream.
-/// r[verify gw.hook.inline-drv-content+2]
+/// r[verify gw.hook.inline-drv-content+3]
 #[tokio::test]
 async fn test_build_derivation_inline_fallback_midsize_accepted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1294,11 +1301,51 @@ async fn test_build_derivation_inline_bad_hash_algo_realized_accepted() -> anyho
     assert!(error_msg.is_empty(), "no error: {error_msg:?}");
     drain_build_result_tail(&mut h.stream).await?;
 
-    assert_eq!(
-        h.scheduler.submit_calls.read().unwrap().len(),
-        1,
-        "the realized offender is exempted and submitted (scheduler cache-cuts it)"
-    );
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(
+            submits.len(),
+            1,
+            "the realized offender is exempted and submitted (scheduler cache-cuts it)"
+        );
+        // r[verify gw.hook.inline-drv-content+3]
+        // The exempted offender's inline content rides along as dispatch
+        // payload but is submitted NON-authoritatively: the bytes cannot
+        // pass the scheduler's authoritative-content ingress validation,
+        // and the node cache-cuts instead of dispatching.
+        let node = &submits[0].nodes[0];
+        assert!(
+            !node.drv_content_authoritative,
+            "exempted offender's inline content must be non-authoritative"
+        );
+        assert!(
+            !node.drv_content.is_empty(),
+            "inline content still rides along as dispatch payload"
+        );
+        let reparsed =
+            rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
+                .expect("inlined drv_content parses");
+        assert_eq!(reparsed.outputs()[0].hash_algo(), "md5");
+        assert_eq!(reparsed.outputs()[0].path(), out_path);
+        assert!(node.is_fixed_output, "FOD flag preserved");
+        assert_eq!(
+            node.expected_output_paths,
+            vec![out_path.to_string()],
+            "declared output path preserved"
+        );
+        let expected_hash = rio_nix::derivation::hash_derivation_modulo(
+            &reparsed,
+            drv_path,
+            &|_| None,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect("modular hash over the inline fallback");
+        assert_eq!(
+            node.ca_modular_hash,
+            expected_hash.to_vec(),
+            "ca_modular_hash still populated for the exempted offender"
+        );
+    }
 
     h.finish().await;
     Ok(())

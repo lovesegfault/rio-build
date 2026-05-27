@@ -1098,7 +1098,11 @@ probe and dispatch makes the node dispatch and fail at the worker's
 fail-closed FOD gate (a node-level failure instead of a submission
 rejection); a substitute fetch that fails after a positive upstream probe
 ends the same way; and dual-mode sessions probe anonymously, which matches
-the scheduler's anonymous merge-time probe in that mode.
+the scheduler's anonymous merge-time probe in that mode. When the exemption
+applies on the inline `wopBuildDerivation` path, the single-node fallback
+submits its inline content non-authoritatively
+(#rref("gw.hook.inline-drv-content+3")) so the scheduler's
+authoritative-content ingress validation does not undo the exemption.
 
 #r("gw.reject.floating-ca-declared-path")[
   The gateway MUST reject at submission any derivation output that sets
@@ -1917,7 +1921,7 @@ untrusted handshake):*
   a missing or unrealized output is reported as a failure result, not an
   empty-`outPath` success
 
-#r("gw.hook.inline-drv-content+2")[
+#r("gw.hook.inline-drv-content+3")[
   When the gateway accepts a content-bound derivation through the inline
   `wopBuildDerivation` single-node fallback (the full `.drv` cannot be
   resolved from the session cache or the store), it MUST embed the
@@ -1928,7 +1932,13 @@ untrusted handshake):*
   guidance (upload the `.drv` first via `nix copy --derivation`, or use
   `--store ssh-ng://`). It MUST mark the node as carrying the authoritative
   copy (`drv_content_authoritative`) so the scheduler persists those bytes
-  for recovery (#rref("sched.recovery.inline-drv-durability")). The inlined
+  for recovery (#rref("sched.recovery.inline-drv-durability")) --- except
+  when the unverifiable-algo realization exemption
+  (#rref("gw.reject.unsupported-hash-algo+3")) applied to this derivation,
+  in which case the gateway MUST submit the inline content
+  non-authoritatively: the bytes cannot pass the scheduler's
+  authoritative-content ingress validation and the node is expected to
+  cache-cut, never dispatch. The inlined
   bytes are never written to the store or
   the session derivation cache: re-serialized content does not text-hash to
   the client's claimed `.drv` path, so persisting it would poison later

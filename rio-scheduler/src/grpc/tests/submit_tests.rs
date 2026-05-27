@@ -1085,3 +1085,48 @@ async fn test_submit_build_join_does_not_clear_authoritative_row() {
         "joining submission must not clear the creating submission's authoritative bytes"
     );
 }
+
+/// The gateway's unverifiable-algo realization exemption submits the
+/// inline fallback NON-authoritatively (the bytes cannot pass — or be
+/// bound by — authoritative ingress validation, and the node is expected
+/// to cache-cut). The scheduler must accept that shape: non-authoritative
+/// drv_content is dispatch payload only and is not subject to the
+/// authoritative identity binding.
+#[tokio::test]
+async fn test_submit_build_accepts_non_authoritative_md5_fod_content() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-md5-exempt").await;
+
+    let mut node = make_node("md5-exempt");
+    let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
+    let aterm = format!(
+        r#"Derive([("out","{out_path}","md5","deadbeefdeadbeefdeadbeefdeadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{out_path}")])"#
+    );
+    let drv = rio_nix::derivation::Derivation::parse(&aterm).unwrap();
+    node.ca_modular_hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        &node.drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap()
+    .to_vec();
+    node.drv_content = aterm.into_bytes();
+    node.drv_content_authoritative = false;
+    node.is_fixed_output = true;
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec![out_path.into()];
+
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            tenant_name: "team-md5-exempt".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "non-authoritative md5-FOD inline content accepted: {result:?}"
+    );
+}
