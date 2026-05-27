@@ -379,6 +379,10 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         "claims should include expected_output_paths: {:?}",
         claims.expected_outputs
     );
+    assert!(
+        !claims.is_fixed_output,
+        "a non-FOD assignment must sign is_fixed_output = false"
+    );
     // Expiry is in the future (timeout_secs × 2 from now).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -454,6 +458,60 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
          (hyphenated UUID) into AssignmentClaims so the store derives \
          hw_perf_samples.submitting_tenant from a verified token, not \
          the request body."
+    );
+
+    Ok(())
+}
+
+/// bug_001 (round 6): the scheduler signs `is_fixed_output` from the
+/// persisted node flag so the store can refuse descriptor-less uploads
+/// for content-bound (fixed-output) assignments. Writer-side pin — the
+/// serde wire-shape halves live in `rio-auth`
+/// (`assignment_claims_fixed_output_*`), and the store-side enforcement
+/// in `rio-store` (`hmac_fod_descriptorless_rejected`).
+#[tokio::test]
+async fn test_hmac_assignment_marks_fixed_output() -> TestResult {
+    use rio_auth::hmac::{HmacSigner, HmacVerifier};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let test_key = b"test-fod-claims-key-32-bytes!!!!".to_vec();
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
+    });
+
+    // FOD nodes dispatch to Fetcher-kind executors.
+    let mut worker_rx = connect_executor_kind(
+        &handle,
+        "fod-w",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+
+    let expected_out = test_store_path("fod-expected-out");
+    let mut node = make_node("fod-claims-drv");
+    node.is_fixed_output = true;
+    node.expected_output_paths = vec![expected_out.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+
+    assert!(
+        claims.is_fixed_output,
+        "FOD assignment must sign is_fixed_output = true"
+    );
+    assert!(
+        !claims.is_ca,
+        "FOD has a known output path — is_ca must stay false"
+    );
+    assert_eq!(
+        claims.expected_outputs,
+        vec![expected_out],
+        "the declared FOD path is membership-bound as usual"
     );
 
     Ok(())

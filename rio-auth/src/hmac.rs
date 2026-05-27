@@ -50,7 +50,7 @@ pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
 /// [`crate::jwt::TenantClaims`] — both appear together in PutPath
 /// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
 /// source of confusion.
-// r[impl common.hmac.claims]
+// r[impl common.hmac.claims+1]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentClaims {
@@ -80,6 +80,36 @@ pub struct AssignmentClaims {
     /// for) a path that doesn't match the content it actually sent —
     /// same blast radius as IA (one content-determined path per NAR).
     pub is_ca: bool,
+    /// Fixed-output derivation (FOD): the assignment's expected output
+    /// is content-bound by a hash *declared in the derivation*, so the
+    /// store MUST NOT accept a descriptor-less upload for it — the
+    /// worker has to present its `fixed:` content-address descriptor,
+    /// which the store then recomputes from the uploaded bytes and
+    /// re-derives the claimed path from
+    /// (`r[sec.authz.ca-path-derived]`). Workers are untrusted: without
+    /// this signed bit the verification trigger would be the
+    /// worker-supplied descriptor itself, and a compromised worker
+    /// could simply omit it and fall back to membership-only
+    /// acceptance. `false` for input-addressed and floating-CA
+    /// assignments (their gates are unchanged).
+    ///
+    /// **Wire-compat / rollout.** `AssignmentClaims` carries
+    /// `#[serde(deny_unknown_fields)]`, so this field follows the
+    /// `tenant` precedent (bug_011):
+    ///
+    /// - **old token → new store:** missing key → `false` via
+    ///   `#[serde(default)]` — today's behaviour.
+    /// - **new token → old store:** `skip_serializing_if` omits the key
+    ///   whenever the value is `false`, so non-FOD tokens stay
+    ///   byte-identical to the previous shape. A `true` token presented
+    ///   to a not-yet-rolled store is rejected with
+    ///   `unknown field 'is_fixed_output'` → `permission_denied`.
+    ///
+    /// Deploy order therefore is **store fleet before scheduler**; the
+    /// skew blast radius is FOD uploads only, and the failure mode is a
+    /// loud build failure (PutPath rejection), never silent acceptance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_fixed_output: bool,
     /// Unix timestamp (seconds). Token invalid after this. Scheduler
     /// sets it to ~2× build_timeout; a worker legitimately uploading
     /// after build completion is well within that window. Prevents
@@ -478,6 +508,7 @@ mod tests {
                 "/nix/store/bbb-hello-dev".into(),
             ],
             is_ca: false,
+            is_fixed_output: false,
             expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
             tenant: None,
         }
@@ -833,6 +864,114 @@ mod tests {
             .expect("pre-tenant store must accept a tenant-less body");
         assert_eq!(parsed.executor_id, without_tenant.executor_id);
         assert_eq!(parsed.expiry_unix, without_tenant.expiry_unix);
+    }
+
+    /// Backward-skew direction for `is_fixed_output`: a token minted by
+    /// a pre-field scheduler (no `is_fixed_output` key) must still
+    /// verify on a store that carries the field — `#[serde(default)]`
+    /// reads the missing key as `false`, i.e. exactly today's
+    /// descriptor-optional behaviour.
+    #[test]
+    fn assignment_claims_fixed_output_backcompat() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Hand-roll the pre-field claims JSON (no `is_fixed_output`).
+        let old_json = serde_json::json!({
+            "executor_id": "w",
+            "drv_hash": "abc",
+            "expected_outputs": ["/nix/store/aaa-x"],
+            "is_ca": false,
+            "expiry_unix": now + 3600,
+        });
+        let old_bytes = serde_json::to_vec(&old_json).unwrap();
+        let mut mac = HmacSha256::new_from_slice(TEST_KEY).unwrap();
+        mac.update(&old_bytes);
+        let tag = mac.finalize().into_bytes();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!("{}.{}", b64.encode(&old_bytes), b64.encode(tag));
+
+        let claims = key
+            .verify::<AssignmentClaims>(&token)
+            .expect("pre-field token still verifies (serde default)");
+        assert!(!claims.is_fixed_output, "missing key must read as false");
+
+        // And a token WITH the bit set round-trips it.
+        let mut fod = test_claims(3600);
+        fod.is_fixed_output = true;
+        let tok = key.sign(&fod);
+        assert!(
+            key.verify::<AssignmentClaims>(&tok)
+                .unwrap()
+                .is_fixed_output
+        );
+    }
+
+    /// Forward-skew direction for `is_fixed_output` (mirrors the tenant
+    /// pin above): `true` emits the key — a pre-field store rejects it
+    /// (`deny_unknown_fields`), which is why the store fleet must roll
+    /// before the scheduler — while `false` omits the key entirely
+    /// (`skip_serializing_if`), keeping every non-FOD token
+    /// byte-identical to the pre-field shape.
+    #[test]
+    fn assignment_claims_fixed_output_forward_skew() {
+        // Pre-field store struct (snapshot of `AssignmentClaims` before
+        // `is_fixed_output` was added). Deliberately local so it never
+        // drifts to track the real struct.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)] // fields read by serde, not by the test body
+        struct OldAssignmentClaims {
+            executor_id: String,
+            drv_hash: String,
+            expected_outputs: Vec<String>,
+            is_ca: bool,
+            expiry_unix: u64,
+            #[serde(default)]
+            tenant: Option<String>,
+        }
+
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims_body = |c: &AssignmentClaims| -> Vec<u8> {
+            let token = key.sign(c);
+            let (claims_b64, _) = token.split_once('.').unwrap();
+            b64.decode(claims_b64).unwrap()
+        };
+
+        // Half 1 — `is_fixed_output: true` is a wire break against a
+        // pre-field store: deploy the store fleet first.
+        let mut fod = test_claims(3600);
+        fod.is_fixed_output = true;
+        let body = claims_body(&fod);
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("\"is_fixed_output\""),
+            "true must emit the key (precondition for the rejection assertion)"
+        );
+        let err = serde_json::from_slice::<OldAssignmentClaims>(&body)
+            .expect_err("pre-field store must reject a FOD-flagged body");
+        assert!(
+            err.to_string().contains("unknown field `is_fixed_output`"),
+            "expected `unknown field 'is_fixed_output'`, got: {err}"
+        );
+
+        // Half 2 — `false` omits the key: every non-FOD token keeps the
+        // exact pre-field wire shape, so rolling the scheduler after the
+        // store fleet only ever risks FOD uploads during the window.
+        let plain = test_claims(3600); // is_fixed_output: false
+        let body = claims_body(&plain);
+        assert!(
+            !std::str::from_utf8(&body)
+                .unwrap()
+                .contains("is_fixed_output"),
+            "false must NOT emit the key (skip_serializing_if)"
+        );
+        serde_json::from_slice::<OldAssignmentClaims>(&body)
+            .expect("pre-field store must accept a non-FOD body");
     }
 
     #[test]

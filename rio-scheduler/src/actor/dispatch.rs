@@ -2429,6 +2429,13 @@ impl DagActor {
                 // Fixed-output CA (FOD) has a known path → treat
                 // as IA for the membership check.
                 is_ca: state.ca.is_ca && !state.is_fixed_output,
+                // Signed FOD marker (persisted on the node, so recovered
+                // assignments still carry it): the store rejects
+                // descriptor-less uploads under a FOD-flagged token, so
+                // a worker cannot skip the content⇔path verification by
+                // simply omitting its `fixed:` descriptor
+                // (sec.authz.ca-path-derived).
+                is_fixed_output: state.is_fixed_output,
                 expiry_unix,
                 // Tenant attribution for hw_perf_samples.submitting_tenant (M_054).
                 // Phase 2 of the bug_011 two-phase rollout (Phase 1 = fb096e50f);

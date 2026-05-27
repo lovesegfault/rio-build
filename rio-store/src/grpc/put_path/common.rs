@@ -300,7 +300,7 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
     Ok(FixedCaDescriptor { recursive, hash })
 }
 
-// r[impl sec.authz.ca-path-derived+5]
+// r[impl sec.authz.ca-path-derived+6]
 /// Content-address authorization gate. Workers are untrusted, so the
 /// store — not the builder — is the authority on whether a claimed
 /// store path is actually derivable from the uploaded bytes. The gate
@@ -365,6 +365,14 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
 /// trusted control plane (gateway `nix copy` ingestion, store-added
 /// text paths) is not subject to worker authorization.
 ///
+/// Descriptor-less worker uploads are membership-only **unless** the
+/// scheduler-signed claims mark the assignment as fixed-output
+/// (`AssignmentClaims::is_fixed_output`): a FOD's expected output is
+/// content-bound by the derivation's declared hash, so the store
+/// requires the `fixed:` descriptor and rejects its absence — the
+/// verification trigger is trusted-plane data, never the (untrusted)
+/// worker's own claim.
+///
 /// Error split (deliberate, pre-existing pattern): a descriptor that
 /// cannot be parsed at all is `InvalidArgument` (malformed request),
 /// while content/path mismatches against a well-formed descriptor are
@@ -398,12 +406,36 @@ pub(in crate::grpc) fn verify_ca_store_path(
         .transpose()?;
 
     if !claims.is_ca && descriptor.is_none() {
+        // Fixed-output assignment (scheduler-signed bit): the expected
+        // output is content-bound by the derivation's declared hash, so
+        // a descriptor-less upload would skip the only server-side
+        // content⇔path verification a FOD gets. Workers are untrusted —
+        // the trigger for verification must be the signed claims, not
+        // the worker's own descriptor — so reject instead of falling
+        // back to membership-only acceptance.
+        if claims.is_fixed_output {
+            warn!(
+                store_path = %info.store_path,
+                executor_id = %claims.executor_id,
+                drv_hash = %claims.drv_hash,
+                "{ctx_label}: fixed-output upload without a content-address descriptor"
+            );
+            metrics::counter!(
+                "rio_store_hmac_rejected_total",
+                "reason" => "fod_descriptor_missing"
+            )
+            .increment(1);
+            return Err(Status::permission_denied(format!(
+                "{ctx_label}: fixed-output upload must carry a `fixed:`                  content-address descriptor so the store can verify the                  content against the path"
+            )));
+        }
         // Input-addressed (or daemon-era descriptor-less) worker upload:
         // path authorization is the `store_path ∈ expected_outputs`
         // membership check in `validate_put_metadata`, and there is no
         // content-address claim to verify — an input-addressed path is
-        // not content-derived. Descriptor-less uploads MUST keep working
-        // exactly like this (legacy workers / daemon-era replays).
+        // not content-derived. Descriptor-less non-FOD uploads MUST keep
+        // working exactly like this (legacy workers / daemon-era
+        // replays).
         return Ok(());
     }
 
@@ -1050,6 +1082,7 @@ mod verify_nar_tests {
             drv_hash: "test-drv-hash".into(),
             expected_outputs: vec![String::new()],
             is_ca: true,
+            is_fixed_output: false,
             expiry_unix: u64::MAX,
             tenant: None,
         }
@@ -1412,6 +1445,35 @@ mod verify_nar_tests {
         c
     }
 
+    /// Worker claims as a fixed-output assignment carries them: the
+    /// scheduler signs `is_fixed_output = true` (and `is_ca = false`,
+    /// since the FOD path is known at dispatch time).
+    fn fod_claims() -> rio_auth::hmac::AssignmentClaims {
+        let mut c = ia_claims();
+        c.is_fixed_output = true;
+        c
+    }
+
+    // r[verify sec.authz.ca-path-derived+6]
+    /// A fixed-output assignment (signed `is_fixed_output = true`) may
+    /// not skip content verification by omitting the descriptor: the
+    /// store rejects rather than falling back to membership-only
+    /// acceptance. Non-FOD descriptor-less uploads stay membership-only
+    /// (pinned by `ca_gate_noop_without_ca_claims`).
+    #[test]
+    fn fod_descriptorless_upload_rejected() {
+        let (path, nar, _descriptor) =
+            build_fod_recursive_upload("fod-silent", b"attacker bytes\n");
+        let info = ca_info(&path, &[], &nar); // no content_address
+        let err = verify_ca_store_path(&info, &nar, Some(&fod_claims()), "t")
+            .expect_err("descriptor-less upload under FOD-flagged claims must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("fixed-output upload must carry"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A fixed-output-shaped upload: content, its recursive (NAR)
     /// SHA-256, the path derived from that hash, and the `fixed:r:`
     /// descriptor the builder records for it.
@@ -1436,7 +1498,7 @@ mod verify_nar_tests {
         (path, nar, descriptor)
     }
 
-    // r[verify sec.authz.ca-path-derived+5]
+    // r[verify sec.authz.ca-path-derived+6]
     /// Fixed-output uploads (is_ca = false, `fixed:` descriptor present)
     /// are content-verified server-side: the descriptor must match the
     /// uploaded bytes AND the claimed path must re-derive from it. A
@@ -1445,7 +1507,7 @@ mod verify_nar_tests {
     #[test]
     fn fod_descriptor_binds_path_and_content_for_non_ca_uploads() {
         let (path, nar, descriptor) = build_fod_recursive_upload("fod-out", b"genuine bytes\n");
-        let claims = ia_claims();
+        let claims = fod_claims();
 
         // Honest upload: descriptor matches the bytes, path derives from it.
         let mut info = ca_info(&path, &[], &nar);
@@ -1482,7 +1544,7 @@ mod verify_nar_tests {
         );
     }
 
-    // r[verify sec.authz.ca-path-derived+5]
+    // r[verify sec.authz.ca-path-derived+6]
     /// Flat-mode fixed-output uploads get the same binding, using the
     /// file-bytes hash instead of the NAR hash.
     #[test]
@@ -1501,7 +1563,7 @@ mod verify_nar_tests {
             false,
         )
         .unwrap();
-        let claims = ia_claims();
+        let claims = fod_claims();
 
         let mut info = ca_info(&path, &[], &nar);
         info.content_address = Some(format!("fixed:{}", hash.to_colon()));
@@ -1520,7 +1582,7 @@ mod verify_nar_tests {
         );
     }
 
-    // r[verify sec.authz.ca-path-derived+5]
+    // r[verify sec.authz.ca-path-derived+6]
     /// Method confusion on the fixed-output arm: the descriptor honestly
     /// matches the bytes under the WRONG method (flat) while the claimed
     /// path was minted recursively — the path re-derivation rejects, the
@@ -1538,7 +1600,7 @@ mod verify_nar_tests {
         let flat_hash = w.finish();
         let mut info = ca_info(&path, &[], &nar);
         info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
-        let err = verify_ca_store_path(&info, &nar, Some(&ia_claims()), "t")
+        let err = verify_ca_store_path(&info, &nar, Some(&fod_claims()), "t")
             .expect_err("flat descriptor against a recursively-minted path must be rejected");
         assert!(
             err.message().contains("content-derived"),

@@ -48,7 +48,25 @@ fn sign_claims_tenant(
         expected_outputs: outputs,
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
         is_ca,
+        is_fixed_output: false,
         tenant: tenant.map(String::from),
+    };
+    HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
+}
+
+/// Sign claims for a fixed-output assignment: the path IS known (so it
+/// goes in `expected_outputs` and `is_ca = false`), and the scheduler
+/// marks the assignment `is_fixed_output = true`, which obliges the
+/// worker to present its `fixed:` descriptor on upload.
+fn sign_claims_fod(executor_id: &str, outputs: Vec<String>, expiry_offset_secs: i64) -> String {
+    let claims = AssignmentClaims {
+        executor_id: executor_id.into(),
+        drv_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        expected_outputs: outputs,
+        expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
+        is_ca: false,
+        is_fixed_output: true,
+        tenant: None,
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -255,6 +273,7 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
         expected_outputs: vec![path.clone()],
         expiry_unix: now_unix() + 60,
         is_ca: false,
+        is_fixed_output: false,
         tenant: None,
     };
     let bad_token = HmacSigner::from_key(wrong_key.to_vec()).sign(&claims);
@@ -359,7 +378,7 @@ fn ca_path_for(name: &str, nar: &[u8]) -> String {
         .to_string()
 }
 
-// r[verify sec.authz.ca-path-derived+5]
+// r[verify sec.authz.ca-path-derived+6]
 #[tokio::test]
 async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -377,7 +396,7 @@ async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+5]
+// r[verify sec.authz.ca-path-derived+6]
 #[tokio::test]
 async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -401,7 +420,7 @@ async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+5]
+// r[verify sec.authz.ca-path-derived+6]
 /// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
 /// for is_ca tokens, so a compromised worker could open a PutPath stream
 /// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
@@ -500,7 +519,7 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+5]
+// r[verify sec.authz.ca-path-derived+6]
 /// `PutPathBatch` is the multi-output endpoint builders use; the CA
 /// path-derivation gate must apply there too. Same attack as
 /// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
@@ -548,6 +567,121 @@ async fn hmac_is_ca_batch_wrong_path_rejected() -> TestResult {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     assert!(
         err.message().contains("content-derived CA path"),
+        "msg: {}",
+        err.message()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-output assignments: descriptor is mandatory (signed claims bit)
+// ---------------------------------------------------------------------------
+
+/// A fixed-output upload shaped the way the builder produces it: the
+/// path derived from the recursive SHA-256 of the NAR, plus the
+/// `fixed:r:` descriptor recorded from the derivation's declared hash.
+fn fod_upload_for(name: &str, nar: &[u8]) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let h = rio_nix::hash::NixHash::new(
+        rio_nix::hash::HashAlgo::SHA256,
+        Sha256::digest(nar).to_vec(),
+    )
+    .unwrap();
+    let path = rio_nix::store_path::StorePath::make_fixed_output(name, &h, true, &[])
+        .unwrap()
+        .to_string();
+    (path, format!("fixed:r:{}", h.to_colon()))
+}
+
+// r[verify sec.authz.ca-path-derived+6]
+/// A worker holding a FOD-flagged token cannot skip content
+/// verification by omitting its `fixed:` descriptor: the membership
+/// check alone is not enough for a content-bound output.
+#[tokio::test]
+async fn hmac_fod_descriptorless_rejected() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"fod payload");
+    let (path, _descriptor) = fod_upload_for("fod-out", &nar);
+    let info = make_path_info_for_nar(&path, &nar); // content_address: None
+
+    let token = sign_claims_fod("test-worker", vec![path.clone()], 60);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("descriptor-less upload under a FOD-flagged token → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("fixed-output upload must carry"),
+        "msg: {}",
+        err.message()
+    );
+    Ok(())
+}
+
+// r[verify sec.authz.ca-path-derived+6]
+/// The honest FOD flow is unaffected: descriptor present, content
+/// matches it, path re-derives from it → accepted.
+#[tokio::test]
+async fn hmac_fod_with_descriptor_accepted() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"honest fod payload");
+    let (path, descriptor) = fod_upload_for("fod-honest", &nar);
+    let mut info = make_path_info_for_nar(&path, &nar);
+    info.content_address = Some(descriptor);
+
+    let token = sign_claims_fod("test-worker", vec![path.clone()], 60);
+    let created = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .context("honest FOD upload")?;
+    assert!(created);
+    Ok(())
+}
+
+// r[verify sec.authz.ca-path-derived+6]
+/// Same enforcement on the batch ingestion path.
+#[tokio::test]
+async fn hmac_fod_batch_descriptorless_rejected() -> TestResult {
+    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    let (nar, _) = make_nar(b"fod batch payload");
+    let (path, _descriptor) = fod_upload_for("fod-batch", &nar);
+    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    let wrap = |m| PutPathBatchRequest {
+        output_index: 0,
+        inner: Some(PutPathRequest { msg: Some(m) }),
+    };
+    tx.send(wrap(put_path_request::Msg::Metadata(PutPathMetadata {
+        info: Some(info),
+    })))
+    .await
+    .unwrap();
+    tx.send(wrap(put_path_request::Msg::NarChunk(nar)))
+        .await
+        .unwrap();
+    tx.send(wrap(put_path_request::Msg::Trailer(trailer)))
+        .await
+        .unwrap();
+    drop(tx);
+
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    let token = sign_claims_fod("test-worker", vec![path], 60);
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+
+    let err = client
+        .put_path_batch(req)
+        .await
+        .expect_err("descriptor-less FOD batch entry → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("fixed-output upload must carry"),
         "msg: {}",
         err.message()
     );
