@@ -600,9 +600,9 @@ mod tests {
     }
 
     /// The resurrection case (Audit B1 #8): chunk at refcount=0,
-    /// deleted=true, uploaded_at NULL — the post-sweep, pre-drain
-    /// state (`decrement_and_enqueue` clears uploaded_at when it sets
-    /// deleted). An upsert resurrects it — refcount 0→1, deleted
+    /// deleted=true, uploaded_at NULL — the post-collect, pre-drain
+    /// state (the collect cycle's soft-delete clears uploaded_at when
+    /// it sets deleted). An upsert resurrects it — refcount 0→1, deleted
     /// flips false, uploaded_at stays NULL → MUST be in needs_upload.
     /// S3 may have already deleted the object between sweep and now.
     #[tokio::test]
@@ -835,9 +835,9 @@ mod tests {
         .await
         .unwrap();
 
-        // The stale reclaim fires while the owner is still uploading:
-        // its chunk-row effect is soft-delete + uploaded_at cleared
-        // (`decrement_and_enqueue`). Simulate exactly that row state.
+        // A soft-deleted row with uploaded_at cleared is the state the
+        // collect cycle leaves behind (and the legacy reclaim used to
+        // leave). Simulate exactly that row state.
         sqlx::query("UPDATE chunks SET deleted = TRUE, uploaded_at = NULL WHERE blake3_hash = $1")
             .bind(&chunk)
             .execute(&db.pool)

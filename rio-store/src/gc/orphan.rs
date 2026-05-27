@@ -10,9 +10,11 @@
 //!
 //! This scanner runs periodically (15min default), finds
 //! 'uploading' manifests older than `STALE_THRESHOLD`, and removes
-//! them via the existing `delete_manifest_chunked_uploading` (which
-//! also decrements chunk refcounts). Chunks hitting 0 get enqueued
-//! to pending_s3_deletes for the drain task.
+//! them via `reap_one`: the abandoned path rows are deleted and the
+//! write-only chunk counter is kept maintained. Chunks the reaped
+//! manifest leaves unreferenced are collected by the next chunk
+//! collect cycle (gc::collect) — the reaper itself never soft-deletes
+//! or enqueues them.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,8 +86,9 @@ pub(crate) enum ReapBy {
 ///
 /// For each stale uploading manifest:
 /// 1. Load its chunk_list (if chunked).
-/// 2. In a tx: DELETE narinfo (CASCADE), decrement chunks,
-///    enqueue 0-refcount chunks to pending_s3_deletes.
+/// 2. In a tx: DELETE narinfo (CASCADE) and issue the write-only
+///    chunk-counter decrement (no soft-delete, no outbox enqueue —
+///    the collect cycle owns those).
 ///
 /// Same transaction semantics as sweep::sweep (the two are
 /// structurally similar — orphan is "sweep for uploading-status"
@@ -186,7 +189,8 @@ pub async fn scan_once(
     Ok((reaped, failed))
 }
 
-/// Reap a single 'uploading' placeholder: chunk-aware DELETE.
+/// Reap a single 'uploading' placeholder: delete the abandoned path
+/// rows and keep the write-only chunk counter maintained.
 ///
 /// `by`: [`ReapBy::Stale`] re-checks `updated_at < now() - secs` inside
 /// the tx (TOCTOU guard against reaping a fresh re-upload).
@@ -197,33 +201,35 @@ pub async fn scan_once(
 /// (already gone, completed, fresher than threshold, or different
 /// claim_id).
 ///
-/// # Why this exists (I-040)
+/// # History (I-040) and what reaping does today
 ///
 /// Substitution's hot-path reclaim and its cleanup-on-failure both
 /// previously called [`crate::metadata::delete_manifest_uploading`]
-/// (the inline variant). That function deletes `manifests` (CASCADE
-/// → `manifest_data`) but does NOT decrement chunk refcounts. For a
-/// CHUNKED placeholder — left by an interrupted `cas::put_chunked` —
-/// this leaks the +1 from `upgrade_manifest_to_chunked`.
+/// (the inline variant), which deletes `manifests` (CASCADE →
+/// `manifest_data`) without touching chunk accounting; the counter
+/// drift that left behind became a data-loss hazard while the upload
+/// skip decision was inferred from the counter (the I-040/M_033
+/// class). Two things have since removed that hazard at the root: the
+/// upload skip decision is keyed on `uploaded_at` (never the counter),
+/// and chunk GC-eligibility is derived from the manifest fold by the
+/// collect cycle. Reaping is therefore a path-row janitor: it deletes
+/// the abandoned placeholder rows (FOR UPDATE + EXISTS-guard, as
+/// before) and issues a write-only refcount decrement so the counter
+/// stays honest for any pre-cutover pod still reading it — no
+/// zero-detect, no soft-delete, no outbox enqueue. The chunks a reaped
+/// manifest leaves unreferenced are collected by the next collect
+/// cycle.
 ///
-/// The leak alone is just storage waste. The data loss happens on the
-/// NEXT upload: `upgrade_manifest_to_chunked` sees `refcount ≥ 1`,
-/// returns `inserted = (refcount == 1) = false`, and `do_upload`
-/// SKIPS the chunk. If the prior crash was BEFORE that chunk made
-/// it to S3 (process killed mid-`do_upload`), the manifest now
-/// references a chunk that doesn't exist. `GetPath` →
-/// `chunk reassembly failed: chunk … not found in backend`.
-///
-/// This helper carries the same FOR UPDATE + EXISTS-guard +
-/// `decrement_and_enqueue` discipline as [`scan_once`]'s loop body,
-/// so any caller that needs to reap an uploading placeholder gets
-/// chunk-aware semantics for free.
+/// The chunk-backend parameter is no longer consulted (it used to
+/// drive the enqueue's `key_for`); it stays in the signature,
+/// underscore-bound, until the legacy chunk machinery is deleted
+/// wholesale in the writer-removal release.
 // r[impl store.put.placeholder-claim+2]
 pub(crate) async fn reap_one(
     pool: &PgPool,
     store_path_hash: &[u8],
     by: ReapBy,
-    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
+    _chunk_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -344,12 +350,24 @@ pub(crate) async fn reap_one(
         return Ok(false);
     }
 
-    // Chunk decrement + enqueue (if chunked). chunk_list was read
-    // INSIDE the tx above — it's the CURRENT value for the manifest
-    // we just deleted. This is the I-040 fix: the inline
-    // `delete_manifest_uploading` skipped this step.
+    // Chunk decrement (if chunked). chunk_list was read INSIDE the tx
+    // above — it's the CURRENT value for the manifest we just deleted.
+    // Write-only: the counter is kept maintained for mixed-fleet
+    // safety while pre-cutover pods may still read it, but there is no
+    // zero-detect, no soft-delete, and no outbox enqueue here — chunks
+    // this reap leaves unreferenced are ordinary collect-cycle victims
+    // (the I-040 data-loss class is closed upstream by the upsert's
+    // uploaded_at-keyed re-upload decision, not by this decrement).
+    // The corrupt-chunk_list skip polarity (warn + decrement nothing,
+    // the as-built C12 behavior) is preserved via
+    // parse_unique_chunk_hashes.
     if let Some(bytes) = chunk_list {
-        super::decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
+        let unique_hashes: Vec<Vec<u8>> = super::parse_unique_chunk_hashes(&bytes)
+            .into_iter()
+            .map(|h| h.to_vec())
+            .collect();
+        let counts = vec![1i64; unique_hashes.len()];
+        super::decrement_hashes(&mut tx, &unique_hashes, &counts).await?;
     }
 
     tx.commit().await?;
@@ -397,7 +415,7 @@ mod tests {
             .unwrap()
             .expect("fresh path → placeholder inserted");
         // One-chunk manifest. The chunk_list bytes must deserialize
-        // (decrement_and_enqueue calls Manifest::deserialize), so
+        // (reap_one parses them via parse_unique_chunk_hashes), so
         // build it via the real serializer.
         let chunk_hash = [hash[0]; 32]; // distinct per test via the path-hash byte
         let chunk_list = Manifest {
@@ -582,7 +600,56 @@ mod tests {
         assert!(reaped, "claim_b matches → B's placeholder reaped");
     }
 
-    /// bug_360: a poison row (CHECK violation in decrement_and_enqueue)
+    /// The as-built C12 skip polarity is preserved at the legacy reap
+    /// callsite: a corrupt `chunk_list` on a stale placeholder is
+    /// logged and decrements nothing, but the placeholder rows are
+    /// still reaped — the reap never errors on it and never collects
+    /// anything because of it (collection is the fail-closed collect
+    /// cycle's job, which aborts on the same corrupt blob instead).
+    #[tokio::test]
+    async fn reap_one_corrupt_chunk_list_skips_decrement() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x47u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("corrupt-reap");
+        let (chunk_hash, claim) = seed_stale_chunked(&db.pool, &hash, &path).await;
+        // Corrupt the chunk_list AFTER the upgrade wrote it.
+        sqlx::query("UPDATE manifest_data SET chunk_list = $2 WHERE store_path_hash = $1")
+            .bind(&hash)
+            .bind(vec![0xFFu8, 0x00, 0x01])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim), None)
+            .await
+            .unwrap();
+        assert!(reaped, "corrupt chunk_list does not block the reap");
+
+        // The placeholder rows are gone; the chunk's counter is
+        // untouched (skip polarity — no decrement was attempted).
+        let manifest_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifest_data WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(manifest_rows, 0);
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "corrupt chunk_list → no decrement (warn + skip)");
+        let deleted: bool = sqlx::query_scalar("SELECT deleted FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(!deleted, "the reap path never soft-deletes");
+    }
+
+    /// bug_360: a poison row (CHECK violation in the reap decrement)
     /// must not abort the whole scan — `scan_once` continues past it.
     /// Before the fix, `?` propagated the first per-row error and
     /// every subsequent stale placeholder leaked forever.
@@ -591,7 +658,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         // A: chunked placeholder whose chunk is pre-decremented to 0 →
-        // reap_one's decrement_and_enqueue trips chunks_refcount_nonneg.
+        // reap_one's write-only decrement trips chunks_refcount_nonneg.
         let hash_a = vec![0x44u8; 32];
         let path_a = rio_test_support::fixtures::test_store_path("poison-a");
         let (chunk_a, _) = seed_stale_chunked(&db.pool, &hash_a, &path_a).await;
@@ -633,7 +700,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         // SCAN_BATCH_SIZE (=2 under cfg(test)) poison rows: chunk
-        // pre-decremented to 0 → reap_one's decrement_and_enqueue
+        // pre-decremented to 0 → reap_one's write-only decrement
         // trips chunks_refcount_nonneg on every row.
         for i in 0..SCAN_BATCH_SIZE {
             let hash = vec![0x60u8 + i as u8; 32];

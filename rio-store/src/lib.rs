@@ -236,7 +236,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_s3_key_enqueued_total",
-        "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
+        "S3 keys enqueued to pending_s3_deletes by the chunk-collect cycle's \
+         batches (soft-deleted chunks awaiting backend deletion)."
     );
     describe_counter!(
         "rio_store_gc_orphan_reap_failed_total",

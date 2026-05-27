@@ -1352,10 +1352,13 @@ in
     # audit (no-live-collect, bounded-garbage-retention, refcount-meaning,
     # refcount-decrement, liveness-not-presence) get their first verify
     # markers here, on the regime that makes each load-bearing;
-    # the pre-existing mechanism rules (refcount-txn, grace-ttl,
-    # upsert-inserted, chunk-upload-committed, pending-deletes,
+    # the pre-existing mechanism rules that the as-built machinery still
+    # implements (refcount-txn, upsert-inserted, chunk-upload-committed,
     # placeholder-claim, orphan-heartbeat) gain the model-checked form on
-    # top of their existing unit-test markers. Witness checks carry no
+    # top of their existing unit-test markers; rules whose text now
+    # describes the replacement collector (grace-ttl, pending-deletes,
+    # bounded-garbage-retention, two-phase) carry their verify markers at
+    # the chunkCollect wirings below instead. Witness checks carry no
     # markers (same policy as the other models).
     # ------------------------------------------------------------------
 
@@ -1428,7 +1431,6 @@ in
     # r[verify store.chunk.refcount-meaning]
     # r[verify store.chunk.refcount-decrement]
     # r[verify store.chunk.liveness-not-presence]
-    # r[verify store.gc.pending-deletes]
     quint-chunk-liveness-contend = mkQuintCheck {
       name = "chunk-liveness-contend";
       spec = "chunkLiveness";
@@ -1768,18 +1770,21 @@ in
     # checks' transcripts.
     #
     # Marker scope: the two replacement rules added by plan T-1a.5
-    # (store.chunk.liveness-derived, store.gc.chunk-collect) get their
-    # first verify markers here, on the regimes that make each
-    # load-bearing; their implementation-side markers land with the
-    # live collector arm (plan T-1a.8, P14), so both appear in
-    # `tracey query uncovered` until that wave. The surviving mechanism rules
-    # (no-live-collect, bounded-garbage-retention, liveness-not-
-    # presence, upsert-inserted, chunk-upload-committed,
-    # placeholder-claim, orphan-heartbeat, pending-deletes) gain the
-    # replacement-model form on top of their as-built chunk-liveness
-    # markers, which stay in place until the as-built model's own
-    # retirement (Phase 2). Witness and falsification checks carry no
-    # markers (same policy as every other expect-violation check).
+    # (store.chunk.liveness-derived, store.gc.chunk-collect) carry
+    # their verify markers here, on the regimes that make each
+    # load-bearing; their implementation-side markers live with the
+    # live collector arm (gc::collect). Surviving mechanism rules whose
+    # text is unchanged (no-live-collect, liveness-not-presence,
+    # upsert-inserted, chunk-upload-committed, placeholder-claim,
+    # orphan-heartbeat) gain the replacement-model form on top of their
+    # as-built chunk-liveness markers, which stay in place until the
+    # as-built model's own retirement (Phase 2). Rules amended at the
+    # cutover to describe collector behavior (grace-ttl,
+    # bounded-garbage-retention, pending-deletes) carry their bumped
+    # verify markers here only — the as-built model checks the
+    # pre-cutover machinery, not the amended sentences. Witness and
+    # falsification checks carry no markers (same policy as every
+    # other expect-violation check).
     # ------------------------------------------------------------------
 
     # The base regime: one writer over two paths and three hashes with
@@ -1852,7 +1857,7 @@ in
     # r[verify store.chunk.no-live-collect]
     # r[verify store.gc.bounded-garbage-retention+2]
     # r[verify store.chunk.liveness-not-presence]
-    # r[verify store.gc.pending-deletes]
+    # r[verify store.gc.pending-deletes+2]
     # r[verify store.chunk.grace-ttl+2]
     quint-chunk-collect-contend = mkQuintCheck {
       name = "chunk-collect-contend";

@@ -288,7 +288,7 @@ pub async fn stage_chunked(
     // command cannot affect row a second time" (SQLSTATE 21000).
     //
     // Deduping here also fixes refcount semantics: 1 ref per UNIQUE
-    // chunk per manifest, matching decrement_and_enqueue's HashSet
+    // chunk per manifest, matching the reap-path decrement's per-hash
     // dedup. The manifest serialization above still has dups
     // (chunk_list_bytes) — reassembly needs the full in-order chunk
     // list. Only the refcount arrays dedup.

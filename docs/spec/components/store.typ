@@ -1237,23 +1237,27 @@ GC redesign must preserve.
 
 = Crash-Safe S3 Deletion (`pending_s3_deletes`)
 
-#r("store.gc.pending-deletes")[
+#r("store.gc.pending-deletes+2")[
   S3 deletes are not transactional with PostgreSQL. To prevent data leaks
   (chunks removed from PG but never deleted from S3) or premature deletes on
-  crash, rio-store uses a transactional outbox pattern:
+  crash, rio-store MUST use a transactional outbox: the collect cycle
+  (#rref("store.gc.chunk-collect")) is the producer --- in the same
+  per-batch transaction that soft-deletes chunks it writes the corresponding
+  S3 keys and `blake3_hash` to `pending_s3_deletes` --- and the background
+  drain MUST re-check `chunks.deleted` by `blake3_hash` under a row lock
+  immediately before each irreversible backend delete, skipping and dropping
+  the row when the chunk has been resurrected (`deleted = false`).
 ]
 
-+ In the same PostgreSQL transaction that marks chunks as `deleted=true` (GC
-  sweep) or decrements refcounts to 0 (orphan cleanup), write the corresponding
-  S3 keys *and `blake3_hash`* to the `pending_s3_deletes` table.
 + A background drain task polls `pending_s3_deletes` on a *fixed 30s interval*
   (`DRAIN_INTERVAL`, not exponential --- S3 DELETE failures are rare and
-  transient; queueing absorbs bursts). Before issuing each S3 DELETE, drain
-  *re-checks the chunk state by `blake3_hash`* (TOCTOU guard: if a concurrent
-  PutPath re-incremented the refcount since sweep enqueued the key, skip the
-  delete and remove the row ---
-  #(refs.metric)("rio_store_gc_chunk_resurrected_total") metric). On S3
+  transient; queueing absorbs bursts). The resurrection skip increments
+  #(refs.metric)("rio_store_gc_chunk_resurrected_total"). On S3
   success, the row is removed; on failure, `attempts` is incremented.
++ The drain re-check consults `deleted` only --- never the legacy refcount
+  counter. The post-snapshot re-reference window that the counter conjunct
+  used to defend is closed by the upsert's `last_referenced_at` touch plus
+  the collect grace term (#rref("store.chunk.grace-ttl")).
 + On crash/restart, unprocessed rows are retried automatically --- S3 DELETE is
   idempotent.
 + Rows exceeding max retry count (default: 10) remain in the table for alerting

@@ -201,9 +201,9 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
 /// caller's batch transaction.
 ///
 /// Returns `false` if narinfo was already gone (defensive; shouldn't
-/// happen under FOR UPDATE). Chunk refcount handling
-/// ([`decrement_and_enqueue`]) is the caller's responsibility — this
-/// only touches the path-keyed tables.
+/// happen under FOR UPDATE). Chunk state is not touched at all (chunk
+/// GC is the collect cycle's job) — this only touches the path-keyed
+/// tables.
 // r[impl store.realisation.gc-sweep]
 // r[impl store.gc.sweep-path-tenants]
 async fn delete_swept_path(

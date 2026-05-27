@@ -1,5 +1,5 @@
 //! Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_key`.
-// r[impl store.gc.pending-deletes]
+// r[impl store.gc.pending-deletes+2]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,10 +29,11 @@ const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Run one drain iteration. Returns (deleted_count, failed_count).
 ///
 /// For each pending row (up to DRAIN_BATCH_SIZE):
-/// - Re-check `chunks.(deleted AND refcount=0)` — if the chunk was
-///   resurrected by a PutPath since sweep enqueued it, skip S3
-///   delete (just remove the pending row). Guards the sweep-vs-
-///   PutPath TOCTOU for chunks shared across different paths.
+/// - Re-check `chunks.deleted` — if the chunk was resurrected by a
+///   PutPath upsert since the collect cycle enqueued it
+///   (`deleted = false`), skip the S3 delete (just remove the pending
+///   row). Guards the collect-vs-PutPath TOCTOU for chunks
+///   re-referenced after their soft-delete.
 /// - `ChunkBackend::delete_by_key` (S3 DeleteObject or fs rm)
 /// - On success: DELETE the pending row
 /// - On failure: UPDATE attempts = attempts + 1, last_error
@@ -129,14 +130,15 @@ enum DrainOutcome {
     /// breaks the iteration so we don't burn through retry budget at
     /// debug! level with no operator signal.
     AuthError,
-    /// Chunk resurrected (PutPath bumped refcount since sweep
-    /// enqueued); S3 skip; pending row removed.
+    /// Chunk resurrected (a PutPath upsert flipped `deleted` back to
+    /// false since the collect cycle enqueued it); S3 skip; pending
+    /// row removed.
     Resurrected,
 }
 
 /// One per-row drain transaction: SELECT one pending row FOR UPDATE
-/// SKIP LOCKED, re-check `chunks.(deleted AND refcount=0)` FOR UPDATE,
-/// S3 delete, commit. Returns `None` if no eligible row.
+/// SKIP LOCKED, re-check `chunks.deleted` FOR UPDATE, S3 delete,
+/// commit. Returns `None` if no eligible row.
 async fn drain_one_row(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
@@ -175,10 +177,21 @@ async fn drain_one_row(
         return Ok(None);
     };
 
-    // Re-check: was this chunk resurrected since sweep enqueued
-    // it? PutPath's ON CONFLICT sets deleted=false + refcount+1.
-    // If so, the chunk is live again — skip S3, drop pending row.
+    // Re-check: was this chunk resurrected since the collect cycle
+    // enqueued it? PutPath's ON CONFLICT sets deleted=false. If so,
+    // the chunk is live again — skip S3, drop the pending row.
     // NULL blake3_hash (pre-006 row) → skip re-check, proceed.
+    //
+    // The re-check is `deleted` only — the counter is not consulted.
+    // The post-snapshot re-reference trace (a manifest committing
+    // after a cycle's mark snapshot against a chunk whose object is
+    // already confirmed) is closed by the upsert's
+    // last_referenced_at touch plus the collect grace term, not by a
+    // counter conjunct here; the chunkCollect model's mark-stale
+    // pair is the standing demonstration that the touch carries that
+    // load. What this re-check defends is the soft-delete-then-
+    // resurrect ordering: an upsert that flips deleted=false after
+    // the enqueue makes the stale outbox row a no-op.
     //
     // FOR UPDATE serializes this re-check with concurrent
     // PutPath upserts — the upsert's ON CONFLICT row lock
@@ -186,23 +199,22 @@ async fn drain_one_row(
     // resurrection-between-check-and-S3-delete is impossible.
     // Without FOR UPDATE, PutPath could flip the chunk live
     // between this SELECT and the S3 delete below: PG would say
-    // refcount≥1, S3 would no longer have the object. Post-M033
+    // deleted=false, S3 would no longer have the object. Post-M033
     // a resurrecting PutPath re-uploads (uploaded_at was cleared
-    // by sweep), so the data-loss exposure is gone, but the FOR
-    // UPDATE still saves a wasted upload round-trip and keeps the
-    // resurrection-between-sweep-and-drain guard exact.
-    // r[impl store.gc.pending-deletes]
+    // at soft-delete), so the data-loss exposure is gone, but the
+    // FOR UPDATE still saves a wasted upload round-trip and keeps
+    // the resurrection-between-collect-and-drain guard exact.
+    // r[impl store.gc.pending-deletes+2]
     if let Some(hash) = &blake3_hash {
-        let still_dead: bool = sqlx::query_scalar(
-            "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1 FOR UPDATE",
-        )
-        .bind(hash)
-        .fetch_optional(&mut *tx)
-        .await?
-        // Row gone entirely = still dead (nothing references it,
-        // and the chunks row itself was deleted somehow — S3
-        // delete is still safe).
-        .unwrap_or(true);
+        let still_dead: bool =
+            sqlx::query_scalar("SELECT deleted FROM chunks WHERE blake3_hash = $1 FOR UPDATE")
+                .bind(hash)
+                .fetch_optional(&mut *tx)
+                .await?
+                // Row gone entirely = still dead (nothing references it,
+                // and the chunks row itself was deleted somehow — S3
+                // delete is still safe).
+                .unwrap_or(true);
         if !still_dead {
             sqlx::query("DELETE FROM pending_s3_deletes WHERE id = $1")
                 .bind(id)
@@ -281,7 +293,7 @@ pub fn spawn_drain_task(
     })
 }
 
-// r[verify store.gc.pending-deletes]
+// r[verify store.gc.pending-deletes+2]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,10 +366,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_skips_resurrected_chunk() {
-        // Sweep-vs-PutPath TOCTOU regression test: sweep marks chunk
-        // X deleted + enqueues S3 delete; PutPath for a DIFFERENT
-        // path (sharing X) resurrects it (refcount→1, deleted→false).
-        // Drain must re-check and SKIP the S3 delete.
+        // Collect-vs-PutPath TOCTOU regression test: the collect cycle
+        // soft-deletes chunk X + enqueues its S3 delete; a PutPath for
+        // a DIFFERENT path (sharing X) resurrects it (deleted→false).
+        // Drain must re-check `deleted` and SKIP the S3 delete.
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
@@ -527,7 +539,7 @@ mod tests {
     /// TOCTOU regression: drain's re-check SELECT ... FOR UPDATE must
     /// serialize with a concurrent PutPath upsert. Without FOR UPDATE,
     /// PutPath could resurrect the chunk between the SELECT and the S3
-    /// delete → PG says refcount≥1, S3 no longer has the object →
+    /// delete → PG says deleted=false, S3 no longer has the object →
     /// permanent data loss.
     ///
     /// We can't interleave inside drain_once's loop from a unit test,
@@ -535,11 +547,11 @@ mod tests {
     /// holds the row lock, a concurrent upsert BLOCKS until drain
     /// commits. We simulate this by opening a second tx that issues
     /// the upsert while drain's tx holds FOR UPDATE on the chunk row.
-    /// The upsert must either see still_dead=true (blocked until
-    /// drain committed → chunk deleted → upsert sees refcount=0 and
-    /// re-uploads) or drain sees resurrection and skips. Neither path
-    /// results in loss.
-    // r[verify store.gc.pending-deletes]
+    /// The upsert must either block until drain committed (chunk row
+    /// gone → the upsert re-inserts and re-uploads) or drain sees the
+    /// resurrection (deleted=false) and skips. Neither path results
+    /// in loss.
+    // r[verify store.gc.pending-deletes+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_for_update_serializes_with_upsert() {
         let db = TestDb::new(&crate::MIGRATOR).await;
