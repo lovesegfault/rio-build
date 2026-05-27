@@ -116,10 +116,11 @@ mountdHmac:
   secretName: ""
 
 # External Secrets Operator sync from AWS Secrets Manager.
-# When enabled: renders ClusterSecretStore + 3 ExternalSecrets (rio-postgres
-# with templated Aurora URL, rio-hmac, rio-signing-key). Requires ESO in the
-# cluster and the bootstrap Job (below) to have populated rio/hmac and
-# rio/signing-key in Secrets Manager.
+# When enabled: renders the ClusterSecretStore + the ExternalSecrets for
+# the Aurora URL (rio-postgres, templated), the assignment/service/mountd
+# HMAC keys, the narinfo signing key, and the gateway SSH host key.
+# Requires ESO in the cluster and the bootstrap Job (below) to have
+# populated the rio/* entries in Secrets Manager.
 externalSecrets:
   enabled: false
   clusterSecretStore: rio-aws-secrets
