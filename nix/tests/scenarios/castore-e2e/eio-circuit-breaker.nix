@@ -116,10 +116,14 @@ scope: with scope; ''
           f"eio-circuit-breaker: only {n_eio} EIO replies for six concurrently "
           f"failed opens (expected ≥ 6)"
       )
-      assert n_miss_small >= 5, (
-          f"eio-circuit-breaker: only {n_miss_small} miss_small opens recorded; "
-          f"open_case: {fam(m, 'rio_builder_castore_fuse_open_case_total')!r}"
-      )
+      # NOTE: open_case_total{miss_small} cannot be asserted here — it
+      # is only incremented for opens that COMPLETE (the counter sits
+      # after the dispatch match in fs.rs::open), and during the outage
+      # every miss-path open fails before reaching it. The observed
+      # run shape: each of the six concurrent opens blocks for its full
+      # jit_fetch_timeout (the no-endpoint Service drops, not resets,
+      # so the hang is the budget, not a fast refusal), eio_total grows
+      # by the failed wave, and the breaker opens at the fifth record.
       print(
           f"eio-circuit-breaker: eio={n_eio}, miss_small={n_miss_small}, "
           f"transient retries={n_retries} (informational)"
