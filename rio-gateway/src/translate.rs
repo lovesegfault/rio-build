@@ -1415,6 +1415,104 @@ mod tests {
         );
     }
 
+    /// Build a linear input-addressed chain of `n` cached derivations
+    /// whose declared output paths are the HONEST derived ones
+    /// (constructed bottom-up, since each parent's derivation hash
+    /// depends on its child's final form). Returns root-first nodes and
+    /// the populated cache.
+    /// `squat`: optionally make node `at` declare the output path of the
+    /// (deeper, already-built) node `steal_from` instead of its honest
+    /// one — every OTHER node stays consistent relative to the tampered
+    /// node, so the tampered node is the only mismatch.
+    fn ia_chain_with(
+        n: usize,
+        squat: Option<(usize, usize)>,
+    ) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
+        let drv_path = |i: usize| format!("/nix/store/{i:0>32}-chain-{i}.drv");
+        let mut cache: HashMap<StorePath, Derivation> = HashMap::new();
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        for i in (0..n).rev() {
+            let inputs = if i + 1 < n {
+                format!(r#"[("{}",["out"])]"#, drv_path(i + 1))
+            } else {
+                "[]".to_owned()
+            };
+            // Probe with a placeholder declared path (declared paths are
+            // masked out of the computation), derive the honest path,
+            // then store the final form.
+            let probe = Derivation::parse(&format!(
+                r#"Derive([("out","","","")],{inputs},[],"x86_64-linux","/bin/sh",["-c","echo"],[("out","")])"#
+            ))
+            .expect("probe ATerm parses");
+            let honest = {
+                let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| cache.get(&sp));
+                rio_nix::derivation::input_addressed_output_paths(
+                    &probe,
+                    &drv_path(i),
+                    &resolve,
+                    &mut hash_cache,
+                )
+                .expect("derive honest path")["out"]
+                    .as_str()
+                    .to_owned()
+            };
+            let declared = match squat {
+                Some((at, steal_from)) if at == i => {
+                    let victim_key = StorePath::parse(&drv_path(steal_from)).unwrap();
+                    cache[&victim_key].outputs()[0].path().to_owned()
+                }
+                _ => honest,
+            };
+            let final_drv = Derivation::parse(&format!(
+                r#"Derive([("out","{declared}","","")],{inputs},[],"x86_64-linux","/bin/sh",["-c","echo"],[("out","{declared}")])"#
+            ))
+            .expect("final ATerm parses");
+            cache.insert(StorePath::parse(&drv_path(i)).unwrap(), final_drv);
+        }
+        let nodes = (0..n)
+            .map(|i| types::DerivationNode {
+                drv_path: drv_path(i),
+                drv_hash: format!("{i}"),
+                ..Default::default()
+            })
+            .collect();
+        (nodes, cache)
+    }
+
+    fn honest_ia_chain(n: usize) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
+        ia_chain_with(n, None)
+    }
+
+    /// A 600-deep honest chain passes the binding gate with a cold
+    /// per-submission hash cache — depth is never a rejection cause.
+    /// (Regression test for the former 512-level recursion cap, which
+    /// turned deep-but-legitimate DAGs into whole-submission
+    /// rejections.)
+    #[test]
+    fn validate_output_path_bindings_accepts_deep_ia_chain() {
+        let (nodes, cache) = honest_ia_chain(600);
+        assert!(
+            validate_output_path_bindings(&nodes, &cache).is_ok(),
+            "a deep honest chain must not be rejected"
+        );
+    }
+
+    /// The same 600-deep chain with one node's declared path swapped to
+    /// another derivation's path is still rejected — removing the depth
+    /// cap must not weaken the gate at depth.
+    #[test]
+    fn validate_output_path_bindings_still_rejects_squat_in_deep_chain() {
+        // Node 300 declares node 400's output path; every other node is
+        // consistent relative to the tampered node (the realistic
+        // attacker shape), so node 300 is the single mismatch.
+        let (nodes, cache) = ia_chain_with(600, Some((300, 400)));
+        let err = validate_output_path_bindings(&nodes, &cache).unwrap_err();
+        assert!(
+            err.contains(&nodes[300].drv_path) && err.contains("must match the derivation"),
+            "squat at depth must be rejected naming the drv: {err}"
+        );
+    }
+
     /// Structural pin for the pipeline split: `validate_dag` performs
     /// only the cheap checks and no longer runs the output-path binding
     /// pass — a squatted IA path passes `validate_dag` but is caught by

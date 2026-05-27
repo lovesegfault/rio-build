@@ -49,9 +49,6 @@ pub enum DerivationError {
     #[error("cycle detected in derivation graph at: {0}")]
     CycleDetected(String),
 
-    #[error("derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)")]
-    RecursionLimitExceeded(String),
-
     #[error("NAR extraction failed: {0}")]
     NarExtract(#[from] crate::nar::NarError),
 
@@ -67,9 +64,6 @@ pub enum DerivationError {
     )]
     NotInputAddressed(String),
 }
-
-/// Maximum recursion depth for `hash_derivation_modulo` (DoS prevention).
-const MAX_HASH_RECURSION_DEPTH: usize = 512;
 
 /// Maximum number of items in any ATerm list (DoS prevention).
 const MAX_ATERM_LIST_ITEMS: usize = 1_048_576;

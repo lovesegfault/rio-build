@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
-use super::{Derivation, DerivationError, DerivationLike, MAX_HASH_RECURSION_DEPTH};
+use super::{Derivation, DerivationError, DerivationLike};
 use crate::store_path::StorePath;
 
 // ---------------------------------------------------------------------------
@@ -31,108 +31,153 @@ pub fn hash_derivation_modulo<'c>(
     resolve_input: &dyn Fn(&str) -> Option<&'c Derivation>,
     hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> Result<[u8; 32], DerivationError> {
-    let mut visiting = HashSet::new();
     // Nix 2.18-2.20: top-level entry (`staticOutputHashes`) passes
     // maskOutputs=true for CA-floating; recursive entry
     // (`pathDerivationModulo`) hard-codes false. We mirror that — the
-    // top-level call masks iff this drv is CA-floating; the recursive
-    // call below always passes false.
+    // top-level subject masks iff it is CA-floating; every input frame
+    // inside the walk uses false.
     let mask_outputs = drv.has_ca_floating_outputs();
-    hash_derivation_modulo_inner(
-        drv,
-        drv_path,
-        resolve_input,
-        hash_cache,
-        &mut visiting,
-        0,
-        mask_outputs,
-    )
+    hash_modulo_walk(drv, drv_path, resolve_input, hash_cache, mask_outputs)
 }
 
-/// `mask_outputs` is threaded explicitly (NOT recomputed per level): a
-/// CA-floating drv has *two* distinct modular hashes — `mask=true` when it
-/// is the realisation-key subject, `mask=false` when it appears as an
+/// One entry on the explicit traversal stack of [`hash_modulo_walk`].
+enum WalkFrame<'c> {
+    /// First touch of a derivation: memo/cycle checks, then push its
+    /// `Finish` frame followed by `Visit` frames for its inputs.
+    Visit { drv: &'c Derivation, path: String },
+    /// All inputs are hashed (their `Visit` frames sat above this frame
+    /// and have completed): assemble the rewrites and hash this node.
+    Finish { drv: &'c Derivation, path: String },
+}
+
+/// Iterative post-order implementation of `hashDerivationModulo`.
+///
+/// `mask_subject` applies only to the top-level subject (`drv_path`): a
+/// CA-floating drv has *two* distinct modular hashes — `mask=true` when
+/// it is the realisation-key subject, `mask=false` when it appears as an
 /// input to another drv. `hash_cache` stores only the `mask=false` value
-/// (the form reused across input lookups), mirroring Nix where `drvHashes`
-/// lives in `pathDerivationModulo`, not `hashDerivationModulo`.
-fn hash_derivation_modulo_inner<'c>(
-    drv: &'c Derivation,
-    drv_path: &str,
+/// (the form reused across input lookups), mirroring Nix where
+/// `drvHashes` lives in `pathDerivationModulo`, not
+/// `hashDerivationModulo`.
+///
+/// The walk is an explicit two-phase stack (`Visit`, then `Finish` once
+/// the inputs are done) instead of recursion so the supported chain
+/// depth is bounded by the closure-size caps alone, not by the thread's
+/// stack — CppNix has no graph-depth limit and neither do we. The
+/// `visiting` set holds exactly the paths whose `Finish` frame is still
+/// pending (the ancestors of the node being expanded), which is the
+/// same ancestor set the recursive form tracked, so cycle detection is
+/// unchanged: re-visiting a pending path is a cycle, re-visiting a
+/// completed (memoised) path is a cache hit.
+fn hash_modulo_walk<'c>(
+    subject_drv: &'c Derivation,
+    subject_path: &str,
     resolve_input: &dyn Fn(&str) -> Option<&'c Derivation>,
     hash_cache: &mut HashMap<String, [u8; 32]>,
-    visiting: &mut HashSet<String>,
-    depth: usize,
-    mask_outputs: bool,
+    mask_subject: bool,
 ) -> Result<[u8; 32], DerivationError> {
-    // Memoisation — cache holds the mask=false form only.
-    if !mask_outputs && let Some(&cached) = hash_cache.get(drv_path) {
+    // Memoisation fast path for the subject itself (mask=false form only).
+    if !mask_subject && let Some(&cached) = hash_cache.get(subject_path) {
         return Ok(cached);
     }
 
-    // Cycle detection
-    if visiting.contains(drv_path) {
-        return Err(DerivationError::CycleDetected(drv_path.to_string()));
-    }
+    let mut visiting: HashSet<String> = HashSet::new();
+    let mut stack: Vec<WalkFrame<'c>> = vec![WalkFrame::Visit {
+        drv: subject_drv,
+        path: subject_path.to_string(),
+    }];
+    let mut subject_hash: Option<[u8; 32]> = None;
 
-    // Depth limit
-    if depth >= MAX_HASH_RECURSION_DEPTH {
-        return Err(DerivationError::RecursionLimitExceeded(
-            drv_path.to_string(),
-        ));
-    }
+    while let Some(frame) = stack.pop() {
+        match frame {
+            WalkFrame::Visit { drv, path } => {
+                let is_subject = path == subject_path;
+                let mask = is_subject && mask_subject;
+                // Memoisation — cache holds the mask=false form only.
+                // (Input frames are always mask=false; the subject may
+                // re-appear as its own transitive input, in which case
+                // the unmasked form is what that input position needs.)
+                if !mask && hash_cache.contains_key(&path) {
+                    continue;
+                }
+                // Cycle detection: the path's Finish frame is still
+                // pending, i.e. it is an ancestor of itself.
+                if visiting.contains(&path) {
+                    return Err(DerivationError::CycleDetected(path));
+                }
+                visiting.insert(path.clone());
 
-    visiting.insert(drv_path.to_string());
-
-    // Compute the hash, ensuring `visiting` is cleaned up on all paths
-    // (error or success) to prevent false CycleDetected in sibling branches.
-    let result = (|| -> Result<[u8; 32], DerivationError> {
-        if drv.is_fixed_output() {
-            // FOD base case: hash the fingerprint string (no recursion)
-            let output = &drv.outputs()[0];
-            // Nix C++ derivations.cc:hashDerivationModulo — the output path
-            // IS part of the fingerprint. The trailing-colon-no-path shape
-            // was a copy-paste from store_path.rs make_store_path_hash
-            // where it IS correct (different function). See phase4a.md §5.
-            let fingerprint = format!(
-                "fixed:out:{}:{}:{}",
-                output.hash_algo(),
-                output.hash(),
-                output.path()
-            );
-            Ok(Sha256::digest(fingerprint.as_bytes()).into())
-        } else {
-            // Input-addressed or CA floating: recurse on input drvs.
-            // Inputs are ALWAYS hashed with mask_outputs=false (Nix
-            // `pathDerivationModulo`), regardless of the input's own
-            // CA-floating-ness — only the top-level subject masks.
-            let mut input_rewrites: BTreeMap<String, String> = BTreeMap::new();
-            for input_drv_path in drv.input_drvs().keys() {
-                let input_drv = resolve_input(input_drv_path)
-                    .ok_or_else(|| DerivationError::InputNotFound(input_drv_path.clone()))?;
-                let input_hash = hash_derivation_modulo_inner(
-                    input_drv,
-                    input_drv_path,
-                    resolve_input,
-                    hash_cache,
-                    visiting,
-                    depth + 1,
-                    false,
-                )?;
-                input_rewrites.insert(input_drv_path.clone(), hex::encode(input_hash));
+                if drv.is_fixed_output() {
+                    // FOD base case: no inputs to expand.
+                    stack.push(WalkFrame::Finish { drv, path });
+                    continue;
+                }
+                // Expand inputs: their Visit frames sit ABOVE this
+                // node's Finish frame, so they complete first
+                // (post-order). Inputs are ALWAYS hashed with
+                // mask_outputs=false (Nix `pathDerivationModulo`),
+                // regardless of the input's own CA-floating-ness —
+                // only the top-level subject masks.
+                stack.push(WalkFrame::Finish { drv, path });
+                for input_drv_path in drv.input_drvs().keys() {
+                    if hash_cache.contains_key(input_drv_path) {
+                        continue;
+                    }
+                    let input_drv = resolve_input(input_drv_path)
+                        .ok_or_else(|| DerivationError::InputNotFound(input_drv_path.clone()))?;
+                    stack.push(WalkFrame::Visit {
+                        drv: input_drv,
+                        path: input_drv_path.clone(),
+                    });
+                }
             }
+            WalkFrame::Finish { drv, path } => {
+                let is_subject = path == subject_path;
+                let mask = is_subject && mask_subject;
+                let hash: [u8; 32] = if drv.is_fixed_output() {
+                    // FOD base case: hash the fingerprint string.
+                    // Nix C++ derivations.cc:hashDerivationModulo — the
+                    // output path IS part of the fingerprint. The
+                    // trailing-colon-no-path shape was a copy-paste from
+                    // store_path.rs make_store_path_hash where it IS
+                    // correct (different function). See phase4a.md §5.
+                    let output = &drv.outputs()[0];
+                    let fingerprint = format!(
+                        "fixed:out:{}:{}:{}",
+                        output.hash_algo(),
+                        output.hash(),
+                        output.path()
+                    );
+                    Sha256::digest(fingerprint.as_bytes()).into()
+                } else {
+                    let mut input_rewrites: BTreeMap<String, String> = BTreeMap::new();
+                    for input_drv_path in drv.input_drvs().keys() {
+                        // Every input completed before this Finish frame
+                        // popped; a missing entry would have aborted the
+                        // walk with InputNotFound during expansion.
+                        let input_hash = hash_cache.get(input_drv_path).ok_or_else(|| {
+                            DerivationError::InputNotFound(input_drv_path.clone())
+                        })?;
+                        input_rewrites.insert(input_drv_path.clone(), hex::encode(input_hash));
+                    }
+                    let modified_aterm = drv.to_aterm_modulo(&input_rewrites, mask)?;
+                    Sha256::digest(modified_aterm.as_bytes()).into()
+                };
 
-            let modified_aterm = drv.to_aterm_modulo(&input_rewrites, mask_outputs)?;
-            Ok(Sha256::digest(modified_aterm.as_bytes()).into())
+                visiting.remove(&path);
+                if !mask {
+                    hash_cache.insert(path.clone(), hash);
+                }
+                if is_subject {
+                    subject_hash = Some(hash);
+                }
+            }
         }
-    })();
-
-    visiting.remove(drv_path);
-
-    let hash = result?;
-    if !mask_outputs {
-        hash_cache.insert(drv_path.to_string(), hash);
     }
-    Ok(hash)
+
+    // The subject's Finish frame is pushed first and therefore pops
+    // last; reaching here without it would be a walker bug.
+    subject_hash.ok_or_else(|| DerivationError::InputNotFound(subject_path.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -187,23 +232,15 @@ pub fn input_addressed_output_paths<'c>(
         .unwrap_or(drv_store_path.name())
         .to_owned();
 
-    // Hash every input drv exactly the way the recursive arm of
-    // `hash_derivation_modulo` does: mask=false — only the top-level
+    // Hash every input drv exactly the way the input frames of
+    // `hash_derivation_modulo` do: mask=false — only the top-level
     // subject of the path computation is masked.
-    let mut visiting = HashSet::new();
     let mut input_rewrites: BTreeMap<String, String> = BTreeMap::new();
     for input_drv_path in drv.input_drvs().keys() {
         let input_drv = resolve_input(input_drv_path)
             .ok_or_else(|| DerivationError::InputNotFound(input_drv_path.clone()))?;
-        let input_hash = hash_derivation_modulo_inner(
-            input_drv,
-            input_drv_path,
-            resolve_input,
-            hash_cache,
-            &mut visiting,
-            1,
-            false,
-        )?;
+        let input_hash =
+            hash_modulo_walk(input_drv, input_drv_path, resolve_input, hash_cache, false)?;
         input_rewrites.insert(input_drv_path.clone(), hex::encode(input_hash));
     }
 
@@ -789,6 +826,109 @@ mod hash_derivation_modulo_tests {
         // Neither single-output form should appear (overwrite would leave one).
         assert!(!result.contains(&format!(r#"("{h}",["dev"])]"#)));
         assert!(!result.contains(&format!(r#"("{h}",["out"])]"#)));
+        Ok(())
+    }
+
+    /// Build a linear input-addressed chain of `n` derivations
+    /// (`chain-0` depends on `chain-1` depends on … `chain-(n-1)`),
+    /// returning (root_path, resolver map). Paths use zero-padded
+    /// digit-only hash parts so they parse as store paths.
+    fn linear_ia_chain(n: usize) -> (String, HashMap<String, Derivation>) {
+        let drv_path = |i: usize| format!("/nix/store/{i:0>32}-chain-{i}.drv");
+        let out_path = |i: usize| format!("/nix/store/{i:0>32}-chain-{i}");
+        let mut map = HashMap::new();
+        for i in 0..n {
+            let inputs = if i + 1 < n {
+                format!(r#"[("{}",["out"])]"#, drv_path(i + 1))
+            } else {
+                "[]".to_owned()
+            };
+            let aterm = format!(
+                r#"Derive([("out","{out}","","")],{inputs},[],"x86_64-linux","/bin/sh",["-c","echo"],[("out","{out}")])"#,
+                out = out_path(i),
+            );
+            map.insert(drv_path(i), Derivation::parse(&aterm).expect("chain ATerm"));
+        }
+        (drv_path(0), map)
+    }
+
+    /// A 600-deep chain hashes with a COLD cache (no recursion-depth
+    /// failure) and the result is identical to the value obtained after
+    /// warming the cache bottom-up — the iterative walker is
+    /// order-independent.
+    #[test]
+    fn deep_chain_hashes_with_cold_cache() -> anyhow::Result<()> {
+        let n = 600;
+        let (root, map) = linear_ia_chain(n);
+        let resolve = |p: &str| map.get(p);
+
+        let mut cold_cache = HashMap::new();
+        let cold = hash_derivation_modulo(&map[&root], &root, &resolve, &mut cold_cache)?;
+
+        // Warm a fresh cache bottom-up, then hash the root again.
+        let mut warm_cache = HashMap::new();
+        for i in (0..n).rev() {
+            let path = format!("/nix/store/{i:0>32}-chain-{i}.drv");
+            hash_derivation_modulo(&map[&path], &path, &resolve, &mut warm_cache)?;
+        }
+        let warm = hash_derivation_modulo(&map[&root], &root, &resolve, &mut warm_cache)?;
+
+        assert_eq!(cold, warm, "cold-cache and warm-cache hashes must agree");
+        Ok(())
+    }
+
+    /// Same chain through `input_addressed_output_paths`: the cold-cache
+    /// derivation succeeds and matches the bottom-up result.
+    #[test]
+    fn deep_chain_output_paths_cold_cache() -> anyhow::Result<()> {
+        let n = 600;
+        let (root, map) = linear_ia_chain(n);
+        let resolve = |p: &str| map.get(p);
+
+        let mut cold_cache = HashMap::new();
+        let cold = input_addressed_output_paths(&map[&root], &root, &resolve, &mut cold_cache)?;
+
+        let mut warm_cache = HashMap::new();
+        for i in (1..n).rev() {
+            let path = format!("/nix/store/{i:0>32}-chain-{i}.drv");
+            hash_derivation_modulo(&map[&path], &path, &resolve, &mut warm_cache)?;
+        }
+        let warm = input_addressed_output_paths(&map[&root], &root, &resolve, &mut warm_cache)?;
+
+        assert_eq!(cold["out"], warm["out"]);
+        Ok(())
+    }
+
+    /// A 600-node chain whose deepest node references the root is still
+    /// reported as a cycle (and terminates) — removing the depth cap
+    /// must not turn deep cycles into hangs or stack overflows.
+    #[test]
+    fn deep_cycle_still_detected() -> anyhow::Result<()> {
+        let n = 600;
+        let drv_path = |i: usize| format!("/nix/store/{i:0>32}-cycle-{i}.drv");
+        let out_path = |i: usize| format!("/nix/store/{i:0>32}-cycle-{i}");
+        let mut map = HashMap::new();
+        for i in 0..n {
+            // Last node points back at the root → cycle.
+            let next = if i + 1 < n {
+                drv_path(i + 1)
+            } else {
+                drv_path(0)
+            };
+            let aterm = format!(
+                r#"Derive([("out","{out}","","")],[("{next}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("out","{out}")])"#,
+                out = out_path(i),
+            );
+            map.insert(drv_path(i), Derivation::parse(&aterm).expect("chain ATerm"));
+        }
+        let root = drv_path(0);
+        let resolve = |p: &str| map.get(p);
+        let mut cache = HashMap::new();
+        let err = hash_derivation_modulo(&map[&root], &root, &resolve, &mut cache).unwrap_err();
+        assert!(
+            matches!(err, DerivationError::CycleDetected(_)),
+            "expected CycleDetected, got: {err:?}"
+        );
         Ok(())
     }
 }

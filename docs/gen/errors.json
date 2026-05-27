@@ -492,13 +492,6 @@
     },
     {
       "enum": "DerivationError",
-      "name": "RecursionLimitExceeded",
-      "crate": "rio-nix",
-      "msg": "derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)",
-      "doc": ""
-    },
-    {
-      "enum": "DerivationError",
       "name": "UnexpectedEof",
       "crate": "rio-nix",
       "msg": "unexpected end of input",
