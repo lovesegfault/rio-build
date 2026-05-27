@@ -7,10 +7,11 @@
 //!    for paths NOT reachable from any root.
 //!
 //! 2. **Sweep** ([`sweep::sweep`]): per unreachable path, in batched
-//!    transactions: DELETE narinfo (CASCADE), decrement chunk refcounts,
-//!    mark refcount=0 chunks deleted, enqueue S3 keys to
-//!    `pending_s3_deletes`. `SELECT FOR UPDATE` on chunk_list guards
-//!    the TOCTOU with concurrent PutPath refcount increment.
+//!    transactions: lock the path's manifest row (`FOR UPDATE`, so a
+//!    concurrent PutPath for the same path waits), re-check
+//!    references, DELETE narinfo (CASCADE) plus realisations and
+//!    path_tenants. The sweep never touches `chunks` — chunk GC is
+//!    decoupled and owned by the collect cycle (phase 3).
 //!
 //! 3. **Collect** (`collect::collect_cycle`): the lazy chunk
 //!    collector — phase 3 of `run_gc` plus a daily backstop timer.
@@ -40,10 +41,11 @@
 //!
 //! # Two-phase S3 commit
 //!
-//! The sweep tx can DELETE narinfo atomically, but S3 DeleteObject
-//! isn't transactional. Enqueue S3 keys in the SAME tx; drain
-//! later. If drain fails, object leaks (storage cost) but PG state
-//! is correct. Better than the reverse (S3 deleted, tx rolled back,
+//! PostgreSQL deletes are transactional, S3 DeleteObject is not. The
+//! collect batch enqueues S3 keys in the SAME transaction as its
+//! soft-deletes; the drain issues the actual DeleteObject later. If
+//! drain fails, the object leaks (storage cost) but PG state is
+//! correct. Better than the reverse (S3 deleted, tx rolled back,
 //! dangling chunk ref → GetPath fails).
 
 pub mod collect;

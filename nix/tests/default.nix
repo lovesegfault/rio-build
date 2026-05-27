@@ -744,7 +744,7 @@ in
       "gc-sweep"
       # r[verify builder.upload.references-scanned]
       # r[verify builder.upload.deriver-populated]
-      # r[verify store.gc.two-phase]
+      # r[verify store.gc.two-phase+2]
       "refs-end-to-end"
     ];
   };

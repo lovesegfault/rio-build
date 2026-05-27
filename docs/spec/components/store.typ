@@ -1039,7 +1039,7 @@ content-addressed output mappings independently of narinfo signatures.
 
 = Two-Phase Garbage Collection
 
-#r("store.gc.two-phase")[
+#r("store.gc.two-phase+2")[
   - *Phase 1 (Mark):* Identify paths unreachable from GC roots via a recursive
     CTE over `narinfo."references"`. GC root seeds: auto-pinned live-build
     inputs in the `scheduler_live_pins` table, manifests with
@@ -1052,13 +1052,16 @@ content-addressed output mappings independently of narinfo signatures.
   - *Grace period:* Configurable per-invocation via `GcRequest.grace_period_hours`
     (default *#(refs.const)("DEFAULT_GC_GRACE_HOURS")h*). Protects paths uploaded shortly before GC that builds
     haven't referenced yet.
-  - *Phase 2 (Sweep):* Re-read chunk refcounts at sweep time (NOT from a
-    mark-phase snapshot). Per unreachable path, in batched transactions:
-    `SELECT chunk_list ... FOR UPDATE OF m` locks the *manifest* row (not chunk
-    rows), then sweep *re-checks references* (#rref("store.gc.sweep-recheck")).
-    DELETE narinfo (CASCADE), decrement chunk refcounts, mark `refcount=0`
-    chunks deleted, enqueue S3 keys to `pending_s3_deletes` --- all in the same
-    PG transaction.
+  - *Phase 2 (Sweep):* Per unreachable path, in batched transactions: lock the
+    path's manifest row (`FOR UPDATE` --- a concurrent PutPath for the same
+    path blocks until the batch commits), re-check references
+    (#rref("store.gc.sweep-recheck")), then DELETE narinfo (CASCADE to
+    manifests/manifest_data) plus the path's realisations and `path_tenants`
+    rows --- all in the same PG transaction. The sweep MUST NOT decrement,
+    soft-delete, or enqueue chunks: chunk collection is decoupled from path GC
+    and owned by the collect cycle (#rref("store.gc.chunk-collect")), which
+    picks up a swept path's now-unreferenced chunks once they age past the
+    grace window.
 ]
 
 #r("store.gc.sweep-referrer-order")[

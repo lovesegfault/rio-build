@@ -137,7 +137,7 @@ pub async fn compute_unreachable(
     Ok(rows.into_iter().map(|(h,)| h).collect())
 }
 
-// r[verify store.gc.two-phase]
+// r[verify store.gc.two-phase+2]
 // (mark is phase 1 of two-phase; sweep tests + these mark tests
 // together verify the mark-then-sweep pattern)
 #[cfg(test)]
@@ -287,7 +287,7 @@ mod tests {
         assert!(unreachable.is_empty());
     }
 
-    // r[verify store.gc.two-phase]
+    // r[verify store.gc.two-phase+2]
     /// T1: NOT EXISTS survives a NULL in the reachable set.
     ///
     /// `NOT IN (a, NULL)` = `x <> a AND x <> NULL` = UNKNOWN → WHERE
