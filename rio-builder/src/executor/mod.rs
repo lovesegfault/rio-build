@@ -1643,7 +1643,7 @@ mod tests {
     /// compares the two on token-admitted Mounts, so any drift makes
     /// every such Mount fail closed with a build-id mismatch. This is
     /// the cross-crate coupling tripwire for ADR-022 §P0559.
-    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-admission+2]
     #[test]
     fn castore_build_id_matches_token_claim() {
         for drv_path in [

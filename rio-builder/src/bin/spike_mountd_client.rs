@@ -383,15 +383,30 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Mint a §P0559 Mount-admission token the way the scheduler does
-    /// (HMAC-signed MountdClaims) and print it to stdout — the VM test
-    /// uses this to drive the token-mode subtests without a scheduler.
+    /// Mint a Mount-admission token the way the scheduler does and
+    /// print it to stdout — the VM test uses this to drive the
+    /// token-mode subtests without a scheduler. With --key-file: the
+    /// legacy §P0559 HMAC-signed MountdClaims envelope. With
+    /// --signing-key-file: the §P0590 Ed25519 `rmt2` envelope
+    /// (node-scoped via --node).
     MintToken {
-        /// Raw key file (the daemon's --token-key-path counterpart).
+        /// Raw HMAC key file (the daemon's --token-key-path
+        /// counterpart). Mutually exclusive with --signing-key-file.
+        #[arg(long, conflicts_with = "signing_key_file")]
+        key_file: Option<PathBuf>,
+        /// Ed25519 signing-key file (`rio-mountd-<n>:base64(seed)`,
+        /// what `keygen` writes) — mints an `rmt2` token like the
+        /// scheduler's §P0590 dispatch path.
         #[arg(long)]
-        key_file: PathBuf,
+        signing_key_file: Option<PathBuf>,
         #[arg(long)]
         build_id: String,
+        /// Node claim for rmt2 tokens (the kube nodeName the token is
+        /// valid on). Omit to mint an UNBOUND token (what the
+        /// scheduler's `prefer` escape hatch produces) — node-checking
+        /// daemons reject it. Ignored for --key-file tokens.
+        #[arg(long)]
+        node: Option<String>,
         /// Seconds until expiry (from now).
         #[arg(long, default_value_t = 3600)]
         ttl_secs: u64,
@@ -403,6 +418,25 @@ enum Cmd {
         /// by the daemon.
         #[arg(long, default_value = rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE)]
         audience: String,
+    },
+    /// Generate an Ed25519 mountd keypair (ADR-022 §P0590): the private
+    /// signing-key file (what the scheduler's
+    /// RIO_MOUNTD_SIGNING_KEY_PATH points at) and the public
+    /// trust-roots line (what the daemon's --token-pubkey-path file
+    /// carries). Stand-in for the bootstrap Job's keypair block in VM
+    /// tests and standalone deployments.
+    Keygen {
+        /// Where to write the PRIVATE signing key (mode 0600).
+        #[arg(long)]
+        out_key: PathBuf,
+        /// Where to APPEND the public trust-root line (created if
+        /// missing) — appending, not truncating, so a second keygen
+        /// produces the rotation-overlap file shape.
+        #[arg(long)]
+        out_pub: PathBuf,
+        /// Key name; must carry the `rio-mountd-` prefix.
+        #[arg(long, default_value = "rio-mountd-1")]
+        name: String,
     },
     /// Assert the daemon drops the connection without answering the
     /// first request (gid gate, uid-bound rejection).
@@ -500,11 +534,26 @@ fn main() -> anyhow::Result<()> {
         } => expect_mount_err(&args.socket, &build_id, token.as_deref(), &expect),
         Cmd::MintToken {
             key_file,
+            signing_key_file,
             build_id,
+            node,
             ttl_secs,
             expired,
             audience,
-        } => mint_token(&key_file, &build_id, ttl_secs, expired, &audience),
+        } => mint_token(
+            key_file.as_deref(),
+            signing_key_file.as_deref(),
+            &build_id,
+            node.as_deref(),
+            ttl_secs,
+            expired,
+            &audience,
+        ),
+        Cmd::Keygen {
+            out_key,
+            out_pub,
+            name,
+        } => keygen(&out_key, &out_pub, &name),
         Cmd::ExpectRejected => expect_rejected(&args.socket),
         Cmd::DoubleMount { build_id } => double_mount(&args.socket, &build_id),
         Cmd::Promote {
@@ -648,18 +697,19 @@ fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
 }
 
 /// Mint a Mount-admission token exactly the way the scheduler's
-/// dispatch does (same claims type, same envelope), so the VM test can
-/// exercise the daemon's verifier without a scheduler in the loop.
+/// dispatch does (same claims types, same envelopes), so the VM test
+/// can exercise the daemon's verifier without a scheduler in the loop.
+/// `--key-file` selects the legacy HMAC envelope, `--signing-key-file`
+/// the §P0590 Ed25519 `rmt2` envelope.
 fn mint_token(
-    key_file: &Path,
+    key_file: Option<&Path>,
+    signing_key_file: Option<&Path>,
     build_id: &str,
+    node: Option<&str>,
     ttl_secs: u64,
     expired: bool,
     audience: &str,
 ) -> anyhow::Result<()> {
-    let signer = rio_auth::hmac::HmacSigner::load(Some(key_file))
-        .map_err(|e| anyhow::anyhow!("load {}: {e}", key_file.display()))?
-        .context("key file missing")?;
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before epoch")?
@@ -669,14 +719,74 @@ fn mint_token(
     } else {
         now.saturating_add(ttl_secs)
     };
-    let token = signer.sign(&rio_auth::hmac::MountdClaims {
-        aud: audience.to_owned(),
-        build_id: build_id.to_owned(),
-        tenant: None,
-        issued_unix: now,
-        expiry_unix,
-    });
+    let token = match (key_file, signing_key_file) {
+        (Some(key_file), None) => {
+            let signer = rio_auth::hmac::HmacSigner::load(Some(key_file))
+                .map_err(|e| anyhow::anyhow!("load {}: {e}", key_file.display()))?
+                .context("key file missing")?;
+            signer.sign(&rio_auth::hmac::MountdClaims {
+                aud: audience.to_owned(),
+                build_id: build_id.to_owned(),
+                tenant: None,
+                issued_unix: now,
+                expiry_unix,
+            })
+        }
+        (None, Some(signing_key_file)) => {
+            let signer = rio_auth::mountd_token::MountdSigningKey::load(Some(signing_key_file))
+                .map_err(|e| anyhow::anyhow!("load {}: {e}", signing_key_file.display()))?
+                .context("signing key file missing")?;
+            signer.sign(&rio_auth::mountd_token::MountdAdmissionClaims {
+                aud: audience.to_owned(),
+                build_id: build_id.to_owned(),
+                tenant: None,
+                issued_unix: now,
+                expiry_unix,
+                node: node.unwrap_or_default().to_owned(),
+                node_fp: None,
+            })
+        }
+        _ => bail!("pass exactly one of --key-file (HMAC) or --signing-key-file (rmt2)"),
+    };
     println!("{token}");
+    Ok(())
+}
+
+/// Generate an Ed25519 mountd keypair: write the private signing-key
+/// file (0600) and append the public trust-root line. Same file formats
+/// the production bootstrap Job provisions via Secrets Manager → ESO.
+fn keygen(out_key: &Path, out_pub: &Path, name: &str) -> anyhow::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut seed = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .context("open /dev/urandom")?
+        .read_exact(&mut seed)
+        .context("read 32 bytes of entropy")?;
+    let key = rio_auth::mountd_token::MountdSigningKey::from_seed(name, &seed)
+        .map_err(|e| anyhow::anyhow!("key name {name:?}: {e}"))?;
+
+    let mut key_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(out_key)
+        .with_context(|| format!("create {}", out_key.display()))?;
+    writeln!(key_file, "{}", key.secret_key_entry()).context("write signing key")?;
+
+    let mut pub_file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(out_pub)
+        .with_context(|| format!("open {}", out_pub.display()))?;
+    writeln!(pub_file, "{}", key.trust_root_entry()).context("write trust root")?;
+
+    println!(
+        "RESULT keygen=ok name={name} key={} pub={}",
+        out_key.display(),
+        out_pub.display()
+    );
     Ok(())
 }
 

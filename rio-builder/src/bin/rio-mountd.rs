@@ -55,9 +55,29 @@ struct Args {
     /// token that verifies (signature, expiry, audience, build_id).
     /// Unset = token mode off; gid-only admission, socket 0660 —
     /// exactly the pre-token posture. Helm sets this via the
-    /// `mountdHmac.secretName` Secret mount + env.
+    /// `mountdHmac.secretName` Secret mount + env. Superseded by
+    /// --token-pubkey-path (the symmetric arm is deleted in the final
+    /// ADR-022 §P0590 phase); both may be set only as the documented
+    /// contingency overlap.
     #[arg(long, env = "RIO_MOUNTD_HMAC_KEY_PATH")]
     token_key_path: Option<PathBuf>,
+    /// Ed25519 trust-roots file for verifying scheduler-minted `rmt2`
+    /// Mount-admission tokens (ADR-022 mount-admission credentials,
+    /// §P0590): one `rio-mountd-<n>:base64(32-byte pubkey)` line per
+    /// active key (multiple lines = rotation overlap). PUBLIC material
+    /// only — holding it mints nothing. Enables token mode exactly like
+    /// --token-key-path (socket 0666; non-gid peers admitted by a
+    /// verifying Mount token). Helm sets this via the
+    /// `mountdSigning.publicKeySecretName` Secret mount + env.
+    #[arg(long, env = "RIO_MOUNTD_PUBKEY_PATH")]
+    token_pubkey_path: Option<PathBuf>,
+    /// This node's kube `spec.nodeName` (helm: downward API). When set,
+    /// an `rmt2` token is admitted only if its node claim names exactly
+    /// this node — the cross-node replay closure. Unset = node check
+    /// skipped (standalone/systemd posture). Ignored for legacy HMAC
+    /// tokens (they carry no node claim).
+    #[arg(long, env = "RIO_MOUNTD_NODE_NAME")]
+    node_name: Option<String>,
     /// Disk-pressure sweep period in seconds: how often statvfs probes
     /// the cache/chunks/staging trees and, below 10% free, evicts
     /// (orphaned staging, then chunks, then cache, oldest first) until
@@ -107,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
         max_promote_bytes: args.max_promote_bytes,
         allowed_gid: args.allowed_gid,
         token_key_path: args.token_key_path,
+        token_pubkey_path: args.token_pubkey_path,
+        node_name: args.node_name,
         sweep_interval: std::time::Duration::from_secs(args.sweep_interval_secs),
     });
     tokio::select! {

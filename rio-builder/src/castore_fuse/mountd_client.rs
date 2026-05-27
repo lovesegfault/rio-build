@@ -1195,7 +1195,7 @@ mod tests {
     /// original RPC — so a Promote issued across a daemon restart
     /// succeeds instead of surfacing EIO.
     // r[verify builder.fs.mountd-reconnect]
-    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-admission+2]
     #[test]
     fn promote_across_a_daemon_restart_redials_and_remounts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
     /// No cooldown is entered — a later RPC re-probes and surfaces the
     /// same rejection again instead of a masked fail-fast error.
     // r[verify builder.fs.mountd-reconnect]
-    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-admission+2]
     #[test]
     fn reconnect_aborts_on_build_fatal_mount_rejection() {
         let tmp = tempfile::tempdir().unwrap();

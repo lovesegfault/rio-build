@@ -128,19 +128,36 @@ pub struct MountdConfig {
     /// verifies (ADR-022 §P0559).
     pub allowed_gid: u32,
     /// HMAC key file for verifying scheduler-minted Mount-admission
-    /// tokens (ADR-022 §P0559). `None` = token mode off: admission is
-    /// the gid gate alone and the socket stays 0660 — exactly the
-    /// pre-token behavior. `Some` = token mode on: the socket becomes
-    /// world-connectable (0666) so `hostUsers: false` executor pods —
-    /// whose remapped uids/gids cannot present the host gid — can
-    /// reach it, and a connection is admitted EITHER by the gid match
-    /// OR by a verifying token in its `Mount{}`.
+    /// tokens (ADR-022 §P0559). `None` = this (legacy) arm off. Any
+    /// configured verifier — this or [`Self::token_pubkey_path`] —
+    /// turns token mode on: the socket becomes world-connectable
+    /// (0666) so `hostUsers: false` executor pods — whose remapped
+    /// uids/gids cannot present the host gid — can reach it, and a
+    /// connection is admitted EITHER by the gid match OR by a
+    /// verifying token in its `Mount{}`.
     ///
     /// MUST be the dedicated mountd key (`RIO_MOUNTD_HMAC_KEY_PATH`),
     /// never the store-facing assignment key — this key lives on every
     /// builder node, and a node compromise must not yield a key the
-    /// store trusts.
+    /// store trusts. Superseded by the Ed25519 trust roots below; the
+    /// symmetric arm is deleted in the final ADR-022 §P0590 phase.
     pub token_key_path: Option<PathBuf>,
+    /// Ed25519 trust-roots file for verifying scheduler-minted `rmt2`
+    /// Mount-admission tokens (ADR-022 mount-admission credentials,
+    /// §P0590): one `rio-mountd-<n>:base64(32-byte pubkey)` line per
+    /// active key, several lines during rotation overlap. PUBLIC
+    /// material only — holding it mints nothing
+    /// (`r[builder.mountd.token-no-node-mint]`). `None` = the rmt2 arm
+    /// off; `Some` enables token mode exactly like `token_key_path`.
+    /// Env: `RIO_MOUNTD_PUBKEY_PATH`.
+    pub token_pubkey_path: Option<PathBuf>,
+    /// This node's kube `spec.nodeName` (downward API,
+    /// `RIO_MOUNTD_NODE_NAME`). When `Some`, an `rmt2` token must name
+    /// exactly this node (`claims.node`) to be admitted — rejects are
+    /// labeled `node-mismatch` / `node-missing`. `None` = node check
+    /// skipped (standalone/systemd posture); legacy HMAC tokens carry
+    /// no node claim and are unaffected either way.
+    pub node_name: Option<String>,
     /// How often the disk-pressure sweep ([`super::sweep`]) probes the
     /// cache/chunks/staging trees. `Duration::ZERO` disables it (unit
     /// and bring-up environments where the daemon does not own the
@@ -533,11 +550,13 @@ fn wait_for_concurrent_promote(
 
 struct Shared {
     cfg: MountdConfig,
-    /// Verifier for scheduler-minted Mount-admission tokens (ADR-022
-    /// §P0559), loaded from [`MountdConfig::token_key_path`]. `Some` =
-    /// token mode: peers outside `allowed_gid` may be admitted by a
-    /// verifying token in their `Mount{}`. `None` = gid gate only.
-    token_verifier: Option<rio_auth::hmac::HmacVerifier>,
+    /// Verifier for scheduler-minted Mount-admission tokens, built from
+    /// [`MountdConfig::token_key_path`] (legacy HMAC arm) and/or
+    /// [`MountdConfig::token_pubkey_path`] (Ed25519 `rmt2` arm —
+    /// ADR-022 §P0590). `Some` = token mode: peers outside
+    /// `allowed_gid` may be admitted by a verifying token in their
+    /// `Mount{}`. `None` = gid gate only.
+    token_verifier: Option<rio_auth::mountd_token::MountdVerifier>,
     staging_base: OwnedFd,
     cache_base: OwnedFd,
     chunks_base: OwnedFd,
@@ -620,17 +639,34 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
     let cache_base = open_base(&cfg.cache_dir)?;
     let chunks_base = open_base(&cfg.chunks_dir)?;
 
-    // Mount-admission token verifier (ADR-022 §P0559). A configured but
-    // unreadable/empty key file is a startup error, not a silent
-    // fall-back to gid-only — the operator asked for token mode.
-    let token_verifier = rio_auth::hmac::HmacVerifier::load(cfg.token_key_path.as_deref())
+    // Mount-admission token verifier. A configured but unreadable/empty
+    // key file (either arm) is a startup error, not a silent fall-back
+    // to gid-only — the operator asked for token mode. The Ed25519
+    // trust roots are public material; the daemon never holds anything
+    // that can mint a credential (ADR-022 §P0590,
+    // r[builder.mountd.token-no-node-mint]).
+    let hmac_key = rio_auth::hmac::HmacKey::load(cfg.token_key_path.as_deref())
         .context("load mountd token key")?;
-    if token_verifier.is_some() {
+    let trust_roots =
+        rio_auth::mountd_token::MountdTrustRoots::load(cfg.token_pubkey_path.as_deref())
+            .context("load mountd trust roots")?;
+    let token_verifier = rio_auth::mountd_token::MountdVerifier::from_parts(hmac_key, trust_roots);
+    if let Some(verifier) = &token_verifier {
         info!(
             allowed_gid = cfg.allowed_gid,
+            node_name = cfg.node_name.as_deref().unwrap_or(""),
             "Mount-admission token mode enabled: peers outside the allowed gid are admitted \
              by a verifying Mount token (socket becomes world-connectable)"
         );
+        // Mandatory rotation observability (ADR-022 §P0590): one gauge
+        // sample per loaded trust root, so "every mountd reports the
+        // new key" is checkable before the signer is flipped.
+        if let Some(roots) = verifier.trust_roots() {
+            for name in roots.key_names() {
+                metrics::gauge!("rio_mountd_trust_root", "key_name" => name.to_string()).set(1.0);
+                info!(key_name = name, "mountd Ed25519 trust root loaded");
+            }
+        }
     }
 
     reap_orphans(&cfg);
@@ -885,7 +921,7 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
     //     (the standalone/systemd path), and a non-matching gid is
     //     admitted PROVISIONALLY — its first frame must be a Mount{}
     //     whose token verifies, otherwise the connection is closed.
-    // r[impl builder.mountd.token-admission]
+    // r[impl builder.mountd.token-admission+2]
     let creds = getsockopt(&fd, sockopt::PeerCredentials).context("SO_PEERCRED")?;
     let gid_ok = creds.gid() == shared.cfg.allowed_gid;
     let token_mode = shared.token_verifier.is_some();
@@ -1338,31 +1374,52 @@ fn handle_mount(
     //
     // Peers whose gid matched `allowed_gid` were admitted at accept
     // time and skip this; a provisionally-admitted peer must present a
-    // token that verifies (signature with the mountd key, unexpired,
-    // audience "rio-mountd") for EXACTLY the build_id it is claiming.
+    // token that verifies for EXACTLY the build_id it is claiming —
+    // an `rmt2` token under one of the Ed25519 trust roots (unexpired,
+    // audience "rio-mountd", and naming this node when --node-name is
+    // set), or a legacy HMAC token while that arm is still configured.
     // The reply never says which check failed — the specifics go to
     // the daemon log and the reject counter only.
-    // r[impl builder.mountd.token-admission]
+    // r[impl builder.mountd.token-admission+2]
+    // r[impl builder.mountd.token-node-scoped]
     if state.needs_token {
         let verifier = shared
             .token_verifier
             .as_ref()
             .expect("needs_token is only ever set when a token verifier is configured");
+        use rio_auth::mountd_token::MountdVerifyError as VE;
         let outcome = match token {
             None => Err("token-missing"),
-            Some(tok) => match rio_auth::hmac::MountdClaims::verify(verifier, tok, &build_id) {
-                Ok(claims) => Ok(claims),
-                Err(rio_auth::hmac::MountdTokenError::BuildIdMismatch) => Err("build-id-mismatch"),
-                Err(rio_auth::hmac::MountdTokenError::Audience) => Err("audience-mismatch"),
-                Err(rio_auth::hmac::MountdTokenError::Token(_)) => Err("token-invalid"),
-            },
+            Some(tok) => {
+                match verifier.verify_for_build(tok, &build_id, shared.cfg.node_name.as_deref()) {
+                    Ok(verified) => Ok(verified),
+                    Err(VE::BuildIdMismatch) => Err("build-id-mismatch"),
+                    Err(VE::Audience) => Err("audience-mismatch"),
+                    Err(VE::NodeMismatch) => Err("node-mismatch"),
+                    Err(VE::NodeMissing) => Err("node-missing"),
+                    Err(VE::Legacy(rio_auth::hmac::MountdTokenError::BuildIdMismatch)) => {
+                        Err("build-id-mismatch")
+                    }
+                    Err(VE::Legacy(rio_auth::hmac::MountdTokenError::Audience)) => {
+                        Err("audience-mismatch")
+                    }
+                    Err(_) => Err("token-invalid"),
+                }
+            }
         };
         match outcome {
-            Ok(claims) => {
+            Ok(verified) => {
                 info!(
                     build_id,
                     uid = state.peer_uid,
-                    tenant = claims.tenant.as_deref().unwrap_or(""),
+                    tenant = verified.claims.tenant.as_deref().unwrap_or(""),
+                    // The trust-root name that vouched for the token —
+                    // from the daemon's own list, never attacker input.
+                    // Empty for the legacy HMAC arm (a shared secret has
+                    // no per-key name). The observable that makes
+                    // trust-root rotation auditable per-Mount.
+                    verified_by = verified.verified_by.as_deref().unwrap_or(""),
+                    node = verified.claims.node,
                     "Mount admitted by token"
                 );
                 metrics::counter!("rio_mountd_mount_admission_total", "method" => "token")
@@ -1620,7 +1677,13 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_mountd_mount_rejected_total",
         "Mount admission rejections in token mode (labeled by reason: token-missing/\
-         token-invalid/build-id-mismatch/audience-mismatch)"
+         token-invalid/build-id-mismatch/audience-mismatch/node-mismatch/node-missing)"
+    );
+    describe_gauge!(
+        "rio_mountd_trust_root",
+        "1 per Ed25519 Mount-admission trust root loaded at startup (labeled by key_name). \
+         Mandatory rotation precondition: flip the scheduler's signing key only after every \
+         mountd reports the incoming key here (ADR-022 mount-admission credentials)"
     );
     describe_gauge!(
         "rio_mountd_cache_free_bytes",
@@ -1657,23 +1720,50 @@ mod tests {
     /// Build a minimal [`Shared`] rooted in a tempdir so connection-level
     /// handlers (`handle_mount`) can run without a daemon, a socket, or
     /// CAP_SYS_ADMIN. Quota is disabled (0) so no XFS is needed. Token
-    /// mode off; [`test_shared_with_token_key`] turns it on.
+    /// mode off; [`test_shared_with_token_key`] /
+    /// [`test_shared_with_trust_roots`] turn it on.
     fn test_shared(tmp: &Path) -> Arc<Shared> {
-        test_shared_inner(tmp, None)
+        test_shared_inner(tmp, None, None)
     }
 
-    /// [`test_shared`] with the Mount-admission token verifier
-    /// configured from `key` (token mode ON).
+    /// [`test_shared`] with the legacy HMAC Mount-admission token
+    /// verifier configured from `key` (token mode ON, no node check).
     fn test_shared_with_token_key(tmp: &Path, key: &[u8]) -> Arc<Shared> {
         test_shared_inner(
             tmp,
-            Some(rio_auth::hmac::HmacVerifier::from_key(key.to_vec())),
+            Some(rio_auth::mountd_token::MountdVerifier::Hmac(
+                rio_auth::hmac::HmacKey::from_key(key.to_vec()),
+            )),
+            None,
+        )
+    }
+
+    /// [`test_shared`] with the Ed25519 trust roots of `signers`
+    /// configured (token mode ON) and an optional `--node-name`.
+    fn test_shared_with_trust_roots(
+        tmp: &Path,
+        signers: &[&rio_auth::mountd_token::MountdSigningKey],
+        node_name: Option<&str>,
+    ) -> Arc<Shared> {
+        let roots = rio_auth::mountd_token::MountdTrustRoots::parse(
+            &signers
+                .iter()
+                .map(|s| s.trust_root_entry())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("trust roots parse");
+        test_shared_inner(
+            tmp,
+            Some(rio_auth::mountd_token::MountdVerifier::Ed25519(roots)),
+            node_name.map(str::to_owned),
         )
     }
 
     fn test_shared_inner(
         tmp: &Path,
-        token_verifier: Option<rio_auth::hmac::HmacVerifier>,
+        token_verifier: Option<rio_auth::mountd_token::MountdVerifier>,
+        node_name: Option<String>,
     ) -> Arc<Shared> {
         let sub = |name: &str| {
             let p = tmp.join(name);
@@ -1691,6 +1781,8 @@ mod tests {
                 max_promote_bytes: DEFAULT_MAX_PROMOTE_BYTES,
                 allowed_gid: nix::unistd::getegid().as_raw(),
                 token_key_path: None,
+                token_pubkey_path: None,
+                node_name,
                 sweep_interval: Duration::ZERO,
             },
             token_verifier,
@@ -1933,8 +2025,8 @@ mod tests {
     /// assertion therefore distinguishes only "admitted past the token
     /// gate" (anything but `Unauthorized`) from "rejected by it"
     /// (`Unauthorized`), plus the no-state-left-behind invariant.
-    // r[verify builder.mountd.token-admission]
-    // r[verify builder.mountd.token-key-separate]
+    // r[verify builder.mountd.token-admission+2]
+    // r[verify builder.mountd.token-key-separate+2]
     #[test]
     fn mount_admission_matrix() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2056,11 +2148,173 @@ mod tests {
         assert!(admitted(&resp), "token mode off must not consult tokens");
     }
 
+    /// The §P0590 Ed25519 (`rmt2`) admission matrix at the
+    /// `handle_mount` level: a daemon configured with PUBLIC trust
+    /// roots only (and its own node name) admits exactly the
+    /// scheduler-signed token scoped to this node and this build, and
+    /// rejects everything else — wrong key, expired, wrong audience,
+    /// wrong build_id, wrong node, missing node claim, legacy HMAC
+    /// tokens (no HMAC key configured), garbage — with no per-build
+    /// state left behind. A daemon WITHOUT a node name skips the node
+    /// check; gid-admitted peers never need a token.
+    // r[verify builder.mountd.token-admission+2]
+    // r[verify builder.mountd.token-node-scoped]
+    // r[verify builder.mountd.token-no-node-mint]
+    #[test]
+    fn rmt2_mount_admission_matrix() {
+        use rio_auth::mountd_token::{MountdAdmissionClaims, MountdSigningKey};
+
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let claims =
+            |build_id: &str, node: &str, aud: &str, expiry_offset: i64| MountdAdmissionClaims {
+                aud: aud.into(),
+                build_id: build_id.into(),
+                tenant: None,
+                issued_unix: now(),
+                expiry_unix: (now() as i64 + expiry_offset).max(0) as u64,
+                node: node.into(),
+                node_fp: None,
+            };
+        let signer = MountdSigningKey::from_seed("rio-mountd-1", &[0x41; 32]).unwrap();
+        let stranger = MountdSigningKey::from_seed("rio-mountd-9", &[0x42; 32]).unwrap();
+        let admitted = |resp: &Resp| !matches!(resp, Resp::Err(ErrKind::Unauthorized));
+
+        let tmp = tempfile::tempdir().unwrap();
+        // The production DaemonSet posture: trust roots + node name.
+        let shared = test_shared_with_trust_roots(tmp.path(), &[&signer], Some("node-a"));
+
+        // gid-admitted connection: no token needed even in token mode.
+        let resp = handle_mount(&shared, &mut test_conn_state(), "b-gid".into(), None, &[]);
+        assert!(admitted(&resp), "gid-admitted Mount must not need a token");
+
+        // The genuine token: right build, right node, in date.
+        let good = signer.sign(&claims(
+            "b-tok",
+            "node-a",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        ));
+        let resp = handle_mount(
+            &shared,
+            &mut test_conn_state_needs_token(),
+            "b-tok".into(),
+            Some(&good),
+            &[],
+        );
+        assert!(admitted(&resp), "valid rmt2 token must admit, got {resp:?}");
+
+        // A legacy HMAC token is rejected outright: no HMAC key is
+        // configured, and holding the public trust roots cannot mint or
+        // accept anything the control plane didn't sign.
+        let legacy = mint_token(
+            TEST_TOKEN_KEY,
+            "b-rej",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        // Every rejection in one sweep; none may claim the id or create
+        // staging.
+        let aud = rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE;
+        for (what, token) in [
+            ("missing", None),
+            ("garbage", Some("rmt2.not.atoken".to_string())),
+            ("legacy-hmac", Some(legacy)),
+            (
+                "wrong-key",
+                Some(stranger.sign(&claims("b-rej", "node-a", aud, 3600))),
+            ),
+            (
+                "expired",
+                Some(signer.sign(&claims("b-rej", "node-a", aud, -120))),
+            ),
+            (
+                "wrong-audience",
+                Some(signer.sign(&claims("b-rej", "node-a", "rio-store", 3600))),
+            ),
+            (
+                "other-build",
+                Some(signer.sign(&claims("b-someone-else", "node-a", aud, 3600))),
+            ),
+            (
+                "wrong-node",
+                Some(signer.sign(&claims("b-rej", "node-b", aud, 3600))),
+            ),
+            (
+                "missing-node-claim",
+                Some(signer.sign(&claims("b-rej", "", aud, 3600))),
+            ),
+        ] {
+            let mut state = test_conn_state_needs_token();
+            let resp = handle_mount(&shared, &mut state, "b-rej".into(), token.as_deref(), &[]);
+            assert_eq!(
+                resp,
+                Resp::Err(ErrKind::Unauthorized),
+                "{what}: token-required Mount must be rejected"
+            );
+            assert!(state.kept.is_none() && state.build_id.is_none());
+            assert!(
+                !shared.live_build_ids.lock().unwrap().contains("b-rej"),
+                "{what}: a rejected Mount must not leave the build_id claimed"
+            );
+            assert!(
+                !tmp.path().join("staging/b-rej").exists(),
+                "{what}: a rejected Mount must not create staging"
+            );
+        }
+
+        // Daemon with NO node name configured (standalone posture): the
+        // node check is skipped — both node-bound and unbound tokens
+        // admit, everything else is unchanged.
+        let no_node = test_shared_with_trust_roots(tmp.path(), &[&signer], None);
+        for (what, build_id, node) in [
+            ("bound", "b-nn-bound", "node-a"),
+            ("unbound", "b-nn-unbound", ""),
+        ] {
+            let tok = signer.sign(&claims(build_id, node, aud, 3600));
+            let resp = handle_mount(
+                &no_node,
+                &mut test_conn_state_needs_token(),
+                build_id.into(),
+                Some(&tok),
+                &[],
+            );
+            assert!(
+                admitted(&resp),
+                "{what}: node check must be skipped when --node-name is unset, got {resp:?}"
+            );
+        }
+
+        // Rotation overlap: a verifier trusting both the outgoing and
+        // incoming roots admits tokens signed by either.
+        let overlap =
+            test_shared_with_trust_roots(tmp.path(), &[&signer, &stranger], Some("node-a"));
+        for (what, key) in [("old-key", &signer), ("new-key", &stranger)] {
+            let bid = format!("b-rot-{what}");
+            let tok = key.sign(&claims(&bid, "node-a", aud, 3600));
+            let resp = handle_mount(
+                &overlap,
+                &mut test_conn_state_needs_token(),
+                bid.clone(),
+                Some(&tok),
+                &[],
+            );
+            assert!(
+                admitted(&resp),
+                "{what}: rotation overlap must admit, got {resp:?}"
+            );
+        }
+    }
+
     /// Full happy path for a token-admitted Mount where the environment
     /// provides /dev/fuse: staging is created and owned by the peer uid
     /// exactly like a gid-admitted Mount — token admission changes who
     /// may Mount, never what a Mount sets up.
-    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-admission+2]
     #[test]
     fn token_admitted_mount_sets_up_staging() {
         let Ok(fuse) = std::fs::OpenOptions::new()
@@ -2098,7 +2352,7 @@ mod tests {
     /// and then closes the connection; a token-verified Mount keeps it
     /// open. Post-auth (or gid-admitted) connections keep the existing
     /// keep-open behavior for protocol errors.
-    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-admission+2]
     #[tokio::test]
     async fn pre_auth_frames_close_the_connection() {
         use std::ops::ControlFlow;

@@ -741,6 +741,12 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             .send(ExecutorMessage {
                 msg: Some(executor_message::Msg::Register(ExecutorRegister {
                     executor_id: rt.build_ctx.executor_id.clone(),
+                    // §P0590 node-scoped mountd tokens: report this pod's
+                    // spec.nodeName (downward API) so the scheduler can
+                    // scope OUR OWN Mount-admission token when the
+                    // controller-attested binding hasn't landed yet.
+                    // Empty outside k8s.
+                    node_name: rt.build_ctx.node_name.clone().unwrap_or_default(),
                 })),
             })
             .await?;
@@ -1458,6 +1464,7 @@ mod tests {
         ExecutorMessage {
             msg: Some(executor_message::Msg::Register(ExecutorRegister {
                 executor_id: id.into(),
+                node_name: String::new(),
             })),
         }
     }
@@ -1510,7 +1517,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "a"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id, .. })) if executor_id == "a"
         ));
 
         // Kill target #1 (drop rx → tx.send() fails in relay).
@@ -1536,7 +1543,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "b"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id, .. })) if executor_id == "b"
         ));
         let r = tokio::time::timeout(Duration::from_secs(1), grpc2_rx.recv())
             .await
@@ -1544,7 +1551,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "c"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id, .. })) if executor_id == "c"
         ));
 
         // Cleanup: drop sink → relay exits.
@@ -1582,7 +1589,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "a"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id, .. })) if executor_id == "a"
         ));
 
         // Swap to target #2. CRITICAL: grpc1_rx is still in scope
@@ -1605,7 +1612,7 @@ mod tests {
         assert!(
             matches!(
                 r.msg,
-                Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "b"
+                Some(executor_message::Msg::Register(ExecutorRegister { executor_id, .. })) if executor_id == "b"
             ),
             "message must route to new target after watch swap"
         );
@@ -1670,7 +1677,7 @@ mod tests {
             assert!(
                 matches!(
                     r.msg,
-                    Some(executor_message::Msg::Register(ExecutorRegister { executor_id }))
+                    Some(executor_message::Msg::Register(ExecutorRegister { executor_id, .. }))
                         if executor_id == want
                 ),
                 "expected {want} in order"
