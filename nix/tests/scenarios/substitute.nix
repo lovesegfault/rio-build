@@ -89,6 +89,24 @@ let
   '';
   bbArg = "--arg busybox '(builtins.storePath ${common.busybox})'";
 
+  # Single-derivation probe for the force-build-roots subtest: built
+  # locally on client, its output published to /srv/cache, then the SAME
+  # expr submitted via ssh-ng under the `force-build` tenant. Same
+  # `{ busybox }:` + `--arg busybox '(builtins.storePath …)'` pattern as
+  # progressClosure; submit with the shared `bbArg`.
+  forceProbe = pkgs.writeText "force-probe.nix" ''
+    { busybox }:
+    derivation {
+      name = "rio-force-probe";
+      system = builtins.currentSystem;
+      builder = "''${busybox}/bin/sh";
+      args = [
+        "-c"
+        "''${busybox}/bin/busybox mkdir -p $out && ''${busybox}/bin/busybox echo rio-force-probe-v1 > $out/x"
+      ];
+    }
+  '';
+
   # Sign a JWT with the jwt-keys.nix test seed. Output on stdout so
   # testScript captures into a Python var. PyJWT's EdDSA wants a PEM
   # private key (not raw 32-byte seed), so we wrap via cryptography.
@@ -108,8 +126,10 @@ pkgs.testers.runNixOSTest {
   skipTypeCheck = true;
 
   # ~60s boot + cache setup ~10s + grpcurl round-trips + ssh-ng build
-  # for substitute-progress-e2e (~40s). No worker builds, no k3s.
-  globalTimeout = 480 + common.covTimeoutHeadroom;
+  # for substitute-progress-e2e (~40s) + force-build-roots probe
+  # build/sign/copy, second gateway restart, and PG poll (~120s).
+  # No worker builds, no k3s.
+  globalTimeout = 600 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -696,6 +716,120 @@ pkgs.testers.runNixOSTest {
             f"substitute-progress-e2e PASS: "
             f"{len(copy_starts)} actCopyPath start/stop matched, "
             f"{n_progress} resProgress events all done≤expected and monotone"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # force-build-roots — gateway policy prevents root substitution
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("force-build-roots-not-substituted"):
+        import time
+
+        # Build the probe locally on client, publish its output to the
+        # fake upstream (same sign + copy commands as the other paths).
+        force_drv = client.succeed(
+            "nix-instantiate ${bbArg} ${forceProbe}"
+        ).strip()
+        force_path = client.succeed(f"nix-store --realise {force_drv}").strip()
+        client.succeed(f"nix store sign --key-file /tmp/sub/sec {force_path}")
+        client.succeed(
+            f"nix copy --no-check-sigs "
+            f"--to 'file:///srv/cache?compression=none' {force_path}"
+        )
+
+        # Tenant `force-build` (the name the gateway.toml policy keys on)
+        # trusts the test cache — so the ONLY thing standing between this
+        # path and a substitution is the force_build_roots gate. The
+        # progress-e2e subtest above is the positive control: same flow,
+        # no policy entry → the scheduler DOES substitute the root.
+        tid_force = mk_tenant("force-build")
+        out = cli(
+            f"upstream add --tenant {tid_force} "
+            "--url http://client:8080 --priority 50 "
+            f"--trusted-key '{test_pubkey}' --sig-mode keep"
+        )
+        assert "added upstream http://client:8080" in out, out
+
+        # SSH key with the tenant NAME as comment, installed exactly like
+        # the substitute-ssh-ng subtest (overwrite authorized_keys with >,
+        # restart the gateway). The earlier ssh-ng subtests are done with
+        # their key by now.
+        client.succeed(
+            "rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub && "
+            "ssh-keygen -t ed25519 -N ''' -C 'force-build' "
+            "-f /root/.ssh/id_ed25519"
+        )
+        force_pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+        ${gatewayHost}.succeed(
+            f"echo '{force_pubkey}' > /var/lib/rio/gateway/authorized_keys"
+        )
+        ${gatewayHost}.succeed("systemctl restart rio-gateway.service")
+        ${gatewayHost}.wait_for_unit("rio-gateway.service")
+        ${gatewayHost}.wait_for_open_port(2222)
+
+        # Precondition: store cold for the probe path (vacuous-guard).
+        before = psql(
+            ${gatewayHost},
+            f"SELECT count(*) FROM narinfo WHERE store_path = '{force_path}'",
+        )
+        assert before == "0", (
+            f"precondition FAIL: narinfo already has {before} row(s) for "
+            f"{force_path} — the no-substitution assertion below is VACUOUS."
+        )
+
+        # Submit the SAME expr via ssh-ng, detached (this fixture has no
+        # builders, so the build can never finish — that is the point).
+        # systemd-run pattern from componentscaler.nix: HOME so ssh reads
+        # /root/.ssh material, PATH so nix can spawn `ssh` via execvp.
+        client.succeed(
+            "systemd-run --unit=force-build-submit --collect "
+            "--setenv=HOME=/root "
+            "--setenv=PATH=/run/current-system/sw/bin "
+            "nix build --impure --no-link "
+            "${bbArg} -f ${forceProbe} "
+            "--store 'ssh-ng://${gatewayHost}' --eval-store auto"
+        )
+
+        # The scheduler must take the drv to ready/queued/created (waiting
+        # for a builder), NOT substituting/completed, and no narinfo row
+        # may appear for the output even though the upstream has it.
+        status = ""
+        for _ in range(60):
+            status = psql(
+                ${gatewayHost},
+                f"SELECT status FROM derivations WHERE drv_path = '{force_drv}'",
+            )
+            if status:
+                break
+            time.sleep(2)
+        if not status:
+            _, submit_log = client.execute(
+                "journalctl -u force-build-submit --no-pager | tail -n 50"
+            )
+            assert status, (
+                f"derivation row for {force_drv} never appeared in scheduler "
+                f"PG — did the ssh-ng submission fail?\n"
+                f"force-build-submit journal:\n{submit_log}"
+            )
+        # Give the dispatch-time probe a chance to (wrongly) substitute.
+        time.sleep(10)
+        status = psql(
+            ${gatewayHost},
+            f"SELECT status FROM derivations WHERE drv_path = '{force_drv}'",
+        )
+        assert status in ("ready", "queued", "created"), (
+            f"force-build root must wait for a builder, got {status!r}"
+        )
+        narinfo_rows = psql(
+            ${gatewayHost},
+            f"SELECT count(*) FROM narinfo WHERE store_path = '{force_path}'",
+        )
+        assert narinfo_rows == "0", (
+            f"force-build root was substituted (narinfo rows={narinfo_rows})"
+        )
+        client.execute("systemctl stop force-build-submit 2>/dev/null || true")
+        print(
+            f"force-build-roots PASS: {force_drv} stayed {status!r}, "
+            f"no narinfo row for {force_path}"
         )
 
     client.execute("systemctl stop test-cache 2>/dev/null || true")

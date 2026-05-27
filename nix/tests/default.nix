@@ -452,6 +452,20 @@ in
         extraClientModules = [
           { networking.firewall.allowedTCPPorts = [ 8080 ]; }
         ];
+        # r[verify sched.merge.force-build-roots]
+        #   force-build-roots-not-substituted: tenant "force-build" has
+        #   force_build_roots in the gateway build-policy; its ssh-ng
+        #   submission of an upstream-available path stays queued for a
+        #   builder (none exist in this fixture) instead of substituting.
+        extraControlModules = [
+          {
+            environment.etc."rio/gateway.toml".text = ''
+              [build_policy."force-build"]
+              keep_going = true
+              force_build_roots = true
+            '';
+          }
+        ];
       };
     };
 

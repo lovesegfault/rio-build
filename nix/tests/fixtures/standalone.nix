@@ -59,6 +59,10 @@ in
   # NixOS modules merged into the client VM. protocol-cold uses this
   # for drvs.coldBootstrapServer (Python http.server serving busybox).
   extraClientModules ? [ ],
+  # NixOS modules merged into the control VM. substitute.nix uses this
+  # to drop /etc/rio/gateway.toml with a per-tenant build policy
+  # ([build_policy."force-build"]) for the force-build-roots subtest.
+  extraControlModules ? [ ],
   # Threaded to mkClientNode's nix.package. Default = nixpkgs CppNix.
   clientNixPackage ? pkgs.nix,
 }:
@@ -183,7 +187,8 @@ let
         ];
       })
       otelModule
-    ];
+    ]
+    ++ extraControlModules;
     systemd.services = {
       # Gateway-only HMAC env override. mkControlNode's extraServiceEnv
       # applies controlHmacEnv to ALL three services (including gateway).

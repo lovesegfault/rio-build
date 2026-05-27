@@ -60,6 +60,7 @@ mod iso01_cross_tenant_listbuilds;
 mod iso02_cross_tenant_same_drv;
 mod iso03_cross_tenant_path_read;
 mod pol01_keep_going;
+mod pol02_force_build_roots;
 
 pub static ALL: &[&dyn Scenario] = &[
     // ─── Shared (read-only) ───────────────────────────────────────────
@@ -93,6 +94,7 @@ pub static ALL: &[&dyn Scenario] = &[
     &i052_addmultiple_sequential::AddMultipleSequential,
     &i110_batch_rpc_scale::BatchRpcScale,
     &pol01_keep_going::KeepGoingPolicy,
+    &pol02_force_build_roots::ForceBuildRootsPolicy,
     // ─── Tenant{count:2} (cross-tenant isolation) ─────────────────────
     &iso01_cross_tenant_listbuilds::CrossTenantListBuilds,
     &iso02_cross_tenant_same_drv::CrossTenantSameDrv,
