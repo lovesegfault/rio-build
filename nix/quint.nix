@@ -1750,6 +1750,440 @@ in
       witness = "s5LiveOwnerNeverReaped";
     };
 
+    # ------------------------------------------------------------------
+    # rio-store's chunk-liveness subsystem, REPLACEMENT shape: lazy
+    # mark-and-collect over the durable manifests (chunkCollect.qnt —
+    # the refcount-formal campaign's Phase-1a / plan T-1a.5 model,
+    # design §4/§4.6; the verdict table and witness list are in
+    # docs/spec/models/refcount-invariant-map.md "Replacement model").
+    # The model is the counter-free end state: no refcount, no
+    # decrement/token machinery; the collector of
+    # rio-store/src/gc/collect.rs (snapshot → fail-closed mark →
+    # per-batch sweep → finish) modeled with its live (soft-delete +
+    # enqueue) arm, the migration-068 last_referenced_at touch, the
+    # T-pre.1 deleted-guard on the presence commit, reap/path-sweep as
+    # path-row janitors, and the deleted-only drain re-check. Four
+    # exhaustive regimes mirror the as-built model's; two further
+    # exhaustive regimes carry the holds-halves of the §4.6
+    # falsification pairs (writer-transaction bound; late-mark guard
+    # under a relaxed heartbeat contract); each pair's falsify-half is
+    # an expect-violation check against an instantiation that flips
+    # exactly one design guard off. State counts, depths and
+    # wall-clocks live in the introducing commits' messages and the
+    # checks' transcripts.
+    #
+    # Marker scope: the two replacement rules added by plan T-1a.5
+    # (store.chunk.liveness-derived, store.gc.chunk-collect) get their
+    # first verify markers here, on the regimes that make each
+    # load-bearing; their implementation-side markers land with the
+    # live collector arm (plan T-1a.8, P14), so both appear in
+    # `tracey query uncovered` until that wave. The surviving mechanism rules
+    # (no-live-collect, bounded-garbage-retention, liveness-not-
+    # presence, upsert-inserted, chunk-upload-committed,
+    # placeholder-claim, orphan-heartbeat, pending-deletes) gain the
+    # replacement-model form on top of their as-built chunk-liveness
+    # markers, which stay in place until the as-built model's own
+    # retirement (Phase 2). Witness and falsification checks carry no
+    # markers (same policy as every other expect-violation check).
+    # ------------------------------------------------------------------
+
+    # The base regime: one writer over two paths and three hashes with
+    # the full chunk-list alphabet, the collector and the drain — no
+    # faults. Liveness is recomputed from the manifests each cycle; no
+    # referenced chunk's object may be deleted, garbage must stay
+    # reclaimable, and presence is never inferred from liveness.
+    # r[verify store.chunk.liveness-derived]
+    # r[verify store.gc.chunk-collect]
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    quint-chunk-collect-base = mkQuintCheck {
+      name = "chunk-collect-base";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      invariants = [
+        "boundsOK"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+        "noReferencedChunkSwept"
+      ];
+    };
+
+    # The crash regime: two writers with process death enabled at every
+    # in-flight phase, the drain's S3-delete-then-commit-fails window,
+    # the path-row janitors, and the collector. A crashed upload's
+    # manifest is reaped by the janitors; its chunks are then ordinary
+    # unreferenced rows the next cycle collects — no counter repair
+    # exists or is needed, and the cleared uploaded_at still forces the
+    # next writer to re-PUT instead of trusting liveness for presence.
+    # r[verify store.chunk.liveness-derived]
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    # r[verify store.chunk.liveness-not-presence]
+    # r[verify store.cas.upsert-inserted+2]
+    # r[verify store.cas.chunk-upload-committed]
+    # r[verify store.gc.orphan-heartbeat]
+    # r[verify store.put.placeholder-claim+2]
+    quint-chunk-collect-crash = mkQuintCheck {
+      name = "chunk-collect-crash";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      invariants = [
+        "boundsOK"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+        "noReferencedChunkSwept"
+      ];
+    };
+
+    # The contend regime: two live writers sharing chunks against the
+    # collector and the drain — the mark-stale race the
+    # last_referenced_at touch closes (a manifest committing after the
+    # cycle's mark snapshot re-references an old chunk), the
+    # resurrect-vs-drain TOCTOU with the deleted-only re-check, and the
+    # late-cleanup no-op contention. No process death.
+    # r[verify store.chunk.liveness-derived]
+    # r[verify store.gc.chunk-collect]
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    # r[verify store.chunk.liveness-not-presence]
+    # r[verify store.gc.pending-deletes]
+    quint-chunk-collect-contend = mkQuintCheck {
+      name = "chunk-collect-contend";
+      spec = "chunkCollect";
+      main = "chunkCollectContend";
+      invariants = [
+        "boundsOK"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+        "noReferencedChunkSwept"
+      ];
+    };
+
+    # The corrupt regime: an existing manifest_data.chunk_list can rot
+    # (C12). Under the replacement the polarity is fail-closed — the
+    # validation pass aborts the cycle, nothing anywhere is collected
+    # while the corruption persists, and the operator quarantine of
+    # adjudication 7 is the sanctioned remediation. CR-2 is checked in
+    # its carved form here; the unconditional form's expected
+    # falsification is wired below as an expect-violation check.
+    # r[verify store.chunk.liveness-derived]
+    # r[verify store.gc.chunk-collect]
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.gc.bounded-garbage-retention]
+    quint-chunk-collect-corrupt = mkQuintCheck {
+      name = "chunk-collect-corrupt";
+      spec = "chunkCollect";
+      main = "chunkCollectCorrupt";
+      invariants = [
+        "boundsOK"
+        "cr1NoLiveChunkCollected"
+        "cr2CarvedCorrupt"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+        "noReferencedChunkSwept"
+      ];
+    };
+
+    # The writer-transaction-bound holds-half (§4.1 collect-soundness
+    # condition): the upgrade transaction is split into begin/commit
+    # and its duration is ceiling-bounded at the grace window by a tick
+    # precondition — CR-1 holds for every interleaving and any
+    # cycle/scan placement. The overrun falsify-half below relaxes the
+    # ceiling by one tick. In production the bound is the monitored
+    # rio_store_chunk_upgrade_tx_seconds assumption (plan T-1a.4).
+    # r[verify store.gc.chunk-collect]
+    # r[verify store.chunk.no-live-collect]
+    quint-chunk-collect-writer-bounded = mkQuintCheck {
+      name = "chunk-collect-writer-bounded";
+      spec = "chunkCollect";
+      main = "chunkCollectWriterBounded";
+      invariants = [
+        "boundsOK"
+        "cr1NoLiveChunkCollected"
+        "cr2NoStrandedGarbage"
+        "cr4PresenceFromConfirmedUpload"
+        "s4OwnerOnlyMutation"
+        "s5LiveOwnerNeverReaped"
+        "l3NoForeignFreshen"
+        "noReferencedChunkSwept"
+      ];
+    };
+
+    # The late-mark holds-half (Phase-1 input list item 1): under a
+    # relaxed heartbeat contract (a live owner may stall past the
+    # reclaim thresholds), the T-pre.1 `AND deleted = FALSE` guard on
+    # mark_chunks_uploaded keeps CR-1 standing. The invariant list is
+    # deliberately CR-1 plus the structural/ownership set: the
+    # relaxation itself makes S5 violable and opens benign bookkeeping
+    # windows (orphan re-PUT, transient uploaded_at-vs-object skew)
+    # with no data-loss content — the regime module's comment carries
+    # the full rationale. The unguarded falsify-half is wired below.
+    # r[verify store.chunk.no-live-collect]
+    # r[verify store.cas.chunk-upload-committed]
+    quint-chunk-collect-latemark-guarded = mkQuintCheck {
+      name = "chunk-collect-latemark-guarded";
+      spec = "chunkCollect";
+      main = "chunkCollectLateMarkGuarded";
+      invariants = [
+        "boundsOK"
+        "cr1NoLiveChunkCollected"
+        "s4OwnerOnlyMutation"
+        "l3NoForeignFreshen"
+        "noReferencedChunkSwept"
+      ];
+    };
+
+    # The deterministic reproducer runs, one check per regime: the
+    # collector happy path and the capped-cycle/backstop resume shape,
+    # the crashed-upload-collected-one-cycle-later shape, the
+    # mark-stale touch-protection walkthrough, and the fail-closed
+    # abort + quarantine-then-resume narratives are replayed step by
+    # step with their expectations re-asserted.
+    quint-chunk-collect-runs-base = mkQuintRunCheck {
+      name = "chunk-collect-runs-base";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+    };
+    quint-chunk-collect-runs-crash = mkQuintRunCheck {
+      name = "chunk-collect-runs-crash";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+    };
+    quint-chunk-collect-runs-contend = mkQuintRunCheck {
+      name = "chunk-collect-runs-contend";
+      spec = "chunkCollect";
+      main = "chunkCollectContend";
+    };
+    quint-chunk-collect-runs-corrupt = mkQuintRunCheck {
+      name = "chunk-collect-runs-corrupt";
+      spec = "chunkCollect";
+      main = "chunkCollectCorrupt";
+    };
+
+    # Non-vacuity witnesses for the chunkCollect regimes. Each check
+    # passes only when the checker violates its witness — the contended
+    # state the regime's invariants constrain is actually reachable.
+    # Deliberately no tracey markers (same policy as every witness
+    # check).
+
+    # The base regime's headline states: a complete chunked upload
+    # exists, a backend delete fires, a referenced-but-unconfirmed
+    # chunk exists (the M_033 precondition restated over the fold), the
+    # heartbeat actually resets staleness, and a collect batch actually
+    # collects something.
+    quint-chunk-collect-witness-complete-upload = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-complete-upload";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      witness = "noCompleteUpload";
+    };
+    quint-chunk-collect-witness-backend-delete = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-backend-delete";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      witness = "noBackendDelete";
+    };
+    quint-chunk-collect-witness-m033-precondition = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-m033-precondition";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      witness = "noUnconfirmedReferencedChunk";
+    };
+    quint-chunk-collect-witness-heartbeat-reset = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-heartbeat-reset";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      witness = "noHeartbeatReset";
+    };
+    quint-chunk-collect-witness-chunk-collected = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-chunk-collected";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      witness = "noChunkCollected";
+    };
+
+    # The crash regime's fault alphabet is reachable: the C1/C2/C5
+    # crash windows, the two-writers-staged-then-crashed C6 shape, the
+    # abandoned-upload garbage those windows leave for the collector,
+    # and both stale-reclaim repair paths firing.
+    quint-chunk-collect-witness-crash-claimed = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-crash-claimed";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noCrashAtClaimed";
+    };
+    quint-chunk-collect-witness-crash-upgraded = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-crash-upgraded";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noCrashAfterUpgrade";
+    };
+    quint-chunk-collect-witness-crash-pending-reap = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-crash-pending-reap";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noCrashBeforeReap";
+    };
+    quint-chunk-collect-witness-double-crash-staged = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-double-crash-staged";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noDoubleCrashStaged";
+    };
+    quint-chunk-collect-witness-abandoned-upload = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-abandoned-upload";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noAbandonedUploadGarbage";
+    };
+    quint-chunk-collect-witness-hotpath-reclaim = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-hotpath-reclaim";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noHotpathReclaim";
+    };
+    quint-chunk-collect-witness-scanner-reap = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-scanner-reap";
+      spec = "chunkCollect";
+      main = "chunkCollectCrash";
+      witness = "noScannerReap";
+    };
+
+    # The contend regime's contended states: the §4.6 mark-stale
+    # reachability witness (a post-snapshot upgrade re-references an
+    # unmarked, past-grace chunk and only the touch retains it while a
+    # sweep batch runs — the race the new column exists to close), the
+    # drain re-check skipping a resurrected chunk under the
+    # deleted-only re-check, and a claim-gated cleanup no-opping
+    # against a foreign row.
+    quint-chunk-collect-witness-mark-miss-touch-saved = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-mark-miss-touch-saved";
+      spec = "chunkCollect";
+      main = "chunkCollectContend";
+      witness = "noMarkMissSavedByTouch";
+    };
+    quint-chunk-collect-witness-drain-resurrect = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-drain-resurrect";
+      spec = "chunkCollect";
+      main = "chunkCollectContend";
+      witness = "noDrainResurrectSkip";
+    };
+    quint-chunk-collect-witness-late-cleanup-noop = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-late-cleanup-noop";
+      spec = "chunkCollect";
+      main = "chunkCollectContend";
+      witness = "noLateCleanupNoop";
+    };
+
+    # The corrupt regime's reachability set: the fail-closed abort
+    # actually fires (the alert image), the adjudication-7 quarantine
+    # fires, and CR-2's unconditional structural form is — exactly as
+    # the design owns in §4.4 — unsatisfiable while a corrupt manifest
+    # coexists with collectable garbage (the fail-closed pause made
+    # visible; the carved form is the regime's invariant above).
+    quint-chunk-collect-witness-parse-abort = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-parse-abort";
+      spec = "chunkCollect";
+      main = "chunkCollectCorrupt";
+      witness = "noParseFailureAbort";
+    };
+    quint-chunk-collect-witness-quarantine = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-quarantine";
+      spec = "chunkCollect";
+      main = "chunkCollectCorrupt";
+      witness = "noQuarantine";
+    };
+    quint-chunk-collect-corrupt-pause-stranded = mkQuintWitnessCheck {
+      name = "chunk-collect-corrupt-pause-stranded";
+      spec = "chunkCollect";
+      main = "chunkCollectCorrupt";
+      witness = "cr2NoStrandedGarbage";
+    };
+
+    # The threshold-ordering inversion, carried over from the as-built
+    # model: with the hot-path reclaim threshold lowered to the
+    # heartbeat deadline, reaping a live owner becomes reachable and S5
+    # falsifies — the path-row janitors keep the ordering dependence
+    # under the replacement.
+    quint-chunk-collect-threshold-order = mkQuintWitnessCheck {
+      name = "chunk-collect-threshold-order";
+      spec = "chunkCollect";
+      main = "chunkCollectThresholdOrder";
+      witness = "s5LiveOwnerNeverReaped";
+    };
+
+    # The §4.6 falsification pairs, falsify-halves: each check
+    # instantiates the SAME transition relation with exactly one design
+    # guard flipped off and passes only while the checker still
+    # falsifies CR-1 — machine-checked evidence that each replacement
+    # mechanism is load-bearing, not decorative. The matching
+    # holds-halves are the wired exhaustive checks above (contend for
+    # the touch, corrupt for fail-closed, writer-bounded for the
+    # transaction bound, latemark-guarded for the deleted-guard).
+
+    # Touch removed (ENABLE_TOUCH = false; design §4.6 (ii), the
+    # required falsification for the one mechanism with no historical
+    # fix): a manifest commits after the mark snapshot against an old
+    # uploaded chunk, the writer skips the PUT, the sweep collects the
+    # chunk and the drain deletes the only copy.
+    quint-chunk-collect-no-touch-falsifies-cr1 = mkQuintWitnessCheck {
+      name = "chunk-collect-no-touch-falsifies-cr1";
+      spec = "chunkCollect";
+      main = "chunkCollectNoTouch";
+      witness = "cr1NoLiveChunkCollected";
+    };
+
+    # Writer-transaction bound relaxed by one tick past grace
+    # (WRITER_TX_BOUND = GRACE + 1): an upgrade transaction that
+    # outlives the grace window leaves its backdated touch before the
+    # cycle cutoff, so the post-commit re-evaluation still collects the
+    # chunk the just-committed manifest references — the §4.1
+    # collect-soundness condition, exercised.
+    quint-chunk-collect-writer-overrun-falsifies-cr1 = mkQuintWitnessCheck {
+      name = "chunk-collect-writer-overrun-falsifies-cr1";
+      spec = "chunkCollect";
+      main = "chunkCollectWriterOverrun";
+      witness = "cr1NoLiveChunkCollected";
+    };
+
+    # Fail-closed rule removed (ENABLE_FAIL_CLOSED = false): the mark
+    # silently skips an unparseable manifest instead of aborting — the
+    # forbidden C12 polarity flip — and a chunk whose only referrer is
+    # the corrupt manifest is collected and drained while that manifest
+    # exists (design §4.4 / adjudication 5).
+    quint-chunk-collect-parse-skip-falsifies-cr1 = mkQuintWitnessCheck {
+      name = "chunk-collect-parse-skip-falsifies-cr1";
+      spec = "chunkCollect";
+      main = "chunkCollectParseSkip";
+      witness = "cr1NoLiveChunkCollected";
+    };
+
+    # Late-mark guard removed under the relaxed heartbeat contract
+    # (ENABLE_MARK_DELETED_GUARD = false): a stalled owner's late
+    # presence commit re-asserts uploaded_at on a collected chunk and
+    # the next writer trusts it — the M_033 harm shape with no counter
+    # involved (Phase-1 input list item 1 / plan T-pre.1).
+    quint-chunk-collect-latemark-unguarded-falsifies-cr1 = mkQuintWitnessCheck {
+      name = "chunk-collect-latemark-unguarded-falsifies-cr1";
+      spec = "chunkCollect";
+      main = "chunkCollectLateMarkUnguarded";
+      witness = "cr1NoLiveChunkCollected";
+    };
+
     # Implementation conformance (model-based testing). The regime checks
     # above prove the PROTOCOL; this one proves rio-lease implements
     # that protocol: rio-lease/src/mbt_tests.rs replays traces generated

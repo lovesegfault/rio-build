@@ -1160,3 +1160,184 @@ and remediation; the histogram is live from the additive release, so
 the Release-A observation window (re-entry gate (a), T-1a.7) also
 produces the empirical upgrade-transaction-duration distribution this
 assumption is judged against.
+
+## Replacement model (Phase 1a) — `chunkCollect.qnt` (plan T-1a.5)
+
+The counter-free replacement model of design §4.6, derived from
+`chunkLiveness.qnt` as a sibling file (plan P10; the as-built model and
+its checks are untouched): the counter, the decrement family, and the
+token/rollback machinery are deleted; the uploaders keep
+claim/heartbeat/guard as path-row state; reap and path-sweep delete
+manifest rows only; `last_referenced_at` joins the per-chunk state as
+the age-since-last-reference-event clock written by the upgrade upsert;
+`mark_chunks_uploaded` carries the T-pre.1 deleted-guard; the drain
+re-check is `deleted`-only; and the collector of
+`rio-store/src/gc/collect.rs` is encoded as four interleavable actions
+(snapshot → fail-closed mark → per-batch sweep → finish), with writer,
+path-GC, drain, and crash actions enabled between any two of them. The
+sweep models the live arm of design §4.1 step 3 (the shipped shadow arm
+is the same cycle with the sweep effects withheld); the per-cycle victim
+cap and keyset cursor are cycle scheduling below the transition
+relation's granularity (a capped stop is a finish before the eligible
+set is exhausted — design §4.6 v4 note), exercised by the
+`cappedCycleResumeRun` named run rather than by new model state. Each
+load-bearing replacement mechanism is a module constant
+(`ENABLE_TOUCH`, `ENABLE_FAIL_CLOSED`, `ENABLE_MARK_DELETED_GUARD`,
+`ENABLE_HB_CONTRACT`, `ENABLE_SPLIT_UPGRADE`/`WRITER_TX_BOUND`), so each
+§4.6 falsification pair is two thin instantiations of the same
+transition relation differing in exactly one constant — the holds-half
+keeps the constant at its as-designed value, the falsify-half flips it.
+
+Wired checks (`nix/quint.nix`): `quint-chunk-collect-{base,crash,
+contend,corrupt}` (exhaustive, TLC), `quint-chunk-collect-writer-bounded`
+and `quint-chunk-collect-latemark-guarded` (exhaustive holds-halves),
+`quint-chunk-collect-runs-{base,crash,contend,corrupt}` (named-run
+replays), eighteen expect-violation checks (fifteen non-vacuity
+witnesses, the corrupt-regime CR-2-unconditional falsification, the
+threshold-order inversion, and — wired separately — the four
+falsify-halves below). Nothing in the plan's must-stay-wired set is
+demoted; both demotable holds-halves are wired as exhaustive checks, so
+no campaign-owner sign-off is consumed.
+
+### Verdict table (regime × invariant)
+
+Distinct-state counts and depths are as measured at the introducing
+commit on the campaign dev box (also in that commit's message and the
+CI transcripts): base 26,335 distinct (4,438,477 generated, depth 22),
+crash 14,918,067 (1,078,114,529, depth 34), contend 5,174,327
+(340,993,537, depth 35), corrupt 17,603,367 (1,227,786,977, depth 41),
+writer-bounded 329,689 (2,161,071, depth 33), latemark-guarded
+6,365,559 (334,165,889, depth 35). Every HOLDS is an exhaustive TLC
+result over that regime's full reachable space.
+
+| Design invariant (§3.3) | Model form | base | crash | contend | corrupt |
+|---|---|---|---|---|---|
+| CR-1 `NoLiveChunkCollected` (state + action form) | `cr1NoLiveChunkCollected` (text identical to the as-built model) | HOLDS | HOLDS | HOLDS | HOLDS |
+| CR-2 `BoundedGarbageRetention`, structural form | `cr2NoStrandedGarbage` (replacement form: garbage is never durably excluded from collection — the only durable exclusion is the fail-closed pause — plus the as-built outbox clause) | HOLDS | HOLDS | HOLDS | **FALSIFIES-AS-PRE-REGISTERED** — the §4.4 fail-closed pause coexisting with collectable garbage (`quint-chunk-collect-corrupt-pause-stranded`); the carved form below is this regime's stated form |
+| CR-2, corrupt-regime carved form | `cr2CarvedCorrupt` (outbox clause; the pause itself is the sanctioned carve-out, observable via the corrupt flag and the parse-failure abort, with resumption pinned by `quarantineResumeRun`) | — (base form checked) | — | — | HOLDS |
+| CR-3 `CounterRefinesManifestFold` | — | retired by construction: no counter exists in the replacement state vector | | | |
+| CR-4 `PresenceNeverInferredFromCounter` | `cr4PresenceFromConfirmedUpload` (text identical) | HOLDS | HOLDS | HOLDS | HOLDS |
+| S4 `OwnerOnlyMutation` (path-level) | `s4OwnerOnlyMutation` (claim-reap arm; the rollback/token arm no longer exists) | HOLDS | HOLDS | HOLDS | HOLDS |
+| S5 `LiveOwnerNeverReaped` (path-level) | `s5LiveOwnerNeverReaped` | HOLDS | HOLDS | HOLDS | HOLDS |
+| L3 support `NoForeignFreshen` (path-level) | `l3NoForeignFreshen` | HOLDS | HOLDS | HOLDS | HOLDS |
+| structural bounds / self-consistency | `boundsOK` | HOLDS | HOLDS | HOLDS | HOLDS |
+| no referenced chunk soft-deleted (replacement sensor, one step before CR-1's irreversible harm) | `noReferencedChunkSwept` | HOLDS | HOLDS | HOLDS | HOLDS |
+
+The two auxiliary exhaustive regimes: `chunkCollectWriterBounded`
+(split upgrade transaction, duration ceiling = grace) HOLDS the full
+base invariant list; `chunkCollectLateMarkGuarded` (relaxed heartbeat
+contract, deleted-guard present) HOLDS `boundsOK`, CR-1, S4, L3,
+`noReferencedChunkSwept` — its invariant list deliberately excludes S5
+(reaping a live-but-stalled owner is the relaxation itself) and the
+CR-2/CR-4 bookkeeping clauses (see Findings below).
+
+### Witness results
+
+All eighteen wired expect-violation checks are violated in the regime
+each is wired against — the contended states are reachable, so the
+HOLDS verdicts above are not vacuous. Carried witnesses keep their
+as-built meaning; the counter-shaped witnesses (stale-token no-op,
+by-count decrement, orphan-sweep re-check, corrupt-leak shape,
+abandoned-accounting) have no replacement analog and are not carried —
+their mechanisms no longer exist.
+
+| Witness (model `val`) | Regime | Probes | Result |
+|---|---|---|---|
+| `noCompleteUpload` | base | a complete chunked upload exists | violated |
+| `noBackendDelete` | base | a backend DeleteObject fires | violated |
+| `noUnconfirmedReferencedChunk` | base | the M_033 precondition, restated over the fold (referenced, `uploaded_at` NULL) | violated |
+| `noHeartbeatReset` | base | a heartbeat resets non-zero staleness | violated |
+| `noChunkCollected` | base | a collect batch actually soft-deletes + enqueues | violated |
+| `noCrashAtClaimed` / `noCrashAfterUpgrade` / `noCrashBeforeReap` / `noDoubleCrashStaged` | crash | C1 / C2 / C5 / C6 | violated |
+| `noAbandonedUploadGarbage` | crash | a crashed upload's garbage awaits the collector (no accounting exists to repair) | violated |
+| `noHotpathReclaim` / `noScannerReap` | crash | both stale-reclaim repair paths fire as path-row janitors | violated |
+| `noMarkMissSavedByTouch` | contend | the §4.6 mark-stale interleaving: a post-snapshot upgrade re-references an unmarked, past-grace chunk and only the touch retains it while a sweep batch runs | violated |
+| `noDrainResurrectSkip` | contend | the drain re-check (deleted-only) skips a resurrected chunk | violated |
+| `noLateCleanupNoop` | contend | a claim-gated cleanup no-ops against a foreign/missing row | violated |
+| `noParseFailureAbort` | corrupt | the fail-closed validation abort fires | violated |
+| `noQuarantine` | corrupt | the adjudication-7 operator quarantine fires | violated |
+| `cr2NoStrandedGarbage` (pre-registered falsification) | corrupt | the fail-closed pause strands collectable garbage while the corrupt manifest exists | violated, as pre-registered |
+| `s5LiveOwnerNeverReaped` (threshold-order inversion) | threshold-order | a live owner reaped once heartbeat-deadline ≥ hot-path threshold | violated |
+
+### Falsification pairs (§4.6 / Phase-1 input list)
+
+All four pairs behave exactly as required; every half is a wired CI
+check. Counterexample depths and the states explored at the stop point
+are in the introducing commit's message and the check transcripts.
+
+| Pair | Falsify-half (expect-violation, wired) | Result | Holds-half (exhaustive, wired) | Result |
+|---|---|---|---|---|
+| Mark-stale touch/grace (§4.6 (i)+(ii)) | `quint-chunk-collect-no-touch-falsifies-cr1` (`ENABLE_TOUCH = false`, contend constants) | CR-1 falsifies via the §4.6 trace (post-snapshot manifest, PUT skipped, chunk collected, drain deletes the only copy) | reachability witness `noMarkMissSavedByTouch` + `quint-chunk-collect-contend` (touch restored) | witness violated; CR-1 HOLDS |
+| Writer-transaction overrun (§4.1 soundness condition) | `quint-chunk-collect-writer-overrun-falsifies-cr1` (`WRITER_TX_BOUND = grace + 1`) | CR-1 falsifies (backdated touch predates the cutoff; post-commit re-evaluation collects the just-referenced chunk) | `quint-chunk-collect-writer-bounded` (`WRITER_TX_BOUND = grace`) | CR-1 (full list) HOLDS for arbitrary cycle/interleaving placement |
+| Parse-failure / fail-closed mark (§4.4) | `quint-chunk-collect-parse-skip-falsifies-cr1` (`ENABLE_FAIL_CLOSED = false`, corrupt constants) | CR-1 falsifies through the parser (skip polarity collects a corrupt manifest's only-referenced chunk) | `quint-chunk-collect-corrupt` (fail-closed) + `noReferencedChunkSwept` | CR-1 and the sensor HOLD; abort + quarantine + resumption pinned by the corrupt runs |
+| Late-mark guard (input list item 1 / T-pre.1) | `quint-chunk-collect-latemark-unguarded-falsifies-cr1` (guard removed under the relaxed heartbeat contract) | CR-1 falsifies via the late-mark trace (M_033 harm shape, no counter involved) | `quint-chunk-collect-latemark-guarded` (guard present, same relaxed contract) | CR-1 HOLDS |
+
+### Encoding notes and findings
+
+- **CR-2's structural content shrinks with the counter, and that is the
+  honest result.** As-built, clause (a) ("garbage stays eligible")
+  carried the real conditionality — a stuck refcount made garbage
+  permanently invisible to the standing machinery. Under the
+  replacement, liveness is recomputed every cycle, so nothing per-chunk
+  can durably exclude garbage from collection; the only durable
+  exclusion is the system-wide fail-closed pause while an unparseable
+  `chunk_list` exists. The structural form therefore reads "garbage
+  implies no corrupt manifest exists" plus the unchanged outbox clause:
+  discharged by construction in the fault-free regimes, expectedly
+  falsified in the corrupt regime (the §4.4 trade made checkable), with
+  the carved form keeping the outbox clause and the
+  resumption-after-remediation half pinned by `quarantineResumeRun`.
+  The wall-clock half of the rule's bound (cadence, the capped-cycle
+  backlog drain, drain lag) stays with runtime metrics per the Phase-1
+  input list's loop-existence note.
+- **The row-lock / READ-COMMITTED assumption is now explicit in the
+  encoding.** The sweep batch cannot fire on a hash staged by an open
+  upgrade transaction (the chunk-row lock); the post-commit
+  re-evaluation outcome is encoded at the commit action — protected iff
+  the backdated touch still postdates the cycle cutoff. This is the
+  §3.2 named assumption carried by the as-built model, made visible
+  here because the split-upgrade regimes are exactly about the window
+  it governs. Consequence, recorded for T-1a.8: the live arm's
+  soft-delete UPDATE must re-evaluate the collect predicate (at minimum
+  the `deleted = FALSE` and `GREATEST(created_at, last_referenced_at) <
+  cutoff` conjuncts) in its own WHERE clause, not only in the candidate
+  scan — re-evaluating a hash-only WHERE after a row-lock wait is what
+  the design's §4.1 "re-evaluating its predicate" sentence forbids
+  relying on, and the model's writer-bounded HOLDS is stated against
+  the predicate-re-checking shape.
+- **S4/L3 stay admission-predicate forms; the consequence level is
+  carried by `noReferencedChunkSwept` and CR-1** (the Stage-C caveat
+  carried into the replacement, per the Phase-1 input list). The
+  acceptance re-run (T-1a.6) exercises the ownership gates by reverting
+  them and falsifying at the consequence level.
+- **Quarantine is modeled against 'complete' manifests only.** The
+  adjudication-7 trigger (consecutive failed cycles on the same named
+  manifest) cannot accumulate against a transient placeholder, and
+  corrupt `'uploading'` rows self-heal via the reapers (design §4.4).
+  Modeling an unrestricted quarantine admits an operator deleting a
+  live, mid-upload placeholder, whose late S3 PUT then recreates an
+  object with no scheduled delete — an orphan-object shape that is not
+  a property of the design's remediation story; the restriction is
+  recorded here rather than silently narrowing the rule text.
+- **Under the relaxed heartbeat contract only**, two benign bookkeeping
+  windows are reachable even with the deleted-guard present: a
+  reclaimed-then-collected chunk whose still-alive owner later re-PUTs
+  the object (an unreferenced S3 object with no scheduled delete,
+  violating CR-2's outbox clause), and a transient
+  `uploaded_at`-set/object-absent state when the late mark lands on a
+  row a concurrent writer has just resurrected (violating CR-4(b) until
+  that writer's own re-upload lands). Neither has data-loss content,
+  both vanish under the production heartbeat contract (the four main
+  regimes HOLD CR-2/CR-4 exhaustively), and the late-mark holds-half
+  therefore checks the pair's actual claim — CR-1 — plus the
+  structural/ownership set. This is the replacement-model image of the
+  Stage-C late-mark finding: `uploaded_at`-as-presence still leans on
+  the heartbeat contract; the T-pre.1 guard closes the data-loss trace,
+  not every bookkeeping wrinkle of a deliberately broken contract.
+- **No demotions, no stop-and-report events.** Every check in the
+  plan's must-stay-wired set is wired and green; the two demotable
+  holds-halves are wired exhaustive checks; no invariant falsified
+  outside the pre-registered corrupt-regime falsification; per-check
+  wall-clocks fit the T-1a.5 step-6 budget with margin (largest regime
+  ≈2 minutes of checker time on the campaign dev box, transcripts in
+  the introducing commit).

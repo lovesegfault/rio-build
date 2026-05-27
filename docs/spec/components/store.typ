@@ -300,6 +300,61 @@ conditionality: liveness is recomputed from the manifests each cycle, so a
 missed decrement cannot occur, and the carve-out narrows to a fail-closed,
 alerted pause of chunk collection while an unparseable `chunk_list` exists.
 
+#r("store.chunk.liveness-derived")[
+  Chunk GC-eligibility MUST be derived from the durable manifests at collect
+  time: a chunk is live iff at least one existing manifest row ---
+  `'uploading'` and `'complete'` alike --- references its hash in
+  `manifest_data.chunk_list`, and a chunk is eligible for collection only if
+  it is absent from that fold as computed by the collect cycle's mark phase
+  (#rref("store.gc.chunk-collect")) and outside the cycle's grace term. No
+  maintained per-chunk counter or other incrementally-maintained liveness
+  aggregate may be consulted for the eligibility decision, and the liveness
+  fold MUST NOT be consulted for backend presence
+  (#rref("store.chunk.liveness-not-presence")).
+]
+
+The replacement counterpart of #rref("store.chunk.refcount-meaning"): the
+same fold, recomputed from `manifest_data.chunk_list` per cycle instead of
+mirrored by hand-maintained arithmetic. It is what dissolves the leaked- and
+under-counted-refcount bug classes --- there is no stored aggregate left to
+drift --- while #rref("store.chunk.no-live-collect") (unchanged) remains the
+data-loss obligation the recomputation must satisfy. The rule is
+deliberately silent on the counter column itself: during the cutover the
+counter may still be written (write-only) for mixed-fleet safety; what is
+forbidden is deciding eligibility from it.
+
+#r("store.gc.chunk-collect")[
+  Chunk collection MUST run as a collect cycle of: (1) a snapshot of the
+  cycle cutoff on the database clock; (2) a fail-closed mark over every
+  existing manifest --- a server-side validation pass plus a set-based
+  expansion of every `manifest_data.chunk_list` into the cycle's live set,
+  in which corrupt input is distinguishable from an empty manifest and any
+  validation failure aborts the cycle, with an alert, before any verdict or
+  collection is produced; (3) collection of chunks absent from the live set
+  whose `GREATEST(created_at, last_referenced_at)` predates the snapshot
+  cutoff by at least the grace window, soft-deleting them and enqueueing
+  them to `pending_s3_deletes` in per-batch transactions, collecting at most
+  a fixed per-cycle victim cap with a keyset cursor carrying the remainder
+  to subsequent cycles; and (4) the existing drain re-check before the
+  irreversible backend delete (#rref("store.gc.pending-deletes")). The cycle
+  MUST run as part of every GC run and from a periodic backstop, and the
+  writer-transaction soundness condition --- no chunk-referencing write
+  transaction outlives the grace window --- MUST be enforced by a
+  transaction-duration bound or carried as a named, monitored assumption.
+]
+
+The cycle shape, the fail-closed polarity (a parser regression or data
+damage suspends collection rather than collecting live data), the
+`last_referenced_at` touch that closes the mark-snapshot race, the capped
+cursor-resumable collect (a backlog drains across cycles instead of
+stretching one cycle past its lock-held budget), and the soundness
+assumption are the design's §4.1/§4.4 commitments; the collector
+implementation in `rio-store/src/gc/collect.rs` ships the cycle in shadow
+mode (mark + report) ahead of the cutover release that enables the
+collecting arm. Like #rref("store.chunk.liveness-derived"), this rule never
+treats the live set as a presence signal: presence remains keyed on
+`uploaded_at` (#rref("store.chunk.liveness-not-presence")).
+
 = Key Operations
 
 #table(
