@@ -1086,7 +1086,7 @@
       {
         "name": "rio_store_gc_chunk_resurrected_total",
         "kind": "counter",
-        "help": "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
+        "help": "Chunks skipped by drain because PutPath cleared deleted=false after a collect batch enqueued them (TOCTOU catch)"
       },
       {
         "name": "rio_store_gc_chunks_collected_total",
@@ -1131,7 +1131,7 @@
       {
         "name": "rio_store_gc_orphan_reap_failed_total",
         "kind": "counter",
-        "help": "Per-row reap_one failures during the orphan scanner's loop (e.g. chunks_refcount_nonneg CHECK violation from a pre-existing accounting bug). The scan continues; sustained nonzero = a poison row needs manual intervention."
+        "help": "Per-row reap_one failures during the orphan scanner's loop (e.g. a transient DB error against one placeholder row). The scan continues; sustained nonzero = a poison row needs manual intervention."
       },
       {
         "name": "rio_store_gc_path_resurrected_total",

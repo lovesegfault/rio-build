@@ -228,7 +228,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_chunk_resurrected_total",
-        "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
+        "Chunks skipped by drain because PutPath cleared deleted=false after a collect batch enqueued them (TOCTOU catch)"
     );
     describe_counter!(
         "rio_store_gc_path_swept_total",
@@ -242,9 +242,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_gc_orphan_reap_failed_total",
         "Per-row reap_one failures during the orphan scanner's loop \
-         (e.g. chunks_refcount_nonneg CHECK violation from a pre-existing \
-         accounting bug). The scan continues; sustained nonzero = a poison \
-         row needs manual intervention."
+         (e.g. a transient DB error against one placeholder row). The scan \
+         continues; sustained nonzero = a poison row needs manual \
+         intervention."
     );
     describe_gauge!(
         "rio_store_gc_sweep_paths_remaining",

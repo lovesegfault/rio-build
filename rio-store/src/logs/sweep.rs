@@ -33,9 +33,8 @@ use uuid::Uuid;
 
 use super::chunks::LogChunkStore;
 
-/// How often the sweep runs. Matches the orphan-chunk sweep's cadence:
-/// retention is measured in days, so anything finer than an hour is
-/// pointless PG load.
+/// How often the sweep runs. Hourly: retention is measured in days,
+/// so anything finer than an hour is pointless PG load.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Executions per batch. Each batch is one indexed SELECT, two `= ANY`

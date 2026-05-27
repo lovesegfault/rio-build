@@ -418,10 +418,9 @@ impl StoreSeed {
 // ChunkSeed — chunks table fixture builder
 // ---------------------------------------------------------------------------
 
-/// Builder for seeding a `chunks` row. Consolidates `seed_chunk`
-/// (gc/mod.rs) and `seed_orphan_chunk` (gc/sweep.rs). The blake3 hash
-/// is synthesized from a single `tag` byte (distinct first byte,
-/// zero-padded) — enough to discriminate chunks in a single-test DB.
+/// Builder for seeding a `chunks` row. The blake3 hash is synthesized
+/// from a single `tag` byte (distinct first byte, zero-padded) —
+/// enough to discriminate chunks in a single-test DB.
 pub struct ChunkSeed {
     tag: u8,
     refcount: i32,
@@ -451,8 +450,9 @@ impl ChunkSeed {
         self
     }
 
-    /// Backdate `created_at`. The orphan-chunk sweeper's grace check
-    /// pivots on `now() - created_at > grace`.
+    /// Backdate `created_at`. The collect cycle's grace check pivots
+    /// on `GREATEST(created_at, last_referenced_at)` being older than
+    /// the grace cutoff.
     pub fn age_secs(mut self, secs: i64) -> Self {
         self.age_secs = Some(secs);
         self
