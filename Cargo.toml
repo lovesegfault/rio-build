@@ -17,7 +17,7 @@ members = [
   "workspace-hack",
   "xtask",
 ]
-exclude = ["fuzz/rio-nix", "fuzz/rio-store"]
+exclude = ["fuzz/rio-auth", "fuzz/rio-nix", "fuzz/rio-store"]
 resolver = "2"
 
 [workspace.package]

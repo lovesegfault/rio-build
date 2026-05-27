@@ -4,10 +4,12 @@
 # workspace, each with its own Cargo.lock, needing nightly for
 # libfuzzer-sys + `-Zsanitizer`. They depend on in-tree crates by path.
 #
-# Two fuzz workspaces:
+# Three fuzz workspaces:
 #   fuzz/rio-nix    — protocol/wire parsers
 #   fuzz/rio-store  — manifest parser (pulls rio-store's full dep
 #                     tree, so its sancov closure is much larger)
+#   fuzz/rio-auth   — rmt2 Mount-admission token parser
+#                     (MountdVerifier::verify_for_build, ADR-022 §P0590)
 #
 # Build: per-crate via crate2nix (third + fourth instantiations
 # alongside the main + coverage trees). Same `globalExtraRustcOpts`
@@ -119,6 +121,18 @@ let
     };
   };
 
+  rio-auth-fuzz-build = mkFuzzBuild {
+    resolvedJson = ../fuzz/rio-auth/Cargo.json;
+    fuzzCrateName = "rio-auth-fuzz";
+    fuzzCrateSrc = fileset.toSource {
+      root = ../fuzz/rio-auth;
+      fileset = fileset.unions [
+        ../fuzz/rio-auth/Cargo.toml
+        ../fuzz/rio-auth/fuzz_targets
+      ];
+    };
+  };
+
   rioNixFuzzTargets = [
     "wire_primitives"
     "opcode_parsing"
@@ -148,6 +162,11 @@ let
         target = "manifest_deserialize";
         fuzzBins = rio-store-fuzz-build.members.rio-store-fuzz;
         corpusRoot = unfilteredRoot + "/fuzz/rio-store/corpus";
+      }
+      {
+        target = "mountd_token_verify";
+        fuzzBins = rio-auth-fuzz-build.members.rio-auth-fuzz;
+        corpusRoot = unfilteredRoot + "/fuzz/rio-auth/corpus";
       }
     ];
 

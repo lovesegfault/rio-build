@@ -1,0 +1,26 @@
+[package]
+name = "rio-auth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# This crate is its own workspace root. It's excluded from the parent
+# workspace (../../Cargo.toml) but has its own Cargo.lock so Nix can
+# vendor its deps independently. Mirrors fuzz/rio-nix/Cargo.toml.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# mountd_token_verify drives MountdVerifier::verify_for_build — the rmt2
+# Mount-admission token parser that rio-mountd runs on attacker-supplied
+# bytes from its UDS (ADR-022 §P0590).
+rio-auth = { path = "../../rio-auth" }
+
+[[bin]]
+name = "mountd_token_verify"
+path = "fuzz_targets/mountd_token_verify.rs"
+test = false
+doc = false
