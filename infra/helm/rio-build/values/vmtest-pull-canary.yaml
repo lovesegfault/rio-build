@@ -1,0 +1,23 @@
+# Pull-canary VM-test overlay (vm-pull-canary-k3s only) — layered on
+# top of vmtest-full.yaml by nix/tests/fixtures/k3s-full.nix via
+# `extraValuesFiles` (Helm -f last-wins, maps deep-merge per key).
+#
+# One knob: pin the SLA probe deadline to the config floor (180 s —
+# rio-scheduler/src/sla/config.rs rejects anything lower). The base
+# vmtest-full.yaml uses 3600 s, which makes the pull-mode establishment
+# window (solved intent deadline + establishment_report_slack, slack
+# default 120 s) unobservable inside a VM-test budget. With 180 s the
+# window for an unfitted derivation is ~300 s, so the pull-canary
+# scenario can assert "an unreported pod death is charged exactly once
+# and only after deadline + report-slack" end-to-end.
+#
+# Intentional side effect: the solved intent deadline also renders into
+# builder Job activeDeadlineSeconds (~180 s for unfitted drvs) and the
+# derived worker build timeout (~90 s). The pull-canary scenario keeps
+# every build sleep <= 60 s for that reason. The other lifecycle splits
+# keep vmtest-full.yaml's 3600 s — this overlay is not layered into
+# their shared fixture.
+scheduler:
+  sla:
+    probe:
+      deadlineSecs: 180

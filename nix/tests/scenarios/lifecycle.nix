@@ -235,6 +235,53 @@ let
     sleepSecs = 45;
   };
 
+  # pull-canary (vm-pull-canary-k3s only): the retry-feed equivalence
+  # script plus the cancel/preempt/establishment arms. Distinct pname
+  # per drv keeps every one unfitted for the SLA estimator (per-pname
+  # estimates), so each Job's activeDeadlineSeconds stays at the
+  # overlay's 180s probe-deadline floor and the establishment window
+  # stays ~300s. The ok/fail pairs are the "same scripted sequence"
+  # driven through the stream pool and then the pull pool — only the
+  # marker (and therefore the pname) differs between the two pools'
+  # copies. The 60s sleepers leave a comfortable margin under the
+  # overlay's ~90s worker timeout while staying observable mid-build.
+  pcStreamOk = drvs.mkTrivial {
+    marker = "pc-stream-ok";
+    sleepSecs = 5;
+  };
+  pcPullOk = drvs.mkTrivial {
+    marker = "pc-pull-ok";
+    sleepSecs = 5;
+  };
+  pcStreamFail = drvs.mkCustom {
+    name = "rio-test-pc-stream-fail";
+    script = ''
+      ''${busybox}/bin/busybox sleep 5
+      ''${busybox}/bin/busybox echo "pull-canary deterministic failure (stream leg)" >&2
+      exit 1
+    '';
+  };
+  pcPullFail = drvs.mkCustom {
+    name = "rio-test-pc-pull-fail";
+    script = ''
+      ''${busybox}/bin/busybox sleep 5
+      ''${busybox}/bin/busybox echo "pull-canary deterministic failure (pull leg)" >&2
+      exit 1
+    '';
+  };
+  pcCancelDrv = drvs.mkTrivial {
+    marker = "pc-cancel";
+    sleepSecs = 60;
+  };
+  pcPreemptDrv = drvs.mkTrivial {
+    marker = "pc-preempt";
+    sleepSecs = 60;
+  };
+  pcEstabDrv = drvs.mkTrivial {
+    marker = "pc-estab";
+    sleepSecs = 60;
+  };
+
   # gc-sweep's path_tenants proof. Distinct marker so DAG-dedup doesn't
   # reuse pinDrv/gcVictimDrv (those were built with the empty-comment
   # key → tenant_id=None → completion hook's filter_map drops → upsert
@@ -639,6 +686,13 @@ let
       ephemeralDrv2
       pullDrv1
       pullDrv2
+      pcStreamOk
+      pcPullOk
+      pcStreamFail
+      pcPullFail
+      pcCancelDrv
+      pcPreemptDrv
+      pcEstabDrv
       tenantDrv
       rolloutPreDrv
       rolloutPostDrv

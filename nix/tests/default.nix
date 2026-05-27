@@ -228,6 +228,24 @@ let
     fixture = k3sFull { jwtEnabled = true; };
   };
 
+  # Pull-canary lifecycle module: same scenario module as lifecycleMod,
+  # but its own fixture instantiation — values/vmtest-pull-canary.yaml
+  # pins scheduler.sla.probe.deadlineSecs to the 180s config floor so
+  # the pull-mode establishment window (solved deadline + 120s report
+  # slack ≈ 300s) fits a VM-test budget. Kept OUT of the shared
+  # lifecycleMod fixture so the other lifecycle splits keep
+  # vmtest-full.yaml's 3600s probe deadline (their Jobs'
+  # activeDeadlineSeconds and worker timeouts are unchanged).
+  lifecyclePullCanaryMod = lifecycle {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      extraValuesFiles = [
+        ../../infra/helm/rio-build/values/vmtest-pull-canary.yaml
+      ];
+    };
+  };
+
   leMod = leader-election {
     inherit pkgs common;
     fixture = k3sFull { };
@@ -788,6 +806,50 @@ in
     # ephemeral ~180s + pull-mode ~360s + ~240s k3s bring-up ≈ 780s
     # expected; TCG tail headroom on top.
     globalTimeout = 1200;
+  };
+
+  # ── pull-canary (dedicated check, T-1b.8/T-1b.9) ──────────────────────
+  # Pull-vs-stream retry-feed equivalence (the same scripted
+  # success+failure sequence on both pool kinds, asserted over the
+  # fold input: same outcome class, one charge per failure, no double
+  # charges, exclusion keying per AD2), plus the AD5 cancel/preempt VM
+  # timing bounds and the establishment window. Dedicated check rather
+  # than another vm-lifecycle-autoscale-k3s subtest: the fixture overlay
+  # (probe deadline pinned to 180s) changes every builder Job's
+  # activeDeadlineSeconds, and the establishment arm alone (~300s
+  # window + rebuild) would blow that group's 1200s budget.
+  #
+  # r[verify sched.attempt.establishment-window]
+  #   establishment arm: a pull-mode pod whose builder is SIGKILLed
+  #   from the host (no SIGTERM-abort report, plain Error pod, nothing
+  #   the controller classifies) stays an open uncharged attempt for
+  #   the whole window, is then charged exactly once as
+  #   executor_crash/unreported by the sweep — only after deadline +
+  #   report-slack (asserted via occurred_at − assigned_at ≥ slack) —
+  #   and the requeued drv still delivers its store path under a fresh
+  #   exec with no further charge.
+  # r[verify ctrl.drain.disruption-target+2]
+  #   preempt arm: patching DisruptionTarget=True on a pull-mode pod
+  #   makes the controller synthesize the preempted report and
+  #   foreground-delete the owning Job (report-then-delete, no
+  #   DrainExecutor hop); pod+Job gone and the attempt closed at the
+  #   report fold within 90s — never the establishment sweep — the
+  #   preempted exec charged exactly once with a non-success
+  #   disruption class, and the requeued drv still delivers. cancel
+  #   arm: the same closed-attempt evidence drives the
+  #   scheduler-cancel successor — CancelBuild closes the attempt, the
+  #   controller foreground-deletes the still-active Job on the
+  #   closed→active edge, the build cgroup/pod/Job are gone within 90s
+  #   and the cancelled exec is charged nothing.
+  vm-pull-canary-k3s = lifecyclePullCanaryMod.mkTest {
+    name = "pull-canary";
+    subtests = [ "pull-canary" ];
+    # Budget: ~240s k3s bring-up + ~80s prelude + stream baseline ~160s
+    # + pool swap & pull equivalence ~175s + cancel arm ~150s + preempt
+    # arm ~200s + establishment arm ~400-470s (the ~300s window
+    # dominates) + cleanup ~30s ≈ 1300-1500s expected on a loaded KVM
+    # runner; 2100s leaves tail headroom without being open-ended.
+    globalTimeout = 2100;
   };
 
   #
