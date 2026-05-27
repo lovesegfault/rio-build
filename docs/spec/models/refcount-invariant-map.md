@@ -1659,3 +1659,194 @@ runbook copy.
 - Rollout, the post-rollout watch, and migration 070's application
   remain deployment-time obligations (checklist rows D6/D7); no
   development-time gate reads them.
+
+## Phase-2 assurance layer
+
+The sections above are the campaign record through the Release B
+landing. This section records the Phase-2 deliverables of design §5's
+Phase-2 row as they were actually exercised: the acceptance table over
+the Stage-C calibration corpus re-stated against the replacement
+architecture, and the Kani decisions for the two §4.6 candidates (the
+collect decision logic and the deferred fallible-parse contract). The
+Phase-2 items this campaign defers rather than executes — retiring the
+as-built `chunkLiveness.qnt` in favor of the model of record,
+re-pointing the surviving G3/G4a/G5 calibration checks, the optional
+MBT-lite integration tests, and the closing bug-sweep rounds — are
+listed with owners and conditions in the campaign close-out, which is
+the final section of this document.
+
+### The acceptance table: the calibration corpus against the replacement architecture
+
+Design §4.6/§5's Phase-2 obligation: every family of the Stage-C
+corpus (G1–G7, plus the M_023/M_033 lessons called out by the design's
+§1) carries a disposition against the architecture the code now runs
+on — the collect cycle of `gc/collect.rs` is the only producer of
+chunk soft-deletes and outbox rows, eligibility is the manifest fold
+recomputed each cycle (server-side fail-closed mark + grace/touch
+term), the counter, the `PlaceholderToken`, the decrement/zero/enqueue
+family, the chunk-aware reap paths, the path-sweep chunk block, and
+the hourly orphan-chunk sweep no longer exist (Release B record), the
+M_023 CHECK and `idx_chunks_gc` are dropped (069), and presence is
+`uploaded_at` only.
+
+The Stage-C table above proved the *as-built model* would re-find each
+encodable bug in the *as-built code*; the family-level re-run at Wave
+A2 entry (T-1a.6) proved the *replacement model* still falsifies when
+the surviving mechanisms are reverted. This table completes the
+obligation per corpus row. Verdict legend, following the retry and log
+campaigns' tables: **CONSTRUCTION** — the state or code path the bug
+lived in does not exist under the replacement; the cited mechanism is
+what replaced it (the residual risk for every such row is a defect in
+the collector itself, owned jointly by the chunkCollect regimes, the
+collector test set, and the differential/EXPLAIN guards). **CHECKED**
+— the mechanism survives deliberately; the named invariant, wired
+check, or test holds the hazard down. **OUTSIDE** — no footprint in
+the chunk-liveness decision path then or now; the named conventional
+vehicle owns it, unchanged by this campaign. Wired-check names are CI
+attrs (`nix/quint.nix`); test names are `rio-store` test functions.
+
+#### G1 — a late or foreign cleanup clobbered someone else's upload
+
+The family-level verdict is CONSTRUCTION for the chunk-accounting
+content (there is no counter, token, or per-hash decrement left for a
+late or foreign cleanup to corrupt) and CHECKED for the surviving
+path-row ownership content (the claim gate on reap/completion and the
+heartbeat survive as path-row janitors).
+
+| Corpus row | Replacement verdict | Mechanism / checker |
+|---|---|---|
+| `1cd975b90` (token-less rollback double-decrement) | CONSTRUCTION | DEC-1 and the `PlaceholderToken` are deleted (Release B); the in-process rollback is the claim-gated `reap_one` row delete, so there is no decrement to double-apply and no foreign hash set to charge. The path-row half is CHECKED: `s4OwnerOnlyMutation` HOLDS in all four `quint-chunk-collect-*` regimes, `quint-chunk-collect-witness-late-cleanup-noop` pins the contended late-cleanup state as reachable, and `rollback_after_reap_and_reupload_is_noop` / `rollback_after_reap_and_fresh_reupload_mid_upload_is_noop` pin the no-op behavior. The retired wired guard is recorded in the Release B calibration-check disposition. |
+| `937a9c928` (completion not claim-gated) | CHECKED | The completion claim gate survives as a path-row janitor. Re-falsified against the replacement model in the acceptance re-run (`refcountCollectG1CompletionUnclaimGated` falsifies the local ownership form and CR-1; the claim-gated baseline HOLDS exhaustively); behavioral coverage stays with the claim-gated completion unit tests (`store.put.placeholder-claim+2`). |
+| `937a9c928` (heartbeat not claim-gated) | CHECKED | `l3NoForeignFreshen` (admission-predicate form) HOLDS in all four chunkCollect regimes; the harm remains an eventuality (delayed reaping), so the claim-gated heartbeat unit tests stay the behavioral pin, exactly as Stage C dispositioned. |
+| `bf7e516e4` C1 (reap matched on path alone) | CONSTRUCTION + CHECKED | The chunk consequence (a foreign reap soft-deleting and enqueuing the successor's chunks) is unconstructible: reaps delete path rows only, and a successor's still-referenced chunk is in the next cycle's mark set by definition. The path-row half is CHECKED by `s4OwnerOnlyMutation` and the late-cleanup-noop witness, plus `upgrade_holds_for_update_against_reaper`. |
+| `ae5f3190b` (rollback hash/size validation) | CONSTRUCTION | The rollback no longer takes a hash list at all (row delete only); the upload-path input validation that remains is OUTSIDE this campaign and keeps its existing unit tests. |
+| `31bd9c512` (scanner staleness re-check inside the reap tx) | CHECKED | The orphan scanner survives as a path-row janitor; reaping a live owner is what `s5LiveOwnerNeverReaped` forbids (HOLDS, all regimes; `quint-chunk-collect-witness-scanner-reap` pins the reap as reachable; `quint-chunk-collect-threshold-order` pins the threshold ordering as load-bearing). The chunk-accounting consequence of a stale-view reap is CONSTRUCTION (nothing to decrement). |
+| `539c2be7c` (reap status re-check inside the tx) | CHECKED | Same treatment as `31bd9c512` — the surviving hazard is path-row-only and sits under S4/S5 plus the existing reap tests. |
+| `31ce52b14` (stale-chunk_list double decrement) | CONSTRUCTION | Reaps no longer read `chunk_list` and no decrement exists; liveness is recomputed from the durable manifests each cycle. |
+
+#### G2 — a cleanup path forgot the chunks (leaked refcounts)
+
+Family-level verdict: CONSTRUCTION. There is no chunk accounting for a
+cleanup path to forget — an unreferenced chunk is an ordinary collect
+victim regardless of which path deleted its manifests, which is also
+why the historical leaks this family produced become reclaimable
+(`live_cycle_collects_stale_refcount_leak`).
+
+| Corpus row | Replacement verdict | Mechanism / checker |
+|---|---|---|
+| `e5bdbff1b` (I-040 inline-only reap) | CONSTRUCTION | A reap that deletes only manifest rows is now the *correct* behavior; the chunks it leaves behind are unmarked next cycle and collected after grace. `quint-chunk-collect-witness-abandoned-upload` pins the crashed-upload garbage shape as reachable, the crash-regime `cr2NoStrandedGarbage` HOLDS structurally, and `live_cycle_collects_stale_refcount_leak` pins the end-to-end reclamation. The retired `quint-refcount-calib-g2-inline-reap` guard is recorded in the Release B disposition. |
+| `dbb42232a` (abort/batch-drop still inline-only) | CONSTRUCTION | Same mechanism; the abort/drop-guard paths are pure path-row janitors (`gt13_batch_chunked_abort_leaves_chunks_unreferenced`, `batch_guard_drop_reaps_placeholders` pin the post-Release-B behavior). |
+| `adfd303d7` C2 (shared chunk decremented once, not N times) | CONSTRUCTION | No by-count arithmetic exists; a chunk shared by N dying manifests is simply absent from the mark fold once all N are gone, however they die. |
+| `d617bf3e5` (M_023 CHECK + orphan-chunk sweep wiring) | CONSTRUCTION + OUTSIDE | The CHECK was dropped by 069 because the quantity it constrained no longer exists (see the M_023 lesson row below). The sweep-wiring half (a background collection loop must exist and run) is OUTSIDE the model, exactly as the Phase-1 input list pre-registered: collector existence/cadence is carried by `run_gc_phase3_runs_live_cycle`, `backstop_first_cycle_waits_one_interval_after_spawn`, `backstop_skips_when_gc_lock_held`, the `RioStoreGcCollectStalled` alert, and the runbook — not by a model invariant. |
+| `8d93ce6c1` (chunk_tenants junction cleanup) | OUTSIDE (subject deleted) | The table was dropped by migration 035 before this campaign began; nothing to disposition. |
+
+#### G3 — the counter was used as an S3-presence signal (data loss)
+
+| Corpus row | Replacement verdict | Mechanism / checker |
+|---|---|---|
+| `dd5c11376` (M_033: row-exists treated as uploaded) | CHECKED | CR-4 survives verbatim: `cr4PresenceFromConfirmedUpload` HOLDS exhaustively in all four chunkCollect regimes; `store.cas.upsert-inserted+2` / `store.chunk.liveness-not-presence` state it; `upsert_returning_sequential_needs_upload_set`, `upsert_returning_concurrent_both_need_upload`, and `sigkill_race_second_uploader_covers` pin the code path. The wired `quint-refcount-calib-g3-counter-presence` regression guard remains against the as-built model (re-pointing at the model of record is deferred — close-out). |
+| `b1c7a9497` (dedup verdict re-queried after the upsert) | CHECKED | The RETURNING-atomic shape is kept and the 068 touch was added to the same statement (the Phase-1 input-list "keep the dedup verdict atomic" item); `store.cas.upsert-inserted+2` pins the wording, `upsert_touch_advances_last_referenced_at` and the upsert-RETURNING tests pin the behavior. |
+| `127168477` (duplicate hashes in one UNNEST batch) | OUTSIDE | Unchanged vehicle: `upgrade_duplicate_hashes_pg_rejects` / `upgrade_deduped_hashes_ok` plus the `fuzz-manifest_deserialize` target. |
+| `00fd5b12d` (PutChunk RPC missed `uploaded_at`) | OUTSIDE (subject deleted) | The RPC was deleted pre-campaign (`c5bb34612`). |
+| G2×G3 joint revert (I-040 stale-skip trace) | CONSTRUCTION + CHECKED | The stale counter the dedup trusted cannot exist (no counter is maintained), and the dedup signal is `uploaded_at` only (CR-4 as above); `i040_inline_delete_stale_row_still_reuploads` pins the historical trace end-to-end. |
+
+#### G4 — collect raced a concurrent re-reference
+
+G4a (chunk-level) mechanisms survive deliberately and stay CHECKED;
+G4b (path-level) stays OUTSIDE exactly as pre-registered. The
+replacement also *adds* two race surfaces this family did not have —
+the mark-snapshot race and the writer-transaction overrun — and both
+carry wired falsification pairs: `quint-chunk-collect-no-touch-falsifies-cr1`
+/ `quint-chunk-collect-witness-mark-miss-touch-saved` (touch/grace is
+load-bearing) and `quint-chunk-collect-writer-overrun-falsifies-cr1` /
+`quint-chunk-collect-writer-bounded` (the §4.1 soundness condition),
+with `live_cycle_spares_uploading_grace_and_touched` and
+`collect_batch_update_rechecks_collect_predicate` as the code-side
+pins and the `RioStoreChunkUpgradeTxSlow` alert as the runtime carrier
+of the writer bound.
+
+| Corpus row | Replacement verdict | Mechanism / checker |
+|---|---|---|
+| `aa738a5d7` (M_006: drain deleted without re-checking) | CHECKED | The drain re-check (now `deleted`-only) and the resurrect path survive; re-falsified against the replacement model (`refcountCollectG4aDrainNoRecheck` falsifies CR-1; contend regime HOLDS as baseline); `quint-chunk-collect-witness-drain-resurrect` pins the contended state; `drain_skips_resurrected_chunk` and `live_cycle_resurrected_chunk_survives_drain` pin the code path. The wired `quint-refcount-calib-g4a-drain-recheck` guard remains against the as-built model. |
+| `a2d4c6cd8` (drain re-check without FOR UPDATE) | CHECKED | The `FOR UPDATE` re-check survives verbatim in `drain.rs`; at model granularity covered by the same module as above; `drain_for_update_serializes_with_upsert` pins the lock interaction. |
+| `a2d4c6cd8` (path_tenants + cycle-reclaim halves) | OUTSIDE (G4b) | Path-level reachability GC, untouched: `store.gc.sweep-path-tenants`, `store.gc.sweep-cycle-reclaim` and the sweep tests. |
+| `2b68855c5`, `261e78c9d`, `7d5ff71dc` (mark-vs-PutPath) | OUTSIDE (G4b) | `store.gc.two-phase`, `store.put.placeholder-refs` and the mark/sweep tests; the path mark CTE is untouched by the campaign. |
+| `62851c73d`, `132446e7e`, `5ba946682`, `adfd303d7` C1/C3, `bf7e516e4` C5 (sweep resurrection/ordering) | OUTSIDE (G4b) | `store.gc.sweep-recheck+2`, `store.gc.sweep-referrer-order`, `store.gc.sweep-cycle-reclaim`, `store.gc.tenant-retention` and their tests, unchanged. |
+
+#### G5 — the repair loops reaped live uploads
+
+| Corpus row | Replacement verdict | Mechanism / checker |
+|---|---|---|
+| `a1b49b4a3` (no heartbeat) | CHECKED | The heartbeat survives as the path-row liveness fence; re-falsified against the replacement model (`refcountCollectG5NoHeartbeat` falsifies S5; baseline HOLDS); `s5LiveOwnerNeverReaped` HOLDS in all four regimes and `quint-chunk-collect-threshold-order` pins the ordering. The late-mark dependency this family carries (uploaded_at-as-presence leans on the heartbeat contract) is closed for the data-loss trace by the T-pre.1 guard and its wired pair `quint-chunk-collect-latemark-guarded` / `quint-chunk-collect-latemark-unguarded-falsifies-cr1`, plus `mark_chunks_uploaded_skips_soft_deleted_rows`. The wired `quint-refcount-calib-g5-no-heartbeat` guard remains against the as-built model. |
+| `064ceadbd` (wall-clock heartbeat + claim plumbing) | CHECKED | Same coverage as `a1b49b4a3` (the model does not distinguish progress-driven from wall-clock heartbeats); the inline-ingest plumbing half stays outside the chunked-upload scope. |
+| `2d7e4f9fd` (I-207: no hot-path reclaim) | CHECKED (latency-only) + CONSTRUCTION (chunk half) | The hot-path reclaim survives as a path-row janitor and its absence is a latency harm, not a safety harm (Stage-C witness-form row); `quint-chunk-collect-witness-hotpath-reclaim` pins that the repair path fires; its former chunk-awareness is deleted (Release B), per the Phase-1 input list's I-207-stays-latency-only item. |
+| `da351aaff`, `f6bf0a546` (spawn_monitored moves) | OUTSIDE | Operability; the G7 treatment below. |
+
+#### G6 — lock order
+
+`595b7ed9b`, `d64dbc4b0`, `5ad99b458`, `bf7e516e4` C4: **OUTSIDE**,
+unchanged from the pre-registration — PG row-lock acquisition order is
+below the model's transaction granularity in both architectures.
+`store.chunk.lock-order` survives with its site list narrowed to the
+upsert, the collect batch (the candidate scan's ascending order, the
+sorted `= ANY` soft-delete, the sorted outbox enqueue — the
+`r[impl store.chunk.lock-order+2]` sites in `gc/collect.rs` /
+`gc/mod.rs`), and the drain's one-row locks; coverage stays with
+`with_sorted_retry`, `upsert_overlapping_no_deadlock`,
+`drain_chunk_lock_released_between_rows`, and
+`drain_skip_locked_disjoint_batches`.
+
+#### G7 — background-loop operability
+
+`bf7e516e4` C2/C3/C6/C7/C9, `adfd303d7` C4, `660825f19`, `947aaba79`,
+`468fd725a`, `a97af109b`: **OUTSIDE**, as pre-registered — and the
+obligation transfers whole to the collector, which is now the single
+producer of soft-deletes (the design §7 single-point-of-non-collection
+risk). The compensating coverage is named: per-batch transaction
+isolation (`live_cycle_per_batch_isolation_on_midcycle_failure`),
+session-state hygiene after success and mid-cycle failure
+(`cycle_leaves_no_session_state_in_pool`,
+`failed_cycle_leaves_no_session_state_in_pool`,
+`temp_table_does_not_leak_across_cycles`), error-outcome visibility
+(`backstop_counts_error_outcome` and the `outcome="error"` counter),
+the cap/cursor drain behavior
+(`live_cycle_cap_stop_then_cursor_resume_drains_backlog`,
+`live_cycle_cap_stop_survives_cursor_loss`,
+`live_cycle_multi_batch_below_cap_collects_all`), the fail-closed
+abort (`validation_failure_aborts_cycle`,
+`live_cycle_parse_failure_collects_nothing`), and the
+`RioStoreGcCollectStalled` / `RioStoreGcCollectParseFailure` alerts
+with their runbook entries. The poison-row livelock analog (L4) stays
+un-modeled, as pre-registered: a poisoned batch fails its own
+transaction, prior batches stay committed, and the cycle surfaces as
+`outcome="error"` plus the stalled alert rather than silent
+non-progress.
+
+#### The M_023 and M_033 lessons, restated against the replacement
+
+| Lesson | Replacement verdict | Mechanism / checker |
+|---|---|---|
+| M_023 — under-counts are never sanctioned (the CHECK was the only runtime enforcement of the counter's meaning) | CONSTRUCTION | The quantity the CHECK constrained no longer exists; there is no maintained aggregate whose under-count could make a referenced chunk eligible. The equivalent hazard — a referenced chunk missing from the mark set — is what the fail-closed mark forbids: `quint-chunk-collect-parse-skip-falsifies-cr1` shows the skip polarity is the data-loss path, the corrupt-regime CR-1 + `noReferencedChunkSwept` HOLD with fail-closed in place, and `mark_expansion_matches_rust_parser` (the differential pinning test) holds the SQL expansion to the Rust definition of a manifest's chunk set. 069's M_069 commentary records why the CHECK had to go first at deployment time. |
+| M_033 — presence is `uploaded_at`, never the liveness signal | CHECKED | `store.chunk.liveness-not-presence` (rule), CR-4 exhaustive in both models, the upsert-RETURNING test set, the i201 probe re-point (Phase 1-pre, consumer-audit row 1), and the i040 selector re-point (Release B, row 2) — no probe or production path infers presence from a liveness signal anywhere in the tree. |
+
+#### Summary
+
+Of the 31 corpus rows above (the 29 Stage-C rows plus the two lesson
+rows), counting each row once by its primary verdict: **10 are
+CONSTRUCTION** — the counter/token/decrement content of G1 (4 rows),
+the forgotten-decrement content of G2 (4 of its 5 rows), the G2×G3
+joint revert, and the M_023 lesson — because the state those bugs
+lived in (the maintained counter and its write-exactly-once
+obligations) no longer exists; **12 are CHECKED** against the
+surviving mechanisms, each with a named wired check and test (the
+claim/heartbeat path-row janitors of G1/G5, the drain re-check and
+resurrect path of G4a, the upsert RETURNING dedup of G3, and the
+M_033 lesson); **9 are OUTSIDE** with their compensating coverage
+named (G4b's path-level GC, G6 lock order, G7 loop operability, the
+two subject-deleted rows, the upsert-batch input-validation row, and
+the spawn_monitored operability row). No row is exposed without a
+named owner. The
+two genuinely new race surfaces the replacement introduces (the
+mark-snapshot race and the writer-transaction overrun) are not corpus
+rows but carry the §4.6 required-falsification pairs as wired CI
+checks, recorded in the chunkCollect section above.
