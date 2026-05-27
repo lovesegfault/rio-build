@@ -173,12 +173,66 @@ impl DagActor {
                 }
             }
         }
+        // A parent can become children-all-produced without any node
+        // becoming Ready (it may already be Substituting/Ready/Running),
+        // so the topdown_pruned re-evaluation runs BEFORE the
+        // newly_ready early-return below.
+        self.clear_topdown_pruned_for_produced_parents(completed)
+            .await;
         if newly_ready.is_empty() {
             return;
         }
         let refs: Vec<&str> = newly_ready.iter().map(DrvHash::as_str).collect();
         self.persist_status_batch(&refs, DerivationStatus::Ready)
             .await;
+    }
+
+    // r[impl sched.merge.substitute-topdown+9]
+    /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
+    /// parents of every hash in `completed` and drop the mark from any
+    /// flagged parent whose children are now ALL produced
+    /// (`children_all_produced` — the same criterion every stamp and
+    /// clear site uses). This is the children-became-produced clearing
+    /// site the merge-time post-reconciliation pass cannot see: that
+    /// pass only sees the children already produced while a merge is
+    /// being ingested, but a pruned node's children are typically
+    /// produced later, by workers or by substitution. Without this
+    /// clear the persisted column would survive into a leader failover
+    /// and the restored mark would wrongly fail-fast a node whose
+    /// closure IS in the store. Per-parent work is flag-gated (one node
+    /// lookup) before the children scan; the PG write is one batched
+    /// best-effort statement (warn-and-continue, same posture as the
+    /// lazy and fail-fast clears — the in-memory clear never depends on
+    /// PG).
+    pub(super) async fn clear_topdown_pruned_for_produced_parents(
+        &mut self,
+        completed: &[DrvHash],
+    ) {
+        let mut candidates: HashSet<DrvHash> = HashSet::new();
+        for c in completed {
+            candidates.extend(self.dag.get_parents(c));
+        }
+        let mut cleared: Vec<String> = Vec::new();
+        for parent in candidates {
+            if self.dag.node(&parent).is_some_and(|s| s.topdown_pruned)
+                && self.children_all_produced(&parent)
+                && let Some(s) = self.dag.node_mut(&parent)
+            {
+                s.topdown_pruned = false;
+                cleared.push(parent.to_string());
+            }
+        }
+        if cleared.is_empty() {
+            return;
+        }
+        debug!(
+            cleared = cleared.len(),
+            "cleared topdown_pruned for parents whose children became produced at completion"
+        );
+        if let Err(e) = self.db.clear_topdown_pruned_by_hashes(&cleared).await {
+            warn!(count = cleared.len(), error = %e,
+                  "failed to clear persisted topdown_pruned after child completion (continuing)");
+        }
     }
 
     // r[impl sched.gc.path-tenants-upsert]

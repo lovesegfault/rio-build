@@ -376,10 +376,11 @@ pub(crate) struct DerivationRow {
     /// nodes ARE stamped; present-but-unbuilt children do not exempt
     /// the node. OR-combined on conflict so an unrelated non-pruned
     /// merge of the same drv never clears it; cleared only once its
-    /// children are all produced (`clear_topdown_pruned_for_parents`
-    /// in the edge-insert transaction, the lazy clear in
-    /// `handle_substitute_complete`) and when the topdown fail-fast
-    /// consumes it.
+    /// children are all produced (the post-reconciliation pass in
+    /// `handle_merge_dag` via `clear_topdown_pruned_by_hashes`, the
+    /// completion-time `clear_topdown_pruned_for_produced_parents`,
+    /// the lazy clear in `handle_substitute_complete`) and when the
+    /// topdown fail-fast consumes it.
     pub topdown_pruned: bool,
 }
 

@@ -147,9 +147,11 @@ impl DagActor {
         // wrongful fail-fast that a resubmit recovers, never the
         // unbounded doomed from-source dispatch. A merge that adds only
         // unbuilt children keeps the mark (they can be reaped unbuilt
-        // later — see `children_all_produced`); the lazy clear in
-        // `handle_substitute_complete` still covers the
-        // children-produced-later case.
+        // later — see `children_all_produced`); once those children are
+        // produced, the completion-time
+        // `clear_topdown_pruned_for_produced_parents` drops it (with the
+        // lazy clear in `handle_substitute_complete` as the walk-failure
+        // backstop).
         let mut clear_candidates: HashSet<DrvHash> =
             ingest.edge_parent_hashes.iter().cloned().collect();
         for child in ingest.cached_hits.keys() {
@@ -1767,17 +1769,22 @@ impl DagActor {
     /// cascade terminal → reap → `children` scrubbed), leaving the node
     /// childless with a never-produced closure and, without the stamp,
     /// eligible for the doomed from-source dispatch. Deliberate trade:
-    /// if a node stamped with unbuilt children later sees them complete
-    /// AND be reaped, one substitute failure can fail-fast where a
-    /// from-source dispatch would have worked — bounded (the fail-fast
-    /// clears the marker it consumes; a resubmit recovers) and strictly
-    /// preferable to the unbounded doomed-dispatch corner. Used by both
+    /// a node stamped alongside unbuilt children carries the mark only
+    /// until those children are produced (the completion-time
+    /// `clear_topdown_pruned_for_produced_parents` drops it then); in
+    /// the residual missed-clear window (e.g. a failover restoring a
+    /// persisted mark whose best-effort PG clear was lost) one
+    /// substitute failure can still fail-fast where a from-source
+    /// dispatch would have worked — bounded (the fail-fast clears the
+    /// marker it consumes; a resubmit recovers) and strictly preferable
+    /// to the unbounded doomed-dispatch corner. Used by both
     /// the in-memory stamping loop in `validate_and_ingest` and the
     /// row-level bind in `persist_merge_to_db` so the two always agree.
     /// Also gates every clear site (the post-reconciliation clear pass
-    /// in `handle_merge_dag` and the lazy clear in
-    /// `handle_substitute_complete`) so stamp and clear always use the
-    /// same criterion.
+    /// in `handle_merge_dag`, the completion-time clear in
+    /// `clear_topdown_pruned_for_produced_parents`, and the lazy clear
+    /// in `handle_substitute_complete`) so stamp and clear always use
+    /// the same criterion.
     pub(super) fn children_all_produced(&self, drv_hash: &str) -> bool {
         let children = self.dag.get_children(drv_hash);
         !children.is_empty()

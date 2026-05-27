@@ -1208,10 +1208,11 @@ impl DagActor {
         // Gate on `get_children().is_empty()`: a backstop for stale
         // flags. The stamp is conditional (closure-dropped nodes whose
         // existing children are not already produced) and a clear only
-        // happens once a node's children are all produced (merge-time,
-        // in memory and in the edge-insert transaction, or lazily
-        // here), so a live flag alongside children — typically unbuilt
-        // ones kept by design — is normal. If R has children the "deps
+        // happens once a node's children are all produced (the
+        // post-reconciliation pass in `handle_merge_dag`, the
+        // completion-time `clear_topdown_pruned_for_produced_parents`,
+        // or lazily here), so a live flag alongside children — typically
+        // unbuilt ones kept by design — is normal. If R has children the "deps
         // were dropped" invariant no longer holds for routing —
         // suppress the fail-fast and fall through to normal
         // Ready/Queued handling instead of collaterally failing a build
@@ -1235,13 +1236,15 @@ impl DagActor {
                     s.topdown_pruned = false;
                 }
                 // Best-effort PG counterpart of the in-memory clear:
-                // this lazy clear is the only clearing site for the
-                // children-produced-later case, and the column is what
-                // a failover restores — left set, a new leader would
-                // resurrect the mark onto a node whose closure IS
-                // produced and a later walk failure would wrongly
-                // fail-fast. Same error posture as the fail-fast's
-                // clear: warn and continue, never fail the handler.
+                // this lazy clear backstops the children-produced-later
+                // case (the completion-time clear in
+                // `clear_topdown_pruned_for_produced_parents` is the
+                // primary site), and the column is what a failover
+                // restores — left set, a new leader would resurrect the
+                // mark onto a node whose closure IS produced and a
+                // later walk failure would wrongly fail-fast. Same
+                // error posture as the fail-fast's clear: warn and
+                // continue, never fail the handler.
                 if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
                     warn!(%drv_hash, error = %e,
                           "failed to clear persisted topdown_pruned after lazy clear (continuing)");
@@ -1833,6 +1836,14 @@ impl DagActor {
         }
         let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
         self.persist_status_batch(&ready_refs, DerivationStatus::Ready)
+            .await;
+
+        // Same completion-time topdown_pruned re-evaluation as the
+        // worker path (`promote_newly_ready_batch`): substitution
+        // success and dispatch-time store hits also turn parents'
+        // children produced, and this path promotes through its own
+        // inline loop above instead of that helper.
+        self.clear_topdown_pruned_for_produced_parents(&ok_hashes)
             .await;
 
         // Per-build (not per-drv): emit one cached event per (drv,
