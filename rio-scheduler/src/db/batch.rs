@@ -115,11 +115,12 @@ impl SchedulerDb {
         // topdown_pruned is OR-combined on conflict for the same reason:
         // an unrelated, non-pruned merge of the same drv elsewhere must
         // never clear a prior pruned merge's marker through the upsert.
-        // Clearing happens elsewhere: `clear_topdown_pruned_for_parents`
-        // in the edge-insert transaction (only for parents whose
-        // children are all already produced), and
-        // `clear_topdown_pruned_by_hash` when the topdown fail-fast
-        // consumes the marker.
+        // Clearing happens elsewhere: `clear_topdown_pruned_by_hashes`
+        // from the post-reconciliation clear pass in `handle_merge_dag`
+        // (only for parents whose children are all already produced and
+        // verified), and `clear_topdown_pruned_by_hash` for the lazy
+        // walk-failure clear and when the topdown fail-fast consumes
+        // the marker.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
@@ -155,10 +156,10 @@ impl SchedulerDb {
             -- union. Monotonically growing — never overwrite.
             --
             -- topdown_pruned: OR — set by pruned merges; this upsert
-            -- never clears it. Cleared by clear_topdown_pruned_for_parents
-            -- (same tx as the edges, only once the children are all
-            -- produced) and by clear_topdown_pruned_by_hash (fail-fast
-            -- consumed it).
+            -- never clears it. Cleared by clear_topdown_pruned_by_hashes
+            -- (post-reconciliation pass, only once the children are all
+            -- produced and verified) and by clear_topdown_pruned_by_hash
+            -- (lazy walk-failure clear; fail-fast consumed it).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -261,20 +262,17 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Clear `topdown_pruned` for derivations whose just-gained
-    /// children are all already produced (`derivation_ids` = the parent
-    /// side of edges inserted in THIS transaction, pre-filtered by the
-    /// caller with `children_all_produced`). A node whose closure is
-    /// produced no longer needs the "must complete via substitution"
-    /// guard — a from-source dispatch is no longer doomed. Run in the
-    /// SAME transaction as `batch_insert_edges`, so a failover can
-    /// never observe THIS merge's edges without its clear. (That is
-    /// the whole guarantee: a row may still carry the flag alongside
-    /// edges written by other merges — e.g. edges to already-completed
-    /// children that recovery no longer loads — which is why the
-    /// fail-fast also clears the flag it consumed.) Mirrors the
-    /// in-memory clear at merge time and the lazy children-all-produced
-    /// clear in `handle_substitute_complete`.
+    /// Tx-scoped batched `topdown_pruned` clear keyed by
+    /// `derivation_id`. No production caller today: the merge-time
+    /// clear that ran here in the edge-insert transaction was replaced
+    /// by the post-reconciliation clear pass in `handle_merge_dag`
+    /// (`clear_topdown_pruned_by_hashes`), which decides per unique
+    /// parent only after `verify_preexisting_completed` has re-verified
+    /// stale Completed children. Retained (test-only, like
+    /// `insert_build_derivation` above) for the DB test pinning the
+    /// OR-on-conflict + clear interplay and for potential future
+    /// tx-scoped use.
+    #[cfg(test)]
     pub(crate) async fn clear_topdown_pruned_for_parents(
         tx: &mut PgConnection,
         derivation_ids: &[Uuid],
@@ -292,6 +290,34 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
         Ok(())
+    }
+
+    /// Best-effort batched `topdown_pruned` clear keyed by `drv_hash`,
+    /// on the pool (outside any transaction). Caller: the
+    /// post-reconciliation clear pass in `handle_merge_dag`, which
+    /// collects the unique parents whose children are all produced
+    /// (and verified) after `reconcile_merged_state` and clears them in
+    /// one statement. Returns the number of rows actually cleared.
+    /// Same error posture as `clear_topdown_pruned_by_hash`: the caller
+    /// warns and continues — the in-memory clear already happened and
+    /// the merge outcome must not depend on this write.
+    pub(crate) async fn clear_topdown_pruned_by_hashes(
+        &self,
+        drv_hashes: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE derivations SET topdown_pruned = false, updated_at = now()
+            WHERE drv_hash = ANY($1) AND topdown_pruned
+            "#,
+        )
+        .bind(drv_hashes)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Best-effort single-row `topdown_pruned` clear, keyed by

@@ -1814,6 +1814,112 @@ async fn test_topdown_pruned_lazy_clear_when_children_produced_at_walk_failure()
 }
 
 // r[verify sched.merge.substitute-topdown+9]
+/// The clear decision must be taken AFTER `verify_preexisting_completed`
+/// (phase 6c) has had its say: a merge that re-adds the edge R → C while
+/// C is `Completed` in the DAG but C's recorded output is gone from the
+/// store (and not substitutable) must NOT clear R's `topdown_pruned`
+/// mark — 6c demotes C back to Ready in the same merge, so R's closure
+/// is NOT in the store and dropping the guard would re-open the doomed
+/// from-source dispatch the mark exists to prevent. A clear computed
+/// before 6c (against the stale Completed status) would be laundered by
+/// exactly the child this merge is about to demote. The mark must
+/// survive in memory AND in PG (the column is what a failover restores).
+#[tokio::test]
+async fn test_topdown_pruned_kept_when_merge_child_is_stale_completed() -> TestResult {
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Full merge: R → C (nothing substitutable → no prune fires).
+    let c_out = test_store_path("tdstale-c-out");
+    let mk_r = || {
+        let mut n = make_node("tdstale-r");
+        n.expected_output_paths = vec![test_store_path("tdstale-r-out")];
+        n
+    };
+    let mk_c = || {
+        let mut n = make_node("tdstale-c");
+        n.expected_output_paths = vec![c_out.clone()];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_c()],
+        vec![make_test_edge("tdstale-r", "tdstale-c")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Stage: C completed earlier and its recorded output has since been
+    // GC'd (never seeded in the mock store, not substitutable); R was
+    // topdown-pruned by an earlier build and is mid-fetch, mark set in
+    // memory and in PG — the post-pruned-merge shape (mirrors the
+    // lazy-clear test's staging above).
+    handle
+        .debug_force_status("tdstale-c", DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_set_output_paths("tdstale-c", vec![c_out.clone()])
+        .await?;
+    handle
+        .debug_force_status("tdstale-r", DerivationStatus::Substituting)
+        .await?;
+    handle.debug_set_topdown_pruned("tdstale-r", true).await?;
+    sqlx::query("UPDATE derivations SET topdown_pruned = true WHERE drv_hash = 'tdstale-r'")
+        .execute(&db.pool)
+        .await?;
+
+    // B2: a full merge that re-adds the edge R → C. C is a pre-existing
+    // Completed candidate whose recorded output is missing and not
+    // substitutable → phase 6c demotes it in this very merge.
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![mk_r(), mk_c()],
+        vec![make_test_edge("tdstale-r", "tdstale-c")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Fixture premise: the stale-Completed child WAS demoted by 6c.
+    let c_post = expect_drv(&handle, "tdstale-c").await;
+    assert!(
+        matches!(
+            c_post.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
+        "fixture premise: stale-Completed child (output GC'd, not \
+         substitutable) must be demoted by verify_preexisting_completed; \
+         got {:?}",
+        c_post.status
+    );
+
+    // The mark must survive: the child this merge re-added is NOT
+    // produced (it was demoted in the same merge), so the clear
+    // criterion does not hold once 6c has run.
+    assert!(
+        expect_drv(&handle, "tdstale-r").await.topdown_pruned,
+        "a merge whose re-added child is stale-Completed (demoted by this \
+         same merge) must NOT clear the in-memory topdown_pruned mark — \
+         R's closure is not in the store"
+    );
+    let (pg,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdstale-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg,
+        "the persisted mark must survive too — clearing it against a \
+         stale-Completed child would let a failover hand R a doomed \
+         from-source dispatch"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+9]
 /// A prune-led merge that fails at the PG-persist step (step 5) must
 /// not leave `topdown_pruned=true` on a pre-existing childless root
 /// shared with an unrelated live build. `cleanup_failed_merge` →
