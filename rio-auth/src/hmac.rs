@@ -1282,15 +1282,23 @@ mod tests {
 
         let assignment_token = signer.sign(&test_claims(3600));
         let mountd_token = signer.sign(&test_mountd_claims("b-alpha_drv", 3600));
+        let service_token = signer.sign(&ServiceClaims {
+            caller: "rio-gateway".into(),
+            expiry_unix: u64::MAX,
+        });
         let executor_token = signer.sign(&ExecutorClaims {
             intent_id: "abc123".into(),
             kind: 0,
             expiry_unix: u64::MAX,
         });
 
-        // Assignment/executor tokens do not admit a Mount.
+        // Assignment/service/executor tokens do not admit a Mount.
         assert!(matches!(
             MountdClaims::verify(&verifier, &assignment_token, "b-alpha_drv"),
+            Err(MountdTokenError::Token(HmacError::Json(_)))
+        ));
+        assert!(matches!(
+            MountdClaims::verify(&verifier, &service_token, "b-alpha_drv"),
             Err(MountdTokenError::Token(HmacError::Json(_)))
         ));
         assert!(matches!(
