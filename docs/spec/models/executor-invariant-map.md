@@ -2293,3 +2293,222 @@ go review reopens them).
   horizon is computed at gate-evaluation time from the live intents;
   it is falsifiable and observable, and it is checked at the 1c'
   gate alongside the model re-target.
+
+### The frozen replacement contract (T-0e.6)
+
+#### The unary signatures and payload reuse (paper freeze; no proto change in Phase 0)
+
+- `PullAssignment(executor_token, intent_id) → WorkAssignment | Gone`
+  — leader-served; one transaction: token↔intent binding check
+  (`sec.executor.identity-token` semantics moved per-unary),
+  Ready→Running transition, `exec_id` mint, `drv_executions` row,
+  GC live-input pin, generation fence (commit only at/above the
+  durable claims floor); re-pulls return the identical payload and
+  `exec_id`; `Gone` = drv no longer wanted, pod exits 0, charge-free.
+  Payload reuse: the existing `WorkAssignment` message (drv path,
+  ATerm, PutPath assignment token, resources, traceparent); the
+  `generation` field is dropped from the contract (kept at most as
+  observability — the fence is transaction-side per T-0e.2).
+  **OA6 rider:** whether the signature carries a third outcome
+  `NotYetReady{retry_after}` (option a) or stays two-outcome with the
+  ready-filter at the spawn side (option b) is the one open hole —
+  the signature does not finally freeze until the OA6 row resolves
+  (no-go condition 8); everything else in this subsection is frozen
+  now and is invariant under either OA6 outcome.
+- `ReportOutcome(exec_id, CompletionReport) → Ack` — leader-served,
+  retried until acked, idempotent by `exec_id` (row-already-terminal
+  ⇒ acknowledged-and-ignored); the report payload is today's
+  `CompletionReport` unchanged; ack ⇒ pod exits 0; report cannot land
+  within the pod's bounded retry budget ⇒ nonzero exit, Job Failed,
+  classification via the pod-terminal path.
+- `ReportAttemptOutcome(attempt identity, terminal status)` —
+  controller→scheduler, the C4/C5 unification: idempotent column fill
+  on the existing open attempt row (`WHERE termination_reason IS
+  NULL` unchanged); a report for an identity with no attempt row is
+  acknowledged and charges nothing (no insert, no budget, no floor
+  bump, no establishment); permitted side effects of the no-attempt
+  arm: clear the intent's ICE cell, re-arm the spawn intent. The
+  controller synthesizes this report whenever it deletes a Job that
+  still has an open attempt (cancel/preempt/reap).
+
+#### The frozen invariant list (what the replacement must preserve)
+
+One row per invariant of the as-built contract: where it is verified
+today (the 0c/0d record above), and what the replacement owes it —
+the named successor property, the by-construction argument, or the
+explicit retire-with-evidence note. "Wired" = a `checks.x86_64-linux`
+entry today; "manual" = the documented manual TLC target from the
+Stage-B record; calib = the permanent `quint-executor-calib-*`
+witness.
+
+| Invariant (family) | Where verified today | What the replacement owes it |
+|---|---|---|
+| `atMostOneLiveStreamPerExecutor` (F1) | Model S by-construction (hijack guard precondition); wired base + fault-stream-msg cfgs; calib evidence module `executor-f1-hijack-accept` (falsifies when the accept gate is removed); `sec.executor.identity-token+2` unit/VM tests | The session-identity class is structural (no streams). The surviving obligation is identity binding: the per-unary token↔intent check (#6 transformed) plus at most one OPEN attempt per (drv, pod) — `AtMostOneOpenAttemptPerJob` in the re-targeted Model S, `drv_attempts_exec_id_uniq` + the pull transaction's row-exists guard in code |
+| `staleStreamEventsAreInert` (F1) | Model S by-construction (I-056a epoch guard); wired cfgs; **wired calib witness** `quint-executor-calib-f1-stale-epoch`; `sched.executor.session-epoch` | Structural (no epochs). The surviving obligation is attribution: a stale pod's report can only fill its own attempt row (`exec_id` keying); a report for a superseded/closed attempt is row-already-terminal ⇒ ignored. Carried by ledger idempotency + re-targeted Model S |
+| `registrationRequiresBothHalves` (F1) | Model S (never-create half by construction, I-048b; both-halves dispatch precondition checked); wired cfgs; `sched.executor.dual-register` | Structural: there is no dispatch and no registration; work binds only at a successful pull (the pull IS both halves). The never-create analogue survives as the no-attempt no-op rule (a report never creates state) — checked at 1a by the red-first no-attempt test and in the re-targeted model |
+| `claimedSlotResolvesAtMostOnce` (F2) | Model S checked; wired base + fault-stream-msg; fault-leader/persist manual re-runs post-fix; `sched.completion.idempotent`, `sched.executor.repair-precedence` | At-most-once resolution keyed by the durable attempt row: terminal fill exactly once (`WHERE termination_reason IS NULL`), `Gone`/establishment/report all converge on the same row, no second resolution after a terminal row. Owed by ledger idempotency (already built) + `fold_report` Kani contract (no transition out of a terminal row) |
+| `unresolvedClaimHasRepairArmed` (F2) | Model S checked (armed-safety); wired cfgs; fault-leader/persist manual re-runs (the 0c defect found here is fixed, `1bbad1ee7`); witnesses noPhantomDrain/noFailoverWithInflight | The armed disjunction re-bases onto: pod alive ⇒ report retry loop armed; pod dead ⇒ Job/pod terminal report path armed; nothing arrives ⇒ establishment sweep armed at deadline+slack (every open attempt is swept — durable, so the 0c "deferred claim forgotten" class is closed structurally). Checked again as the re-targeted Model S armed-safety form at 1c' |
+| `noFabricatedCompletion` (F2) | Model S checked; wired cfgs; `sched.executor.repair-precedence` | Unchanged obligation: repair paths (establishment, synthesize-on-delete, store-probe adopt) never invent a worker outcome; the no-attempt rule never creates rows; the store-probe adopt arm survives in the establishment sweep. Verified by the re-targeted model + the 1b fold-input assertions |
+| `confirmedPhantomIsDrained` (F2, calibration-added) | Model S by-construction; **wired calib witness** `quint-executor-calib-f2-phantom-drain`; wired cfgs re-verified with the conjunct | The phantom class (scheduler-recorded binding the worker never saw) cannot form: there is no push channel, the binding exists only because the worker pulled it. By-construction in the replacement — stated here explicitly as the retirement evidence for the two-strike mechanism (#10), per the 0d contract input |
+| `reportSurvivesStreamChurn` (F2, Model D) | Model D checked; wired base + fault-stream + fault-process cfgs; witnesses noSwapWithReportOwed / noInFlightCellDropped; calib evidence module f2d-eager-swap | The delivery choreography is deleted (1d). The obligation becomes: an unacked report is retried until acked or the pod dies; a died-before-ack pod's outcome arrives via the pod-terminal second installment or establishment. Owed by the report retry loop + AD1 path + the establishment sweep; Model D retires only at 1d with the unary idempotency proofs + chaos VM suite named as carriers |
+| `noExitWithReportOwed` (F2, Model D) | Model D checked; wired cfgs; **wired calib witness** `quint-executor-calib-f2d-exit-owed`; `builder.completion.exactly-once-or-death` | Exit 0 is reserved for `Gone` and post-ack; a pod that cannot land its report exits nonzero (Job Failed ⇒ pod-terminal classification). The drain-gate semantics invert under AD5 (SIGTERM = abort + one bounded report attempt), and that inversion is priced in AD5, not silently lost |
+| `atMostOnceDelivery` (F2, Model D) | Model D checked; wired cfgs | Idempotent `ReportOutcome` by `exec_id`: duplicates acknowledged-and-ignored; never two different outcomes for one attempt (terminal row wins). Kani `fold_report` target |
+| `relayOnlyIntoConfirmed` / `staleAssignmentsRejected` (F2/B5, Model D) | Model D (by construction / checked); wired cfgs; witness noStaleAssignmentRejected | Objectless (no relay, no pushed assignments). The stale-assignment fence's property moves to the transaction-side generation fence (T-0e.2); `StaleAuthorityWritesAreInert` at 1c' is the successor check |
+| `noReapWhileFreshInWorkerTime` (F3) | Model S checked; wired cfgs; **wired calib witness** `quint-executor-calib-f3-stall-credit`; witness noReapAfterStall; `sched.executor.liveness-window` | No scheduler-side liveness verdict exists to get wrong: nothing in the scheduler kills or deregisters a working pod on its own clock. The only time-based action left (establishment sweep) acts only on attempts past deadline+report-slack with no terminal row — the analogue obligation "never establish while the worker is still inside its budget" is carried by the OA1-sized window and checked in the re-targeted model |
+| `silentSlotReapArmed` (F3) | Model S checked (enabled-implies-fires); wired cfgs; calib evidence module f3-reap-strikes | Real death is detected within a bound: kubelet/Job controller observe the pod, `activeDeadlineSeconds` bounds wedges, the pod-terminal report + establishment sweep close the attempt. The bound is the AD5/OA1 budget — signed when OA1 resolves; the 1b VM gate asserts a no-report death is charged exactly once and only after the window |
+| `correlationEntryLifecycle` (F4) | Model S checked; wired cfgs; **wired calib witness** `quint-executor-calib-f4-correlation-entry`; `sched.reassign.no-promote-on-ephemeral-disconnect+4` | The correlation map is deleted; the correlation IS the attempt row keyed by `exec_id` (no TTL race, durable). Owed: the second installment fills only the matching open row; a post-completion death creates nothing (no-attempt rule = the `last_completed` discriminator's successor); first-classifier-wins becomes row-already-terminal |
+| `establishmentOnlyAfterWindowCloses` (F4) | Model S checked; wired cfgs; witness noEstablishment; calib evidence module f4-establish-early | Establishment fires only when deadline + report-slack passes with no terminal row, never earlier, and a non-terminal/no-op report does not establish. Same invariant, re-keyed window (OA1 number); checked in the re-targeted model and asserted in the 1b VM gate |
+| `neverOfferUnrunnableWork` (F5) | Model S checked; wired cfgs; **wired calib witness** `quint-executor-calib-f5-closed-stream` | There is no offer. The surviving obligation is never-spawn/never-admit-unrunnable: kind/system/feature eligibility and the exclusion set move to the spawn-intent gate (AD2); the closed-stream/capacity/draining clauses are structural (no slot state). Static-eligibility content keeps its NOT-ENCODED status — the placeable()/eligibility unit suite is the binding coverage (0d input), re-stated over (excluded_sources, spawnable_sources) per AD2 |
+| `eligibleWorkOfferedWithinBound` (F5) | Model S checked (STARVE_BOUND form); wired cfgs | Bounded progress re-bases onto: Ready intent ⇒ spawn intent emitted (Model J ceiling/headroom + queue, already verified) ⇒ pod pulls or the pull-retry/`activeDeadlineSeconds` policy bounds the wait; starvation-by-bookkeeping has no bookkeeping left to starve on. The freeze-detector observable survives re-keyed to open-attempts/queue age |
+| `rollbackRestoresExactly` (F5) | Model S checked; wired cfgs; witness noRollback | No half-recorded push can exist: the pull transaction commits atomically or the pod retries; nothing to roll back. Kani `admit_pull` idempotency + the 1a double-pull red-first test carry it |
+| `deposedLeaderSessionEventsAreInert` (F6) | Model S checked; fault-leader manual + wired witnesses (noDeposedBeliever, noAdopt, noFailoverWithInflight); calib evidence module f6-deposed-reassign; `sched.lease.standby-drops-writes` + lease-campaign checks | An observed-deposed replica still mutates nothing (the leader gates survive); the deposed-but-unaware residual is now CLOSED at the transaction fence rather than left to the worker-side latch: `StaleAuthorityWritesAreInert` (1c' re-target) + the `admit_pull` floor check. The lease checklist re-derivation (T-0e.2) is the 1c' deliverable |
+| `convergenceToGroundTruth` (F6) | Model S checked (per-action form); wired cfgs; fault-leader manual | Recovery converges from durable state: the ledger fold + the same store-probe adopt-or-reset arm (now inside the establishment sweep); no special-case 45 s timer, no not-yet-heartbeated deferral (the 0c defect class is structurally gone — open attempts are durable and swept every tick). Verified by the re-targeted model + recovery tests |
+| F7 obligations (busy-accuracy, ack arming, report idempotency, dead_nodes) | Stated as Model S guarantees (header); `sched.admin.list-executors*`, `sched.sla.hw-class.ice-mask`, `sched.completion.idempotent`, `sched.admin.hung-node-detector+3`; consumed by the wired spawnCoherence/nodeclaimLifecycle checks | The Model J/N obligation table above IS the contract for these: busy = open attempt (bridge then ledger view), ICE clear = first pull / pod-Ready, report idempotency = the fill guard, dead_nodes = OA2's successor. Re-derived and re-run at 1c'/1d |
+| F8 input hardening | Unit/bounds tests at the gRPC boundary; `sched.executor.input-bounds+2`, `sec.executor.identity-token+2`, etc. | The same hardening applies to the two new unaries (length bounds, token binding, output-membership on reports); no protocol state — stays test-covered, no model obligation |
+| Imported: retry fold (`attemptsChargedOnce`, `verdictMatchesFold`, `failoverPreservesHistory`, atomic append) | retryPolicy.qnt wired regimes (campaign #4, closed) | Keep feeding the fold what §4.3 lists: classified worker-report rows, the pod-terminal second installment, established crashes only after the window, the AD2-re-keyed exclusion/fleet inputs; the pull-mode environment regime (T-0e.3) is the re-derivation vehicle at 1b |
+| Imported: lease (`atMostOneCASWinner`, `boundedDualLeadership`, `staleLeaderHasStaleGeneration`) | leaderElection.qnt wired regimes + witnesses (rio-lease campaign) | All remain consumed; the consumer of the generation ordering moves to the transaction fence (T-0e.2); claim-before-advertise's successor is claim-before-serve; nothing becomes unconsumable |
+| Imported: Model J (`ceilingRespected`, `reapSafety`, `orphanRemoved`, `gateFailClosed`, `ackSoundness`, `ackCoversPending`, `degradedPolarity`) and Model N producer guarantees | spawnCoherence.qnt / nodeclaimLifecycle.qnt wired regimes + witnesses (controller campaign) | Stay imported as the pod-supply environment; single-Job-per-intent stays an assumed-not-proven environment constraint (unchanged); the scheduler-side obligations they import back are the obligation table above |
+
+#### The per-mechanism disposition table, finalized against the 0d calibration
+
+The design §4.2 dispositions, finalized: every "unnecessary" row now
+names the by-construction argument or the successor that carries its
+family's invariant, citing the 0d evidence where the calibration
+sharpened the claim (the AD6 contract runs in both directions — the
+introduced-mechanism list follows the table). Economy-vs-safety
+findings from 0d are folded in where they change the row's
+justification.
+
+Scheduler mechanisms #1–#22:
+
+| # | Mechanism | Disposition | What carries the invariant (0d evidence) |
+|---|---|---|---|
+| 1 | Heartbeat-timeout reaper | Unnecessary | Liveness belongs to kubelet/Job + `activeDeadlineSeconds`; F3's no-false-reap half becomes structural (no scheduler liveness verdict), the real-death bound moves to the AD5/OA1 budget |
+| 2 | Stall credit | Unnecessary with #1 | The worker-time discipline exists to protect workers from the scheduler's own stalls; with no scheduler-side verdict there is nothing to credit. Calib row `1757790f2` shows what it protected — the obligation transfers to the establishment window being measured from durable timestamps, not actor uptime |
+| 3 | Stream-close → disconnect → reassign | Detection unnecessary; requeue survives as the fold's verdict arm | Triggered by terminal classification (report / pod-terminal / establishment) instead of a socket event; charging unchanged (retry-owned) |
+| 4 | Stream-epoch stale-disconnect filter | Unnecessary | No epochs. Attribution survives as `exec_id` keying (frozen-invariant row 2). Calib witness f1-stale-epoch stays wired as the as-built regression guard until 1c' |
+| 5 | Reconnect stale-flag clear | Unnecessary | No reconnect; flags do not exist. 0d found this row's loss was an eligibility/economy regression, not a safety latch (`3082598a3` ENC-A note) — consistent with deletion |
+| 6 | Hijack / intent-mismatch rejection | Survives transformed | Same token↔intent binding check, per-unary at pull/report; `sec.executor.identity-token` unchanged |
+| 7 | Unknown-executor heartbeat drop | Unnecessary | Never-create becomes the no-attempt no-op rule (reports never create state) |
+| 8 | Heartbeat running-build TOCTOU keep | Unnecessary | No competing in-memory view to reconcile; the attempt row is the single record |
+| 9 | Heartbeat adopt | Unnecessary | **0d economy-vs-safety finding:** the `be3ad068e` HOLDS probe shows the adopt arm is economy (re-learn instead of re-run) and execution correlation, not a safety invariant, at session resolution — the deletion is evidence-backed, and the economy loss is priced as: a leader that loses the in-memory binding before the report lands re-runs the build (bounded by the deadline), it never double-charges (first terminal row wins) |
+| 10 | Phantom two-strike + drain | Split | The lost-assignment half cannot form (no push channel — `confirmedPhantomIsDrained` is by-construction in the replacement; calib row `0127cf854` is the as-built evidence and its wired witness stays until 1c'); the lost-completion half is carried by the establishment sweep + `ReportAttemptOutcome` (#17's successor), per the design's own mapping |
+| 11 | Closed-stream dispatch exclusion (I-095) | Unnecessary | No offer path (calib row `96d8092b8` documents what it protected); never-admit-unrunnable moves to the spawn gate (AD2) |
+| 12 | Completion capacity-free hoist + stale-report guard | Survives as ledger idempotency | Already built (retry 1b–2); row-already-terminal is the stale-report guard's successor |
+| 13 | One-shot draining + `last_completed` | Unnecessary | One-shot is structural (the pod exits); the `last_completed` discriminator's job (post-completion deaths create no correlation entry) becomes the no-attempt rule — calib row F4/I-197 maps to it directly |
+| 14 | `recently_disconnected` map + TTL sweep | Unnecessary as in-memory state | The correlation is the attempt row's two installments (durable, no TTL race); the sweep survives only as the establishment sweep; F4's lifecycle invariants re-key onto the row (frozen-invariant rows 13–14) |
+| 15 | Termination-report dedup | Survives as the idempotent fill guard | Already built; the in-memory first-report-wins map goes; obligation-table row 4 |
+| 16 | DeadlineExceeded Job-name prefix-match | Unnecessary | The Job name is the attempt key by construction (deterministic name = intent id) |
+| 17 | Backstop timeout | Shrinks to the establishment sweep | Open attempt past deadline+slack with no terminal row → store-probe → establish per C2; the cancel/quarantine halves go (the Job deadline already killed the pod) |
+| 18 | Dispatch rollback | Unnecessary | The pull transaction commits or the pod retries; no half-recorded state (frozen-invariant row 18) |
+| 19 | 45 s post-failover reconcile | Absorbed into normal recovery | The ledger fold + the same store-probe arm; the deferral special-case (the 0c defect's home) is structurally gone — open attempts are durable rows visited by every sweep, not an in-memory claim a one-shot timer can forget |
+| 20 | Hung-node detector | Moves to the controller (OA2) | AWAITING OWNER for shape/owner/landing or the signed gap; the as-built detector covers only stream-mode pods during the transition (it goes blind per pool at flip), so retention is not coverage — AD6's carried-by-named-successor clause applies |
+| 21 | Leader-transition hygiene | Shrinks | The leader gate stays; the generation-fenced pull/establishment transactions replace the cleared maps (which no longer exist); `StaleAuthorityWritesAreInert` is the 1c' check |
+| 22 | `dispatched_cells` sweep + ICE clear | Survives with a renamed trigger | ICE clears on first pull / pod-Ready; the DAG-state sweep is unchanged; obligation-table rows 2–3 |
+
+Builder side: B1 reconnect loop, B2 relay swap, B3 half-close, B4
+completion-pending drain gate, B6 slot/draining rejection —
+**collapse** into "retry the two unaries until acked" plus the
+existing `BuildSlot`; their Model D invariants' successors are the
+frozen-invariant rows 8–11 (retry loops, nonzero-exit-on-failure,
+idempotent report). B5 generation fence — **replaced**, not deleted
+as objectless: the comparison moves to the pull/establishment
+transactions (T-0e.2); the worker-side latch is deleted with the
+stream at 1c'. B7 idle exit — replaced by the `Gone` exit (and by
+the OA6(a) idle bound if that option is taken). B8 — survives
+trivially as per-unary timeouts. B9 panic-catcher — survives (a
+panic must still produce a report or a nonzero exit). The SIGTERM
+drain gate inverts to abort-and-report per AD5.
+
+Controller side: C1 stale/collision/drift reap — survives unchanged.
+C2 excess-Pending reap — survives, downgraded from correctness to
+economics (an excess pod self-terminates via `Gone`). C3
+orphan-Running reap — busy becomes "an open attempt exists" via the
+chosen §4.5 bridge (the 1a switch), the leader-age arm retires only
+at the cleanup slice, RPC-error/unanswerable arms stay fail-closed
+(obligation-table row 1). C4+C5 — unify into `ReportAttemptOutcome`
+with the synthesize-on-delete rule. C6 DisruptionTarget — synthesize
+the terminal report, then foreground-delete with the AD5 abort
+semantics; successor must be live for a pool at its flip.
+`GetSpawnIntents` / `MintExecutorTokens` / `AckSpawnedIntents` —
+untouched (Model J's subject).
+
+Operator controls: O1 per-executor drain → cordon + AD2 exclusion;
+O2 force-evict → cancel verdict + Job deletion under the AD5 budget;
+O3 fleet stop → pause spawn intents + bulk cancel; all three retire
+their RPC/CLI/dashboard surfaces only at 1c' after the OA5 successor
+view is signed off (the OA5 record above).
+
+Mechanisms the replacement INTRODUCES (the other direction of AD6's
+contract): the pull retry loop, the report retry loop, the controller
+cancel/preempt deletion arm with the synthesized terminal report, the
+`ReportAttemptOutcome` ingestion path, the establishment sweep, the
+transaction-side generation fence, the controller-side node-wedge
+signal (OA2), and — during coexistence only — the §4.5 busy-signal
+bridge. Each enters the Phase-1 plan with its own red-first tests and
+(for the fence and the establishment sweep) its 1c' model coverage.
+
+K8s-native carriers named (rows that delete a mechanism because the
+platform already provides it): kubelet/Job-controller pod liveness
+(#1/#3 detection), `activeDeadlineSeconds` (#17's wall-clock half,
+wedge bound), the deterministic Job name + 409 dedupe (#16, spawn
+identity), foreground deletion + TTL (#13's cleanup half, C2),
+anti-affinity rendering (AD2's exclusion carrier).
+
+#### AD1–AD6 at 0e
+
+| AD | 0e status |
+|---|---|
+| AD1 (controller stays the pod-terminal observer) | Confirmed against the 0a–0d record; nothing in calibration contradicts it; the no-attempt no-op rule is its load-bearing companion. Signed with the go |
+| AD2 (exclusion re-keys to the controller-authoritative node; exhaustion survives re-keyed) | Confirmed; the 0d F5 re-dispositions make the placeable()/eligibility unit suite the binding coverage for the eligibility *content* (no model backstop), and migration ≥067's source column is the durability requirement. The Kani/placeable re-statement is Phase-1 work. Signed with the go |
+| AD3 (pull = Ready→Running, leader-served, idempotent) | Confirmed; the fence rider from T-0e.2 (claims-floor check) is part of the same transaction. Signed with the go |
+| AD4 (no periodic worker→scheduler channel; fence moves transaction-side) | Confirmed; the lease-seam note above is the evidence no guarantee becomes unconsumable. Signed with the go |
+| AD5 (cancel/preempt = synthesized report + Job deletion; SIGTERM = abort; composite latency budget) | Structure confirmed (components: scheduler-verdict→controller-observation latency + one tick + deletion propagation + min(grace, abort-and-report bound)); **the numeric budget is NOT signed at this cut** — it requires the OA1 baseline (AWAITING OWNER). The cancel-timing/preemption-timing VM re-baselines stay scheduled at 1b |
+| AD6 (the disposition table is the deletion-wave contract, both directions) | The finalized table above IS the artifact; signed with the go |
+
+#### The coexistence invariant (1a–1d)
+
+Throughout 1a–1d every controller decision that acts on executor pods
+(orphan-Running reap C3, DisruptionTarget preemption C6) MUST be
+answerable for both protocols: busy = stream `running_build` OR an
+open pull-mode attempt; preemption = force-drain for stream pods,
+synthesized-report + Job deletion for pull-mode pods. A pool template
+may not flip before the consumers it depends on are rewired — this is
+what orders the C3 busy-source change (the §4.5 bridge) into 1a and
+the C6 successor into 1b. Mixed-era accounting: attempt rows do not
+change shape; the only mixed-era surface is the exclusion key
+(pod-name entries from old attempts, node entries from new ones), and
+AD2 carries both keys in the exclusion set during the transition,
+dropping the pod-name key with the old protocol.
+
+#### Controller-campaign ordering, re-confirmed at 0e
+
+Status at this cut (re-checked in `controller-invariant-map.md`): its
+Phase-0 exit-gate verdict is "Met"; **no Phase-1 record or close-out
+exists**, so that campaign is still mid-campaign and a 0e go fires
+its re-pin clause ("executor-lifecycle replacement green-lit
+mid-campaign") in full:
+
+- **F1/F3 prerequisite review (performed now, recorded here).** The
+  controller map's F1 rows (SingleJobPerIntent, CeilingRespected,
+  ReapSafety, OrphanBounded, TickOrdering) and F3 rows (AckSoundness,
+  IceMarkSignalSoundness, NoMassClearAfterFailover) were read against
+  the replacement's peer behavior. Findings: SingleJobPerIntent,
+  CeilingRespected, TickOrdering, NoMassClearAfterFailover are
+  untouched (spawn path unchanged). ReapSafety/OrphanBounded are
+  touched exactly where the obligation table's row 1 says (the busy
+  source changes; the documented busy-but-never-registered residual
+  becomes busy-but-never-pulled and is bounded by ORPHAN_REAP_GRACE
+  re-validation, work item (ii)). AckSoundness is untouched on the
+  arming side; only the clear trigger renames (row 2).
+  IceMarkSignalSoundness's scheduler-side clear ladder gains the
+  first-pull trigger (row 2). No controller-map row is invalidated by
+  the paper contract; the affected rows are exactly the ones already
+  scheduled for re-audit at 1b/1d.
+- **Stage-B re-check with the heartbeat-authority assumptions
+  removed:** carried by the planned 1c'/1d Model J/N checklist
+  re-derivation and check re-runs (obligation table + work items
+  (i)–(iii)), not re-scheduled separately.
+- **Stage-C calibration-table delta pass** on the controller map:
+  added to the Phase-1 input list below as a 1b/1d deliverable signed
+  by that campaign's owner.
