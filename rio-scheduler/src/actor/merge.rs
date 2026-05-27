@@ -2427,10 +2427,12 @@ impl DagActor {
     /// outputs are available (present in store or
     /// upstream-substitutable). The caller prunes the submission to the
     /// demand set, dropping every other node and all edges before
-    /// merge, and stamps `topdown_pruned=true` on the kept nodes —
-    /// flagged non-roots are retained as standalone nodes (like
-    /// multiple roots today) so they get classified, routed to
-    /// substitution, and reported like any other demanded node. The
+    /// merge, and stamps `topdown_pruned=true` on the kept nodes whose
+    /// dependency closure the prune dropped and whose existing DAG
+    /// children (if any) are not already all produced — flagged
+    /// non-roots are retained as standalone nodes (like multiple roots
+    /// today) so they get classified, routed to substitution, and
+    /// reported like any other demanded node. The
     /// actual fetch is deferred (`r[sched.substitute.detached]`) and
     /// runs AFTER the prune commits; on `SubstituteComplete{ok=false}`
     /// for a `topdown_pruned` node, `handle_substitute_complete` fails

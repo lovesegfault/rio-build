@@ -1205,13 +1205,17 @@ impl DagActor {
         // construction; there is no other work to "keep going" with,
         // and leaving the build Active would hang it.
         //
-        // Gate on `get_children().is_empty()`: `topdown_pruned` is set
-        // once at merge and never cleared, so a later full-merge that
-        // adds R's deps to the DAG (while R's fetch is in-flight)
-        // would still see the flag here and collaterally fail that
-        // build even though R IS now buildable. If R has children the
-        // "deps were dropped" invariant no longer holds — clear the
-        // flag and fall through to normal Ready/Queued handling.
+        // Gate on `get_children().is_empty()`: a backstop for stale
+        // flags. The stamp is conditional (closure-dropped nodes whose
+        // existing children are not already produced) and merges that
+        // add children clear it (in memory and in the edge-insert
+        // transaction), but a flag can still be live here while R has
+        // children — e.g. the children-adding merge landed while R's
+        // fetch was in flight, or the children are unbuilt deps kept by
+        // design. If R has children the "deps were dropped" invariant
+        // no longer holds — clear the flag and fall through to normal
+        // Ready/Queued handling instead of collaterally failing a
+        // build whose R IS buildable.
         //
         // Also gate on `!forgiven_now_wanted`: that downgrade means
         // the fetch did NOT definitively fail — it forgave a seed

@@ -1016,7 +1016,7 @@
       {
         "name": "rio_scheduler_topdown_substitute_fail_total",
         "kind": "counter",
-        "help": "Top-down-pruned roots whose deferred substitute fetch failed (build failed fast; resubmit re-probes)"
+        "help": "Top-down-pruned roots that could not complete via substitution (deferred fetch failed, or a wanted output was definitively missing/unsubstitutable at dispatch time) — build failed fast; resubmit re-probes"
       },
       {
         "name": "rio_scheduler_transition_rejected_total",

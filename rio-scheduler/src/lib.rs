@@ -244,7 +244,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_topdown_substitute_fail_total",
-        "Top-down-pruned roots whose deferred substitute fetch failed (build failed fast; resubmit re-probes)"
+        "Top-down-pruned roots that could not complete via substitution (deferred fetch failed, or a wanted output was definitively missing/unsubstitutable at dispatch time) — build failed fast; resubmit re-probes"
     );
     describe_counter!(
         "rio_scheduler_queue_backpressure",

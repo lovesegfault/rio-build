@@ -114,10 +114,11 @@ impl SchedulerDb {
         //
         // topdown_pruned is OR-combined on conflict for the same reason:
         // an unrelated, non-pruned merge of the same drv elsewhere must
-        // never clear a prior pruned merge's marker (the node is still
-        // childless until a merge actually inserts its dep edges — the
-        // only clearing site is `clear_topdown_pruned_for_parents`, in
-        // the same transaction as those edges).
+        // never clear a prior pruned merge's marker through the upsert.
+        // Clearing happens elsewhere: `clear_topdown_pruned_for_parents`
+        // in the same transaction as the edges that give the node
+        // children, and `clear_topdown_pruned_by_hash` when the topdown
+        // fail-fast consumes the marker.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
@@ -152,9 +153,10 @@ impl SchedulerDb {
             -- if either side is empty; otherwise the sorted distinct
             -- union. Monotonically growing — never overwrite.
             --
-            -- topdown_pruned: OR — set by pruned merges, never cleared
-            -- here (cleared only when the node gains children; see
-            -- clear_topdown_pruned_for_parents).
+            -- topdown_pruned: OR — set by pruned merges; this upsert
+            -- never clears it. Cleared by clear_topdown_pruned_for_parents
+            -- (same tx as the edges that give the node children) and by
+            -- clear_topdown_pruned_by_hash (fail-fast consumed it).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
