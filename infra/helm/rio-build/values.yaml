@@ -1112,7 +1112,7 @@ karpenter:
   # Kernel features the operator DECLARES the node AMI was built with.
   # A declaration, not a probe — the chart cannot inspect the running
   # kernel; it can only refuse to render a karpenter-enabled release
-  # whose declared AMI lacks what castore-FUSE needs. _helpers.tpl
+  # whose declared AMI lacks what castore-FUSE needs. templates/karpenter.yaml
   # fails the render when karpenter.enabled and this list is missing
   # FUSE_PASSTHROUGH: without it (kernel < 6.9) every castore open()
   # silently degrades to userspace read round-trips on every builder
