@@ -196,6 +196,36 @@ let
         assert nb == 1, f"worker journald shows {nb} builds, expected 1"
         nf = journal_builds_succeeded(fetcher)
         assert nf == 1, f"fetcher journald shows {nf} builds, expected 1"
+
+    # ── hook-mode FOD: inline derivation carried in the submission ─────
+    # Lives in the COLD variant only: FODs hard-split-route to the
+    # fetcher pool (P0452), and only this fixture provisions one — in
+    # the warm fixture the build would sit unroutable until the global
+    # timeout. Runs AFTER the exact-count metric assertions above, which
+    # this extra build would otherwise perturb.
+    with subtest("hook-mode FOD without .drv upload (inline drv_content)"):
+        # A fixed-output derivation in build-hook mode takes the
+        # content-bound single-node fallback: build-remote sends the
+        # derivation inline via wopBuildDerivation and never uploads the
+        # .drv, so the gateway must embed the serialized derivation in
+        # the submission for the fetcher to execute it. Before
+        # gw.hook.inline-drv-content this flow was accepted but always
+        # failed at the worker ("derivation not found in store").
+        out_fod = client.succeed(
+            "nix build --no-link --print-out-paths "
+            f"--max-jobs 0 --builders '{store_url} x86_64-linux' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "-f ${hookFodDrv} 2>&1 | tail -n1"
+        ).strip()
+        assert out_fod.startswith("/nix/store/"), (
+            f"hook-mode FOD build did not produce a store path: {out_fod!r}"
+        )
+        assert "hook-inline-fod" in out_fod, (
+            f"unexpected hook-mode FOD output name: {out_fod!r}"
+        )
+        # Registered in the rio store → the fetcher really executed the
+        # inline derivation and uploaded the verified output.
+        client.succeed(f"nix path-info --store '{store_url}' {out_fod}")
   '';
 
   warmScript = ''
@@ -320,31 +350,6 @@ let
         # The output is registered in the rio store — the build went
         # through the gateway, not a local fallback builder.
         client.succeed(f"nix path-info --store '{store_url}' {out_hook}")
-
-    # ── hook-mode FOD: inline derivation carried in the submission ─────
-    with subtest("hook-mode FOD without .drv upload (inline drv_content)"):
-        # A fixed-output derivation in build-hook mode takes the
-        # content-bound single-node fallback: build-remote sends the
-        # derivation inline via wopBuildDerivation and never uploads the
-        # .drv, so the gateway must embed the serialized derivation in
-        # the submission for the fetcher to execute it. Before
-        # gw.hook.inline-drv-content this flow was accepted but always
-        # failed at the worker ("derivation not found in store").
-        out_fod = client.succeed(
-            "nix build --no-link --print-out-paths "
-            f"--max-jobs 0 --builders '{store_url} x86_64-linux' "
-            "--arg busybox '(builtins.storePath ${common.busybox})' "
-            "-f ${hookFodDrv} 2>&1 | tail -n1"
-        ).strip()
-        assert out_fod.startswith("/nix/store/"), (
-            f"hook-mode FOD build did not produce a store path: {out_fod!r}"
-        )
-        assert "hook-inline-fod" in out_fod, (
-            f"unexpected hook-mode FOD output name: {out_fod!r}"
-        )
-        # Registered in the rio store → the fetcher really executed the
-        # inline derivation and uploaded the verified output.
-        client.succeed(f"nix path-info --store '{store_url}' {out_fod}")
 
     ${pkgs.lib.optionalString withNomExitTest nomExitScript}
 

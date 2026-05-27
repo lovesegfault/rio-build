@@ -276,7 +276,6 @@ in
 
   # r[verify gw.handshake.untrusted]
   # r[verify gw.hook.single-node-dag+2]
-  # r[verify gw.hook.inline-drv-content]
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
@@ -350,6 +349,7 @@ in
     };
   };
 
+  # r[verify gw.hook.inline-drv-content]
   vm-protocol-cold-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
