@@ -1,5 +1,5 @@
-//! Tenant JWT + assignment HMAC token sign/verify, and the gRPC
-//! interceptor that wires them.
+//! Tenant JWT + assignment HMAC token sign/verify, the Ed25519
+//! mountd admission tokens, and the gRPC interceptor that wires them.
 //!
 //! Extracted from `rio-common`: the auth stack is the largest cohesive
 //! sub-tree in what was a 17-module god crate, and rebuilding every
@@ -11,6 +11,7 @@
 pub mod hmac;
 pub mod jwt;
 pub mod jwt_interceptor;
+pub mod mountd_token;
 
 /// Clock-read errors. Both [`hmac`] and [`jwt`] gate token validity on
 /// "now ≥ epoch"; a pre-epoch system clock means the comparison is
