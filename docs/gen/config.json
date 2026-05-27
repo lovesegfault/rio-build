@@ -417,7 +417,7 @@
         "key": "assignment_revocation.enabled",
         "type": "boolean",
         "default": "true",
-        "description": "Master switch."
+        "description": "Master switch for terminal-build revocation of assignment tokens on the castore read RPCs."
       },
       {
         "key": "assignment_revocation.cache_ttl_secs",

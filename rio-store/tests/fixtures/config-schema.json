@@ -395,7 +395,7 @@
         "type": "object",
         "properties": {
           "enabled": {
-            "description": "Master switch. Default ON. Turn OFF only for a store whose\nPostgres has no scheduler writing `derivations` rows at all\n(then every probe is a guaranteed miss and the check is pure\noverhead). With the scheduler present there is no reason to\ndisable it: the probe is cached and fails open on PG errors.\nSet via `RIO_ASSIGNMENT_REVOCATION__ENABLED`.",
+            "description": "Master switch for terminal-build revocation of assignment tokens\non the castore read RPCs. Default ON. Turn OFF only for a store\nwhose Postgres has no scheduler writing `derivations` rows at all\n(then every probe is a guaranteed miss and the check is pure\noverhead). With the scheduler present there is no reason to\ndisable it: the probe is cached and fails open on PG errors.\nSet via `RIO_ASSIGNMENT_REVOCATION__ENABLED`.",
             "type": "boolean",
             "default": true
           },

@@ -364,8 +364,9 @@ impl Default for BinaryCacheCompat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AssignmentRevocation {
-    /// Master switch. Default ON. Turn OFF only for a store whose
-    /// Postgres has no scheduler writing `derivations` rows at all
+    /// Master switch for terminal-build revocation of assignment tokens
+    /// on the castore read RPCs. Default ON. Turn OFF only for a store
+    /// whose Postgres has no scheduler writing `derivations` rows at all
     /// (then every probe is a guaranteed miss and the check is pure
     /// overhead). With the scheduler present there is no reason to
     /// disable it: the probe is cached and fails open on PG errors.
