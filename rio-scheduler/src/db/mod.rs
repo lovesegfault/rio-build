@@ -26,6 +26,7 @@ mod derivations;
 mod executions;
 mod history;
 mod live_pins;
+pub(crate) mod open_attempts;
 mod recovery;
 mod tenants;
 

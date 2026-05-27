@@ -278,6 +278,12 @@ pub fn describe_metrics() {
         "rio_scheduler_workers_active",
         "Fully-registered workers (stream + heartbeat)"
     );
+    describe_gauge!(
+        "rio_scheduler_open_attempts",
+        "Open pull-mode attempts (active assignment + execution pair minted by \
+         PullAssignment, no terminal classification yet). The pull-mode successor \
+         of workers_active; stream-mode executors stay on workers_active."
+    );
     describe_counter!(
         "rio_scheduler_assignments_total",
         "Total derivation-to-worker assignments"

@@ -2493,6 +2493,21 @@ forget --- so the post-failover "deferred claim forgotten" defect class is
 closed structurally. Stream-mode attempts keep the as-built 60 s correlation
 machinery as their only establishment vehicle during coexistence.
 
+#r("sched.admin.list-open-attempts")[
+  `AdminService.ListOpenAttempts` MUST return every open pull-mode attempt
+  --- an active `assignments` row joined to its `drv_executions` row with
+  `dispatch_mode = 'pull'` and no terminal `drv_attempts` fill --- and MUST
+  NOT list stream-mode executors or stream-mode in-flight builds (those
+  remain `ListExecutors`' surface). Each entry carries the intent id (drv
+  hash), derivation path, `exec_id`, executor identity, source node when
+  known, the assignment's generation, and its age; the response carries
+  `leader_for_secs` with the same fail-closed freshness semantics as
+  #rref("sched.admin.list-executors-leader-age"). The RPC is leader-served.
+]
+The same view feeds the `rio_scheduler_open_attempts` gauge (the pull-mode
+successor of `workers_active`; the stream fleet remains visible via
+`workers_active`) and the establishment sweep.
+
 = Backpressure
 
 The scheduler applies @backpressure at multiple layers to prevent overload:

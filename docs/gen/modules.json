@@ -1010,6 +1010,11 @@
       "doc": "scheduler_live_pins — auto-pin live-build input closure."
     },
     {
+      "path": "db/open_attempts.rs",
+      "depth": 1,
+      "doc": "The ledger-backed open-attempt view (pull-mode dispatch)."
+    },
+    {
       "path": "db/recovery.rs",
       "depth": 1,
       "doc": "Phase 3b: state recovery read queries."

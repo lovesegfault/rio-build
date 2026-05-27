@@ -114,6 +114,7 @@
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_merge_phase_seconds",
+    "rio_scheduler_open_attempts",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
     "rio_scheduler_phase_forward_dropped_total",
@@ -806,6 +807,11 @@
         "name": "rio_scheduler_merge_phase_seconds",
         "kind": "histogram",
         "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+      },
+      {
+        "name": "rio_scheduler_open_attempts",
+        "kind": "gauge",
+        "help": "Open pull-mode attempts (active assignment + execution pair minted by PullAssignment, no terminal classification yet). The pull-mode successor of workers_active; stream-mode executors stay on workers_active."
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

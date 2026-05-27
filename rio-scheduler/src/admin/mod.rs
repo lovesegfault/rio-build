@@ -533,15 +533,46 @@ impl AdminService for AdminServiceImpl {
         ))
     }
 
+    /// Ledger-backed open pull-mode attempt view: the controller's
+    /// busy-signal bridge, the cancel/preempt read, the OA2 clustering
+    /// input, and the operator fleet view. Returns ONLY
+    /// `dispatch_mode = 'pull'` rows (the stream fleet stays on
+    /// `ListExecutors`, untouched), so every RPC consumer is
+    /// pull-filtered by construction. Leader-read with the same
+    /// `ensure_leader` discipline as `ListExecutors`; `leader_for_secs`
+    /// carries the same fail-closed freshness input.
+    // r[impl sched.admin.list-open-attempts]
     #[instrument(skip(self, request), fields(rpc = "ListOpenAttempts"))]
     async fn list_open_attempts(
         &self,
         request: Request<rio_proto::types::ListOpenAttemptsRequest>,
     ) -> Result<Response<rio_proto::types::ListOpenAttemptsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        Err(Status::unimplemented(
-            "ListOpenAttempts is not implemented yet (pull-mode dispatch lands incrementally)",
-        ))
+        self.ensure_leader()?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let rows = db
+            .list_open_pull_attempts()
+            .await
+            .status_internal("list_open_pull_attempts")?;
+        let attempts = rows
+            .into_iter()
+            .map(|r| rio_proto::types::OpenAttempt {
+                intent_id: r.drv_hash,
+                derivation: r.drv_path,
+                exec_id: r.exec_id.to_string(),
+                executor_id: r.executor_id,
+                source_node: r.source_node.unwrap_or_default(),
+                generation: r.generation.max(0) as u64,
+                assigned_at_age_secs: r.age_secs.max(0.0) as u64,
+                // Deadline enrichment (the intent deadline) is consumer
+                // work when a consumer needs it; 0 = unknown for now.
+                deadline_secs: 0,
+            })
+            .collect();
+        Ok(Response::new(rio_proto::types::ListOpenAttemptsResponse {
+            attempts,
+            leader_for_secs: self.leader.leader_for().map_or(0, |d| d.as_secs()),
+        }))
     }
 
     // r[impl sched.admin.list-poisoned]

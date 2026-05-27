@@ -180,6 +180,7 @@ impl DagActor {
         self.tick_gc_orphan_derivations().await;
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
+        self.tick_refresh_open_attempts_gauge().await;
 
         // r[impl sched.actor.dispatch-decoupled]
         // I-163: coalesced dispatch. Heartbeat sets the flag; we drain
@@ -892,5 +893,24 @@ impl DagActor {
                 })
                 .count() as f64,
         );
+    }
+
+    /// Refresh `rio_scheduler_open_attempts` from the durable
+    /// open-attempt view (pull-mode rows only — the stream fleet stays
+    /// visible via `workers_active`). Durable-backed on purpose: open
+    /// pull-mode attempts have no in-memory session state to count, and
+    /// the gauge must survive failover exactly like the rows it counts.
+    /// Best-effort: a PG error keeps the previous reading and is
+    /// retried next tick. Leader-only via the `handle_tick`
+    /// early-return (same posture as `tick_publish_gauges`).
+    pub(super) async fn tick_refresh_open_attempts_gauge(&self) {
+        match self.db.list_open_pull_attempts().await {
+            Ok(rows) => {
+                metrics::gauge!("rio_scheduler_open_attempts").set(rows.len() as f64);
+            }
+            Err(e) => {
+                debug!(error = %e, "open-attempts gauge refresh failed; keeping previous value");
+            }
+        }
     }
 }
