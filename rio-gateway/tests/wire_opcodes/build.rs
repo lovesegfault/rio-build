@@ -3,7 +3,9 @@
 // r[verify gw.opcode.build-derivation+2]
 // r[verify gw.wire.derived-path]
 // r[verify gw.dag.reconstruct+3]
-// r[verify gw.hook.single-node-dag]
+// r[verify gw.hook.single-node-dag+2]
+// r[verify gw.reject.output-path-mismatch]
+// r[verify gw.reject.unsupported-hash-algo]
 // r[verify gw.hook.ifd-detection+2]
 // r[verify gw.stderr.activity+2]
 
@@ -862,6 +864,52 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
         h.scheduler.submit_calls.read().unwrap().len(),
         1,
         "the resolved full-DAG path must be submitted"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline BasicDerivation declaring an
+/// outputHashAlgo the builder cannot verify (md5) is rejected at the
+/// gateway's inline check, before resolve/SubmitBuild — same rule the
+/// cached-DAG algo gate enforces. r[verify gw.reject.unsupported-hash-algo]
+#[tokio::test]
+async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — the inline check must fire on its own.
+    let drv_path = "/nix/store/0000000000000000000000000000000a-inline-md5.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        string: "md5",                           // unsupported algo
+        string: "deadbeefdeadbeefdeadbeefdeadbeef",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("md5") && err.message.contains("sha256"),
+        "error should name the bad algo and the supported set: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "unsupported-algo rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;

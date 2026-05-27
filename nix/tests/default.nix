@@ -274,6 +274,8 @@ in
     inherit pkgs rio-workspace;
   };
 
+  # r[verify gw.handshake.untrusted]
+  # r[verify gw.hook.single-node-dag+2]
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {

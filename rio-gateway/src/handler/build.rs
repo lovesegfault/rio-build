@@ -1154,7 +1154,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 }
 
 // r[impl gw.opcode.build-derivation+2]
-// r[impl gw.hook.single-node-dag]
+// r[impl gw.hook.single-node-dag+2]
 // r[impl gw.hook.ifd-detection+2]
 /// wopBuildDerivation (36): Build a derivation via scheduler.
 ///
@@ -1216,6 +1216,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         );
     }
 
+    // r[impl gw.reject.unsupported-hash-algo]
     // Same early rejection for unverifiable hash algorithms as
     // validate_dag performs on the cached DAG: the builder's FOD hash
     // gate and floating-CA finalization are both fail-closed, so an
@@ -1266,6 +1267,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             }
         }
         Err(e) => {
+            // r[impl gw.reject.output-path-mismatch]
             // Declared-hash (fixed-output) outputs on the inline
             // BasicDerivation get the same trusted-plane binding the
             // cached path gets via validate_dag: declared path must
@@ -1286,6 +1288,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                 );
                 stderr_err!(stderr, "{reason}");
             }
+            // r[impl gw.reject.output-path-mismatch]
             // The precedent for inline checks is the __noChroot check
             // above; this one closes the same bypass for output paths.
             //

@@ -120,6 +120,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 // r[impl gw.handshake.features]
 // r[impl gw.handshake.initial-stderr-last]
 // r[impl gw.handshake.flush-points]
+// r[impl gw.handshake.untrusted]
 #[tracing::instrument(name = "handshake", skip_all)]
 pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -247,6 +248,7 @@ mod tests {
         // Client reads version string + trusted + STDERR_LAST
         let version_str = wire::read_string(&mut reader).await?;
         assert!(version_str.contains("rio-build"));
+        // r[verify gw.handshake.untrusted]
         let trusted = wire::read_u64(&mut reader).await?;
         assert_eq!(trusted, 2, "the gateway must report NotTrusted (2)");
         let stderr_last = wire::read_u64(&mut reader).await?;

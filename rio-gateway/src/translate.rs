@@ -472,6 +472,7 @@ pub fn validate_dag(
         ));
     }
 
+    // r[impl gw.reject.unsupported-hash-algo]
     // Outputs whose declared hash algorithm the builder cannot verify
     // are rejected at submission. For fixed-output derivations the
     // builder's `verify_fod_hashes` is fail-closed (it is the sole
@@ -498,6 +499,7 @@ pub fn validate_dag(
         }
     }
 
+    // r[impl gw.reject.output-path-mismatch]
     // Declared-hash (fixed-output) outputs: bind the declared path to
     // the declared hash and enforce CppNix's single-'out' shape rule.
     // Without this a junk outputHash would exempt an arbitrary declared
@@ -551,6 +553,7 @@ pub fn validate_dag(
 /// `handler::build::enforce_output_path_bindings` — so a single
 /// adversarial closure cannot stall the session reactor or bypass the
 /// per-tenant limiter.
+// r[impl gw.reject.output-path-mismatch]
 pub(crate) fn validate_output_path_bindings(
     nodes: &[types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -1274,6 +1277,7 @@ mod tests {
     /// paths it derives to) passes; declaring somebody else's
     /// well-formed path is rejected; malformed declared paths are out
     /// of scope for this gate (they cannot alias a real store object).
+    // r[verify gw.reject.output-path-mismatch]
     #[test]
     fn validate_dag_binds_ia_declared_paths_to_the_derivation() {
         let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mine.drv";
@@ -1338,6 +1342,7 @@ mod tests {
     /// well-formed static path must not dodge the gate via the
     /// content-bound fast path; genuinely all-content-bound derivations
     /// (all-floating-CA, single-output FOD) keep their fast path.
+    // r[verify gw.reject.output-path-mismatch]
     #[test]
     fn validate_dag_rejects_squatted_path_next_to_floating_ca() {
         let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-camix.drv";
@@ -1390,6 +1395,7 @@ mod tests {
     /// A crafted derivation pairing a deferred (empty-path) output with a
     /// squatted well-formed one must not dodge the path gate via any
     /// drv-level skip.
+    // r[verify gw.reject.output-path-mismatch]
     #[test]
     fn validate_dag_rejects_squatted_path_next_to_deferred_output() {
         let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mixed.drv";
@@ -1488,6 +1494,7 @@ mod tests {
     /// (Regression test for the former 512-level recursion cap, which
     /// turned deep-but-legitimate DAGs into whole-submission
     /// rejections.)
+    // r[verify gw.reject.output-path-mismatch]
     #[test]
     fn validate_output_path_bindings_accepts_deep_ia_chain() {
         let (nodes, cache) = honest_ia_chain(600);
@@ -1554,6 +1561,7 @@ mod tests {
     /// algo alike. Verifiable algorithms (sha256, r:sha512) pass in
     /// both shapes, and input-addressed outputs (no hash, no algo) are
     /// never checked.
+    // r[verify gw.reject.unsupported-hash-algo]
     #[test]
     fn validate_dag_rejects_unverifiable_fod_algo() {
         let fod_drv_at = |algo: &str, hash: &str, path: &str| -> Derivation {
@@ -1666,6 +1674,7 @@ mod tests {
     /// hash at submission: the declared path must equal
     /// `make_fixed_output(declared hash)`. A junk hash can no longer
     /// exempt an arbitrary (victim) path from validation.
+    // r[verify gw.reject.output-path-mismatch]
     #[test]
     fn validate_dag_binds_declared_hash_outputs() {
         let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
