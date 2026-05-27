@@ -500,7 +500,7 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
-            // r[impl sched.merge.authoritative-conflict+2]
+            // r[impl sched.merge.authoritative-conflict+3]
             // Authoritative-content protection. Evaluated BEFORE the
             // resubmit-reset below so the existing node is examined in
             // EVERY lifecycle state — running it after the reset would

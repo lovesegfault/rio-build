@@ -2550,7 +2550,7 @@ fn authoritative_node(tag: &str, content: &[u8]) -> DerivationNode {
     n
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[test]
 fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2577,7 +2577,7 @@ fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[test]
 fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2596,7 +2596,7 @@ fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Res
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[test]
 fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2628,7 +2628,7 @@ fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[test]
 fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2652,7 +2652,7 @@ fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[test]
 fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2677,7 +2677,7 @@ fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
 /// node in a retriable state (Failed / Cancelled / DependencyFailed /
 /// Poisoned-under-budget) cannot be silently redefined by different
@@ -2732,7 +2732,7 @@ fn authoritative_redefinition_rejected_in_retriable_states(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// A poison-budget-exhausted authoritative squat is terminal and gets
 /// displaced by the conflicting verifiable (store-backed) definition —
 /// fresh node without inherited interest or failure history, surfaced in
@@ -2772,7 +2772,7 @@ fn conflicting_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// Cancelled is terminal: a conflicting store-backed definition takes the
 /// displacement path (fresh node, no inherited interest), NOT the
 /// interest-carrying resubmit-reset.
@@ -2808,7 +2808,7 @@ fn conflicting_identity_displaces_cancelled_authoritative_node_without_interest(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// Failed is NOT terminal (the retry machinery still owns it): a
 /// conflicting store-backed submission is rejected, not displaced.
 #[test]
@@ -2840,7 +2840,7 @@ fn conflicting_identity_rejected_while_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// A merge that displaces a poisoned-over-budget squat but fails on a
 /// LATER node in the same submission must restore the squat exactly
 /// (status, bytes, interest, poison accumulator) — displacement rides the
@@ -2887,7 +2887,7 @@ fn rollback_restores_a_displaced_poisoned_squat() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// Floating-CA squat scenario: public attributes (system, output names,
 /// flags) are copyable from the victim's public derivation and floating-CA
 /// expected paths are empty by construction, so a store-backed submission
@@ -2925,7 +2925,7 @@ fn floating_ca_squat_without_evidence_conflicts_in_flight() -> anyhow::Result<()
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// Once the no-evidence conflict target is terminal, the store-backed
 /// definition displaces it instead of being rejected — same displacement
 /// semantics as any other verifiable-identity conflict.
@@ -2959,7 +2959,7 @@ fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 /// Fixed-output derivations carry their content commitment in the expected
 /// output path (derived from the declared hash and bound to the bytes at
 /// ingress), so agreement on a non-empty path is sufficient evidence — no

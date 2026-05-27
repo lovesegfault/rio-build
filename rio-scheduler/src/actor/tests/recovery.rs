@@ -5112,7 +5112,7 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
 /// persisted row carries the DISPLACING identity, so recovery rebuilds
 /// (and re-dispatches) that definition — not the squatter's — and without
 /// the squatter's stale authoritative bytes.
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[tokio::test]
 async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
     let squatter = Uuid::new_v4();

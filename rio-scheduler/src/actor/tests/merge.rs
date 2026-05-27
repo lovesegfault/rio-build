@@ -8791,7 +8791,7 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
 /// identity is what PG persists, the displaced hash stops counting toward
 /// prior interested builds (they complete instead of hanging Active), and
 /// the displaced fresh node belongs to the displacer only.
-// r[verify sched.merge.authoritative-conflict+2]
+// r[verify sched.merge.authoritative-conflict+3]
 #[tokio::test]
 async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
     let (db, handle, _task) = setup().await;

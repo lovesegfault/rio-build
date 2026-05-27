@@ -1586,7 +1586,11 @@ so a retriable re-creation (resubmit after failure / cancel / poison reset)
 refreshes or clears the bytes, while submissions that merely join a live node
 leave its persisted content untouched. Rows written before the column existed
 (or by a pre-upgrade scheduler) recover with empty content and keep the
-pre-durability failure mode for that one window.
+pre-durability failure mode for that one window. Restoration applies to
+poisoned-row recovery as well: a recovered `poisoned` node carries the same
+bytes, authoritative flag, identity, and recomputed CA modular hash it held
+while live, so the authoritative-conflict gate keeps holding across a leader
+failover instead of being silently disabled for poisoned nodes.
 
 #r("sched.recovery.inline-drv-ca-hash")[
   A recovered derivation carrying authoritative inline content that is
@@ -1604,7 +1608,7 @@ cannot drift, no migration is needed, and a row whose bytes fail to parse
 degrades to an unset hash (the build still completes; only realisation
 registration is lost, with a warning).
 
-#r("sched.merge.authoritative-conflict+2")[
+#r("sched.merge.authoritative-conflict+3")[
   A node whose in-memory state carries authoritative inline derivation
   content MUST NOT be redefined by a later submission for the same
   `drv_hash`: a submission that itself claims authoritative content MUST be
@@ -1616,12 +1620,20 @@ registration is lost, with a warning).
   on a non-empty fixed-output expected path, or a byte-equal CA modular
   hash. A store-backed submission whose identity conflicts --- or that
   carries no content-bound evidence --- MUST be rejected while the node is
-  non-terminal and MUST displace it as a fresh node --- without inheriting
-  the old node's interest --- once it is terminal. Displacement MUST
-  refresh the persisted recovery row to the displacing submission's
-  verifiable identity with its status reset to the creation snapshot, and
-  MUST remove the displaced node from prior interested builds' completion
-  accounting. Both rejections surface as `FAILED_PRECONDITION`.
+  non-terminal and MUST displace it as a fresh node once it is terminal. A
+  store-backed submission whose identity matches MUST also displace the
+  node --- rather than join it --- when the node sits in a terminal failure
+  state that is no longer retriable on resubmit, so a poison-locked
+  authoritative claim cannot capture later legitimate submissions for the
+  remainder of its poison TTL. Displacement MUST NOT carry the displaced
+  node's interest or failure accounting into the fresh node, MUST refresh
+  the persisted recovery row to the displacing submission's verifiable
+  identity with its status reset to the creation snapshot, and MUST remove
+  the displaced node from the completion accounting of prior interested
+  builds that are still non-terminal at displacement time --- builds
+  already terminal at that moment keep their settled accounting --- and
+  that removal MUST survive leader failover. Both rejections surface as
+  `FAILED_PRECONDITION`.
 ]
 The byte-equality arm makes the legitimate producer's behaviour (identical
 hook-fallback resubmissions) a no-op while closing the cross-tenant
@@ -1629,22 +1641,69 @@ pre-squat: a predictable `drv_path` cannot be claimed with attacker bytes
 and then silently joined by --- or built on behalf of --- the victim's
 submission. Public attributes alone are copyable from the victim's public
 derivation, and floating-CA expected paths are empty by construction, so a
-match must additionally rest on content the submitter cannot fake: a
-fixed-output expected path commits to the declared output hash (and ingress
-binds it to the authoritative bytes), and the CA modular hash is recomputed
-from the bytes at ingress, so agreement means byte-level knowledge of the
-same derivation (forging it requires a SHA-256 preimage). Identical content
-still joins: the hook receives an already-resolved derivation --- CppNix
-resolves CA derivations before hook dispatch (the building goal asserts
-`inputDrvs` is empty) --- so the fallback's modular hash equals the
+match must additionally rest on content evidence. The two forms guarantee
+different things: for a floating-CA derivation the modular hash is
+recomputed from the bytes at ingress, so agreement means byte-level
+knowledge of the same derivation (forging it requires a SHA-256 preimage);
+for a fixed-output derivation the expected path commits only to the
+declared output hash --- it is derivable from the public `(name, algo,
+hash)` triple --- so agreement guarantees the same content-defined output
+(which the store independently verifies on upload), not knowledge of the
+same builder. That weaker FOD guarantee is deliberate: covering builder,
+arguments, or environment would over-reject legitimate identical-output
+joins, and the residual harm is availability-only --- a squat that joins
+and fail-fasts can cost a joiner one spurious failure or a bounded wait,
+and a genuinely dead FOD at most one extra poison cycle --- which the
+match-displacement clause bounds by refusing to let a poison-locked claim
+hold the hash for its TTL. Tenant-scoped poisoning and stronger FOD
+evidence were considered and rejected as disproportionate. Identical
+content still joins: the hook receives an already-resolved derivation ---
+CppNix resolves CA derivations before hook dispatch (the building goal
+asserts `inputDrvs` is empty) --- so the fallback's modular hash equals the
 full-form hash a store-backed submission of the same derivation computes.
 The gate is evaluated against the existing node in every lifecycle state
 (before any resubmit-reset is applied), and terminal includes a
 poison-budget-exhausted node, so a squat cannot dodge the rule by parking
 in a retriable or poisoned state. Displaced interest is not carried;
-instead the displaced hash stops counting toward prior interested builds
-(they keep any results already received), so those builds neither hang nor
-get silently re-pointed at a definition they never submitted.
+instead the displaced hash stops counting toward still-running prior
+interested builds (they keep any results already received), so those
+builds neither hang nor get silently re-pointed at a definition they never
+submitted, while builds that already finished are history and keep their
+settled counts. The removal is made durable by deleting those prior
+builds' `build_derivations` links in the same transaction as the
+recreate-refresh, so a recovery rebuilt purely from the database cannot
+re-point them at the displacing definition.
+
+#r("sched.merge.authoritative-claim-no-redefine")[
+  A submission claiming authoritative inline content that lands on an
+  existing store-backed (non-authoritative) node MUST NOT redefine it
+  through the resubmit path: when the existing node is eligible for a
+  resubmit-reset, the claim MUST be rejected as `FAILED_PRECONDITION`
+  unless its verifiable identity matches the existing node's, in which case
+  it is admitted through the normal resubmit-reset and its bytes are
+  adopted. An authoritative claim MUST NOT displace a store-backed node.
+]
+A live or non-retriable store-backed node keeps its existing semantics: the
+incoming claim joins it and the claimed bytes are ignored. Without this arm
+a parked (failed, cancelled, or poison-reset) store-backed definition could
+be silently redefined by an attacker's claim through the resubmit-reset,
+carrying the prior builds' interest onto attacker-chosen content; with it,
+an authoritative claim can only ever adopt a definition it can prove it
+shares.
+
+#r("sched.merge.displaced-failure-reset")[
+  Displacement MUST reset every failure-derived column of the displaced
+  derivation's persisted row --- poison state, failed-builder set, retry
+  and resubmit counters, status, and the reactive resource floors --- and
+  the displacing definition's in-memory node MUST NOT inherit the displaced
+  node's resource floors. Administrative poison clears, TTL expiry, and
+  same-definition resubmits keep their floor-preserving semantics.
+]
+Failure attribution and reactive sizing must not cross the definition
+boundary: the floors were ratcheted by the displaced definition's failures,
+and letting the displacing definition inherit them would permanently
+dispatch the victim at ceiling sizes (the floors never decay and survive
+failover).
 
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from
@@ -1673,6 +1732,24 @@ identity, and without the snapshot refresh a leader failover would rebuild
 the node from the displaced squatter's identity, silently undoing the
 displacement. Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
+
+#r("sched.persist.atomic-activation")[
+  The merge-time persistence of (re)created derivation rows,
+  build-derivation links, edges, and the durable displacement prune MUST
+  commit in the same transaction as the owning build's `pending` to
+  `active` status update. A merge that fails before that single commit
+  point MUST leave every pre-existing derivation row --- including
+  displaced and resubmit-reset nodes' status, identity, and authoritative
+  inline content --- exactly as its prior creation persisted it.
+  Best-effort accounting resets (poison clears, the displaced-row failure
+  reset) MUST run only after that commit.
+]
+With one commit point, "the build was accepted" and "its rows are durable"
+are the same event: a submission rejected late (or a leader that dies
+mid-merge) leaves either nothing or a `pending` build row that orphan
+handling already covers, never a half-committed displacement or a cleared
+authoritative blob for a build that was never activated, and recovery needs
+no compensating logic.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to
