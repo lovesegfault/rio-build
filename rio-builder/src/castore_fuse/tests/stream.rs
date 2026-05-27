@@ -895,6 +895,45 @@ async fn streaming_open_reclaims_an_orphaned_partial() {
     );
 }
 
+/// An enforce-mode store replica that has not seen this build's closure
+/// answers the fill's StatBlob with `CASTORE_SCOPE_REQUIRED`: the fill
+/// re-presents and retries inside its own budget — and does NOT
+/// misread the denial as the inline-manifest `FailedPrecondition`
+/// (which would silently fall back to ReadBlob and hit the same
+/// denial).
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_fill_represents_on_scope_required() {
+    let h = harness_scoped(scoped_test_closure()).await;
+    h.mock.accept_present();
+    h.mock.require_scope();
+    let content = patterned(5000);
+    let (digest, _chunks) = h.mock.seed_chunked_blob(&content, 1000, 16);
+
+    let (fill, case) = unwrap_streaming(
+        ensure_readable_blocking(&h.open_path, digest, content.len() as u64)
+            .await
+            .expect("the streaming open succeeds after the re-present"),
+    );
+    assert_eq!(case, OpenCase::MissStream);
+    assert_eq!(
+        read_blocking(&fill, 0, content.len() as u32).await.unwrap(),
+        content
+    );
+    assert_eq!(h.mock.present_closure_calls(), 1, "one re-present");
+    assert_eq!(
+        h.mock.stat_blob_calls(),
+        2,
+        "StatBlob denied once then served"
+    );
+    assert_eq!(
+        h.mock.read_blob_calls(),
+        0,
+        "the scope denial must not trigger the inline-manifest ReadBlob fallback"
+    );
+    assert!(!h.open_path.circuit.is_open());
+}
+
 /// The streaming fill's RPCs (StatBlob for the chunk window, GetChunks
 /// for the misses) carry the build's assignment token, same as the
 /// whole-file path — the store's tenant gate applies to them equally.

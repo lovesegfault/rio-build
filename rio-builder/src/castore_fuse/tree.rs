@@ -24,7 +24,7 @@ use prost::Message;
 use rio_proto::castore::{Directory, RootNode, root_node};
 use rio_proto::types::{GetDirectoryRequest, get_directory_request};
 
-use crate::store_fetch::StoreClients;
+use crate::store_fetch::{ScopePresenter, StoreClients};
 
 /// Standard 512-byte block size reported in every [`FileAttr`].
 const BLOCK_SIZE: u32 = 512;
@@ -497,7 +497,9 @@ fn make_attr(ino: u64, kind: FileType, size: u64, perm: u16) -> FileAttr {
 /// One `GetDirectory(recursive=true)` call seeded with ALL `Dir` roots'
 /// digests in field 3 (the multi-root extension) — one RPC for the
 /// whole closure instead of one per root (the I-110 PG-wall lesson).
-/// The whole call is wrapped in `timeout(dag_prefetch_timeout)`; expiry
+/// The presentation of the build's input closure (`scope`,
+/// `r[builder.castore.scope-present]`) and the prefetch share one
+/// `timeout(dag_prefetch_timeout)`; expiry
 /// is an infrastructure retry, not a build failure (the build never
 /// started, no partial state).
 ///
@@ -506,13 +508,16 @@ fn make_attr(ino: u64, kind: FileType, size: u64, perm: u16) -> FileAttr {
 /// encodings (`r[store.castore.canonical-encoding]`), so re-encoding
 /// the decoded message reproduces the digest. Duplicate bodies (the
 /// server already dedupes, but a malicious/buggy server might not) are
-/// idempotent inserts.
+/// idempotent inserts — which is also what makes the scope-required
+/// re-present-and-retry below safe to re-run the stream.
 // r[impl builder.fs.castore-dag-source]
+// r[impl builder.castore.scope-present]
 pub async fn build_tree(
     store: &StoreClients,
     roots: &[(String, RootNode)],
     dag_prefetch_timeout: Duration,
     assignment_token: &str,
+    scope: &ScopePresenter,
 ) -> Result<InoMap, TreeError> {
     let started = std::time::Instant::now();
 
@@ -529,31 +534,43 @@ pub async fn build_tree(
     }
 
     let mut dirs: HashMap<[u8; 32], Directory> = HashMap::new();
-    if let Some((first, rest)) = dir_roots.split_first() {
-        // The assignment token is how rio-store's tenant gate
-        // authenticates this build's castore reads — without it the
-        // call is rejected before any Directory body is streamed.
-        let req = crate::store_fetch::authed_request(
-            GetDirectoryRequest {
-                by_what: Some(get_directory_request::ByWhat::Digest(first.clone())),
-                recursive: true,
-                digests: rest.to_vec(),
-            },
-            assignment_token,
-        )?;
-        let mut client = store.directory.clone();
-        let fetch = async {
-            let mut stream = client.get_directory(req).await?.into_inner();
-            while let Some(body) = stream.message().await? {
-                let digest = *blake3::hash(&body.encode_to_vec()).as_bytes();
-                dirs.insert(digest, body);
-            }
-            Ok::<_, tonic::Status>(())
-        };
-        tokio::time::timeout(dag_prefetch_timeout, fetch)
-            .await
-            .map_err(|_| TreeError::PrefetchTimeout(dag_prefetch_timeout))??;
-    }
+    let prefetch = async {
+        // Establish the closure read scope BEFORE the build's first
+        // castore read: this channel is new to this build, so an
+        // enforce-mode store replica has (usually) never seen the
+        // closure. Best-effort — the scope-aware retry below covers a
+        // replica the presentation didn't reach.
+        scope.present_on_new_channel().await;
+        if let Some((first, rest)) = dir_roots.split_first() {
+            scope
+                .run_scoped("get_directory", async || {
+                    // The assignment token is how rio-store's tenant gate
+                    // authenticates this build's castore reads — without
+                    // it the call is rejected before any Directory body
+                    // is streamed.
+                    let req = crate::store_fetch::authed_request(
+                        GetDirectoryRequest {
+                            by_what: Some(get_directory_request::ByWhat::Digest(first.clone())),
+                            recursive: true,
+                            digests: rest.to_vec(),
+                        },
+                        assignment_token,
+                    )?;
+                    let mut client = store.directory.clone();
+                    let mut stream = client.get_directory(req).await?.into_inner();
+                    while let Some(body) = stream.message().await? {
+                        let digest = *blake3::hash(&body.encode_to_vec()).as_bytes();
+                        dirs.insert(digest, body);
+                    }
+                    Ok::<_, tonic::Status>(())
+                })
+                .await?;
+        }
+        Ok::<_, tonic::Status>(())
+    };
+    tokio::time::timeout(dag_prefetch_timeout, prefetch)
+        .await
+        .map_err(|_| TreeError::PrefetchTimeout(dag_prefetch_timeout))??;
 
     let map = InoMap::assemble(roots, dirs)?;
     metrics::histogram!("rio_builder_castore_dag_prefetch_seconds")

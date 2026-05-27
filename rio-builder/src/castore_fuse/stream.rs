@@ -47,7 +47,7 @@ use super::circuit::CircuitBreaker;
 use super::fs::read_at_full;
 use super::mountd_client::MountdClient;
 use crate::IgnorePoison;
-use crate::store_fetch::StoreClients;
+use crate::store_fetch::{ScopePresenter, StoreClients};
 
 /// How many chunks ahead of the assembly cursor the fill probes the
 /// node chunk cache and requests remote misses. Bounds the
@@ -238,6 +238,12 @@ pub(super) struct FillContext {
     /// (`StatBlob`, `GetChunks`, the `ReadBlob` fallback) — the store
     /// derives the caller's tenant from it.
     pub assignment_token: String,
+    /// The build's closure-scope presenter (ADR-022 P0591), shared with
+    /// the mount-time prefetch and the whole-file path: the fill's
+    /// scoped reads (`StatBlob`, the `ReadBlob` fallback) re-present and
+    /// retry through it on `CASTORE_SCOPE_REQUIRED`. The chunk RPCs are
+    /// digest-as-capability and never scoped.
+    pub scope: Arc<ScopePresenter>,
     /// The in-flight fill registry this fill deregisters from when it
     /// finishes (so the next opener of a failed digest starts fresh).
     pub registry: Arc<Mutex<HashMap<[u8; 32], Arc<StreamFill>>>>,
@@ -252,6 +258,11 @@ enum FillError {
     /// rio-store unreachable or a gRPC stream failed (counts against
     /// the fetch circuit breaker).
     Store(String),
+    /// The store still demands a closure presentation
+    /// (`CASTORE_SCOPE_REQUIRED`) after the bounded re-presents — an
+    /// authorization-coordination failure, deliberately NOT counted
+    /// against the fetch circuit breaker (ADR-022 P0591).
+    ScopeRequired(String),
     /// Bytes did not match a content address (a chunk's blake3, the
     /// whole-file digest, or a malformed chunk window).
     Integrity(String),
@@ -321,6 +332,14 @@ fn run_fill(ctx: &FillContext, fill: &Arc<StreamFill>) {
             tracing::warn!(error = %msg, "castore-fuse: streaming fill failed fetching from rio-store");
             Some(Errno::EIO)
         }
+        Err(FillError::ScopeRequired(msg)) => {
+            tracing::warn!(
+                error = %msg,
+                "castore-fuse: streaming fill denied pending closure presentation \
+                 (CASTORE_SCOPE_REQUIRED still unresolved after re-presenting)"
+            );
+            Some(Errno::EIO)
+        }
         Err(FillError::Integrity(msg)) => {
             metrics::counter!("rio_builder_castore_fuse_integrity_fail_total").increment(1);
             tracing::error!(error = %msg, "castore-fuse: streaming fill integrity failure");
@@ -340,7 +359,8 @@ fn run_fill(ctx: &FillContext, fill: &Arc<StreamFill>) {
     };
     // The breaker watches store reachability: only store-side failures
     // (and timeouts, which on this path are dominated by the remote
-    // transfer) count against it.
+    // transfer) count against it. ScopeRequired is excluded by design
+    // (ADR-022 P0591): it is a coordination signal, not a health signal.
     match &outcome {
         Ok(()) => ctx.circuit.record(true),
         Err(FillError::Store(_) | FillError::Timeout) => ctx.circuit.record(false),
@@ -581,30 +601,42 @@ enum StatOutcome {
 
 /// `StatBlob(file_digest, send_chunks=true)` bounded by the fill
 /// deadline. Transport-level failures get the short in-budget transient
-/// retry (`store_fetch::retry_transient`) — the loop runs inside `left`,
+/// retry (`store_fetch::retry_transient`); a `CASTORE_SCOPE_REQUIRED`
+/// answer gets the closure re-present-and-retry
+/// (`r[builder.castore.scope-present]`) — both loops run inside `left`,
 /// so the fill's overall deadline and its single breaker record are
 /// unchanged.
+// r[impl builder.castore.scope-present]
 fn stat_blob(ctx: &FillContext, deadline: Instant) -> Result<StatOutcome, FillError> {
     let left = remaining(deadline)?;
     let resp = ctx.runtime.block_on(async {
         tokio::time::timeout(
             left,
-            crate::store_fetch::retry_transient("stat_blob", async || {
-                let req = crate::store_fetch::authed_request(
-                    StatBlobRequest {
-                        file_digest: ctx.file_digest.to_vec(),
-                        send_chunks: true,
-                    },
-                    &ctx.assignment_token,
-                )?;
-                let mut directory = ctx.clients.directory.clone();
-                directory.stat_blob(req).await
+            ctx.scope.run_scoped("stat_blob", async || {
+                crate::store_fetch::retry_transient("stat_blob", async || {
+                    let req = crate::store_fetch::authed_request(
+                        StatBlobRequest {
+                            file_digest: ctx.file_digest.to_vec(),
+                            send_chunks: true,
+                        },
+                        &ctx.assignment_token,
+                    )?;
+                    let mut directory = ctx.clients.directory.clone();
+                    directory.stat_blob(req).await
+                })
+                .await
             }),
         )
         .await
     });
     match resp {
         Err(_elapsed) => Err(FillError::Timeout),
+        // A scope-required answer that survived the re-present loop is
+        // NOT the inline-manifest signal — falling through to ReadBlob
+        // would just hit the same denial.
+        Ok(Err(status)) if ScopePresenter::is_scope_required(&status) => {
+            Err(FillError::ScopeRequired(format!("StatBlob: {status}")))
+        }
         // The documented "no chunk list — use ReadBlob" signal
         // (store.proto StatBlob): an inline manifest, not a failure.
         Ok(Err(status)) if status.code() == tonic::Code::FailedPrecondition => {
@@ -635,20 +667,26 @@ fn fill_from_read_blob(
     let mut stream = match ctx.runtime.block_on(async {
         tokio::time::timeout(
             left,
-            crate::store_fetch::retry_transient("read_blob_connect", async || {
-                let req = crate::store_fetch::authed_request(
-                    rio_proto::types::ReadBlobRequest {
-                        file_digest: ctx.file_digest.to_vec(),
-                    },
-                    &ctx.assignment_token,
-                )?;
-                let mut directory = ctx.clients.directory.clone();
-                directory.read_blob(req).await
+            ctx.scope.run_scoped("read_blob_connect", async || {
+                crate::store_fetch::retry_transient("read_blob_connect", async || {
+                    let req = crate::store_fetch::authed_request(
+                        rio_proto::types::ReadBlobRequest {
+                            file_digest: ctx.file_digest.to_vec(),
+                        },
+                        &ctx.assignment_token,
+                    )?;
+                    let mut directory = ctx.clients.directory.clone();
+                    directory.read_blob(req).await
+                })
+                .await
             }),
         )
         .await
     }) {
         Err(_elapsed) => return Err(FillError::Timeout),
+        Ok(Err(status)) if ScopePresenter::is_scope_required(&status) => {
+            return Err(FillError::ScopeRequired(format!("ReadBlob: {status}")));
+        }
         Ok(Err(status)) => return Err(FillError::Store(format!("ReadBlob: {status}"))),
         Ok(Ok(resp)) => resp.into_inner(),
     };

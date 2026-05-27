@@ -4,7 +4,8 @@
 //! fetch paths: the per-build gRPC client bundle ([`StoreClients`]),
 //! the crate-internal assignment-token request wrapper
 //! (`authed_request`), the in-budget transient-retry policy for
-//! JIT/streaming fetches, and the
+//! JIT/streaming fetches, the per-build closure-scope presenter
+//! ([`ScopePresenter`], ADR-022 P0591 Phase 2), and the
 //! size-aware JIT fetch-timeout helper ([`jit_fetch_timeout`]). The
 //! FUSE-typed callers (the `open()` whole-file fetch, the streaming
 //! fill task, the DAG prefetch) live in `castore_fuse::{open,stream,
@@ -15,6 +16,7 @@ use std::time::Duration;
 use tonic::transport::Channel;
 
 use rio_proto::store::chunk_service_client::ChunkServiceClient;
+use rio_proto::types::PresentClosureRequest;
 use rio_proto::{DirectoryServiceClient, StoreServiceClient};
 
 /// gRPC client bundle for store fetches.
@@ -74,6 +76,297 @@ pub(crate) fn authed_request<T>(
     let mut req = tonic::Request::new(msg);
     crate::upload::common::attach_assignment_token(&mut req, assignment_token)?;
     Ok(req)
+}
+
+/// Re-presentations of the input closure allowed per castore read
+/// operation when the store keeps answering `FAILED_PRECONDITION` +
+/// `CASTORE_SCOPE_REQUIRED` (ADR-022 P0591). Each re-present is one
+/// cheap idempotent unary plus one retry of the read, all inside the
+/// caller's existing per-operation budget — the bound only exists so a
+/// pathological store (or an L7 balancer ping-ponging every retry to a
+/// replica that immediately evicts the scope) cannot spin the loop for
+/// the whole budget. Normal multi-replica churn needs exactly one.
+pub const SCOPE_PRESENT_ATTEMPTS: u32 = 3;
+
+/// Per-build closure-scope presenter (ADR-022 P0591 Phase 2,
+/// `r[builder.castore.scope-present]`).
+///
+/// rio-store scopes a build's assignment-token castore reads to the
+/// input closure the scheduler signed for it (`castore_read_scope.mode
+/// = "enforce"`, the shipped default). The store learns that closure
+/// when the builder presents `WorkAssignment.input_closure` via
+/// `DirectoryService.PresentClosure`; this type owns that presentation
+/// for one build:
+///
+/// - **once per store channel** — [`Self::present_on_new_channel`] runs
+///   at mount time before the DAG prefetch (the build's first castore
+///   read), so the common case never sees a scope miss;
+/// - **on demand** — [`Self::run_scoped`] wraps every castore read of
+///   the JIT/streaming/prefetch paths and, when the store answers
+///   `FAILED_PRECONDITION` carrying
+///   [`rio_proto::CASTORE_SCOPE_REQUIRED_MSG`] (a replica that never
+///   saw, or evicted, the scope), re-presents and retries within the
+///   caller's existing budget — bounded by [`SCOPE_PRESENT_ATTEMPTS`]
+///   and **excluded from circuit-breaker accounting** (the callers skip
+///   their breaker record for this failure class; it is a coordination
+///   signal, not a store-health signal);
+/// - **singleflight** — concurrent fetches that all hit a scope miss
+///   serialize on one presentation: each caller snapshots the
+///   presentation generation before its read, and only the first one
+///   through re-presents; the rest see the bumped generation and just
+///   retry.
+///
+/// Tolerates `UNIMPLEMENTED` from a store that predates the RPC (skip
+/// presentation, log once, proceed — such a store never emits the
+/// scope-required reason either). When the assignment carries no
+/// `input_closure` (legacy/degraded dispatch) the presenter is inert:
+/// no RPC is ever sent and behavior is unchanged.
+// r[impl builder.castore.scope-present]
+pub struct ScopePresenter {
+    /// Dedicated client clone for `PresentClosure` (same shared channel
+    /// as every other castore RPC).
+    directory: DirectoryServiceClient<Channel>,
+    /// `WorkAssignment.input_closure`, exactly as received. Empty =
+    /// nothing to present (the token carries no closure attestation
+    /// either, so the store never asks).
+    closure: Vec<String>,
+    assignment_token: String,
+    state: tokio::sync::Mutex<PresenterState>,
+}
+
+#[derive(Default)]
+struct PresenterState {
+    /// Number of successful presentations on this channel. 0 = never
+    /// presented; callers snapshot this before a read and pass it back
+    /// so only one of several concurrent scope-miss victims re-presents.
+    generation: u64,
+    /// The store answered `UNIMPLEMENTED`: it predates PresentClosure.
+    /// Never present again on this channel (logged once).
+    unsupported: bool,
+}
+
+/// How [`ScopePresenter::run_scoped`] inspects and produces the
+/// caller's error type: `tonic::Status` for the prefetch/streaming
+/// paths, the whole-file path's `FetchError` in `castore_fuse::open`.
+pub trait ScopeRetryError: Sized {
+    /// The wrapped gRPC status, if this error is `FAILED_PRECONDITION`
+    /// carrying the `CASTORE_SCOPE_REQUIRED` reason.
+    fn scope_required(&self) -> Option<&tonic::Status>;
+    /// Wrap a failed `PresentClosure` status (surfaced instead of the
+    /// opaque scope-required error — e.g. an `INVALID_ARGUMENT` closure
+    /// mismatch is the actionable root cause).
+    fn from_present_failure(status: tonic::Status) -> Self;
+}
+
+impl ScopeRetryError for tonic::Status {
+    fn scope_required(&self) -> Option<&tonic::Status> {
+        ScopePresenter::is_scope_required(self).then_some(self)
+    }
+    fn from_present_failure(status: tonic::Status) -> Self {
+        status
+    }
+}
+
+impl ScopePresenter {
+    pub fn new(
+        directory: DirectoryServiceClient<Channel>,
+        closure: Vec<String>,
+        assignment_token: String,
+    ) -> Self {
+        Self {
+            directory,
+            closure,
+            assignment_token,
+            state: tokio::sync::Mutex::new(PresenterState::default()),
+        }
+    }
+
+    /// True iff `status` is the store's "present the closure and retry"
+    /// answer (`r[builder.castore.scope-present]`). Deliberately narrow:
+    /// other `FAILED_PRECONDITION` reasons (inline manifest on StatBlob,
+    /// chunked-upload preconditions) MUST NOT trigger the
+    /// present-and-retry loop — mirrors `is_chunked_unsupported`'s
+    /// single-constant match.
+    pub fn is_scope_required(status: &tonic::Status) -> bool {
+        status.code() == tonic::Code::FailedPrecondition
+            && status
+                .message()
+                .contains(rio_proto::CASTORE_SCOPE_REQUIRED_MSG)
+    }
+
+    /// Whether this assignment carries a closure to present.
+    pub fn has_closure(&self) -> bool {
+        !self.closure.is_empty()
+    }
+
+    /// Proactive presentation for a freshly established store channel —
+    /// called at mount time, before the DAG prefetch, inside the
+    /// caller's `dag_prefetch_timeout`. Best-effort: a failure here is
+    /// logged and the build proceeds (a `log`-mode or pre-P0591 store
+    /// serves without it; an `enforce`-mode store re-asks via
+    /// `CASTORE_SCOPE_REQUIRED` and [`Self::run_scoped`] re-presents).
+    /// No-op when the closure is empty or a previous attempt already
+    /// presented / learned the store doesn't support it.
+    pub async fn present_on_new_channel(&self) {
+        if !self.has_closure() {
+            return;
+        }
+        {
+            let state = self.state.lock().await;
+            if state.generation > 0 || state.unsupported {
+                return;
+            }
+        }
+        if let Err(status) = self.present(0, "mount").await {
+            tracing::warn!(
+                error = %status,
+                paths = self.closure.len(),
+                "PresentClosure failed at mount; proceeding — an enforce-mode store will \
+                 ask again via CASTORE_SCOPE_REQUIRED and the fetch path re-presents"
+            );
+        }
+    }
+
+    /// Snapshot of the presentation generation, taken by
+    /// [`Self::run_scoped`] before each attempt so concurrent scope-miss
+    /// victims don't stampede `PresentClosure`.
+    async fn generation(&self) -> u64 {
+        self.state.lock().await.generation
+    }
+
+    /// Present the closure (idempotent). Returns `Ok(true)` when the
+    /// caller should retry its read: either this call presented, or a
+    /// concurrent caller already advanced the generation past
+    /// `observed_generation`. Returns `Ok(false)` when presentation is
+    /// impossible and retrying is pointless (no closure to present, or
+    /// the store doesn't implement the RPC). `Err` carries the
+    /// `PresentClosure` failure itself.
+    async fn present(
+        &self,
+        observed_generation: u64,
+        trigger: &'static str,
+    ) -> Result<bool, tonic::Status> {
+        if !self.has_closure() {
+            return Ok(false);
+        }
+        let mut state = self.state.lock().await;
+        if state.unsupported {
+            return Ok(false);
+        }
+        if state.generation > observed_generation {
+            // Another fetch already (re-)presented since the caller
+            // observed its failure — its presentation covers us.
+            return Ok(true);
+        }
+        let req = authed_request(
+            PresentClosureRequest {
+                closure: self.closure.clone(),
+            },
+            &self.assignment_token,
+        )?;
+        let mut client = self.directory.clone();
+        match client.present_closure(req).await {
+            Ok(_) => {
+                state.generation += 1;
+                metrics::counter!(
+                    "rio_builder_castore_scope_present_total",
+                    "trigger" => trigger,
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                tracing::debug!(
+                    trigger,
+                    paths = self.closure.len(),
+                    generation = state.generation,
+                    "presented the input closure to rio-store"
+                );
+                Ok(true)
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                // Old store: presentation (and scope enforcement) does
+                // not exist there. Log once, never try again.
+                state.unsupported = true;
+                metrics::counter!(
+                    "rio_builder_castore_scope_present_total",
+                    "trigger" => trigger,
+                    "outcome" => "unsupported"
+                )
+                .increment(1);
+                tracing::info!(
+                    "rio-store does not implement PresentClosure (pre-P0591 store); \
+                     skipping closure presentation for this build"
+                );
+                Ok(false)
+            }
+            Err(status) => {
+                metrics::counter!(
+                    "rio_builder_castore_scope_present_total",
+                    "trigger" => trigger,
+                    "outcome" => "error"
+                )
+                .increment(1);
+                Err(status)
+            }
+        }
+    }
+
+    /// Run `op`, intercepting the store's `FAILED_PRECONDITION` +
+    /// `CASTORE_SCOPE_REQUIRED` answer: present the closure and retry,
+    /// at most [`SCOPE_PRESENT_ATTEMPTS`] presentations per operation.
+    /// Every other outcome (success, NotFound, Unavailable, …) passes
+    /// through untouched, so the existing transient-retry, circuit
+    /// breaker, and EIO classification see exactly what they saw before
+    /// — callers exclude only this scope-required class from their
+    /// breaker record.
+    ///
+    /// The retries run inside whatever budget the caller already wraps
+    /// around `op` (`jit_fetch_timeout`, the streaming fill deadline,
+    /// `dag_prefetch_timeout`) — this loop never sleeps and never
+    /// extends a fetch past it.
+    pub async fn run_scoped<T, E: ScopeRetryError>(
+        &self,
+        op_name: &'static str,
+        mut op: impl AsyncFnMut() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut presents = 0u32;
+        loop {
+            let observed = self.generation().await;
+            let err = match op().await {
+                Err(err) if err.scope_required().is_some() => err,
+                other => return other,
+            };
+            if presents >= SCOPE_PRESENT_ATTEMPTS {
+                tracing::warn!(
+                    op = op_name,
+                    presents,
+                    "castore read still reports CASTORE_SCOPE_REQUIRED after re-presenting; \
+                     giving up within this operation's budget"
+                );
+                return Err(err);
+            }
+            presents += 1;
+            match self.present(observed, "scope_required").await {
+                // Presented (or a concurrent fetch did) — retry the read.
+                Ok(true) => continue,
+                // Nothing to present / store can't accept it: the
+                // original scope-required error stands.
+                Ok(false) => return Err(err),
+                Err(present_err) => {
+                    // The presentation itself failed — that status is the
+                    // actionable root cause (e.g. INVALID_ARGUMENT when
+                    // the presented closure doesn't hash to the token's
+                    // signed digest), so surface it instead of the
+                    // deliberately generic scope-required answer.
+                    tracing::warn!(
+                        op = op_name,
+                        error = %present_err,
+                        "PresentClosure failed while handling CASTORE_SCOPE_REQUIRED"
+                    );
+                    return Err(E::from_present_failure(present_err));
+                }
+            }
+        }
+    }
 }
 
 /// Attempts (first try included) for the in-budget transient retry on
@@ -191,6 +484,27 @@ pub fn jit_fetch_timeout(base: Duration, nar_size: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CASTORE_SCOPE_REQUIRED matcher is deliberately narrow: only
+    /// `FAILED_PRECONDITION` carrying the wire constant triggers the
+    /// present-and-retry loop — other `FAILED_PRECONDITION` reasons
+    /// (StatBlob's inline-manifest answer, upload preconditions) and
+    /// other codes carrying the same text must not.
+    // r[verify builder.castore.scope-present]
+    #[test]
+    fn is_scope_required_matches_only_the_wire_constant() {
+        assert!(ScopePresenter::is_scope_required(
+            &tonic::Status::failed_precondition(rio_proto::CASTORE_SCOPE_REQUIRED_MSG)
+        ));
+        // Same code, different reason (e.g. the inline-manifest answer).
+        assert!(!ScopePresenter::is_scope_required(
+            &tonic::Status::failed_precondition("inline manifest: no chunk list, use ReadBlob")
+        ));
+        // Same reason text under a different code is not the contract.
+        assert!(!ScopePresenter::is_scope_required(
+            &tonic::Status::unavailable(rio_proto::CASTORE_SCOPE_REQUIRED_MSG)
+        ));
+    }
 
     #[test]
     fn jit_fetch_timeout_floors_at_base() {

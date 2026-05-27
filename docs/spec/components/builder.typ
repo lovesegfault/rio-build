@@ -1159,6 +1159,43 @@ errno-restricted: for failures *inside* a declared input (the daemon's
 permanent build failure; the input root itself failing to resolve
 reclassifies on any errno.
 
+== Closure-Scope Presentation
+
+rio-store scopes a build's assignment-token castore reads to the input
+closure the scheduler signed for it (#rref("store.castore.closure-scope"),
+default `enforce`); the store learns that closure from the builder:
+
+#r("builder.castore.scope-present")[
+  When a `WorkAssignment` carries a non-empty `input_closure`, the builder
+  MUST present it via `DirectoryService.PresentClosure` (with the build's
+  assignment token) once per established store channel, before the build's
+  first castore read --- at mount time, inside the `dag_prefetch_timeout`
+  budget --- and all of the build's castore read paths (DAG prefetch,
+  whole-file JIT fetch, streaming fill) MUST share that one presentation
+  state. When a castore read fails with `FAILED_PRECONDITION` carrying the
+  `CASTORE_SCOPE_REQUIRED` reason, the builder MUST re-present (idempotent)
+  and retry the read within the operation's existing budget, bounded per
+  operation, without recording the failure against the fetch circuit breaker
+  and without changing the EIO classification of an exhausted retry; no
+  other `FAILED_PRECONDITION` reason may trigger that loop. The builder MUST
+  tolerate `UNIMPLEMENTED` from a store that predates the RPC (skip
+  presentation for the rest of the build, log once, proceed) and MUST NOT
+  call `PresentClosure` at all when the assignment carries no
+  `input_closure` (legacy/degraded dispatch --- behavior unchanged).
+]
+
+The presenter is a per-build singleflight: concurrent fetches that all hit a
+scope miss serialize on one `PresentClosure` (generation-snapshotted), so an
+L7 balancer spreading a build's reads over several store replicas costs at
+most one presentation per replica encountered, not one per read. Presentation
+failures other than `UNIMPLEMENTED` are surfaced from the failing read (an
+`INVALID_ARGUMENT` closure-vs-digest mismatch is the actionable root cause),
+while the mount-time proactive presentation is best-effort --- an
+enforce-mode store re-asks via `CASTORE_SCOPE_REQUIRED` and the fetch path
+re-presents on demand. Presentations are observable via
+#(refs.metric)("rio_builder_castore_scope_present_total") (trigger =
+mount/scope_required, outcome = ok/unsupported/error).
+
 = Stream Relay & Reconnect
 
 #r("builder.completion.pending-armed-early")[

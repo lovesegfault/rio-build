@@ -241,6 +241,17 @@ pub fn describe_metrics() {
          per build (one multi-root call for the whole input closure)."
     );
     describe_counter!(
+        "rio_builder_castore_scope_present_total",
+        "PresentClosure calls made by the closure-scope presenter (ADR-022 P0591), \
+         labeled by trigger (mount = proactive presentation before the build's first \
+         castore read; scope_required = re-presentation after a store replica answered \
+         CASTORE_SCOPE_REQUIRED) and outcome (ok / unsupported = the store predates the \
+         RPC / error). A steady scope_required rate tracks per-replica presentation \
+         churn under L7 balancing; outcome=error means presentations are being \
+         rejected — check the store's scope_mismatch counter and the scheduler's \
+         closure attestation."
+    );
+    describe_counter!(
         "rio_builder_objects_cache_hit_total",
         "Castore-FUSE open()s whose file_digest was already present in the node-shared \
          backing cache (/var/rio/cache) — no fetch, straight to passthrough. The \

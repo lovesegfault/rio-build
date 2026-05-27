@@ -145,6 +145,15 @@ pub struct MountInputs<'a> {
     pub build_id: &'a str,
     pub roots: &'a [(String, RootNode)],
     pub assignment_token: &'a str,
+    /// `WorkAssignment.input_closure` — the sorted input closure the
+    /// scheduler signed into the assignment token's
+    /// `input_closure_digest` claim. The mount sequence presents it to
+    /// rio-store via `PresentClosure` so the token's castore reads are
+    /// scoped to exactly this closure (ADR-022 P0591,
+    /// `r[builder.castore.scope-present]`). Empty = legacy/degraded
+    /// dispatch with no closure attestation: nothing is presented and
+    /// the read paths behave exactly as before.
+    pub input_closure: &'a [String],
     /// `WorkAssignment.mountd_token` — the scheduler-minted Mount
     /// admission credential rio-mountd verifies when this build's peer
     /// gid cannot match the daemon's allowed gid (the `hostUsers:
@@ -281,6 +290,16 @@ pub(super) fn prepare_mount(
     opts: &CastoreOptions,
 ) -> Result<PreparedMount, CastoreMountError> {
     let build_id = inputs.build_id;
+    // The build's closure-scope presenter (ADR-022 P0591): one instance
+    // per mount, shared by the DAG prefetch below and every JIT/
+    // streaming fetch the served filesystem makes, so the whole build
+    // presents to a given store channel exactly once and re-presents
+    // (idempotently) only when a replica answers CASTORE_SCOPE_REQUIRED.
+    let scope = Arc::new(crate::store_fetch::ScopePresenter::new(
+        clients.directory.clone(),
+        inputs.input_closure.to_vec(),
+        inputs.assignment_token.to_owned(),
+    ));
     // ── (1) Directory-DAG prefetch. One multi-root recursive
     // GetDirectory for the whole closure; an unindexed root or an empty
     // stream is a typed, actionable error. An auth rejection gets its
@@ -292,6 +311,7 @@ pub(super) fn prepare_mount(
             inputs.roots,
             opts.dag_prefetch_timeout,
             inputs.assignment_token,
+            &scope,
         ))
         .map_err(|e| match e {
             TreeError::Rpc(status)
@@ -370,6 +390,7 @@ pub(super) fn prepare_mount(
         client.clone(),
         circuit,
         inputs.assignment_token.to_owned(),
+        scope,
         OpenConfig {
             jit_fetch_timeout: opts.jit_fetch_timeout,
             mountd_request_timeout: opts.mountd_request_timeout,

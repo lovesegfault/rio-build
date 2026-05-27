@@ -644,6 +644,12 @@ pub async fn execute_build(
         // the same token the upload path presents on PutPathChunked;
         // rio-store derives the build's tenant from it.
         let assignment_token = assignment.assignment_token.clone();
+        // The input closure the scheduler signed into that token
+        // (`input_closure_digest`): the mount sequence presents it via
+        // PresentClosure so the token's castore reads are scoped to
+        // exactly this build's closure (ADR-022 P0591,
+        // `r[builder.castore.scope-present]`).
+        let input_closure = assignment.input_closure.clone();
         // The mountd token (ADR-022 §P0559) is a SEPARATE credential:
         // it admits this build's Mount{} at the node's rio-mountd when
         // the pod's userns-remapped gid cannot match the daemon's
@@ -659,6 +665,7 @@ pub async fn execute_build(
                     build_id: &castore_build_id,
                     roots: &roots,
                     assignment_token: &assignment_token,
+                    input_closure: &input_closure,
                     mountd_token: &mountd_token,
                 },
                 castore_clients,

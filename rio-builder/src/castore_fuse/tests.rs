@@ -32,7 +32,7 @@ use rio_test_support::grpc::spawn_grpc_server;
 use super::mountd_proto::{self as proto, Reply, Req, Resp};
 use super::open::{Backed, OpenCase, OpenConfig, OpenPath};
 use super::tree::{self, build_tree};
-use crate::store_fetch::StoreClients;
+use crate::store_fetch::{SCOPE_PRESENT_ATTEMPTS, ScopePresenter, StoreClients};
 
 // ─── Mock DirectoryService ─────────────────────────────────────────────
 
@@ -84,6 +84,25 @@ struct MockState {
     /// rejected with `UNAUTHENTICATED` — the same shape rio-store's
     /// tenant gate produces (`store.castore.tenant-scope+2`).
     require_token: AtomicBool,
+    /// `PresentClosure` calls received (accepted or not).
+    present_closure_calls: AtomicUsize,
+    /// When set, `PresentClosure` is accepted (records the closure and
+    /// flips `presented`); when clear (the default), the mock plays an
+    /// old store and answers `UNIMPLEMENTED`.
+    present_accepts: AtomicBool,
+    /// Set once a `PresentClosure` was accepted.
+    presented: AtomicBool,
+    /// Every closure accepted via `PresentClosure`, in arrival order.
+    presented_closures: std::sync::Mutex<Vec<Vec<String>>>,
+    /// When set, the scoped read RPCs (`GetDirectory`/`ReadBlob`/
+    /// `StatBlob`) answer `FAILED_PRECONDITION` +
+    /// `CASTORE_SCOPE_REQUIRED` until a presentation has been accepted
+    /// — rio-store's enforce-mode scope-miss behavior.
+    require_scope: AtomicBool,
+    /// When set, the scoped read RPCs answer the scope-required status
+    /// unconditionally (even after a presentation) — the pathological
+    /// store the re-present loop bound exists for.
+    scope_required_always: AtomicBool,
 }
 
 impl MockCastore {
@@ -123,6 +142,51 @@ impl MockCastore {
     /// on (rio-store's tenant-gate behavior).
     fn require_token(&self) {
         self.state.require_token.store(true, Ordering::SeqCst);
+    }
+
+    /// Accept `PresentClosure` from now on (the default mock plays an
+    /// old store and answers `UNIMPLEMENTED`).
+    fn accept_present(&self) {
+        self.state.present_accepts.store(true, Ordering::SeqCst);
+    }
+
+    /// Demand a closure presentation before serving the scoped read
+    /// RPCs — rio-store's `enforce`-mode scope-miss answer
+    /// (`FAILED_PRECONDITION` + `CASTORE_SCOPE_REQUIRED`).
+    fn require_scope(&self) {
+        self.state.require_scope.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer every scoped read with the scope-required status no
+    /// matter how many presentations arrive (loop-bound scenario).
+    fn scope_required_always(&self) {
+        self.state
+            .scope_required_always
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn present_closure_calls(&self) -> usize {
+        self.state.present_closure_calls.load(Ordering::SeqCst)
+    }
+
+    /// Closures accepted via `PresentClosure`, in arrival order.
+    fn presented_closures(&self) -> Vec<Vec<String>> {
+        self.state.presented_closures.lock().unwrap().clone()
+    }
+
+    /// rio-store's enforce-mode scope gate, applied to the scoped read
+    /// RPCs after the token gate: scope still unresolved ⇒ ask the
+    /// caller to present and retry.
+    fn scope_gate(&self) -> Result<(), Status> {
+        let unresolved = self.state.scope_required_always.load(Ordering::SeqCst)
+            || (self.state.require_scope.load(Ordering::SeqCst)
+                && !self.state.presented.load(Ordering::SeqCst));
+        if unresolved {
+            return Err(Status::failed_precondition(
+                rio_proto::CASTORE_SCOPE_REQUIRED_MSG,
+            ));
+        }
+        Ok(())
     }
 
     fn seed_dirs(&self, dirs: &HashMap<[u8; 32], Directory>) {
@@ -249,6 +313,7 @@ impl DirectoryService for MockCastore {
         self.state
             .get_directory_calls
             .fetch_add(1, Ordering::SeqCst);
+        self.scope_gate()?;
         let req = request.into_inner();
         let mut roots = Vec::new();
         if let Some(rio_proto::types::get_directory_request::ByWhat::Digest(d)) = req.by_what {
@@ -295,6 +360,7 @@ impl DirectoryService for MockCastore {
     ) -> Result<Response<Self::ReadBlobStream>, Status> {
         self.observe_token("read_blob", &request)?;
         self.state.read_blob_calls.fetch_add(1, Ordering::SeqCst);
+        self.scope_gate()?;
         // Scripted transient failure (counted above so tests can assert
         // "the retry really re-called us").
         if self
@@ -339,6 +405,7 @@ impl DirectoryService for MockCastore {
     ) -> Result<Response<StatBlobResponse>, Status> {
         self.observe_token("stat_blob", &request)?;
         self.state.stat_blob_calls.fetch_add(1, Ordering::SeqCst);
+        self.scope_gate()?;
         let req = request.into_inner();
         let digest: [u8; 32] = req
             .file_digest
@@ -361,15 +428,30 @@ impl DirectoryService for MockCastore {
         }
     }
 
-    /// The mock plays an old / minimal store: scope presentation is a
-    /// store-side feature (ADR-022 P0591) these FUSE tests don't model,
-    /// and the (Phase 2) presenting builder must tolerate exactly this
-    /// answer from stores that predate the RPC.
+    /// By default the mock plays an old / minimal store and answers
+    /// `UNIMPLEMENTED` — the presenting builder must tolerate exactly
+    /// that. With [`MockCastore::accept_present`] it records the
+    /// closure, marks the scope presented (see
+    /// [`MockCastore::scope_gate`]), and answers Ok — rio-store's
+    /// behavior.
     async fn present_closure(
         &self,
-        _request: Request<rio_proto::types::PresentClosureRequest>,
+        request: Request<rio_proto::types::PresentClosureRequest>,
     ) -> Result<Response<rio_proto::types::PresentClosureResponse>, Status> {
-        Err(Status::unimplemented("MockCastore: PresentClosure"))
+        self.observe_token("present_closure", &request)?;
+        self.state
+            .present_closure_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if !self.state.present_accepts.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("MockCastore: PresentClosure"));
+        }
+        self.state
+            .presented_closures
+            .lock()
+            .unwrap()
+            .push(request.into_inner().closure);
+        self.state.presented.store(true, Ordering::SeqCst);
+        Ok(Response::new(rio_proto::types::PresentClosureResponse {}))
     }
 }
 
@@ -651,6 +733,14 @@ struct Harness {
     chunks: PathBuf,
     /// The fake mountd's recorded traffic + scripted-reply queue.
     mountd_state: Arc<FakeMountdState>,
+    /// Client bundle on the mock store's channel — the scope-presenter
+    /// tests drive `build_tree` against the same store the harness's
+    /// `OpenPath` fetches from.
+    clients: StoreClients,
+    /// The build's closure-scope presenter, shared by `open_path` (and
+    /// by `build_tree` in the presenter tests). Empty closure (a no-op
+    /// presenter) unless built via [`harness_scoped`].
+    scope: Arc<ScopePresenter>,
     _tmp: tempfile::TempDir,
     _server: tokio::task::JoinHandle<()>,
     _mountd: std::thread::JoinHandle<()>,
@@ -672,6 +762,12 @@ const FAST: Duration = Duration::from_secs(5);
 /// tests) present on every castore RPC.
 const HARNESS_TOKEN: &str = "harness-assignment-token";
 
+/// An inert [`ScopePresenter`] (no closure to present) for tests that
+/// exercise the pre-P0591 fetch behavior unchanged.
+fn noop_scope(clients: &StoreClients, token: &str) -> ScopePresenter {
+    ScopePresenter::new(clients.directory.clone(), Vec::new(), token.to_string())
+}
+
 async fn harness() -> Harness {
     harness_with(OpenConfig {
         jit_fetch_timeout: FAST,
@@ -682,6 +778,27 @@ async fn harness() -> Harness {
 }
 
 async fn harness_with(cfg: OpenConfig) -> Harness {
+    // No closure to present — the pre-P0591 shape every existing test
+    // exercises (the presenter is inert).
+    harness_with_scope(cfg, Vec::new()).await
+}
+
+/// [`harness`] with a closure-bearing [`ScopePresenter`] (the ADR-022
+/// P0591 presenter tests). The default `OpenConfig`; the closure is
+/// what the presenter offers `PresentClosure`.
+async fn harness_scoped(closure: Vec<String>) -> Harness {
+    harness_with_scope(
+        OpenConfig {
+            jit_fetch_timeout: FAST,
+            mountd_request_timeout: FAST,
+            stream_threshold: 1024,
+        },
+        closure,
+    )
+    .await
+}
+
+async fn harness_with_scope(cfg: OpenConfig, closure: Vec<String>) -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache = tmp.path().join("cache");
     let staging = tmp.path().join("staging");
@@ -695,15 +812,21 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
     let (mock, clients, server) = spawn_mock_castore().await;
     let (mountd, mountd_state, mountd_thread) =
         spawn_fake_mountd(staging.clone(), cache.clone(), chunks.clone());
+    let scope = Arc::new(ScopePresenter::new(
+        clients.directory.clone(),
+        closure,
+        HARNESS_TOKEN.to_string(),
+    ));
     let open_path = Arc::new(OpenPath::new(
         cache.clone(),
         staging.clone(),
         chunks.clone(),
-        clients,
+        clients.clone(),
         tokio::runtime::Handle::current(),
         mountd,
         Arc::new(super::circuit::CircuitBreaker::default()),
         HARNESS_TOKEN.to_string(),
+        Arc::clone(&scope),
         cfg,
     ));
     Harness {
@@ -712,6 +835,8 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
         staging,
         chunks,
         mountd_state,
+        clients,
+        scope,
         _tmp: tmp,
         _server: server,
         _mountd: mountd_thread,
@@ -767,9 +892,15 @@ async fn castore_rpcs_carry_the_assignment_token() {
     mock.require_token();
     let fx = tree::tests::fixture();
     mock.seed_dirs(&fx.dirs);
-    build_tree(&clients, &fx.roots, FAST, "tree-token")
-        .await
-        .expect("a token-bearing prefetch is accepted");
+    build_tree(
+        &clients,
+        &fx.roots,
+        FAST,
+        "tree-token",
+        &noop_scope(&clients, "tree-token"),
+    )
+    .await
+    .expect("a token-bearing prefetch is accepted");
     assert_eq!(
         mock.tokens_for("get_directory"),
         vec![Some("tree-token".to_string())],
@@ -788,6 +919,193 @@ async fn castore_rpcs_carry_the_assignment_token() {
         h.mock.tokens_for("read_blob"),
         vec![Some(HARNESS_TOKEN.to_string())],
         "ReadBlob must carry x-rio-assignment-token"
+    );
+}
+
+// ─── closure-scope presenter (ADR-022 P0591) ───────────────────────────
+
+/// The closure the presenter tests hand to [`harness_scoped`]: shape
+/// matters more than content (the mock records, never parses, it).
+fn scoped_test_closure() -> Vec<String> {
+    vec![
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-input-a".to_string(),
+        "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-input-b".to_string(),
+    ]
+}
+
+/// The mount-time prefetch presents `WorkAssignment.input_closure`
+/// exactly once per store channel — before the build's first castore
+/// read — and the JIT fetch path reuses that presentation instead of
+/// presenting again.
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_presenter_presents_once_per_channel() {
+    let h = harness_scoped(scoped_test_closure()).await;
+    h.mock.accept_present();
+    h.mock.require_scope();
+    let fx = tree::tests::fixture();
+    h.mock.seed_dirs(&fx.dirs);
+
+    // Mount-time prefetch: the presentation precedes the (scope-gated)
+    // GetDirectory, so the prefetch succeeds on its first attempt.
+    build_tree(&h.clients, &fx.roots, FAST, HARNESS_TOKEN, &h.scope)
+        .await
+        .expect("prefetch under enforce succeeds once the closure is presented");
+    assert_eq!(h.mock.present_closure_calls(), 1, "presented at mount");
+    assert_eq!(
+        h.mock.state.get_directory_calls.load(Ordering::SeqCst),
+        1,
+        "presentation precedes the prefetch — no scope-required retry needed"
+    );
+    assert_eq!(
+        h.mock.presented_closures(),
+        vec![scoped_test_closure()],
+        "the presented closure is exactly WorkAssignment.input_closure"
+    );
+    assert_eq!(
+        h.mock.tokens_for("present_closure"),
+        vec![Some(HARNESS_TOKEN.to_string())],
+        "PresentClosure carries the assignment token"
+    );
+
+    // A JIT fetch on the same channel rides the existing presentation —
+    // exactly one PresentClosure per channel.
+    let content = b"scoped jit fetch".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("scoped JIT fetch");
+    assert_eq!(
+        h.mock.present_closure_calls(),
+        1,
+        "presented once per channel, not once per read"
+    );
+}
+
+/// A store replica that answers `CASTORE_SCOPE_REQUIRED` (never saw the
+/// presentation, or evicted it) triggers one re-present + retry inside
+/// the same fetch budget; the read then succeeds and the staged bytes
+/// are intact.
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_required_read_represents_and_retries() {
+    let h = harness_scoped(scoped_test_closure()).await;
+    h.mock.accept_present();
+    h.mock.require_scope();
+
+    // No mount-time presentation reached this "replica": the first
+    // ReadBlob is denied with CASTORE_SCOPE_REQUIRED, the presenter
+    // presents, the retried ReadBlob is served.
+    let content = b"re-present then fetch".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    let case = ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("the fetch succeeds after the re-present");
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(h.mock.present_closure_calls(), 1, "exactly one re-present");
+    assert_eq!(h.mock.read_blob_calls(), 2, "denied once, then served");
+    assert!(!h.open_path.circuit.is_open());
+    assert_eq!(
+        std::fs::read(h.open_path.cache_path(&digest)).unwrap(),
+        content,
+        "the retried fetch publishes the verified bytes as usual"
+    );
+}
+
+/// The re-present loop is bounded: a store that keeps demanding a
+/// presentation costs at most [`SCOPE_PRESENT_ATTEMPTS`] presents per
+/// operation, then the read fails — and none of it counts against the
+/// fetch circuit breaker (a scope denial is an authorization
+/// coordination signal, not a store-health signal).
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_represent_loop_is_bounded_and_breaker_excluded() {
+    let h = harness_scoped(scoped_test_closure()).await;
+    h.mock.accept_present();
+    h.mock.scope_required_always();
+
+    // More failing opens than the breaker's threshold (5): if scope
+    // denials were recorded as fetch failures the breaker would be open
+    // by the end.
+    let opens = 6usize;
+    for i in 0..opens {
+        let content = vec![u8::try_from(i).unwrap(); 64];
+        let digest = seeded_blob(&h.mock, &content);
+        let err = ensure_blocking(&h.open_path, digest, content.len() as u64)
+            .await
+            .expect_err("a never-resolvable scope fails the open");
+        assert_eq!(err.code(), fuser::Errno::EIO.code());
+    }
+    assert_eq!(
+        h.mock.present_closure_calls(),
+        opens * SCOPE_PRESENT_ATTEMPTS as usize,
+        "each open re-presents at most SCOPE_PRESENT_ATTEMPTS times"
+    );
+    assert_eq!(
+        h.mock.read_blob_calls(),
+        opens * (SCOPE_PRESENT_ATTEMPTS as usize + 1),
+        "each open pays the initial read plus one retry per re-present"
+    );
+    assert!(
+        !h.open_path.circuit.is_open(),
+        "scope-required denials are excluded from breaker accounting"
+    );
+    h.open_path
+        .circuit
+        .check()
+        .expect("the breaker stays closed for later fetches");
+}
+
+/// An old store that answers `UNIMPLEMENTED` to PresentClosure: the
+/// builder tries once, remembers the answer, and every read proceeds
+/// exactly as before — no further presentation attempts.
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn unimplemented_present_closure_is_tolerated() {
+    // Default mock behavior: PresentClosure → UNIMPLEMENTED, reads are
+    // served without any scope handling (a pre-P0591 store).
+    let h = harness_scoped(scoped_test_closure()).await;
+    let fx = tree::tests::fixture();
+    h.mock.seed_dirs(&fx.dirs);
+    build_tree(&h.clients, &fx.roots, FAST, HARNESS_TOKEN, &h.scope)
+        .await
+        .expect("prefetch against an old store");
+    assert_eq!(h.mock.present_closure_calls(), 1, "tried once at mount");
+
+    let content = b"old store fetch".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("JIT fetch against an old store");
+    assert_eq!(
+        h.mock.present_closure_calls(),
+        1,
+        "UNIMPLEMENTED is remembered: no further presentation attempts"
+    );
+}
+
+/// An assignment with no `input_closure` (legacy/degraded dispatch)
+/// never presents anything — the prefetch and fetch paths behave
+/// exactly as before.
+// r[verify builder.castore.scope-present]
+#[tokio::test(flavor = "multi_thread")]
+async fn no_presentation_without_input_closure() {
+    let h = harness().await; // empty closure → inert presenter
+    h.mock.accept_present();
+    let fx = tree::tests::fixture();
+    h.mock.seed_dirs(&fx.dirs);
+    build_tree(&h.clients, &fx.roots, FAST, HARNESS_TOKEN, &h.scope)
+        .await
+        .expect("prefetch");
+    let content = b"unscoped fetch".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    ensure_blocking(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("fetch");
+    assert_eq!(
+        h.mock.present_closure_calls(),
+        0,
+        "nothing to present, nothing sent"
     );
 }
 
@@ -818,6 +1136,7 @@ async fn unauthenticated_castore_prefetch_is_an_actionable_mount_failure() {
                 // No token → the mock (like rio-store) rejects with
                 // UNAUTHENTICATED before streaming any Directory body.
                 assignment_token: "",
+                input_closure: &[],
                 mountd_token: "",
             },
             clients,
@@ -853,9 +1172,15 @@ async fn build_tree_prefetches_the_dag_in_one_call() {
     let fx = tree::tests::fixture();
     mock.seed_dirs(&fx.dirs);
 
-    let map = build_tree(&clients, &fx.roots, FAST, HARNESS_TOKEN)
-        .await
-        .expect("build_tree");
+    let map = build_tree(
+        &clients,
+        &fx.roots,
+        FAST,
+        HARNESS_TOKEN,
+        &noop_scope(&clients, HARNESS_TOKEN),
+    )
+    .await
+    .expect("build_tree");
 
     assert_eq!(
         mock.state.get_directory_calls.load(Ordering::SeqCst),
@@ -887,9 +1212,15 @@ async fn build_tree_skips_the_rpc_when_there_are_no_dir_roots() {
         .filter(|(p, _)| !p.ends_with("aaaa-hello"))
         .cloned()
         .collect();
-    let map = build_tree(&clients, &file_only, FAST, HARNESS_TOKEN)
-        .await
-        .expect("build_tree");
+    let map = build_tree(
+        &clients,
+        &file_only,
+        FAST,
+        HARNESS_TOKEN,
+        &noop_scope(&clients, HARNESS_TOKEN),
+    )
+    .await
+    .expect("build_tree");
     assert_eq!(mock.state.get_directory_calls.load(Ordering::SeqCst), 0);
     assert!(map.lookup(fuser::INodeNo::ROOT.0, b"bbbb-script").is_some());
 }
@@ -909,6 +1240,7 @@ async fn build_tree_times_out_as_a_prefetch_error() {
         &fx.roots,
         Duration::from_millis(100),
         HARNESS_TOKEN,
+        &noop_scope(&clients, HARNESS_TOKEN),
     )
     .await
     .expect_err("must time out");
@@ -1458,15 +1790,18 @@ async fn cache_path_matches_the_mountd_shard_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let (mountd, _batches, _t) =
         spawn_fake_mountd(tmp.path().into(), tmp.path().into(), tmp.path().into());
+    let clients = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
+    let scope = Arc::new(noop_scope(&clients, HARNESS_TOKEN));
     let op = OpenPath::new(
         PathBuf::from("/var/rio/cache"),
         PathBuf::from("/var/rio/staging/b1"),
         PathBuf::from("/var/rio/chunks"),
-        StoreClients::from_channel(rio_test_support::grpc::dead_channel()),
+        clients,
         tokio::runtime::Handle::current(),
         mountd,
         Arc::new(super::circuit::CircuitBreaker::default()),
         HARNESS_TOKEN.to_string(),
+        scope,
         OpenConfig {
             jit_fetch_timeout: FAST,
             mountd_request_timeout: FAST,

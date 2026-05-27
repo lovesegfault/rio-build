@@ -39,7 +39,7 @@ use super::mountd_client::{MountdClient, MountdError};
 use super::mountd_proto::ErrKind;
 use super::stream::{self, StreamFill};
 use crate::IgnorePoison;
-use crate::store_fetch::StoreClients;
+use crate::store_fetch::{ScopePresenter, ScopeRetryError, StoreClients};
 
 /// Tunables for the open path, lifted from [`crate::config::Config`].
 #[derive(Clone, Debug)]
@@ -268,6 +268,10 @@ pub struct OpenPath {
     /// `x-rio-assignment-token` to every castore RPC (the store derives
     /// the caller's tenant from it — `r[store.castore.tenant-scope+2]`).
     assignment_token: String,
+    /// The build's closure-scope presenter (ADR-022 P0591) — shared
+    /// with the mount-time DAG prefetch so every fetch path of this
+    /// build routes through one presentation state.
+    scope: Arc<ScopePresenter>,
     cfg: OpenConfig,
 }
 
@@ -282,6 +286,7 @@ impl OpenPath {
         mountd: MountdClient,
         circuit: Arc<CircuitBreaker>,
         assignment_token: String,
+        scope: Arc<ScopePresenter>,
         cfg: OpenConfig,
     ) -> Self {
         Self {
@@ -295,6 +300,7 @@ impl OpenPath {
             runtime,
             mountd,
             assignment_token,
+            scope,
             cfg,
         }
     }
@@ -505,6 +511,7 @@ impl OpenPath {
                     mountd_timeout: self.cfg.mountd_request_timeout,
                     budget,
                     assignment_token: self.assignment_token.clone(),
+                    scope: Arc::clone(&self.scope),
                     registry: Arc::clone(&self.streams),
                 };
                 let partial_path = ctx.partial_path.clone();
@@ -557,7 +564,10 @@ impl OpenPath {
 
         // Stream the blob into the .partial, hashing as we go. The
         // whole attempt (connect, stream, disk writes) is bounded by
-        // jit_fetch_timeout.
+        // jit_fetch_timeout. The scope-aware wrapper re-presents the
+        // build's input closure and retries — inside the same budget —
+        // when an enforce-mode store replica answers
+        // CASTORE_SCOPE_REQUIRED (`r[builder.castore.scope-present]`).
         //
         // The timeout MUST be constructed inside the async block (i.e.
         // inside `block_on`, where the runtime context is entered):
@@ -570,18 +580,33 @@ impl OpenPath {
         // `executing '<builder>': Input/output error`). Same shape as
         // every bridge in `stream.rs`.
         // r[impl builder.fs.file-digest-integrity]
+        // r[impl builder.castore.scope-present]
         let fetch = self.runtime.block_on(async {
             tokio::time::timeout(
                 self.cfg.jit_fetch_timeout,
-                read_blob_into(
-                    self.clients.clone(),
-                    *file_digest,
-                    &mut file,
-                    &self.assignment_token,
-                ),
+                self.scope.run_scoped("read_blob", async || {
+                    // A scope-required retry re-runs the whole stream:
+                    // start from a clean file. In practice the store
+                    // rejects a scope miss before streaming any frame,
+                    // so this is already byte 0.
+                    file.set_len(0).map_err(FetchError::Io)?;
+                    file.seek(std::io::SeekFrom::Start(0))
+                        .map_err(FetchError::Io)?;
+                    read_blob_into(
+                        self.clients.clone(),
+                        *file_digest,
+                        &mut file,
+                        &self.assignment_token,
+                    )
+                    .await
+                }),
             )
             .await
         });
+        // The scope-required coordination failure (still unresolved
+        // after the bounded re-presents) is excluded from breaker
+        // accounting: it says nothing about store reachability.
+        let mut scope_denied = false;
         let fetched = match fetch {
             Err(_elapsed) => {
                 tracing::warn!(
@@ -602,6 +627,7 @@ impl OpenPath {
                 Err(Errno::EIO)
             }
             Ok(Err(FetchError::Rpc(status))) => {
+                scope_denied = ScopePresenter::is_scope_required(&status);
                 tracing::warn!(
                     digest = %hex::encode(file_digest),
                     status = %status,
@@ -629,8 +655,11 @@ impl OpenPath {
         };
         // One record per fetch attempt, success or failure — the
         // breaker's consecutive-failure count is the "is the store
-        // healthy" signal.
-        self.circuit.record(fetched.is_ok());
+        // healthy" signal. A scope-required denial is the one excluded
+        // class (ADR-022 P0591: not a transient, not a health signal).
+        if !scope_denied {
+            self.circuit.record(fetched.is_ok());
+        }
         if let Err(errno) = fetched {
             drop(file);
             let _ = std::fs::remove_file(&partial);
@@ -850,6 +879,22 @@ enum FetchError {
         got: String,
         bytes: u64,
     },
+}
+
+/// Lets [`ScopePresenter::run_scoped`] drive the whole-file fetch: a
+/// scope-required answer lives in the [`FetchError::Rpc`] variant, and
+/// a failed re-presentation surfaces as the same variant (it is a gRPC
+/// status like any other fetch failure).
+impl ScopeRetryError for FetchError {
+    fn scope_required(&self) -> Option<&tonic::Status> {
+        match self {
+            FetchError::Rpc(status) if ScopePresenter::is_scope_required(status) => Some(status),
+            _ => None,
+        }
+    }
+    fn from_present_failure(status: tonic::Status) -> Self {
+        FetchError::Rpc(status)
+    }
 }
 
 /// Stream `ReadBlob(file_digest)` into `dst`, hashing as we go, and
