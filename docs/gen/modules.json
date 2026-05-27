@@ -761,6 +761,16 @@
       "doc": "`rio-parity eval` — build an eval set from a Hydra evaluation: the"
     },
     {
+      "path": "evalset/",
+      "depth": 0,
+      "doc": "Eval-set construction."
+    },
+    {
+      "path": "evalset/recipe.rs",
+      "depth": 1,
+      "doc": "Hydra-faithful eval recipe."
+    },
+    {
       "path": "hydra.rs",
       "depth": 0,
       "doc": "hydra.nixos.org API client."

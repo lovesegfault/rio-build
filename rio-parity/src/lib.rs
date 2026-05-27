@@ -6,6 +6,7 @@
 //! fixtures.
 
 pub mod cmd;
+pub mod evalset;
 pub mod hydra;
 pub mod nixcache;
 

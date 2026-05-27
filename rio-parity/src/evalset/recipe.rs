@@ -1,0 +1,413 @@
+//! Hydra-faithful eval recipe.
+//!
+//! Reconstructs the evaluator invocation Hydra used for an evaluation,
+//! so a local nix-eval-jobs run reproduces Hydra's drvPaths bit-for-bit
+//! (verified against the recorded Hydra evaluation 1824219): recover
+//! revCount/shortRev from a sampled build's release name, render the
+//! `nixpkgs` argument attrset, map the jobset's other declared inputs
+//! onto `--arg` pairs, derive the pinned-source tarball URL, and build
+//! the nix-eval-jobs argv for full or scoped (selection-expression)
+//! runs.
+
+use std::path::Path;
+
+use crate::hydra::HydraJobset;
+
+/// revCount/shortRev recovered from a versionSuffix-carrying build's
+/// `nixname`/`releasename` (e.g. `nixos-26.05pre975402.68d8aa3d661f`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionSuffix {
+    pub rev_count: u64,
+    pub short_rev: String,
+}
+
+/// Recover revCount/shortRev from a build's `nixname`/`releasename` by
+/// matching the nixpkgs versionSuffix convention `pre<revCount>.<shortRev>`
+/// — the regex `pre(\d+)\.([0-9a-f]{7,40})`. Names without a version
+/// suffix (plain packages, VM tests) yield `None`.
+pub fn recover_version_suffix(name: &str) -> Option<VersionSuffix> {
+    // Compiled on every call; callers invoke this a handful of times
+    // per eval set, so a cached regex is not worth a once_cell dep.
+    let re = regex::Regex::new(r"pre(\d+)\.([0-9a-f]{7,40})").expect("static regex");
+    let caps = re.captures(name)?;
+    Some(VersionSuffix {
+        rev_count: caps[1].parse().ok()?,
+        short_rev: caps[2].to_string(),
+    })
+}
+
+/// The `--arg nixpkgs` attrset passed to the jobset entry point, in the
+/// exact form whose evaluation reproduces Hydra's drvPaths bit-for-bit
+/// (including jobs such as nixos.channel and nixpkgs.tarball that embed
+/// rev/shortRev/revCount in their outputs).
+#[derive(Debug, Clone)]
+pub struct NixpkgsArg {
+    /// Store path of the unpacked tarball added as `--name source`.
+    pub source_store_path: String,
+    /// Full 40-char revision (required: `system.nixos.revision`,
+    /// `.git-revision` files consume it).
+    pub rev: String,
+    pub short_rev: String,
+    pub rev_count: u64,
+}
+
+impl NixpkgsArg {
+    pub fn to_nix_expr(&self) -> String {
+        format!(
+            "{{ outPath = builtins.storePath {}; rev = \"{}\"; shortRev = \"{}\"; revCount = {}; }}",
+            self.source_store_path, self.rev, self.short_rev, self.rev_count
+        )
+    }
+}
+
+/// Map the jobset's declared inputs (minus the nixexprinput itself)
+/// onto `--arg <name> <nix literal>` pairs. Only the input types the
+/// release expressions actually consume are supported; anything else
+/// (a second git input, path inputs, …) is an error so we never
+/// silently evaluate with a missing argument.
+pub fn jobset_extra_args(jobset: &HydraJobset) -> anyhow::Result<Vec<(String, String)>> {
+    let expr_input = jobset.nixexprinput.as_deref().unwrap_or_default();
+    let mut out = Vec::new();
+    for (name, input) in &jobset.inputs {
+        if name == expr_input {
+            continue;
+        }
+        let value = input.value.clone().unwrap_or_default();
+        let literal = match input.input_type.as_str() {
+            "boolean" => match value.as_str() {
+                "true" | "false" => value,
+                other => anyhow::bail!("jobset input {name}: boolean with value {other:?}"),
+            },
+            "string" => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
+            "nix" => value,
+            other => anyhow::bail!(
+                "jobset input {name} has unsupported type {other:?}; \
+                 only the nixexprinput plus boolean/string/nix inputs are supported"
+            ),
+        };
+        out.push((name.clone(), literal));
+    }
+    Ok(out)
+}
+
+/// GitHub archive tarball URL for the pinned revision. The unpacked
+/// archive is NAR-identical to Hydra's git export of the same revision
+/// (verified on eval 1824219), so no git checkout is needed.
+pub fn tarball_url(git_uri: &str, rev: &str) -> anyhow::Result<String> {
+    let base = git_uri.trim_end_matches('/').trim_end_matches(".git");
+    anyhow::ensure!(
+        base.starts_with("https://github.com/"),
+        "only github.com nixpkgs inputs are supported (got {git_uri}); \
+         supply an explicit source tarball URL to override"
+    );
+    Ok(format!("{base}/archive/{rev}.tar.gz"))
+}
+
+/// nix-eval-jobs argv (after the program name) for a FULL-scope eval.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluator_argv_full(
+    entry_point: &Path,
+    source_tree: &Path,
+    nixpkgs: &NixpkgsArg,
+    extra_args: &[(String, String)],
+    gc_roots_dir: &Path,
+    workers: u32,
+    max_memory_mb: u64,
+) -> Vec<String> {
+    let mut argv = vec![
+        entry_point.display().to_string(),
+        "-I".into(),
+        format!("nixpkgs={}", source_tree.display()),
+        "--arg".into(),
+        "nixpkgs".into(),
+        nixpkgs.to_nix_expr(),
+    ];
+    for (name, literal) in extra_args {
+        argv.push("--arg".into());
+        argv.push(name.clone());
+        argv.push(literal.clone());
+    }
+    argv.extend([
+        "--gc-roots-dir".into(),
+        gc_roots_dir.display().to_string(),
+        "--workers".into(),
+        workers.to_string(),
+        "--max-memory-size".into(),
+        max_memory_mb.to_string(),
+        "--meta".into(),
+        "--constituents".into(),
+        "--force-recurse".into(),
+    ]);
+    argv
+}
+
+/// nix-eval-jobs argv (after the program name) for a SCOPED eval over
+/// a generated selection expression (the expression already binds the
+/// jobset arguments, so no `--arg` here).
+pub fn evaluator_argv_scoped(
+    selection_file: &Path,
+    source_tree: &Path,
+    gc_roots_dir: &Path,
+    workers: u32,
+    max_memory_mb: u64,
+) -> Vec<String> {
+    vec![
+        selection_file.display().to_string(),
+        "-I".into(),
+        format!("nixpkgs={}", source_tree.display()),
+        "--gc-roots-dir".into(),
+        gc_roots_dir.display().to_string(),
+        "--workers".into(),
+        workers.to_string(),
+        "--max-memory-size".into(),
+        max_memory_mb.to_string(),
+        "--meta".into(),
+    ]
+}
+
+/// Generate the scoped selection expression: one shared evaluation of
+/// the jobset entry point, exposing exactly the requested jobs as a
+/// flat attrset keyed by Hydra job name.
+pub fn selection_expr(
+    entry_point: &Path,
+    nixpkgs: &NixpkgsArg,
+    extra_args: &[(String, String)],
+    jobs: &[String],
+) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    let mut expr = String::new();
+    writeln!(
+        expr,
+        "# Generated by rio-parity eval: scoped selection over the Hydra jobset entry point."
+    )?;
+    writeln!(expr, "let")?;
+    writeln!(expr, "  release = import {} {{", entry_point.display())?;
+    writeln!(expr, "    nixpkgs = {};", nixpkgs.to_nix_expr())?;
+    for (name, literal) in extra_args {
+        writeln!(expr, "    {name} = {literal};")?;
+    }
+    writeln!(expr, "  }};")?;
+    writeln!(
+        expr,
+        "  getPath = path: set: builtins.foldl' (s: a: builtins.getAttr a s) set path;"
+    )?;
+    writeln!(expr, "in")?;
+    writeln!(expr, "{{")?;
+    for job in jobs {
+        let components: Vec<&str> = job.split('.').collect();
+        anyhow::ensure!(
+            !components.is_empty() && components.iter().all(|c| !c.is_empty()),
+            "job name {job:?} has an empty attr-path component"
+        );
+        let path_list = components
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        writeln!(expr, "  \"{job}\" = getPath [ {path_list} ] release;")?;
+    }
+    writeln!(expr, "}}")?;
+    Ok(expr)
+}
+
+/// `(short_rev, full_rev)` consistency check used after recovery.
+pub fn short_rev_matches(short_rev: &str, full_rev: &str) -> bool {
+    !short_rev.is_empty() && full_rev.starts_with(short_rev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real values from the recorded Hydra eval 1824219: REV is the
+    // nixpkgs input revision; SOURCE_STORE_PATH is what
+    // `nix store add-path --name source` produced for that revision's
+    // unpacked tarball when the recipe was verified against Hydra.
+    const REV: &str = "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9";
+    const SOURCE_STORE_PATH: &str = "/nix/store/gay80fqbpm2wakbsyd4in44gx0cwx3h5-source";
+
+    #[test]
+    fn recovers_revcount_and_shortrev_from_release_names() {
+        // releasename of nixos.channel in the recorded eval 1824219.
+        let v = recover_version_suffix("nixos-26.05pre975402.68d8aa3d661f").unwrap();
+        assert_eq!(v.rev_count, 975402);
+        assert_eq!(v.short_rev, "68d8aa3d661f");
+        // nixname form works too.
+        let v = recover_version_suffix("nixos-channel-26.05pre975402.68d8aa3d661f").unwrap();
+        assert_eq!(v.rev_count, 975402);
+        // Plain packages carry no version suffix.
+        assert!(recover_version_suffix("hello-2.12.3").is_none());
+        assert!(recover_version_suffix("vm-test-run-openssh").is_none());
+        // The recovered shortRev must be a prefix of the full revision.
+        assert!(REV.starts_with(&v.short_rev));
+    }
+
+    #[test]
+    fn nixpkgs_arg_renders_the_hydra_faithful_attrset() {
+        let arg = NixpkgsArg {
+            source_store_path: SOURCE_STORE_PATH.to_string(),
+            rev: REV.to_string(),
+            short_rev: "68d8aa3d661f".to_string(),
+            rev_count: 975402,
+        };
+        assert_eq!(
+            arg.to_nix_expr(),
+            "{ outPath = builtins.storePath /nix/store/gay80fqbpm2wakbsyd4in44gx0cwx3h5-source; \
+             rev = \"68d8aa3d661f0e6bd5862291b5bb263b2a6595c9\"; \
+             shortRev = \"68d8aa3d661f\"; revCount = 975402; }"
+        );
+    }
+
+    #[test]
+    fn jobset_inputs_become_extra_args() {
+        let js: crate::hydra::HydraJobset = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/hydra/jobset-nixos-unstable.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // nixpkgs is the nixexprinput → excluded; stableBranch boolean → bare literal.
+        assert_eq!(
+            jobset_extra_args(&js).unwrap(),
+            vec![("stableBranch".to_string(), "false".to_string())]
+        );
+    }
+
+    #[test]
+    fn unsupported_jobset_input_types_are_rejected() {
+        let js: crate::hydra::HydraJobset = serde_json::from_str(
+            r#"{"project":"p","name":"j","nixexprinput":"src","nixexprpath":"release.nix",
+                "inputs":{"src":{"type":"git","value":"https://example.com/x.git"},
+                          "other":{"type":"git","value":"https://example.com/y.git"}}}"#,
+        )
+        .unwrap();
+        let err = jobset_extra_args(&js).unwrap_err();
+        assert!(err.to_string().contains("other"), "got: {err:#}");
+    }
+
+    #[test]
+    fn tarball_url_from_git_uri() {
+        assert_eq!(
+            tarball_url("https://github.com/nixos/nixpkgs.git", REV).unwrap(),
+            format!("https://github.com/nixos/nixpkgs/archive/{REV}.tar.gz")
+        );
+        assert_eq!(
+            tarball_url("https://github.com/NixOS/nixpkgs", REV).unwrap(),
+            format!("https://github.com/NixOS/nixpkgs/archive/{REV}.tar.gz")
+        );
+        assert!(tarball_url("git://example.com/repo.git", REV).is_err());
+    }
+
+    fn sample_arg() -> NixpkgsArg {
+        NixpkgsArg {
+            source_store_path: SOURCE_STORE_PATH.to_string(),
+            rev: REV.to_string(),
+            short_rev: "68d8aa3d661f".to_string(),
+            rev_count: 975402,
+        }
+    }
+
+    #[test]
+    fn full_scope_argv_is_hydra_faithful() {
+        let argv = evaluator_argv_full(
+            std::path::Path::new("/src/tree/nixos/release-combined.nix"),
+            std::path::Path::new("/src/tree"),
+            &sample_arg(),
+            &[("stableBranch".to_string(), "false".to_string())],
+            std::path::Path::new("/work/gcroots"),
+            4,
+            4096,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/src/tree/nixos/release-combined.nix",
+                "-I",
+                "nixpkgs=/src/tree",
+                "--arg",
+                "nixpkgs",
+                "{ outPath = builtins.storePath /nix/store/gay80fqbpm2wakbsyd4in44gx0cwx3h5-source; rev = \"68d8aa3d661f0e6bd5862291b5bb263b2a6595c9\"; shortRev = \"68d8aa3d661f\"; revCount = 975402; }",
+                "--arg",
+                "stableBranch",
+                "false",
+                "--gc-roots-dir",
+                "/work/gcroots",
+                "--workers",
+                "4",
+                "--max-memory-size",
+                "4096",
+                "--meta",
+                "--constituents",
+                "--force-recurse",
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_argv_points_at_generated_expression() {
+        let argv = evaluator_argv_scoped(
+            std::path::Path::new("/work/selection.nix"),
+            std::path::Path::new("/src/tree"),
+            std::path::Path::new("/work/gcroots"),
+            4,
+            4096,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/work/selection.nix",
+                "-I",
+                "nixpkgs=/src/tree",
+                "--gc-roots-dir",
+                "/work/gcroots",
+                "--workers",
+                "4",
+                "--max-memory-size",
+                "4096",
+                "--meta",
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_expression_golden() {
+        let expr = selection_expr(
+            std::path::Path::new("/src/tree/nixos/release-combined.nix"),
+            &sample_arg(),
+            &[("stableBranch".to_string(), "false".to_string())],
+            &[
+                "nixpkgs.hello.x86_64-linux".to_string(),
+                "nixos.tests.login.x86_64-linux".to_string(),
+            ],
+        )
+        .unwrap();
+        let expected = r#"# Generated by rio-parity eval: scoped selection over the Hydra jobset entry point.
+let
+  release = import /src/tree/nixos/release-combined.nix {
+    nixpkgs = { outPath = builtins.storePath /nix/store/gay80fqbpm2wakbsyd4in44gx0cwx3h5-source; rev = "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9"; shortRev = "68d8aa3d661f"; revCount = 975402; };
+    stableBranch = false;
+  };
+  getPath = path: set: builtins.foldl' (s: a: builtins.getAttr a s) set path;
+in
+{
+  "nixpkgs.hello.x86_64-linux" = getPath [ "nixpkgs" "hello" "x86_64-linux" ] release;
+  "nixos.tests.login.x86_64-linux" = getPath [ "nixos" "tests" "login" "x86_64-linux" ] release;
+}
+"#;
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn selection_expression_rejects_empty_attr_component() {
+        let err = selection_expr(
+            std::path::Path::new("/e.nix"),
+            &sample_arg(),
+            &[],
+            &["nixpkgs..hello".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nixpkgs..hello"));
+    }
+}
