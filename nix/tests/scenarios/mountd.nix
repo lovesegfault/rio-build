@@ -54,6 +54,21 @@
 #                     missing/invalid/expired/mismatched tokens are
 #                     rejected with no fs trace, and gid-990 peers keep
 #                     working without a token (the standalone path)
+#   rmt2-mode         (§P0590) with --token-pubkey-path (PUBLIC trust
+#                     roots from an in-VM `spike_mountd_client keygen`)
+#                     and --node-name, a non-990 peer is admitted iff
+#                     Mount{} carries a scheduler-shaped Ed25519 rmt2
+#                     token for exactly this build AND this node; the
+#                     full reject matrix (missing/garbage/wrong-key/
+#                     expired/wrong-audience/wrong-build_id/wrong-node/
+#                     missing-node-claim/legacy-HMAC) leaves no fs
+#                     trace; a second trust root admits tokens from the
+#                     rotated key; a daemon restart re-admits the
+#                     retained token; --node-name unset skips the node
+#                     check; gid-990 peers stay token-less; the
+#                     rio_mountd_trust_root gauge names every loaded
+#                     root; and a keyless restart returns to the 0660
+#                     gid-only socket
 #
 # Perf criteria (P0578 vi `BackingOpen` p99 < 200 µs, vii `Promote`
 # ≥ 1 GiB/s, x concurrent p99 < 1 ms) are gated only when the guest
@@ -106,8 +121,10 @@ in
 pkgs.testers.runNixOSTest {
   name = "mountd";
   # 900 covered phases 1-2; the §P0559 token-mode phase adds one more
-  # daemon restart plus a handful of small Mounts (~1-2 min under TCG).
-  globalTimeout = 1080 + common.covTimeoutHeadroom;
+  # daemon restart plus a handful of small Mounts (~1-2 min under TCG);
+  # the §P0590 rmt2 phase adds two keygens, three more daemon restarts,
+  # and another dozen small Mounts (~2-3 min under TCG).
+  globalTimeout = 1380 + common.covTimeoutHeadroom;
 
   nodes.machine = _: {
     virtualisation.memorySize = 2048;
@@ -640,6 +657,166 @@ pkgs.testers.runNixOSTest {
         assert 'rio_mountd_mount_admission_total{method="token"}' in metrics, metrics
         assert 'rio_mountd_mount_admission_total{method="gid"}' in metrics, metrics
         assert "rio_mountd_mount_rejected_total" in metrics, metrics
+
+    # ═══ Phase 4: Ed25519 rmt2 admission, node-scoped (§P0590) ═════════
+    # The ADR-022 mount-admission-credentials scheme: an in-VM keygen
+    # produces the scheduler-side signing key and the daemon-side PUBLIC
+    # trust roots; the daemon is restarted with ONLY the trust roots (no
+    # HMAC key) plus its own --node-name, so the only node-resident
+    # credential material is public. Tokens are minted with the spike
+    # client's mint-token --signing-key-file: the same
+    # MountdAdmissionClaims/rmt2 envelope the scheduler signs into
+    # WorkAssignment.mountd_token at dispatch.
+    stop_mountd()
+    machine.succeed(
+        f"{CLIENT} keygen --out-key /run/mountd-signing.key"
+        " --out-pub /run/mountd-trust-roots.pub --name rio-mountd-1"
+    )
+    NODE = "vm-test-node"
+    start_mountd(
+        64 * 1024 * 1024,
+        f"--token-pubkey-path /run/mountd-trust-roots.pub --node-name {NODE}",
+    )
+
+    def mint2(args):
+        return machine.succeed(
+            f"{CLIENT} mint-token --signing-key-file /run/mountd-signing.key {args}"
+        ).strip()
+
+    with subtest("rmt2: trust-root gauge names the loaded key"):
+        machine.wait_until_succeeds(
+            "curl -sf 127.0.0.1:9095/metrics"
+            " | grep -q 'rio_mountd_trust_root{key_name=\"rio-mountd-1\"}'",
+            timeout=30,
+        )
+
+    with subtest("rmt2: right-node token admits a non-990 peer; staging as usual"):
+        mode = machine.succeed("stat -c '%a' /run/rio-mountd/mountd.sock").strip()
+        assert mode == "666", f"rmt2 token-mode socket mode is {mode}, want 666"
+        tok = mint2(f"--build-id b-rmt2 --node {NODE}")
+        serve("outsider", "b-rmt2", "rmt2", token=tok)
+        st = machine.succeed("stat -c '%a %U' /var/rio/staging/b-rmt2").strip()
+        assert st == "700 outsider", f"staging dir is {st}"
+        machine.succeed("kill $(cat /tmp/rmt2.pid)")
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-rmt2", timeout=30)
+        wait_idle()
+
+    with subtest("rmt2: full reject matrix leaves no fs trace"):
+        # A second, UNTRUSTED keypair for the wrong-key case (its pub
+        # line is never added to the daemon's trust roots).
+        machine.succeed(
+            f"{CLIENT} keygen --out-key /run/mountd-rogue.key"
+            " --out-pub /run/mountd-rogue.pub --name rio-mountd-rogue"
+        )
+        rejects = {
+            "missing": None,
+            "garbage": "rmt2.not-a-token",
+            "wrong-key": machine.succeed(
+                f"{CLIENT} mint-token --signing-key-file /run/mountd-rogue.key"
+                f" --build-id b-r2rej --node {NODE}"
+            ).strip(),
+            "expired": mint2(f"--build-id b-r2rej --node {NODE} --expired"),
+            "wrong-audience": mint2(f"--build-id b-r2rej --node {NODE} --audience rio-store"),
+            "wrong-build-id": mint2(f"--build-id b-someone-else --node {NODE}"),
+            "wrong-node": mint2("--build-id b-r2rej --node some-other-node"),
+            "missing-node-claim": mint2("--build-id b-r2rej"),
+            # The §P0559 HMAC envelope is rejected outright: this daemon
+            # has no HMAC key configured (Ed25519-only posture).
+            "legacy-hmac": machine.succeed(
+                f"{CLIENT} mint-token --key-file /run/mountd-token.key --build-id b-r2rej"
+            ).strip(),
+        }
+        for what, tok in rejects.items():
+            token_arg = f"--token {tok} " if tok else ""
+            machine.succeed(
+                client(
+                    "outsider",
+                    f"expect-mount-err --build-id b-r2rej {token_arg}--expect Unauthorized",
+                )
+            )
+            print(f"rmt2 reject ok: {what}")
+        machine.succeed("test ! -e /var/rio/staging/b-r2rej")
+        wait_idle()
+        # Rejects are visible (with reasons) in the counter; the wire
+        # reply stayed the one opaque Unauthorized the client asserted.
+        metrics = machine.succeed("curl -sf 127.0.0.1:9095/metrics")
+        assert 'reason="node-mismatch"' in metrics, metrics
+        assert 'reason="node-missing"' in metrics, metrics
+
+    with subtest("rmt2: gid-990 peer still admitted without a token"):
+        serve("build1", "b-r2-gid", "r2gid")
+        st = machine.succeed("stat -c '%a %U' /var/rio/staging/b-r2-gid").strip()
+        assert st == "700 build1", f"staging dir is {st}"
+        machine.succeed("kill $(cat /tmp/r2gid.pid)")
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-r2-gid", timeout=30)
+        wait_idle()
+
+    with subtest("rmt2: daemon restart re-admits the retained token (rotation overlap loaded)"):
+        # The builder retains its token and re-Mounts after a mountd
+        # restart; the binding is the node NAME, not a daemon instance,
+        # so the same token must admit again. The restarted daemon also
+        # loads a SECOND trust root (the rotation-overlap file shape:
+        # keygen appends to the same .pub file).
+        retained = mint2(f"--build-id b-retained --node {NODE}")
+        serve("outsider", "b-retained", "retained1", token=retained)
+        machine.succeed("kill $(cat /tmp/retained1.pid) || true")
+        stop_mountd()
+        machine.succeed(
+            f"{CLIENT} keygen --out-key /run/mountd-signing-2.key"
+            " --out-pub /run/mountd-trust-roots.pub --name rio-mountd-2"
+        )
+        start_mountd(
+            64 * 1024 * 1024,
+            f"--token-pubkey-path /run/mountd-trust-roots.pub --node-name {NODE}",
+        )
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-retained", timeout=30)
+        wait_idle()
+        serve("outsider", "b-retained", "retained2", token=retained)
+        machine.succeed("kill $(cat /tmp/retained2.pid)")
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-retained", timeout=30)
+        wait_idle()
+        # Both roots are reported by the gauge (the rotation-runbook
+        # precondition for flipping the signer)…
+        metrics = machine.succeed("curl -sf 127.0.0.1:9095/metrics")
+        assert 'rio_mountd_trust_root{key_name="rio-mountd-1"}' in metrics, metrics
+        assert 'rio_mountd_trust_root{key_name="rio-mountd-2"}' in metrics, metrics
+        # …and a token signed by the incoming key-2 is admitted too.
+        rotated = machine.succeed(
+            f"{CLIENT} mint-token --signing-key-file /run/mountd-signing-2.key"
+            f" --build-id b-rotated --node {NODE}"
+        ).strip()
+        serve("outsider", "b-rotated", "rotated", token=rotated)
+        machine.succeed("kill $(cat /tmp/rotated.pid)")
+        machine.wait_until_succeeds("test ! -e /var/rio/staging/b-rotated", timeout=30)
+        wait_idle()
+
+    with subtest("rmt2: --node-name unset skips the node check"):
+        stop_mountd()
+        start_mountd(
+            64 * 1024 * 1024,
+            "--token-pubkey-path /run/mountd-trust-roots.pub",
+        )
+        # A token scoped to a node this daemon does not claim to be —
+        # and an unbound one — both admit when no node name is set.
+        for what, bid, node_arg in [
+            ("bound", "b-nonode-bound", f"--node {NODE}"),
+            ("unbound", "b-nonode-unbound", ""),
+        ]:
+            tok = mint2(f"--build-id {bid} {node_arg}")
+            serve("outsider", bid, f"nonode-{what}", token=tok)
+            machine.succeed(f"kill $(cat /tmp/nonode-{what}.pid)")
+            machine.wait_until_succeeds(f"test ! -e /var/rio/staging/{bid}", timeout=30)
+            wait_idle()
+
+    with subtest("keyless restart: socket back to 0660 gid-only"):
+        stop_mountd()
+        start_mountd(64 * 1024 * 1024)
+        mode = machine.succeed("stat -c '%a' /run/rio-mountd/mountd.sock").strip()
+        assert mode == "660", f"keyless socket mode is {mode}, want 660"
+        # outsider cannot even connect on the 0660 socket (DAC), exactly
+        # as in the phase-2 gid-gate subtest.
+        rc, out = machine.execute(client("outsider", "expect-rejected") + " 2>&1")
+        assert rc != 0 and "ermission denied" in out, f"rc={rc} out={out!r}"
 
     # collectCoverage below only stops systemd-managed rio services;
     # the raw-exec'd daemon needs an explicit SIGTERM to flush its
