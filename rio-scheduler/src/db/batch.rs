@@ -218,11 +218,15 @@ impl SchedulerDb {
                 END,
                 topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned,
                 closure_hole = derivations.closure_hole OR EXCLUDED.closure_hole,
-                -- A later non-authoritative submission of the same
-                -- drv_hash (NULL here) must never wipe persisted
-                -- authoritative bytes; a later authoritative one
-                -- refreshes them.
-                drv_content = COALESCE(EXCLUDED.drv_content, derivations.drv_content)
+                -- Last write wins: a later authoritative submission
+                -- refreshes the persisted bytes, and a later
+                -- NON-authoritative submission of the same drv_hash
+                -- clears them — non-authoritative means the .drv is
+                -- fetchable from the store, so the persisted copy is
+                -- no longer needed, and clearing it bounds how long a
+                -- stale (or hostile, pre-validation) blob can outlive
+                -- the submission that wrote it.
+                drv_content = EXCLUDED.drv_content
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,

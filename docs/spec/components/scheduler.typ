@@ -1569,14 +1569,23 @@ tables) during state recovery.
   (`drv_content_authoritative`, the content-bound hook fallback) MUST have
   those bytes persisted with the derivation row at merge time and restored
   into the in-memory state on recovery, so a post-failover dispatch carries
-  the same content. The persisted bytes are dispatch payload only --- they
-  MUST never be written to any store or served as a store object.
+  the same content. Before persisting, `SubmitBuild` ingress MUST validate
+  the claim: a single-node submission whose bytes parse as a content-bound
+  derivation consistent with the node's declared system, output names,
+  fixed-output paths, and `ca_modular_hash` --- submitters are untrusted,
+  and unvalidated authoritative bytes would let one tenant poison the
+  persisted content rebuilt under another derivation's identity after a
+  failover. The persisted bytes are dispatch payload only --- they MUST
+  never be written to any store or served as a store object.
 ]
-The column is `NULL` for every other derivation and is merged with
-`COALESCE` on re-upsert, so a later non-authoritative submission of the same
-derivation never erases the persisted copy. Rows written before the column
-existed (or by a pre-upgrade scheduler) recover with empty content and keep
-the pre-durability failure mode for that one window.
+The column is `NULL` for every other derivation and re-upsert is
+last-write-wins: a later authoritative submission refreshes the bytes and a
+later non-authoritative submission of the same derivation clears them (its
+`.drv` is then fetchable from the store, so the persisted copy is no longer
+needed --- and a stale blob never outlives the next submission). Rows
+written before the column existed (or by a pre-upgrade scheduler) recover
+with empty content and keep the pre-durability failure mode for that one
+window.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to

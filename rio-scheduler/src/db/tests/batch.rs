@@ -657,18 +657,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
     assert_eq!(fetch("hookdrv").await?, Some(aterm.clone()), "persisted");
     assert_eq!(fetch("plaindrv").await?, None, "ordinary node stays NULL");
 
-    // Re-upsert the same drv_hash WITHOUT content (a later full-DAG
-    // submission of the same derivation) — COALESCE keeps the bytes.
-    let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", None)]).await?;
-    tx.commit().await?;
-    assert_eq!(
-        fetch("hookdrv").await?,
-        Some(aterm.clone()),
-        "non-authoritative re-upsert must not wipe persisted bytes"
-    );
-
-    // A later authoritative upsert refreshes them.
+    // A later authoritative upsert refreshes the bytes.
     let aterm2 = b"Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])".to_vec();
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", Some(aterm2.clone()))]).await?;
@@ -683,6 +672,20 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
         .find(|r| r.drv_hash == "hookdrv")
         .expect("hookdrv loaded");
     assert_eq!(hook.drv_content.as_deref(), Some(aterm2.as_slice()));
+
+    // Last write wins: a later NON-authoritative submission of the same
+    // drv_hash (e.g. another tenant's ordinary full-DAG build of the
+    // same derivation, whose .drv is in the store) clears the persisted
+    // blob — a previously-written authoritative copy can never leak
+    // into, or outlive, an unrelated later submission.
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", None)]).await?;
+    tx.commit().await?;
+    assert_eq!(
+        fetch("hookdrv").await?,
+        None,
+        "non-authoritative re-upsert clears persisted bytes (last write wins)"
+    );
     let plain = recovered
         .iter()
         .find(|r| r.drv_hash == "plaindrv")

@@ -1169,12 +1169,17 @@ pub const M_064: () = ();
 /// from). Supersedes `004_recovery.sql`'s "drv_content not persisted"
 /// note for authoritative nodes — 004 is frozen and stays as written.
 ///
-/// NULL for every non-fallback derivation; written via COALESCE on
-/// re-upsert so a later non-authoritative submission of the same
-/// drv_hash never wipes the persisted bytes. No size CHECK (the shared
-/// ingress bound in rio-common is authoritative; a SQL literal would
-/// drift). Bounded at one row per hook submission and ≤ the ingress cap
-/// (TOAST-able, no index), so row growth is negligible.
+/// NULL for every non-fallback derivation. Re-upsert is last-write-wins:
+/// a later authoritative submission refreshes the bytes, and a later
+/// non-authoritative one clears them (the .drv is then fetchable from
+/// the store, so persistence is unnecessary — and clearing bounds how
+/// long any stale blob can outlive the submission that wrote it).
+/// SubmitBuild ingress validates authoritative content against the
+/// node's claimed identity before it can ever reach this column. No
+/// size CHECK (the shared ingress bound in rio-common is authoritative;
+/// a SQL literal would drift). Bounded at one row per hook submission
+/// and ≤ the ingress cap (TOAST-able, no index), so row growth is
+/// negligible.
 ///
 /// Rolling-upgrade caveat: rows written before this migration (or by an
 /// old scheduler) have NULL drv_content, so a hook-fallback build that

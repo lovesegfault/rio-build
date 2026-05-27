@@ -425,9 +425,10 @@ pub(crate) struct DerivationRow {
     pub closure_hole: bool,
     /// Authoritative inline derivation bytes (content-bound hook
     /// fallback) — `Some` only when the gateway marked the node
-    /// `drv_content_authoritative`; `None` for every other node so the
-    /// column stays NULL and a re-upsert can never wipe persisted
-    /// bytes (COALESCE on conflict).
+    /// `drv_content_authoritative` (and SubmitBuild ingress validated
+    /// the bytes against the node's claimed identity); `None` for every
+    /// other node. Last write wins on re-upsert: a later submission
+    /// that can rely on the store clears the column.
     pub drv_content: Option<Vec<u8>>,
 }
 

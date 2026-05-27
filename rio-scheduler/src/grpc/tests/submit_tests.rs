@@ -781,3 +781,190 @@ async fn revoked_jti_rejected_by_cancel_watch_query() {
     assert_eq!(s.code(), tonic::Code::Unauthenticated);
     assert!(s.message().contains("revoked"), "got: {}", s.message());
 }
+
+// ── Authoritative inline drv_content: ingress identity binding ──────────
+//
+// `drv_content_authoritative` means "persist these bytes and rebuild them
+// verbatim after failover", so the scheduler must not take a submitter's
+// word for them: the bytes must describe a content-bound derivation
+// consistent with the node's claimed identity, and the flag is only valid
+// for the single-node hook-fallback shape.
+// r[verify sched.recovery.inline-drv-durability]
+
+/// Helper: a floating-CA ATerm + the node fields that legitimately
+/// describe it (what the gateway's content-bound fallback produces).
+fn authoritative_ca_node(tag: &str) -> rio_proto::types::DerivationNode {
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+    let mut node = make_node(tag);
+    let drv = rio_nix::derivation::Derivation::parse(aterm).unwrap();
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        &node.drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap();
+    node.drv_content = aterm.as_bytes().to_vec();
+    node.drv_content_authoritative = true;
+    node.expected_output_paths = vec![String::new()];
+    node.is_content_addressed = true;
+    node.needs_resolve = true;
+    node.ca_modular_hash = hash.to_vec();
+    node
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_in_multi_node_dag() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let req = Req {
+        nodes: vec![
+            authoritative_ca_node("auth-multi-a"),
+            make_node("auth-multi-b"),
+        ],
+        edges: vec![],
+        ..Default::default()
+    };
+    let status = grpc.submit_build(Request::new(req)).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("single-node"),
+        "should name the single-node constraint: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_identity_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    // Fixed-output ATerm whose declared path is NOT what its declared
+    // hash derives to — the canonical poisoning shape.
+    let aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    let mut node = make_node("auth-mismatch");
+    node.drv_content = aterm.as_bytes().to_vec();
+    node.drv_content_authoritative = true;
+    node.is_fixed_output = true;
+    node.expected_output_paths = vec!["/nix/store/ffffffffffffffffffffffffffffffff-victim".into()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("derives to"),
+        "should name the path/hash mismatch: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_input_addressed_content() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    // Plain IA-shaped output (declared path, no hash): never a
+    // legitimate hook fallback, and exactly the shape that could squat
+    // another derivation's output paths after a failover.
+    let aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    let mut node = make_node("auth-ia");
+    node.drv_content = aterm.as_bytes().to_vec();
+    node.drv_content_authoritative = true;
+    node.expected_output_paths = vec!["/nix/store/ffffffffffffffffffffffffffffffff-victim".into()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("content-bound"),
+        "should require content-bound outputs: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_accepts_authoritative_fod_fallback() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-fod-hook").await;
+
+    let mut node = make_node("auth-fod-ok");
+    // Honest FOD: derive the path from the declared hash exactly like
+    // the gateway/builder do.
+    let digest =
+        hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest).unwrap();
+    let drv_name = {
+        let sp = rio_nix::store_path::StorePath::parse(&node.drv_path).unwrap();
+        sp.name()
+            .strip_suffix(".drv")
+            .unwrap_or(sp.name())
+            .to_owned()
+    };
+    let honest = rio_nix::store_path::StorePath::make_fixed_output(&drv_name, &nix_hash, true, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let aterm = format!(
+        r#"Derive([("out","{honest}","r:sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{honest}")])"#
+    );
+    node.drv_content = aterm.into_bytes();
+    node.drv_content_authoritative = true;
+    node.is_fixed_output = true;
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec![honest];
+
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            tenant_name: "team-fod-hook".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_ok(), "honest FOD fallback accepted: {result:?}");
+}
+
+#[tokio::test]
+async fn test_submit_build_accepts_authoritative_floating_ca_fallback() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-ca-hook").await;
+    let node = authoritative_ca_node("auth-ca-ok");
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            tenant_name: "team-ca-hook".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "honest floating-CA fallback accepted: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_modular_hash_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = authoritative_ca_node("auth-ca-badhash");
+    node.ca_modular_hash = vec![0u8; 32];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("ca_modular_hash"),
+        "should name the hash mismatch: {}",
+        status.message()
+    );
+}

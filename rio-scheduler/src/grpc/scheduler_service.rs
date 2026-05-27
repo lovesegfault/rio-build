@@ -148,6 +148,14 @@ impl SchedulerService for SchedulerGrpc {
                 rio_common::limits::MAX_DRV_CONTENT_BYTES,
             )?;
         }
+        // r[impl sched.recovery.inline-drv-durability]
+        // Authoritative inline derivations are persisted and rebuilt
+        // verbatim after a failover, so the scheduler must not take the
+        // submitter's word for them (workers and direct submitters are
+        // untrusted; the gateway being the only intended producer is
+        // not a defense). Bind the bytes to the node's claimed identity
+        // before they can ever reach the derivations table.
+        validate_authoritative_drv_content(&req.nodes)?;
 
         // UUID v7 (time-ordered, RFC 9562): the high 48 bits are Unix-ms
         // timestamp, so lexicographic sort == chronological sort. This
@@ -442,4 +450,203 @@ impl SchedulerService for SchedulerGrpc {
             tenant_id: tenant_id.to_string(),
         }))
     }
+}
+
+/// Validate a node that claims `drv_content_authoritative`.
+///
+/// The flag means "persist these bytes and rebuild them verbatim after a
+/// failover", so accepting them on faith would let a direct submitter
+/// poison the persisted derivation content for an arbitrary `drv_hash`
+/// (sticky until the next submission of that derivation) and have the
+/// post-failover dispatch build attacker-chosen content under another
+/// derivation's identity. The only legitimate producer is the gateway's
+/// content-bound single-node hook fallback, so enforce exactly that
+/// shape and bind the bytes to the node's claimed identity:
+///
+/// - single-node submission (the hook fallback is never part of a DAG);
+/// - the bytes parse as a derivation whose platform and output names
+///   match the node's `system` / `output_names`;
+/// - every output is content-bound — fixed-output (declared hash, whose
+///   recomputed store path must equal both the path declared inside the
+///   ATerm and the node's `expected_output_paths` entry) or floating-CA
+///   (no declared path, empty expected path);
+/// - plain input-addressed outputs are rejected outright (the gateway
+///   refuses inline IA derivations, and an IA-shaped authoritative blob
+///   is exactly the poisoning shape this check exists to stop);
+/// - when any output is floating-CA the node's `ca_modular_hash` must
+///   equal `hash_derivation_modulo` recomputed over the supplied bytes
+///   (and when present it must match for fixed-output nodes too).
+///
+/// `drv_hash` itself cannot be bound to the bytes (the inline
+/// re-serialization deliberately does not text-hash to the client's
+/// claimed `.drv` path), but with the checks above whatever is persisted
+/// can only describe a content-bound build whose outputs the store
+/// verifies against their own content — it can never produce bytes at
+/// another derivation's input-addressed output paths.
+fn validate_authoritative_drv_content(
+    nodes: &[rio_proto::types::DerivationNode],
+) -> Result<(), Status> {
+    use rio_nix::derivation::{Derivation, DerivationLike};
+    use rio_nix::hash::NixHash;
+    use rio_nix::store_path::StorePath;
+
+    let Some(node) = nodes.iter().find(|n| n.drv_content_authoritative) else {
+        return Ok(());
+    };
+    if nodes.len() != 1 {
+        return Err(Status::invalid_argument(format!(
+            "drv_content_authoritative is only valid for a single-node submission \
+             (the content-bound hook fallback), got {} nodes",
+            nodes.len()
+        )));
+    }
+    if node.drv_content.is_empty() {
+        return Err(Status::invalid_argument(
+            "drv_content_authoritative requires non-empty drv_content",
+        ));
+    }
+    let text = std::str::from_utf8(&node.drv_content).map_err(|_| {
+        Status::invalid_argument("authoritative drv_content is not valid UTF-8 ATerm")
+    })?;
+    let drv = Derivation::parse(text).map_err(|e| {
+        Status::invalid_argument(format!(
+            "authoritative drv_content does not parse as a derivation: {e}"
+        ))
+    })?;
+
+    if drv.platform() != node.system {
+        return Err(Status::invalid_argument(format!(
+            "authoritative drv_content platform {:?} does not match node.system {:?}",
+            drv.platform(),
+            node.system
+        )));
+    }
+    let mut parsed_names: Vec<&str> = drv.outputs().iter().map(|o| o.name()).collect();
+    parsed_names.sort_unstable();
+    let mut node_names: Vec<&str> = node.output_names.iter().map(String::as_str).collect();
+    node_names.sort_unstable();
+    if parsed_names != node_names {
+        return Err(Status::invalid_argument(format!(
+            "authoritative drv_content outputs {parsed_names:?} do not match node.output_names {node_names:?}"
+        )));
+    }
+    if node.is_fixed_output != drv.is_fixed_output() {
+        return Err(Status::invalid_argument(
+            "node.is_fixed_output does not match the authoritative drv_content",
+        ));
+    }
+
+    let expected: std::collections::HashMap<&str, &str> = node
+        .output_names
+        .iter()
+        .map(String::as_str)
+        .zip(node.expected_output_paths.iter().map(String::as_str))
+        .collect();
+    let drv_name = StorePath::parse(&node.drv_path)
+        .ok()
+        .map(|sp| {
+            sp.name()
+                .strip_suffix(".drv")
+                .unwrap_or_else(|| sp.name())
+                .to_owned()
+        })
+        .unwrap_or_default();
+
+    let mut has_floating = false;
+    for out in drv.outputs() {
+        let (name, path, algo, hash) = (out.name(), out.path(), out.hash_algo(), out.hash());
+        if !algo.is_empty() && !hash.is_empty() {
+            // Fixed output: the declared hash must derive to the path the
+            // ATerm declares AND to the node's expected output path.
+            let (recursive, algo_str) = match algo.strip_prefix("r:") {
+                Some(rest) => (true, rest),
+                None => (false, algo),
+            };
+            let parsed_algo = algo_str.parse().map_err(|_| {
+                Status::invalid_argument(format!(
+                    "authoritative drv_content output '{name}' declares unsupported \
+                     outputHashAlgo '{algo}'"
+                ))
+            })?;
+            let digest = hex::decode(hash).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "authoritative drv_content output '{name}': outputHash is not valid base16"
+                ))
+            })?;
+            let nix_hash = NixHash::new(parsed_algo, digest).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "authoritative drv_content output '{name}': invalid outputHash: {e}"
+                ))
+            })?;
+            let derived = StorePath::make_fixed_output(&drv_name, &nix_hash, recursive, &[])
+                .map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "authoritative drv_content output '{name}': cannot derive fixed-output \
+                         path: {e}"
+                    ))
+                })?;
+            if derived.as_str() != path {
+                return Err(Status::invalid_argument(format!(
+                    "authoritative drv_content output '{name}' declares path {path} but its \
+                     declared hash derives to {} — content and identity do not match",
+                    derived.as_str()
+                )));
+            }
+            if let Some(exp) = expected.get(name)
+                && !exp.is_empty()
+                && *exp != derived.as_str()
+            {
+                return Err(Status::invalid_argument(format!(
+                    "node.expected_output_paths['{name}'] = {exp} does not match the \
+                     fixed-output path {} derived from the authoritative drv_content",
+                    derived.as_str()
+                )));
+            }
+        } else if !algo.is_empty() {
+            // Floating-CA output: no static path exists yet anywhere.
+            has_floating = true;
+            if !path.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "authoritative drv_content output '{name}' is floating-CA but declares a \
+                     path"
+                )));
+            }
+            if let Some(exp) = expected.get(name)
+                && !exp.is_empty()
+            {
+                return Err(Status::invalid_argument(format!(
+                    "node.expected_output_paths['{name}'] must be empty for floating-CA output"
+                )));
+            }
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "authoritative inline derivations must be content-bound (fixed-output or \
+                 floating-CA); output '{name}' is input-addressed"
+            )));
+        }
+    }
+
+    // The realisation key the gateway carries must be the hash of the
+    // bytes it is carrying — recompute and compare. Mandatory when a
+    // floating output exists (the realisation is how the result becomes
+    // consumable); for FOD-only nodes an empty value is tolerated but a
+    // present one must still match.
+    if has_floating || !node.ca_modular_hash.is_empty() {
+        let mut cache = std::collections::HashMap::new();
+        let recomputed = rio_nix::derivation::hash_derivation_modulo(
+            &drv,
+            &node.drv_path,
+            &|_| None,
+            &mut cache,
+        )
+        .map_err(|e| {
+            Status::invalid_argument(format!("authoritative drv_content cannot be hashed: {e}"))
+        })?;
+        if node.ca_modular_hash != recomputed.to_vec() {
+            return Err(Status::invalid_argument(
+                "node.ca_modular_hash does not match the authoritative drv_content",
+            ));
+        }
+    }
+    Ok(())
 }
