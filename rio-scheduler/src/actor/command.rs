@@ -243,6 +243,20 @@ pub enum ActorCommand {
         reply: oneshot::Sender<bool>,
     },
 
+    /// Pull-mode dispatch: a pod asks for the work it was spawned for
+    /// (`ExecutorService.PullAssignment`). Leader-served; the actor
+    /// answers Deliver/Gone/NotYetReady or rejects (stale generation,
+    /// token mismatch). `send_unchecked` from the gRPC layer: the pod
+    /// retries with backoff, so backpressure shows up as retried pulls
+    /// rather than dropped work.
+    PullAssignment {
+        /// SpawnIntent.intent_id == drv hash (the DAG key).
+        intent_id: String,
+        /// HMAC-attested intent binding (None = dev mode, no key).
+        auth_intent: Option<String>,
+        reply: oneshot::Sender<Result<super::pull::PullOutcome, super::pull::PullRejection>>,
+    },
+
     /// Controller acked it created Jobs for these intents → arm the
     /// Pending-watch (ICE-backoff) timer for each band-targeted one.
     /// Separated from `GetSpawnIntents` so that path stays read-only:
@@ -732,6 +746,7 @@ impl ActorCommand {
             Self::ExecutorConnected { .. } => "ExecutorConnected",
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
             Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
+            Self::PullAssignment { .. } => "PullAssignment",
             Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",
             Self::PrefetchComplete { .. } => "PrefetchComplete",
             Self::Heartbeat(_) => "Heartbeat",

@@ -2382,7 +2382,7 @@ impl DagActor {
 
     /// Phase 4 of [`assign_to_worker`](Self::assign_to_worker): emit
     /// `DerivationStarted` + progress to interested gateways.
-    fn emit_assignment_started(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
+    pub(super) fn emit_assignment_started(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
         let drv_path = self.dag.path_or_hash_fallback(drv_hash);
         // The execution this dispatch minted (`assign_to_worker` set
         // `state.exec_id = Some(..)` before calling here). The gateway
@@ -2426,7 +2426,7 @@ impl DagActor {
     /// cancel) — caller treats that as assignment failure.
     ///
     /// [`WorkAssignment`]: rio_proto::types::WorkAssignment
-    async fn build_assignment_proto(
+    pub(super) async fn build_assignment_proto(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,

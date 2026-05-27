@@ -89,6 +89,15 @@ static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 //   systems[i], supported_features[i] → executor-lifetime actor state     → reject RPC > MAX_IDENT_LEN each
 //   running_build                     → hash_for_path lookup              → reject RPC > MAX_DERIVATION_PATH_LEN
 //   resources / kind / flags          → numeric                           → n/a
+// PullAssignment RPC (pull-mode dispatch):
+//   intent_id                         → DAG lookup, assignments/executions rows → reject RPC > MAX_IDENT_LEN
+//   executor_token                    → HMAC-verified then dropped        → reject RPC > MAX_EXECUTOR_TOKEN_LEN
+//                                       (verification fails on any tamper; the bound only caps the hash work)
+// ReportOutcome RPC (pull-mode dispatch):
+//   exec_id                           → UUID parse → attempt lookup       → reject RPC if not a valid UUID
+//   report.* (CompletionReport)       → same fields as the stream Completion arm → same bounds/validation as
+//                                       above (drv_path reject > MAX_DERIVATION_PATH_LEN, error_msg truncate,
+//                                       node_name/hw_class None if > MAX_IDENT_LEN, numerics validated actor-side)
 
 /// Upper bound on the byte length of a worker-supplied
 /// `derivation_path` (`BuildPhase`). A legitimate
@@ -140,6 +149,12 @@ pub(super) const MAX_IDENT_LEN: usize = 256;
 /// builder padding the marker past 16 KiB only denies itself the
 /// resource-floor bump.
 pub(super) const MAX_ERROR_MSG_LEN: usize = 16 * 1024;
+
+/// Upper bound on the body-supplied `PullAssignmentRequest.executor_token`.
+/// A legitimate HMAC executor token is a few hundred bytes; the bound only
+/// caps how much input the verifier hashes before rejecting garbage. The
+/// metadata carrier is already bounded by the HTTP/2 header limits.
+pub(super) const MAX_EXECUTOR_TOKEN_LEN: usize = 8 * 1024;
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
@@ -656,19 +671,104 @@ impl ExecutorService for SchedulerGrpc {
         }))
     }
 
-    // Pull-mode dispatch surface (additive). Stubs until the handler
-    // tasks land: the wire surface exists, nothing in production calls
-    // it, and the stream path above is untouched.
+    // Pull-mode dispatch surface (additive; coexists with the stream
+    // path above, which is untouched). Nothing in production calls
+    // these until a pool opts into pull mode.
 
+    /// The pull-mode pod's single ask. Leader-served; the actor turn
+    /// runs the admission kernel and (on Deliver) the one fenced
+    /// transaction. A re-pull while the attempt is open returns the
+    /// identical payload and exec_id.
+    // r[impl sched.executor.pull-transaction]
     #[instrument(skip(self, request), fields(rpc = "PullAssignment"))]
     async fn pull_assignment(
         &self,
         request: Request<rio_proto::types::PullAssignmentRequest>,
     ) -> Result<Response<rio_proto::types::PullAssignmentResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        Err(Status::unimplemented(
-            "PullAssignment is not implemented yet (pull-mode dispatch lands incrementally)",
-        ))
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        // r[impl sec.executor.identity-token+2]
+        // The same token↔intent binding the stream/heartbeat path
+        // enforces, applied per-unary. The token may arrive in metadata
+        // (x-rio-executor-token) or in the request body (the unary is
+        // self-contained for clients that cannot set per-call
+        // metadata); either carrier is verified by the same key.
+        let auth_intent = match self.require_executor(&request) {
+            Ok(claims) => claims.map(|c| c.intent_id),
+            Err(metadata_err) => {
+                let body_token = request.get_ref().executor_token.as_str();
+                if body_token.is_empty() {
+                    return Err(metadata_err);
+                }
+                // r[impl sched.executor.input-bounds+2]
+                rio_common::grpc::check_bound(
+                    "executor_token bytes",
+                    body_token.len(),
+                    MAX_EXECUTOR_TOKEN_LEN,
+                )?;
+                let Some(key) = &self.hmac_key else {
+                    // require_executor only fails when a key is
+                    // configured; unreachable, but stay closed.
+                    return Err(metadata_err);
+                };
+                let claims: rio_auth::hmac::ExecutorClaims =
+                    key.verify(body_token).map_err(|e| {
+                        Status::unauthenticated(format!("executor_token verification failed: {e}"))
+                    })?;
+                Some(claims.intent_id)
+            }
+        };
+        let req = request.into_inner();
+        if req.intent_id.is_empty() {
+            return Err(Status::invalid_argument("intent_id is required"));
+        }
+        // r[impl sched.executor.input-bounds+2]
+        rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
+
+        // send_unchecked: a dropped pull would park the pod for a full
+        // backoff interval; the pod retries anyway, so backpressure
+        // surfaces as retried pulls, never lost work.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.actor
+            .send_unchecked(ActorCommand::PullAssignment {
+                intent_id: req.intent_id,
+                auth_intent,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(Self::actor_error_to_status)?;
+        let outcome = reply_rx
+            .await
+            .map_err(|_| Status::internal("actor dropped PullAssignment reply"))?;
+
+        use rio_proto::types::pull_assignment_response::Outcome;
+        let outcome = match outcome {
+            Ok(crate::actor::PullOutcome::Deliver(assignment)) => Outcome::Assignment(*assignment),
+            Ok(crate::actor::PullOutcome::Gone) => Outcome::Gone(rio_proto::types::Gone {}),
+            Ok(crate::actor::PullOutcome::NotYetReady { retry_after_secs }) => {
+                Outcome::NotYetReady(rio_proto::types::NotYetReady {
+                    retry_after_seconds: retry_after_secs,
+                })
+            }
+            Err(crate::actor::PullRejection::NotLeader)
+            | Err(crate::actor::PullRejection::StaleGeneration) => {
+                // The same retryable not-leader class `ensure_leader`
+                // produces — the pod retries against the real leader.
+                return Err(Status::unavailable("not leader (standby replica)"));
+            }
+            Err(crate::actor::PullRejection::TokenMismatch) => {
+                return Err(Status::permission_denied(
+                    "executor token is bound to a different intent",
+                ));
+            }
+            Err(crate::actor::PullRejection::Internal(msg)) => {
+                return Err(Status::internal(msg));
+            }
+        };
+        Ok(Response::new(rio_proto::types::PullAssignmentResponse {
+            outcome: Some(outcome),
+        }))
     }
 
     #[instrument(skip(self, request), fields(rpc = "ReportOutcome"))]

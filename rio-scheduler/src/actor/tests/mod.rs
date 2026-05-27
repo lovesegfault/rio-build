@@ -22,6 +22,7 @@ mod keep_going;
 mod lifecycle_sweep;
 mod merge;
 mod misc;
+mod pull;
 mod recovery;
 mod sla_contract;
 mod wiring;

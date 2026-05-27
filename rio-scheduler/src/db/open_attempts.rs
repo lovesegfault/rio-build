@@ -57,6 +57,79 @@ pub(crate) struct OpenAttemptRow {
 }
 
 impl SchedulerDb {
+    /// The fenced pull-mint transaction (the durable half of
+    /// `PullAssignment`'s Deliver arm): write/refresh the active
+    /// `assignments` row and insert the `drv_executions` row
+    /// (`dispatch_mode = 'pull'`, `source_node` when known) in ONE
+    /// transaction that commits only if `serving_generation` is not
+    /// below the durable claims floor (GREATEST over
+    /// `leader_generation_claims` and `assignments` — the same arms
+    /// `max_known_generation` reads). Returns `Ok(true)` when the
+    /// transaction committed and `Ok(false)` when the fence aborted it
+    /// (nothing written).
+    // r[impl sched.executor.pull-transaction]
+    pub(crate) async fn mint_pull_attempt_fenced(
+        &self,
+        derivation_id: Uuid,
+        executor_id: &crate::state::ExecutorId,
+        serving_generation: i64,
+        exec_id: Uuid,
+        log_hash: &str,
+        source_node: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // The floor read runs on the transaction's connection so the
+        // commit happens at-or-after any claim row visible here; a
+        // below-floor serving generation aborts with no writes.
+        let floor: Option<i64> = sqlx::query_scalar(
+            "SELECT GREATEST( \
+                 (SELECT MAX(generation) FROM assignments), \
+                 (SELECT MAX(generation) FROM leader_generation_claims))",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if floor.is_some_and(|f| serving_generation < f) {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        // Same active-row upsert discipline as the stream path's
+        // insert_assignment (assignments_active_uq is the arbiter).
+        sqlx::query(
+            "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+             VALUES ($1, $2, $3, 'pending', $4) \
+             ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged') \
+             DO UPDATE SET \
+                 builder_id = EXCLUDED.builder_id, \
+                 generation = EXCLUDED.generation, \
+                 status = 'pending', \
+                 assigned_at = now(), \
+                 completed_at = NULL, \
+                 exec_id = EXCLUDED.exec_id",
+        )
+        .bind(derivation_id)
+        .bind(executor_id.as_str())
+        .bind(serving_generation)
+        .bind(exec_id)
+        .execute(&mut *tx)
+        .await?;
+        // The execution lifecycle row carries the pull discriminator
+        // and the controller-authoritative source attribution (071).
+        sqlx::query(
+            "INSERT INTO drv_executions \
+                 (exec_id, drv_hash, executor_id, started_at, dispatch_mode, source_node) \
+             VALUES ($1, $2, $3, now(), 'pull', $4) \
+             ON CONFLICT (exec_id) DO NOTHING",
+        )
+        .bind(exec_id)
+        .bind(log_hash)
+        .bind(executor_id.as_str())
+        .bind(source_node)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Every open **pull-mode** attempt: active assignment ⋈ execution
     /// (`dispatch_mode = 'pull'`) with no terminal `drv_attempts` fill.
     ///

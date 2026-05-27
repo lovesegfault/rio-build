@@ -53,6 +53,7 @@ pub(crate) mod floor;
 mod handle;
 mod housekeeping;
 mod merge;
+pub(crate) mod pull;
 mod recovery;
 mod snapshot;
 
@@ -67,6 +68,7 @@ pub use handle::ActorHandle;
 #[cfg(test)]
 pub(crate) use handle::DebugDerivationInfo;
 pub(crate) use handle::DebugExecutorInfo;
+pub use pull::{PullOutcome, PullRejection};
 
 #[cfg(test)]
 mod debug;
@@ -1251,6 +1253,17 @@ impl DagActor {
                     // poison/Ready/terminal writes) self-gates on
                     // is_leader() in executor.rs.
                     self.handle_executor_disconnected(&executor_id, stream_epoch)
+                        .await;
+                }
+                ActorCommand::PullAssignment {
+                    intent_id,
+                    auth_intent,
+                    reply,
+                } => {
+                    // r[sched.lease.standby-drops-writes]: the handler
+                    // self-gates on is_leader() and the mint transaction
+                    // carries the durable generation fence.
+                    self.handle_pull_assignment(intent_id, auth_intent, reply)
                         .await;
                 }
                 ActorCommand::ReportExecutorTermination {
