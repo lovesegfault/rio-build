@@ -296,9 +296,9 @@ pub(super) async fn collect_outputs(
     }
 }
 
-/// True iff the daemon's `MiscFailure` is `getting attributes of path
-/// '<p>': No such file or directory` where `<p>` is in the build's
-/// input closure.
+/// True iff the daemon's failure is `getting attributes of path
+/// '<p>': No such file or directory` (or one of the sibling phrasings
+/// below) where `<p>` is in the build's input closure.
 ///
 /// I-178: that pattern means the daemon's sandbox-setup `lstat(input)`
 /// hit overlay → FUSE → ENOENT (warm timeout, FUSE EIO, or the I-043
@@ -308,6 +308,33 @@ pub(super) async fn collect_outputs(
 /// materialization failure, NOT a build defect. Reporting
 /// `PermanentFailure` poisons the derivation; `InfrastructureFailure`
 /// lets the scheduler retry on a fresh worker.
+///
+/// Status gate (P0560 round 3b finding (a)): which `BuildStatus` the
+/// daemon wraps the failure in depends on WHEN it fired relative to the
+/// child's `\2` setup-done marker (Nix ≥ 2.24 `derivation-builder.cc`):
+///
+/// - **Before `\2`** (sandbox setup: `lstat`/bind-mount of inputs): the
+///   child serializes the exception to the parent, which rethrows it —
+///   the goal fails with **`MiscFailure`** and the message IS the
+///   daemon phrasing ("while setting up the build environment: getting
+///   attributes of path '…': …").
+/// - **After `\2`** (the `execve` of the builder itself — exactly where
+///   a never-node-cached castore input EIOs first): the child can only
+///   print the error to its stderr and `_exit(1)`; the parent sees a
+///   non-zero builder exit and wraps it as **`PermanentFailure`**
+///   (sandboxed IA derivations) or **`TransientFailure`** (FODs), with
+///   the daemon phrasing only inside the "Last N log lines" tail of the
+///   message ("Cannot build '…'. Reason: builder failed with exit code
+///   1. Last 1 log lines: > error: executing '…': Input/output error").
+///
+/// All three statuses are therefore eligible for reclassification; the
+/// closure-membership check (and, for inside-an-input paths, the
+/// availability-errno restriction) stays the load-bearing guard. A
+/// build script that *prints* a daemon-shaped line about a closure
+/// input and exits non-zero would ride the infra-retry loop instead of
+/// poisoning — that loop is bounded by the scheduler's
+/// `max_infra_retries`, and a closure input genuinely failing to read
+/// mid-build IS an infrastructure failure, so the trade is acceptable.
 ///
 /// String-matching the daemon's error is brittle but the message is
 /// stable since Nix 2.3 (`libstore/posix-fs-canonicalise.cc`). The
@@ -363,7 +390,16 @@ pub(crate) fn is_input_materialization_failure(
     static ANSI: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*m").expect("static regex"));
 
-    if nix_status != BuildStatus::MiscFailure {
+    // See the doc comment's status-gate section: MiscFailure is the
+    // pre-`\2` setup-failure wrap; PermanentFailure/TransientFailure are
+    // the post-`\2` builder-exit wraps (sandboxed vs FOD) whose message
+    // carries the daemon phrasing in the log-line tail. Everything else
+    // (OutputRejected, InputRejected, TimedOut, …) is never an input
+    // materialization failure.
+    if !matches!(
+        nix_status,
+        BuildStatus::MiscFailure | BuildStatus::PermanentFailure | BuildStatus::TransientFailure
+    ) {
         return false;
     }
     let stripped = ANSI.replace_all(error_msg, "");
@@ -615,11 +651,19 @@ mod tests {
             "ENOENT on non-closure path must NOT reclassify"
         );
 
-        // Non-MiscFailure status + matching path → false (status guard).
-        assert!(
-            !is_input_materialization_failure(Nix::PermanentFailure, &enoent, &closure),
-            "status guard: only MiscFailure is reclassified"
-        );
+        // Statuses outside the {Misc,Permanent,Transient}Failure gate
+        // never reclassify, marker or not.
+        for status in [
+            Nix::TimedOut,
+            Nix::OutputRejected,
+            Nix::InputRejected,
+            Nix::DependencyFailed,
+        ] {
+            assert!(
+                !is_input_materialization_failure(status, &enoent, &closure),
+                "status gate: {status:?} must NOT reclassify"
+            );
+        }
 
         // MiscFailure + unrelated message → false.
         assert!(
@@ -637,5 +681,79 @@ mod tests {
             &enoent,
             &[]
         ));
+    }
+
+    /// P0560 round 3b finding (a): when the castore lower EIOs on the
+    /// builder's very first read, the failing syscall is the daemon
+    /// child's `execve` — which fires AFTER the `\2` setup-done marker,
+    /// so the daemon wraps it as a non-zero builder exit
+    /// (`PermanentFailure` for sandboxed IA drvs, `TransientFailure` for
+    /// FODs) with the `executing '…': Input/output error` line only in
+    /// the "Last N log lines" tail. That shape MUST still reclassify to
+    /// infrastructure — the live finding was a derivation terminally
+    /// poisoned after one attempt because only MiscFailure was gated in.
+    // r[verify builder.result.input-eio-is-infra]
+    #[test]
+    fn test_builder_exit_wrapped_exec_eio_reclassifies() {
+        use rio_nix::protocol::build::BuildStatus as Nix;
+
+        let builder_input = "/nix/store/k41177w0qaa27diyrygniwmy5d59aiqs-castore-eio-builder";
+        let closure = vec![
+            builder_input.to_string(),
+            "/nix/store/y7fhmxcdbfyslfgkclgf4263wy6bhp3j-busybox-static".to_string(),
+        ];
+
+        // Literal Nix 2.34 fixupBuilderFailureErrorMessage shape (ANSI
+        // included): the daemon phrasing sits in the log-line tail.
+        let wrapped = format!(
+            "Cannot build '\u{1b}[35;1m/nix/store/pg93ljdiq52aaczx7l68p1zvpj3fnmx6-rio-castore-eio-infra.drv\u{1b}[0m'.\n\
+             Reason: \u{1b}[31;1mbuilder failed with exit code 1\u{1b}[0m.\n\
+             Output paths:\n  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-rio-castore-eio-infra\n\
+             Last 1 log lines:\n\
+             > error: executing '{builder_input}': Input/output error\n\
+             For full logs, run:\n  \u{1b}[1mnix log /nix/store/pg93ljdiq52aaczx7l68p1zvpj3fnmx6-rio-castore-eio-infra.drv\u{1b}[0m"
+        );
+        for status in [Nix::PermanentFailure, Nix::TransientFailure] {
+            assert!(
+                is_input_materialization_failure(status, &wrapped, &closure),
+                "{status:?}-wrapped execve EIO on a closure root must reclassify"
+            );
+        }
+
+        // Same wrap, but the failure is the build's own doing (script
+        // exited 1, no daemon phrasing about a closure input) — stays a
+        // build failure.
+        let plain_script_failure = "Cannot build '/nix/store/...-foo.drv'.\n\
+             Reason: builder failed with exit code 1.\n\
+             Last 2 log lines:\n\
+             > configure: error: C compiler cannot create executables\n\
+             > make: *** [all] Error 2";
+        assert!(
+            !is_input_materialization_failure(
+                Nix::PermanentFailure,
+                plain_script_failure,
+                &closure
+            ),
+            "an ordinary failing build must NOT reclassify"
+        );
+
+        // The errno restriction still applies through the wrap: an
+        // ENOENT for a file INSIDE an existing input (wrong interpreter
+        // baked into the drv) stays permanent even in log-tail form.
+        let wrapped_inside_enoent = format!(
+            "Cannot build '/nix/store/...-foo.drv'.\n\
+             Reason: builder failed with exit code 1.\n\
+             Last 1 log lines:\n\
+             > error: executing '{}/bin/missing': No such file or directory",
+            closure[1]
+        );
+        assert!(
+            !is_input_materialization_failure(
+                Nix::PermanentFailure,
+                &wrapped_inside_enoent,
+                &closure
+            ),
+            "ENOENT inside an existing input stays permanent through the exit-code wrap"
+        );
     }
 }
