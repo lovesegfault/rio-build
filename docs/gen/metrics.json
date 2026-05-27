@@ -37,6 +37,7 @@
     "rio_controller_ffd_placeable_intents",
     "rio_controller_ffd_unplaced_cores",
     "rio_controller_gc_runs_total",
+    "rio_controller_job_terminal_report_seconds",
     "rio_controller_lease_acquired_total",
     "rio_controller_lease_lost_total",
     "rio_controller_nodeclaim_consolidate_threshold_seconds",
@@ -75,6 +76,7 @@
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
     "rio_scheduler_attempt_record_retries_total",
+    "rio_scheduler_attempt_requeue_seconds",
     "rio_scheduler_backstop_timeouts_total",
     "rio_scheduler_broadcast_lagged_total",
     "rio_scheduler_build_duration_seconds",
@@ -417,6 +419,11 @@
         "help": "GC cron runs. result=success|connect_failure|rpc_failure. connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
       },
       {
+        "name": "rio_controller_job_terminal_report_seconds",
+        "kind": "histogram",
+        "help": "OA1 interval (i): Pod/Job terminal-condition timestamp → ReportExecutorTermination acked by the scheduler, by reason (oom_killed | disk_pressure | deadline_exceeded). Sampled once per terminal Pod/Job per controller process at the first acked report — the report path re-reports the same object every tick for the Job TTL window (the scheduler dedups server-side), and re-sampling those would measure the TTL window instead of the report latency. This is the controller-report-slack baseline the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
+      },
+      {
         "name": "rio_controller_lease_acquired_total",
         "kind": "counter",
         "help": "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn (check apiserver health / pod restarts)."
@@ -609,6 +616,11 @@
         "name": "rio_scheduler_attempt_record_retries_total",
         "kind": "counter",
         "help": "Re-deliveries of failure completions whose attempt-recording transaction (drv_attempts append + decide() + status persist) failed. Each increment is one bounded re-push of the completion event onto the actor mailbox; the derivation stays in its pre-report state until a re-delivery lands. Sustained rate > 0 means PG is rejecting the failure-accounting write path (the backstop sweep is the fallback once the per-derivation re-delivery budget is exhausted)."
+      },
+      {
+        "name": "rio_scheduler_attempt_requeue_seconds",
+        "kind": "histogram",
+        "help": "OA1 interval (ii): scheduler-side terminal/death observation → the event that closes the released attempt and (re)queues the derivation, by cause. cause=worker-report: the worker's own failure report and the requeue, same actor turn (the sample is the in-turn processing latency). cause=pod-terminal: disconnect observation → the controller's classifying termination report consumed. cause=establishment: disconnect observation → the TTL-sweep establishment fill. In stream mode the requeue itself happens at the disconnect, so the pod-terminal/establishment samples measure how long the released attempt waited for its classification — the controller-report-slack input the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
       },
       {
         "name": "rio_scheduler_backstop_timeouts_total",

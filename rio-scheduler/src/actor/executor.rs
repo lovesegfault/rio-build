@@ -721,6 +721,16 @@ impl DagActor {
         let mut race_ahead = false;
         let drv_hash = match self.recently_disconnected.remove(executor_id) {
             Some(entry) => {
+                // OA1 interval (ii), pod-terminal cause: disconnect
+                // observation → the controller's classifying report
+                // consumed. First-report-wins (the entry is removed),
+                // so each released attempt is sampled at most once on
+                // this cause.
+                metrics::histogram!(
+                    "rio_scheduler_attempt_requeue_seconds",
+                    "cause" => "pod-terminal"
+                )
+                .record(entry.at.elapsed().as_secs_f64());
                 released = entry.derivation_id.zip(entry.exec_id);
                 entry.drv_hash
             }
@@ -1014,6 +1024,15 @@ impl DagActor {
             .recently_disconnected
             .remove(&pod_name)
             .expect("key found above");
+        // OA1 interval (ii), pod-terminal cause: disconnect observation
+        // → the controller's DeadlineExceeded report consumed (the Job
+        // controller deleted the pod, so this is the prefix-matched
+        // classifying report for the released attempt).
+        metrics::histogram!(
+            "rio_scheduler_attempt_requeue_seconds",
+            "cause" => "pod-terminal"
+        )
+        .record(entry.at.elapsed().as_secs_f64());
         let drv_hash = entry.drv_hash.clone();
 
         let outcome = self
@@ -1224,6 +1243,17 @@ impl DagActor {
             let decision = match result {
                 Ok((won, decision)) => {
                     if won {
+                        // OA1 interval (ii), establishment cause:
+                        // disconnect observation → the establishment
+                        // fill. Recorded only when this sweep's fill
+                        // won the row (a row another party already
+                        // classified is not re-sampled), so the cause
+                        // labels partition released attempts.
+                        metrics::histogram!(
+                            "rio_scheduler_attempt_requeue_seconds",
+                            "cause" => "establishment"
+                        )
+                        .record(now.duration_since(entry.at).as_secs_f64());
                         if let Some(state) = self.dag.node_mut(drv_hash) {
                             state.classify_attempt_record(
                                 exec_id,

@@ -73,6 +73,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         // explicitly disables it.
         kube_build_scheduler_enabled: true,
         hw_config: crate::reconcilers::node_informer::HwClassConfig::default(),
+        terminal_report_sampled: Default::default(),
     })
 }
 

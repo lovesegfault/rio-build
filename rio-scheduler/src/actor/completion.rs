@@ -2709,6 +2709,10 @@ impl DagActor {
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
     ) -> FailureHandling {
+        // OA1 interval (ii), worker-report cause: the worker's own
+        // report is the terminal observation; the requeue (if the
+        // verdict is a retry) happens in this same actor turn.
+        let observed_at = Instant::now();
         // Ledger row for this observed attempt (1a): captured before
         // any transition clears the exec_id carrier; appended together
         // with whichever status persist this handler ends in.
@@ -2937,6 +2941,11 @@ impl DagActor {
                         warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
                     } else {
                         self.push_ready(drv_hash.clone());
+                        metrics::histogram!(
+                            "rio_scheduler_attempt_requeue_seconds",
+                            "cause" => "worker-report"
+                        )
+                        .record(observed_at.elapsed().as_secs_f64());
                     }
                 }
                 // C2c: dashboard's WatchBuild showed stale running_count
@@ -2988,6 +2997,9 @@ impl DagActor {
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
     ) -> FailureHandling {
+        // OA1 interval (ii), worker-report cause (see
+        // handle_transient_failure).
+        let observed_at = Instant::now();
         let error_msg = report.error_msg;
         // Ledger row for this observed attempt (1a): captured before
         // the floor bump / reset clears the exec_id carrier. The class
@@ -3209,6 +3221,11 @@ impl DagActor {
                     "infrastructure failure — retry without poison count"
                 );
                 self.requeue_after_recorded_retry(drv_hash);
+                metrics::histogram!(
+                    "rio_scheduler_attempt_requeue_seconds",
+                    "cause" => "worker-report"
+                )
+                .record(observed_at.elapsed().as_secs_f64());
             }
         }
         FailureHandling::Handled
@@ -3368,6 +3385,9 @@ impl DagActor {
         executor_id: &ExecutorId,
         report: FailureReportCtx<'_>,
     ) -> FailureHandling {
+        // OA1 interval (ii), worker-report cause (see
+        // handle_transient_failure).
+        let observed_at = Instant::now();
         let error_msg = report.error_msg;
         // Ledger row for this observed attempt (1a): captured before
         // the floor bump / reset clears the exec_id carrier; the floor
@@ -3516,6 +3536,11 @@ impl DagActor {
             );
         }
         self.requeue_after_recorded_retry(drv_hash);
+        metrics::histogram!(
+            "rio_scheduler_attempt_requeue_seconds",
+            "cause" => "worker-report"
+        )
+        .record(observed_at.elapsed().as_secs_f64());
         FailureHandling::Handled
     }
 

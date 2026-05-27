@@ -177,6 +177,20 @@ pub struct Ctx {
     /// instance shared with `node_informer::run` and the
     /// nodeclaim_pool reconciler.
     pub hw_config: node_informer::HwClassConfig,
+    /// Pod/Job names whose first acked `ReportExecutorTermination` has
+    /// already been sampled into
+    /// `rio_controller_job_terminal_report_seconds` (the OA1
+    /// interval-(i) instrument), with the insertion instant for
+    /// pruning. The report path re-reports the same terminal object
+    /// every tick for the Job TTL window (the scheduler dedups
+    /// server-side); without this gate the histogram would re-sample
+    /// the same terminal event every tick and measure the TTL window
+    /// instead of the terminal→first-acked-report latency. In-process
+    /// only (a controller restart may re-sample an object once —
+    /// acceptable observability noise, never a behavior change).
+    /// Pruned in `pool/job::report_terminated_pods` once entries
+    /// outlive the TTL window.
+    pub terminal_report_sampled: Mutex<HashMap<String, Instant>>,
 }
 
 /// ComponentScaler reconciler state.

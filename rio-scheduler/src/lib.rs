@@ -106,6 +106,18 @@ const MERGE_PHASE_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Histogram bucket boundaries for `rio_scheduler_attempt_requeue_seconds`
+/// (the OA1 interval-(ii) instrument). Spans the worker-report cause
+/// (same actor turn — tens of ms, dominated by the appending PG
+/// transaction), the pod-terminal cause (the controller's classifying
+/// report typically lands one or a few reconcile ticks after the
+/// disconnect), and the establishment cause (the TTL sweep fires at
+/// `TERMINATION_REPORT_TTL` after the disconnect), with headroom for
+/// controller-outage tails.
+const ATTEMPT_REQUEUE_BUCKETS: &[f64] = &[
+    0.05, 0.25, 1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 300.0, 600.0,
+];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -123,6 +135,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     ("rio_scheduler_dispatch_wait_seconds", DISPATCH_WAIT_BUCKETS),
     ("rio_scheduler_merge_phase_seconds", MERGE_PHASE_BUCKETS),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
+    (
+        "rio_scheduler_attempt_requeue_seconds",
+        ATTEMPT_REQUEUE_BUCKETS,
+    ),
     (
         "rio_scheduler_warm_prefetch_paths",
         WARM_PREFETCH_PATHS_BUCKETS,
@@ -543,6 +559,22 @@ pub fn describe_metrics() {
         "Time from a derivation entering Ready to being Assigned (fed \
          from DerivationState.ready_at). With ephemeral builders, \
          dominated by node-provision (~60–180s on EKS)."
+    );
+    describe_histogram!(
+        "rio_scheduler_attempt_requeue_seconds",
+        "OA1 interval (ii): scheduler-side terminal/death observation → \
+         the event that closes the released attempt and (re)queues the \
+         derivation, by cause. cause=worker-report: the worker's own \
+         failure report and the requeue, same actor turn (the sample is \
+         the in-turn processing latency). cause=pod-terminal: disconnect \
+         observation → the controller's classifying termination report \
+         consumed. cause=establishment: disconnect observation → the \
+         TTL-sweep establishment fill. In stream mode the requeue itself \
+         happens at the disconnect, so the pod-terminal/establishment \
+         samples measure how long the released attempt waited for its \
+         classification — the controller-report-slack input the \
+         executor-replacement establishment window is sized against \
+         (executor-lifecycle campaign, OA1)."
     );
     describe_counter!(
         "rio_scheduler_broadcast_lagged_total",

@@ -72,6 +72,16 @@ const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.
 /// + apiserver tail under load) so the ⊥-tick latency floor is visible.
 const NODECLAIM_TICK_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 
+/// Histogram bucket boundaries for `rio_controller_job_terminal_report_seconds`
+/// (the OA1 interval-(i) instrument). Typical = one or a few ~10s
+/// reconcile ticks between the Pod/Job going terminal and the acked
+/// report; the upper buckets cover scheduler/controller outages up to
+/// and past the Job TTL window so the tail the establishment slack must
+/// absorb stays visible instead of collapsing into +Inf.
+const JOB_TERMINAL_REPORT_BUCKETS: &[f64] = &[
+    1.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -85,6 +95,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     (
         "rio_controller_nodeclaim_tick_duration_seconds",
         NODECLAIM_TICK_BUCKETS,
+    ),
+    (
+        "rio_controller_job_terminal_report_seconds",
+        JOB_TERMINAL_REPORT_BUCKETS,
     ),
 ];
 
@@ -212,6 +226,19 @@ pub fn describe_metrics() {
         "nodeclaim_pool reconcile_once latency. Recorded on success AND error \
          (⊥-tick, apiserver 5xx). p99 approaching ADMIN_RPC_TIMEOUT (5s) = scheduler \
          stalled; approaching tick interval = reconciler can't keep up."
+    );
+    describe_histogram!(
+        "rio_controller_job_terminal_report_seconds",
+        "OA1 interval (i): Pod/Job terminal-condition timestamp → \
+         ReportExecutorTermination acked by the scheduler, by reason \
+         (oom_killed | disk_pressure | deadline_exceeded). Sampled once \
+         per terminal Pod/Job per controller process at the first acked \
+         report — the report path re-reports the same object every tick \
+         for the Job TTL window (the scheduler dedups server-side), and \
+         re-sampling those would measure the TTL window instead of the \
+         report latency. This is the controller-report-slack baseline \
+         the executor-replacement establishment window is sized against \
+         (executor-lifecycle campaign, OA1)."
     );
     describe_gauge!(
         "rio_controller_nodeclaim_live",

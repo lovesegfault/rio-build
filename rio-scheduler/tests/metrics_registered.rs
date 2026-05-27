@@ -32,8 +32,8 @@ rio_test_support::metrics_suite! {
     crate_name: "rio-scheduler",
     prefix: "rio_scheduler_",
     histogram_buckets: rio_scheduler::HISTOGRAM_BUCKETS,
-    spec_floor: 20,
-    emit_floor: 30,
+    spec_floor: 21,
+    emit_floor: 31,
     default_buckets_ok: [
         "rio_scheduler_recovery_duration_seconds",
         // Actor commands should be sub-second; the [0.005..10.0]

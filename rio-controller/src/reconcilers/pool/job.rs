@@ -3,12 +3,12 @@
 //! patch status. Consumed only by `jobs.rs`; kept as a separate file
 //! because the merged module would top 2000 LoC.
 
-use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{Pod, PodSpec, PodTemplateSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use kube::CustomResourceExt;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 use tracing::{debug, info, warn};
@@ -968,6 +968,99 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
     TerminationReason::Unknown
 }
 
+/// `metav1.Time` → unix-epoch seconds (kube wraps `jiff::Timestamp`).
+fn time_epoch_secs(t: &Time) -> f64 {
+    t.0.as_second() as f64
+}
+
+/// Unix-epoch seconds `now()`, the ack-side endpoint of the OA1
+/// interval-(i) sample arithmetic.
+fn epoch_now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// OA1 interval-(i) endpoint A for the Pod path: the Pod's
+/// terminal-condition timestamp. The first terminated containerStatus's
+/// `finishedAt` (the OOMKilled shape); for evictions where kubelet sets
+/// only pod-level status, the latest pod-condition `lastTransitionTime`.
+/// `None` when neither is populated — the caller skips the sample
+/// rather than guessing an endpoint.
+pub(super) fn pod_terminal_epoch_secs(pod: &Pod) -> Option<f64> {
+    let status = pod.status.as_ref()?;
+    if let Some(t) = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .find_map(|cs| cs.state.as_ref()?.terminated.as_ref()?.finished_at.as_ref())
+    {
+        return Some(time_epoch_secs(t));
+    }
+    status
+        .conditions
+        .iter()
+        .flatten()
+        .filter_map(|c| c.last_transition_time.as_ref())
+        .map(time_epoch_secs)
+        .reduce(f64::max)
+}
+
+/// OA1 interval-(i) endpoint A for the Job path: the
+/// `Failed/DeadlineExceeded` condition's `lastTransitionTime`.
+pub(super) fn job_deadline_exceeded_epoch_secs(job: &Job) -> Option<f64> {
+    job.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Failed" && c.reason.as_deref() == Some("DeadlineExceeded"))?
+        .last_transition_time
+        .as_ref()
+        .map(time_epoch_secs)
+}
+
+/// Prometheus `reason` label for the OA1 interval-(i) histogram. Same
+/// strings the scheduler's floor path persists as `termination_reason`,
+/// so the controller-side and scheduler-side series line up. Only the
+/// promoting reasons and DeadlineExceeded ever reach the metric (the
+/// report path filters the rest before the RPC).
+fn termination_reason_label(reason: TerminationReason) -> &'static str {
+    match reason {
+        TerminationReason::OomKilled => "oom_killed",
+        TerminationReason::EvictedDiskPressure => "disk_pressure",
+        TerminationReason::DeadlineExceeded => "deadline_exceeded",
+        TerminationReason::EvictedOther
+        | TerminationReason::Completed
+        | TerminationReason::Error
+        | TerminationReason::Unknown => "other",
+    }
+}
+
+/// How long a sampled Pod/Job name stays in `Ctx::terminal_report_sampled`
+/// before pruning: 2× the Job TTL, by which point the object is no
+/// longer listable so the entry can never suppress a legitimate new
+/// sample.
+const TERMINAL_REPORT_SAMPLED_TTL: Duration = Duration::from_secs(2 * JOB_TTL_SECS as u64);
+
+/// OA1 interval-(i) sample gate: returns the latency sample (seconds,
+/// clamped at zero against apiserver/controller clock skew) for `key`
+/// exactly once per controller process; later calls for the same key
+/// return `None`. See `Ctx::terminal_report_sampled` for why the
+/// TTL-window re-reports must not be re-sampled.
+pub(super) fn first_terminal_report_sample(
+    seen: &mut HashMap<String, Instant>,
+    key: &str,
+    terminal_epoch_secs: f64,
+    now_epoch_secs: f64,
+) -> Option<f64> {
+    if seen.contains_key(key) {
+        return None;
+    }
+    seen.insert(key.to_owned(), Instant::now());
+    Some((now_epoch_secs - terminal_epoch_secs).max(0.0))
+}
+
 /// Report each terminated Pod's k8s reason to the scheduler so it can
 /// gate `resource_floor` promotion on actual OOMKilled/DiskPressure
 /// (not bare disconnect). Called from the Job-mode reconcilers' tick
@@ -989,6 +1082,11 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
 /// doesn't promote"; the next OOM on the same drv will (floor is
 /// sticky). Never blocks the spawn/reap loop.
 pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
+    // OA1 sample-gate hygiene: drop entries for objects that can no
+    // longer be listed (past the TTL window) so the map stays bounded.
+    ctx.terminal_report_sampled
+        .lock()
+        .retain(|_, inserted| inserted.elapsed() < TERMINAL_REPORT_SAMPLED_TTL);
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     let list = match pods
         .list(&ListParams::default().labels(&format!("{POOL_LABEL}={pool}")))
@@ -1032,6 +1130,24 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         .await
         {
             Ok(resp) => {
+                // OA1 interval (i): Pod terminal-condition timestamp →
+                // report acked, sampled once per Pod (the same Pod is
+                // re-reported every tick for the TTL window — see
+                // `Ctx::terminal_report_sampled`).
+                if let Some(terminal) = pod_terminal_epoch_secs(pod)
+                    && let Some(latency) = first_terminal_report_sample(
+                        &mut ctx.terminal_report_sampled.lock(),
+                        name,
+                        terminal,
+                        epoch_now_secs(),
+                    )
+                {
+                    metrics::histogram!(
+                        "rio_controller_job_terminal_report_seconds",
+                        "reason" => termination_reason_label(reason)
+                    )
+                    .record(latency);
+                }
                 if resp.into_inner().promoted {
                     info!(
                         pool, executor_id = %name, ?reason,
@@ -1104,6 +1220,23 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         .await
         {
             Ok(resp) => {
+                // OA1 interval (i): the Job's Failed/DeadlineExceeded
+                // condition transition → report acked, sampled once per
+                // Job (see `Ctx::terminal_report_sampled`).
+                if let Some(terminal) = job_deadline_exceeded_epoch_secs(job)
+                    && let Some(latency) = first_terminal_report_sample(
+                        &mut ctx.terminal_report_sampled.lock(),
+                        name,
+                        terminal,
+                        epoch_now_secs(),
+                    )
+                {
+                    metrics::histogram!(
+                        "rio_controller_job_terminal_report_seconds",
+                        "reason" => termination_reason_label(TerminationReason::DeadlineExceeded)
+                    )
+                    .record(latency);
+                }
                 if resp.into_inner().promoted {
                     info!(
                         executor_id = %name,
@@ -1174,6 +1307,117 @@ mod tests {
         assert_ne!(
             c["lastTransitionTime"], "2020-01-01T00:00:00Z",
             "True→False transition must stamp fresh lastTransitionTime"
+        );
+    }
+
+    /// OA1 interval-(i) instrument helpers: endpoint-A extraction from
+    /// the k8s objects and the once-per-object sample gate that keeps
+    /// the TTL-window re-reports from skewing
+    /// `rio_controller_job_terminal_report_seconds` (the histogram
+    /// itself is described in lib.rs and covered by
+    /// tests/metrics_registered.rs).
+    #[test]
+    fn terminal_report_sample_helpers() {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodCondition, PodStatus,
+        };
+        use k8s_openapi::jiff::{SignedDuration, Timestamp};
+
+        // OOMKilled shape: terminated containerStatus carries finishedAt.
+        let finished = Timestamp::now() - SignedDuration::from_secs(42);
+        let oom = Pod {
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            reason: Some("OOMKilled".into()),
+                            finished_at: Some(Time(finished)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let got = pod_terminal_epoch_secs(&oom).expect("finishedAt present");
+        assert!((got - finished.as_second() as f64).abs() < 1.0);
+
+        // Eviction shape: pod-level status only — fall back to the
+        // latest condition lastTransitionTime.
+        let cond_t = Timestamp::now() - SignedDuration::from_secs(10);
+        let evicted = Pod {
+            status: Some(PodStatus {
+                reason: Some("Evicted".into()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".into(),
+                    status: "False".into(),
+                    last_transition_time: Some(Time(cond_t)),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(pod_terminal_epoch_secs(&evicted).is_some());
+
+        // No status → no endpoint A → no sample (caller skips).
+        assert!(pod_terminal_epoch_secs(&Pod::default()).is_none());
+
+        // Job path: the Failed/DeadlineExceeded condition's
+        // lastTransitionTime; any other condition → None.
+        let deadline_t = Timestamp::now() - SignedDuration::from_secs(30);
+        let deadline_job = Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![JobCondition {
+                    type_: "Failed".into(),
+                    reason: Some("DeadlineExceeded".into()),
+                    status: "True".into(),
+                    last_transition_time: Some(Time(deadline_t)),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(job_deadline_exceeded_epoch_secs(&deadline_job).is_some());
+        assert!(job_deadline_exceeded_epoch_secs(&Job::default()).is_none());
+
+        // The sample gate: first ack for a key yields the latency,
+        // re-reports of the same key do not re-sample, a different key
+        // does, and clock skew clamps at zero (never a negative sample).
+        let mut seen = HashMap::new();
+        assert_eq!(
+            first_terminal_report_sample(&mut seen, "pod-a", 100.0, 130.0),
+            Some(30.0)
+        );
+        assert_eq!(
+            first_terminal_report_sample(&mut seen, "pod-a", 100.0, 140.0),
+            None,
+            "TTL-window re-report must not re-sample"
+        );
+        assert_eq!(
+            first_terminal_report_sample(&mut seen, "pod-b", 200.0, 190.0),
+            Some(0.0),
+            "clock skew clamps at zero"
+        );
+
+        // Label values match the scheduler-side termination_reason
+        // strings for the reasons that reach the wire.
+        assert_eq!(
+            termination_reason_label(TerminationReason::OomKilled),
+            "oom_killed"
+        );
+        assert_eq!(
+            termination_reason_label(TerminationReason::EvictedDiskPressure),
+            "disk_pressure"
+        );
+        assert_eq!(
+            termination_reason_label(TerminationReason::DeadlineExceeded),
+            "deadline_exceeded"
         );
     }
 

@@ -187,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         placeable,
         kube_build_scheduler_enabled: cfg.nodeclaim_pool.kube_build_scheduler_enabled,
         hw_config: hw_config.clone(),
+        terminal_report_sampled: Default::default(),
     });
 
     // ---- Reconcilers ----
