@@ -5090,9 +5090,10 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
     let handle = f.handle;
 
     // Sanity: the columns recovery reads were persisted by phase 1. The
-    // non-force control covers the persistence direction the B4 test
-    // does not: force_build_roots stays FALSE while its root link is
-    // still is_root = TRUE.
+    // non-force control covers the persistence direction
+    // `test_force_build_roots_persisted` (tests/merge.rs) does not:
+    // force_build_roots stays FALSE while its root link is still
+    // is_root = TRUE.
     let (fbr,): (bool,) =
         sqlx::query_as("SELECT force_build_roots FROM builds WHERE build_id = $1")
             .bind(force_build)
@@ -5138,7 +5139,9 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
     // root-a via the batch probe, root-b via the per-drv
     // ready_check_or_spawn fallback once the locally-present dep
     // completes mid-pass. recv_assignment skips PrefetchHint variants,
-    // the same way the B5 dispatch-gate test does.
+    // the same way the dispatch-gate test
+    // `dispatch_time_force_build_root_dispatches_not_substitutes`
+    // (tests/dispatch.rs) does.
     let mut rx1 = connect_executor(&handle, "exec-rec-1", "x86_64-linux").await?;
     let mut rx2 = connect_executor(&handle, "exec-rec-2", "x86_64-linux").await?;
     let a1 = recv_assignment(&mut rx1).await;
@@ -5187,7 +5190,10 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
     // Structural: 1 batch FindMissingPaths (root-a/dep/ctrl, Ready at
     // pass start) + 1 per-drv FindMissingPaths (root-b, promoted
     // mid-pass) — proves root-b's decision went through
-    // ready_check_or_spawn, not the batch.
+    // ready_check_or_spawn, not the batch. The count is stable because
+    // probe_generation only advances on Tick — which this test never
+    // sends — so the inline connect-time dispatch passes cannot
+    // re-probe and inflate it.
     assert_eq!(
         store.calls.find_missing_calls.load(Ordering::SeqCst),
         2,
