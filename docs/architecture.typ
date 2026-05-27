@@ -107,7 +107,7 @@
       #text(size: 0.75em)[
         @fuse `/nix/store` + SSD cache \
         @overlayfs + synth SQLite DB \
-        nix sandbox
+        rio-exec sandbox
       ]
     ],
     node(
@@ -350,7 +350,7 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
         comment: [`WorkAssignment` (via `BuildExecution`)#pin("rs-assign")],
       )
       _seq("Builder", "Store", comment: [`GetPath` (FUSE fetch)])
-      _seq("Builder", "Builder", comment: [nix sandbox build])
+      _seq("Builder", "Builder", comment: [rio-exec sandbox build])
       _seq("Builder", "Sched", comment: [`BuildLogBatch`])
       _seq("Sched", "GW", comment: [`BuildEvent` (logs)])
       _seq("GW", "Client", comment: [`STDERR_NEXT`])

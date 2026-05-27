@@ -76,7 +76,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 
   [Memory],
   [#qty("8", "GB") minimum],
-  [Nix sandbox + overlay + @fuse daemon overhead],
+  [rio-exec sandbox + overlay + @fuse daemon overhead],
 
   [Local SSD (FUSE cache)],
   [#qty("100", "GB")],

@@ -98,7 +98,7 @@ injects `tenant_id` (as a signed JWT) into all requests.
 
 Workers are shared across tenants. Per-build overlay filesystem isolation
 ensures that one tenant's build cannot access another tenant's build
-artifacts or intermediate state. The Nix sandbox provides additional
+artifacts or intermediate state. The rio-exec sandbox provides additional
 process-level isolation.
 
 == Store Paths

@@ -665,7 +665,7 @@ After build completes:
 + Chunk and upload to rio-store (@cas). Each `PutPath` request carries the
   scheduler-issued HMAC @assignment-token in the `x-rio-assignment-token` gRPC
   metadata header; the store verifies the token and rejects uploads for paths
-  not in `claims.expected_outputs` (see #rref("common.hmac.claims"))
+  not in `claims.expected_outputs` (see #rref("common.hmac.claims+1"))
 + Register path metadata (@narinfo, references)
 + Discard upper layer
 
@@ -952,7 +952,7 @@ discarded; the next build runs in a fresh pod and sees none of it.
 = Namespace Ordering
 <sec-ns-order>
 
-#r("builder.ns.order+3")[
+#r("builder.ns.order+4")[
   Overlayfs and the rio-exec sandbox both use mounts; the per-build store
   is bind-mounted writable at `/nix/store` inside the sandbox (the merged
   overlay view), with the input closure nested read-only inside it. The
@@ -960,14 +960,18 @@ discarded; the next build runs in a fresh pod and sees none of it.
   + Builder sets up the FUSE mount at `/var/rio/fuse-store` and creates the
     per-build overlayfs (lower: FUSE only; upper: SSD; merged at
     `{build_dir}/nix/store`) --- all in the builder's mount namespace.
+  + The executor compiles the sandbox plan and materializes the chroot
+    skeleton (the plan's directory tree, inline files, and symlinks)
+    host-side under the per-build chroot directory --- still in the
+    builder's mount namespace, before any sandbox process exists.
   + The executor forks the rio-exec sandbox: the intermediate unshares fresh
     mount/PID/IPC/UTS/cgroup (and, for non-FOD builds, network) namespaces;
-    the child assembles the chroot skeleton and applies the planned binds
-    --- the merged store writable at `/nix/store`, each input closure path
-    read-only nested inside it, `/build` writable, the static sandbox shell
-    at `/bin/sh`, and a fresh unmasked `/proc` for the new PID namespace
-    (containerd masks `/proc` paths in non-privileged pods, and PSA rejects
-    `procMount: Unmasked` with `hostUsers: true` per KEP-4265).
+    the child applies the planned binds --- the merged store writable at
+    `/nix/store`, each input closure path read-only nested inside it,
+    `/build` writable, the static sandbox shell at `/bin/sh`, and a fresh
+    unmasked `/proc` for the new PID namespace (containerd masks `/proc`
+    paths in non-privileged pods, and PSA rejects `procMount: Unmasked`
+    with `hostUsers: true` per KEP-4265).
   + The child enters the new root with `pivot_root` (plus a belt-and-braces
     `chroot`), lazily detaches the old root, applies the seccomp filter, and
     drops to the build user before `execve`.
@@ -1129,7 +1133,7 @@ protocol-version, or binary pin to manage on the worker.
 = Future: Privilege Splitting
 
 The current design holds `CAP_SYS_ADMIN` throughout build execution because
-both overlayfs setup and the Nix sandbox require it. A sandbox escape gives
+both overlayfs setup and the rio-exec sandbox require it. A sandbox escape gives
 the attacker full `CAP_SYS_ADMIN` capabilities.
 
 A future improvement would split the builder into two processes:
@@ -1496,8 +1500,8 @@ changes.
 *The hard part: executor store lifecycle.* The FUSE + overlay approach
 introduces ordering complexity --- upper layer cleanup must be deterministic
 (unique per-build directory, discarded with the pod), and the namespace
-ordering (FUSE mount → overlayfs → nix sandbox) must be correct
-(#rref("builder.ns.order+3")). The decided approach is that each executor runs
+ordering (FUSE mount → overlayfs → rio-exec sandbox) must be correct
+(#rref("builder.ns.order+4")). The decided approach is that each executor runs
 the FUSE layer that lazily fetches store paths from rio-store; each build gets
 a per-build overlayfs with the FUSE mount as lower and a per-build synthetic
 SQLite database in the upper layer. This avoids shared mutable state,
@@ -1632,13 +1636,13 @@ churn) → P0541 (SPO → Bottlerocket bootstrap-container) → ADR-021
 (Bottlerocket → NixOS AMI, profiles baked in) → SPO + `seccompPreinstalled`
 removed once k3s VM tests adopted the same tmpfiles delivery.
 
-*The hard part: executor pod security.* overlayfs and the Nix sandbox both
+*The hard part: executor pod security.* overlayfs and the rio-exec sandbox both
 require `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT`, which conflicts with
 PodSecurityStandards on managed Kubernetes clusters. Mitigations: dedicated
 node pools with relaxed pod security policies for executor pods, custom
 seccomp profiles that allow only the specific syscalls needed (mount,
 pivot_root), and NetworkPolicy isolation to restrict executor pod network
-access. The Nix sandbox is NOT a security boundary --- it's a purity mechanism
+access. The rio-exec sandbox is NOT a security boundary --- it's a purity mechanism
 that prevents builds from accessing paths outside their declared inputs. For
 multi-tenant deployments, the actual security boundary is the executor pod and
 node isolation provided by Kubernetes.
