@@ -791,6 +791,11 @@
       "doc": "drvPath fidelity gate for locally produced eval sets."
     },
     {
+      "path": "evalset/key.rs",
+      "depth": 1,
+      "doc": "Eval-set identity: the key digest and the evalset.json metadata."
+    },
+    {
       "path": "evalset/recipe.rs",
       "depth": 1,
       "doc": "Hydra-faithful eval recipe."
@@ -814,6 +819,11 @@
       "path": "nixcache.rs",
       "depth": 0,
       "doc": "cache.nixos.org narinfo client (mass per-path ground truth; Fastly"
+    },
+    {
+      "path": "s3.rs",
+      "depth": 0,
+      "doc": "Write-once S3 layout writer for eval-set artifacts."
     }
   ],
   "rio-proto": [

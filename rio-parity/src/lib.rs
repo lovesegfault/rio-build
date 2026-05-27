@@ -9,6 +9,7 @@ pub mod cmd;
 pub mod evalset;
 pub mod hydra;
 pub mod nixcache;
+pub mod s3;
 
 /// Descriptive User-Agent for every engine-originated HTTP request, so
 /// hydra.nixos.org and cache.nixos.org operators can tell this traffic

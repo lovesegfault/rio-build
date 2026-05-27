@@ -10,9 +10,15 @@ pub mod artifacts;
 pub mod depclosure;
 pub mod evaluator;
 pub mod fidelity;
+pub mod key;
 pub mod recipe;
 
 /// What part of the Hydra evaluation an eval set covers.
+///
+/// The serde encoding (kebab-case `kind` tag, snake_case fields) feeds
+/// [`key::EvalSetKey::digest`] and is embedded verbatim in
+/// `evalset.json`, so changing it changes every eval-set key digest —
+/// treat it as frozen (the digest's golden test pins it).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Scope {
