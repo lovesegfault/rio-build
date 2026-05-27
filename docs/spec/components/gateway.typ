@@ -1924,6 +1924,11 @@ untrusted handshake):*
   full-DAG builds of the same derivation.
 ]
 
+The fallback inline cap is the same constant the scheduler enforces per
+node at `SubmitBuild` ingress (`MAX_DRV_CONTENT_BYTES` in
+#src("rio-common/src/limits.rs")), so a fallback submission the gateway
+accepts is never size-rejected downstream.
+
 Pre-2.16 hook clients that send inline input-addressed derivations without
 uploading the `.drv` receive the rejection described in
 #rref("gw.reject.output-path-mismatch"); the documented client floor for

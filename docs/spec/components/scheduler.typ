@@ -2840,4 +2840,8 @@ Mitigations: profile memory and throughput against a 60K-node DAG target
 (#rref("sched.actor.dispatch-decoupled")); bound individual submissions at
 `MAX_DAG_NODES = 1,048,576` / `MAX_DAG_EDGES = 5,242,880` --- global
 compile-time constants in #src("rio-common/src/limits.rs"), not per-tenant
-(SubmitBuild rejects DAGs exceeding either limit before merge).
+(SubmitBuild rejects DAGs exceeding either limit before merge). The same
+module owns the per-node `drv_content` ingress bound
+(`MAX_DRV_CONTENT_BYTES` = 1 MiB), which the gateway's content-bound
+hook-fallback cap aliases so the producer and consumer limits cannot
+drift apart.

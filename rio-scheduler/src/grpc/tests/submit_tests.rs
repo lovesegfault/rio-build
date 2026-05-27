@@ -26,9 +26,12 @@ type Req = rio_proto::types::SubmitBuildRequest;
 #[case::empty_drv_path(|r: &mut Req| r.nodes[0].drv_path = String::new(), "drv_path")]
 // Empty system never matches any worker → sits Ready forever with no feedback.
 #[case::empty_system(|r: &mut Req| r.nodes[0].system = String::new(), "system")]
-// >256 KB drv_content — defensive bound (gateway caps at 64 KB; hostile client may bypass).
+// > MAX_DRV_CONTENT_BYTES drv_content — the shared gateway/scheduler bound
+// (1 MiB; the gateway's hook-fallback cap aliases the same constant). The
+// scheduler re-checks it as defense in depth against direct submitters.
 #[case::oversized_drv_content(
-    |r: &mut Req| r.nodes[0].drv_content = vec![b'a'; 256 * 1024 + 1],
+    |r: &mut Req| r.nodes[0].drv_content =
+        vec![b'a'; rio_common::limits::MAX_DRV_CONTENT_BYTES + 1],
     "drv_content"
 )]
 // Unrecognized priority_class would leak as a PG CHECK violation in Status::internal.
@@ -123,6 +126,32 @@ async fn test_submit_build_resolves_known_tenant() {
             .await
             .expect("build lookup");
     assert_eq!(db_tenant, Some(tenant_uuid));
+}
+
+/// Regression for the (256 KiB, 1 MiB] window: a node whose `drv_content`
+/// is exactly the shared bound (`MAX_DRV_CONTENT_BYTES`, i.e. the
+/// gateway's content-bound hook-fallback cap) is accepted at ingress —
+/// the scheduler bound aliases the gateway producer cap, so nothing the
+/// gateway emits is size-rejected here.
+#[tokio::test]
+async fn test_submit_build_accepts_drv_content_at_the_shared_bound() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-bound").await;
+
+    let mut node = make_node("at-bound-drv");
+    node.drv_content = vec![b'a'; rio_common::limits::MAX_DRV_CONTENT_BYTES];
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![node],
+        edges: vec![],
+        tenant_name: "team-bound".into(),
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(
+        result.is_ok(),
+        "drv_content at the shared bound must be accepted: {result:?}"
+    );
 }
 
 // r[verify sched.tenant.authz+2]

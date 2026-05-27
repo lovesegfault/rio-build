@@ -121,6 +121,26 @@ pub const MAX_DAG_NODES: usize = 1_048_576;
 /// pathological submission (1M nodes = 10^12 edges).
 pub const MAX_DAG_EDGES: usize = 5_242_880;
 
+/// Maximum size of a single `DerivationNode.drv_content` payload accepted
+/// at SubmitBuild ingress, and equally the gateway's cap on the serialized
+/// inline derivation for the content-bound single-node hook fallback.
+///
+/// Two producers fill `drv_content`:
+/// - the inline-`.drv` *optimization* (`filter_and_inline_drv`), which
+///   inlines cache-resident derivations of ≤64 KiB each under a 16 MiB
+///   per-submission total budget, and
+/// - the content-bound *hook fallback* (`build_fallback_node`), which may
+///   carry a single derivation up to this constant because the `.drv`
+///   exists in no store for the worker to fetch.
+///
+/// The scheduler validates the same bound defensively at SubmitBuild
+/// ingress (workers and direct submitters are untrusted). Because the
+/// gateway's fallback cap *is* this constant, anything the gateway
+/// accepts is never size-rejected downstream — keep both sides pointed
+/// at this single definition so the producer and consumer bounds cannot
+/// drift apart again.
+pub const MAX_DRV_CONTENT_BYTES: usize = 1024 * 1024;
+
 /// Worker heartbeat interval. The worker sends a HeartbeatRequest to the
 /// scheduler at this cadence; the scheduler's staleness check uses the
 /// derived timeout below. Changing this one constant moves both sides

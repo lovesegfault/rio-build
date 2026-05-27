@@ -133,15 +133,19 @@ impl SchedulerService for SchedulerGrpc {
                     node.drv_hash
                 )));
             }
-            // Gateway caps per-node at 64 KB; this is a defensive
-            // upper bound (256 KB). Per-node — the 16 MB TOTAL budget
-            // is gateway-enforced; here we just stop one malformed
-            // node from being pathological.
-            const MAX_DRV_CONTENT_BYTES: usize = 256 * 1024;
+            // Per-node drv_content bound, shared with the gateway
+            // (rio_common::limits::MAX_DRV_CONTENT_BYTES = 1 MiB). Two
+            // gateway producers fill this field: the inline-.drv
+            // optimization (≤64 KiB per node, 16 MiB total budget,
+            // gateway-enforced) and the content-bound hook fallback
+            // (single node up to the shared cap). The bound here is
+            // defense in depth against direct/hostile submitters that
+            // bypass the gateway — it equals the gateway's fallback
+            // cap, so nothing the gateway accepts is rejected here.
             rio_common::grpc::check_bound(
                 "node.drv_content",
                 node.drv_content.len(),
-                MAX_DRV_CONTENT_BYTES,
+                rio_common::limits::MAX_DRV_CONTENT_BYTES,
             )?;
         }
 

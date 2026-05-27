@@ -848,6 +848,70 @@ async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::R
     Ok(())
 }
 
+/// wopBuildDerivation (36): an inline content-bound derivation whose
+/// serialized form sits between the old scheduler ingress bound
+/// (256 KiB) and the shared 1 MiB fallback cap is accepted and the
+/// submitted node carries the full drv_content — the producer cap and
+/// the SubmitBuild ingress bound are the same shared constant, so the
+/// (256 KiB, 1 MiB] window cannot be rejected downstream.
+/// r[verify gw.hook.inline-drv-content]
+#[tokio::test]
+async fn test_build_derivation_inline_fallback_midsize_accepted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Store is EMPTY — single-node fallback path.
+    let drv_path = "/nix/store/0000000000000000000000000000000m-inline-mid.drv";
+    // ~320 KiB env value: above the old 256 KiB scheduler bound, well
+    // under the 1 MiB fallback cap.
+    let mid_env = "x".repeat(320 * 1024);
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // floating-CA
+        string: "r:sha256",
+        string: "",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "big",
+        string: &mid_env,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "mid-size inline fallback must build (Built=0), got {status}"
+    );
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 1, "mid-size fallback is submitted");
+        let node = &submits[0].nodes[0];
+        assert!(
+            node.drv_content.len() > 256 * 1024,
+            "the full drv_content ({} bytes) is carried past the old 256 KiB bound",
+            node.drv_content.len()
+        );
+        assert!(
+            node.drv_content.len() <= rio_common::limits::MAX_DRV_CONTENT_BYTES,
+            "still within the shared cap"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
 /// ATerm whose declared output path is a well-formed store path that the
 /// derivation does NOT derive to — the canonical path-squatting shape the
 /// output-path binding gate rejects. Seeded into the mock store so

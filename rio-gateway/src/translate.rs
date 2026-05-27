@@ -1120,7 +1120,12 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
 /// certainly has a pathological env, and the size-unbounded path
 /// (upload the `.drv`, let the worker fetch it from the store) is
 /// always available.
-pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = 1024 * 1024;
+///
+/// This is an alias of the shared SubmitBuild ingress bound
+/// ([`rio_common::limits::MAX_DRV_CONTENT_BYTES`]): the scheduler
+/// validates the same constant, so a fallback submission the gateway
+/// accepts is never size-rejected downstream.
+pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = rio_common::limits::MAX_DRV_CONTENT_BYTES;
 
 /// Build the submission node for the content-bound single-node
 /// fallback: like [`build_node`], but the serialized derivation is
