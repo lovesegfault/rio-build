@@ -3513,3 +3513,136 @@ async fn solve_inputs_called_once_per_dispatch_pass() {
         after - before,
     );
 }
+
+/// **First pull clears the single-cell ICE mask** (mechanism #22's
+/// clear half, pull-mode trigger): a pull-mode pod's first successful
+/// pull is the success edge for its intent — the cell the spawn ack
+/// armed is cleared exactly as the stream path's registration edge
+/// clears it — while a `NotYetReady` answer (the pod has not taken
+/// work) clears nothing and leaves the armed entry in place. The
+/// stream-mode registration edge itself is untouched (its existing
+/// contract tests above keep covering it).
+// r[verify sched.sla.hw-class.ice-mask]
+#[tokio::test]
+async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
+    use crate::actor::pull::PullOutcome;
+    use crate::sla::config::CapacityType;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    // Real merges (durable rows) so the fenced pull mint can commit:
+    // one Ready drv, plus a parent whose dep is unbuilt (the
+    // NotYetReady waiter).
+    let merge = |nodes: Vec<rio_proto::types::DerivationNode>,
+                 edges: Vec<rio_proto::types::DerivationEdge>| MergeDagRequest {
+        build_id: Uuid::new_v4(),
+        tenant_id: None,
+        priority_class: PriorityClass::Scheduled,
+        nodes,
+        edges,
+        options: BuildOptions::default(),
+        keep_going: false,
+        traceparent: String::new(),
+        jti: None,
+        jwt_token: None,
+    };
+    actor
+        .handle_merge_dag(merge(vec![make_node("ice-pull-a")], vec![]))
+        .await
+        .expect("merge ready drv");
+    actor
+        .handle_merge_dag(merge(
+            vec![make_node("ice-pull-dep"), make_node("ice-pull-b")],
+            vec![make_test_edge("ice-pull-b", "ice-pull-dep")],
+        ))
+        .await
+        .expect("merge waiter dag");
+
+    // Controller flow for the Ready drv: poll → ack the emitted intent
+    // (arms dispatched_cells from the wire form) and report its cell
+    // unfulfillable (marks ICE).
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "ice-pull-a")
+        .expect("ready drv emitted")
+        .clone();
+    assert_eq!(
+        intent.hw_class_names.len(),
+        1,
+        "precondition: single-cell A' (the |A'|=1 clear discipline applies)"
+    );
+    let cap = intent.node_affinity[0]
+        .match_expressions
+        .iter()
+        .find(|r| r.key == "karpenter.sh/capacity-type")
+        .and_then(|r| r.values.first())
+        .cloned()
+        .expect("affinity term carries the capacity type");
+    let cell: crate::sla::config::Cell = (
+        intent.hw_class_names[0].clone(),
+        CapacityType::parse(&cap).expect("known capacity type"),
+    );
+    let cell_str = format!("{}:{cap}", intent.hw_class_names[0]);
+    actor.handle_ack_spawned_intents(
+        std::slice::from_ref(&intent),
+        std::slice::from_ref(&cell_str),
+        &[],
+        &[],
+        &[],
+    );
+    // Arm + mark the waiter's intent the same way (hand-built echo with
+    // the same cell — the ack handler arms from the wire form alone).
+    let waiter_intent = rio_proto::types::SpawnIntent {
+        intent_id: "ice-pull-b".into(),
+        hw_class_names: intent.hw_class_names.clone(),
+        node_affinity: intent.node_affinity.clone(),
+        ..Default::default()
+    };
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&waiter_intent), &[], &[], &[], &[]);
+    assert!(actor.ice.is_masked(&cell), "precondition: cell ICE-masked");
+    assert!(actor.dispatched_cells.contains_key("ice-pull-a"));
+    assert!(actor.dispatched_cells.contains_key("ice-pull-b"));
+
+    // A NotYetReady answer (deps unbuilt) clears nothing: the pod has
+    // not taken work.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_pull_assignment("ice-pull-b".into(), Some("ice-pull-b".into()), tx)
+        .await;
+    assert!(
+        matches!(
+            rx.await.expect("reply"),
+            Ok(PullOutcome::NotYetReady { .. })
+        ),
+        "precondition: the waiter answers NotYetReady"
+    );
+    assert!(
+        actor.ice.is_masked(&cell),
+        "NotYetReady is not a success edge — the mask stays"
+    );
+    assert!(
+        actor.dispatched_cells.contains_key("ice-pull-b"),
+        "the armed entry stays until the pod actually takes work"
+    );
+
+    // The first successful pull of the Ready drv IS the success edge.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_pull_assignment("ice-pull-a".into(), Some("ice-pull-a".into()), tx)
+        .await;
+    assert!(
+        matches!(rx.await.expect("reply"), Ok(PullOutcome::Deliver(_))),
+        "precondition: the pull delivered"
+    );
+    assert!(
+        !actor.ice.is_masked(&cell),
+        "the first successful pull clears the single-cell ICE mask"
+    );
+    assert!(
+        !actor.dispatched_cells.contains_key("ice-pull-a"),
+        "the armed entry is consumed by the clear, exactly like the registration edge"
+    );
+}

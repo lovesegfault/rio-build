@@ -327,6 +327,23 @@ impl DagActor {
             return Err(PullRejection::StaleGeneration);
         }
 
+        // r[impl sched.sla.hw-class.ice-mask]
+        // Mechanism #22's clear half, pull-mode trigger: the first
+        // successful pull is the success edge for the pull path — the
+        // pod is scheduled and has taken the work — exactly what the
+        // stream path's registration edge signals. Same |A'| = 1
+        // discipline as that edge (the pod's affinity is OR-of-A', so a
+        // multi-cell intent identifies no single cell; over-clearing
+        // would defeat `ice_step_doubles`); `registered_cells` (A18)
+        // remains the per-cell signal. NotYetReady / Gone / rejected
+        // pulls never reach here, so they never clear. Arming
+        // (`AckSpawnedIntents`) and the DAG-state sweep are untouched.
+        if let Some((_, cells)) = self.dispatched_cells.remove(drv_hash.as_str())
+            && let [cell] = cells.as_slice()
+        {
+            self.ice.clear(cell);
+        }
+
         // Durable mint committed — now the in-memory bookkeeping, the
         // same shape the stream path's record phase keeps (transition,
         // exec_id, assigned executor, status persist, GC pins).
