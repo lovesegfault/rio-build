@@ -166,6 +166,43 @@ impl SchedulerDb {
         .await
     }
 
+    /// Recovered parents whose persisted children are ALL produced —
+    /// produced = `'completed' | 'skipped'` only, the PG mirror of the
+    /// in-memory `children_all_produced` criterion every other
+    /// `topdown_pruned` clear site uses.
+    ///
+    /// Consumed by the recovery-time `topdown_pruned` gate in
+    /// `load_dag_from_rows`: produced children are excluded from
+    /// [`Self::load_nonterminal_derivations`] and their edges are
+    /// dropped by [`Self::load_edges_for_derivations`], so this check
+    /// can only be answered against the persisted graph. Childless rows
+    /// are never returned (no `derivation_edges` rows → no GROUP BY
+    /// group), so a genuine childless pruned root keeps its restored
+    /// flag; any unbuilt / `failed` / `cancelled` / `poisoned` /
+    /// `dependency_failed` child fails the `bool_and`, so the
+    /// must-substitute guard is kept for those parents too.
+    pub(crate) async fn load_parents_with_all_children_produced(
+        &self,
+        derivation_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar(
+            r#"
+            SELECT e.parent_id
+            FROM derivation_edges e
+            JOIN derivations c ON c.derivation_id = e.child_id
+            WHERE e.parent_id = ANY($1)
+            GROUP BY e.parent_id
+            HAVING bool_and(c.status IN ('completed', 'skipped'))
+            "#,
+        )
+        .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Load (build_id, derivation_id) links for a set of builds.
     /// `recover_from_pg` uses this to rebuild `interested_builds`
     /// on each DerivationState and `derivation_hashes` on BuildInfo.

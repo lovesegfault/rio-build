@@ -194,6 +194,11 @@ impl DagActor {
         // Build db_id → drv_hash map for edge + build_derivation
         // resolution below. Also build DerivationState nodes.
         let mut id_to_hash: HashMap<Uuid, DrvHash> = HashMap::with_capacity(drv_rows.len());
+        // Rows restored with `topdown_pruned = true`: candidates for the
+        // produced-children gate run after the edge load below (the
+        // recovered in-memory DAG alone cannot decide it — see that
+        // block's comment).
+        let mut flagged: Vec<Uuid> = Vec::new();
         let mut restamped_buffers = 0usize;
         for row in drv_rows {
             let derivation_id = row.derivation_id;
@@ -221,6 +226,9 @@ impl DagActor {
                 ) => Some((exec_id, executor_id)),
                 _ => None,
             };
+            if state.topdown_pruned {
+                flagged.push(derivation_id);
+            }
             id_to_hash.insert(derivation_id, hash.clone());
             self.dag.insert_recovered_node(state);
             // Re-stamp the LogBuffers ring buffer for active
@@ -347,6 +355,57 @@ impl DagActor {
             }
         }
         info!(count = edge_rows.len(), "loaded edges");
+
+        // r[impl sched.merge.substitute-topdown+9]
+        // Produced-children gate on restored `topdown_pruned` marks:
+        // drop the mark from any flagged row whose persisted children
+        // are ALL produced (`completed`/`skipped`). The check MUST be
+        // PG-side: produced children are excluded from
+        // load_nonterminal_derivations and their edges were dropped
+        // above, so in the recovered in-memory DAG such a parent is
+        // indistinguishable from a genuine childless pruned root —
+        // which must KEEP its flag (its closure was never merged; a
+        // from-source dispatch would ENOENT). Unbuilt / failed /
+        // cancelled / poisoned / dependency_failed children fail the
+        // query's bool_and, so the must-substitute guard is also kept
+        // for them. Running here — before seed_ready_queue and before
+        // any dispatch (dispatch gates on recovery_complete) — means no
+        // dispatch-time probe can ever observe the stale flag and
+        // wrongly fail-fast a build whose closure IS produced. This
+        // also absorbs the PG-true/memory-false skew left behind when a
+        // best-effort clear (merge-, completion-, or fail-fast-time)
+        // lost its PG write: the next failover lands here and the row
+        // is re-evaluated against the same produced-children criterion.
+        if !flagged.is_empty() {
+            let produced_parents = self
+                .db
+                .load_parents_with_all_children_produced(&flagged)
+                .await?;
+            let mut cleared: Vec<String> = Vec::new();
+            for parent_id in produced_parents {
+                let Some(hash) = id_to_hash.get(&parent_id) else {
+                    continue;
+                };
+                if let Some(state) = self.dag.node_mut(hash) {
+                    state.topdown_pruned = false;
+                    cleared.push(hash.to_string());
+                }
+            }
+            if !cleared.is_empty() {
+                info!(
+                    count = cleared.len(),
+                    "recovery: dropped restored topdown_pruned marks (persisted children all produced)"
+                );
+                // Best-effort persisted clear so later failovers don't
+                // re-evaluate the same rows; the in-memory clear above
+                // is what this tenure's correctness relies on.
+                if let Err(e) = self.db.clear_topdown_pruned_by_hashes(&cleared).await {
+                    warn!(count = cleared.len(), error = %e,
+                          "failed to clear persisted topdown_pruned at recovery (best-effort; \
+                           next failover re-evaluates)");
+                }
+            }
+        }
 
         // --- Load build_derivations + rebuild interested_builds ---
         let bd_rows = self.db.load_build_derivations(&build_ids).await?;

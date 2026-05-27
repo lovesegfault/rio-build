@@ -3893,3 +3893,120 @@ async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_sourc
     );
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+9]
+/// Failover counterpart of the children-became-produced clear: a
+/// restored `topdown_pruned` mark must be DROPPED at recovery when the
+/// node's persisted children are all produced (`completed`/`skipped`).
+///
+/// The recovered in-memory DAG cannot tell such a parent apart from a
+/// genuine childless pruned root — produced children are filtered out
+/// of `load_nonterminal_derivations` and their edges are dropped — so
+/// the gate must consult PG (`derivation_edges` JOIN `derivations`).
+/// Without it, the stale mark survives into the new leader and the
+/// first dispatch pass takes the fail-fast arm for a node whose
+/// closure IS produced, wrongly terminal-failing a healthy build that
+/// would have dispatched from source. The same gate also absorbs a
+/// PG-true/memory-false skew left by a lost best-effort clear under
+/// the previous leader.
+///
+/// Staged shape (phase 1): full merge parent→child WITH the edge
+/// persisted to `derivation_edges`, then backdate the child to
+/// `completed` and the parent to `substituting` + `topdown_pruned =
+/// true`. Phase 2's store has `out` substitutable and `debug` missing
+/// / not substitutable — exactly the shape where a surviving flag
+/// would fire the wrongful fail-fast instead of the from-source
+/// dispatch asserted below.
+#[tokio::test]
+async fn test_failover_clears_topdown_pruned_when_children_all_produced() -> TestResult {
+    let out = test_store_path("tdcp-root-out");
+    let dbg = test_store_path("tdcp-root-debug");
+
+    // Phase-2 store: `out` substitutable upstream; `debug` missing and
+    // NOT substitutable — the recovered all-declared wanted set can
+    // neither complete inline nor route to substitution, so the node
+    // must go to a from-source dispatch (valid: its children are
+    // produced) unless a stale flag wrongly fail-fasts it.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        // Full merge: the parent depends on the child and the edge IS
+        // persisted — this is what distinguishes the parent from the
+        // genuine childless pruned roots staged by the two tests above.
+        let mut parent = make_node("tdcp-root");
+        parent.output_names = vec!["out".into(), "debug".into()];
+        parent.expected_output_paths = vec![out.clone(), dbg.clone()];
+        parent.wanted_output_names = vec![];
+        merge_dag(
+            &handle,
+            build_id,
+            vec![parent, make_node("tdcp-dep")],
+            vec![make_test_edge("tdcp-root", "tdcp-dep")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate: the child finished under the old leader (produced),
+        // while the parent is left mid-substitution with the mark still
+        // set — the persisted shape a crash before the completion-time
+        // clear (or a lost best-effort PG clear) leaves behind.
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'tdcp-dep'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = 'tdcp-root'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // A builder is available — the parent should dispatch to it from
+    // source once the stale mark is dropped.
+    let mut rx = connect_executor(&handle, "tdcp-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+
+    // Not the wrongful fail-fast: the build stays alive...
+    let s = query_status(&handle, build_id).await?;
+    assert_ne!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "a parent whose persisted children are all produced must not be \
+         fail-fasted by a stale restored topdown_pruned mark; error={:?}",
+        s.error_summary
+    );
+    // ...and the parent dispatches from source (`debug` is missing and
+    // not substitutable, so source is the only way to produce it).
+    let a = recv_assignment(&mut rx).await;
+    assert_eq!(
+        a.drv_path,
+        test_drv_path("tdcp-root"),
+        "parent with an all-produced persisted closure must dispatch from \
+         source after failover"
+    );
+    // The mark was dropped at recovery, in memory...
+    assert!(
+        !expect_drv(&handle, "tdcp-root").await.topdown_pruned,
+        "recovery must drop the restored topdown_pruned mark when the \
+         persisted children are all produced"
+    );
+    // ...and (best-effort) in PG, so later failovers don't re-evaluate
+    // the same stale row.
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdcp-root'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert!(
+        !pg_pruned,
+        "the recovery-time drop must be persisted so the stale mark does not \
+         re-arm on every subsequent failover"
+    );
+    Ok(())
+}
