@@ -1,0 +1,443 @@
+//! Campaign spec (operator input), engine knobs, and the campaign.json record.
+//!
+//! [`CampaignSpec`] is what `xtask parity launch` writes (or a developer
+//! writes by hand for local runs); [`CampaignRecord`] is the engine-owned
+//! campaign.json artifact carrying the spec plus the plan-stage output and
+//! the comparability block every report leads with.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+
+/// How the campaign builds: against upstream caches (leaf) or entirely
+/// from source inside the cluster (self-hosted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    Leaf,
+    SelfHosted,
+}
+
+impl Mode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Mode::Leaf => "leaf",
+            Mode::SelfHosted => "self-hosted",
+        }
+    }
+
+    /// The build tenant conventionally paired with each mode.
+    pub fn expected_build_tenant(&self) -> &'static str {
+        match self {
+            Mode::Leaf => "parity-leaf",
+            Mode::SelfHosted => "parity-selfhosted",
+        }
+    }
+}
+
+/// Which eval set the campaign runs against.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvalSetRef {
+    pub hydra_eval_id: u64,
+    /// Eval-set key digest as recorded in evalset.json (its 16-char short
+    /// form names the eval set's S3 prefix).
+    pub key_digest: String,
+    /// S3 bucket holding `parity/evals/...` (None = same bucket as `s3.bucket`).
+    pub s3_bucket: Option<String>,
+    /// Key prefix of the eval set, e.g. `parity/evals/1824219/8b919129046e0f60`.
+    pub s3_prefix: Option<String>,
+}
+
+/// Where campaign artifacts are synced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3Target {
+    /// Campaign artifact bucket (the existing chunk bucket). None = S3 sync disabled.
+    pub bucket: Option<String>,
+    /// Key prefix for campaign artifacts, default `parity/campaigns`.
+    pub prefix: String,
+}
+
+impl Default for S3Target {
+    fn default() -> Self {
+        Self {
+            bucket: None,
+            prefix: "parity/campaigns".into(),
+        }
+    }
+}
+
+/// Cluster endpoints the engine talks to.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ClusterEndpoints {
+    /// ssh-ng URL for the build tenant (parity-leaf / parity-selfhosted),
+    /// e.g. `ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/parity-leaf`.
+    pub gateway_store_url: String,
+    /// ssh-ng URL for the parity-warm tenant (leaf mode only).
+    pub warm_store_url: Option<String>,
+    /// Scheduler AdminService address, e.g. `rio-scheduler.rio-system.svc:9001`.
+    pub scheduler_addr: String,
+    /// Store StoreService address, e.g. `rio-store.rio-store.svc:9002`.
+    pub store_addr: String,
+    /// Path to the HMAC key for `x-rio-service-token` (None = no token, dev mode).
+    pub service_hmac_key_path: Option<PathBuf>,
+}
+
+/// Tenant names plus the launch-time upstream-set assertion.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TenantBlock {
+    /// `parity-leaf` or `parity-selfhosted`.
+    pub build_tenant: String,
+    /// `parity-warm` (unused in self-hosted mode).
+    pub warm_tenant: String,
+    /// Set by `xtask parity launch` after it asserted the parity tenants'
+    /// upstream sets via rio-cli. The engine cannot perform that assertion
+    /// itself: the ListTenants/ListUpstreams admin RPCs are allowlisted to
+    /// operator CLIs and exclude `rio-parity`.
+    pub upstreams_verified: bool,
+    pub upstreams_verified_at: Option<String>,
+    /// Snapshot recorded by launch: tenant name → upstream URLs.
+    pub upstream_snapshot: BTreeMap<String, Vec<String>>,
+}
+
+/// Job-scope filters applied by the plan stage.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct Filters {
+    /// Systems to keep (empty = keep all systems present in the manifest).
+    pub systems: Vec<String>,
+    /// Job-name include globs (empty = include all).
+    pub include_globs: Vec<String>,
+    /// Exclude jobs whose requiredFeatures intersect this set (e.g. ["kvm"]).
+    pub exclude_features: Vec<String>,
+    /// Keep only the first N in-scope jobs (after deterministic sort).
+    pub limit: Option<usize>,
+    /// Path to a newline-separated explicit job list (overrides include_globs).
+    pub jobs_file: Option<PathBuf>,
+}
+
+/// Hydra-truth inputs: where narinfo presence is checked and how.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HydraBlock {
+    pub cache_url: String,
+    pub user_agent: String,
+    /// Optional path to a JSON map `{job: buildstatus}` for scoped campaigns
+    /// where exact Hydra buildstatus was collected at eval time.
+    pub buildstatus_file: Option<PathBuf>,
+}
+
+impl Default for HydraBlock {
+    fn default() -> Self {
+        Self {
+            cache_url: "https://cache.nixos.org".into(),
+            user_agent: crate::user_agent(None),
+            buildstatus_file: None,
+        }
+    }
+}
+
+/// Engine tuning knobs. The defaults are the locked starting values for
+/// the first campaigns; every knob is overridable per campaign via the
+/// spec.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Knobs {
+    pub batch_max_jobs: usize,
+    pub batch_max_nodes: usize,
+    pub submit_concurrency: usize,
+    pub narinfo_concurrency: usize,
+    pub s3_sync_interval_secs: u64,
+    pub collect_poll_secs: u64,
+    pub cluster_status_poll_secs: u64,
+    pub spawn_intents_poll_secs: u64,
+    pub active_stall_hours: f64,
+    pub queued_watchdog_hours: f64,
+    pub max_queued_requeues: u32,
+    pub max_auto_retries: u32,
+    pub failfast_singleton_after: u32,
+    pub evidence_ttl_hours: f64,
+    pub batch_timeout_hours: f64,
+    pub log_tail_bytes: usize,
+    pub idle_polls_for_suspend: u32,
+    pub ice_masked_cells_threshold: usize,
+    pub dispatch_gap_threshold: i64,
+    pub dispatch_gap_polls: u32,
+    pub pause_queue_depth: Option<u32>,
+    pub infra_pause_pct: f64,
+    pub infra_low_confidence_pct: f64,
+    pub hydra_unknown_threshold_pct: f64,
+    pub report_top_n: usize,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Self {
+            batch_max_jobs: 50,
+            batch_max_nodes: 4500,
+            submit_concurrency: 8,
+            narinfo_concurrency: 64,
+            s3_sync_interval_secs: 300,
+            collect_poll_secs: 60,
+            cluster_status_poll_secs: 60,
+            spawn_intents_poll_secs: 300,
+            active_stall_hours: 6.0,
+            queued_watchdog_hours: 2.0,
+            max_queued_requeues: 2,
+            max_auto_retries: 1,
+            failfast_singleton_after: 3,
+            evidence_ttl_hours: 24.0,
+            batch_timeout_hours: 24.0,
+            log_tail_bytes: 65536,
+            idle_polls_for_suspend: 3,
+            ice_masked_cells_threshold: 3,
+            dispatch_gap_threshold: 50,
+            dispatch_gap_polls: 5,
+            pause_queue_depth: None,
+            infra_pause_pct: 25.0,
+            infra_low_confidence_pct: 5.0,
+            hydra_unknown_threshold_pct: 5.0,
+            report_top_n: 20,
+        }
+    }
+}
+
+/// The operator-provided campaign spec (input to `rio-parity run --spec`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CampaignSpec {
+    pub campaign_id: Option<String>,
+    pub mode: Mode,
+    pub eval_set: EvalSetRef,
+    pub s3: S3Target,
+    pub cluster: ClusterEndpoints,
+    pub tenants: TenantBlock,
+    pub filters: Filters,
+    pub knobs: Knobs,
+    pub hydra: HydraBlock,
+    /// Deployed image versions verified by launch pre-flight (recorded verbatim).
+    pub cluster_versions: Option<serde_json::Value>,
+    /// Deadline (RFC3339); also settable via --deadline.
+    pub deadline: Option<String>,
+}
+
+impl Default for CampaignSpec {
+    fn default() -> Self {
+        Self {
+            campaign_id: None,
+            mode: Mode::Leaf,
+            eval_set: EvalSetRef::default(),
+            s3: S3Target::default(),
+            cluster: ClusterEndpoints::default(),
+            tenants: TenantBlock::default(),
+            filters: Filters::default(),
+            knobs: Knobs::default(),
+            hydra: HydraBlock::default(),
+            cluster_versions: None,
+            deadline: None,
+        }
+    }
+}
+
+impl CampaignSpec {
+    /// Read and parse a campaign spec JSON file.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read campaign spec {}", path.display()))?;
+        let spec: Self = serde_json::from_str(&text)
+            .with_context(|| format!("parse campaign spec {}", path.display()))?;
+        Ok(spec)
+    }
+}
+
+/// Generate a campaign id when the spec doesn't pin one:
+/// `c<UTC yyyymmddthhmmssz>-<8 hex>` — sortable, unique, k8s-name safe.
+pub fn generate_campaign_id(now_rfc3339: &str) -> String {
+    let compact: String = now_rfc3339
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("c{}-{}", compact, &suffix[..8])
+}
+
+/// Comparability block: every report leads with it so two campaign
+/// reports can only be compared when their eval set, mode, tenant,
+/// filters, and engine/signature versions actually line up.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ComparabilityBlock {
+    pub eval_set: String,
+    pub manifest_sha256: String,
+    pub mode: String,
+    pub build_tenant: String,
+    pub filters: Filters,
+    pub engine_version: String,
+    pub signature_table_version: String,
+    pub in_scope: usize,
+    pub attemptable: usize,
+    pub attempted: usize,
+    pub excluded: BTreeMap<String, usize>,
+    pub completeness_pct: f64,
+    pub low_confidence: Vec<String>,
+}
+
+/// Plan-stage output persisted inside campaign.json: warm and
+/// not-attemptable membership plus the plan-time validity snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlanOutput {
+    pub planned_at: String,
+    pub in_scope: Vec<String>,
+    pub skipped: BTreeMap<String, String>,
+    pub not_attemptable: Vec<String>,
+    pub warm_set: Vec<String>,
+    pub cached_prior_paths: Vec<String>,
+    pub cached_prior_jobs: Vec<String>,
+    pub counts: BTreeMap<String, usize>,
+}
+
+/// The campaign.json artifact: identity, the spec as launched, the
+/// pinned eval set, the comparability block, and (once planned) the
+/// plan-stage output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CampaignRecord {
+    pub campaign_id: String,
+    pub created_at: String,
+    pub engine_version: String,
+    pub signature_table_version: String,
+    pub spec: CampaignSpec,
+    pub eval_set: EvalSetPin,
+    pub comparability: ComparabilityBlock,
+    pub plan: Option<PlanOutput>,
+}
+
+/// The eval set a campaign ran against, pinned by id, key digest, and
+/// manifest checksum.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EvalSetPin {
+    pub hydra_eval_id: u64,
+    pub key_digest: String,
+    pub manifest_sha256: String,
+}
+
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Bumped when the failure-signature rules change. The current table
+/// captures raw evidence only (no signature normalization yet).
+pub const SIGNATURE_TABLE_VERSION: &str = "m1-raw-evidence";
+
+impl CampaignRecord {
+    pub fn new(
+        campaign_id: String,
+        created_at: String,
+        spec: CampaignSpec,
+        pin: EvalSetPin,
+    ) -> Self {
+        let comparability = ComparabilityBlock {
+            eval_set: format!("{}/{}", pin.hydra_eval_id, pin.key_digest),
+            manifest_sha256: pin.manifest_sha256.clone(),
+            mode: spec.mode.as_str().to_string(),
+            build_tenant: spec.tenants.build_tenant.clone(),
+            filters: spec.filters.clone(),
+            engine_version: ENGINE_VERSION.to_string(),
+            signature_table_version: SIGNATURE_TABLE_VERSION.to_string(),
+            ..ComparabilityBlock::default()
+        };
+        Self {
+            campaign_id,
+            created_at,
+            engine_version: ENGINE_VERSION.to_string(),
+            signature_table_version: SIGNATURE_TABLE_VERSION.to_string(),
+            spec,
+            eval_set: pin,
+            comparability,
+            plan: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knob_defaults_match_design() {
+        let k = Knobs::default();
+        assert_eq!((k.batch_max_jobs, k.batch_max_nodes), (50, 4500));
+        assert_eq!(k.narinfo_concurrency, 64);
+        assert_eq!(k.max_queued_requeues, 2);
+        assert_eq!(k.max_auto_retries, 1);
+        assert_eq!(k.active_stall_hours, 6.0);
+        assert_eq!(k.evidence_ttl_hours, 24.0);
+        assert_eq!(k.idle_polls_for_suspend, 3);
+        assert_eq!(k.ice_masked_cells_threshold, 3);
+        assert_eq!(k.dispatch_gap_threshold, 50);
+        assert_eq!(k.dispatch_gap_polls, 5);
+    }
+
+    #[test]
+    fn spec_minimal_json_roundtrip() {
+        // A minimal spec as xtask launch would write it; unknown fields tolerated,
+        // missing fields defaulted.
+        let json = r#"{
+            "mode": "leaf",
+            "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+                        "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
+                        "store_addr": "rio-store.rio-store.svc:9002"},
+            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true}
+        }"#;
+        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.mode, Mode::Leaf);
+        assert_eq!(spec.eval_set.hydra_eval_id, 1824219);
+        assert_eq!(spec.knobs.batch_max_jobs, 50);
+        assert_eq!(spec.tenants.build_tenant, "parity-leaf");
+        assert_eq!(spec.mode.expected_build_tenant(), "parity-leaf");
+        // Round-trips.
+        let re: CampaignSpec =
+            serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(re.eval_set.key_digest, "ab12cd34");
+    }
+
+    #[test]
+    fn campaign_id_generation_shape() {
+        let id = generate_campaign_id("2026-05-26T12:34:56Z");
+        assert!(id.starts_with("c20260526t123456z-"), "{id}");
+        assert_eq!(id.len(), "c20260526t123456z-".len() + 8);
+        // k8s-name safe: lowercase alnum + dashes.
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        );
+    }
+
+    #[test]
+    fn campaign_record_comparability_seeded() {
+        let spec: CampaignSpec = serde_json::from_str(
+            r#"{"mode":"self-hosted","tenants":{"build_tenant":"parity-selfhosted"}}"#,
+        )
+        .unwrap();
+        let rec = CampaignRecord::new(
+            "c1".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            EvalSetPin {
+                hydra_eval_id: 1,
+                key_digest: "k".into(),
+                manifest_sha256: "m".into(),
+            },
+        );
+        assert_eq!(rec.comparability.mode, "self-hosted");
+        assert_eq!(rec.comparability.eval_set, "1/k");
+        assert_eq!(rec.comparability.engine_version, ENGINE_VERSION);
+    }
+}

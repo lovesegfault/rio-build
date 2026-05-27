@@ -20007,6 +20007,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "async-trait",
+          "packageId": "async-trait"
+        },
+        {
           "name": "aws-config",
           "packageId": "aws-config"
         },
@@ -20017,6 +20021,10 @@
         {
           "name": "clap",
           "packageId": "clap"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
         },
         {
           "name": "hex",
@@ -20033,6 +20041,10 @@
         {
           "name": "reqwest",
           "packageId": "reqwest"
+        },
+        {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
         },
         {
           "name": "rio-common",
@@ -20063,8 +20075,16 @@
           "packageId": "tokio"
         },
         {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         },
         {
           "name": "workspace-hack",

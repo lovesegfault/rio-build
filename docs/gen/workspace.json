@@ -158,6 +158,7 @@
     },
     "rio-parity": {
       "prod": [
+        "rio-auth",
         "rio-common",
         "rio-nix",
         "rio-proto"

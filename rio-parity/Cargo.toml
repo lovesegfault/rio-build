@@ -13,6 +13,9 @@ name = "rio-parity"
 path = "src/main.rs"
 
 [dependencies]
+# HMAC service-token signing for the campaign engine's AdminService /
+# StoreService calls (`x-rio-service-token`).
+rio-auth = { workspace = true }
 # Shared S3 client builder (rio_common::s3::default_client) — same
 # config as rio-store/rio-scheduler so credential/retry resolution
 # doesn't drift.
@@ -25,9 +28,11 @@ rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 clap = { workspace = true }
+futures-util = { workspace = true }
 hex = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
@@ -36,7 +41,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 zstd = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 

@@ -821,6 +821,31 @@
       "doc": "cache.nixos.org narinfo client (mass per-path ground truth; Fastly"
     },
     {
+      "path": "run/",
+      "depth": 0,
+      "doc": "`rio-parity run` — the parity campaign engine."
+    },
+    {
+      "path": "run/glob.rs",
+      "depth": 1,
+      "doc": "Minimal glob matching for job-name filters (`*` = any run of"
+    },
+    {
+      "path": "run/model.rs",
+      "depth": 1,
+      "doc": "Shared campaign data model: per-job records (results.jsonl),"
+    },
+    {
+      "path": "run/spec.rs",
+      "depth": 1,
+      "doc": "Campaign spec (operator input), engine knobs, and the campaign.json record."
+    },
+    {
+      "path": "run/state.rs",
+      "depth": 1,
+      "doc": "Append-only campaign state on the pod volume."
+    },
+    {
       "path": "s3.rs",
       "depth": 0,
       "doc": "Write-once S3 layout writer for eval-set artifacts."

@@ -1,14 +1,14 @@
 //! rio-parity — nixpkgs-parity campaign engine.
 //!
-//! This crate hosts the eval-set builder and, in a later change, the
-//! campaign runner. The binary entry point is `src/main.rs`; everything
-//! else is a library module so it can be unit-tested against recorded
-//! fixtures.
+//! This crate hosts the eval-set builder and the campaign engine. The
+//! binary entry point is `src/main.rs`; everything else is a library
+//! module so it can be unit-tested against recorded fixtures.
 
 pub mod cmd;
 pub mod evalset;
 pub mod hydra;
 pub mod nixcache;
+pub mod run;
 pub mod s3;
 
 /// Canonical public repository URL, embedded in [`user_agent`].
