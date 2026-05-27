@@ -858,7 +858,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+7")[
+#r("sched.merge.substitute-topdown+8")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -876,8 +876,8 @@ submitted after the failover record contributions as usual).
   store and otherwise routed to the deferred upstream fetch
   (#rref("sched.substitute.detached"), no inline `QueryPathInfo`); kept
   nodes whose dependency closure the prune dropped (a kept node whose
-  dependencies are already in the DAG, or one with none, is not marked)
-  are marked `topdown_pruned` --- a mark that MUST
+  dependencies are already produced in the DAG, or one with no closure to
+  drop, is not marked) are marked `topdown_pruned` --- a mark that MUST
   be applied only after the merge has committed, MUST be persisted and
   restored at leader-failover recovery, and MUST be cleared (in PG and in
   memory) when a later merge gives the node children. The scheduler MUST
