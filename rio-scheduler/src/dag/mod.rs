@@ -31,6 +31,81 @@ pub enum DagError {
         path: String,
         source: rio_nix::store_path::StorePathError,
     },
+    /// A submission claimed authoritative inline derivation content for a
+    /// node that already holds DIFFERENT authoritative content. Those
+    /// bytes are the only copy of their derivation anywhere, so silently
+    /// joining would let the second submitter redefine what the first
+    /// one's build runs and what recovery rebuilds. Maps to
+    /// `FAILED_PRECONDITION` (client-actionable conflict, not an internal
+    /// invariant breach).
+    #[error(
+        "conflicting authoritative derivation content for {drv_path}: a node \
+         with different inline content already exists"
+    )]
+    AuthoritativeContentMismatch { drv_path: String },
+    /// A store-backed (non-authoritative) submission's verifiable identity
+    /// (system, output names, fixed-output flag, content-addressed flag,
+    /// declared expected output paths) conflicts with an in-flight node
+    /// that carries authoritative inline content. Joining would attribute
+    /// that in-flight build's results to a derivation that provably
+    /// differs. Maps to `FAILED_PRECONDITION`; once the conflicting node
+    /// is terminal the verifiable definition displaces it instead.
+    #[error(
+        "in-flight derivation {drv_path} carries authoritative inline content \
+         that conflicts with this submission's declared identity"
+    )]
+    ConflictingInFlightContent { drv_path: String },
+}
+
+/// `sched.merge.authoritative-conflict` cross-check: does the submission's
+/// verifiable identity agree with an existing authoritative node?
+///
+/// Compared: `system`, output names (order-insensitive), the fixed-output
+/// flag, the content-addressed flag, and expected output paths for output
+/// names where BOTH sides declare one (an empty path carries no
+/// information — floating-CA outputs declare `""`). `ca_modular_hash` is
+/// deliberately NOT compared: the basic-form hash of a hook fallback
+/// legitimately differs from the full-form hash of the same derivation
+/// once its `inputDrvs` closure is known.
+fn verifiable_identity_matches(
+    existing: &DerivationState,
+    node: &crate::domain::DerivationNode,
+) -> bool {
+    if existing.system != node.system
+        || existing.is_fixed_output != node.is_fixed_output
+        || existing.ca.is_ca != node.is_content_addressed
+    {
+        return false;
+    }
+    let mut existing_names: Vec<&str> = existing.output_names.iter().map(String::as_str).collect();
+    let mut incoming_names: Vec<&str> = node.output_names.iter().map(String::as_str).collect();
+    existing_names.sort_unstable();
+    incoming_names.sort_unstable();
+    if existing_names != incoming_names {
+        return false;
+    }
+    let existing_paths: HashMap<&str, &str> = existing
+        .output_names
+        .iter()
+        .zip(existing.expected_output_paths.iter())
+        .map(|(n, p)| (n.as_str(), p.as_str()))
+        .collect();
+    for (name, path) in node
+        .output_names
+        .iter()
+        .zip(node.expected_output_paths.iter())
+    {
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(existing_path) = existing_paths.get(name.as_str())
+            && !existing_path.is_empty()
+            && *existing_path != path.as_str()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Result of a successful `merge()` operation. Surfaces all the rollback
@@ -441,6 +516,64 @@ impl DerivationDag {
             } else {
                 None
             };
+
+            // r[impl sched.merge.authoritative-conflict]
+            // Authoritative-content protection. When the surviving
+            // existing node carries the only copy of its derivation
+            // (content-bound hook fallback), a later submission for the
+            // same drv_hash must not be able to redefine it:
+            //   - another AUTHORITATIVE submission must be byte-identical
+            //     (identical hook resubmissions — the only legitimate
+            //     producer — are; anything else is a conflict);
+            //   - a store-backed (non-authoritative) submission whose
+            //     verifiable identity conflicts is rejected while the
+            //     node is in flight, and DISPLACES it once the node is
+            //     terminal (the verifiable definition wins over the
+            //     squat; prior interest is NOT carried — those builds
+            //     already received the old node's results).
+            // Store-backed existing nodes are exempt: their truth lives
+            // in the store, so a later submission's bytes are ignored
+            // and the node joins as before.
+            if let Some(existing) = self.nodes.get(&drv_hash) {
+                if node.drv_content_authoritative && existing.drv_content_authoritative {
+                    if existing.drv_content != node.drv_content {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            &traceparent_upgraded,
+                            build_id,
+                            removed_retriable,
+                        );
+                        return Err(DagError::AuthoritativeContentMismatch {
+                            drv_path: node.drv_path.clone(),
+                        });
+                    }
+                } else if !node.drv_content_authoritative
+                    && existing.drv_content_authoritative
+                    && !verifiable_identity_matches(existing, node)
+                {
+                    if matches!(
+                        existing.status(),
+                        DerivationStatus::Completed | DerivationStatus::Skipped
+                    ) {
+                        let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                        removed_retriable.push((drv_hash.clone(), old));
+                    } else {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            &traceparent_upgraded,
+                            build_id,
+                            removed_retriable,
+                        );
+                        return Err(DagError::ConflictingInFlightContent {
+                            drv_path: node.drv_path.clone(),
+                        });
+                    }
+                }
+            }
 
             // Every mutation in this branch MUST be tracked for
             // `rollback_merge` — a failed merge restores the exact

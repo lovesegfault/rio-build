@@ -67,7 +67,22 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // signature, not two.
         ActorError::ChannelSend => Status::unavailable(ACTOR_UNAVAILABLE_MSG),
         ActorError::Database(e) => Status::internal(format!("database error: {e}")),
-        ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
+        // DAG-merge failures are internal invariants (cycle detection,
+        // malformed paths — both also pre-screened at ingress) EXCEPT the
+        // authoritative-content protections, which are client-actionable
+        // conflicts with state another submission established
+        // (sched.merge.authoritative-conflict): retrying the identical
+        // submission cannot succeed, so they map to FAILED_PRECONDITION
+        // rather than INTERNAL.
+        ActorError::Dag(e) => match &e {
+            crate::dag::DagError::AuthoritativeContentMismatch { .. }
+            | crate::dag::DagError::ConflictingInFlightContent { .. } => {
+                Status::failed_precondition(format!("DAG merge failed: {e}"))
+            }
+            crate::dag::DagError::CycleDetected | crate::dag::DagError::InvalidDrvPath { .. } => {
+                Status::internal(format!("DAG merge failed: {e}"))
+            }
+        },
         ActorError::MissingDbId { .. } => Status::internal(err.to_string()),
         // UNAVAILABLE — gateway/client sees this as a retriable error.
         // They should back off and retry; the breaker auto-closes in 30s

@@ -1883,6 +1883,11 @@ impl DagActor {
     /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
+    ///
+    /// Derivation rows are written ONLY for nodes this merge (re)created
+    /// (`newly_inserted`); submissions that merely join a live node never
+    /// rewrite or clear its persisted recovery columns — see
+    /// `sched.persist.creation-scoped`.
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
@@ -1891,23 +1896,27 @@ impl DagActor {
         newly_inserted: &HashSet<DrvHash>,
         topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
-        // Build input rows for batch upsert.
+        // r[impl sched.persist.creation-scoped]
+        // Build input rows for batch upsert — creation-scoped: only the
+        // nodes this merge inserted (fresh or reset-recreated). The SQL
+        // upsert itself stays last-write-wins, but because the only
+        // writers are creations, a live node's persisted identity and
+        // authoritative inline content (sched.recovery.inline-drv-
+        // durability) cannot be overwritten or cleared by a later
+        // submission that merely joins it.
         let node_rows: Vec<_> = nodes
             .iter()
+            .filter(|node| newly_inserted.contains(node.drv_hash.as_str()))
             .map(|node| {
-                let status = if newly_inserted.contains(node.drv_hash.as_str()) {
-                    DerivationStatus::Created
-                } else if let Some(state) = self.dag.node(&node.drv_hash) {
-                    state.status()
-                } else {
-                    DerivationStatus::Created
-                };
                 crate::db::DerivationRow {
                     drv_hash: node.drv_hash.clone(),
                     drv_path: node.drv_path.clone(),
                     pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
                     system: node.system.clone(),
-                    status,
+                    // Newly-inserted nodes always start at Created; later
+                    // status changes are persisted by their own
+                    // update_derivation_status call sites.
+                    status: DerivationStatus::Created,
                     required_features: node.required_features.clone(),
                     // Phase 3b recovery columns: persist what we
                     // need to fully reconstruct DerivationState on
@@ -1978,11 +1987,29 @@ impl DagActor {
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
         let mut tx = self.db.pool().begin().await?;
 
-        // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
+        // Batch 1: upsert the newly-created derivations, get back
+        // drv_hash -> db_id map.
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
-        // Batch 2: link all nodes to this build.
-        let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+        // Batch 2: link ALL submitted nodes to this build — newly-created
+        // ones via this tx's id_map, pre-existing live nodes via the
+        // db_id their creating merge committed (their rows are not
+        // re-upserted, see above).
+        let mut db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+        for node in nodes {
+            if newly_inserted.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            let db_id = self
+                .dag
+                .node(&node.drv_hash)
+                .and_then(|s| s.db_id)
+                .or_else(|| self.dag.db_id_for_path(&node.drv_path))
+                .ok_or_else(|| ActorError::MissingDbId {
+                    drv_path: node.drv_path.clone(),
+                })?;
+            db_ids.push(db_id);
+        }
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
         // Batch 3: insert edges. Resolve drv_path -> db_id via:

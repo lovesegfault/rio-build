@@ -968,3 +968,120 @@ async fn test_submit_build_rejects_authoritative_modular_hash_mismatch() {
         status.message()
     );
 }
+
+// ── Merge-time authoritative-content protection ─────────────────────────
+//
+// Ingress validation binds authoritative bytes to the SUBMITTER's claims;
+// the merge-time rules bind them across submissions: a second submitter
+// cannot redefine an in-flight authoritative node, and a joining
+// submission cannot rewrite or clear its persisted recovery row.
+
+// r[verify sched.merge.authoritative-conflict]
+#[tokio::test]
+async fn test_submit_build_authoritative_conflict_is_failed_precondition() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-auth-a").await;
+    seed_tenant(&db.pool, "team-auth-b").await;
+
+    // Tenant A establishes the in-flight authoritative node.
+    let node_a = authoritative_ca_node("auth-conflict");
+    let drv_hash = node_a.drv_hash.clone();
+    let original_bytes = node_a.drv_content.clone();
+    grpc.submit_build(Request::new(Req {
+        nodes: vec![node_a],
+        edges: vec![],
+        tenant_name: "team-auth-a".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("first authoritative submission accepted");
+
+    // Tenant B claims the same drv_path with DIFFERENT authoritative
+    // bytes — self-consistent (so ingress identity validation passes),
+    // but conflicting with the in-flight node.
+    let mut node_b = authoritative_ca_node("auth-conflict");
+    let aterm_b = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo poisoned"],[("out","")])"#;
+    node_b.drv_content = aterm_b.as_bytes().to_vec();
+    node_b.ca_modular_hash = {
+        let drv = rio_nix::derivation::Derivation::parse(aterm_b).unwrap();
+        rio_nix::derivation::hash_derivation_modulo(
+            &drv,
+            &node_b.drv_path,
+            &|_| None,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .to_vec()
+    };
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node_b],
+            edges: vec![],
+            tenant_name: "team-auth-b".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("authoritative"),
+        "should name the authoritative-content conflict: {}",
+        status.message()
+    );
+
+    // The persisted recovery row still carries tenant A's bytes.
+    let row: (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT drv_content FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_hash)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0.as_deref(), Some(original_bytes.as_slice()));
+}
+
+// r[verify sched.persist.creation-scoped]
+#[tokio::test]
+async fn test_submit_build_join_does_not_clear_authoritative_row() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-auth-keep").await;
+
+    let node_a = authoritative_ca_node("auth-keep");
+    let drv_hash = node_a.drv_hash.clone();
+    let original_bytes = node_a.drv_content.clone();
+    grpc.submit_build(Request::new(Req {
+        nodes: vec![node_a],
+        edges: vec![],
+        tenant_name: "team-auth-keep".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("authoritative submission accepted");
+
+    // A later store-backed submission with the SAME verifiable identity
+    // joins the live node. Before creation-scoped persistence this
+    // re-upserted the row and cleared the authoritative bytes.
+    let mut joiner = make_node("auth-keep");
+    joiner.is_content_addressed = true;
+    joiner.needs_resolve = true;
+    joiner.expected_output_paths = vec![String::new()];
+    grpc.submit_build(Request::new(Req {
+        nodes: vec![joiner],
+        edges: vec![],
+        tenant_name: "team-auth-keep".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("store-backed join accepted");
+
+    let row: (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT drv_content FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_hash)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row.0.as_deref(),
+        Some(original_bytes.as_slice()),
+        "joining submission must not clear the creating submission's authoritative bytes"
+    );
+}

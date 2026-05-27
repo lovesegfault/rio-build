@@ -1577,14 +1577,48 @@ tables) during state recovery.
   failover. The persisted bytes are dispatch payload only --- they MUST
   never be written to any store or served as a store object.
 ]
-The column is `NULL` for every other derivation and re-upsert is
-last-write-wins: a later authoritative submission refreshes the bytes and a
-later non-authoritative submission of the same derivation clears them (its
-`.drv` is then fetchable from the store, so the persisted copy is no longer
-needed --- and a stale blob never outlives the next submission). Rows
-written before the column existed (or by a pre-upgrade scheduler) recover
-with empty content and keep the pre-durability failure mode for that one
-window.
+The column is `NULL` for every other derivation. Refresh and clearing follow
+node lifecycle, not submission order: the row is written by the submission
+that (re)creates the in-memory node (#rref("sched.persist.creation-scoped")),
+so a retriable re-creation (resubmit after failure / cancel / poison reset)
+refreshes or clears the bytes, while submissions that merely join a live node
+leave its persisted content untouched. Rows written before the column existed
+(or by a pre-upgrade scheduler) recover with empty content and keep the
+pre-durability failure mode for that one window.
+
+#r("sched.merge.authoritative-conflict")[
+  A node whose in-memory state carries authoritative inline derivation
+  content MUST NOT be redefined by a later submission for the same
+  `drv_hash`: a submission that itself claims authoritative content MUST be
+  rejected unless its bytes are identical to the existing node's, and a
+  store-backed (non-authoritative) submission whose verifiable identity
+  (system, output names, fixed-output flag, content-addressed flag, declared
+  expected output paths) conflicts with the existing node MUST be rejected
+  while that node is non-terminal and MUST displace it as a fresh node ---
+  without inheriting the old node's interest --- once it is terminal. Both
+  rejections surface as `FAILED_PRECONDITION`.
+]
+The byte-equality arm makes the legitimate producer's behaviour (identical
+hook-fallback resubmissions) a no-op while closing the cross-tenant
+pre-squat: a predictable `drv_path` cannot be claimed with attacker bytes
+and then silently joined by --- or built on behalf of --- the victim's
+submission. `ca_modular_hash` is deliberately not part of the
+verifiable-identity comparison: the basic-form hash of a hook fallback
+legitimately differs from the full-form hash of the same derivation once its
+`inputDrvs` closure is known.
+
+#r("sched.persist.creation-scoped")[
+  The scheduler MUST write a derivation's persisted recovery row only from
+  the submission that (re)creates its in-memory node. Submissions that join
+  an existing live node MUST NOT rewrite or clear that node's persisted
+  recovery columns (declared identity, expected output paths, authoritative
+  inline content).
+]
+This makes persistence follow the in-memory first-writer-wins truth: the SQL
+upsert stays last-write-wins, but the only writers are creations, so an
+in-flight node's recovery row can no longer be overwritten --- or its
+authoritative inline content cleared --- by a submission that did not create
+it.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to

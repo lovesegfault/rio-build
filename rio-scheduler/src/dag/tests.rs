@@ -2532,3 +2532,137 @@ fn test_remove_node_scrubs_only_neighbors() -> anyhow::Result<()> {
     assert_eq!(dag.parents["c"], HashSet::from(["a".into()]));
     Ok(())
 }
+
+// ── sched.merge.authoritative-conflict ──────────────────────────────────
+
+/// Helper: a content-bound (floating-CA-shaped) node carrying
+/// authoritative inline derivation content, the shape produced by the
+/// gateway's content-bound hook fallback.
+fn authoritative_node(tag: &str, content: &[u8]) -> DerivationNode {
+    let mut n = make_node(tag, "x86_64-linux");
+    n.drv_content = content.to_vec();
+    n.drv_content_authoritative = true;
+    n.is_content_addressed = true;
+    n.expected_output_paths = vec![String::new()];
+    n
+}
+
+// r[verify sched.merge.authoritative-conflict]
+#[test]
+fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let b3 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("auth", b"Derive-A")], &[], "")?;
+
+    // Different authoritative bytes for the same drv_hash → rejected,
+    // existing node untouched, no interest recorded for the rejecter.
+    let err = dag
+        .merge(b2, &[authoritative_node("auth", b"Derive-B")], &[], "")
+        .unwrap_err();
+    assert!(matches!(err, DagError::AuthoritativeContentMismatch { .. }));
+    let node = dag.node("auth").unwrap();
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(!node.interested_builds.contains(&b2));
+
+    // Byte-identical resubmission (the legitimate hook producer) joins.
+    let res = dag.merge(b3, &[authoritative_node("auth", b"Derive-A")], &[], "")?;
+    assert!(res.newly_inserted.is_empty());
+    assert!(dag.node("auth").unwrap().interested_builds.contains(&b3));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+#[test]
+fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("squat", b"Derive-A")], &[], "")?;
+
+    // Store-backed submission with a conflicting verifiable identity
+    // (different system) while the squatting node is in flight → rejected.
+    let mut victim = make_node("squat", "aarch64-linux");
+    victim.is_content_addressed = true;
+    let err = dag.merge(b2, &[victim], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+    assert!(!dag.node("squat").unwrap().interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+#[test]
+fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("squat2", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("squat2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+
+    // Once the squatting node is terminal, the verifiable definition
+    // displaces it: fresh node, no inherited interest, no rejection.
+    let mut victim = make_node("squat2", "aarch64-linux");
+    victim.is_content_addressed = true;
+    let res = dag.merge(b2, &[victim], &[], "")?;
+    assert!(res.newly_inserted.contains("squat2"));
+    let node = dag.node("squat2").unwrap();
+    assert_eq!(node.system, "aarch64-linux");
+    assert!(node.drv_content.is_empty());
+    assert!(!node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b2));
+    assert!(!node.interested_builds.contains(&b1));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+#[test]
+fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("join", b"Derive-A")], &[], "")?;
+
+    // Same verifiable identity → joins as before; bytes untouched.
+    let mut same = make_node("join", "x86_64-linux");
+    same.is_content_addressed = true;
+    let res = dag.merge(b2, &[same], &[], "")?;
+    assert!(res.newly_inserted.is_empty());
+    let node = dag.node("join").unwrap();
+    assert!(node.interested_builds.contains(&b2));
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(node.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+#[test]
+fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // Store-backed node first…
+    dag.merge(b1, &[make_node("store-backed", "x86_64-linux")], &[], "")?;
+    // …then an authoritative submission for the same drv_hash: joins,
+    // bytes ignored (the store remains the source of truth).
+    let res = dag.merge(
+        b2,
+        &[authoritative_node("store-backed", b"Derive-X")],
+        &[],
+        "",
+    )?;
+    assert!(res.newly_inserted.is_empty());
+    let node = dag.node("store-backed").unwrap();
+    assert!(node.interested_builds.contains(&b2));
+    assert!(node.drv_content.is_empty());
+    assert!(!node.drv_content_authoritative);
+    Ok(())
+}

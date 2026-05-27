@@ -805,8 +805,19 @@ pub struct DerivationState {
     /// nodes that will actually dispatch (outputs missing from store).
     /// Empty = worker fetches from store via GetPath (fallback
     /// path, still works). Forwarded verbatim into WorkAssignment.
-    /// ≤256 KB bound enforced at gRPC ingress.
+    /// Bounded at gRPC ingress by `rio_common::limits::MAX_DRV_CONTENT_BYTES`
+    /// (1 MiB, the content-bound hook-fallback cap; the inline
+    /// optimization producer stays ≤64 KiB per node).
     pub drv_content: Vec<u8>,
+    /// Whether `drv_content` is the AUTHORITATIVE copy of the
+    /// derivation (content-bound hook fallback: the bytes exist
+    /// nowhere else). Set from the proto flag at merge time and
+    /// re-derived from row presence on recovery. Gates the
+    /// merge-time content protections
+    /// (`sched.merge.authoritative-conflict`): a later submission can
+    /// neither join this node with different authoritative bytes nor
+    /// silently attach a conflicting verifiable identity to it.
+    pub drv_content_authoritative: bool,
     /// `inputSrcs` from the derivation ATerm — already-built store
     /// paths this derivation reads (NOT in the DAG as child nodes).
     /// Parsed once at merge time so `approx_input_closure` can
@@ -1084,6 +1095,7 @@ impl DerivationState {
             // visible "not yet set" marker.
             sched: SchedHint::default(),
             drv_content: node.drv_content.clone(),
+            drv_content_authoritative: node.drv_content_authoritative,
             input_srcs,
             retry: RetryState::default(),
             output_paths: Vec::new(),
@@ -1194,7 +1206,11 @@ impl DerivationState {
             // dispatch still works; everything else stays empty and
             // the worker fetches the .drv from the store. Re-run the
             // same best-effort inputSrcs parse as try_from_node so
-            // prefetch hints are also restored.
+            // prefetch hints are also restored. A row only ever holds
+            // content when the creating submission marked it
+            // authoritative (sched.persist.creation-scoped), so the
+            // flag is re-derived from presence.
+            drv_content_authoritative: row.drv_content.is_some(),
             input_srcs: row
                 .drv_content
                 .as_deref()
@@ -1311,6 +1327,7 @@ impl DerivationState {
             exec_id: None,
             sched: SchedHint::default(),
             drv_content: Vec::new(),
+            drv_content_authoritative: false,
             input_srcs: Vec::new(),
             retry: RetryState {
                 resubmit_cycles: row.resubmit_cycles.max(0) as u32,
