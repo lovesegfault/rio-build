@@ -260,14 +260,37 @@ pub struct HydraEntry {
 /// would mask what the campaign measures).
 pub const DISPOSITION_NOT_FOUND_UPSTREAM: &str = "not-found-upstream";
 
+/// [`WarmEntry::disposition`] value for a warm-set path that was already
+/// valid in rio-store at the plan-time validity snapshot — nothing to warm.
+pub const DISPOSITION_ALREADY_PRESENT: &str = "already-present";
+
+/// [`WarmEntry::disposition`] value for a warm-set path whose warm build
+/// completed without executing anything: the scheduler substituted it from
+/// an upstream cache.
+pub const DISPOSITION_SUBSTITUTED: &str = "substituted";
+
+/// [`WarmEntry::disposition`] value for a warm-set path whose warm build
+/// ended in a failed terminal state after the scheduler's retries.
+pub const DISPOSITION_FAILED_AFTER_RETRIES: &str = "failed-after-retries";
+
+/// [`WarmEntry::disposition`] value for a warm-set path whose warm build
+/// completed by actually executing the producing derivation (substitution
+/// fell through and the scheduler built it as a fallback).
+pub const DISPOSITION_BUILT_FALLBACK: &str = "built-fallback";
+
+/// [`WarmEntry::disposition`] value for a warm-set path with no static
+/// producing derivation in the dep closure (content-addressed / floating
+/// outputs) — excluded from warming because there is no drv to submit.
+pub const DISPOSITION_NO_STATIC_PRODUCER: &str = "no-static-producer";
+
 /// One line of warm.jsonl — per-path warm-stage disposition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarmEntry {
     pub path: String,
     pub drv_path: Option<String>,
-    /// "not-found-upstream" | "already-present" | "substituted" |
-    /// "failed-after-retries" | "built-fallback"
+    /// One of the `DISPOSITION_*` constants in this module; warm.jsonl
+    /// writers must use the constants, never hand-typed literals.
     pub disposition: String,
     pub batch_id: Option<u64>,
     pub observed_at: String,
@@ -357,6 +380,33 @@ mod tests {
             let back: Bucket = serde_json::from_str(&json).unwrap();
             assert_eq!(back, bucket);
         }
+    }
+
+    #[test]
+    fn warm_disposition_vocabulary_is_fixed_and_distinct() {
+        let all = [
+            DISPOSITION_NOT_FOUND_UPSTREAM,
+            DISPOSITION_ALREADY_PRESENT,
+            DISPOSITION_SUBSTITUTED,
+            DISPOSITION_FAILED_AFTER_RETRIES,
+            DISPOSITION_BUILT_FALLBACK,
+            DISPOSITION_NO_STATIC_PRODUCER,
+        ];
+        // The wire strings are frozen: warm.jsonl is append-only across
+        // resumes, so renaming a disposition would orphan prior entries.
+        assert_eq!(
+            all,
+            [
+                "not-found-upstream",
+                "already-present",
+                "substituted",
+                "failed-after-retries",
+                "built-fallback",
+                "no-static-producer",
+            ]
+        );
+        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len());
     }
 
     #[test]

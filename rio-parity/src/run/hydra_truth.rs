@@ -117,6 +117,11 @@ async fn fetch_one(
     }
 }
 
+/// Emit a sweep-progress log line every this many completed fetches, so an
+/// operator watching the logs can tell a long-but-moving sweep apart from one
+/// wedged in retry backoff.
+const PROGRESS_LOG_EVERY: usize = 500;
+
 /// Outcome counters for progress reporting.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepStats {
@@ -169,6 +174,12 @@ pub async fn run_hydra_truth(
         cached: seen.len() - want.len(),
         ..SweepStats::default()
     };
+    let to_fetch = want.len();
+    tracing::info!(
+        to_fetch,
+        cached = stats.cached,
+        "hydra-truth sweep starting"
+    );
 
     let concurrency = concurrency.max(1);
     let mut fetches = futures_util::stream::iter(want.into_iter().map(|path| async move {
@@ -187,6 +198,15 @@ pub async fn run_hydra_truth(
         }
         state.append_jsonl(StateFile::Hydra, &entry)?;
         by_path.insert(path, entry);
+        if stats.fetched.is_multiple_of(PROGRESS_LOG_EVERY) {
+            tracing::info!(
+                fetched = stats.fetched,
+                total = to_fetch,
+                found = stats.found,
+                not_found = stats.not_found,
+                "hydra-truth sweep progress"
+            );
+        }
     }
 
     // Warm pre-classification: a warm-set path with no upstream narinfo can
@@ -347,6 +367,52 @@ mod tests {
         // No duplicate warm classification.
         let warm2: Vec<WarmEntry> = state.load_jsonl(StateFile::Warm).unwrap();
         assert_eq!(warm2.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_retries_abort_sweep_and_keep_completed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let good = store_path("good");
+        let bad = store_path("bad");
+
+        let mut source = FakeSource::default();
+        source.bodies.insert(good.clone(), narinfo_text(&good));
+        // `bad` keeps failing transiently past max_attempts.
+        source
+            .fail_first
+            .lock()
+            .unwrap()
+            .insert(bad.clone(), u32::MAX);
+
+        // Concurrency 1 keeps completion order deterministic: `good` is
+        // fetched and appended before `bad` exhausts its retries.
+        let err = run_hydra_truth(&state, &source, &[good.clone(), bad.clone()], &[], 1, 3)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(&bad),
+            "abort error must name the failing path: {err}"
+        );
+
+        // The entry appended before the abort persists for resume.
+        let hydra: Vec<HydraEntry> = state.load_jsonl(StateFile::Hydra).unwrap();
+        assert_eq!(hydra.len(), 1);
+        assert_eq!(hydra[0].path, good);
+
+        // Resume after the upstream recovers (404 now): only the failed path
+        // is re-fetched, the completed one is served from the disk cache.
+        source.fail_first.lock().unwrap().clear();
+        let before = source.fetches.load(Ordering::SeqCst);
+        let stats = run_hydra_truth(&state, &source, &[good.clone(), bad.clone()], &[], 1, 3)
+            .await
+            .unwrap();
+        assert_eq!(stats.cached, 1);
+        assert_eq!(stats.fetched, 1);
+        assert_eq!(stats.not_found, 1);
+        assert_eq!(source.fetches.load(Ordering::SeqCst), before + 1);
+        let hydra: Vec<HydraEntry> = state.load_jsonl(StateFile::Hydra).unwrap();
+        assert_eq!(hydra.len(), 2);
     }
 
     #[tokio::test]

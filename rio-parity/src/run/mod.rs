@@ -12,6 +12,7 @@
 //! machine once every stage exists.
 
 pub mod artifact;
+pub mod classify;
 pub mod evalset_input;
 pub mod glob;
 pub mod grpc;
