@@ -91,6 +91,12 @@ pub struct DagActorPlumbing {
     /// HMAC signer for assignment tokens. `None` = legacy unsigned
     /// format-string (dev mode).
     pub hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// HMAC signer for rio-mountd Mount-admission tokens (ADR-022
+    /// §P0559). SEPARATE key from `hmac_signer` — its verifier is
+    /// mounted into the rio-mountd DaemonSet on every builder node.
+    /// `None` = `WorkAssignment.mountd_token` stays empty and mountd
+    /// admits by gid only.
+    pub mountd_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// HMAC signer for `x-rio-service-token` (SEPARATE key from
     /// `hmac_signer`). `None` = dispatch-time substitution probe
     /// degrades to local-presence-only —
@@ -143,6 +149,7 @@ impl Default for DagActorPlumbing {
             log_buffers: None,
             event_persist_tx: None,
             hmac_signer: None,
+            mountd_signer: None,
             service_signer: None,
             leader: LeaderState::default(),
             cost_table: Arc::default(),

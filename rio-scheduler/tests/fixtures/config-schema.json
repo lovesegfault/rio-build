@@ -89,6 +89,14 @@
         ],
         "default": null
       },
+      "mountd_hmac_key_path": {
+        "description": "HMAC key file for signing rio-mountd Mount-admission tokens\n(ADR-022 §P0559). SEPARATE from `hmac_key_path`: the matching\nverifier key is mounted into the rio-mountd DaemonSet on every\nbuilder node, and a node compromise must not yield a key the\nstore trusts. When set, dispatch mints a `MountdClaims{aud,\nbuild_id, tenant, expiry}` token into\n`WorkAssignment.mountd_token` with the same TTL as the\nassignment token; the builder presents it in the mountd\n`Mount{}` frame so `hostUsers: false` executor pods (which\ncannot present the host rio-builder gid) are admitted. Unset =\nno mountd token minted (dev/standalone — mountd's gid gate is\nthe only admission path). Env: `RIO_MOUNTD_HMAC_KEY_PATH`.\nHelm: `mountdHmac.secretName`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
       "jwt": {
         "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).\nThe gateway signs with the matching seed; scheduler verifies.\nUnset = interceptor inert (dev mode / pre-key-rotation-infra).\nSIGHUP reloads from the same path — kubelet remounts the\nConfigMap on rotation, operator SIGHUPs the pod. Set via\n`RIO_JWT__KEY_PATH` (nested config key — double underscore).",
         "$ref": "#/$defs/JwtConfig",
@@ -315,6 +323,7 @@
     "hmac_key_path": null,
     "assignment_token_ttl_cap_secs": 172800,
     "service_hmac_key_path": null,
+    "mountd_hmac_key_path": null,
     "jwt": {
       "required": false,
       "key_path": null

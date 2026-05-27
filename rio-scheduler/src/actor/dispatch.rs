@@ -1987,6 +1987,36 @@ impl DagActor {
             format!("{executor_id}-{drv_hash}-{generation}")
         };
 
+        // Mountd Mount-admission token (ADR-022 §P0559): minted only
+        // when the SEPARATE mountd key is configured. Same TTL as the
+        // assignment token — the builder's reconnect path re-issues
+        // Mount{} mid-build after a mountd restart, so the token must
+        // stay valid for the whole build window, not just the initial
+        // mount. claims.build_id is the exact string the builder will
+        // send in Mount{} (the sanitized drv_path basename); mountd
+        // compares them, so a leaked token cannot claim another
+        // build's id. Empty = no key configured = builder sends no
+        // token and mountd's gid gate is the only admission path.
+        let mountd_token = if let Some(signer) = &self.mountd_signer {
+            let ttl_secs = assignment_token_ttl_secs(
+                build_opts.build_timeout,
+                self.assignment_token_ttl_cap_secs,
+            );
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            signer.sign(&rio_auth::hmac::MountdClaims {
+                aud: rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE.to_string(),
+                build_id: rio_auth::hmac::MountdClaims::build_id_for_drv_path(state.drv_path()),
+                tenant: state.attributed_tenant(&self.builds).map(|u| u.to_string()),
+                issued_unix: now_unix,
+                expiry_unix: now_unix.saturating_add(ttl_secs),
+            })
+        } else {
+            String::new()
+        };
+
         Some(rio_proto::types::WorkAssignment {
             drv_path: state.drv_path().to_string(),
             // Forward what the gateway inlined (or empty → worker
@@ -2027,6 +2057,7 @@ impl DagActor {
             // happen, but the field is non-Option in the proto.
             exec_id: state.exec_id.map(|u| u.to_string()).unwrap_or_default(),
             input_closure,
+            mountd_token,
             input_roots: input_root_rows
                 .into_iter()
                 .map(|r| {

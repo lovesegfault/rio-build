@@ -214,6 +214,12 @@
         "description": "HMAC key file for signing `x-rio-service-token` (SEPARATE from `hmac_key_path`)."
       },
       {
+        "key": "mountd_hmac_key_path",
+        "type": "string",
+        "default": "",
+        "description": "HMAC key file for signing rio-mountd Mount-admission tokens (ADR-022 §P0559)."
+      },
+      {
         "key": "jwt.required",
         "type": "boolean",
         "default": "false",

@@ -389,6 +389,105 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     Ok(())
 }
 
+/// ADR-022 §P0559: when the SEPARATE mountd key is configured,
+/// dispatch mints `WorkAssignment.mountd_token` — a `MountdClaims`
+/// token bound to the exact mountd `build_id` the builder will send in
+/// `Mount{}` (the sanitized drv_path basename) — and that token is
+/// useless against the store-facing assignment key (and vice versa).
+/// Without the key, the field stays empty (fail-closed keyless dev
+/// posture: no token minted, mountd admits by gid only).
+// r[verify builder.mountd.token-key-separate]
+#[tokio::test]
+async fn test_mountd_token_minted_with_separate_key_and_bound_to_build_id() -> TestResult {
+    use rio_auth::hmac::{HmacSigner, HmacVerifier, MountdClaims, MountdTokenError};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let assignment_key = b"test-assignment-key-32-bytes-ok!".to_vec();
+    let mountd_key = b"test-mountd-hmac-key-32-bytes-ok".to_vec();
+
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(assignment_key.clone())));
+        p.mountd_signer = Some(Arc::new(HmacSigner::from_key(mountd_key.clone())));
+    });
+    let mut worker_rx = connect_executor(&handle, "mountd-w", "x86_64-linux").await?;
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("mountd-drv")],
+        vec![],
+        false,
+    )
+    .await?;
+    let assignment = recv_assignment(&mut worker_rx).await;
+
+    // The token verifies under the mountd key for the build_id the
+    // builder derives from the assignment's drv_path…
+    let expected_build_id = MountdClaims::build_id_for_drv_path(&assignment.drv_path);
+    let mountd_verifier = HmacVerifier::from_key(mountd_key.clone());
+    let claims = MountdClaims::verify(
+        &mountd_verifier,
+        &assignment.mountd_token,
+        &expected_build_id,
+    )
+    .expect("mountd token verifies for the drv_path-derived build_id");
+    assert_eq!(claims.build_id, expected_build_id);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(claims.expiry_unix > now, "expiry must cover the build");
+
+    // …but not for a different build_id (no cross-build replay)…
+    assert!(matches!(
+        MountdClaims::verify(&mountd_verifier, &assignment.mountd_token, "b-other"),
+        Err(MountdTokenError::BuildIdMismatch)
+    ));
+
+    // …and not under the assignment key (separate key families). The
+    // assignment token is equally useless as a mountd credential.
+    let assignment_verifier = HmacVerifier::from_key(assignment_key);
+    assert!(
+        MountdClaims::verify(
+            &assignment_verifier,
+            &assignment.mountd_token,
+            &expected_build_id
+        )
+        .is_err(),
+        "mountd token must not verify under the assignment key"
+    );
+    assert!(
+        MountdClaims::verify(
+            &mountd_verifier,
+            &assignment.assignment_token,
+            &expected_build_id
+        )
+        .is_err(),
+        "assignment token must not admit a Mount"
+    );
+
+    drop(handle);
+
+    // Keyless: no mountd signer → empty token (builder sends none).
+    let db2 = TestDb::new(&MIGRATOR).await;
+    let (handle2, _task2) = setup_actor_configured(db2.pool.clone(), None, |_, _| {});
+    let mut worker_rx2 = connect_executor(&handle2, "mountd-w2", "x86_64-linux").await?;
+    merge_dag(
+        &handle2,
+        Uuid::new_v4(),
+        vec![make_node("mountd-keyless-drv")],
+        vec![],
+        false,
+    )
+    .await?;
+    let keyless = recv_assignment(&mut worker_rx2).await;
+    assert!(
+        keyless.mountd_token.is_empty(),
+        "no mountd key configured → no mountd token minted"
+    );
+
+    Ok(())
+}
+
 /// bug_011 Phase 2 invariant: `dispatch.rs` stamps the attributed
 /// tenant UUID into the SIGNED `AssignmentClaims` so the store derives
 /// `hw_perf_samples.submitting_tenant` from a verified token, never

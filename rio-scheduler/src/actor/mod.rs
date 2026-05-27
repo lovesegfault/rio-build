@@ -505,6 +505,14 @@ pub struct DagActor {
     /// Arc because assign_to_worker is hot path and cloning the
     /// underlying key Vec on every dispatch would allocate.
     hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// HMAC signer for rio-mountd Mount-admission tokens (ADR-022
+    /// §P0559). When Some, dispatch signs a `MountdClaims { aud,
+    /// build_id, tenant, issued, expiry }` into
+    /// `WorkAssignment.mountd_token` (same TTL as the assignment
+    /// token); the builder presents it in the mountd `Mount{}` frame.
+    /// SEPARATE key from `hmac_signer` — its verifier lives on every
+    /// builder node. None = no mountd token (gid-only admission).
+    mountd_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Cap (seconds) on the assignment-token TTL minted at dispatch —
     /// `r[common.hmac.expiry-cap]`. From
     /// [`DagActorConfig::assignment_token_ttl_cap_secs`].
@@ -778,6 +786,7 @@ impl DagActor {
             self_tx: None,
             soft_features: cfg.soft_features,
             hmac_signer: plumbing.hmac_signer,
+            mountd_signer: plumbing.mountd_signer,
             assignment_token_ttl_cap_secs: cfg.assignment_token_ttl_cap_secs,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
@@ -865,6 +874,7 @@ impl DagActor {
             self_tx: _,
             soft_features,
             hmac_signer: _,
+            mountd_signer: _,
             // Retained: deploy config, not persisted state — a leader
             // transition doesn't change the operator's TTL cap.
             assignment_token_ttl_cap_secs: _,

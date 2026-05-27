@@ -66,6 +66,20 @@ pub struct Config {
     /// `r[sched.dispatch.fod-substitute]`. Unset = dispatch-time
     /// substitution probe disabled (falls back to local-presence-only).
     pub service_hmac_key_path: Option<std::path::PathBuf>,
+    /// HMAC key file for signing rio-mountd Mount-admission tokens
+    /// (ADR-022 §P0559). SEPARATE from `hmac_key_path`: the matching
+    /// verifier key is mounted into the rio-mountd DaemonSet on every
+    /// builder node, and a node compromise must not yield a key the
+    /// store trusts. When set, dispatch mints a `MountdClaims{aud,
+    /// build_id, tenant, expiry}` token into
+    /// `WorkAssignment.mountd_token` with the same TTL as the
+    /// assignment token; the builder presents it in the mountd
+    /// `Mount{}` frame so `hostUsers: false` executor pods (which
+    /// cannot present the host rio-builder gid) are admitted. Unset =
+    /// no mountd token minted (dev/standalone — mountd's gid gate is
+    /// the only admission path). Env: `RIO_MOUNTD_HMAC_KEY_PATH`.
+    /// Helm: `mountdHmac.secretName`.
+    pub mountd_hmac_key_path: Option<std::path::PathBuf>,
     /// JWT verification. `key_path` → ConfigMap mount at
     /// `/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).
     /// The gateway signs with the matching seed; scheduler verifies.
@@ -171,6 +185,7 @@ impl Default for Config {
             hmac_key_path: None,
             assignment_token_ttl_cap_secs: crate::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS,
             service_hmac_key_path: None,
+            mountd_hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             lease_name: None,
             lease_namespace: None,

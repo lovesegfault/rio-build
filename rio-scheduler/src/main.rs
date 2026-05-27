@@ -225,6 +225,17 @@ async fn main() -> anyhow::Result<()> {
     if service_verifier.is_some() {
         info!("service-token verification enabled (controller-only AdminService RPCs)");
     }
+    // Mountd Mount-admission signer (ADR-022 §P0559). THIRD key,
+    // separate from both the assignment key (its verifier lives on
+    // every builder node via the rio-mountd DaemonSet — node compromise
+    // must not yield a store-trusted key) and the service key. None =
+    // no mountd token minted; mountd then admits by gid only.
+    let mountd_signer = rio_auth::hmac::HmacSigner::load(cfg.mountd_hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("mountd HMAC key load: {e}"))?
+        .map(Arc::new);
+    if mountd_signer.is_some() {
+        info!("mountd token signing enabled (WorkAssignment.mountd_token)");
+    }
 
     // ADR-023 phase-13: hw-band cost table. PG-backed (sla_ema_state)
     // so a restart doesn't re-warm; lease-gated poller below keeps it
@@ -364,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
             log_buffers: Some(Arc::clone(&log_buffers)),
             event_persist_tx: Some(event_persist_tx),
             hmac_signer,
+            mountd_signer,
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
             cost_table: std::sync::Arc::clone(&cost_table),
