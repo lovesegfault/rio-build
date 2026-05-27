@@ -97,7 +97,8 @@ use crate::manifest::{Manifest, ManifestEntry};
 // equivalence checks, and the chunks-fixture seeding all exercise the
 // production SQL rather than a copy that could drift from it.
 use super::collect::{
-    MARK_EXPANSION_SQL as SERVER_MARK_SQL, mark_validation_sql as server_validate_sql,
+    COLLECT_BATCH_SELECT_SQL, COLLECT_BATCH_UPDATE_SQL, MARK_EXPANSION_SQL as SERVER_MARK_SQL,
+    mark_validation_sql as server_validate_sql,
 };
 
 /// Deterministic splitmix64 — no external RNG dependency, uniform output.
@@ -1017,55 +1018,6 @@ const COLLECT_CAP_DEFAULT: u64 = 500_000;
 /// guard asserts. The 150 k and 1.5 M measurement points both enforce.
 const PLAN_SHAPE_ENFORCE_MIN_PATHS: u64 = 100_000;
 
-/// One collect batch's candidate scan: the next `LIMIT` unmarked
-/// chunks past grace, in `blake3_hash` order, resuming from a keyset
-/// cursor ($1). This is the design §4.1 step-3 predicate (anti-join
-/// against the mark product, `GREATEST(created_at, last_referenced_at)`
-/// against the cycle snapshot) in the orphan-chunk-sweep skeleton the
-/// design names (candidate SELECT, then a sorted `= ANY` soft-delete in
-/// the same per-batch transaction — [`COLLECT_BATCH_UPDATE_SQL`]). The
-/// keyset cursor is the bench's one addition over the as-written
-/// skeleton: without it every batch re-probes all marked rows that
-/// precede its candidates (quadratic in batch count at the design-point
-/// scale); the cursor also bounds the anti-join's inner side so each
-/// index is walked once across the whole loop. The live arm is expected
-/// to adopt the same cursor; the EXPLAIN guard pins this statement's
-/// shape (re-entry gate (b)).
-const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chunks c \
-     WHERE c.blake3_hash > $1 \
-       AND c.deleted = FALSE \
-       AND NOT EXISTS (SELECT 1 FROM live_chunks lc \
-                        WHERE lc.blake3_hash = c.blake3_hash AND lc.blake3_hash > $1) \
-       AND GREATEST(c.created_at, c.last_referenced_at) < $2::timestamptz \
-     ORDER BY c.blake3_hash \
-     LIMIT $3";
-
-/// One collect batch's soft-delete. The UPDATE re-evaluates the collect
-/// predicate's row-local conjuncts — `deleted = FALSE` plus the
-/// `GREATEST(created_at, last_referenced_at) < cutoff` grace term — in
-/// its own WHERE clause, per the T-1a.8 consequence recorded in
-/// `docs/spec/models/refcount-invariant-map.md` (chunkCollect encoding
-/// notes, the row-lock / READ-COMMITTED bullet) and design §4.1's
-/// in-flight-overlap sentence: a READ-COMMITTED row-lock wait re-checks
-/// only the conjuncts present in this WHERE, so the touch/grace
-/// re-check here is what protects a chunk re-referenced and touched
-/// between the candidate scan and this UPDATE; the anti-join is not
-/// re-evaluated. The model's writer-bounded HOLDS verdict is stated
-/// against this predicate-re-checking shape — the live arm (T-1a.8)
-/// MUST NOT ship a hash-only or deleted-only WHERE. This mirrors
-/// `sweep_orphan_batch`, whose UPDATE re-checks its full liveness
-/// predicate (`refcount = 0 AND deleted = FALSE`); this statement is
-/// its predicate-swapped analog. In the bench (no concurrent writers)
-/// the grace conjunct filters nothing — it is pinned here because this
-/// constant is the template the live arm is expected to adopt. The bind
-/// is the candidate scan's result, which is already in ascending hash
-/// order — the `r[store.chunk.lock-order]` discipline for `= ANY`
-/// writers.
-const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL \
-     WHERE blake3_hash = ANY($1) AND deleted = FALSE \
-       AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
-     RETURNING blake3_hash, size";
-
 /// The candidate-scan statement with literals spliced in place of the
 /// bind parameters, for `EXPLAIN` only (EXPLAIN cannot carry binds and
 /// a generic plan would not reflect the custom plan the loop gets).
@@ -1651,8 +1603,8 @@ async fn mark_scan_bench_collect_phase() {
     );
 }
 
-/// The live-arm soft-delete template re-evaluates the row-local collect
-/// predicate — `deleted = FALSE` AND the
+/// The live arm's soft-delete statement re-evaluates the row-local
+/// collect predicate — `deleted = FALSE` AND the
 /// `GREATEST(created_at, last_referenced_at) < cutoff` grace term — in
 /// its own WHERE clause (the T-1a.8 consequence recorded in
 /// `docs/spec/models/refcount-invariant-map.md`). A candidate that a
@@ -1661,11 +1613,12 @@ async fn mark_scan_bench_collect_phase() {
 /// candidate must still be collected (the conjunct filters, it does not
 /// neuter the statement). Dropping either conjunct re-opens the §4.6(i)
 /// mark-stale data-loss window, so the structural pin fails loudly if
-/// the template regresses to a hash-only or deleted-only WHERE.
+/// the shipped statement regresses to a hash-only or deleted-only
+/// WHERE.
 #[tokio::test]
 async fn collect_batch_update_rechecks_collect_predicate() {
-    // Structural pin: the template the live arm (T-1a.8) is expected to
-    // adopt must carry both row-local conjuncts in its own WHERE.
+    // Structural pin: the statement the live arm ships must carry both
+    // row-local conjuncts in its own WHERE.
     assert!(
         COLLECT_BATCH_UPDATE_SQL.contains("deleted = FALSE")
             && COLLECT_BATCH_UPDATE_SQL

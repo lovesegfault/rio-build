@@ -257,8 +257,9 @@ pub fn describe_metrics() {
          batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow."
     );
 
-    // Lazy chunk collector (gc::collect) — shadow mode in this release:
-    // every cycle reports, nothing is modified until the cutover release.
+    // Lazy chunk collector (gc::collect) — the live collect arm runs as
+    // run_gc phase 3 and from the daily backstop; a dry-run GC keeps
+    // phase 3 in shadow (report-only) mode.
     describe_gauge!(
         "rio_store_gc_chunks_live",
         "Distinct chunk hashes referenced by at least one existing manifest \
@@ -266,10 +267,19 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_store_gc_chunks_would_collect",
-        "Chunks the collect cycle would soft-delete: not deleted, absent from \
-         the mark set, and older than grace measured from \
-         GREATEST(created_at, last_referenced_at). Shadow mode reports this \
-         without deleting anything."
+        "Chunks a shadow (report-only) collect cycle would soft-delete: not \
+         deleted, absent from the mark set, and older than grace measured \
+         from GREATEST(created_at, last_referenced_at). Emitted by shadow \
+         cycles only (a dry-run GC's phase 3); live cycles do not re-run \
+         this full anti-join count — their backlog visibility is \
+         rio_store_gc_collect_backlog_chunks."
+    );
+    describe_counter!(
+        "rio_store_gc_chunks_collected_total",
+        "Chunks soft-deleted (and, when a chunk backend exists, enqueued to \
+         pending_s3_deletes) by live collect cycles. Incremented per \
+         committed collect batch. The expected one-time reclamation of \
+         historical refcount leaks shows up here after the cutover."
     );
     describe_gauge!(
         "rio_store_gc_refcount_drift_leaked",
@@ -590,4 +600,5 @@ pub fn describe_metrics() {
     metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error").absolute(0);
     metrics::counter!("rio_store_gc_collect_parse_failures_total").absolute(0);
     metrics::counter!("rio_store_gc_collect_cycles_capped_total").absolute(0);
+    metrics::counter!("rio_store_gc_chunks_collected_total").absolute(0);
 }

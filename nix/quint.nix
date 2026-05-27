@@ -1432,7 +1432,6 @@ in
     # r[verify store.chunk.refcount-decrement]
     # r[verify store.chunk.liveness-not-presence]
     # r[verify store.gc.pending-deletes]
-    # r[verify store.chunk.grace-ttl]
     quint-chunk-liveness-contend = mkQuintCheck {
       name = "chunk-liveness-contend";
       spec = "chunkLiveness";
@@ -1848,13 +1847,17 @@ in
     # last_referenced_at touch closes (a manifest committing after the
     # cycle's mark snapshot re-references an old chunk), the
     # resurrect-vs-drain TOCTOU with the deleted-only re-check, and the
-    # late-cleanup no-op contention. No process death.
+    # late-cleanup no-op contention. No process death. The touch/grace
+    # term this regime exercises is the amended grace-ttl eligibility
+    # predicate (zero references at the mark snapshot AND older than
+    # grace from GREATEST(created_at, last_referenced_at)).
     # r[verify store.chunk.liveness-derived]
     # r[verify store.gc.chunk-collect]
     # r[verify store.chunk.no-live-collect]
     # r[verify store.gc.bounded-garbage-retention]
     # r[verify store.chunk.liveness-not-presence]
     # r[verify store.gc.pending-deletes]
+    # r[verify store.chunk.grace-ttl+2]
     quint-chunk-collect-contend = mkQuintCheck {
       name = "chunk-collect-contend";
       spec = "chunkCollect";

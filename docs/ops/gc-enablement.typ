@@ -40,22 +40,32 @@ fires one full interval after the pod starts (a pod boot, scale-up, or
 crash-loop never triggers a cycle), and a tick that finds the GC
 advisory lock held --- a GC run or another replica's cycle in flight
 --- skips, so at most one cycle runs cluster-wide at a time and a
-replica skipping its tick is expected, not a stall. The collector
-ships in *shadow mode* first: each cycle computes the
-live set and reports
-#(refs.metric)("rio_store_gc_chunks_live"),
-#(refs.metric)("rio_store_gc_chunks_would_collect"),
-the refcount drift pair
+replica skipping its tick is expected, not a stall. Each live cycle
+computes the live set, reports
+#(refs.metric)("rio_store_gc_chunks_live") and the refcount drift pair
 (#(refs.metric)("rio_store_gc_refcount_drift_leaked"),
-#(refs.metric)("rio_store_gc_refcount_drift_undercount")),
-#(refs.metric)("rio_store_gc_collect_backlog_chunks") and a
-cycle-duration histogram, but modifies nothing. A later release turns
-on the collecting arm (soft-delete + S3-delete enqueue), capped per
-cycle so a backlog drains across cycles. The cycle's validation pass,
+#(refs.metric)("rio_store_gc_refcount_drift_undercount")), then
+soft-deletes and enqueues unreferenced chunks past grace --- at most
+`COLLECT_CYCLE_VICTIM_CAP` per cycle, with a keyset cursor carrying
+any remainder to the next cycle, so a backlog (the first enable's
+historical-leak reclamation, a mass deletion, a collector outage)
+drains across cycles instead of stretching one cycle past its
+lock-held budget. Watch the drain through
+#(refs.metric)("rio_store_gc_collect_backlog_chunks") (a decremental
+estimate, re-anchored at zero when a pass completes),
+#(refs.metric)("rio_store_gc_chunks_collected_total"), the
+capped-cycles counter
+#(refs.metric)("rio_store_gc_collect_cycles_capped_total"), and the
+cycle-duration histogram.
+#(refs.metric)("rio_store_gc_chunks_would_collect") is emitted only by
+shadow (report-only) cycles --- a dry-run GC's phase 3 --- which also
+re-anchor the backlog estimate; live cycles do not re-run that full
+anti-join count. A dry-run GC keeps phase 3 observation-only (nothing
+is soft-deleted or enqueued). The cycle's validation pass,
 mark, and report all run on one REPEATABLE READ snapshot, so the drift
 gauges measure real refcount drift --- uploads or rollbacks that commit
 while a cycle is running cannot show up as drift, and a nonzero
-under-count reading is a real abort signal, not cycle-concurrent
+under-count reading is a real stop signal, not cycle-concurrent
 traffic.
 
 == Parse-failure abort: #(refs.alert)("RioStoreGcCollectParseFailure") (critical)

@@ -14,11 +14,12 @@
 //!
 //! 3. **Collect** (`collect::collect_cycle`): the lazy chunk
 //!    collector — phase 3 of `run_gc` plus a daily backstop timer.
-//!    Shadow mode in this release: derives the live-chunk set from
-//!    every existing manifest's `chunk_list` (fail-closed on any
-//!    unparseable blob) and reports would-collect / drift gauges
-//!    without modifying anything; the collecting arm is a later
-//!    release.
+//!    Derives the live-chunk set from every existing manifest's
+//!    `chunk_list` (fail-closed on any unparseable blob), then
+//!    soft-deletes + enqueues unreferenced chunks past grace, capped
+//!    per cycle with a keyset cursor carrying any backlog to the next
+//!    cycle. A dry-run GC keeps this phase observation-only (shadow
+//!    mode: would-collect / drift gauges, no modification).
 //!
 //! 4. **Drain** ([`drain::spawn_drain_task`]): background task that
 //!    reads `pending_s3_deletes`, calls `ChunkBackend::delete_by_key`,
@@ -91,11 +92,13 @@ use crate::manifest::{Manifest, ManifestError};
 pub struct GcStats {
     /// Paths deleted from narinfo (and cascaded tables).
     pub paths_deleted: u64,
-    /// Chunks marked deleted (refcount → 0 this sweep).
+    /// Chunks soft-deleted by the collect cycle (run_gc phase 3); a
+    /// dry run reports the cycle's would-collect estimate instead.
     pub chunks_deleted: u64,
-    /// S3 keys enqueued to pending_s3_deletes.
+    /// S3 keys enqueued to pending_s3_deletes by the collect cycle.
     pub s3_keys_enqueued: u64,
-    /// Total bytes of chunks marked deleted (for storage savings estimate).
+    /// Total bytes of chunks soft-deleted by the collect cycle (for
+    /// storage savings estimate).
     pub bytes_freed: u64,
     /// Paths skipped because a new narinfo referenced them after
     /// mark (mark-vs-sweep race window — a PutPath completed BETWEEN
@@ -279,7 +282,7 @@ pub async fn run_gc(
     // Shutdown token threaded through: sweep checks it between
     // batches (not mid-transaction — a partial batch ROLLBACKs
     // cleanly via tx drop). Returns SweepAbort::Shutdown if fired.
-    let stats = match sweep::sweep(
+    let mut stats = match sweep::sweep(
         pool,
         chunk_backend.as_ref(),
         unreachable,
@@ -302,29 +305,65 @@ pub async fn run_gc(
         }
     };
 
-    // --- Phase 3: chunk-collect cycle (shadow mode — mark + report only) ---
+    // --- Phase 3: chunk-collect cycle (the live collect arm) ---
     // Runs while GC_LOCK_ID is still held: the cycle uses its own
     // pooled connection for the session temp table; the advisory lock
     // stays on lock_conn (same split the sweep's temp table uses).
-    // Shadow mode writes nothing, so a failure here never affects the
+    // A dry-run GC keeps phase 3 observation-only (Shadow mode) so a
+    // dry run never deletes anything; a real run collects (capped per
+    // cycle, cursor-resumable). A phase-3 failure never affects the
     // path GC that just committed — log and continue; the daily
     // backstop (and the next GC run) retries. A parse-failure abort is
     // reported inside the cycle (counter + error log), not as an Err.
-    match collect::collect_cycle(pool, sweep::CHUNK_GRACE_SECS, collect::CollectMode::Shadow).await
+    let collect_mode = if params.dry_run {
+        collect::CollectMode::Shadow
+    } else {
+        collect::CollectMode::Live
+    };
+    match collect::collect_cycle(
+        pool,
+        chunk_backend.as_ref(),
+        sweep::CHUNK_GRACE_SECS,
+        collect_mode,
+    )
+    .await
     {
         Ok(report) => {
+            // P11: from the cutover release on, the chunk-level GC
+            // stats (chunks deleted / bytes freed / S3 keys enqueued)
+            // are sourced from the collect cycle, not the path sweep;
+            // a dry run reports the would-collect estimate instead.
+            match collect_mode {
+                collect::CollectMode::Live => {
+                    stats.chunks_deleted = report.victims_collected;
+                    stats.bytes_freed = report.victim_bytes;
+                    stats.s3_keys_enqueued = report.s3_keys_enqueued;
+                }
+                collect::CollectMode::Shadow => {
+                    stats.chunks_deleted = report.would_collect;
+                    stats.bytes_freed = report.would_collect_bytes;
+                    stats.s3_keys_enqueued = if chunk_backend.is_some() {
+                        report.would_collect
+                    } else {
+                        0
+                    };
+                }
+            }
             info!(
                 outcome = ?report.outcome,
+                mode = ?collect_mode,
                 mark_set_size = report.mark_set_size,
                 would_collect = report.would_collect,
                 drift_leaked = report.drift_leaked,
                 drift_undercount = report.drift_undercount,
                 victims_collected = report.victims_collected,
+                victim_bytes = report.victim_bytes,
+                s3_keys_enqueued = report.s3_keys_enqueued,
                 batches_run = report.batches_run,
                 cap_reached = report.cap_reached,
                 cursor_at_stop = ?report.cursor_at_stop.as_deref().map(hex::encode),
                 cycle_seconds = report.cycle_seconds,
-                "GC: collect phase 3 (shadow) complete"
+                "GC: collect phase 3 complete"
             );
         }
         Err(e) => {
@@ -333,7 +372,7 @@ pub async fn run_gc(
             // instead of only via the 25h stalled alert.
             metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error")
                 .increment(1);
-            warn!(error = %e, "GC: collect phase 3 (shadow) failed");
+            warn!(error = %e, "GC: collect phase 3 failed");
         }
     }
 

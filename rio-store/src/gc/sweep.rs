@@ -726,7 +726,6 @@ async fn sweep_one_batch(
 /// [`GcStats`] (or log them directly — this is callable outside
 /// the main GC run for a lightweight "just clean up orphan chunks"
 /// cron).
-// r[impl store.chunk.grace-ttl]
 #[instrument(skip(pool, chunk_backend))]
 pub async fn sweep_orphan_chunks(
     pool: &PgPool,
@@ -1519,8 +1518,9 @@ mod tests {
             .await
     }
 
-    // r[verify store.chunk.grace-ttl]
-    /// The three-way partition the grace-TTL guard must uphold:
+    /// The three-way partition the orphan-chunk sweep's grace guard
+    /// must uphold (the amended grace-ttl rule's verification now
+    /// lives with the collect-cycle tests in gc::collect):
     ///
     /// | Chunk | refcount | age vs grace | Expected |
     /// |-------|----------|--------------|----------|
@@ -2159,7 +2159,6 @@ mod tests {
         );
     }
 
-    // r[verify store.chunk.grace-ttl]
     /// Mutation-tested: removing `AND refcount = 0` from
     /// sweep_orphan_batch's inner UPDATE → fails here.
     #[tokio::test]

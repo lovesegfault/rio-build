@@ -196,14 +196,26 @@ table schema:
   permitted (masks real lock-order bugs).
 ]
 
-#r("store.chunk.grace-ttl")[
-  Chunks with zero manifest references AND `created_at < now() - grace_seconds`
-  are GC-eligible. The grace period covers transient refcount-zero windows
-  inside the server-side `PutPath` flow --- e.g., a failed upload's rollback
-  (`reap_one`) decrements a chunk to zero while a concurrent `PutPath` that
-  already saw the chunk as present and skipped re-upload has not yet committed
-  its increment. (Sibling to #rref("store.chunk.refcount-txn").)
+#r("store.chunk.grace-ttl+2")[
+  A chunk MUST be GC-eligible only if it has zero manifest references at the
+  collect cycle's mark snapshot (#rref("store.chunk.liveness-derived")) AND
+  `GREATEST(created_at, last_referenced_at)` predates the cycle's snapshot
+  cutoff by at least the grace window. The grace window MUST cover the three
+  windows it exists for: the mark-snapshot window (a manifest whose upgrade
+  transaction commits after the snapshot re-references an old chunk; only the
+  upsert's `last_referenced_at` touch keeps that chunk inside the grace term),
+  the interrupted-then-retried upload window (a crashed upload's chunk rows
+  stay claimable by the retry before any reclamation fires --- the
+  `uploaded_at`-skip optimization), and headroom over the writer-transaction
+  soundness bound of #rref("store.gc.chunk-collect").
 ]
+
+The eligibility predicate is evaluated against the cycle snapshot on the
+database clock, never re-derived per batch; a `NULL last_referenced_at` is
+equivalent to `created_at` (the column is touched only by the upsert's
+`ON CONFLICT` arm). Before the cutover the same grace value also bounded the
+orphan-chunk sweep's `refcount = 0` reaping --- that mechanism is retired with
+the counter readers; the window itself (and its 300 s default) is unchanged.
 
 #r("store.chunk.refcount-decrement")[
   *Refcount decrement:* every transaction that deletes a manifest row --- the

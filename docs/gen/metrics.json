@@ -171,6 +171,7 @@
     "rio_store_chunk_upgrade_tx_seconds",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
+    "rio_store_gc_chunks_collected_total",
     "rio_store_gc_chunks_live",
     "rio_store_gc_chunks_would_collect",
     "rio_store_gc_collect_backlog_chunks",
@@ -1096,6 +1097,11 @@
         "help": "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
       },
       {
+        "name": "rio_store_gc_chunks_collected_total",
+        "kind": "counter",
+        "help": "Chunks soft-deleted (and, when a chunk backend exists, enqueued to pending_s3_deletes) by live collect cycles. Incremented per committed collect batch. The expected one-time reclamation of historical refcount leaks shows up here after the cutover."
+      },
+      {
         "name": "rio_store_gc_chunks_live",
         "kind": "gauge",
         "help": "Distinct chunk hashes referenced by at least one existing manifest (any status) at the last collect cycle's mark snapshot (mark-set size)."
@@ -1103,7 +1109,7 @@
       {
         "name": "rio_store_gc_chunks_would_collect",
         "kind": "gauge",
-        "help": "Chunks the collect cycle would soft-delete: not deleted, absent from the mark set, and older than grace measured from GREATEST(created_at, last_referenced_at). Shadow mode reports this without deleting anything."
+        "help": "Chunks a shadow (report-only) collect cycle would soft-delete: not deleted, absent from the mark set, and older than grace measured from GREATEST(created_at, last_referenced_at). Emitted by shadow cycles only (a dry-run GC's phase 3); live cycles do not re-run this full anti-join count — their backlog visibility is rio_store_gc_collect_backlog_chunks."
       },
       {
         "name": "rio_store_gc_collect_backlog_chunks",
