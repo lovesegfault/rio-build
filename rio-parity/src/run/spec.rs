@@ -299,6 +299,13 @@ impl CampaignSpec {
         for (field, value) in nonzero_knobs {
             anyhow::ensure!(value != 0, "campaign spec field {field} must be nonzero");
         }
+        // The batch timeout becomes the per-child kill deadline; zero, NaN,
+        // or a negative value would kill every `nix build` child the moment
+        // it spawns.
+        anyhow::ensure!(
+            self.knobs.batch_timeout_hours.is_finite() && self.knobs.batch_timeout_hours > 0.0,
+            "campaign spec field knobs.batch_timeout_hours must be a positive finite number of hours"
+        );
         Ok(())
     }
 }
@@ -489,6 +496,26 @@ mod tests {
             err.to_string().contains("cluster.gateway_store_url"),
             "expected the first missing field to be named, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn nonpositive_batch_timeout_is_rejected() {
+        // Otherwise-valid spec with a zero batch timeout: validation must
+        // name the offending knob instead of letting it become a 0-second
+        // child deadline downstream.
+        let json = r#"{
+            "mode": "leaf",
+            "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+                        "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
+                        "store_addr": "rio-store.rio-store.svc:9002"},
+            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true},
+            "knobs": {"batch_timeout_hours": 0.0}
+        }"#;
+        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+        let err = spec.validate().unwrap_err();
+        assert!(err.to_string().contains("batch_timeout_hours"), "{err:#}");
     }
 
     #[test]

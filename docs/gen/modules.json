@@ -871,6 +871,11 @@
       "doc": "Plan stage: scope selection, warm / not-attemptable computation, the"
     },
     {
+      "path": "run/reader.rs",
+      "depth": 1,
+      "doc": "`ResultReader` — the trait collect uses to learn per-(build, drv) status"
+    },
+    {
       "path": "run/spec.rs",
       "depth": 1,
       "doc": "Campaign spec (operator input), engine knobs, and the campaign.json record."
