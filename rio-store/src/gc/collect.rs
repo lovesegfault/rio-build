@@ -72,10 +72,17 @@ pub const COLLECT_CYCLE_VICTIM_CAP: u64 = 50;
 /// as phase 3 of every `run_gc`; the backstop covers stores that never
 /// trigger GC so bounded garbage retention has a worst-case clock
 /// (24 h + grace + drain lag once the live arm is enabled).
+///
+/// The backstop's first tick fires one full interval after spawn —
+/// process boot deliberately does NOT trigger a cycle (see
+/// [`spawn_collect_backstop`]).
 #[cfg(not(test))]
 pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Test override: long enough that the no-cycle-at-boot assertion has
+/// real-time margin under CI load, short enough that the
+/// tick-after-one-interval half completes quickly.
 #[cfg(test)]
-pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `work_mem` for the mark expansion's set-based dedup (and
 /// `maintenance_work_mem` for the one-time index build on the mark
@@ -495,27 +502,42 @@ pub(crate) async fn collect_backstop_once(
     result.map(Some)
 }
 
-/// Spawn the daily collect backstop. Same `spawn_periodic` shape as
-/// [`super::sweep::spawn_orphan_chunk_sweep`]
-/// (`MissedTickBehavior::Skip`); errors are logged and the next tick
-/// retries.
+/// Spawn the daily collect backstop. Errors are logged and the next
+/// tick retries (`MissedTickBehavior::Skip`, like
+/// [`super::sweep::spawn_orphan_chunk_sweep`]).
+///
+/// Unlike `spawn_periodic` (whose first tick fires immediately), the
+/// ticker here is armed one full interval after spawn: the collect
+/// cycle is the heaviest query pattern in the system (full
+/// manifest_data expansion + chunks anti-join, multi-GB temp spill at
+/// the design point — invariant map T-1a.1b/T-1a.1c), and rolling
+/// deploys, scale-outs, and crash-loops must not trigger it on every
+/// pod boot — exactly the moments the database is already under
+/// stress. Each store replica arms its own daily timer; concurrent
+/// ticks (and ticks during a GC run) are deduplicated by the
+/// non-blocking [`super::GC_LOCK_ID`] try-lock in
+/// `collect_backstop_once`, so at most one cycle runs cluster-wide
+/// at a time. Accepted trade-off: a store that restarts more often
+/// than once per interval gets its cycles only from `run_gc` phase 3
+/// (the controller GC schedule); the `RioStoreGcCollectStalled` alert
+/// is the detector for a fleet where neither trigger completes.
 pub fn spawn_collect_backstop(
     pool: PgPool,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_periodic(
-        "gc-collect-backstop",
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + COLLECT_BACKSTOP_INTERVAL,
         COLLECT_BACKSTOP_INTERVAL,
-        shutdown,
-        move || {
-            let pool = pool.clone();
-            async move {
-                if let Err(e) = collect_backstop_once(&pool, super::sweep::CHUNK_GRACE_SECS).await {
-                    warn!(error = %e, "chunk-collect backstop failed (will retry next interval)");
-                }
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    rio_common::task::spawn_periodic_with("gc-collect-backstop", ticker, shutdown, move || {
+        let pool = pool.clone();
+        async move {
+            if let Err(e) = collect_backstop_once(&pool, super::sweep::CHUNK_GRACE_SECS).await {
+                warn!(error = %e, "chunk-collect backstop failed (will retry next interval)");
             }
-        },
-    )
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1106,6 +1128,56 @@ mod tests {
             .execute(&mut *probe)
             .await
             .unwrap();
+    }
+
+    /// The backstop's first tick fires one full interval after spawn,
+    /// never at process boot: a freshly spawned backstop must NOT have
+    /// run a cycle while well inside the first interval (the heaviest
+    /// query pattern in the system must not fire on every pod
+    /// boot/scale-up/crash-loop), and must then run cycles once the
+    /// interval elapses (the daily cadence still exists). The settle
+    /// window is a small fraction of the cfg(test) interval, so the
+    /// boot-side assertion has generous real-time margin; the liveness
+    /// side polls with a long deadline rather than a tight gate.
+    #[tokio::test]
+    async fn backstop_first_cycle_waits_one_interval_after_spawn() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let shutdown = rio_common::signal::Token::new();
+        let handle = spawn_collect_backstop(db.pool.clone(), shutdown.clone());
+
+        // Settle: ample real time for a boot-fired cycle to have
+        // completed (the fixture is empty, a cycle is a handful of
+        // trivial statements), while staying far inside the first
+        // interval so a fixed backstop cannot have ticked yet.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            0,
+            "the backstop must not run a collect cycle at process boot"
+        );
+
+        // Liveness: after the first interval elapses the backstop does
+        // run cycles. Poll with a generous deadline (structural
+        // assertion on the counter, not a tight wall-clock gate).
+        let mut ran = 0;
+        for _ in 0..200 {
+            ran = rec.get("rio_store_gc_collect_cycles_total{outcome=ok}");
+            if ran >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            ran >= 1,
+            "the backstop must run a cycle once its interval elapses"
+        );
+
+        shutdown.cancel();
+        handle.await.expect("backstop task shuts down cleanly");
     }
 
     /// Capped-collect scaffolding: the process-local cursor round-trips

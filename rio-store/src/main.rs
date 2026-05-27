@@ -309,9 +309,12 @@ async fn main() -> anyhow::Result<()> {
     // Daily chunk-collect backstop (shadow mode in this release):
     // covers stores that never trigger GC, so the collect cycle's
     // shadow report — and, once the live arm ships, bounded garbage
-    // retention — has a worst-case cadence. Takes GC_LOCK_ID
-    // non-blocking and skips when a GC run (which already runs the
-    // cycle as phase 3) is in flight.
+    // retention — has a worst-case cadence. The first tick fires one
+    // full interval after boot: pod boot/scale-up/crash-loops never
+    // trigger the cycle (the heaviest query pattern in the system).
+    // Takes GC_LOCK_ID non-blocking and skips when a GC run (which
+    // already runs the cycle as phase 3) or another replica's backstop
+    // is in flight.
     rio_store::gc::collect::spawn_collect_backstop(pool.clone(), shutdown.clone());
     if let Some(backend) = chunk_backend_for_gc {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());

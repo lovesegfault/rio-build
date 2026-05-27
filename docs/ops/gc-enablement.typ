@@ -35,7 +35,13 @@ The chunk collector derives chunk GC-eligibility from the durable
 manifests (every existing `manifest_data.chunk_list`, any status) at
 collect time, instead of trusting the maintained `chunks.refcount`
 counter. It runs as phase 3 of every GC run and from a daily backstop
-timer, and it ships in *shadow mode* first: each cycle computes the
+timer. Each store replica arms its own backstop timer, the first tick
+fires one full interval after the pod starts (a pod boot, scale-up, or
+crash-loop never triggers a cycle), and a tick that finds the GC
+advisory lock held --- a GC run or another replica's cycle in flight
+--- skips, so at most one cycle runs cluster-wide at a time and a
+replica skipping its tick is expected, not a stall. The collector
+ships in *shadow mode* first: each cycle computes the
 live set and reports
 #(refs.metric)("rio_store_gc_chunks_live"),
 #(refs.metric)("rio_store_gc_chunks_would_collect"),

@@ -303,7 +303,11 @@ pub fn describe_metrics() {
         "rio_store_gc_collect_cycles_total",
         "Chunk-collect cycles by outcome (ok | parse_failure). A cycle that \
          stops at the per-cycle victim cap counts as ok; staleness of ok \
-         cycles drives the RioStoreGcCollectStalled alert."
+         cycles (summed across replicas) drives the RioStoreGcCollectStalled \
+         alert. Cycles run as phase 3 of every GC run and from each \
+         replica's daily backstop timer, which arms one full interval after \
+         boot (pod boot never triggers a cycle) and skips its tick when \
+         another cycle holds the GC advisory lock."
     );
     describe_counter!(
         "rio_store_gc_collect_parse_failures_total",
