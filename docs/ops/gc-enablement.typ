@@ -159,16 +159,17 @@ the completed workstream is eventually deployed. Run the rows in
 order; every FAIL is a stop-and-report to the rollout owner --- the
 lever column is the sanctioned response, never a silent retune.
 
-*Signal lifetime, up front:* the refcount drift pair
-(`rio_store_gc_refcount_drift_leaked`,
-`rio_store_gc_refcount_drift_undercount`) is emitted only by the
-additive/Release-A-stage binaries: it is valid from the first
-deployment of the collector through the pre-Release-B observation
-window and is retired at Release B (the release that deletes the
-counter writers --- the current tree). After that the counter is no
-longer maintained and the pair stops being emitted, so the gauge names
-above are deliberately not validated metric references here. Train
-dashboards and alert expectations on that lifetime from the start.
+*Signal lifetime, up front:* the refcount drift pair (the
+leak-direction and under-count-direction gauges; their exact names are
+in the Release-A-stage image's own metric catalog and runbook) is
+emitted only by the additive/Release-A-stage binaries: it is valid
+from the first deployment of the collector through the pre-Release-B
+observation window and is retired at Release B (the release that
+deletes the counter writers --- the current tree). After that the
+counter is no longer maintained and the pair stops being emitted,
+which is also why the pair is not listed here as a validated metric
+reference. Train dashboards and alert expectations on that lifetime
+from the start.
 
 *Unexplained drift (the stop-the-rollout definition):* any nonzero
 under-count reading (a chunk referenced by an existing manifest while

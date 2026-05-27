@@ -1675,38 +1675,23 @@ in
     # were reintroduced, and that the invariant is not vacuous for it.
     # The full per-commit calibration table (and the evidence-only
     # override modules that are not wired here) lives in
-    # docs/spec/models/refcount-invariant-map.md; these five are the
+    # docs/spec/models/refcount-invariant-map.md; the wired ones are the
     # representative per-family regression guards (one per encodable
     # family, deepest consequence, cheap state space). Deliberately no
     # tracey markers (same policy as the other witness checks).
-
-    # G1 (1cd975b90): the in-process rollback loses its PlaceholderToken /
-    # generation gate — a late rollback fires against a reaped-and-
-    # re-claimed placeholder, erasing the successor's reference and
-    # re-decrementing an already-reclaimed one, so the counter stops
-    # refining the manifest fold (the under-count direction M_023 exists
-    # to catch).
-    quint-refcount-calib-g1-token-rollback = mkQuintWitnessCheck {
-      name = "refcount-calib-g1-token-rollback";
-      spec = "calibration/refcount-g1";
-      main = "refcountCalibG1RollbackPreToken";
-      extraSpecs = [ "chunkLiveness" ];
-      step = "calibStep";
-      witness = "cr3CounterRefinesFold";
-    };
-
-    # G2 (e5bdbff1b / I-040): the owner-side reap reverts to the
-    # inline-only delete — manifests deleted, chunk accounting kept — so
-    # an unreferenced chunk is stranded above zero (the permanent-leak
-    # shape the I-040 incident produced).
-    quint-refcount-calib-g2-inline-reap = mkQuintWitnessCheck {
-      name = "refcount-calib-g2-inline-reap";
-      spec = "calibration/refcount-g2";
-      main = "refcountCalibG2ReapInlineOnly";
-      extraSpecs = [ "chunkLiveness" ];
-      step = "calibStep";
-      witness = "cr3CounterRefinesFold";
-    };
+    #
+    # The G1 (token rollback) and G2 (inline-only reap) guards were
+    # retired at Release B of the refcount-formal campaign: the
+    # PlaceholderToken and the decrement family they guarded no longer
+    # exist in the code, so the regressions they watched for cannot
+    # recur by construction. Their override modules
+    # (calibration/refcount-g{1,2}.qnt) stay committed as evidence and
+    # remain re-runnable by hand; the disposition record is in the
+    # invariant map ("Release B calibration-check disposition"). The
+    # surviving G3/G4a/G5 guards below watch mechanisms that outlived
+    # the counter (presence keyed on uploaded_at, the drain re-check,
+    # the heartbeat) and stay wired against the as-built model until
+    # Phase 2 re-points them at the model of record.
 
     # G3 (dd5c11376 / M_033): the needs-upload verdict is keyed on the
     # liveness record instead of uploaded_at — a writer skips the PUT for

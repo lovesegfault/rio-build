@@ -1575,3 +1575,87 @@ restated as facts of the landed tree):
   the Release-B go/no-go template. Release A is complete in the
   development sense: code landed and gate-green, verification evidence
   and review recorded; nothing here deploys.
+
+## Release B record (plan T-1b.1–T-1b.5; Phase 1b landing close-out)
+
+Release B landed as five commits on the integration branch
+(`refcount-rel-b`): migration 069 (the `chunks_refcount_nonneg` CHECK
+and `idx_chunks_gc` drops, PINNED via the failing-test flow, M_069
+commentary carrying the §4.5 ordering), the writer/token deletion
+(T-1b.2 — the upsert stops writing the counter, DEC-1 and the
+`PlaceholderToken` are gone, the rollback is the claim-gated
+`reap_one`, the reap paths are pure path-row janitors, the P5 drift
+pair is retired, and the two as-built counter rules are retired with
+`refcount-txn`/`lock-order`/`upsert-inserted` amended and re-pointed in
+the same commit), the counter prose pass (T-1b.3), the i040 selector
+re-point (T-1b.4, consumer-audit row 2), and this calibration-check
+disposition. Per the v5 owner directive this is a landing close-out
+only: nothing deploys, and the rollout/post-rollout observations stay
+in the deployment-time validation checklist (rows D6/D7) and the
+runbook copy.
+
+### Calibration-check disposition at Release B (plan P12)
+
+- **G1 — `quint-refcount-calib-g1-token-rollback`: retired (wired
+  check removed) with this record.** The pre-fix behavior it replayed
+  — a token-less in-process rollback clobbering a successor's
+  placeholder and double-decrementing the counter — cannot recur by
+  construction: the rollback is now the claim-gated `reap_one` row
+  delete, there is no token to lose and no decrement to double-apply,
+  and the property the falsification targeted (`cr3CounterRefinesFold`)
+  describes a counter that no longer has writers. Acceptance row:
+  **cannot recur by construction — Release B landed; wired check
+  retired this commit.** The override module
+  (`calibration/refcount-g1.qnt`) stays committed as evidence and
+  remains re-runnable with the Stage-C command shape.
+- **G2 — `quint-refcount-calib-g2-inline-reap`: retired (wired check
+  removed) with this record.** The pre-fix behavior — an owner-side
+  reap reverting to the inline-only delete and stranding the counter
+  above zero — is now indistinguishable from the shipped behavior at
+  the model's resolution (every reap is a path-row delete and no
+  counter is maintained), and the leak class it guarded is dissolved
+  rather than guarded: an unreferenced chunk is an ordinary collect
+  victim regardless of any historical counter value. Acceptance row:
+  **cannot recur by construction — Release B landed; wired check
+  retired this commit.** The override module
+  (`calibration/refcount-g2.qnt`) stays committed as evidence.
+- **G3 / G4a / G5 — kept wired, unchanged.** Counter-as-presence, the
+  drain re-check, and the heartbeat are mechanisms that survive the
+  replacement; their checks keep guarding the as-built model
+  bit-identically. Re-pointing them at the model of record
+  (chunkCollect) is Phase 2 work, as is the as-built model's own
+  retirement.
+- **Resolution of the map's two earlier statements.** The Stage-C
+  witness section says the G1/G2 checks "stay in CI until [the
+  writer-removal release] removes that machinery and are then retired
+  or re-pointed", while the Phase-1 input list says "their wired
+  calibration checks are retired or re-pointed in Phase 2". Those
+  differ (retire-at-deletion vs retire-in-Phase-2); this campaign takes
+  the at-deletion reading, per plan P12, because the machinery the
+  checks guard was deleted in this landing and an expect-violation
+  check whose falsification target has no remaining implementation
+  guards nothing. The retirement is recorded here rather than executed
+  silently; the modules stay as evidence either way.
+
+### Development-side landing checklist (T-1b.5, v5 scope)
+
+- Migration 069 is append-only, PINNED, and drops exactly the CHECK and
+  the partial index; the column drop remains reserved for 070 with its
+  deployment-time application constraint (checklist row D7).
+- After the writer deletion, production rio-store issues no SQL that
+  names `chunks.refcount`; the only remaining writers anywhere are the
+  historical rows the column already holds. Increments, decrements, the
+  token, the chunk-aware reap obligations, and the drift-pair
+  instrumentation are gone; the collect cycle remains the only producer
+  of chunk soft-deletes and outbox rows.
+- Every retired or re-pointed test, rule, and marker is enumerated in
+  the landing commits' messages (the P13 disposition lists); `tracey`
+  reports no stale references and the two retired rules appear in no
+  query output.
+- The chunkLiveness regime checks, the chunkCollect checks, and the
+  surviving calibration checks are wired exactly as before this
+  landing (no model file changed in Release B); the two retired G1/G2
+  checks are the only check-set change.
+- Rollout, the post-rollout watch, and migration 070's application
+  remain deployment-time obligations (checklist rows D6/D7); no
+  development-time gate reads them.
