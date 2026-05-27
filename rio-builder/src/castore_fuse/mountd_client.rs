@@ -34,7 +34,12 @@
 //! [`MOUNTD_RECONNECT_MOUNT_TIMEOUT`]); after an exhausted cycle a
 //! cooldown ([`MOUNTD_RECONNECT_COOLDOWN`]) makes further attempts fail
 //! fast so a long outage degrades exactly like the pre-reconnect
-//! behavior instead of stalling every FUSE callback.
+//! behavior instead of stalling every FUSE callback. A re-dial that
+//! reaches the daemon but has its re-`Mount` REJECTED build-fatally
+//! (e.g. `Unauthorized` after the mountd key rotated mid-build) aborts
+//! the cycle immediately and surfaces that rejection — more re-dials
+//! cannot fix an explicit refusal, and the crisp error beats reporting
+//! the stale connection loss.
 //!
 //! `BackingOpen`/`BackingClose` deliberately do NOT enter the cycle
 //! ([`OnConnLoss::FailFast`]): their callers already have a cheap
@@ -631,6 +636,19 @@ impl MountdClient {
                     self.clear_reconnect_cooldown();
                     conn = fresh;
                 }
+                // The daemon was reachable but REJECTED the re-Mount
+                // build-fatally (Unauthorized after the mountd key
+                // rotated mid-build, BadBuildId, ...): more re-dials
+                // cannot fix an explicit refusal, so abort the cycle
+                // and surface the rejection instead of burning the rest
+                // of the budget and reporting a stale connection loss.
+                // Deliberately NO cooldown — the daemon is up, and
+                // later RPCs should keep surfacing the same crisp
+                // rejection (each pays one short re-dial, never the
+                // exhausted-cycle schedule).
+                Err(re_err) if matches!(&re_err, MountdError::Rejected(k) if k.is_build_fatal()) => {
+                    return Err(re_err);
+                }
                 Err(re_err) => {
                     tracing::warn!(
                         error = %re_err,
@@ -1054,8 +1072,12 @@ mod tests {
         mount_had_fd: Mutex<Vec<bool>>,
         /// The token each Mount frame carried (None = token-less).
         mount_tokens: Mutex<Vec<Option<String>>>,
-        /// The accepted connection, so the test can kill this
-        /// incarnation (shutdown → the client sees EOF, the serve
+        /// When set, every `Mount` is answered with this rejection
+        /// instead of `Mounted{0}` — the "daemon up but refusing"
+        /// incarnation (key rotated, admission revoked).
+        mount_reject: Mutex<Option<ErrKind>>,
+        /// The most recently accepted connection, so the test can kill
+        /// this incarnation (shutdown → the client sees EOF, the serve
         /// thread exits) the way a real daemon restart does.
         conn: Mutex<Option<Arc<OwnedFd>>>,
     }
@@ -1088,62 +1110,79 @@ mod tests {
     }
 
     /// Accept ONE connection on `listener` and serve it until EOF:
-    /// `Mount` → `Mounted{0}`, `Promote`/`BackingClose` → `Ok`,
-    /// `BackingOpen` → `BackingId(1)`. Every request is recorded in
-    /// `log`.
+    /// `Mount` → `Mounted{0}` (or `log.mount_reject`),
+    /// `Promote`/`BackingClose` → `Ok`, `BackingOpen` → `BackingId(1)`.
+    /// Every request is recorded in `log`.
     fn serve_one_connection(listener: OwnedFd, log: Arc<DaemonLog>) -> std::thread::JoinHandle<()> {
+        serve_connections(listener, log, 1)
+    }
+
+    /// [`serve_one_connection`] generalized to `conns` sequential
+    /// connections — for tests where the client legitimately re-dials
+    /// the same incarnation more than once (e.g. each RPC's reconnect
+    /// gets its re-Mount rejected and drops the fresh connection).
+    fn serve_connections(
+        listener: OwnedFd,
+        log: Arc<DaemonLog>,
+        conns: usize,
+    ) -> std::thread::JoinHandle<()> {
         use nix::sys::socket::accept4;
         std::thread::spawn(move || {
-            let conn = match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
-                // SAFETY: accept4 just returned a fresh fd owned by
-                // nobody else.
-                Ok(raw) => {
-                    Arc::new(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) })
-                }
-                Err(_) => return,
-            };
-            *log.conn.lock().unwrap() = Some(Arc::clone(&conn));
-            loop {
-                let frame = match proto::recv_frame(conn.as_raw_fd()) {
-                    Ok(f) => f,
+            for _ in 0..conns {
+                let conn = match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
+                    // SAFETY: accept4 just returned a fresh fd owned by
+                    // nobody else.
+                    Ok(raw) => {
+                        Arc::new(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) })
+                    }
                     Err(_) => return,
                 };
-                let req: Request = match proto::decode(&frame.bytes) {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-                let resp = match &req.req {
-                    Req::Mount { build_id, token } => {
-                        log.requests
-                            .lock()
-                            .unwrap()
-                            .push(format!("mount:{build_id}"));
-                        log.mount_had_fd.lock().unwrap().push(!frame.fds.is_empty());
-                        log.mount_tokens.lock().unwrap().push(token.clone());
-                        Resp::Mounted {
-                            staging_quota_bytes: 0,
+                *log.conn.lock().unwrap() = Some(Arc::clone(&conn));
+                loop {
+                    let frame = match proto::recv_frame(conn.as_raw_fd()) {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    let req: Request = match proto::decode(&frame.bytes) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    let resp = match &req.req {
+                        Req::Mount { build_id, token } => {
+                            log.requests
+                                .lock()
+                                .unwrap()
+                                .push(format!("mount:{build_id}"));
+                            log.mount_had_fd.lock().unwrap().push(!frame.fds.is_empty());
+                            log.mount_tokens.lock().unwrap().push(token.clone());
+                            match log.mount_reject.lock().unwrap().clone() {
+                                Some(kind) => Resp::Err(kind),
+                                None => Resp::Mounted {
+                                    staging_quota_bytes: 0,
+                                },
+                            }
                         }
+                        Req::Promote { .. } => {
+                            log.requests.lock().unwrap().push("promote".into());
+                            Resp::Ok
+                        }
+                        Req::BackingOpen => {
+                            log.requests.lock().unwrap().push("backing_open".into());
+                            Resp::BackingId(1)
+                        }
+                        Req::BackingClose { .. } => {
+                            log.requests.lock().unwrap().push("backing_close".into());
+                            Resp::Ok
+                        }
+                        Req::PromoteChunks { .. } => {
+                            log.requests.lock().unwrap().push("promote_chunks".into());
+                            Resp::Ok
+                        }
+                    };
+                    let bytes = proto::encode(&Reply { seq: req.seq, resp }).expect("encode");
+                    if proto::send_frame(conn.as_raw_fd(), &bytes, &[]).is_err() {
+                        break;
                     }
-                    Req::Promote { .. } => {
-                        log.requests.lock().unwrap().push("promote".into());
-                        Resp::Ok
-                    }
-                    Req::BackingOpen => {
-                        log.requests.lock().unwrap().push("backing_open".into());
-                        Resp::BackingId(1)
-                    }
-                    Req::BackingClose { .. } => {
-                        log.requests.lock().unwrap().push("backing_close".into());
-                        Resp::Ok
-                    }
-                    Req::PromoteChunks { .. } => {
-                        log.requests.lock().unwrap().push("promote_chunks".into());
-                        Resp::Ok
-                    }
-                };
-                let bytes = proto::encode(&Reply { seq: req.seq, resp }).expect("encode");
-                if proto::send_frame(conn.as_raw_fd(), &bytes, &[]).is_err() {
-                    return;
                 }
             }
         })
@@ -1282,6 +1321,74 @@ mod tests {
              (took {:?})",
             second_started.elapsed()
         );
+    }
+
+    /// A reconnect that reaches the daemon but has its re-Mount
+    /// REJECTED build-fatally (the admission credential no longer
+    /// verifies — e.g. the mountd key rotated mid-build) must abort the
+    /// cycle at that first rejection and surface it: more re-dials
+    /// cannot fix an explicit refusal, and the crisp `Unauthorized`
+    /// beats reporting a stale connection loss after the full budget.
+    /// No cooldown is entered — a later RPC re-probes and surfaces the
+    /// same rejection again instead of a masked fail-fast error.
+    // r[verify builder.fs.mountd-reconnect]
+    // r[verify builder.mountd.token-admission]
+    #[test]
+    fn reconnect_aborts_on_build_fatal_mount_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mountd.sock");
+
+        // Incarnation 1: healthy — serves the initial Mount, then dies.
+        let log1 = Arc::new(DaemonLog::default());
+        let daemon1 = serve_one_connection(bind_listener(&sock), Arc::clone(&log1));
+        let client = MountdClient::connect(&sock).expect("connect");
+        let fuse_stub = tempfile::tempfile().unwrap();
+        client
+            .mount("b-revoked", Some("stale-token"), fuse_stub.as_raw_fd(), T)
+            .expect("initial mount");
+        std::fs::remove_file(&sock).unwrap();
+        log1.kill();
+        daemon1.join().unwrap();
+
+        // Incarnation 2: up, but rejects every Mount as Unauthorized.
+        // Two connections — one per promote attempt below.
+        let log2 = Arc::new(DaemonLog::default());
+        *log2.mount_reject.lock().unwrap() = Some(ErrKind::Unauthorized);
+        let daemon2 = serve_connections(bind_listener(&sock), Arc::clone(&log2), 2);
+
+        // First RPC: the cycle aborts at the FIRST rejected re-Mount —
+        // exactly one Mount reaches the daemon (no multi-attempt burn)
+        // and the caller sees the rejection, not a connection-loss
+        // error.
+        let err = client
+            .promote([0xAA; 32], T)
+            .expect_err("rejected re-Mount must fail the RPC");
+        assert!(
+            matches!(&err, MountdError::Rejected(ErrKind::Unauthorized)),
+            "got {err:?}"
+        );
+        assert!(err.is_build_fatal());
+        assert_eq!(
+            log2.requests.lock().unwrap().as_slice(),
+            ["mount:b-revoked"],
+            "the cycle must stop at the first rejected re-Mount"
+        );
+
+        // Second RPC: no cooldown was entered, so it re-probes the
+        // daemon and surfaces the same rejection (a cooldown would fail
+        // fast with the stale connection-loss error instead).
+        let err = client.promote([0xBB; 32], T).expect_err("still rejected");
+        assert!(
+            matches!(&err, MountdError::Rejected(ErrKind::Unauthorized)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            log2.requests.lock().unwrap().as_slice(),
+            ["mount:b-revoked", "mount:b-revoked"],
+            "each later RPC re-probes once and surfaces the rejection"
+        );
+        drop(client);
+        daemon2.join().unwrap();
     }
 
     /// During an outage, `BackingOpen` must NOT pay the reconnect
