@@ -30,7 +30,13 @@
 //!   batched soft-delete anti-join (`NOT EXISTS` against `live_chunks`,
 //!   `GREATEST(created_at, last_referenced_at)` grace term, keyset cursor +
 //!   LIMIT batches, loop-until-short, one statement per batch) — timing
-//!   mark, prepare, and collect separately plus combined. Also carries the
+//!   mark, prepare, and collect separately plus combined. The collect loop
+//!   is capped at a per-cycle victim budget (the design §4.1 step 3 v4
+//!   capped collect — see [`COLLECT_CAP_DEFAULT`]); a backlog larger than
+//!   the cap stops the cycle at the cap with the keyset cursor reported,
+//!   which is the gate-(c) v4 verdict shape. The candidate-scan and
+//!   soft-delete terms are timed separately so the sparse full-pass scan
+//!   cost stays visible next to the victim-write cost. Also carries the
 //!   EXPLAIN plan-shape guard (re-entry gate (b)) over the expansion and
 //!   the per-batch anti-join statement.
 //!
@@ -62,6 +68,8 @@
 //!   formulation (default 1,000,000)
 //! - `MARK_SCAN_BENCH_COLLECT_BATCH` — per-batch LIMIT for the collect-phase soft-delete loop
 //!   (default 10,000)
+//! - `MARK_SCAN_BENCH_COLLECT_CAP`  — per-cycle victim cap for the collect-phase loop
+//!   (default [`COLLECT_CAP_DEFAULT`]; smaller values exercise the cap stop on smoke fixtures)
 //!
 //! At or below 20 k paths the alternative formulations also run the
 //! prescribed shape on the same fixture and assert both produce a mark set
@@ -1024,6 +1032,19 @@ const UNREF_PROTECTED_DIVISOR: i64 = 20;
 /// orphan-chunk sweep does).
 const COLLECT_BATCH_DEFAULT: u64 = 10_000;
 
+/// Default per-cycle victim cap for the collect loop
+/// (`MARK_SCAN_BENCH_COLLECT_CAP` overrides). This is the design value
+/// of the collector's `COLLECT_CYCLE_VICTIM_CAP` (design §4.1 step 3
+/// v4; derivation recorded in the invariant map's T-1a.1b entry and
+/// sign-off item 8): the gate-(c) capped-cycle confirmation runs at
+/// exactly this value, so the bench defaults to it rather than to the
+/// shipped const's `cfg(test)` override (which is sized for structural
+/// tests, not for the design-point measurement). A backlog larger than
+/// the cap stops the cycle after `cap / batch` batches with the keyset
+/// cursor carried to the next cycle; smoke runs can pass a smaller cap
+/// to exercise the stop/resume shape without a 500k-victim fixture.
+const COLLECT_CAP_DEFAULT: u64 = 500_000;
+
 /// Below this fixture scale the EXPLAIN plan-shape guard only prints
 /// (small tables legitimately plan differently); at or above it the
 /// guard asserts. The 150 k and 1.5 M measurement points both enforce.
@@ -1234,15 +1255,23 @@ async fn seed_chunks_fixture(pool: &PgPool, work_mem: &str) -> ChunkFixtureStats
 /// Outcome of one collect-phase run. `combined` is mark + prepare +
 /// collect — the lock-held window the §5b gate-(c) verdict is judged
 /// against; bookkeeping between the phases (sample probes, EXPLAIN,
-/// counts) is excluded.
+/// counts) is excluded. `collect_scan` / `collect_delete` split the
+/// collect term into the anti-join candidate-scan cost and the
+/// soft-delete (UPDATE + commit) cost, so a sparse full-pass cycle
+/// (scan-bound, few victims) is distinguishable from the victim-write
+/// cost the cap bounds.
 struct CollectPhaseStats {
     mark_validate: std::time::Duration,
     mark_expand: std::time::Duration,
     prepare: std::time::Duration,
     collect: std::time::Duration,
+    collect_scan: std::time::Duration,
+    collect_delete: std::time::Duration,
     combined: std::time::Duration,
     batches: u64,
     rows_collected: u64,
+    cap_reached: bool,
+    cursor_at_stop: Option<Vec<u8>>,
     mark_set_size: i64,
     live_table_bytes: i64,
     spill_delta_bytes: i64,
@@ -1255,11 +1284,14 @@ struct CollectPhaseStats {
 /// expansion into `live_chunks`, a one-time unique index + ANALYZE on
 /// the mark product (what makes the per-batch anti-join an index probe
 /// instead of a per-batch hash/sort of the whole mark set), then the
-/// batched keyset soft-delete loop.
+/// batched keyset soft-delete loop, capped at `victim_cap` victims per
+/// cycle (the §4.1 step 3 v4 capped collect; the cursor at the stop
+/// point is reported so a follow-up cycle could resume from it).
 async fn run_collect_phase(
     pool: &PgPool,
     work_mem: &str,
     batch_limit: u64,
+    victim_cap: u64,
     sample: &[[u8; 32]],
     enforce_plan_shape: bool,
 ) -> CollectPhaseStats {
@@ -1373,27 +1405,44 @@ async fn run_collect_phase(
     // Per batch, one transaction: candidate scan (already hash-ordered
     // by the keyset SELECT), then the sorted `= ANY` soft-delete — the
     // sweep_orphan_batch shape with the predicate swapped. The loop
-    // ends on the first short candidate scan.
+    // ends on the first short candidate scan (pass complete) or when
+    // `victim_cap` victims have been collected (cap stop — the v4
+    // capped collect; the per-batch LIMIT is clamped to the remaining
+    // budget so the cycle never overshoots the cap). The candidate
+    // scan and the soft-delete halves are accumulated separately.
     let t5 = Instant::now();
     let mut cursor: Vec<u8> = Vec::new();
     let mut batches = 0u64;
     let mut rows_collected = 0u64;
+    let mut cap_reached = false;
+    let mut scan_elapsed = std::time::Duration::ZERO;
+    let mut delete_elapsed = std::time::Duration::ZERO;
     loop {
+        let remaining = victim_cap.saturating_sub(rows_collected);
+        if remaining == 0 {
+            cap_reached = true;
+            break;
+        }
+        let this_limit = batch_limit.min(remaining);
         let mut tx = sqlx::Connection::begin(&mut *conn)
             .await
             .expect("begin collect batch tx");
+        let scan_started = Instant::now();
         let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
             .bind(&cursor)
             .bind(&cutoff)
-            .bind(batch_limit as i64)
+            .bind(this_limit as i64)
             .fetch_all(&mut *tx)
             .await
             .expect("collect candidate scan");
+        scan_elapsed += scan_started.elapsed();
         if candidates.is_empty() {
             tx.commit().await.expect("commit empty collect batch");
             break;
         }
         batches += 1;
+        let short = candidates.len() < this_limit as usize;
+        let delete_started = Instant::now();
         let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
             .bind(&candidates)
             .fetch_all(&mut *tx)
@@ -1401,13 +1450,14 @@ async fn run_collect_phase(
             .expect("collect soft-delete batch");
         rows_collected += rows.len() as u64;
         tx.commit().await.expect("commit collect batch");
-        if candidates.len() < batch_limit as usize {
-            break;
-        }
+        delete_elapsed += delete_started.elapsed();
         cursor = candidates
             .last()
-            .expect("full batch has a last hash")
+            .expect("non-empty batch has a last hash")
             .clone();
+        if short {
+            break;
+        }
     }
     let t6 = Instant::now();
 
@@ -1422,9 +1472,17 @@ async fn run_collect_phase(
         mark_expand: t2 - t1,
         prepare: t4 - t3,
         collect: t6 - t5,
+        collect_scan: scan_elapsed,
+        collect_delete: delete_elapsed,
         combined: (t2 - t0) + (t4 - t3) + (t6 - t5),
         batches,
         rows_collected,
+        cap_reached,
+        cursor_at_stop: if cursor.is_empty() {
+            None
+        } else {
+            Some(cursor)
+        },
         mark_set_size,
         live_table_bytes,
         spill_delta_bytes,
@@ -1442,6 +1500,7 @@ async fn mark_scan_bench_collect_phase() {
     let seed_workers = env_u64("MARK_SCAN_BENCH_SEED_WORKERS", 12).max(1);
     let work_mem = env_work_mem();
     let batch_limit = env_u64("MARK_SCAN_BENCH_COLLECT_BATCH", COLLECT_BATCH_DEFAULT).max(1);
+    let victim_cap = env_u64("MARK_SCAN_BENCH_COLLECT_CAP", COLLECT_CAP_DEFAULT).max(1);
     let pool_size = (n_paths * 4).clamp(4_096, 8_000_000);
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
@@ -1453,6 +1512,7 @@ async fn mark_scan_bench_collect_phase() {
         &db.pool,
         &work_mem,
         batch_limit,
+        victim_cap,
         &sample,
         n_paths >= PLAN_SHAPE_ENFORCE_MIN_PATHS,
     )
@@ -1460,7 +1520,8 @@ async fn mark_scan_bench_collect_phase() {
 
     println!(
         "mark_scan_bench[collect_phase]: paths={n_paths} seed_workers={seed_workers} \
-         shared_pool={pool_size} work_mem={work_mem} batch_limit={batch_limit}\n\
+         shared_pool={pool_size} work_mem={work_mem} batch_limit={batch_limit} \
+         victim_cap={victim_cap}\n\
          mark_scan_bench[collect_phase]: seeded entries={} blob_bytes={} \
          manifest_data_total_bytes={} seed_secs={:.1}\n\
          mark_scan_bench[collect_phase]: CHUNKS live_rows={} unref_rows={} \
@@ -1470,7 +1531,8 @@ async fn mark_scan_bench_collect_phase() {
          mark_set_size={} live_table_bytes={}\n\
          mark_scan_bench[collect_phase]: PREPARE index_analyze_secs={:.3}\n\
          mark_scan_bench[collect_phase]: COLLECT batches={} rows_soft_deleted={} \
-         collect_secs={:.3} spill_delta_bytes={}\n\
+         cap_reached={} collect_secs={:.3} candidate_scan_secs={:.3} soft_delete_secs={:.3} \
+         cursor_at_stop={} spill_delta_bytes={}\n\
          mark_scan_bench[collect_phase]: COMBINED mark+prepare+collect_secs={:.3}\n\
          mark_scan_bench[collect_phase]: expand_plan={}\n\
          mark_scan_bench[collect_phase]: collect_plan={}",
@@ -1492,7 +1554,15 @@ async fn mark_scan_bench_collect_phase() {
         stats.prepare.as_secs_f64(),
         stats.batches,
         stats.rows_collected,
+        stats.cap_reached,
         stats.collect.as_secs_f64(),
+        stats.collect_scan.as_secs_f64(),
+        stats.collect_delete.as_secs_f64(),
+        stats
+            .cursor_at_stop
+            .as_deref()
+            .map(hex::encode)
+            .unwrap_or_else(|| "none".to_string()),
         stats.spill_delta_bytes,
         stats.combined.as_secs_f64(),
         stats.expand_plan_summary,
@@ -1505,27 +1575,83 @@ async fn mark_scan_bench_collect_phase() {
         "the mark set and the seeded referenced population are the same set"
     );
 
-    // Collect-side correctness: exactly the old, untouched, unreferenced
-    // population is soft-deleted; both protected sub-populations and
-    // every referenced row survive.
-    assert_eq!(
-        stats.rows_collected, chunks_fixture.expected_collectable as u64,
-        "collect soft-deletes exactly the old unreferenced population"
-    );
+    // Collect-side correctness. Uncapped pass (victims fit in the cap):
+    // exactly the old, untouched, unreferenced population is
+    // soft-deleted. Capped pass (the gate-(c) v4 backlog case): exactly
+    // `victim_cap` victims are soft-deleted across exactly
+    // ceil(cap / batch) full batches and the cursor is reported. In
+    // both cases nothing outside the old-untouched-unreferenced
+    // population is ever soft-deleted (asserted structurally below).
     let (deleted_rows, surviving_rows): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*) FILTER (WHERE deleted), COUNT(*) FILTER (WHERE NOT deleted) FROM chunks",
     )
     .fetch_one(&db.pool)
     .await
     .expect("post-collect chunk counts");
+    let total_rows = chunks_fixture.live_rows + chunks_fixture.unref_rows;
+    if stats.cap_reached {
+        assert!(
+            (chunks_fixture.expected_collectable as u64) > victim_cap,
+            "cap_reached implies the backlog exceeded the cap"
+        );
+        assert_eq!(
+            stats.rows_collected, victim_cap,
+            "a capped cycle soft-deletes exactly the per-cycle victim cap"
+        );
+        assert_eq!(
+            stats.batches,
+            victim_cap.div_ceil(batch_limit),
+            "a capped cycle stops after exactly ceil(cap / batch) batches"
+        );
+        assert!(
+            stats.cursor_at_stop.is_some(),
+            "a capped cycle reports the keyset cursor it stopped at"
+        );
+        assert_eq!(
+            deleted_rows as u64, victim_cap,
+            "soft-deleted rows match the cap"
+        );
+        assert_eq!(
+            surviving_rows as u64,
+            total_rows as u64 - victim_cap,
+            "everything past the cap is left for subsequent cycles"
+        );
+    } else {
+        assert_eq!(
+            stats.rows_collected, chunks_fixture.expected_collectable as u64,
+            "collect soft-deletes exactly the old unreferenced population"
+        );
+        assert_eq!(
+            deleted_rows, chunks_fixture.expected_collectable,
+            "soft-deleted rows match the expected victim set"
+        );
+        assert_eq!(
+            surviving_rows,
+            chunks_fixture.live_rows
+                + chunks_fixture.grace_protected
+                + chunks_fixture.touch_protected,
+            "referenced, younger-than-grace, and freshly-touched rows all survive"
+        );
+    }
+
+    // Victim-set soundness, capped or not: a soft-deleted row is never
+    // S3-confirmed (the referenced fixture rows all carry uploaded_at),
+    // never freshly touched (the 068 column), and never younger than
+    // grace — i.e. victims ⊆ the old, untouched, unreferenced seed.
+    let bad_victims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chunks \
+          WHERE deleted \
+            AND (uploaded_at IS NOT NULL \
+                 OR last_referenced_at IS NOT NULL \
+                 OR created_at > now() - make_interval(secs => $1))",
+    )
+    .bind(super::sweep::CHUNK_GRACE_SECS)
+    .fetch_one(&db.pool)
+    .await
+    .expect("victim soundness probe");
     assert_eq!(
-        deleted_rows, chunks_fixture.expected_collectable,
-        "soft-deleted rows match the expected victim set"
-    );
-    assert_eq!(
-        surviving_rows,
-        chunks_fixture.live_rows + chunks_fixture.grace_protected + chunks_fixture.touch_protected,
-        "referenced, younger-than-grace, and freshly-touched rows all survive"
+        bad_victims, 0,
+        "no referenced, grace-protected, or touch-protected row is ever soft-deleted"
     );
     let sample_deleted: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted AND blake3_hash = ANY($1)")

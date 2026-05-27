@@ -1050,3 +1050,71 @@ bound), while the scan term (every existing chunk row probed against
 the mark set once) is fixed by store size; the prepare term is paid
 once per cycle and could be folded into the expansion statement later
 without changing the architecture.
+
+#### T-1a.1c — capped-cycle confirmation (re-entry gate (c), v4 form)
+
+The second re-entry redefined gate (c) to the capped cycle (design §4.1
+step 3 v4, `COLLECT_CYCLE_VICTIM_CAP = 500_000`; plan sign-off item 8):
+the gate now asks whether mark + prepare + collect-at-cap fits the
+combined five-minute (300 s) lock-held budget at the 1.5 M-path design
+point, with a backlog larger than the cap draining across cycles by
+design rather than stretching one cycle. The bench's collect loop
+gained the cap (default = the design value, env-tunable for smoke
+runs), a clamped final batch so a cycle never overshoots the cap, a
+split of the collect term into its anti-join candidate-scan and
+soft-delete halves (so the sparse full-pass scan cost stays visible
+separately from the victim-write cost the cap bounds), and the keyset
+cursor at the stop point in the report. Mark, prepare, batch shape,
+fixture, hardware, PostgreSQL, `work_mem`, and batch LIMIT are
+unchanged from the T-1a.1b record; the 12.4 M-victim backlog is
+exactly the case the cap must absorb.
+
+Two release-profile runs at the design point were taken: the first
+overlapped repository-scan and build activity from the executor's own
+session on the shared dev box during the mark window, and is kept on
+record as a contended variance data point rather than discarded (the
+same identify-the-artifact-and-rerun discipline as the T-1a.1b
+bring-up probes); the second ran with the executor quiescent. Raw
+figures in the introducing commit message and the run transcripts;
+the verdict-relevant magnitudes:
+
+| run | mark | prepare | collect at cap (scan + soft-delete) | combined |
+|---|---|---|---|---|
+| r1 (executor-contended) | 228.6 s | 53.0 s | 21.0 s (18.5 s + 2.5 s) | 302.6 s |
+| r2 (executor quiescent) | 207.6 s | 52.3 s | 18.4 s (16.0 s + 2.4 s) | 278.3 s |
+
+Both runs: 50 batches, exactly 500,000 victims soft-deleted, cap
+reached with the keyset cursor reported, plan-shape guard (gate (b))
+green, `workers_planned = 0`, mark-set size 138,042,866 (identical to
+the T-1a.1b record), and the protected populations (referenced,
+younger-than-grace, freshly-touched) untouched — the capped cycle's
+soundness shape is the uncapped cycle's, only the stopping rule
+differs. The collect-at-cap term measured ≈37 µs/victim in the
+quiescent run — the same per-victim cost as the T-1a.1b record and
+well inside the 2× allowance the cap derivation budgeted (≈42 µs in
+the contended run, still inside it).
+
+**Verdict against the redefined gate (c) (combined ≤ 300 s at the
+design point): PASS** — 278.3 s, ≈93 % of the budget, in the
+executor-quiescent run; the contended run exceeded the budget by
+0.9 % (302.6 s), which is within the run-to-run band of the mark term
+on this shared box and is recorded, not adjudicated over the
+quiescent run.
+
+What the pair of runs adds to the record: mark + prepare alone is
+254–282 s across the three measured cycles of this fixture (T-1a.1b
+and the two runs here), i.e. 85–94 % of the budget is consumed before
+any collect work happens, and the run-to-run band of those terms on
+this shared dev box (~10 %) is the same order as the entire
+collect-at-cap allowance. The cap bounds the term it was derived to
+bound; the remaining margin is carried almost entirely by mark-phase
+variance. That makes re-entry gate (a) — the production-DB-class mark
+confirmation from the additive-release window, on the production
+database where the cycle runs alone under the GC lock — the
+load-bearing check for the budget, exactly as the v3 record already
+framed it; the cycle-duration histogram (T-1a.3) is the runtime
+monitor for it. Caveats carried forward otherwise unchanged from
+T-1a.1b: tmpfs-backed PostgreSQL, fsync off, EPYC clocks (absolute
+times are a lower bound on production cost); the sparse full-pass
+scan term is bounded by store size, not by the cap, and stays
+monitored (cycle-duration histogram + stalled alert), not gated.
