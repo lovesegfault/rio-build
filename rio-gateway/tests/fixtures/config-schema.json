@@ -197,7 +197,7 @@
             "default": false
           },
           "force_build_roots": {
-            "description": "`SubmitBuildRequest.force_build_roots`: do not substitute this\ntenant's submission roots — see `r[sched.merge.force-build-roots]`.",
+            "description": "`SubmitBuildRequest.force_build_roots`: do not substitute this\ntenant's submission roots from upstream; locally-present roots\nstill short-circuit to Completed. See\n`r[sched.merge.force-build-roots]`.",
             "type": "boolean",
             "default": false
           }
