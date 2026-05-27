@@ -36,7 +36,8 @@
       "terminationGracePeriodSeconds",
       "privileged",
       "seccompProfile",
-      "hostNetwork"
+      "hostNetwork",
+      "dispatchMode"
     ]
   }
 }

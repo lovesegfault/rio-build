@@ -395,7 +395,7 @@
       {
         "name": "rio_controller_disruption_drains_total",
         "kind": "counter",
-        "help": "DisruptionTarget watcher DrainExecutor calls. result=sent|timeout|rpc_error. Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
+        "help": "DisruptionTarget watcher preemption actions. Stream pods: DrainExecutor calls (result=sent|timeout|rpc_error). Pull-mode pods: synthesized preempted report + foreground Job delete (result=preempted_pull|preempted_pull_report_failed). Zero rate with evictions happening = watcher dead, falling back to SIGTERM self-drain."
       },
       {
         "name": "rio_controller_ephemeral_jobs_reaped_total",
