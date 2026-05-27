@@ -1633,3 +1633,153 @@ module executorSessionBase {
     SIGTERMS = 1
   ).*
 }
+
+/// fault-stream is split into two cfgs (the campaign plan's
+/// pre-registered demote-or-split fallback, taken for per-check cost):
+/// message faults and connection faults. Both stay in checks.*; the
+/// design's per-class budgets are unchanged (1 each), only their
+/// grouping per check changed.
+///
+/// fault-stream-msg: faults on messages in transit — assignment-message
+/// loss, duplicate assignment delivery, try_send failure (the rollback
+/// path).
+module executorSessionFaultStreamMsg {
+  import executorSession(
+    EXECS = Set("e1", "e2"),
+    DRVS = Set("d1"),
+    EPOCH_CEIL = 2,
+    DISPATCH_CEIL = 2,
+    STARVE_BOUND = 2,
+    POD_DEATHS = 0,
+    WEDGES = 0,
+    FAILOVERS = 0,
+    PERSIST_FAULTS = 0,
+    MSG_LOSS = 1,
+    SEND_FAILS = 1,
+    HALF_DEATHS = 0,
+    STREAM_DROPS = 0,
+    HB_DROPS = 0,
+    DUP_MSGS = 1,
+    STALLS = 1,
+    FUSE_FLIPS = 2,
+    ADMIN_DRAINS = 1,
+    SIGTERMS = 1
+  ).*
+}
+
+/// fault-stream-conn: faults on the connection — bridge half-death
+/// (I-095), full connection drop (the I-056a reconnect/late-disconnect
+/// race), heartbeat loss/delay. Carries the F1 session-identity
+/// content: stale-epoch disconnects stay inert, the half-dead binding
+/// never accepts a second live stream, registration still requires
+/// both halves.
+module executorSessionFaultStreamConn {
+  import executorSession(
+    EXECS = Set("e1", "e2"),
+    DRVS = Set("d1"),
+    EPOCH_CEIL = 2,
+    DISPATCH_CEIL = 2,
+    STARVE_BOUND = 2,
+    POD_DEATHS = 0,
+    WEDGES = 0,
+    FAILOVERS = 0,
+    PERSIST_FAULTS = 0,
+    MSG_LOSS = 0,
+    SEND_FAILS = 0,
+    HALF_DEATHS = 1,
+    STREAM_DROPS = 1,
+    HB_DROPS = 1,
+    DUP_MSGS = 0,
+    STALLS = 1,
+    FUSE_FLIPS = 2,
+    ADMIN_DRAINS = 1,
+    SIGTERMS = 1
+  ).*
+}
+
+/// fault-process: pod death (with or without a prior report) and the
+/// wedge (no report, no death — the
+/// backstop's subject), plus heartbeat loss so a live-but-silent slot
+/// is distinguishable from a dead one.
+module executorSessionFaultProcess {
+  import executorSession(
+    EXECS = Set("e1", "e2"),
+    DRVS = Set("d1"),
+    EPOCH_CEIL = 2,
+    DISPATCH_CEIL = 2,
+    STARVE_BOUND = 2,
+    POD_DEATHS = 1,
+    WEDGES = 1,
+    FAILOVERS = 0,
+    PERSIST_FAULTS = 0,
+    MSG_LOSS = 0,
+    SEND_FAILS = 0,
+    HALF_DEATHS = 0,
+    STREAM_DROPS = 0,
+    HB_DROPS = 1,
+    DUP_MSGS = 0,
+    STALLS = 1,
+    FUSE_FLIPS = 1,
+    ADMIN_DRAINS = 1,
+    SIGTERMS = 1
+  ).*
+}
+
+/// fault-leader: one failover under in-flight builds — depose,
+/// deposed-believer window, observed loss (state wipe + stream fence),
+/// re-acquire, PG recovery, the 45 s reconcile sweep. Imports
+/// boundedDualLeadership, not neverDual: the deposed-believer window
+/// stays reachable (noDeposedBeliever witness).
+module executorSessionFaultLeader {
+  import executorSession(
+    EXECS = Set("e1", "e2"),
+    DRVS = Set("d1"),
+    EPOCH_CEIL = 2,
+    DISPATCH_CEIL = 2,
+    STARVE_BOUND = 2,
+    POD_DEATHS = 0,
+    WEDGES = 0,
+    FAILOVERS = 1,
+    PERSIST_FAULTS = 0,
+    MSG_LOSS = 0,
+    SEND_FAILS = 0,
+    HALF_DEATHS = 0,
+    STREAM_DROPS = 0,
+    HB_DROPS = 0,
+    DUP_MSGS = 0,
+    STALLS = 0,
+    FUSE_FLIPS = 0,
+    ADMIN_DRAINS = 1,
+    SIGTERMS = 1
+  ).*
+}
+
+/// fault-persist: one status-persist write may silently fail (the
+/// retry model's TX_FAULTS shape). The divergence is only observable
+/// through a failover's PG recovery, so the regime also carries one
+/// failover and one pod death — the lost-Ready / lost-Assigned mirrors
+/// must still converge through the reconcile sweep without fabricating
+/// a completion or losing the claim.
+module executorSessionFaultPersist {
+  import executorSession(
+    EXECS = Set("e1", "e2"),
+    DRVS = Set("d1"),
+    EPOCH_CEIL = 2,
+    DISPATCH_CEIL = 2,
+    STARVE_BOUND = 2,
+    POD_DEATHS = 1,
+    WEDGES = 0,
+    FAILOVERS = 1,
+    PERSIST_FAULTS = 1,
+    MSG_LOSS = 0,
+    SEND_FAILS = 0,
+    HALF_DEATHS = 0,
+    STREAM_DROPS = 0,
+    HB_DROPS = 0,
+    DUP_MSGS = 0,
+    STALLS = 0,
+    FUSE_FLIPS = 0,
+    ADMIN_DRAINS = 0,
+    SIGTERMS = 1
+  ).*
+}
