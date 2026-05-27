@@ -128,6 +128,14 @@
 //     — environment here — cleared at the registration edge,
 //     disconnect, and the DAG-state sweep), termination-report
 //     idempotency (the first-report-wins consumption modeled in F4).
+//     Coexistence note (executor Phase-1a): busy-accuracy is now also
+//     served by the durable open-attempt view (the ledger-backed
+//     ListOpenAttempts surface fed by the fenced pull transaction) for
+//     pull-mode attempts, which never appear in the executors map this
+//     model tracks; the obligation's consumer (Model J's orphan-reap
+//     step) reads the OR of both carriers during coexistence. The
+//     stream-side guarantee stated here is unchanged; the pull-side
+//     carrier is priced by the 1c' re-targeted model, not this one.
 //
 // ENCODING DECISIONS
 //   - One state record (`st`) threaded through pure defs, plus a latch

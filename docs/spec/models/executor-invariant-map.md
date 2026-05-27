@@ -2771,3 +2771,105 @@ the owner resolves the four open items above.
     observable, the 1c' deletion-wave gate items (a)–(d), the 1d
     cleanup and Model D retirement, the Phase-2 acceptance table and
     close-out honesty contract).
+
+## Phase-1a record (Slice 1a, additive — Waves 1a-A and 1a-B)
+
+Recorded at the Wave-1a-B landing. Everything in this slice is
+additive and dormant in production: the stream path is untouched, no
+pool template changes, the builder's `dispatch_mode` Config flag
+defaults to `stream`, and every pull-only consumer keys on the
+`drv_executions.dispatch_mode = 'pull'` discriminator that only the
+fenced pull transaction writes. Under the 2026-05-27 directive there
+is no development-time deploy: the additive production rollout and the
+OA1-baseline accumulation against the new handlers are deployment-time
+validation checklist rows D0/D1 of the Phase-1 plan, not part of this
+record.
+
+**What landed.**
+
+- Wave 1a-A (scheduler/proto/migration): the four unaries
+  (`PullAssignment`, `ReportOutcome`, `ReportAttemptOutcome`,
+  `ListOpenAttempts`) with the new spec rules; migration 071
+  (`source_node` on `drv_attempts`/`drv_executions`,
+  `drv_executions.dispatch_mode`); the ledger-backed open pull-attempt
+  view and the `rio_scheduler_open_attempts` gauge; the fenced pull
+  transaction with the pure `admit_pull` kernel; the idempotent
+  `ReportOutcome` intake; the `ReportAttemptOutcome` second-installment
+  fill with the no-attempt charge-free rule; the establishment sweep
+  for open pull-mode attempts and the `establishment_report_slack`
+  Config field.
+- Wave 1a-B (controller/builder/VM/process): the §4.5 option-(b) busy
+  bridge (`reap_orphan_running` consults `ListOpenAttempts` alongside
+  `ListExecutors`, fail-closed on either source); the
+  synthesize-on-delete arm (every controller Job-delete call site
+  routes through `delete_job_with_synthesized_report`; reason `reaped`
+  at this slice); the builder pull-mode client behind
+  `dispatch_mode = pull` (no registration/heartbeat/stream; the OA6
+  bounded NotYetReady retry reusing `idle_timeout`; exit codes per
+  `builder.pull.exit-codes`); the `pull-mode` VM subtest in
+  `vm-lifecycle-autoscale-k3s`; the OA2 interim controls (the
+  `RioSchedulerAttemptEstablishmentCluster` alert and the
+  `docs/ops/hung-node-manual-reap.typ` runbook); this bookkeeping.
+
+**Obligation-table rows now satisfied additively** (the table's
+dispositions are unchanged; this records that the successor signals
+exist in the tree):
+
+- Row 1 (busy view): the bridge is landed — the orphan-Running reap
+  treats a Job as busy when either the stream view or an open
+  pull-mode attempt covers it, with the fail-closed posture spanning
+  both reads; the leader-age arm is retained as-is (its retirement
+  stays a 1c'/1d item).
+- Row 4 (termination-report idempotency): the idempotent
+  `ReportAttemptOutcome` column fill is live (first classifier wins,
+  `WHERE termination_reason IS NULL`), with the no-attempt no-op rule
+  red-first tested; `ReportExecutorTermination` keeps serving
+  stream-mode pools unchanged (delta 13 of the Phase-1 plan).
+- Row 7 (cancel/preempt read): the open-attempt read exists
+  (`ListOpenAttempts`, pull-filtered server-side) and is already the
+  busy-bridge input; the cancel-arm consumer lands at 1b (T-1b.4).
+
+**OA6 consequence-list status** (the decision block above prices four
+consequences; their execution state at 1a):
+
+1. Protocol enum — DONE: `PullAssignmentResponse` carries the
+   `NotYetReady{retry_after_seconds}` outcome (T-1a.1) and the
+   scheduler returns it for wanted-but-not-deliverable pulls,
+   including the open-on-another-executor coexistence arm (T-1a.4).
+2. Pod-side bounded retry — DONE: the builder re-pulls after the
+   suggested `retry_after` (±20 % jitter) and exits 0 charge-free
+   after receiving only `NotYetReady` for `idle_timeout` (T-1a.10;
+   idle bound reuses I-116 per Phase-1 plan delta 5 — no new number).
+3. Spec-consequence rule — DONE: `sched.executor.pull-not-ready`
+   carries the NotYetReady semantics (T-1a.1).
+4. Model-S pricing — PENDING until 1c' (T-1c'.5): the re-targeted
+   model carries the NotYetReady wait state, its inertness invariant,
+   and the reachability witnesses; nothing to re-run at 1a.
+
+**Establishment persist-clause discharge (T-1a.7 step 2).** The
+lease-seam note above says the pull and establishment transactions
+"persist [the serving generation] on the row they create". As built:
+the establishment transaction runs the same claims-floor check as the
+pull transaction and closes/updates the `assignments` row that the
+fenced pull minted — that row already persists the binding generation
+— and the floor itself is computed from `leader_generation_claims` +
+`assignments` (the existing `max_known_generation` arms). No
+`drv_attempts.generation` column exists or is needed for the clause;
+the 1c' lease-checklist re-derivation (T-1c'.7) should read the clause
+against the assignments-row carrier, not a per-attempt-row column.
+
+**Carried to 1b (recorded at the 1a-A integration, restated here so
+the map is self-contained):** the post-failover reconcile
+(`collect_orphaned_assignments`) must learn the
+`dispatch_mode = 'pull'` discriminator before any pull-mode traffic
+exists (the establishment sweep, not the orphan reconcile, owns pull
+attempts); `drv_attempts.source_node` stamping is deferred to T-1b.1;
+`OpenAttempt.deadline_secs` returns 0 at this slice (the sweep
+computes the deadline from the live solver); `ListOpenAttempts` is
+service-token-gated (controller/cli/dashboard callers).
+
+**Model bookkeeping.** `spawnCoherence.qnt` and `executorSession.qnt`
+gained coexistence/busy-view header notes only (assumption text; no
+transition change); the affected wired checks were re-run at this
+landing with bit-identical state counts (recorded in the landing
+commit message per the volatile-figures convention).

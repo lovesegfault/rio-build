@@ -36,6 +36,19 @@
 //   MintExecutorTokens, HwClassSampled, termination reports and the
 //   status patch are out of model (no protocol state).
 //
+//   Busy-view note (executor Phase-1a, the §4.5 option-(b) bridge): as
+//   built, step 9's busy input is now the OR of two carriers — the
+//   stream executors map (ListExecutors.busy, as before) and the
+//   durable open pull-mode attempt view (ListOpenAttempts), with the
+//   same fail-closed posture on either read failing. The model's
+//   single executor-map busy flag abstracts "busy in the scheduler's
+//   view" and therefore stands for the OR of both carriers; no
+//   transition changes. The busy-but-never-registered residual noted
+//   under the weakened-test procedure below is, for pull-mode pods,
+//   closed in the code by the durable view; it remains the documented
+//   model bound until the 1c' re-target prices the pull path
+//   explicitly.
+//
 // PER-READ SNAPSHOT ABSTRACTION (the load-bearing abstraction)
 //   A tick is one transition; the I-183 hazard family is the environment
 //   moving between two reads inside one tick. Instead of modeling every
