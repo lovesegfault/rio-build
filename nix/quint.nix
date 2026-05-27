@@ -2433,14 +2433,123 @@ in
     };
 
     # ------------------------------------------------------------------
-    # Executor-lifecycle campaign (#1), Phase 0 Stage B: non-vacuity
-    # witnesses for Model S (executorSession.qnt, the scheduler's
-    # session state machine) and Model D (executorDelivery.qnt, the
-    # builder's delivery choreography). Each expect-violation check
-    # passes only while the contended state stays reachable in the
-    # named regime; the exhaustive invariant cfgs for the same regimes
-    # are wired separately. The witness pre-registration is the §3.5
-    # list in docs/spec/models/executor-invariant-map.md.
+    # Executor-lifecycle campaign (#1), Phase 0 Stage B: the AS-BUILT
+    # scheduler⇄executor session protocol.
+    #
+    # Model S (executorSession.qnt) — the scheduler's session state
+    # machine: registration/dual-register, heartbeat reconcile
+    # (keep/adopt/two-strike phantom), the dispatch push and its
+    # rollback, completion intake (capacity hoist, one-shot drain,
+    # idempotency/staleness guards), disconnect with the I-056a
+    # stale-epoch filter, the worker-time reaper with stall credit, the
+    # recently_disconnected correlation/establishment lifecycle,
+    # draining flags, and the failover convergence machinery. Two
+    # executor slots, two derivations, bucketed time; budgets/charges
+    # are imported from retryPolicy.qnt (see the model header's
+    # assume-guarantee checklist), the controller's Job tick from
+    # spawnCoherence.qnt, the lease from leaderElection.qnt.
+    #
+    # Model D (executorDelivery.qnt) — the builder's delivery
+    # choreography at await-point granularity: the permanent sink, the
+    # relay swap-after-confirmed-open, the stream-local in-flight cell,
+    # the half-close flush, the SIGTERM drain gate, the idle exit and
+    # the generation watermark. Discharges Model S's peer assumption
+    # (delivery-or-death, at-most-once).
+    #
+    # The invariant ↔ rule map and the Stage-B record (verdicts,
+    # bounds, encoding notes) are in
+    # docs/spec/models/executor-invariant-map.md.
+    #
+    # NOTE (stop-and-report): the fault-leader and fault-persist
+    # regimes of Model S falsify unresolvedClaimHasRepairArmed on the
+    # as-built encoding (a post-failover deferred-then-unrevisited
+    # Assigned derivation; see
+    # ~/tmp/rio-formal-verification/executor-0c-falsification-
+    # unresolvedClaimHasRepairArmed.md). Per the campaign's
+    # pre-registered empty falsification list those two exhaustive
+    # invariant cfgs are NOT wired until the campaign owner
+    # adjudicates; their witness checks below stay wired (the
+    # contended states must remain reachable). Wiring them would gate
+    # merges on a known-red check; silently excluding the falsifying
+    # invariant would weaken the gate — neither is acceptable, so the
+    # absence is recorded here and in the invariant map.
+
+    # The base regime: no faults — registration, dispatch, builder
+    # accept/reject, completion intake, the one-shot drain, SIGTERM /
+    # admin draining, voluntary exits and their disconnects (a
+    # one-shot exit goes stale and is reaped in worker time, so the
+    # reaper / liveness-window discipline and the repair-precedence
+    # idempotency guards are exercised here). Verifies the
+    # F1/F2/F3/F4/F5 invariant set plus the one-shot flag semantics on
+    # the happy-path interleavings.
+    # r[verify sched.executor.one-shot]
+    # r[verify sched.executor.liveness-window]
+    # r[verify sched.executor.repair-precedence]
+    quint-executor-session-base = mkQuintCheck {
+      name = "executor-session-base";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      invariants = [ "allInvariants" ];
+    };
+
+    # fault-stream is split into two cfgs (the campaign plan's
+    # pre-registered demote-or-split fallback, taken for per-check
+    # cost; the design's per-class budgets are unchanged): message
+    # faults and connection faults.
+    #
+    # fault-stream-msg: assignment-message loss, duplicate assignment
+    # delivery and try_send failure (the rollback path).
+    quint-executor-session-fault-stream-msg = mkQuintCheck {
+      name = "executor-session-fault-stream-msg";
+      spec = "executorSession";
+      main = "executorSessionFaultStreamMsg";
+      invariants = [ "allInvariants" ];
+    };
+
+    # fault-stream-conn (bridge half-death, connection drop, heartbeat
+    # loss) and fault-process (pod death, wedge, heartbeat silence)
+    # exist as regime modules and hold every invariant in deep random
+    # simulation, but their exhaustive runs do NOT converge within a
+    # gate-compatible budget at the recorded witness-preserving bounds
+    # (figures in the wiring commit message). Per the campaign plan's
+    # demotion floor that is a stop-and-report for the campaign owner,
+    # not a recorded fallback, so their exhaustive cfgs are not wired
+    # here yet; their witness checks below stay in the gate (the
+    # contended states remain pinned reachable), and the invariant
+    # map's Stage-B record carries the full account alongside the
+    # fault-leader/fault-persist falsification.
+
+    # Model D, base regime: the happy-path delivery choreography plus
+    # the SIGTERM drain and idle-exit orderings.
+    quint-executor-delivery-base = mkQuintCheck {
+      name = "executor-delivery-base";
+      spec = "executorDelivery";
+      main = "executorDeliveryBase";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Model D, fault-stream: failed opens, confirmed streams dying
+    # under the relay, and one generation move — the reconnect /
+    # park / re-buffer choreography and the B5 watermark fence carry
+    # the exactly-once-or-death obligation here.
+    # r[verify builder.completion.exactly-once-or-death]
+    quint-executor-delivery-fault-stream = mkQuintCheck {
+      name = "executor-delivery-fault-stream";
+      spec = "executorDelivery";
+      main = "executorDeliveryFaultStream";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Model D, fault-process: SIGKILL / OOM-kill at any point (the "or
+    # death" arm) on top of one stream death — no graceful-exit latch
+    # may fire even though the report can be lost with the pod.
+    # r[verify builder.completion.exactly-once-or-death]
+    quint-executor-delivery-fault-process = mkQuintCheck {
+      name = "executor-delivery-fault-process";
+      spec = "executorDelivery";
+      main = "executorDeliveryFaultProcess";
+      invariants = [ "allInvariants" ];
+    };
 
     # Non-vacuity witnesses for Model S (the §3.5 pre-registered list
     # plus three establishment/rollback/race-ahead probes). Each check
@@ -2464,6 +2573,10 @@ in
       main = "executorSessionFaultStreamConn";
       witness = "noHalfDeadStream";
     };
+    # The I-056a stale-epoch-behind-a-rebound state stays pinned
+    # reachable while the conn regime's exhaustive cfg awaits the
+    # budget adjudication.
+    # r[verify sched.executor.session-epoch]
     quint-executor-session-witness-stale-epoch = mkQuintWitnessCheck {
       name = "executor-session-witness-stale-epoch";
       spec = "executorSession";

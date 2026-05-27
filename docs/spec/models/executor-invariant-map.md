@@ -1088,6 +1088,204 @@ a silent re-disposition.
 | F8 (G8) | NOT-ENCODED by design (bounds checks + existing unit tests at the gRPC boundary) |
 | G7 controller half (cross-campaign bucket) | controller campaign's table (already calibrated there) |
 
+## Stage-B record (0c) — Models S and D
+
+Executed in worktree `executor-p0c` (base `f3bf70c0d`). The 0c re-pin
+check (the re-pin protocol's pre-Stage-B run) found two kinds of
+post-pin commits only: the 0b spec-rule commit (comment-only markers +
+new rules) and rio-retry-kernel proof-path-representation work
+(cfg(kani) only, production semantics unchanged) — neither triggers
+re-validation, so the 0a/0b artifacts stand unchanged under this
+record.
+
+### The models
+
+- `executorSession.qnt` (Model S): the scheduler's session state
+  machine — registration/dual-register and the hijack guards, the
+  heartbeat reconcile (keep / adopt / two-strike phantom), dispatch
+  push + rollback, completion intake (capacity hoist, one-shot drain,
+  idempotency/staleness guards), disconnect with the I-056a
+  stale-epoch filter, the worker-time reaper and stall credit, the
+  recently_disconnected correlation/establishment lifecycle, draining
+  flags, the dispatched_cells bookkeeping, and the failover
+  convergence machinery (depose / observed loss / re-acquire /
+  recovery / 45 s reconcile). Regime modules: base, fault-stream,
+  fault-process, fault-leader, fault-persist.
+- `executorDelivery.qnt` (Model D): the builder's delivery
+  choreography at await-point granularity — completion_pending armed
+  before the first await, the permanent sink, the relay
+  swap-after-confirmed-open and its one-message buffer, the
+  stream-local in-flight cell distinct from endpoint receipt, the
+  half-close flush, the SIGTERM drain gate and idle exit, the B5
+  generation watermark. Regime modules: base, fault-stream,
+  fault-process. **Model D regime-split decision (T-0c.3):** no
+  separate fault-leader cfg — the serving-generation move is an
+  environment action inside fault-stream, and the
+  generation-moved-vs-holder-changed distinction needs no regime of
+  its own because nothing in the builder reacts to a generation move
+  except the stale-assignment fence (checked there).
+
+### Bounds (final values; design §3.2 constants as encoded)
+
+| Bound | Design §3.2 | Wired value | Note |
+|---|---|---|---|
+| executor slots | 2 | 2 | |
+| derivations | 1–2 | 1 (wired regimes) | within the design range; the 2-drv instantiation remains available to override modules; lowered from 2 during Stage B for state-space cost, with every witness re-verified violated at the lower bound |
+| epoch / reconnect ceiling | 2 | 2 (per slot) | epochs numbered per slot (the stale-disconnect guard only compares same-slot epochs), so the production-global STREAM_EPOCH_SEQ ordering is not part of the state |
+| in-flight heartbeat per slot | ≤1 | 0 explicit | heartbeat content is read from the builder's current truth at the arrival step; staleness arises from interleaving (no stored message copy) |
+| pod-death budget | 1–2 | 1 (fault-process, fault-persist) | within the design range; lowered from 2 during Stage B for per-check cost with every fault-process witness re-verified violated |
+| failover budget | 1 | 1 (fault-leader, fault-persist) | |
+| persist-fault budget | 1 | 1 (fault-persist) | restricted to divergences a lost write can actually leave (PG keeps the previous value) |
+| tick ceiling | 2–3 buckets | structural | bucketed effects only; a tick that changes nothing is a self-loop, so no numeric tick counter is needed |
+| STARVE_BOUND | named const | 2 | starved-ticks counter capped at STARVE_BOUND+1 |
+| fault-stream loss/dup/delay | 1 each | 1 each | loss = in-flight WorkAssignment loss; dup = duplicate assignment delivery; delay = heartbeat drop; plus half-death 1, full connection drop 1, try_send failure (rollback path) 1. The regime is wired as TWO cfgs (message faults / connection faults — the plan's pre-registered demote-or-split fallback, taken for per-check cost); budgets per class are unchanged and witnesses were re-verified violated in their split regime |
+| dispatch ceiling (added) | — | 2 per drv | bounds the attempt counter (re-dispatch after one repair stays reachable) |
+| structural budgets (added) | — | SIGTERM 1, admin-drain 1, FUSE flips 2 (base) / 1 (fault), actor stall 1 | keep always-on environment toggles from multiplying interleavings; each recorded here because they bound real-world event counts per behaviour |
+| voluntary exit | — | requires a reason (post-report or SIGTERM) | the bare I-116 idle exit is folded into the SIGTERM exit path (same scheduler-side observable: a clean disconnect of an idle worker); `builder.idle-exit` stays covered by its existing tests |
+
+### Verdict table (exhaustive TLC, allInvariants per regime)
+
+Distinct/generated state counts and wall-clocks are in the introducing
+commit messages (volatile-figures discipline); this table records the
+verdicts.
+
+| Model / regime | Wired as | Verdict |
+|---|---|---|
+| S base | `quint-executor-session-base` | HOLD (search depth 27) |
+| S fault-stream-msg | `quint-executor-session-fault-stream-msg` | HOLD (search depth 30) |
+| S fault-stream-conn | NOT wired (stop-and-report: budget) | held in deep simulation; the exhaustive run did NOT converge within a gate-compatible budget at the recorded bounds (still expanding past 19 M distinct states at 31 min) — owner adjudication, witnesses wired |
+| S fault-process | NOT wired (stop-and-report: budget) | held in deep simulation; the exhaustive run was not driven to completion after the sibling regime's non-convergence (same state-space class) — owner adjudication, witnesses wired |
+| S fault-leader | NOT wired (stop-and-report) | **falsified** — `unresolvedClaimHasRepairArmed` (see below) |
+| S fault-persist | NOT wired (stop-and-report) | **falsified** — `unresolvedClaimHasRepairArmed` (same root cause) |
+| S node (optional) | NOT attempted | pre-registered NOT-ENCODED fallback taken: the F3 hung-node / node-aggregation sub-family keeps its named coverage (`nix/tests` `chaos`, `lifecycle/recovery` scenarios + the detector unit tests); recorded here, not silently unwired |
+| D base | `quint-executor-delivery-base` | HOLD (search depth 12) |
+| D fault-stream | `quint-executor-delivery-fault-stream` | HOLD (search depth 20) |
+| D fault-process | `quint-executor-delivery-fault-process` | HOLD (search depth 17) |
+
+### Stop-and-report (two items for the campaign owner)
+
+**(2) Budget non-convergence of the demotion-floor regimes.** The
+fault-stream-conn and fault-process exhaustive cfgs do not converge
+within a gate-compatible per-check budget at the recorded
+witness-preserving bounds (fault-stream-conn was still expanding past
+19 M distinct states after 31 min at 32 TLC workers; fault-stream-msg,
+the converging sibling, needed ~14 min for 11.4 M distinct states —
+an order of magnitude past the design's retryPolicy yardstick). The
+plan's demotion floor forbids moving these regimes to `packages.*` or
+silently shrinking them further, and makes a budget failure at the
+witness-preserving floor an owner adjudication. Until adjudicated
+their exhaustive cfgs are not wired; their witness checks are wired
+and green; base and fault-stream-msg carry the wired exhaustive
+coverage. Possible owner outcomes: accept multi-ten-minute checks,
+authorize a further split (one fault class per cfg), authorize a
+coarser re-encoding of Model S, or accept
+representative-revert-only calibration for the affected slices.
+
+### Stop-and-report (pre-registered empty falsification list)
+
+The as-built encoding falsifies `unresolvedClaimHasRepairArmed` (F2's
+armed-safety form) in the fault-leader and fault-persist regimes: a
+PG-Assigned derivation whose executor entry is recreated around a
+failover, deferred by the one-shot 45 s reconcile because its first
+heartbeat had not yet landed, and never revisited afterwards (the
+reaper requeues only the entry's own running_build; the backstop scans
+Running only; the correlation map was wiped at recovery), has no repair
+mechanism armed until the next leader transition. Work on those two
+regimes is paused per the plan; the write-up, the trace, the
+model-bug-vs-code-bug analysis and the adjudication options are in
+`~/tmp/rio-formal-verification/executor-0c-falsification-unresolvedClaimHasRepairArmed.md`.
+Until adjudicated: the two regimes' exhaustive cfgs are not wired (a
+red check would gate merges; excluding the falsifying invariant would
+weaken the gate); their witness checks ARE wired and green, so the
+contended states stay pinned reachable. No other regime falsifies
+anything.
+
+### Witness results (every §3.5 pre-registered witness + extras)
+
+All wired witness checks violate (= the contended state is reachable)
+in their named regime:
+
+| Witness (val) | Regime | Pre-registered # |
+|---|---|---|
+| noPhantomDrain | base | 1 |
+| noHalfDeadStream | fault-stream-conn | 2 |
+| noStaleEpochDisconnect | fault-stream-conn | 3 |
+| noAdopt | fault-leader | 4 |
+| noReapAfterStall | fault-process | 5 |
+| noDeathByTwoChannels | fault-process | 6 |
+| noFailoverWithInflight | fault-leader | 7 |
+| noDrainWithPendingCompletion | base | 8 |
+| noDeposedBeliever | fault-leader | 9 |
+| noEstablishment | fault-process | extra |
+| noRollback | fault-stream-msg | extra |
+| noRaceAheadReport | fault-process | extra |
+| noSwapWithReportOwed (D) | fault-stream | 10 |
+| noInFlightCellDropped (D) | fault-stream | 11 |
+| noHalfCloseFlush (D) | base | 12 |
+| noExitBlockedWhileOwed (D) | base | 13 |
+| noStaleAssignmentRejected (D) | fault-stream | extra |
+
+The fault-leader witnesses (noAdopt, noFailoverWithInflight,
+noDeposedBeliever) are wired against the unwired-for-invariants
+fault-leader regime module — exactly the demotion-floor rule that
+witnesses never leave the gate with their cfg.
+
+### Encoding notes (what is by-construction vs checked)
+
+Checked (the model can structurally reach the violating shape and the
+checker excludes it): `claimedSlotResolvesAtMostOnce`,
+`unresolvedClaimHasRepairArmed`, `noFabricatedCompletion`,
+`noReapWhileFreshInWorkerTime`, `silentSlotReapArmed`,
+`eligibleWorkOfferedWithinBound`, `neverOfferUnrunnableWork` (the
+flag/exclusion clauses), `rollbackRestoresExactly` (the structural
+half), `convergenceToGroundTruth` (the no-fabrication and
+no-unresolved-after-sweep halves), and Model D's
+`reportSurvivesStreamChurn`, `noExitWithReportOwed`,
+`atMostOnceDelivery`, `staleAssignmentsRejected`.
+
+By construction in the as-built encoding (the production guard is
+encoded as the action's precondition, so the latch can only be set by
+a Stage-C override that removes it): `atMostOneLiveStreamPerExecutor`
+(the live-stream hijack guard), `staleStreamEventsAreInert` (the
+I-056a epoch guard), the never-create half of
+`registrationRequiresBothHalves` (I-048b), the mid-build-only insert
+and non-promoting no-op halves of `correlationEntryLifecycle`,
+`establishmentOnlyAfterWindowCloses` (the sweep consumes only expired
+entries), `deposedLeaderSessionEventsAreInert` (every PG-writing arm
+is leader-gated), and Model D's `relayOnlyIntoConfirmed`
+(swap-after-Ok). These are exactly the pre-fix orderings the Stage-C
+representative reverts re-introduce.
+
+Deliberate over-approximations (each priced in the model headers):
+CancelSignal delivery/ordering is abstract (a force-drained or
+backstopped build may still be reported by the worker — the
+as-built first-to-resolve guards absorb it); channel-full try_send
+failure is represented by the fault-stream send-failure budget;
+best_executor's scoring/warm preference is collapsed to "any eligible
+slot".
+
+### Convergence record and check-budget impact
+
+- Model D regimes verify exhaustively well inside the per-check
+  guidance.
+- Model S regimes are substantially heavier than the design's
+  retryPolicy-failover yardstick at the same §3.2 bounds even after
+  the witness-preserving reductions recorded above (the per-slot
+  session vector times two slots, the six observation channels and the
+  repair interleavings dominate). Measured figures are in the
+  introducing/wiring commit messages; the base and fault-stream-msg
+  cfgs are wired (minutes-class checks), and the
+  fault-stream-conn / fault-process budget non-convergence is the
+  stop-and-report item (2) above (the plan's demotion floor forbids
+  moving them out of `checks.*` by executor decision, so the wiring
+  waits on the owner).
+- New checks wired by this stage: 22 (5 exhaustive regime cfgs — S
+  base, S fault-stream-msg, D base, D fault-stream, D fault-process —
+  plus 17 witness checks); the S fault-stream-conn / fault-process
+  cfgs (budget stop-and-report), the fault-leader / fault-persist
+  cfgs (falsification stop-and-report) and the optional node regime
+  add 0 until adjudication.
+
 ## Open adjudications (0a tracking)
 
 Owner for every entry: B. Meurer (campaign owner; also the
