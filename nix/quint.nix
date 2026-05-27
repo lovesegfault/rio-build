@@ -3102,5 +3102,91 @@ in
       main = "executorDeliveryFaultStream";
       witness = "noStaleAssignmentRejected";
     };
+
+    # ---- Executor-lifecycle Stage-C calibration witnesses -------------
+    # The executor-lifecycle (campaign #1) historical-fix corpus replayed
+    # against Models S and D (executor-invariant-map.md, the Stage-C
+    # calibration section). Each check instantiates the as-built model,
+    # swaps ONE action for its PRE-FIX behavior (the calibration module's
+    # `calibStep`) and passes only while the checker still falsifies the
+    # invariant the corresponding historical fix protects — machine-
+    # checked evidence that the model would re-find that bug class if it
+    # were reintroduced, and that the invariant is not vacuous for it.
+    # One representative per falsifying family with a plausible
+    # regression path and a cheap counterexample (the refcount/controller
+    # precedent); the remaining override modules under
+    # docs/spec/models/calibration/executor-*.qnt are evidence modules,
+    # re-runnable with the README recipe. Deliberately no tracey markers
+    # (the spec rules are verified by the HOLD regime checks above, not
+    # by these pre-fix reproductions).
+
+    # F1 (db457374f): losing the stream-epoch attribution lets a stale
+    # disconnect evict the legitimately reconnected worker (I-056a).
+    quint-executor-calib-f1-stale-epoch = mkQuintWitnessCheck {
+      name = "executor-calib-f1-stale-epoch";
+      spec = "calibration/executor-f1-stale-epoch";
+      main = "executorCalibF1StaleEpochApplies";
+      extraSpecs = [ "executorSession" ];
+      step = "calibStep";
+      witness = "staleStreamEventsAreInert";
+    };
+
+    # F2 scheduler half (0127cf854): losing the two-strike phantom drain
+    # leaves a confirmed phantom bound to the slot forever (I-035).
+    quint-executor-calib-f2-phantom-drain = mkQuintWitnessCheck {
+      name = "executor-calib-f2-phantom-drain";
+      spec = "calibration/executor-f2-phantom-no-drain";
+      main = "executorCalibF2PhantomNoDrain";
+      extraSpecs = [ "executorSession" ];
+      step = "calibStep";
+      witness = "confirmedPhantomIsDrained";
+    };
+
+    # F2 builder half (8201db59b / bug_012 / bug_117): arming
+    # completion_pending late and dropping the half-close lets a
+    # graceful exit leave with the report still owed.
+    quint-executor-calib-f2d-exit-owed = mkQuintWitnessCheck {
+      name = "executor-calib-f2d-exit-owed";
+      spec = "calibration/executor-f2d-late-arm";
+      main = "executorCalibF2dLateArmNoHalfClose";
+      extraSpecs = [ "executorDelivery" ];
+      step = "calibStep";
+      witness = "noExitWithReportOwed";
+    };
+
+    # F3 (1757790f2): an uncredited actor stall consumes the heartbeat
+    # window and the reaper removes workers that are fresh in worker
+    # time (the I-178 family).
+    quint-executor-calib-f3-stall-credit = mkQuintWitnessCheck {
+      name = "executor-calib-f3-stall-credit";
+      spec = "calibration/executor-f3-stall-no-credit";
+      main = "executorCalibF3StallNoCredit";
+      extraSpecs = [ "executorSession" ];
+      step = "calibStep";
+      witness = "noReapWhileFreshInWorkerTime";
+    };
+
+    # F4 (the I-197 discriminator): losing the last_completed gate mints
+    # a correlation entry for an already-classified death — the
+    # double-charge precondition.
+    quint-executor-calib-f4-correlation-entry = mkQuintWitnessCheck {
+      name = "executor-calib-f4-correlation-entry";
+      spec = "calibration/executor-f4-entry-not-mid-build";
+      main = "executorCalibF4EntryNotMidBuild";
+      extraSpecs = [ "executorSession" ];
+      step = "calibStep";
+      witness = "correlationEntryLifecycle";
+    };
+
+    # F5 (96d8092b8): losing the closed-stream exclusion offers fresh
+    # work to a half-dead binding (I-095).
+    quint-executor-calib-f5-closed-stream = mkQuintWitnessCheck {
+      name = "executor-calib-f5-closed-stream";
+      spec = "calibration/executor-f5-offer-closed-stream";
+      main = "executorCalibF5OfferClosedStream";
+      extraSpecs = [ "executorSession" ];
+      step = "calibStep";
+      witness = "neverOfferUnrunnableWork";
+    };
   };
 }

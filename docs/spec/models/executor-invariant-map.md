@@ -1595,6 +1595,40 @@ pre-registered. Every NOT-ENC row names its covering vehicle; every
 prediction-vs-verdict mismatch is recorded in-row as a
 checked-prediction correction (none silently).
 
+### Permanent expect-violation witnesses (wired into nix/quint.nix)
+
+Six of the twelve override modules are wired as `quint-executor-calib-*`
+checks — one per falsifying family with a plausible regression path in
+the as-built code and a cheap counterexample (the refcount/controller
+proportion); the rest stay evidence modules, re-runnable with the
+calibration README recipe.
+
+| Check | Module | Violated invariant | Guards against |
+|---|---|---|---|
+| `quint-executor-calib-f1-stale-epoch` | `executorCalibF1StaleEpochApplies` | `staleStreamEventsAreInert` | losing the stream-epoch attribution on disconnect delivery (db457374f / I-056a) |
+| `quint-executor-calib-f2-phantom-drain` | `executorCalibF2PhantomNoDrain` | `confirmedPhantomIsDrained` | losing the two-strike phantom drain (0127cf854 / I-035) |
+| `quint-executor-calib-f2d-exit-owed` | `executorCalibF2dLateArmNoHalfClose` | `noExitWithReportOwed` | arming completion_pending late / dropping the half-close flush (8201db59b, bug_012/bug_117) |
+| `quint-executor-calib-f3-stall-credit` | `executorCalibF3StallNoCredit` | `noReapWhileFreshInWorkerTime` | losing the FMP stall credit (1757790f2 / I-178) |
+| `quint-executor-calib-f4-correlation-entry` | `executorCalibF4EntryNotMidBuild` | `correlationEntryLifecycle` | losing the I-197 last_completed discriminator on the correlation insert |
+| `quint-executor-calib-f5-closed-stream` | `executorCalibF5OfferClosedStream` | `neverOfferUnrunnableWork` | losing the I-095 closed-stream exclusion in dispatch (96d8092b8) |
+
+The remaining six (the F1 hijack-accept, the F2 no-adopt HOLDS probe,
+the F2D eager-swap, the F3 reap-strikes, the F4 establish-early and
+the F6 deposed-reassign modules) stay evidence modules: their
+regression paths are either guarded by a wired sibling on the same
+machinery (hijack-accept by the wired stale-epoch + the Stage-B
+identity-token coverage; reap-strikes by the wired stall-credit check
+on the same reap pass; establish-early by the wired correlation-entry
+check on the same sweep), are HOLDS evidence rather than a regression
+guard (no-adopt), exercise the same latch class as a wired sibling
+(eager-swap vs the wired exit-owed check and the Stage-B
+relay/in-flight-cell witnesses), or sit on the costliest regime where
+the leader-gate family is already covered by the wired
+standby-drops-writes machinery and the lease campaign's checks
+(deposed-reassign). Check-budget impact: +6 first-counterexample
+checks (each terminates at its violation; transcript wall-clocks are
+seconds-class), no new exhaustive cfgs.
+
 ### Phase-1 / 0e-contract inputs from the dispositions
 
 - `confirmedPhantomIsDrained` is now part of the as-built contract the
