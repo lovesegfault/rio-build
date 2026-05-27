@@ -1476,3 +1476,102 @@ now recorded against the replacement:
 | G5 reaped live uploads | Re-falsified against the replacement model (this task, row above); I-207 stays latency-only per the Phase-1 input list (its hot-path-reclaim mechanism is a path-row janitor here, exercised by the `noHotpathReclaim` witness) |
 | G6 lock order | Carried pre-registered NOT-ENCODED disposition — below transaction granularity; `store.chunk.lock-order` survives with its site list narrowed (the collect batch's sorted `= ANY` is one of the surviving sites) |
 | G7 loop operability | Carried pre-registered NOT-ENCODED disposition — the collector inherits the obligation; carried by the runtime metrics/alerts (cycle counters, stalled alert, parse-failure alert) and the loop tests, not by the model |
+
+## Wave A2 cutover record (plan T-1a.8–T-1a.11; Release A landing close-out)
+
+The cutover wave landed as four commits on the integration branch
+(`refcount-a2`): the live collect arm, then the three reader
+retirements — the path sweep's chunk block, the hourly orphan-chunk
+sweep, and the reap zero-detect plus the drain's counter conjunct.
+Per the v5 owner directive there is no deployment or soak in this
+record; the production observations live in the deployment-time
+validation checklist (plan rows D0–D7) and its operator copy in
+`docs/ops/gc-enablement.typ`.
+
+Development-side landing checklist (the plan's T-1a.11 step-2 items,
+restated as facts of the landed tree):
+
+- **Start condition.** All seven Wave-A2 start-condition items were in
+  place before the live arm landed: the chunkCollect verdicts, witness
+  results, and falsification pairs (this document, "Replacement model
+  (Phase 1a)"); the acceptance re-run (G4a / G5 / completion-clobber,
+  above); the differential-pinning and validation-abort tests from the
+  shadow collector; the capped-cycle gate-(c) PASS (T-1a.1c) with the
+  T-1a.3 capped-collect scaffolding; the EXPLAIN plan-shape guard
+  (gate (b)) over the shared statement builder; and the Wave-A1
+  collector code-review pass with its dispositions (previous
+  subsection).
+- **Live arm.** The collect cycle's live arm reuses the bench-pinned
+  statements as shipped SQL (the keyset-cursor candidate scan and the
+  predicate-re-checking soft-delete moved from the bench into
+  `gc::collect` and are imported back by the bench), so the gate-(b)
+  plan-shape guard and the gate-(c) measurement loop exercise the
+  production statements. The soft-delete re-checks `deleted = FALSE`
+  and the grace conjunct in its own WHERE — the shape the
+  writer-bounded HOLDS verdict is stated against (the T-1a.8
+  consequence in the encoding notes above). The cap and cursor follow
+  P15: `COLLECT_CYCLE_VICTIM_CAP` per cycle, process-local cursor,
+  no would-collect anti-join in live cycles, backlog gauge as a
+  decremental estimate, capped cycles counted. Fail-closed validation
+  aborts the whole cycle before any batch runs. A dry-run GC keeps
+  phase 3 in the report-only shadow arm.
+- **Red-first.** The live-arm structural test set (historical-leak
+  collection, uploading/grace/touch protection, fail-closed abort
+  against the live arm, post-collect resurrect + drain skip,
+  enqueue-exactly-once, multi-batch termination, per-batch isolation,
+  cap stop + cursor resume, cursor-loss drain) was written first and
+  captured failing before the collect loop was enabled; the capture
+  and the green run are in the introducing commit's message. This is
+  the development-time analog of acceptance criterion A-A2-2.
+- **Reader retirement.** After the three retirement commits, the only
+  production references to `chunks.refcount` in `rio-store/src` are
+  the upsert increment, the token-gated rollback decrement (DEC-1),
+  the write-only reap decrement (DEC-2, by-count UPDATE only), and the
+  P5 drift-pair instrumentation reads in the collect cycle (the
+  cutover's monitoring signal, retired with the writers in Release B).
+  Nothing decides eligibility, presence, or skip behavior from the
+  counter; the collect cycle is the only producer of chunk
+  soft-deletes and outbox rows (acceptance criterion A-A2-1).
+  Increments and decrements still fire everywhere they fired before.
+- **Spec/markers.** Four rules were amended with the code they
+  license: grace-ttl (the collect-cycle eligibility predicate and the
+  three grace jobs), two-phase (the path sweep deletes path rows only;
+  chunk GC decoupled), bounded-garbage-retention (the capped
+  ceil(backlog/cap)-cycles bound with the fail-closed carve-out), and
+  pending-deletes (the collect cycle as outbox producer; deleted-only
+  drain re-check). Every prior marker site of those rules was bumped
+  in place, re-pointed to the collector/replacement-model sites, or
+  removed where the as-built model no longer verifies the amended
+  sentence; the stale-reference query reports none. The two
+  replacement rules (liveness-derived, chunk-collect) gained their
+  implementation-side markers with the live arm (P14), so they no
+  longer sit in the uncovered list.
+- **Mixed-fleet construction review (design §4.5).** New pods never
+  read the counter and never delete an increment: the upsert
+  increment, DEC-1, and the per-manifest write-only reap decrement are
+  intact, so a new pod decrements only references it (or the manifest
+  it is deleting) had itself added — the M_023 CHECK stays satisfiable
+  by construction and is untouched until Release B. Removing the path
+  sweep's decrement can only leave counters higher than before
+  (over-count, the safe direction). An old pod's drain re-check may
+  skip a new-pod soft-delete while the stale counter reads positive —
+  retention-safe and self-resolving as old pods drain. The collector's
+  soft-deletes are justified by the manifest fold regardless of the
+  counter, so they are correct under both regimes. This review is
+  construction-level only; the mixed fleet itself exists only at
+  deployment time (checklist rows D0/D5/D6).
+- **Path-GC regression guard (sign-off item 7, option B).** The
+  vm-lifecycle-gc-k3s scenario is unchanged across the wave and green
+  at the landed tree; no chunk-collect assertions or markers were
+  added at the VM wiring (the fixture stores everything inline). The
+  collector's verification remains the chunkCollect checks, the
+  postgres-backed collect tests, and the code-review pass, with the
+  deployment-time checklist as the eventual live confirmation.
+- **Deployment-time checklist.** The plan's rows D0–D7 exist and the
+  operator copy in `docs/ops/gc-enablement.typ` (the
+  "Refcount-cutover deployment validation checklist" section) carries
+  the same rows, the watch queries, the three alerts, the P5
+  unexplained-drift definition, the drift-pair lifetime statement, and
+  the Release-B go/no-go template. Release A is complete in the
+  development sense: code landed and gate-green, verification evidence
+  and review recorded; nothing here deploys.
