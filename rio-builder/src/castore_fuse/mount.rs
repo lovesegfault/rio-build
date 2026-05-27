@@ -368,11 +368,16 @@ pub(super) fn prepare_mount(
     })
 }
 
-/// Create `staging/{build_id}/.rio-live` ([`sweep::LIVE_SENTINEL`]) and
-/// take the exclusive flock that marks this build's staging dir as
+/// Create `staging/{build_id}/.rio-live` ([`super::sweep::LIVE_SENTINEL`])
+/// and take the exclusive flock that marks this build's staging dir as
 /// in-use to any *future* mountd incarnation. Returns `None` (with a
 /// warning) when the sentinel cannot be created or locked — protection
 /// is then simply absent, matching pre-sentinel behavior.
+///
+/// There is a tiny window between mountd's mkdir of `staging/{build_id}`
+/// and this flock during which a daemon restarting at exactly that
+/// instant could still reap the dir; that degrades to the
+/// input-EIO → infra-retry path, not data loss.
 fn acquire_staging_live_lock(staging_dir: &Path) -> Option<nix::fcntl::Flock<std::fs::File>> {
     let sentinel = staging_dir.join(super::sweep::LIVE_SENTINEL);
     let file = match std::fs::OpenOptions::new()

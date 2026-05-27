@@ -515,11 +515,14 @@ struct Shared {
     live_uids: Mutex<HashSet<libc::uid_t>>,
     /// One live `Mount{build_id}` per process across all connections.
     live_build_ids: Mutex<HashSet<String>>,
-    /// Monotonic XFS project-id allocator. Starts at 1 after the
-    /// startup orphan scan empties `staging/` — a reused projid whose
-    /// previous owner's files are all gone accounts from zero, so
-    /// persistence across restarts is unnecessary. Never derived from
-    /// the adversary-chosen `build_id`.
+    /// Monotonic XFS project-id allocator. Seeded at [`run`] time to
+    /// one above the highest projid still assigned to a surviving
+    /// staging dir (the startup orphan scan spares dirs whose builder
+    /// holds the `.rio-live` flock), falling back to 1 on a fresh
+    /// `staging/`. A reused projid only ever maps to a dir whose
+    /// previous owner's files are all gone, so it accounts from zero
+    /// and persistence across restarts is unnecessary. Never derived
+    /// from the adversary-chosen `build_id`.
     next_projid: AtomicU32,
     /// Bounds concurrent `Promote`/`PromoteChunks` copy loops.
     promote_sem: Arc<tokio::sync::Semaphore>,

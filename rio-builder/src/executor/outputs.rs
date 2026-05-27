@@ -83,8 +83,9 @@ pub(super) async fn collect_outputs(
             metrics::counter!("rio_builder_input_materialization_failures_total").increment(1);
             tracing::warn!(
                 drv_path = %drv_path,
+                original_status = ?build_result.status,
                 error = %build_result.error_msg,
-                "daemon ENOENT on closure input — reclassifying MiscFailure → \
+                "input materialization failure on closure input — reclassifying as \
                  InfrastructureFailure (warm timeout / FUSE EIO / I-043 race)"
             );
             return Ok(BuildOutputs::failed(

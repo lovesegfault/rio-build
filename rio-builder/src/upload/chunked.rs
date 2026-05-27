@@ -817,7 +817,7 @@ impl ChunkSourceReader {
 /// store cannot accept chunked uploads (caller falls back to the
 /// legacy path), or `Err(UploadExhausted)` after the retry budget.
 /// Each retry re-probes `HasChunks` and re-sends only the still-missing
-/// chunks (`r[store.put.idempotent]` re-drive semantics).
+/// chunks (`r[store.put.idempotent+2]` re-drive semantics).
 // r[impl builder.upload.batch+2]
 #[instrument(skip_all, fields(outputs = outputs.len()))]
 pub(super) async fn upload_outputs_chunked(
