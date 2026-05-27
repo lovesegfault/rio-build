@@ -464,8 +464,12 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
 /// `assignment_token_ttl_cap_secs` (default 48 h) — not the old 7-day
 /// constant, and certainly not year 584942417355. Behavior change from
 /// the pre-cap formula is intentional (`r[common.hmac.expiry-cap]`).
+/// Also asserts the mint-time WARN that names the cap knob fires when
+/// the declared timeout exceeds the cap (the operator's only signal
+/// that a legitimately long build will outlive its token).
 // r[verify common.hmac.expiry-cap]
 #[tokio::test]
+#[traced_test]
 async fn test_hmac_timeout_clamps_to_ttl_cap() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
@@ -523,6 +527,11 @@ async fn test_hmac_timeout_clamps_to_ttl_cap() -> TestResult {
         "expiry {} should sit at the cap (≈ now+{cap}); a much smaller value \
          means the huge timeout fell through to the floor instead",
         claims.expiry_unix
+    );
+    assert!(
+        logs_contain("assignment-token TTL capped below the declared build_timeout"),
+        "dispatch must WARN (naming assignment_token_ttl_cap_secs) when the \
+         declared build_timeout exceeds the cap"
     );
 
     Ok(())

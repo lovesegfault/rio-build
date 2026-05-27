@@ -1938,6 +1938,23 @@ impl DagActor {
                 build_opts.build_timeout,
                 self.assignment_token_ttl_cap_secs,
             );
+            // Mint-time signal when the cap truncates a *declared*
+            // timeout: the token would expire before the build's own
+            // build_timeout elapses, so a legitimately long build can
+            // lose castore access mid-build unless the operator raises
+            // the cap. Deliberately NOT emitted for build_timeout = 0
+            // ("unlimited" → cap is the documented mapping, not a
+            // truncation); 0 can never exceed the cap so the comparison
+            // already excludes it.
+            if build_opts.build_timeout > self.assignment_token_ttl_cap_secs {
+                warn!(
+                    drv_hash = %drv_hash,
+                    build_timeout_secs = build_opts.build_timeout,
+                    assignment_token_ttl_cap_secs = self.assignment_token_ttl_cap_secs,
+                    "assignment-token TTL capped below the declared build_timeout; raise \
+                     assignment_token_ttl_cap_secs if builds legitimately run this long"
+                );
+            }
             let expiry_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
