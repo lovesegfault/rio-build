@@ -437,7 +437,11 @@ written up (the `phase2-falsification-*` format), and the campaign
 owner adjudicates "model encoding bug" vs "real as-built defect"
 before Stage B resumes. A real defect found that way is recorded here
 as a known-defect row and handed to the normal fix process — never
-fixed inside Phase 0 and never modeled around.
+fixed inside Phase 0 and never modeled around. (Stage B produced
+exactly one such falsification — `unresolvedClaimHasRepairArmed` in
+the fault-leader / fault-persist regimes — adjudicated a real defect
+and fixed; the known-defect row and the verdict flip are in the
+Stage-B record's adjudication section below.)
 
 ## Witness pre-registration (the §3.5 non-vacuity obligations)
 
@@ -1155,16 +1159,18 @@ verdicts.
 | S fault-stream-msg | `quint-executor-session-fault-stream-msg` | HOLD (search depth 30) |
 | S fault-stream-conn | NOT wired (stop-and-report: budget) | held in deep simulation; the exhaustive run did NOT converge within a gate-compatible budget at the recorded bounds (still expanding past 19 M distinct states at 31 min) — owner adjudication, witnesses wired |
 | S fault-process | NOT wired (stop-and-report: budget) | held in deep simulation; the exhaustive run was not driven to completion after the sibling regime's non-convergence (same state-space class) — owner adjudication, witnesses wired |
-| S fault-leader | NOT wired (stop-and-report) | **falsified** — `unresolvedClaimHasRepairArmed` (see below) |
-| S fault-persist | NOT wired (stop-and-report) | **falsified** — `unresolvedClaimHasRepairArmed` (same root cause) |
+| S fault-leader | NOT wired (budget; documented manual target) | **falsified pre-fix** (`unresolvedClaimHasRepairArmed`) — adjudicated a real defect and fixed (see the adjudication record below); the re-run on the fixed encoding finds **no violation**, with the bounded-exhaustive sweep clearing well past the falsifying trace class's depth before being stopped over the gate budget (figures in the model-flip commit message) |
+| S fault-persist | NOT wired (budget; documented manual target) | **falsified pre-fix** (same root cause) — adjudicated and fixed with fault-leader; the re-run on the fixed encoding finds **no violation**, with the bounded-exhaustive sweep likewise clearing well past the falsifying trace class's depth before being stopped over the gate budget (figures in the model-flip commit message) |
 | S node (optional) | NOT attempted | pre-registered NOT-ENCODED fallback taken: the F3 hung-node / node-aggregation sub-family keeps its named coverage (`nix/tests` `chaos`, `lifecycle/recovery` scenarios + the detector unit tests); recorded here, not silently unwired |
 | D base | `quint-executor-delivery-base` | HOLD (search depth 12) |
 | D fault-stream | `quint-executor-delivery-fault-stream` | HOLD (search depth 20) |
 | D fault-process | `quint-executor-delivery-fault-process` | HOLD (search depth 17) |
 
-### Stop-and-report (two items for the campaign owner)
+### Stop-and-report (campaign owner): budget non-convergence of the demotion-floor regimes
 
-**(2) Budget non-convergence of the demotion-floor regimes.** The
+Of the two 0c stop-and-report items, the falsification one is
+resolved (see the adjudication record below); this budget item remains
+open. The
 fault-stream-conn and fault-process exhaustive cfgs do not converge
 within a gate-compatible per-check budget at the recorded
 witness-preserving bounds (fault-stream-conn was still expanding past
@@ -1181,24 +1187,54 @@ authorize a further split (one fault class per cfg), authorize a
 coarser re-encoding of Model S, or accept
 representative-revert-only calibration for the affected slices.
 
-### Stop-and-report (pre-registered empty falsification list)
+### Falsification adjudication and fix record (`unresolvedClaimHasRepairArmed`)
 
-The as-built encoding falsifies `unresolvedClaimHasRepairArmed` (F2's
-armed-safety form) in the fault-leader and fault-persist regimes: a
-PG-Assigned derivation whose executor entry is recreated around a
-failover, deferred by the one-shot 45 s reconcile because its first
-heartbeat had not yet landed, and never revisited afterwards (the
-reaper requeues only the entry's own running_build; the backstop scans
-Running only; the correlation map was wiped at recovery), has no repair
-mechanism armed until the next leader transition. Work on those two
-regimes is paused per the plan; the write-up, the trace, the
-model-bug-vs-code-bug analysis and the adjudication options are in
-`~/tmp/rio-formal-verification/executor-0c-falsification-unresolvedClaimHasRepairArmed.md`.
-Until adjudicated: the two regimes' exhaustive cfgs are not wired (a
-red check would gate merges; excluding the falsifying invariant would
-weaken the gate); their witness checks ARE wired and green, so the
-contended states stay pinned reachable. No other regime falsifies
-anything.
+**The falsification (Stage B, 0c).** The as-built encoding falsified
+`unresolvedClaimHasRepairArmed` (F2's armed-safety form) in the
+fault-leader and fault-persist regimes: a PG-Assigned derivation whose
+executor entry is recreated around a failover, deferred by the
+one-shot 45 s reconcile because its first heartbeat had not yet
+landed, and never revisited afterwards (the reaper and the disconnect
+path requeue only the entry's own running_build; the backstop scans
+Running only; the heartbeat reconcile and the two-strike phantom key
+off the entry, never the DAG-side binding; the correlation map was
+wiped at recovery) — no repair mechanism armed until the next leader
+transition. The write-up, the trace and the model-bug-vs-code-bug
+analysis are in
+`~/tmp/rio-formal-verification/executor-0c-falsification-unresolvedClaimHasRepairArmed.md`,
+with the adversarial confirmation (every load-bearing claim verified
+against the code, the trigger window, the consequence class) in
+`executor-0c-falsification-review.md` alongside it. No other regime
+falsified anything.
+
+**Adjudication: real as-built defect (option 1 of the report).** Per
+the pre-registration above ("Expected as-built falsifications: none"),
+the falsification was a stop-and-report; the campaign owner
+adjudicated it a real defect and routed it to the normal fix process
+— the known-defect row below is the record. Phase 0 itself made no
+production change; the fix landed as ordinary scheduler work.
+
+**Known-defect row (fixed).**
+
+| Defect | Consequence | Fix |
+|---|---|---|
+| A claim deferred by the post-recovery reconcile (worker stream-connected, first heartbeat not yet accepted) was never revisited: the reconcile timer was one-shot and no other mechanism consults the DAG-side `assigned_executor` binding for an entry whose `running_build` is empty. | A silently stuck build (derivation parked Assigned to a live, idle executor) until the next leader transition / scheduler restart or an external cancel; contagious to every later build wanting the same drv; no double-charge, no double-dispatch, no incorrect result. | `handle_reconcile_assignments` now re-arms `schedule_reconcile_timer` whenever its collection pass deferred at least one claim, so each deferral grants one more full reconcile window and the follow-up sweep resolves the claim (cross-check, orphan arm, or defer-and-re-arm again). The repair stays on the established no-charge reset path (`reset_orphan_to_ready`); the new `rio_scheduler_reconcile_deferred_total` counter makes the defer path observable. Red-first actor test: `test_deferred_assigned_claim_revisited_by_rearmed_reconcile` (rio-scheduler). |
+
+**Model and verdict flip.** `executorSession.qnt`'s `reconcileSweep`
+now encodes the fixed behavior (`reconcilePending` stays set while any
+claim was deferred, mirroring the re-arm), and the invariant no longer
+falsifies in either regime's re-run (the fault-leader and fault-persist
+rows of the verdict table above; counts and wall-clocks in the
+model-flip commit message). The two exhaustive cfgs remain unwired on
+per-check cost grounds only — at the witness-preserving bounds they
+exceed the gate budget, the same class as the budget stop-and-report
+above — so they are documented manual targets
+(`quint verify --backend=tlc --main=executorSessionFaultLeader|executorSessionFaultPersist --invariant=allInvariants docs/spec/models/executorSession.qnt`),
+and their witness checks stay wired and green so the contended states
+remain pinned reachable. The falsification report and its review stay
+in `~/tmp/rio-formal-verification/` as the historical trace and
+confirmation record; their "awaiting adjudication" status is
+superseded by this record.
 
 ### Witness results (every §3.5 pre-registered witness + extras)
 
@@ -1276,15 +1312,19 @@ slot".
   introducing/wiring commit messages; the base and fault-stream-msg
   cfgs are wired (minutes-class checks), and the
   fault-stream-conn / fault-process budget non-convergence is the
-  stop-and-report item (2) above (the plan's demotion floor forbids
+  open stop-and-report item above (the plan's demotion floor forbids
   moving them out of `checks.*` by executor decision, so the wiring
-  waits on the owner).
+  waits on the owner). The fault-leader / fault-persist re-runs on the
+  fixed encoding are in the same budget class (they exceed the
+  ~15 min gate guidance at the witness-preserving bounds — figures in
+  the model-flip commit message), so they are documented manual
+  targets per the adjudication record above.
 - New checks wired by this stage: 22 (5 exhaustive regime cfgs — S
   base, S fault-stream-msg, D base, D fault-stream, D fault-process —
   plus 17 witness checks); the S fault-stream-conn / fault-process
   cfgs (budget stop-and-report), the fault-leader / fault-persist
-  cfgs (falsification stop-and-report) and the optional node regime
-  add 0 until adjudication.
+  cfgs (falsified pre-fix, now resolved and held back on budget — see
+  the adjudication record) and the optional node regime add 0.
 
 ## Open adjudications (0a tracking)
 
