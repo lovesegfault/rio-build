@@ -20,7 +20,7 @@
 //!    soft-deletes + enqueues unreferenced chunks past grace, capped
 //!    per cycle with a keyset cursor carrying any backlog to the next
 //!    cycle. A dry-run GC keeps this phase observation-only (shadow
-//!    mode: would-collect / drift gauges, no modification).
+//!    mode: would-collect report, no modification).
 //!
 //! 4. **Drain** ([`drain::spawn_drain_task`]): background task that
 //!    reads `pending_s3_deletes`, calls `ChunkBackend::delete_by_key`,
@@ -87,6 +87,7 @@ use tracing::{info, warn};
 use rio_proto::types::GcProgress;
 
 use crate::backend::ChunkBackend;
+#[cfg(test)]
 use crate::manifest::{Manifest, ManifestError};
 
 /// Summary stats from a GC run.
@@ -356,8 +357,6 @@ pub async fn run_gc(
                 mode = ?collect_mode,
                 mark_set_size = report.mark_set_size,
                 would_collect = report.would_collect,
-                drift_leaked = report.drift_leaked,
-                drift_undercount = report.drift_undercount,
                 victims_collected = report.victims_collected,
                 victim_bytes = report.victim_bytes,
                 s3_keys_enqueued = report.s3_keys_enqueued,
@@ -465,14 +464,14 @@ pub(super) async fn enqueue_chunk_deletes(
     if soft_deleted.is_empty() {
         return Ok(0);
     }
-    // r[impl store.chunk.lock-order]
+    // r[impl store.chunk.lock-order+2]
     // Sort by hash before building the parallel keys/hashes vecs: the
     // input is a RETURNING set (PG internal order, NOT input-array
     // order). The pending_s3_deletes INSERT below binds UNNEST() —
     // unsorted → circular-wait against a concurrent
-    // enqueue_chunk_deletes or rollback. One sort here covers all
-    // callers (the collect batches). The .to_vec() clone is cheap
-    // (~KB) relative to the PG roundtrip.
+    // enqueue_chunk_deletes. One sort here covers all callers (the
+    // collect batches). The .to_vec() clone is cheap (~KB) relative
+    // to the PG roundtrip.
     let mut soft_deleted: Vec<_> = soft_deleted.to_vec();
     soft_deleted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut keys: Vec<String> = Vec::with_capacity(soft_deleted.len());
@@ -508,15 +507,23 @@ pub(super) async fn enqueue_chunk_deletes(
 /// content blocks in the NAR) — each unique hash appears exactly once.
 ///
 /// Corrupt input (anything `Manifest::deserialize` rejects) is an
-/// `Err`, never an empty `Ok`, so a caller that must fail closed (a
-/// collector mark phase that derives liveness from the manifest fold)
-/// can distinguish "this manifest references no chunks" from "this
+/// `Err`, never an empty `Ok`, so a caller that must fail closed can
+/// distinguish "this manifest references no chunks" from "this
 /// manifest is unreadable". An empty manifest (zero entries) is NOT
 /// corrupt: it parses to `Ok` of an empty vec.
 ///
+/// The collector's production parse is the server-side validation
+/// pass + set-based expansion inside `collect_cycle`; this Rust-side
+/// parse is the test/bench oracle for it — the differential-pinning
+/// test compares the SQL expansion against this function over the
+/// same rows, and the mark-scan bench uses it when synthesizing and
+/// auditing fixtures. Test-only since the legacy decrement paths
+/// (its last production callers) were deleted with the counter
+/// writers.
+///
 /// The ascending sort gives a deterministic order independent of the
-/// manifest's entry order; the consumers are order-insensitive
-/// ([`decrement_hashes`] re-sorts its input).
+/// manifest's entry order; the consumers are order-insensitive.
+#[cfg(test)]
 pub(crate) fn try_parse_unique_chunk_hashes(
     chunk_list: &[u8],
 ) -> Result<Vec<[u8; 32]>, ManifestError> {
@@ -527,99 +534,12 @@ pub(crate) fn try_parse_unique_chunk_hashes(
     Ok(hashes)
 }
 
-/// Infallible wrapper around `try_parse_unique_chunk_hashes` for the
-/// legacy decrement paths (today: the placeholder reapers' write-only
-/// decrement): a corrupt `chunk_list` is logged and yields empty (the
-/// narinfo DELETE has already CASCADEd the manifest away; worst case
-/// is a stale counter — collection is unaffected because the collector
-/// derives liveness from the manifest fold, not the counter). This
-/// warn-and-empty behavior is the as-built C12 skip polarity,
-/// deliberately preserved at the legacy callsites until they are
-/// deleted; a collector that derives liveness from the manifest fold
-/// must NOT use this wrapper — treating corrupt input as "references
-/// nothing" would turn a storage leak into collected live data, so its
-/// mark phase aborts the cycle on `Err` instead.
-pub(super) fn parse_unique_chunk_hashes(chunk_list: &[u8]) -> Vec<[u8; 32]> {
-    try_parse_unique_chunk_hashes(chunk_list).unwrap_or_else(|e| {
-        warn!(error = %e, "GC: corrupt chunk_list, skipping decrement");
-        Vec::new()
-    })
-}
-
-/// Write-only refcount decrement for the placeholder reap paths: takes
-/// pre-deduped hashes paired with per-hash decrement counts and issues
-/// the single by-count UPDATE — no zero-detect, no soft-delete, no
-/// outbox enqueue. The counter stays maintained (write-only) for
-/// mixed-fleet safety while pre-cutover pods may still read it; chunks
-/// a reaped manifest leaves unreferenced are collected by the next
-/// collect cycle, which never consults the counter. The decrement (and
-/// the upsert increment it mirrors) is deleted wholesale in the
-/// writer-removal release.
-///
-/// Runs inside an EXISTING transaction — caller is responsible for
-/// begin/commit/rollback, and a caller-provided transaction is also
-/// why this CANNOT use [`crate::metadata::with_sorted_retry`] (retry
-/// would need to replay the whole outer txn). The sort below keeps a
-/// deterministic lock order; PG drives the `unnest` join through a
-/// btree scan regardless, so it is defense-in-depth (see
-/// `reap_decrement_no_deadlock`).
-// r[impl store.chunk.lock-order]
-pub(super) async fn decrement_hashes(
-    tx: &mut Transaction<'_, Postgres>,
-    unique_hashes: &[Vec<u8>],
-    counts: &[i64],
-) -> Result<(), sqlx::Error> {
-    debug_assert_eq!(unique_hashes.len(), counts.len());
-    if unique_hashes.is_empty() {
-        return Ok(());
-    }
-
-    let mut pairs: Vec<(Vec<u8>, i64)> = unique_hashes
-        .iter()
-        .cloned()
-        .zip(counts.iter().copied())
-        .collect();
-    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let (unique_hashes, counts): (Vec<Vec<u8>>, Vec<i64>) = pairs.into_iter().unzip();
-
-    // Decrement by count: a chunk referenced N times by the deleted
-    // manifests is decremented by N. unnest preserves single-statement
-    // semantics (one btree-scan-order lock acquisition). The M_023
-    // CHECK still rejects a decrement below zero until Release B drops
-    // it — a violation here is a caller bug (wrong hashes or a double
-    // decrement), surfaced loudly rather than silently corrupting the
-    // write-only counter.
-    sqlx::query(
-        r#"
-        UPDATE chunks c SET refcount = c.refcount - d.n
-          FROM unnest($1::bytea[], $2::bigint[]) AS d(h, n)
-         WHERE c.blake3_hash = d.h
-        "#,
-    )
-    .bind(&unique_hashes)
-    .bind(&counts)
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::{Manifest, ManifestEntry};
-    use crate::test_helpers::{ChunkSeed, mem_backend};
+    use crate::test_helpers::mem_backend;
     use rio_test_support::TestDb;
-    use sqlx::PgPool;
-
-    /// Seed a chunk row with the given refcount. Returns the blake3 hash.
-    async fn seed_chunk(pool: &PgPool, tag: u8, refcount: i32, size: i64) -> [u8; 32] {
-        ChunkSeed::new(tag)
-            .with_refcount(refcount)
-            .with_size(size)
-            .seed(pool)
-            .await
-    }
 
     /// Build a serialized manifest referencing the given chunk hashes.
     fn make_manifest(hashes: &[[u8; 32]]) -> Vec<u8> {
@@ -692,65 +612,6 @@ mod tests {
         assert!(try_parse_unique_chunk_hashes(&empty).unwrap().is_empty());
     }
 
-    /// The legacy infallible wrapper keeps the as-built C12 skip
-    /// polarity: corrupt input yields an empty set (warn + skip the
-    /// decrement), it does not error or panic. Pinned so the polarity
-    /// is not "fixed" out from under the callsites that rely on it.
-    #[test]
-    fn parse_unique_chunk_hashes_keeps_corrupt_skip_polarity() {
-        assert!(parse_unique_chunk_hashes(&[0xFF]).is_empty());
-        assert!(parse_unique_chunk_hashes(b"").is_empty());
-
-        // And the happy path still parses through the wrapper.
-        let h = [0x42u8; 32];
-        assert_eq!(parse_unique_chunk_hashes(&make_manifest(&[h, h])), vec![h]);
-    }
-
-    /// The reap-path decrement is write-only: refcounts go down by the
-    /// requested counts, but nothing is soft-deleted and nothing is
-    /// enqueued — even when a chunk reaches zero. (Zero-references is
-    /// the collect cycle's business, not the reaper's.) Empty input is
-    /// a no-op.
-    #[tokio::test]
-    async fn reap_decrement_is_write_only() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let h1 = seed_chunk(&db.pool, 1, 2, 1000).await;
-        let h2 = seed_chunk(&db.pool, 2, 1, 2000).await;
-
-        // Empty input: no-op, no error.
-        let mut tx = db.pool.begin().await.unwrap();
-        decrement_hashes(&mut tx, &[], &[]).await.unwrap();
-        tx.commit().await.unwrap();
-
-        let mut tx = db.pool.begin().await.unwrap();
-        decrement_hashes(&mut tx, &[h1.to_vec(), h2.to_vec()], &[1, 1])
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        // h1: 2→1. h2: 1→0 — and even at zero it is NOT soft-deleted
-        // and NOT enqueued (write-only).
-        let rows: Vec<(Vec<u8>, i32, bool)> = sqlx::query_as(
-            "SELECT blake3_hash, refcount, deleted FROM chunks ORDER BY blake3_hash",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, 1, "h1 refcount 2→1");
-        assert!(!rows[0].2);
-        assert_eq!(rows[1].1, 0, "h2 refcount 1→0");
-        assert!(
-            !rows[1].2,
-            "zero-refcount chunk is NOT soft-deleted by the reaper"
-        );
-        let enqueued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(enqueued, 0, "the reaper never writes the outbox");
-    }
-
     /// enqueue_chunk_deletes: a hash that isn't 32 bytes is skipped
     /// with a warn, not a panic. The well-formed siblings in the same
     /// batch still enqueue. (Can't-happen in practice — chunks PK writers
@@ -781,48 +642,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, good);
-    }
-
-    /// Migration 023's CHECK catches double-decrement at the source:
-    /// an `UPDATE SET refcount = refcount - 1` that would take a
-    /// chunk negative raises a constraint violation instead of
-    /// silently leaking (a negative refcount never matches
-    /// `WHERE refcount = 0` → chunk never GC'd).
-    ///
-    /// Replaces the old `idempotent_enqueue_on_conflict` test, which
-    /// reached its assertion by decrementing the same manifest's
-    /// chunks twice — silently driving refcount 0→-1.
-    /// That test claimed to exercise the INSERT's `ON CONFLICT DO
-    /// NOTHING`, but `pending_s3_deletes` has no unique constraint
-    /// on `s3_key` or `blake3_hash` (only `id BIGSERIAL PK`,
-    /// migrations/005) so the ON CONFLICT never actually fired. The
-    /// "no duplicate" it observed came from the `deleted = false`
-    /// filter in RETURNING, not the ON CONFLICT. The scenario it
-    /// modeled ("orphan scan after GC already swept") can't happen
-    /// in practice either: orphan scanner targets status='uploading'
-    /// manifests, GC sweep targets completed narinfo paths —
-    /// mutually exclusive.
-    #[tokio::test]
-    async fn double_decrement_rejected_by_check() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let h1 = seed_chunk(&db.pool, 1, 1, 1000).await;
-
-        // First decrement: 1→0, fine.
-        let mut tx = db.pool.begin().await.unwrap();
-        decrement_hashes(&mut tx, &[h1.to_vec()], &[1])
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        // Second decrement: 0→-1, CHECK fires (until Release B drops it).
-        let mut tx = db.pool.begin().await.unwrap();
-        let err = decrement_hashes(&mut tx, &[h1.to_vec()], &[1])
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("chunks_refcount_nonneg"),
-            "expected CHECK constraint violation, got: {err}"
-        );
     }
 
     /// bug_304: final `GcProgress.paths_scanned` MUST equal the
@@ -1060,138 +879,5 @@ mod tests {
             .unwrap();
             assert!(exists, "Q's narinfo must survive sweep");
         }
-    }
-
-    /// Regression: the concurrent reap-path decrement
-    /// (`decrement_hashes`) vs another chunk writer on overlapping
-    /// hashes MUST NOT deadlock.
-    ///
-    /// `decrement_hashes` runs inside a CALLER-provided txn so
-    /// it cannot use `with_sorted_retry`; its inline sort is the
-    /// lock-order discipline.
-    /// The per-row contender stands in for any other chunk writer
-    /// obeying r\[store.chunk.lock-order\] — it row-locks in iteration
-    /// order, so its `with_sorted_retry` wrapper is what makes its
-    /// order canonical. With both sides ascending, no circular wait.
-    ///
-    /// Mutation-tested: removing `with_sorted_retry`'s sort (the
-    /// contender's discipline) makes the contender lock descending
-    /// while `decrement_hashes` locks PK-ascending → 40P01 →
-    /// attempts==3 → fails here. Removing the inline sort at this
-    /// function's annotated site is NOT independently observable:
-    /// both its UPDATEs are batch `= ANY($1)` which PG evaluates in
-    /// scan order regardless of array order (btree presort) — same
-    /// root insight as `rollback_overlapping_no_deadlock`. The inline
-    /// sort is discipline (defends a future per-row refactor), not
-    /// load-bearing under the current batch-ANY shape.
-    // r[verify store.chunk.lock-order]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn reap_decrement_no_deadlock() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        // Seed 100 chunks at refcount=2 — both sides decrement once
-        // without tripping CHECK(refcount>=0). 100 hashes so the
-        // per-row contender's 100 sequential roundtrips overlap the
-        // batch UPDATE. Raw INSERT (ChunkSeed's hash is `[tag,0..]`;
-        // we need `[i;32]` to match `make_manifest`).
-        let hashes: Vec<[u8; 32]> = (0u8..100).map(|i| [i; 32]).collect();
-        for h in &hashes {
-            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 2, 1024)")
-                .bind(&h[..])
-                .execute(&db.pool)
-                .await
-                .unwrap();
-        }
-        let hashes: Vec<Vec<u8>> = hashes.into_iter().map(|h| h.to_vec()).collect();
-
-        // Per-row contender: locks in `sorted` ARRAY order. No-op
-        // write — row-locks unconditionally.
-        async fn contend_per_row(pool: &PgPool, sorted: &[Vec<u8>]) -> crate::metadata::Result<()> {
-            let mut tx = pool.begin().await?;
-            for h in sorted {
-                sqlx::query("UPDATE chunks SET size = size WHERE blake3_hash = $1")
-                    .bind(h)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
-            Ok(())
-        }
-
-        // Side A: the production reap-path decrement inside a fresh
-        // txn, wrapped in retry-once-on-40P01. The hashes vec passed
-        // to with_sorted_retry is the SAME set the reaper derives from
-        // the manifest — the helper's sort is a no-op for side A's
-        // lock order (batch ANY locks scan-order); its role here is
-        // the retry + attempt counter.
-        // Side B: per-row contender fed REVERSED.
-        let hashes_fwd = hashes.clone();
-        let mut hashes_rev = hashes.clone();
-        hashes_rev.reverse();
-
-        let pool_a = db.pool.clone();
-        let pool_b = db.pool.clone();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_a = Arc::clone(&attempts);
-        let attempts_b = Arc::clone(&attempts);
-
-        let task_a = tokio::spawn(async move {
-            crate::metadata::with_sorted_retry(hashes_fwd, move |sorted| {
-                attempts_a.fetch_add(1, Ordering::Relaxed);
-                let pool_a = pool_a.clone();
-                async move {
-                    let mut tx = pool_a.begin().await?;
-                    let counts = vec![1i64; sorted.len()];
-                    decrement_hashes(&mut tx, &sorted, &counts).await?;
-                    tx.commit().await?;
-                    Ok(())
-                }
-            })
-            .await
-        });
-        let task_b = tokio::spawn(async move {
-            crate::metadata::with_sorted_retry(hashes_rev, move |sorted| {
-                attempts_b.fetch_add(1, Ordering::Relaxed);
-                let pool_b = pool_b.clone();
-                async move { contend_per_row(&pool_b, &sorted).await }
-            })
-            .await
-        });
-
-        let (ra, rb) = timeout(Duration::from_secs(5), async {
-            tokio::try_join!(task_a, task_b).expect("tasks should not panic")
-        })
-        .await
-        .expect("concurrent decrement+contender must complete within 5s — deadlock detected");
-
-        ra.expect("the reap decrement should succeed");
-        rb.expect("contender should succeed");
-
-        // Mutation sentinel: with both sides obeying lock-order
-        // discipline → no 40P01 → no retry → exactly 2 body
-        // invocations total.
-        assert_eq!(
-            attempts.load(Ordering::Relaxed),
-            2,
-            "lock-order discipline should prevent 40P01 (no retry needed)"
-        );
-
-        // Vacuity sentinel: the decrement UPDATE must have matched all
-        // 100 (refcount 2→1). If a future seed regression makes the
-        // UPDATE match zero rows, this fails loudly instead of going
-        // vacuous.
-        let sum: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
-        )
-        .bind(&hashes)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(sum, 100, "decrement matched all 100 chunks (2→1)");
     }
 }

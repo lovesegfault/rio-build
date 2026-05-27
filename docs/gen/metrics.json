@@ -181,8 +181,6 @@
     "rio_store_gc_orphan_reap_failed_total",
     "rio_store_gc_path_resurrected_total",
     "rio_store_gc_path_swept_total",
-    "rio_store_gc_refcount_drift_leaked",
-    "rio_store_gc_refcount_drift_undercount",
     "rio_store_gc_s3_key_enqueued_total",
     "rio_store_gc_sweep_paths_remaining",
     "rio_store_get_path_active",
@@ -1093,7 +1091,7 @@
       {
         "name": "rio_store_gc_chunks_collected_total",
         "kind": "counter",
-        "help": "Chunks soft-deleted (and, when a chunk backend exists, enqueued to pending_s3_deletes) by live collect cycles. Incremented per committed collect batch. The expected one-time reclamation of historical refcount leaks shows up here after the cutover."
+        "help": "Chunks soft-deleted (and, when a chunk backend exists, enqueued to pending_s3_deletes) by live collect cycles. Incremented per committed collect batch. The expected one-time reclamation of historical chunk leaks shows up here after the cutover."
       },
       {
         "name": "rio_store_gc_chunks_live",
@@ -1144,16 +1142,6 @@
         "name": "rio_store_gc_path_swept_total",
         "kind": "counter",
         "help": "Paths deleted by GC sweep (narinfo + CASCADE). Monotonic over store lifetime."
-      },
-      {
-        "name": "rio_store_gc_refcount_drift_leaked",
-        "kind": "gauge",
-        "help": "Refcount drift, leak direction: chunks with refcount > 0 that no existing manifest references (not deleted). Computed on the collect cycle's single REPEATABLE READ snapshot, so traffic concurrent with the cycle cannot surface here. Expected to match the historical leak classes before the cutover and stopped-decrement artifacts after it; growth beyond those is unexplained drift."
-      },
-      {
-        "name": "rio_store_gc_refcount_drift_undercount",
-        "kind": "gauge",
-        "help": "Refcount drift, under-count direction: chunks referenced by an existing manifest while refcount = 0 (not deleted). Computed on the collect cycle's single REPEATABLE READ snapshot, so traffic concurrent with the cycle cannot surface here. Never expected while the increment still fires; any occurrence during the Release A window is an abort signal for the cutover."
       },
       {
         "name": "rio_store_gc_s3_key_enqueued_total",

@@ -298,11 +298,7 @@ async fn main() -> anyhow::Result<()> {
         .with_shutdown(shutdown.clone())
         .with_service_verifier(service_verifier)
         .with_substitute_admission(substitute_admission);
-    rio_store::gc::orphan::spawn_scanner(
-        pool.clone(),
-        chunk_backend_for_gc.clone(),
-        shutdown.clone(),
-    );
+    rio_store::gc::orphan::spawn_scanner(pool.clone(), shutdown.clone());
     // Daily chunk-collect backstop (live arm): covers stores that
     // never trigger GC, so bounded garbage retention has a worst-case
     // cadence (24h + grace + drain lag). The first tick fires one

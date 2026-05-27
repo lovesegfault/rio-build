@@ -155,9 +155,10 @@ pub(crate) async fn manifest_uploading_age(
 /// CASCADE on the FK would also work but explicit ordering makes intent
 /// clear and doesn't depend on schema details.
 ///
-/// Production callers use [`crate::gc::orphan::reap_one`] (chunk-aware).
-/// This inline-only delete is kept for the defense-in-depth test that
-/// asserts a leaked refcount no longer causes upload-skip.
+/// Production callers use [`crate::gc::orphan::reap_one`] (the
+/// claim/stale-gated path-row janitor). This inline-only delete is
+/// kept for the defense-in-depth test that asserts an abandoned chunk
+/// row no longer causes upload-skip.
 #[cfg(test)]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub(crate) async fn delete_manifest_uploading(pool: &PgPool, store_path_hash: &[u8]) -> Result<()> {

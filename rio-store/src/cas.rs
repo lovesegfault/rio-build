@@ -28,7 +28,7 @@ use crate::metadata;
 /// NARs below this size bypass chunking and go into `manifests.inline_blob`.
 ///
 /// 256 KiB = CHUNK_MAX. A NAR smaller than one max-chunk gains nothing from
-/// chunking: it'd be 1-2 chunks at most, with manifest overhead + refcount
+/// chunking: it'd be 1-2 chunks at most, with manifest + chunk-row
 /// bookkeeping for no dedup benefit. The `.drv` files that dominate nixpkgs
 /// closures by count are typically <10 KiB — all of those stay inline.
 pub const INLINE_THRESHOLD: usize = 256 * 1024;
@@ -103,9 +103,9 @@ const HEARTBEAT_CHUNK_INTERVAL: u32 = 64;
 ///
 /// Guards the reap race introduced by P0483's 15min STALE_THRESHOLD:
 /// a 6GB NAR over 50Mbps takes ~16 minutes — without heartbeat the
-/// scanner would reap it mid-flight, decrement chunk refcounts, and
-/// the uploader's `complete_manifest` would point at chunks already
-/// enqueued to `pending_s3_deletes`.
+/// scanner would reap it mid-flight, deleting the placeholder whose
+/// manifest_data is what keeps the in-flight chunks out of the collect
+/// cycle's eligible set.
 ///
 /// `claim` is the ownership token from `insert_manifest_uploading`:
 /// if our row was stale-reaped and a fresh re-upload now holds the
@@ -164,15 +164,16 @@ impl PutChunkedStats {
 /// # Flow
 ///
 /// 1. **Chunk**: FastCDC over `nar_data` → (hash, slice) list.
-/// 2. **Upgrade write-ahead**: add manifest_data + increment refcounts
-///    to the existing 'uploading' placeholder. One tx.
+/// 2. **Upgrade write-ahead**: add manifest_data + upsert the chunk
+///    rows on the existing 'uploading' placeholder. One tx.
 /// 3. **Upload new chunks**: step 2 atomically returns which hashes
-///    need upload (RETURNING refcount=1). Parallel S3 PUTs for those only.
+///    need upload (`uploaded_at IS NULL`). Parallel S3 PUTs for those only.
 /// 5. **Complete**: fill narinfo + flip status='complete'.
 ///
-/// On error in 3-5: `delete_manifest_chunked_uploading` rolls back
-/// refcounts + placeholders. Caller doesn't need to clean up (we consumed
-/// their placeholder; we clean up our own mess).
+/// On error in 3-5: the claim-gated rollback (`gc::orphan::reap_one`)
+/// deletes the placeholder rows; chunks left unreferenced are picked up
+/// by the next collect cycle. Caller doesn't need to clean up (we
+/// consumed their placeholder; we clean up our own mess).
 #[instrument(skip(pool, backend, info, nar_data), fields(
     store_path = %info.store_path.as_str(),
     nar_size = nar_data.len(),
@@ -190,18 +191,19 @@ pub async fn put_chunked(
     // --- Step 5: Complete ---
     if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim).await {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
-        // Chunks are uploaded to S3. reap_one decrements refcounts →
-        // GC-eligible. We DON'T delete from S3 — GC sweep's job.
-        // Deleting now races with a concurrent uploader that just
-        // incremented the same chunk. ReapBy::Claim: stage_chunked's
-        // own rollback may have already deleted OUR row and a fresh
-        // uploader may now hold the slot — claim_id mismatch makes
-        // this a no-op there (M_052).
+        // Chunks are uploaded to S3. reap_one deletes the placeholder
+        // rows; chunks the dead manifest leaves unreferenced become
+        // ordinary collect-cycle victims. We DON'T delete from S3 —
+        // that's the collect cycle + drain's job, and deleting now
+        // races with a concurrent uploader re-referencing the same
+        // chunk. ReapBy::Claim: stage_chunked's own rollback may have
+        // already deleted OUR row and a fresh uploader may now hold
+        // the slot — claim_id mismatch makes this a no-op there
+        // (M_052).
         if let Err(e2) = crate::gc::orphan::reap_one(
             pool,
             &info.store_path_hash,
             crate::gc::orphan::ReapBy::Claim(claim),
-            Some(backend),
         )
         .await
         {
@@ -218,15 +220,16 @@ pub async fn put_chunked(
 /// that (via `metadata::complete_manifest_chunked` or its `_in_tx`
 /// variant).
 ///
-/// On internal error this rolls back its OWN refcount increments + the
-/// caller's `'uploading'` placeholder (same rollback contract as
-/// [`put_chunked`] — caller doesn't clean up).
+/// On internal error this rolls back the caller's `'uploading'`
+/// placeholder (same rollback contract as [`put_chunked`] — caller
+/// doesn't clean up); chunk rows it staged are left for the collect
+/// cycle.
 ///
 /// PutPathBatch calls this per-output BEFORE its atomic completion tx
 /// so the visibility flip for N outputs (inline + chunked) commits
-/// together. On batch-tx failure, `abort_batch` → `reap_one` (chunk-
-/// aware) decrements the staged refcounts; S3 blobs orphan and GC
-/// sweeps them.
+/// together. On batch-tx failure, `abort_batch` → `reap_one` deletes
+/// the placeholder rows; staged chunks and S3 blobs are picked up by
+/// the collect cycle + drain.
 #[instrument(skip(pool, backend, info, nar_data), fields(
     store_path = %info.store_path.as_str(),
     nar_size = nar_data.len(),
@@ -287,11 +290,9 @@ pub async fn stage_chunked(
     // with duplicate PKs in the SAME batch: "ON CONFLICT DO UPDATE
     // command cannot affect row a second time" (SQLSTATE 21000).
     //
-    // Deduping here also fixes refcount semantics: 1 ref per UNIQUE
-    // chunk per manifest, matching the reap-path decrement's per-hash
-    // dedup. The manifest serialization above still has dups
+    // The manifest serialization above still has dups
     // (chunk_list_bytes) — reassembly needs the full in-order chunk
-    // list. Only the refcount arrays dedup.
+    // list. Only the upsert arrays dedup.
     //
     // `chunks` vec stays undeduped — manifest serialization needs the
     // full in-order list. do_upload dedups intra-NAR repeats itself.
@@ -306,16 +307,16 @@ pub async fn stage_chunked(
 
     // --- Step 2: Upgrade write-ahead ---
     // Caller owns the 'uploading' placeholder from step 3. We add
-    // manifest_data + refcounts to it. If this fails (placeholder
+    // manifest_data + the chunk rows to it. If this fails (placeholder
     // missing — shouldn't happen but defensive), bail WITHOUT rollback:
-    // we haven't touched refcounts yet.
+    // nothing was committed.
     //
     // Returns the set of hashes that need upload — `(uploaded_at IS
     // NULL)` per chunk, atomic with the upsert. A chunk that another
     // PutPath has already CONFIRMED in S3 (via `mark_chunks_uploaded`)
-    // is skipped; one that's merely refcounted (upload in flight or
+    // is skipped; one whose row merely exists (upload in flight or
     // interrupted) is re-uploaded — see M_033.
-    let (needs_upload, token) = metadata::upgrade_manifest_to_chunked(
+    let needs_upload = metadata::upgrade_manifest_to_chunked(
         pool,
         store_path_hash,
         &chunk_list_bytes,
@@ -324,9 +325,9 @@ pub async fn stage_chunked(
     )
     .await?;
 
-    // From here on, refcounts are incremented. Any error must roll back
-    // via delete_manifest_chunked_uploading. scopeguard can't do async
-    // drop, so explicit match-on-error.
+    // From here on, the durable manifest reference exists. Any error
+    // must roll back the placeholder via the claim-gated reap.
+    // scopeguard can't do async drop, so explicit match-on-error.
 
     let stats = match do_upload(
         Some((pool, store_path_hash, claim)),
@@ -341,7 +342,7 @@ pub async fn stage_chunked(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "chunk upload failed; rolling back");
-            rollback(pool, store_path_hash, token, &chunk_hashes).await;
+            rollback(pool, store_path_hash, claim).await;
             return Err(e);
         }
     };
@@ -350,11 +351,11 @@ pub async fn stage_chunked(
     // Uploads succeeded → record `uploaded_at` so later PutPaths can
     // safely skip these hashes. If THIS write fails the chunks are in
     // S3 but PG says NULL — next PutPath re-uploads (idempotent), so
-    // rollback here is for refcount hygiene, not data safety.
+    // rollback here is placeholder hygiene, not data safety.
     let needs_upload: Vec<Vec<u8>> = needs_upload.into_iter().collect();
     if let Err(e) = metadata::mark_chunks_uploaded(pool, &needs_upload).await {
         warn!(error = %e, "mark_chunks_uploaded failed; rolling back");
-        rollback(pool, store_path_hash, token, &chunk_hashes).await;
+        rollback(pool, store_path_hash, claim).await;
         return Err(e.into());
     }
 
@@ -455,7 +456,7 @@ async fn do_upload(
     // Any single failed PUT aborts the whole upload (try_for_each
     // short-circuits on first Err). We don't try to upload the rest —
     // if S3 is having a bad time, piling on more PUTs won't help. The
-    // rollback decrements refcounts, and the next PutPath attempt
+    // rollback deletes the placeholder, and the next PutPath attempt
     // retries the whole thing.
     stream::iter(to_upload)
         .map(|(hash, range)| {
@@ -509,18 +510,22 @@ async fn do_upload(
     })
 }
 
-/// Best-effort rollback. Errors are logged, not propagated — the caller
-/// is already returning an error; a rollback failure shouldn't mask it.
-/// The orphan scanner (gc/orphan.rs) catches any leaked state.
-async fn rollback(
-    pool: &PgPool,
-    store_path_hash: &[u8],
-    token: metadata::PlaceholderToken,
-    chunk_hashes: &[Vec<u8>],
-) {
-    if let Err(e) =
-        metadata::delete_manifest_chunked_uploading(pool, store_path_hash, token, chunk_hashes)
-            .await
+/// Best-effort rollback: a claim-gated delete of our own `'uploading'`
+/// placeholder rows (manifests + manifest_data + the narinfo
+/// placeholder) and nothing else — chunks the dead manifest leaves
+/// unreferenced are ordinary collect-cycle victims. The claim gate
+/// means a stale rollback can never clobber a re-uploader's fresh
+/// placeholder (its claim_id differs). Errors are logged, not
+/// propagated — the caller is already returning an error; a rollback
+/// failure shouldn't mask it. The orphan scanner (gc/orphan.rs)
+/// catches any leaked state.
+async fn rollback(pool: &PgPool, store_path_hash: &[u8], claim: uuid::Uuid) {
+    if let Err(e) = crate::gc::orphan::reap_one(
+        pool,
+        store_path_hash,
+        crate::gc::orphan::ReapBy::Claim(claim),
+    )
+    .await
     {
         warn!(error = %e, "rollback of chunked upload failed; orphan scanner will clean up");
     }

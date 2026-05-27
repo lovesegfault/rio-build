@@ -3,27 +3,23 @@
 //! If a worker crashes mid-PutPath (between insert_manifest_
 //! placeholder and complete_manifest), the manifest stays in
 //! `status='uploading'` forever. It's a GC root (mark.rs seeds
-//! uploading manifests) so its narinfo is never swept. And its
-//! chunks have refcounts from insert_manifest_chunked but the
-//! manifest never completes to make them reachable via a real
-//! path.
+//! uploading manifests) so its narinfo is never swept, and a stale
+//! placeholder blocks every re-upload of its path with `Aborted`
+//! until someone deletes it.
 //!
 //! This scanner runs periodically (15min default), finds
 //! 'uploading' manifests older than `STALE_THRESHOLD`, and removes
-//! them via `reap_one`: the abandoned path rows are deleted and the
-//! write-only chunk counter is kept maintained. Chunks the reaped
-//! manifest leaves unreferenced are collected by the next chunk
-//! collect cycle (gc::collect) — the reaper itself never soft-deletes
-//! or enqueues them.
+//! them via `reap_one`: a pure path-row janitor — the abandoned
+//! placeholder rows are deleted and nothing else is touched. Chunks
+//! the reaped manifest leaves unreferenced are collected by the next
+//! chunk collect cycle (gc::collect) — the reaper never reads
+//! `chunk_list`, never soft-deletes, and never enqueues.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-
-use crate::backend::ChunkBackend;
 
 /// How old an 'uploading' manifest must be before we reap it.
 ///
@@ -84,24 +80,20 @@ pub(crate) enum ReapBy {
 
 /// Run one scan iteration. Returns count of orphans reaped.
 ///
-/// For each stale uploading manifest:
-/// 1. Load its chunk_list (if chunked).
-/// 2. In a tx: DELETE narinfo (CASCADE) and issue the write-only
-///    chunk-counter decrement (no soft-delete, no outbox enqueue —
-///    the collect cycle owns those).
+/// For each stale uploading manifest, `reap_one` re-checks staleness
+/// inside its own transaction and deletes the abandoned path rows
+/// (narinfo CASCADE → manifests/manifest_data) — nothing else.
 ///
 /// Same transaction semantics as sweep::sweep (the two are
 /// structurally similar — orphan is "sweep for uploading-status"
 /// with different selection criteria).
-pub async fn scan_once(
-    pool: &PgPool,
-    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
-) -> Result<(u64, u64), sqlx::Error> {
-    // Find stale uploading manifests. SELECT hash only — chunk_list
-    // is re-read INSIDE the tx (see TOCTOU handling below). I-148:
-    // covered by the partial index from migration 031 (predicate
-    // matches `WHERE status = 'uploading'` exactly); without it this
-    // was a ~4s seq-scan over ~1.5M rows per replica per interval.
+pub async fn scan_once(pool: &PgPool) -> Result<(u64, u64), sqlx::Error> {
+    // Find stale uploading manifests. SELECT hash only — the
+    // staleness predicate is re-checked INSIDE reap_one's tx (see the
+    // TOCTOU handling there). I-148: covered by the partial index
+    // from migration 031 (predicate matches `WHERE status =
+    // 'uploading'` exactly); without it this was a ~4s seq-scan over
+    // ~1.5M rows per replica per interval.
     //
     // LIMIT + loop-until-short: bounds memory after a mass-crash
     // backlog (the unbounded fetch_all would otherwise materialize
@@ -134,9 +126,9 @@ pub async fn scan_once(
 
         let mut progressed = 0u64;
         for (store_path_hash,) in stale {
-            // Per-row isolation: a poison row (e.g. M023's
-            // `chunks_refcount_nonneg` CHECK from a pre-existing
-            // accounting bug) must not wedge the scanner. Log + count;
+            // Per-row isolation: a poison row (a row that makes its
+            // own delete transaction fail, e.g. an FK surprise from
+            // manual surgery) must not wedge the scanner. Log + count;
             // next 15min tick re-finds it (and the metric makes it
             // operator-visible).
             match reap_one(
@@ -145,7 +137,6 @@ pub async fn scan_once(
                 ReapBy::Stale {
                     secs: threshold_secs,
                 },
-                chunk_backend,
             )
             .await
             {
@@ -190,7 +181,7 @@ pub async fn scan_once(
 }
 
 /// Reap a single 'uploading' placeholder: delete the abandoned path
-/// rows and keep the write-only chunk counter maintained.
+/// rows and nothing else.
 ///
 /// `by`: [`ReapBy::Stale`] re-checks `updated_at < now() - secs` inside
 /// the tx (TOCTOU guard against reaping a fresh re-upload).
@@ -210,36 +201,30 @@ pub async fn scan_once(
 /// drift that left behind became a data-loss hazard while the upload
 /// skip decision was inferred from the counter (the I-040/M_033
 /// class). Two things have since removed that hazard at the root: the
-/// upload skip decision is keyed on `uploaded_at` (never the counter),
-/// and chunk GC-eligibility is derived from the manifest fold by the
-/// collect cycle. Reaping is therefore a path-row janitor: it deletes
-/// the abandoned placeholder rows (FOR UPDATE + EXISTS-guard, as
-/// before) and issues a write-only refcount decrement so the counter
-/// stays honest for any pre-cutover pod still reading it — no
-/// zero-detect, no soft-delete, no outbox enqueue. The chunks a reaped
-/// manifest leaves unreferenced are collected by the next collect
-/// cycle.
-///
-/// The chunk-backend parameter is no longer consulted (it used to
-/// drive the enqueue's `key_for`); it stays in the signature,
-/// underscore-bound, until the legacy chunk machinery is deleted
-/// wholesale in the writer-removal release.
+/// upload skip decision is keyed on `uploaded_at` (never a liveness
+/// signal), and chunk GC-eligibility is derived from the manifest
+/// fold by the collect cycle. Reaping is therefore a pure path-row
+/// janitor: it deletes the abandoned placeholder rows (FOR UPDATE +
+/// EXISTS-guard, as before) — no `chunk_list` parse, no chunk-row
+/// writes, no outbox enqueue. The chunks a reaped manifest leaves
+/// unreferenced are collected by the next collect cycle. This is also
+/// the claim-gated rollback `cas::put_chunked`/`cas::stage_chunked`
+/// use on their failure paths.
 // r[impl store.put.placeholder-claim+2]
 pub(crate) async fn reap_one(
     pool: &PgPool,
     store_path_hash: &[u8],
     by: ReapBy,
-    _chunk_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    // Re-read chunk_list INSIDE the tx with FOR UPDATE. Two races
+    // Re-check the predicate INSIDE the tx with FOR UPDATE. Two races
     // this guards (preserved from the pre-extraction loop body):
     //
     // (1) Outer-SELECT vs inner-DELETE: scan_once's outer SELECT is
-    // OUTSIDE any tx. Reading chunk_list INSIDE the tx (with FOR
-    // UPDATE locking the manifest row) guarantees we decrement the
-    // chunk_list that we DELETE.
+    // OUTSIDE any tx. Re-checking INSIDE the tx (with FOR UPDATE
+    // locking the manifest row) guarantees the row we delete is the
+    // row that matched.
     //
     // (2) Reap-then-reupload (ReapBy::Stale): store-0 + store-1 both
     // outer-SELECT the same stale hash; store-0 reaps; worker
@@ -257,40 +242,46 @@ pub(crate) async fn reap_one(
     // Two query strings (not a runtime-built one) so sqlx can prepare
     // both at compile time. The EXISTS-guard DELETE below mirrors the
     // same shape.
-    let chunk_list: Option<Vec<u8>> = match by {
-        ReapBy::Stale { secs } => sqlx::query_scalar(
-            r#"
-            SELECT md.chunk_list
+    let matched: Option<i32> = match by {
+        ReapBy::Stale { secs } => {
+            sqlx::query_scalar(
+                r#"
+            SELECT 1
               FROM manifests m
-              LEFT JOIN manifest_data md USING (store_path_hash)
              WHERE m.store_path_hash = $1
                AND m.status = 'uploading'
                AND m.updated_at < now() - make_interval(secs => $2)
                FOR UPDATE OF m
             "#,
-        )
-        .bind(store_path_hash)
-        .bind(secs)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten(),
-        ReapBy::Claim(id) => sqlx::query_scalar(
-            r#"
-            SELECT md.chunk_list
+            )
+            .bind(store_path_hash)
+            .bind(secs)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+        ReapBy::Claim(id) => {
+            sqlx::query_scalar(
+                r#"
+            SELECT 1
               FROM manifests m
-              LEFT JOIN manifest_data md USING (store_path_hash)
              WHERE m.store_path_hash = $1
                AND m.status = 'uploading'
                AND m.claim_id = $2
                FOR UPDATE OF m
             "#,
-        )
-        .bind(store_path_hash)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten(),
+            )
+            .bind(store_path_hash)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
     };
+    if matched.is_none() {
+        // Gone, completed, fresher than the threshold, or a different
+        // claim — not ours to touch.
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     // DELETE narinfo → CASCADE to manifests/manifest_data.
     //
@@ -302,9 +293,8 @@ pub(crate) async fn reap_one(
     // different → EXISTS false).
     //
     // The FOR UPDATE above already re-checked status (+ stale/claim)
-    // and locked the row — the EXISTS guard is defense-in-depth for
-    // the case where FOR UPDATE returned 0 rows (chunk_list=None) but
-    // the DELETE would otherwise match a fresh row.
+    // and locked the row — the EXISTS guard is defense-in-depth
+    // against the predicate changing between the two statements.
     let deleted = match by {
         ReapBy::Stale { secs } => {
             sqlx::query(
@@ -350,26 +340,6 @@ pub(crate) async fn reap_one(
         return Ok(false);
     }
 
-    // Chunk decrement (if chunked). chunk_list was read INSIDE the tx
-    // above — it's the CURRENT value for the manifest we just deleted.
-    // Write-only: the counter is kept maintained for mixed-fleet
-    // safety while pre-cutover pods may still read it, but there is no
-    // zero-detect, no soft-delete, and no outbox enqueue here — chunks
-    // this reap leaves unreferenced are ordinary collect-cycle victims
-    // (the I-040 data-loss class is closed upstream by the upsert's
-    // uploaded_at-keyed re-upload decision, not by this decrement).
-    // The corrupt-chunk_list skip polarity (warn + decrement nothing,
-    // the as-built C12 behavior) is preserved via
-    // parse_unique_chunk_hashes.
-    if let Some(bytes) = chunk_list {
-        let unique_hashes: Vec<Vec<u8>> = super::parse_unique_chunk_hashes(&bytes)
-            .into_iter()
-            .map(|h| h.to_vec())
-            .collect();
-        let counts = vec![1i64; unique_hashes.len()];
-        super::decrement_hashes(&mut tx, &unique_hashes, &counts).await?;
-    }
-
     tx.commit().await?;
     Ok(true)
 }
@@ -383,14 +353,12 @@ pub(crate) async fn reap_one(
 /// Interval drifts; fine for a 15min background task.
 pub fn spawn_scanner(
     pool: PgPool,
-    chunk_backend: Option<Arc<dyn ChunkBackend>>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     rio_common::task::spawn_periodic("gc-orphan-scanner", SCAN_INTERVAL, shutdown, move || {
         let pool = pool.clone();
-        let chunk_backend = chunk_backend.clone();
         async move {
-            if let Err(e) = scan_once(&pool, chunk_backend.as_ref()).await {
+            if let Err(e) = scan_once(&pool).await {
                 warn!(error = %e, "orphan scan failed (will retry next interval)");
             }
         }
@@ -403,20 +371,18 @@ mod tests {
     use crate::manifest::{Manifest, ManifestEntry};
     use rio_test_support::TestDb;
 
-    /// Seed an 'uploading' placeholder, upgrade to chunked (refcount
-    /// +1, manifest_data written), backdate. Simulates: prior
+    /// Seed an 'uploading' placeholder, upgrade to chunked (chunk row
+    /// + manifest_data written), backdate. Simulates: prior
     /// `cas::put_chunked` crashed AFTER `upgrade_manifest_to_chunked`.
     ///
-    /// Returns (chunk_hash, claim_id) so callers can check refcount
-    /// and exercise `ReapBy::Claim`.
+    /// Returns (chunk_hash, claim_id) so callers can check the chunk
+    /// row state and exercise `ReapBy::Claim`.
     async fn seed_stale_chunked(pool: &PgPool, hash: &[u8], path: &str) -> ([u8; 32], Uuid) {
         let claim = crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
             .await
             .unwrap()
             .expect("fresh path → placeholder inserted");
-        // One-chunk manifest. The chunk_list bytes must deserialize
-        // (reap_one parses them via parse_unique_chunk_hashes), so
-        // build it via the real serializer.
+        // One-chunk manifest, built via the real serializer.
         let chunk_hash = [hash[0]; 32]; // distinct per test via the path-hash byte
         let chunk_list = Manifest {
             entries: vec![ManifestEntry {
@@ -446,41 +412,33 @@ mod tests {
     }
 
     // r[verify store.substitute.stale-reclaim]
-    /// I-040 unit: `reap_one` on a CHUNKED placeholder MUST decrement.
-    /// This is what the inline `delete_manifest_uploading` skipped.
-    /// Spec at store.typ: "The chunk list in `manifest_data` is
-    /// used to decrement refcounts" — substitute's reclaim violated
-    /// this (called the inline delete unconditionally).
+    /// `reap_one` on a CHUNKED placeholder is a pure path-row janitor:
+    /// the placeholder rows go (narinfo CASCADE → manifests /
+    /// manifest_data) and the chunk rows are left exactly as they
+    /// were — no soft-delete, no outbox row. The chunks the reaped
+    /// manifest leaves unreferenced are the next collect cycle's
+    /// ordinary victims (covered by the gc::collect live-cycle tests).
     #[tokio::test]
-    async fn reap_one_chunked_decrements_refcount() {
+    async fn reap_one_chunked_is_path_row_janitor() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let hash = vec![0x40u8; 32];
         let path = rio_test_support::fixtures::test_store_path("i040-reap-chunked");
         let (chunk_hash, claim) = seed_stale_chunked(&db.pool, &hash, &path).await;
 
-        // Verify setup: refcount=1, manifest_data exists.
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+        // Verify setup: chunk row + manifest_data exist.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE blake3_hash = $1")
             .bind(chunk_hash.as_slice())
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(rc, 1, "setup: chunk at refcount=1");
+        assert_eq!(n, 1, "setup: chunk row exists");
 
         // reap_one (owner-side — by claim).
-        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim), None)
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim))
             .await
             .unwrap();
         assert!(reaped, "chunked placeholder reaped");
-
-        // Refcount decremented to 0. Before I-040 fix, the inline
-        // delete would have left this at 1 (leaked).
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-            .bind(chunk_hash.as_slice())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(rc, 0, "I-040: chunked-reap MUST decrement refcount");
 
         // Placeholder gone (narinfo CASCADE → manifests/manifest_data).
         let n: (i64,) =
@@ -490,29 +448,48 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(n.0, 0, "manifest_data gone via CASCADE");
+
+        // Chunk row untouched: present, not soft-deleted, no outbox row.
+        let (del, outbox): (bool, i64) = sqlx::query_as(
+            "SELECT c.deleted, \
+                    (SELECT COUNT(*) FROM pending_s3_deletes p WHERE p.blake3_hash = c.blake3_hash) \
+             FROM chunks c WHERE c.blake3_hash = $1",
+        )
+        .bind(chunk_hash.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!del, "reap never soft-deletes chunk rows");
+        assert_eq!(outbox, 0, "reap never enqueues outbox rows");
     }
 
-    /// `scan_once`'s loop now delegates to `reap_one` — chunked
-    /// placeholders found by the periodic scanner ALSO decrement.
-    /// (This was already correct pre-extraction; this test pins it.)
+    /// `scan_once`'s loop delegates to `reap_one` — chunked
+    /// placeholders found by the periodic scanner are also handled as
+    /// path rows only.
     #[tokio::test]
-    async fn scan_once_chunked_decrements_refcount() {
+    async fn scan_once_chunked_reaps_path_rows_only() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let hash = vec![0x41u8; 32];
         let path = rio_test_support::fixtures::test_store_path("i040-scan-chunked");
         let (chunk_hash, _) = seed_stale_chunked(&db.pool, &hash, &path).await;
 
-        let (reaped, failed) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, failed) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 1);
         assert_eq!(failed, 0);
 
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-            .bind(chunk_hash.as_slice())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(rc, 0, "scan_once via reap_one decrements");
+        let (del, n_md): (bool, i64) = sqlx::query_as(
+            "SELECT c.deleted, \
+                    (SELECT COUNT(*) FROM manifest_data WHERE store_path_hash = $1) \
+             FROM chunks c WHERE c.blake3_hash = $2",
+        )
+        .bind(&hash)
+        .bind(chunk_hash.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!del, "scanner reap leaves the chunk row untouched");
+        assert_eq!(n_md, 0, "scanner reap deleted the path rows");
     }
 
     /// `reap_one(Some(threshold))` skips a fresh placeholder. Same
@@ -536,18 +513,30 @@ mod tests {
         .unwrap();
 
         // 5min threshold → fresh placeholder NOT reaped.
-        let reaped = reap_one(&db.pool, &hash, ReapBy::Stale { secs: 300 }, None)
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Stale { secs: 300 })
             .await
             .unwrap();
         assert!(!reaped, "fresh placeholder skipped under threshold");
 
-        // Refcount UNCHANGED (still 1).
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-            .bind(chunk_hash.as_slice())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(rc, 1, "fresh chunked placeholder's refcount untouched");
+        // The fresh upload's rows are all still there.
+        let (n_md, n_chunk): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM manifest_data WHERE store_path_hash = $1), \
+               (SELECT COUNT(*) FROM chunks WHERE blake3_hash = $2)",
+        )
+        .bind(&hash)
+        .bind(chunk_hash.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n_md, 1,
+            "fresh chunked placeholder's manifest_data untouched"
+        );
+        assert_eq!(
+            n_chunk, 1,
+            "fresh chunked placeholder's chunk row untouched"
+        );
     }
 
     // r[verify store.put.placeholder-claim+2]
@@ -555,7 +544,8 @@ mod tests {
     /// inserted with claim_b at the same hash. Before M_052 the
     /// equivalent (`reap_one(threshold=None)`) filtered
     /// `status='uploading'` only — A's late drop-guard reaped B's
-    /// narinfo + chunk refcounts mid-upload.
+    /// in-flight placeholder (and with it the manifest_data that keeps
+    /// B's chunks out of the collect cycle's eligible set).
     #[tokio::test]
     async fn reap_one_claim_mismatch_is_noop() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -565,49 +555,46 @@ mod tests {
 
         // A inserts + is reaped by the orphan scanner (its row is GONE).
         let (_, claim_a) = seed_stale_chunked(&db.pool, &hash, &path).await;
-        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 1, "scanner reaped A's stale placeholder");
 
         // B inserts a FRESH placeholder at the same hash.
-        let (chunk_hash, claim_b) = seed_stale_chunked(&db.pool, &hash, &path).await;
+        let (_, claim_b) = seed_stale_chunked(&db.pool, &hash, &path).await;
         assert_ne!(claim_a, claim_b);
 
         // A's late drop-guard fires with claim_a → MUST NOT match B.
-        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim_a), None)
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim_a))
             .await
             .unwrap();
         assert!(!reaped, "claim_a mismatch → no-op (B's row protected)");
 
-        // B's narinfo + manifests intact; B's chunk refcount unchanged.
-        let n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE store_path_hash = $1")
-                .bind(&hash)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(n, 1, "B's manifests row survives");
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-            .bind(chunk_hash.as_slice())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(rc, 1, "B's chunk refcount untouched");
+        // B's narinfo + manifests + manifest_data intact.
+        let (n_m, n_md): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM manifests WHERE store_path_hash = $1), \
+               (SELECT COUNT(*) FROM manifest_data WHERE store_path_hash = $1)",
+        )
+        .bind(&hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(n_m, 1, "B's manifests row survives");
+        assert_eq!(n_md, 1, "B's manifest_data row survives");
 
         // B's own claim DOES match.
-        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim_b), None)
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim_b))
             .await
             .unwrap();
         assert!(reaped, "claim_b matches → B's placeholder reaped");
     }
 
-    /// The as-built C12 skip polarity is preserved at the legacy reap
-    /// callsite: a corrupt `chunk_list` on a stale placeholder is
-    /// logged and decrements nothing, but the placeholder rows are
-    /// still reaped — the reap never errors on it and never collects
-    /// anything because of it (collection is the fail-closed collect
-    /// cycle's job, which aborts on the same corrupt blob instead).
+    /// The reap is independent of `chunk_list` contents: a corrupt
+    /// blob on a stale placeholder neither blocks the reap nor causes
+    /// any chunk-row write (the reap never parses it — corrupt-input
+    /// handling lives entirely with the collect cycle's fail-closed
+    /// mark, which aborts on the same blob instead).
     #[tokio::test]
-    async fn reap_one_corrupt_chunk_list_skips_decrement() {
+    async fn reap_one_ignores_corrupt_chunk_list() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let hash = vec![0x47u8; 32];
@@ -621,13 +608,12 @@ mod tests {
             .await
             .unwrap();
 
-        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim), None)
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim))
             .await
             .unwrap();
         assert!(reaped, "corrupt chunk_list does not block the reap");
 
-        // The placeholder rows are gone; the chunk's counter is
-        // untouched (skip polarity — no decrement was attempted).
+        // The placeholder rows are gone; the chunk row is untouched.
         let manifest_rows: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM manifest_data WHERE store_path_hash = $1")
                 .bind(&hash)
@@ -635,94 +621,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(manifest_rows, 0);
-        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
-            .bind(chunk_hash.as_slice())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(rc, 1, "corrupt chunk_list → no decrement (warn + skip)");
         let deleted: bool = sqlx::query_scalar("SELECT deleted FROM chunks WHERE blake3_hash = $1")
             .bind(chunk_hash.as_slice())
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert!(!deleted, "the reap path never soft-deletes");
-    }
-
-    /// bug_360: a poison row (CHECK violation in the reap decrement)
-    /// must not abort the whole scan — `scan_once` continues past it.
-    /// Before the fix, `?` propagated the first per-row error and
-    /// every subsequent stale placeholder leaked forever.
-    #[tokio::test]
-    async fn scan_once_continues_past_poison_row() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        // A: chunked placeholder whose chunk is pre-decremented to 0 →
-        // reap_one's write-only decrement trips chunks_refcount_nonneg.
-        let hash_a = vec![0x44u8; 32];
-        let path_a = rio_test_support::fixtures::test_store_path("poison-a");
-        let (chunk_a, _) = seed_stale_chunked(&db.pool, &hash_a, &path_a).await;
-        sqlx::query("UPDATE chunks SET refcount = 0 WHERE blake3_hash = $1")
-            .bind(chunk_a.as_slice())
-            .execute(&db.pool)
-            .await
-            .unwrap();
-
-        // B: well-formed stale chunked placeholder.
-        let hash_b = vec![0x45u8; 32];
-        let path_b = rio_test_support::fixtures::test_store_path("poison-b");
-        seed_stale_chunked(&db.pool, &hash_b, &path_b).await;
-
-        let (reaped, failed) = scan_once(&db.pool, None).await.unwrap();
-        // With cfg(test) SCAN_BATCH_SIZE=2: iter1 selects {A,B}, A
-        // fails, B reaped (progressed=1). iter2 re-selects {A}, A
-        // fails again, n=1<2 → break. failed counts attempts.
-        assert_eq!(failed, 2, "A failed (CHECK violation), retried once");
-        assert_eq!(reaped, 1, "B reaped despite A's failure");
-
-        let b_gone: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
-                .bind(&hash_b)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(b_gone, 0, "B's narinfo deleted");
-    }
-
-    /// merged_bug_019: ≥SCAN_BATCH_SIZE poison rows must NOT livelock
-    /// the scanner. Per-row isolation rolls back failed rows (they
-    /// re-match the predicate); without the zero-progress break, a
-    /// full poison batch yields n=SCAN_BATCH_SIZE forever and
-    /// `spawn_periodic` never reaches the next tick. With the fix,
-    /// scan_once returns (0, SCAN_BATCH_SIZE) after one full batch.
-    #[tokio::test]
-    async fn scan_once_full_poison_batch_terminates() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        // SCAN_BATCH_SIZE (=2 under cfg(test)) poison rows: chunk
-        // pre-decremented to 0 → reap_one's write-only decrement
-        // trips chunks_refcount_nonneg on every row.
-        for i in 0..SCAN_BATCH_SIZE {
-            let hash = vec![0x60u8 + i as u8; 32];
-            let path = rio_test_support::fixtures::test_store_path(&format!("poison-full-{i}"));
-            let (chunk, _) = seed_stale_chunked(&db.pool, &hash, &path).await;
-            sqlx::query("UPDATE chunks SET refcount = 0 WHERE blake3_hash = $1")
-                .bind(chunk.as_slice())
-                .execute(&db.pool)
-                .await
-                .unwrap();
-        }
-
-        let (reaped, failed) =
-            tokio::time::timeout(Duration::from_secs(5), scan_once(&db.pool, None))
-                .await
-                .expect("scan_once must terminate on a full poison batch (zero-progress break)")
-                .unwrap();
-        assert_eq!(reaped, 0, "all rows poison");
-        assert_eq!(
-            failed, SCAN_BATCH_SIZE as u64,
-            "one full batch failed, then break (not unbounded re-count)"
-        );
     }
 
     /// Helper: insert an 'uploading' placeholder AND backdate
@@ -754,7 +658,7 @@ mod tests {
         let path = rio_test_support::fixtures::test_store_path("orphan-stale");
         seed_stale_uploading(&db.pool, &hash, &path).await;
 
-        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 1, "stale uploading manifest reaped");
 
         // narinfo gone (CASCADE took manifests too).
@@ -844,7 +748,7 @@ mod tests {
 
         // And scan_once itself finds nothing (status already
         // complete → SELECT filters it out).
-        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 0, "scan_once found nothing (status=complete)");
     }
 
@@ -870,7 +774,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 0, "fresh upload not reaped");
 
         // narinfo still present.
@@ -901,7 +805,7 @@ mod tests {
 
         // --- store-0's turn: seed stale + reap ---
         seed_stale_uploading(&db.pool, &hash, &path).await;
-        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 1, "store-0 reaped the stale upload");
 
         // --- Worker re-uploads same path (FRESH placeholder) ---
@@ -924,18 +828,13 @@ mod tests {
         //
         // Run the FOR UPDATE query directly. With the stale-threshold
         // re-check, it should return None (fresh re-upload has
-        // updated_at > now()-threshold → doesn't match).
-        // SELECT a non-nullable PK column (NOT md.chunk_list, which is
-        // NULL via LEFT JOIN regardless of WHERE-match → .flatten()
-        // collapsed "no row" with "row + NULL column", making the
-        // assertion vacuous). The LEFT JOIN stays so the FOR UPDATE
-        // shape mirrors production reap_one.
+        // updated_at > now()-threshold → doesn't match). The query
+        // mirrors production reap_one's ownership re-check shape.
         let mut tx = db.pool.begin().await.unwrap();
         let matched: Option<Vec<u8>> = sqlx::query_scalar(
             r#"
             SELECT m.store_path_hash
               FROM manifests m
-              LEFT JOIN manifest_data md USING (store_path_hash)
              WHERE m.store_path_hash = $1
                AND m.status = 'uploading'
                AND m.updated_at < now() - make_interval(secs => $2)
@@ -1070,7 +969,7 @@ mod tests {
         // No heartbeat.
 
         // Scan: dead reaped, live skipped.
-        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool).await.unwrap();
         assert_eq!(reaped, 1, "exactly the non-heartbeated placeholder reaped");
 
         // live still present; dead gone.

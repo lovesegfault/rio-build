@@ -81,13 +81,20 @@ async fn test_chunked_large_nar_chunks() -> TestResult {
     .await?;
     assert_eq!(md_count, 1, "manifest_data row should exist");
 
-    // chunks table refcounts all == 1 (first upload).
-    let refcounts: Vec<(i32,)> = sqlx::query_as("SELECT refcount FROM chunks")
-        .fetch_all(&s.db.pool)
-        .await?;
-    assert_eq!(refcounts.len(), chunk_count);
-    for (rc,) in &refcounts {
-        assert_eq!(*rc, 1, "first upload: all refcounts should be 1");
+    // chunks table: one row per backend chunk, every one confirmed
+    // uploaded, none touched by a second reference yet.
+    let rows: Vec<(bool, bool)> = sqlx::query_as(
+        "SELECT (uploaded_at IS NOT NULL), (last_referenced_at IS NOT NULL) FROM chunks",
+    )
+    .fetch_all(&s.db.pool)
+    .await?;
+    assert_eq!(rows.len(), chunk_count);
+    for (uploaded, touched) in &rows {
+        assert!(
+            *uploaded,
+            "first upload: every chunk row confirmed uploaded"
+        );
+        assert!(!*touched, "first upload: no chunk re-referenced yet");
     }
 
     Ok(())
@@ -129,12 +136,19 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
          {chunks_after_b} after B (should be equal)"
     );
 
-    // Refcounts should all be 2 (both manifests reference every chunk).
-    let refcounts: Vec<(i32,)> = sqlx::query_as("SELECT refcount FROM chunks")
-        .fetch_all(&s.db.pool)
-        .await?;
-    for (rc,) in &refcounts {
-        assert_eq!(*rc, 2, "two uploads of same content: refcount should be 2");
+    // Every chunk row was re-referenced by the second manifest (the
+    // upsert's conflict arm recorded the touch) and stays confirmed.
+    let rows: Vec<(bool, bool)> = sqlx::query_as(
+        "SELECT (uploaded_at IS NOT NULL), (last_referenced_at IS NOT NULL) FROM chunks",
+    )
+    .fetch_all(&s.db.pool)
+    .await?;
+    for (uploaded, touched) in &rows {
+        assert!(*uploaded, "dedup never clears confirmed presence");
+        assert!(
+            *touched,
+            "two uploads of same content: every chunk re-referenced"
+        );
     }
 
     Ok(())
@@ -166,8 +180,8 @@ async fn test_chunked_idempotent() -> TestResult {
 }
 
 /// Hash mismatch rollback: send a large NAR declaring the WRONG hash.
-/// Validation fails → abort_upload. Verify: no manifest_data, no chunks,
-/// refcounts untouched.
+/// Validation fails → abort_upload. Verify: no manifest_data, no chunk
+/// rows leaked.
 ///
 /// This exercises the OLD abort path (pre-chunking) — the validation
 /// failure happens at step 5, BEFORE put_chunked is called. So this is
@@ -609,7 +623,7 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
 
 /// `PutPathBatch` with a chunk backend, both outputs over
 /// `INLINE_THRESHOLD`: phase-2 stages each via `cas::stage_chunked`
-/// (chunks uploaded + refcounted, manifest still `'uploading'`),
+/// (chunks uploaded + chunk rows written, manifest still `'uploading'`),
 /// phase-3's atomic tx flips both to `'complete'` via
 /// `complete_manifest_in_conn`. Asserts both are queryable and
 /// both landed as chunked (`manifest_data.chunk_list IS NOT NULL`,
@@ -673,15 +687,16 @@ async fn gt13_batch_chunked_happy_path() -> TestResult {
 }
 
 /// `PutPathBatch` chunked abort: output-0 large+valid (gets fully
-/// staged in phase-2: placeholder owned, chunks uploaded, refcounts
-/// at 1), output-1 hash-mismatches → phase-2 `bail!` → `abort_batch`
-/// → `reap_one(output-0)` MUST decrement output-0's chunk refcounts
-/// back to zero (the "GC-eligible orphan" guarantee from the
-/// `put_path_batch.rs` doc-comment). DB ends with no committed
-/// manifests and no positive-refcount chunks; only the S3-side blobs
+/// staged in phase-2: placeholder owned, chunks uploaded, chunk rows
+/// written), output-1 hash-mismatches → phase-2 `bail!` → `abort_batch`
+/// → `reap_one(output-0)` MUST delete output-0's placeholder rows so
+/// its staged chunks are left unreferenced (the "GC-eligible orphan"
+/// guarantee from the `put_path_batch.rs` doc-comment — the next
+/// collect cycle owns them). DB ends with no committed manifests and
+/// no manifest references to the staged chunks; only the S3-side blobs
 /// orphan (spec: "blob-store writes are NOT rolled back").
 #[tokio::test]
-async fn gt13_batch_chunked_abort_decrements_refcounts() -> TestResult {
+async fn gt13_batch_chunked_abort_leaves_chunks_unreferenced() -> TestResult {
     let (s, backend) = StoreSession::new_chunked().await?;
     let mut client = s.client.clone();
 
@@ -728,22 +743,24 @@ async fn gt13_batch_chunked_abort_decrements_refcounts() -> TestResult {
         "PlaceholderGuard drop reaped output-0's staged placeholder"
     );
 
-    // THE REFCOUNT ASSERTION: output-0's chunks were staged at
-    // refcount=1; reap_one decremented them back to 0 (GC-eligible).
-    // Without this, every failed batch leaks refcounted chunks
-    // forever. The same `reap_one` tx commits both placeholder DELETE
-    // and refcount decrement, so once `uploading == 0` above this is
-    // settled — but poll for symmetry.
-    let live_chunks = poll_scalar_until(
-        &s.db.pool,
-        "SELECT COUNT(*) FROM chunks WHERE refcount > 0",
-        0i64,
-    )
-    .await;
+    // THE UNREFERENCED ASSERTION: output-0's staged chunk rows are no
+    // longer referenced by any manifest (the reap CASCADE-deleted its
+    // manifest_data), so the next collect cycle can reclaim them. The
+    // reap itself never touches the chunk rows. The same `reap_one` tx
+    // commits the placeholder DELETE, so once `uploading == 0` above
+    // this is settled — but poll for symmetry.
+    let referencing_manifests =
+        poll_scalar_until(&s.db.pool, "SELECT COUNT(*) FROM manifest_data", 0i64).await;
     assert_eq!(
-        live_chunks, 0,
-        "PlaceholderGuard drop's reap_one must decrement staged chunk refcounts to zero"
+        referencing_manifests, 0,
+        "PlaceholderGuard drop's reap_one must delete the staged manifest_data"
     );
+    let (chunk_rows, soft_deleted): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER (WHERE deleted) FROM chunks")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert!(chunk_rows > 0, "the staged chunk rows are left in place");
+    assert_eq!(soft_deleted, 0, "the reap never soft-deletes chunk rows");
 
     // Blob-store writes are NOT rolled back — output-0's chunks orphan
     // in the backend until S3 GC sweeps them. This is the documented

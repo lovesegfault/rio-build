@@ -1348,17 +1348,21 @@ in
     # counts, depths and wall-clocks live in the introducing commits'
     # messages and the checks' transcripts.
     #
-    # Marker scope: the chunk-liveness rules added by the Stage-A spec
-    # audit (no-live-collect, bounded-garbage-retention, refcount-meaning,
-    # refcount-decrement, liveness-not-presence) get their first verify
-    # markers here, on the regime that makes each load-bearing;
-    # the pre-existing mechanism rules that the as-built machinery still
-    # implements (refcount-txn, upsert-inserted, chunk-upload-committed,
-    # placeholder-claim, orphan-heartbeat) gain the model-checked form on
-    # top of their existing unit-test markers; rules whose text now
-    # describes the replacement collector (grace-ttl, pending-deletes,
-    # bounded-garbage-retention, two-phase) carry their verify markers at
-    # the chunkCollect wirings below instead. Witness checks carry no
+    # Marker scope: of the Stage-A spec-audit rules, the surviving ones
+    # (no-live-collect, liveness-not-presence) keep verify markers here,
+    # on the regime that makes each load-bearing; the two as-built
+    # counter rules the audit added (refcount-meaning,
+    # refcount-decrement) were retired with the counter writers in
+    # Release B, so these checks no longer claim spec coverage for them
+    # — the checks themselves stay wired against the as-built model
+    # until its own retirement (Phase 2). Pre-existing mechanism rules
+    # the as-built machinery still implements (upsert-inserted,
+    # chunk-upload-committed, placeholder-claim, orphan-heartbeat) keep
+    # the model-checked form on top of their unit-test markers; rules
+    # whose text now describes the replacement collector (refcount-txn's
+    # upsert+touch pairing, grace-ttl, pending-deletes,
+    # bounded-garbage-retention, two-phase) carry their verify markers
+    # at the chunkCollect wirings below instead. Witness checks carry no
     # markers (same policy as the other models).
     # ------------------------------------------------------------------
 
@@ -1369,9 +1373,6 @@ in
     # must stay reclaimable, and no referenced chunk's object may be
     # deleted.
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.chunk.refcount-meaning]
-    # r[verify store.chunk.refcount-decrement]
-    # r[verify store.chunk.refcount-txn]
     quint-chunk-liveness-base = mkQuintCheck {
       name = "chunk-liveness-base";
       spec = "chunkLiveness";
@@ -1399,9 +1400,8 @@ in
     # writer to re-PUT instead of trusting the counter, and a live
     # heartbeating owner is never reaped.
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.chunk.refcount-meaning]
     # r[verify store.chunk.liveness-not-presence]
-    # r[verify store.cas.upsert-inserted+2]
+    # r[verify store.cas.upsert-inserted+3]
     # r[verify store.cas.chunk-upload-committed]
     # r[verify store.gc.orphan-heartbeat]
     # r[verify store.put.placeholder-claim+2]
@@ -1428,8 +1428,6 @@ in
     # by-count batch sweep, and the late-cleanup no-op contention. No
     # process death: every interleaving is a healthy-process schedule.
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.chunk.refcount-meaning]
-    # r[verify store.chunk.refcount-decrement]
     # r[verify store.chunk.liveness-not-presence]
     quint-chunk-liveness-contend = mkQuintCheck {
       name = "chunk-liveness-contend";
@@ -1457,7 +1455,6 @@ in
     # errs toward retention). The unconditional forms are the
     # pre-registered falsifications below, never invariants here.
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.chunk.refcount-meaning]
     quint-chunk-liveness-corrupt = mkQuintCheck {
       name = "chunk-liveness-corrupt";
       spec = "chunkLiveness";
@@ -1796,6 +1793,7 @@ in
     # r[verify store.gc.chunk-collect]
     # r[verify store.chunk.no-live-collect]
     # r[verify store.gc.bounded-garbage-retention+2]
+    # r[verify store.chunk.refcount-txn+2]
     quint-chunk-collect-base = mkQuintCheck {
       name = "chunk-collect-base";
       spec = "chunkCollect";
@@ -1823,7 +1821,7 @@ in
     # r[verify store.chunk.no-live-collect]
     # r[verify store.gc.bounded-garbage-retention+2]
     # r[verify store.chunk.liveness-not-presence]
-    # r[verify store.cas.upsert-inserted+2]
+    # r[verify store.cas.upsert-inserted+3]
     # r[verify store.cas.chunk-upload-committed]
     # r[verify store.gc.orphan-heartbeat]
     # r[verify store.put.placeholder-claim+2]

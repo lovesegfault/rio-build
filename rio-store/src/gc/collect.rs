@@ -6,8 +6,8 @@
 //! counts it today) inside PostgreSQL, then soft-deletes + enqueues
 //! the chunks that no manifest references and that are older than the
 //! grace window measured from `GREATEST(created_at,
-//! last_referenced_at)`. The maintained `chunks.refcount` counter is
-//! never consulted for the eligibility decision.
+//! last_referenced_at)`. No maintained per-chunk counter exists or is
+//! consulted for the eligibility decision.
 //!
 //! Two arms share the cycle (`CollectMode`, crate-private):
 //!
@@ -27,9 +27,8 @@
 //! `store_path_hash` logged at error level, no verdict produced and
 //! nothing collected. Treating corrupt input as "references nothing"
 //! would turn a storage leak into collected live data, which is the
-//! polarity the design forbids; the legacy decrement paths'
-//! warn-and-skip behavior (`super::parse_unique_chunk_hashes`) is
-//! exactly what the collector must NOT do.
+//! polarity the design forbids (the retired decrement paths'
+//! warn-and-skip behavior is exactly what the collector must NOT do).
 //!
 //! # Capped collect
 //!
@@ -200,7 +199,7 @@ fn mark_validation_offenders_sql() -> String {
 /// count at the design-point scale), and mirroring the cursor into the
 /// anti-join's inner side means each index is walked once across the
 /// whole pass. Eligibility is the manifest fold (absence from
-/// `live_chunks`) plus the grace term; `chunks.refcount` is never
+/// `live_chunks`) plus the grace term; no other liveness signal is
 /// consulted.
 ///
 /// Shared with `gc::mark_scan_bench` so the bench's EXPLAIN plan-shape
@@ -237,7 +236,7 @@ pub(crate) const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chu
 ///
 /// Shared with `gc::mark_scan_bench` (gate (c) measurement runs and
 /// the structural predicate pin exercise this exact statement).
-// r[impl store.chunk.lock-order]
+// r[impl store.chunk.lock-order+2]
 pub(crate) const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL \
      WHERE blake3_hash = ANY($1) AND deleted = FALSE \
        AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
@@ -282,11 +281,6 @@ pub(crate) struct CollectReport {
     /// Sum of `chunks.size` over the would-collect set (shadow arm
     /// only — the dry-run "bytes that would be freed" estimate).
     pub(crate) would_collect_bytes: u64,
-    /// Drift, leak direction: `refcount > 0`, unmarked, not deleted.
-    pub(crate) drift_leaked: u64,
-    /// Drift, under-count direction: marked live, `refcount = 0`, not
-    /// deleted. Never expected while the increment still fires.
-    pub(crate) drift_undercount: u64,
     /// Victims soft-deleted this cycle. Always 0 in shadow mode.
     pub(crate) victims_collected: u64,
     /// Sum of `chunks.size` over the victims soft-deleted this cycle.
@@ -409,8 +403,8 @@ pub(crate) static COLLECT_FAIL_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// written: the validation pass and the expansion see the same manifest
 /// set (no TOCTOU inside the fail-closed guarantee), and uploads or
 /// PutPath rollbacks that commit during the multi-minute mark→report
-/// window cannot surface in the drift gauges — a nonzero drift reading
-/// is real refcount drift, not cycle-concurrent traffic. The
+/// window cannot skew the report — every count is taken against the
+/// same snapshot the verdict was computed on. The
 /// transaction also scopes the cycle's session state (`SET LOCAL`
 /// memory budget) so nothing outlives the cycle on any exit path. The
 /// snapshot (and with it the xmin horizon) is held for the full
@@ -525,8 +519,6 @@ pub(crate) async fn collect_cycle(
             mark_set_size: 0,
             would_collect: 0,
             would_collect_bytes: 0,
-            drift_leaked: 0,
-            drift_undercount: 0,
             victims_collected: 0,
             victim_bytes: 0,
             s3_keys_enqueued: 0,
@@ -573,31 +565,22 @@ pub(crate) async fn collect_cycle(
         .fetch_one(&mut *tx)
         .await?;
 
-    // --- Report: one pass over the not-deleted chunk rows, on the
-    // cycle snapshot ---
-    // drift, leak direction: refcount > 0 AND unmarked;
-    // drift, under-count direction: refcount = 0 AND marked;
-    // would-collect (shadow arm only): unmarked AND past grace (the
-    // collect predicate) plus its byte sum. The live arm does NOT
-    // re-run the would-collect anti-join count — that scan term is
-    // exactly what the per-cycle cap exists to manage (P15); its
-    // backlog visibility comes from the decremental estimate below.
-    let (would_collect, would_collect_bytes, drift_leaked, drift_undercount): (
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = match mode {
+    // --- Report (shadow arm only): one pass over the not-deleted
+    // chunk rows, on the cycle snapshot ---
+    // would-collect: unmarked AND past grace (the collect predicate)
+    // plus its byte sum. The live arm does NOT re-run the
+    // would-collect anti-join count — that scan term is exactly what
+    // the per-cycle cap exists to manage (P15); its backlog
+    // visibility comes from the decremental estimate below.
+    let (would_collect, would_collect_bytes): (i64, i64) = match mode {
         CollectMode::Shadow => {
             sqlx::query_as(
                 "SELECT \
                    COUNT(*) FILTER (WHERE NOT in_mark \
                                       AND GREATEST(created_at, last_referenced_at) < $1::timestamptz), \
                    COALESCE(SUM(size) FILTER (WHERE NOT in_mark \
-                                      AND GREATEST(created_at, last_referenced_at) < $1::timestamptz), 0)::bigint, \
-                   COUNT(*) FILTER (WHERE refcount > 0 AND NOT in_mark), \
-                   COUNT(*) FILTER (WHERE refcount = 0 AND in_mark) \
-                 FROM (SELECT c.refcount, c.size, c.created_at, c.last_referenced_at, \
+                                      AND GREATEST(created_at, last_referenced_at) < $1::timestamptz), 0)::bigint \
+                 FROM (SELECT c.size, c.created_at, c.last_referenced_at, \
                               EXISTS (SELECT 1 FROM live_chunks lc \
                                        WHERE lc.blake3_hash = c.blake3_hash) AS in_mark \
                          FROM chunks c \
@@ -607,21 +590,7 @@ pub(crate) async fn collect_cycle(
             .fetch_one(&mut *tx)
             .await?
         }
-        CollectMode::Live => {
-            let (leaked, undercount): (i64, i64) = sqlx::query_as(
-                "SELECT \
-                   COUNT(*) FILTER (WHERE refcount > 0 AND NOT in_mark), \
-                   COUNT(*) FILTER (WHERE refcount = 0 AND in_mark) \
-                 FROM (SELECT c.refcount, \
-                              EXISTS (SELECT 1 FROM live_chunks lc \
-                                       WHERE lc.blake3_hash = c.blake3_hash) AS in_mark \
-                         FROM chunks c \
-                        WHERE c.deleted = FALSE) AS s",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            (0, 0, leaked, undercount)
-        }
+        CollectMode::Live => (0, 0),
     };
 
     // Commit ends the cycle's snapshot. In shadow mode the temp table
@@ -630,8 +599,6 @@ pub(crate) async fn collect_cycle(
     tx.commit().await?;
 
     metrics::gauge!("rio_store_gc_chunks_live").set(mark_set_size as f64);
-    metrics::gauge!("rio_store_gc_refcount_drift_leaked").set(drift_leaked as f64);
-    metrics::gauge!("rio_store_gc_refcount_drift_undercount").set(drift_undercount as f64);
 
     if mode == CollectMode::Shadow {
         let cycle_seconds = cycle_started.elapsed().as_secs_f64();
@@ -645,11 +612,7 @@ pub(crate) async fn collect_cycle(
 
         info!(
             mark_set_size,
-            would_collect,
-            drift_leaked,
-            drift_undercount,
-            cycle_seconds,
-            "chunk-collect shadow cycle complete"
+            would_collect, cycle_seconds, "chunk-collect shadow cycle complete"
         );
 
         return Ok(CollectReport {
@@ -657,8 +620,6 @@ pub(crate) async fn collect_cycle(
             mark_set_size: mark_set_size as u64,
             would_collect: would_collect as u64,
             would_collect_bytes: would_collect_bytes as u64,
-            drift_leaked: drift_leaked as u64,
-            drift_undercount: drift_undercount as u64,
             victims_collected: 0,
             victim_bytes: 0,
             s3_keys_enqueued: 0,
@@ -799,8 +760,6 @@ pub(crate) async fn collect_cycle(
 
     info!(
         mark_set_size,
-        drift_leaked,
-        drift_undercount,
         victims_collected,
         victim_bytes,
         s3_keys_enqueued,
@@ -815,8 +774,6 @@ pub(crate) async fn collect_cycle(
         mark_set_size: mark_set_size as u64,
         would_collect: 0,
         would_collect_bytes: 0,
-        drift_leaked: drift_leaked as u64,
-        drift_undercount: drift_undercount as u64,
         victims_collected,
         victim_bytes,
         s3_keys_enqueued,
@@ -991,34 +948,20 @@ mod tests {
 
     /// Mark-fold correctness: chunks referenced by 'complete' AND
     /// 'uploading' manifests are both live; only the unreferenced old
-    /// chunk is would-collect; the drift gauges see the seeded shapes;
-    /// and the shadow cycle modifies nothing anywhere.
+    /// chunk is would-collect; and the shadow cycle modifies nothing
+    /// anywhere.
     #[tokio::test]
     async fn shadow_cycle_reports_fold_and_modifies_nothing() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Chunk A: referenced by a complete manifest (refcount honest).
-        let a = ChunkSeed::new(0xA1)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        // Chunk A: referenced by a complete manifest.
+        let a = ChunkSeed::new(0xA1).uploaded().seed(&db.pool).await;
         // Chunk B: referenced ONLY by an 'uploading' placeholder.
-        let b = ChunkSeed::new(0xB2).with_refcount(1).seed(&db.pool).await;
-        // Chunk C: unreferenced, old, stale refcount > 0 (the
-        // historical-leak shape) -> would-collect + drift_leaked.
-        ChunkSeed::new(0xC3)
-            .with_refcount(2)
-            .age_secs(3600)
-            .seed(&db.pool)
-            .await;
-        // Chunk D: referenced by the complete manifest but refcount=0
-        // (the under-count shape, M_023 direction) -> drift_undercount.
-        let d = ChunkSeed::new(0xD4)
-            .with_refcount(0)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let b = ChunkSeed::new(0xB2).seed(&db.pool).await;
+        // Chunk C: unreferenced and old -> would-collect.
+        ChunkSeed::new(0xC3).age_secs(3600).seed(&db.pool).await;
+        // Chunk D: referenced by the complete manifest.
+        let d = ChunkSeed::new(0xD4).uploaded().seed(&db.pool).await;
 
         seed_chunked_manifest(
             &db.pool,
@@ -1051,14 +994,6 @@ mod tests {
         assert_eq!(report.outcome, CollectOutcome::Ok);
         assert_eq!(report.mark_set_size, 3, "a, b, d are referenced (dedup'd)");
         assert_eq!(report.would_collect, 1, "only the old unreferenced chunk");
-        assert_eq!(
-            report.drift_leaked, 1,
-            "stale refcount>0 on the unreferenced chunk"
-        );
-        assert_eq!(
-            report.drift_undercount, 1,
-            "marked-live chunk at refcount=0"
-        );
         assert_eq!(report.victims_collected, 0);
         assert_eq!(report.batches_run, 0);
         assert!(!report.cap_reached);
@@ -1069,14 +1004,6 @@ mod tests {
         assert_eq!(rec.gauge_value("rio_store_gc_chunks_live{}"), Some(3.0));
         assert_eq!(
             rec.gauge_value("rio_store_gc_chunks_would_collect{}"),
-            Some(1.0)
-        );
-        assert_eq!(
-            rec.gauge_value("rio_store_gc_refcount_drift_leaked{}"),
-            Some(1.0)
-        );
-        assert_eq!(
-            rec.gauge_value("rio_store_gc_refcount_drift_undercount{}"),
             Some(1.0)
         );
         assert_eq!(
@@ -1208,11 +1135,7 @@ mod tests {
 
         // A valid manifest + its chunk, plus an old unreferenced chunk
         // that WOULD be reported if the cycle ran.
-        let good = ChunkSeed::new(0x10)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let good = ChunkSeed::new(0x10).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(
             &db.pool,
             "abort-good",
@@ -1248,8 +1171,6 @@ mod tests {
         for g in [
             "rio_store_gc_chunks_live",
             "rio_store_gc_chunks_would_collect",
-            "rio_store_gc_refcount_drift_leaked",
-            "rio_store_gc_refcount_drift_undercount",
             "rio_store_gc_collect_backlog_chunks",
         ] {
             assert!(
@@ -1738,8 +1659,8 @@ mod tests {
             hash[1] = (i & 0xFF) as u8;
             hash[2] = 0xC0;
             sqlx::query(
-                "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at) \
-                 VALUES ($1, 0, $2, now() - interval '1 hour', now() - interval '1 hour')",
+                "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at) \
+                 VALUES ($1, $2, now() - interval '1 hour', now() - interval '1 hour')",
             )
             .bind(&hash[..])
             .bind(size)
@@ -1797,10 +1718,6 @@ mod tests {
         assert_eq!(report.s3_keys_enqueued, 1);
         assert!(!report.cap_reached);
         assert!(report.cursor_at_stop.is_none(), "pass completed");
-        assert_eq!(
-            report.drift_leaked, 1,
-            "the stale counter is reported as leak-direction drift, not consulted"
-        );
 
         let (deleted, uploaded_cleared): (bool, bool) = sqlx::query_as(
             "SELECT deleted, uploaded_at IS NULL FROM chunks WHERE blake3_hash = $1",
@@ -1997,7 +1914,7 @@ mod tests {
             .unwrap()
             .expect("placeholder inserted");
         let chunk_list = make_chunk_list(&[hash]);
-        let (needs_upload, _token) = crate::metadata::upgrade_manifest_to_chunked(
+        let needs_upload = crate::metadata::upgrade_manifest_to_chunked(
             &db.pool,
             &path_hash,
             &chunk_list,
@@ -2010,14 +1927,12 @@ mod tests {
             needs_upload.contains(hash.as_slice()),
             "resurrected chunk must be re-uploaded (uploaded_at was cleared)"
         );
-        let (deleted, refcount): (bool, i32) =
-            sqlx::query_as("SELECT deleted, refcount FROM chunks WHERE blake3_hash = $1")
-                .bind(&hash[..])
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
+        let deleted: bool = sqlx::query_scalar("SELECT deleted FROM chunks WHERE blake3_hash = $1")
+            .bind(&hash[..])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert!(!deleted, "upsert flips deleted back to false");
-        assert!(refcount > 0);
 
         // The stale outbox row from the collect cycle is skipped and
         // dropped by the drain; the backend object survives.

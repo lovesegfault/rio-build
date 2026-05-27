@@ -60,8 +60,8 @@ pub enum MetadataError {
     /// Deadlock detected (PG code 40P01). Two transactions have a
     /// circular lock-wait on overlapping row sets. Retriable — PG
     /// aborted one txn; retry will likely succeed. Prevention: sort
-    /// batch-UPDATE input so all writers acquire locks in the same
-    /// order (see `metadata::with_sorted_retry`). Maps to `aborted`.
+    /// batch row-locking input so all writers acquire locks in the
+    /// same order (the chunk lock-order rule). Maps to `aborted`.
     #[error("deadlock detected (retry)")]
     Deadlock(#[source] sqlx::Error),
 

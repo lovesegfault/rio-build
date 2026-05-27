@@ -166,9 +166,10 @@ pub trait ChunkBackend: Send + Sync {
     async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>>;
 
     /// Compute the storage key for a hash without doing I/O. Used by
-    /// GC sweep to enqueue the key to `pending_s3_deletes` in the SAME
-    /// PG transaction as the refcount decrement (two-phase commit for
-    /// S3 cleanup — enqueue atomically, delete later).
+    /// the chunk collect cycle to enqueue the key to
+    /// `pending_s3_deletes` in the SAME PG transaction as the
+    /// soft-delete (two-phase commit for S3 cleanup — enqueue
+    /// atomically, delete later).
     ///
     /// Returns the backend-specific key: for S3 it's `prefix/aa/hex`
     /// (bucket-relative); for filesystem it's the relative path. The

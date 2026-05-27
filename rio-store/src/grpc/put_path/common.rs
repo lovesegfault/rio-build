@@ -56,7 +56,7 @@ pub(in crate::grpc) enum NarPersist {
     /// Bytes carried so the batch tx can write `inline_blob`.
     Inline(Bytes),
     /// `nar_data.len() >= INLINE_THRESHOLD` and a chunk backend is
-    /// configured. Chunks already uploaded + refcounted via
+    /// configured. Chunks already uploaded + their rows written via
     /// [`cas::stage_chunked`]; only the `status='complete'` flip
     /// remains.
     ChunkedStaged,
@@ -431,19 +431,14 @@ impl StoreServiceImpl {
     }
 
     /// Thin wrapper over [`crate::ingest::spawn_placeholder_guard`]
-    /// supplying `self.pool` / `self.chunk_backend`. See that fn's doc
-    /// for the drop-cleanup + heartbeat invariants.
+    /// supplying `self.pool`. See that fn's doc for the drop-cleanup +
+    /// heartbeat invariants.
     pub(in crate::grpc) fn spawn_placeholder_guard(
         &self,
         store_path_hash: Vec<u8>,
         claim: uuid::Uuid,
     ) -> PlaceholderGuard {
-        crate::ingest::spawn_placeholder_guard(
-            self.pool.clone(),
-            self.chunk_backend.clone(),
-            store_path_hash,
-            claim,
-        )
+        crate::ingest::spawn_placeholder_guard(self.pool.clone(), store_path_hash, claim)
     }
 
     /// Drain a single-output PutPath stream after metadata: accumulate
@@ -569,15 +564,9 @@ impl StoreServiceImpl {
         refs: &[String],
         _ctx_label: &str,
     ) -> Result<PlaceholderClaim, metadata::MetadataError> {
-        let claim = ingest::claim_placeholder(
-            &self.pool,
-            self.chunk_backend.as_ref(),
-            store_path_hash,
-            store_path,
-            refs,
-            PUTPATH_HOOKS,
-        )
-        .await?;
+        let claim =
+            ingest::claim_placeholder(&self.pool, store_path_hash, store_path, refs, PUTPATH_HOOKS)
+                .await?;
         match &claim {
             PlaceholderClaim::AlreadyComplete => {
                 metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
@@ -630,7 +619,7 @@ impl StoreServiceImpl {
     }
 
     /// Batch-phase staging: for outputs ≥ [`cas::INLINE_THRESHOLD`],
-    /// upload chunks + increment refcounts via [`cas::stage_chunked`]
+    /// upload chunks + write their rows via [`cas::stage_chunked`]
     /// WITHOUT flipping `status='complete'`. Returns the
     /// [`NarPersist`] discriminant so the batch's atomic tx can pick
     /// the `inline_blob` arg to [`metadata::complete_manifest_in_conn`].

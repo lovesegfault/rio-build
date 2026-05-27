@@ -867,7 +867,6 @@ impl Substituter {
 
         let claim = match ingest::claim_placeholder(
             &self.pool,
-            self.chunk_backend.as_ref(),
             &store_path_hash,
             info.store_path.as_str(),
             &refs_str,
@@ -915,12 +914,8 @@ impl Substituter {
         // We OWN the placeholder. Guard against future-drop (client
         // RST_STREAM mid-fetch) — the guard's spawn reaps it if any
         // path between here and the defuse below is abandoned.
-        let placeholder_guard = ingest::spawn_placeholder_guard(
-            self.pool.clone(),
-            self.chunk_backend.clone(),
-            store_path_hash.to_vec(),
-            claim,
-        );
+        let placeholder_guard =
+            ingest::spawn_placeholder_guard(self.pool.clone(), store_path_hash.to_vec(), claim);
 
         // The remaining steps are fallible AND we own the placeholder;
         // funnel through one async block so a single error arm handles
@@ -1008,13 +1003,7 @@ impl Substituter {
                 // slate (the guard's tokio::spawn fires too late for
                 // that). threshold=None: our placeholder.
                 placeholder_guard.defuse();
-                ingest::abort_placeholder(
-                    &self.pool,
-                    self.chunk_backend.as_ref(),
-                    &store_path_hash,
-                    claim,
-                )
-                .await;
+                ingest::abort_placeholder(&self.pool, &store_path_hash, claim).await;
                 Err(e)
             }
         }

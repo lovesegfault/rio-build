@@ -16,11 +16,12 @@
 //! S3 uploads can't live inside a DB transaction (the spec says
 //! "blob-store writes are NOT rolled back"). Outputs ≥
 //! `INLINE_THRESHOLD` are staged via [`cas::stage_chunked`] BEFORE the
-//! atomic tx (chunks uploaded + refcounted, manifest still
+//! atomic tx (chunks uploaded + chunk rows written, manifest still
 //! `status='uploading'`); the tx then flips inline AND chunked outputs
 //! to `'complete'` together. On batch failure the staged chunks orphan
-//! (refcount-zero after `PlaceholderGuard` drop-reap, GC-eligible).
-//! Bound: ≤1 NAR-size of orphaned blob per failed output.
+//! (unreferenced after `PlaceholderGuard` drop-reap, collected by the
+//! next collect cycle). Bound: ≤1 NAR-size of orphaned blob per
+//! failed output.
 // r[impl store.atomic.multi-output]
 
 use std::collections::BTreeMap;
@@ -344,8 +345,8 @@ impl StoreServiceImpl {
     /// Phase 3: open ONE transaction, flip every owned output to
     /// `status='complete'` (inline or chunked-staged), commit, then
     /// emit per-output created/bytes metrics. Tx auto-rollback on early
-    /// return; caller's `PlaceholderGuard`s reap placeholders on Drop +
-    /// staged chunk refcounts (committed in phase-2's separate txs).
+    /// return; caller's `PlaceholderGuard`s reap placeholders on Drop
+    /// (staged chunks are left for the collect cycle).
     // r[impl store.put.wal-manifest]
     // r[impl obs.metric.transfer-volume]
     async fn commit_batch(

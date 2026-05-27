@@ -37,7 +37,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rio_proto::validated::ValidatedPathInfo;
-use tracing::warn;
 
 mod chunked;
 mod cluster_key_history;
@@ -51,8 +50,7 @@ pub(crate) mod upstreams;
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub(crate) use chunked::{
-    PlaceholderToken, complete_manifest_chunked, delete_manifest_chunked_uploading,
-    mark_chunks_uploaded, upgrade_manifest_to_chunked,
+    complete_manifest_chunked, mark_chunks_uploaded, upgrade_manifest_to_chunked,
 };
 pub(crate) use cluster_key_history::load_cluster_key_history;
 pub(crate) use inline::{
@@ -87,41 +85,6 @@ const PG_DEADLOCK_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::B
 /// 50–150ms jitter; see [`PG_DEADLOCK_BACKOFF`].
 pub(crate) fn jitter() -> Duration {
     PG_DEADLOCK_BACKOFF.duration(0)
-}
-
-/// Execute a batch `UPDATE ... WHERE <key> = ANY($1)` with deadlock-safe
-/// lock ordering. Sorts the input before binding so all callers acquire
-/// PG row locks in the same deterministic order (prevents circular wait
-/// → SQLSTATE 40P01). Wraps in a single retry-on-40P01: the sort SHOULD
-/// prevent deadlock, but PG can still hit it on index-page splits under
-/// extreme contention; one retry is cheap, unbounded retry masks real
-/// problems.
-///
-/// The `body` closure receives the SORTED keys (owned, cloned once per
-/// attempt) and must perform the full transaction (begin→UPDATE→commit).
-/// On 40P01, the closure is re-invoked after jitter — PG aborts the
-/// whole txn on deadlock, not just the failing statement.
-///
-/// Owned `Vec<Vec<u8>>` (not `&[Vec<u8>]`): the closure returns a
-/// `Future` that must own its captures across `.await` points; a slice
-/// borrow into the helper's stack would need higher-ranked trait bounds.
-/// The one-clone cost (~KB for typical chunk batches) is negligible
-/// versus PG roundtrips.
-// r[impl store.chunk.lock-order]
-pub(crate) async fn with_sorted_retry<T, F, Fut>(mut keys: Vec<Vec<u8>>, body: F) -> Result<T>
-where
-    F: Fn(Vec<Vec<u8>>) -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    keys.sort_unstable();
-    match body(keys.clone()).await {
-        Err(MetadataError::Deadlock(e)) => {
-            warn!(error = %e, "40P01 on batch UPDATE; retrying once after jitter");
-            tokio::time::sleep(jitter()).await;
-            body(keys).await
-        }
-        r => r,
-    }
 }
 
 /// How a NAR's content is stored. Returned by [`get_manifest`].
@@ -654,25 +617,22 @@ mod tests {
 
     /// upgrade_manifest_to_chunked's ON CONFLICT upsert must clear
     /// `deleted=false` when resurrecting a chunk. Without this,
-    /// PutPath bumps refcount but leaves deleted=true → chunks row
-    /// is inconsistent (refcount>0 but marked deleted). The drain
-    /// re-check catches it either way, but self-consistent row state
-    /// makes the chunks table correct on its own.
+    /// PutPath re-references the chunk but leaves deleted=true → the
+    /// chunks row is inconsistent (referenced but flagged for the
+    /// drain). The drain re-check catches it either way, but
+    /// self-consistent row state makes the chunks table correct on
+    /// its own.
     #[tokio::test]
     async fn integration_chunked_upsert_clears_deleted() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Seed a "sweep just marked me dead" chunk: refcount=0,
-        // deleted=true.
+        // Seed a "collect just marked me dead" chunk: deleted=true.
         let chunk_hash = vec![0xEEu8; 32];
-        sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-             VALUES ($1, 0, 100, true)",
-        )
-        .bind(&chunk_hash)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO chunks (blake3_hash, size, deleted) VALUES ($1, 100, true)")
+            .bind(&chunk_hash)
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         // Set up placeholder for upgrade_manifest_to_chunked (requires
         // existing 'uploading' manifests row, which requires narinfo).
@@ -682,8 +642,8 @@ mod tests {
             .unwrap();
 
         // Upgrade with a chunk_list referencing our dead chunk.
-        // Minimal Manifest: one entry. The upsert should bump
-        // refcount 0→1 AND clear deleted→false.
+        // Minimal Manifest: one entry. The upsert should clear
+        // deleted→false and record the re-reference (the touch).
         let manifest = crate::manifest::Manifest {
             entries: vec![crate::manifest::ManifestEntry {
                 hash: [0xEEu8; 32],
@@ -700,15 +660,16 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify: refcount=1, deleted=false. refcount is PG INTEGER → i32.
-        let (refcount, deleted): (i32, bool) =
-            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
-                .bind(&chunk_hash)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(refcount, 1, "upsert bumped refcount");
+        // Verify: deleted=false, re-reference touch recorded.
+        let (deleted, touched): (bool, bool) = sqlx::query_as(
+            "SELECT deleted, (last_referenced_at IS NOT NULL) FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk_hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
         assert!(!deleted, "upsert cleared deleted=false (chunk resurrected)");
+        assert!(touched, "upsert's conflict arm recorded the re-reference");
     }
 
     /// Test-only shallow clone. MetadataError can't derive Clone (holds

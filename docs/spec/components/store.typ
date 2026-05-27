@@ -173,27 +173,39 @@ table schema:
   [Soft-delete flag (set by GC sweep)],
 )
 
-#r("store.chunk.refcount-txn")[
-  *Refcount increment:* In the same PostgreSQL transaction that writes
-  `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT
-  (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` --- a single
-  UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict
-  resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls
-  with overlapping chunk lists both increment correctly without explicit
-  locking.
+#r("store.chunk.refcount-txn+2")[
+  *Chunk-row write-ahead:* In the same PostgreSQL transaction that writes
+  `manifest_data` (step 2 of PutPath), the chunk rows for every hash the
+  manifest references MUST be upserted --- a single `INSERT ... ON CONFLICT
+  (blake3_hash) DO UPDATE` over the full chunk list via `UNNEST`, whose
+  conflict arm clears `deleted` (the resurrect) and sets
+  `last_referenced_at = now()` (the re-reference touch the collect cycle's
+  grace term reads). No per-chunk counter or other liveness aggregate is
+  maintained. PostgreSQL's conflict resolution serializes INSERT vs UPDATE
+  per-row, so concurrent `PutPath` calls with overlapping chunk lists are
+  both recorded correctly without explicit locking.
 ]
 
-#r("store.chunk.lock-order")[
+The pairing matters in both directions: the durable manifest reference and
+the chunk row it justifies commit together, so the collect cycle's mark fold
+(which reads `manifest_data.chunk_list` of every existing manifest) and the
+row state it collects against can never disagree about an in-flight upload.
+
+#r("store.chunk.lock-order+2")[
   All batch row-locking statements keyed on `blake3_hash` (`UPDATE chunks ...
   WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash
-  arrays) MUST bind a sorted input array. PostgreSQL acquires row locks in
-  ANY()/UNNEST scan order; unsorted overlapping sets across concurrent
-  transactions create circular lock-wait → SQLSTATE 40P01. Sorting makes
-  lock-acquisition order deterministic across all writers. Note: a RETURNING
-  set is NOT in input-array order --- re-sort before passing to downstream
-  ANY() statements. A single defensive retry on 40P01 is permitted (index-page
-  splits can still deadlock under extreme contention); unbounded retry is NOT
-  permitted (masks real lock-order bugs).
+  arrays) MUST bind a sorted input array. After the counter writers'
+  retirement the statements this binds are the PutPath chunk-row upsert,
+  `mark_chunks_uploaded`, and the collect cycle's batch statements (candidate
+  scan order feeding the sorted `= ANY` soft-delete and the outbox enqueue);
+  the drain takes single-row locks and carries no array to sort. PostgreSQL
+  acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets
+  across concurrent transactions create circular lock-wait → SQLSTATE 40P01.
+  Sorting makes lock-acquisition order deterministic across all writers.
+  Note: a RETURNING set is NOT in input-array order --- re-sort before
+  passing to downstream ANY() statements. A single defensive retry on 40P01
+  is permitted (index-page splits can still deadlock under extreme
+  contention); unbounded retry is NOT permitted (masks real lock-order bugs).
 ]
 
 #r("store.chunk.grace-ttl+2")[
@@ -217,51 +229,19 @@ equivalent to `created_at` (the column is touched only by the upsert's
 orphan-chunk sweep's `refcount = 0` reaping --- that mechanism is retired with
 the counter readers; the window itself (and its 300 s default) is unchanged.
 
-#r("store.chunk.refcount-decrement")[
-  *Refcount decrement:* every transaction that deletes a manifest row --- the
-  reclaim of a stale `'uploading'` manifest, the in-process `put_chunked`
-  rollback, or the GC sweep of an unreachable `'complete'` path --- MUST
-  decrement `chunks.refcount` in that same transaction, using the chunk list
-  taken from the deleted manifest's own `manifest_data.chunk_list`: one
-  decrement per unique hash per deleted manifest, summed by count when one
-  statement covers several deleted manifests sharing a chunk. Chunks that
-  reach `refcount = 0` are never deleted from the backend by the deleting
-  transaction: the GC/reap paths soft-delete them (`deleted = true`,
-  `uploaded_at` cleared) and enqueue their keys to `pending_s3_deletes` in
-  the same transaction (#rref("store.gc.pending-deletes")); the in-process
-  rollback leaves them at zero for the orphan-chunk sweep to collect after
-  the grace TTL (#rref("store.chunk.grace-ttl")).
-]
-
-As-built rule, slated for retirement together with the counter: it exists to
-keep #rref("store.chunk.refcount-meaning") true and has no meaning without
-the column. Known deviation, accepted as-built: a `chunk_list` that fails to
-deserialize at deletion time is logged and the decrement skipped --- the
-affected chunks' refcounts never return to zero and the chunks are never
-collected (the carve-out under #rref("store.gc.bounded-garbage-retention")).
-
-#r("store.chunk.refcount-meaning")[
-  Counter meaning: at every point where no chunk-mutating transaction is in
-  flight, `chunks.refcount(h)` MUST equal the number of existing manifests
-  --- `'uploading'` and `'complete'` alike --- whose
-  `manifest_data.chunk_list` references `h`, counting each manifest once
-  regardless of how many times `h` repeats inside its chunk list. The
-  increment (#rref("store.chunk.refcount-txn")) and decrement
-  (#rref("store.chunk.refcount-decrement")) exist solely to maintain this
-  equality; nothing else writes the counter. Sanctioned deviations: transient
-  over-counts left by a crash between the write-ahead upsert and the upload's
-  completion or cleanup, repaired when the stale placeholder is reclaimed
-  (#rref("store.put.stale-reclaim"), the orphan scanner); and the permanent
-  over-count left by a manifest whose `chunk_list` could not be deserialized
-  at deletion time (#rref("store.chunk.refcount-decrement")). Under-counts
-  are never sanctioned.
-]
-
-As-built rule, slated for retirement together with the counter: the planned
-replacement derives chunk liveness from the manifests at collect time, makes
-this equality true by construction, and then deletes the column. The
-`CHECK (refcount >= 0)` constraint added by migration 023 is the only runtime
-enforcement of (one side of) this rule; the spec carries the full equality.
+The two as-built counter rules that used to live here ---
+`store.chunk.refcount-decrement` (every manifest-deleting transaction
+decrements the counter from the deleted manifest's own `chunk_list`) and
+`store.chunk.refcount-meaning` (the counter equals the manifest fold at every
+quiescent point) --- were retired with the counter writers in Release B of
+the refcount-formal campaign. Liveness is derived from the manifests at
+collect time (#rref("store.chunk.liveness-derived"),
+#rref("store.gc.chunk-collect")), which makes the old equality true by
+construction with no maintained aggregate left to drift; the historical
+`chunks.refcount` column is write-free, unread, and dropped by the
+post-rollout follow-up migration. The retirement record (what each rule
+required, what replaced it, and the calibration evidence) lives in
+`docs/spec/models/refcount-invariant-map.md`.
 
 #r("store.chunk.no-live-collect")[
   No live chunk is ever collected: if any existing `'complete'` manifest's
@@ -277,14 +257,15 @@ enforcement of (one side of) this rule; the spec carries the full equality.
 ]
 
 This is the chunk store's data-loss invariant, stated mechanism-neutrally:
-today it is enforced by the write-ahead increment
-(#rref("store.chunk.refcount-txn")), the same-transaction
-decrement-and-zero-detect (#rref("store.chunk.refcount-decrement")), the
-upsert's resurrect arm (`deleted = false`), the soft-delete clearing
+today it is enforced by the write-ahead chunk-row upsert committing with the
+manifest reference (#rref("store.chunk.refcount-txn")), the collect cycle's
+fail-closed mark fold and grace term (#rref("store.gc.chunk-collect"),
+#rref("store.chunk.grace-ttl")), the upsert's resurrect arm
+(`deleted = false`) and `last_referenced_at` touch, the soft-delete clearing
 `uploaded_at` (#rref("store.cas.chunk-upload-committed")), and the drain's
 `FOR UPDATE` re-check immediately before the irreversible backend delete
-(#rref("store.gc.pending-deletes")). It survives unchanged if the counter is
-replaced by manifest-derived collection.
+(#rref("store.gc.pending-deletes")). It survived the counter's replacement
+by manifest-derived collection unchanged.
 
 #r("store.gc.bounded-garbage-retention+2")[
   No dead chunk is retained forever: an existing chunk row referenced by no
@@ -307,10 +288,10 @@ The bound was previously one full pass of the applicable legacy reclamation
 path (the path sweep's chunk block, the stale-placeholder reclaim, the hourly
 orphan-chunk sweep) and was conditional on the hand-maintained refcount being
 correct: a counter left above zero by a missed decrement (including the
-corrupt-`chunk_list` skip recorded under
-#rref("store.chunk.refcount-decrement")) never returned to zero and the chunk
-was retained indefinitely --- the carve-out was a permanent,
-warning-level-only exemption. The collector replaces the conditionality:
+corrupt-`chunk_list` decrement skip the as-built rules sanctioned) never
+returned to zero and the chunk was retained indefinitely --- the carve-out
+was a permanent, warning-level-only exemption. The collector replaces the
+conditionality:
 liveness is recomputed from the manifests each cycle, so a missed decrement
 cannot occur, historical leak shapes become ordinary collect-cycle victims,
 a backlog larger than the per-cycle cap drains across consecutive cycles
@@ -330,15 +311,16 @@ narrows to the fail-closed, alerted, remediation-bounded pause stated above.
   (#rref("store.chunk.liveness-not-presence")).
 ]
 
-The replacement counterpart of #rref("store.chunk.refcount-meaning"): the
+The replacement counterpart of the retired as-built counter-meaning rule: the
 same fold, recomputed from `manifest_data.chunk_list` per cycle instead of
 mirrored by hand-maintained arithmetic. It is what dissolves the leaked- and
 under-counted-refcount bug classes --- there is no stored aggregate left to
 drift --- while #rref("store.chunk.no-live-collect") (unchanged) remains the
 data-loss obligation the recomputation must satisfy. The rule is
-deliberately silent on the counter column itself: during the cutover the
-counter may still be written (write-only) for mixed-fleet safety; what is
-forbidden is deciding eligibility from it.
+deliberately silent on the historical counter column itself: until the
+post-rollout follow-up migration drops it, pre-cutover pods may still write
+it for mixed-fleet safety; what is forbidden is deciding eligibility from
+it.
 
 #r("store.gc.chunk-collect")[
   Chunk collection MUST run as a collect cycle of: (1) a snapshot of the
@@ -1194,13 +1176,14 @@ unrewritten until the refcount-prose retirement pass._
   progress stream.
 ]
 
-#r("store.cas.upsert-inserted+2")[
+#r("store.cas.upsert-inserted+3")[
   The chunk-upsert batch INSERT returns per-row `(uploaded_at IS NULL) AS
   needs_upload` so the caller knows which blake3 hashes need upload to backend.
   The predicate is atomic with the upsert (no re-query window) and is keyed on
-  confirmed backend presence rather than refcount: a chunk whose first uploader
-  was killed mid-PUT has refcount≥1 but `uploaded_at IS NULL`, so the next
-  PutPath re-uploads instead of skipping into permanent data loss.
+  confirmed backend presence rather than any liveness signal or row
+  pre-existence: a chunk whose first uploader was killed mid-PUT has its row
+  in place but `uploaded_at IS NULL`, so the next PutPath re-uploads instead
+  of skipping into permanent data loss.
 ]
 
 #r("store.cas.chunk-upload-committed")[

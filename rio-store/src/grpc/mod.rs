@@ -531,13 +531,7 @@ impl StoreServiceImpl {
     /// `insert_manifest_uploading` returned `Some(claim)` (i.e., we own the
     /// placeholder).
     async fn abort_upload(&self, store_path_hash: &[u8], claim: uuid::Uuid) {
-        crate::ingest::abort_placeholder(
-            &self.pool,
-            self.chunk_backend.as_ref(),
-            store_path_hash,
-            claim,
-        )
-        .await;
+        crate::ingest::abort_placeholder(&self.pool, store_path_hash, claim).await;
         metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
     }
 }

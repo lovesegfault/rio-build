@@ -374,20 +374,17 @@ mod tests {
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed chunk X in backend + chunks table (resurrected state:
-        // refcount=1, deleted=false — as PutPath's upsert would leave it).
+        // deleted=false — as PutPath's upsert would leave it).
         let hash_x = [0x11u8; 32];
         backend
             .put(&hash_x, bytes::Bytes::from_static(b"chunk-X-live-data"))
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-             VALUES ($1, 1, 17, false)",
-        )
-        .bind(hash_x.as_slice())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO chunks (blake3_hash, size, deleted) VALUES ($1, 17, false)")
+            .bind(hash_x.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
         // Pending row (sweep enqueued this BEFORE PutPath resurrected).
         let key_x = backend.key_for(&hash_x);
         sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
@@ -397,21 +394,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Also seed chunk Y — genuinely dead (refcount=0, deleted=true).
-        // Proves the re-check doesn't accidentally skip REAL deletes.
+        // Also seed chunk Y — genuinely dead (deleted=true). Proves
+        // the re-check doesn't accidentally skip REAL deletes.
         let hash_y = [0x22u8; 32];
         backend
             .put(&hash_y, bytes::Bytes::from_static(b"chunk-Y-dead-data"))
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-             VALUES ($1, 0, 17, true)",
-        )
-        .bind(hash_y.as_slice())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO chunks (blake3_hash, size, deleted) VALUES ($1, 17, true)")
+            .bind(hash_y.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let key_y = backend.key_for(&hash_y);
         sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
             .bind(&key_y)
@@ -557,21 +551,18 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
-        // Seed chunk X: dead state (refcount=0, deleted=true) — sweep
+        // Seed chunk X: dead state (deleted=true) — the collect cycle
         // already marked it. Pending S3 delete enqueued.
         let hash_x = [0x77u8; 32];
         backend
             .put(&hash_x, bytes::Bytes::from_static(b"chunk-X-toctou"))
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-             VALUES ($1, 0, 14, true)",
-        )
-        .bind(hash_x.as_slice())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO chunks (blake3_hash, size, deleted) VALUES ($1, 14, true)")
+            .bind(hash_x.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let key_x = backend.key_for(&hash_x);
         sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
             .bind(&key_x)
@@ -590,15 +581,16 @@ mod tests {
 
         let (drain_res, upsert_res) = tokio::join!(
             drain_once(&pool_a, &backend_a),
-            // PutPath's chunk upsert: ON CONFLICT bumps refcount,
-            // clears deleted. RETURNING (uploaded_at IS NULL) tells
-            // caller whether to upload (true = no prior upload
-            // committed). Mirrors metadata::upgrade_manifest_to_chunked.
+            // PutPath's chunk upsert: ON CONFLICT clears deleted and
+            // touches last_referenced_at. RETURNING (uploaded_at IS
+            // NULL) tells the caller whether to upload (true = no
+            // prior upload committed). Mirrors
+            // metadata::upgrade_manifest_to_chunked.
             sqlx::query_scalar::<_, bool>(
-                "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-                 VALUES ($1, 1, 14, false) \
+                "INSERT INTO chunks (blake3_hash, size, deleted) \
+                 VALUES ($1, 14, false) \
                  ON CONFLICT (blake3_hash) DO UPDATE SET \
-                   refcount = chunks.refcount + 1, deleted = false \
+                   deleted = false, last_referenced_at = now() \
                  RETURNING (uploaded_at IS NULL)"
             )
             .bind(hash_x.as_slice())
@@ -610,15 +602,15 @@ mod tests {
 
         // Two valid serializations:
         //
-        // A) Drain wins: re-check sees (deleted AND refcount=0)=true,
-        //    S3-deletes, commits. THEN upsert runs against the
-        //    deleted row → uploaded_at is NULL → must_upload=true →
-        //    caller re-uploads. deleted=1, must_upload=true.
+        // A) Drain wins: re-check sees deleted=true, S3-deletes,
+        //    commits. THEN upsert runs against the deleted row →
+        //    uploaded_at is NULL → must_upload=true → caller
+        //    re-uploads. deleted=1, must_upload=true.
         //
-        // B) Upsert wins: refcount→1, deleted→false, commits. THEN
-        //    drain's re-check sees (deleted AND refcount=0)=false,
-        //    skips S3 delete. deleted=0, must_upload=true (uploaded_at
-        //    still NULL — drain seed never set it).
+        // B) Upsert wins: deleted→false, commits. THEN drain's
+        //    re-check sees deleted=false, skips S3 delete. deleted=0,
+        //    must_upload=true (uploaded_at still NULL — drain seed
+        //    never set it).
         //
         // What must NEVER happen (the bug FOR UPDATE fixes):
         // deleted=1 AND must_upload=false → S3 deleted but caller
@@ -633,12 +625,12 @@ mod tests {
             "permanent data loss: S3 deleted but upsert saw uploaded_at set \
              (skipped re-upload). deleted={deleted} must_upload={must_upload}"
         );
-        // In practice, with this timing, upsert always sees
-        // refcount=1 (chunk was at 0 before). Both serializations
-        // yield must_upload=true. Sanity-check that invariant.
+        // In practice, with this timing, both serializations yield
+        // must_upload=true (the seed never set uploaded_at).
+        // Sanity-check that invariant.
         assert!(
             must_upload,
-            "upsert should see refcount=1 (was 0) → must re-upload"
+            "upsert should see uploaded_at NULL → must re-upload"
         );
     }
 
@@ -658,14 +650,11 @@ mod tests {
         let hash_x = [0x10u8; 32];
         let hash_y = [0x20u8; 32];
         for h in [&hash_x, &hash_y] {
-            sqlx::query(
-                "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
-                 VALUES ($1, 0, 8, true)",
-            )
-            .bind(h.as_slice())
-            .execute(&db.pool)
-            .await
-            .unwrap();
+            sqlx::query("INSERT INTO chunks (blake3_hash, size, deleted) VALUES ($1, 8, true)")
+                .bind(h.as_slice())
+                .execute(&db.pool)
+                .await
+                .unwrap();
             sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
                 .bind(hex::encode(h))
                 .bind(h.as_slice())

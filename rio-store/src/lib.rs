@@ -274,25 +274,7 @@ pub fn describe_metrics() {
         "Chunks soft-deleted (and, when a chunk backend exists, enqueued to \
          pending_s3_deletes) by live collect cycles. Incremented per \
          committed collect batch. The expected one-time reclamation of \
-         historical refcount leaks shows up here after the cutover."
-    );
-    describe_gauge!(
-        "rio_store_gc_refcount_drift_leaked",
-        "Refcount drift, leak direction: chunks with refcount > 0 that no \
-         existing manifest references (not deleted). Computed on the collect \
-         cycle's single REPEATABLE READ snapshot, so traffic concurrent with \
-         the cycle cannot surface here. Expected to match the historical \
-         leak classes before the cutover and stopped-decrement artifacts \
-         after it; growth beyond those is unexplained drift."
-    );
-    describe_gauge!(
-        "rio_store_gc_refcount_drift_undercount",
-        "Refcount drift, under-count direction: chunks referenced by an \
-         existing manifest while refcount = 0 (not deleted). Computed on the \
-         collect cycle's single REPEATABLE READ snapshot, so traffic \
-         concurrent with the cycle cannot surface here. Never expected while \
-         the increment still fires; any occurrence during the Release A \
-         window is an abort signal for the cutover."
+         historical chunk leaks shows up here after the cutover."
     );
     describe_gauge!(
         "rio_store_gc_collect_backlog_chunks",
@@ -578,8 +560,6 @@ pub fn describe_metrics() {
     // pre-register reasoning as the drain gauges above.
     metrics::gauge!("rio_store_gc_chunks_live").set(0.0);
     metrics::gauge!("rio_store_gc_chunks_would_collect").set(0.0);
-    metrics::gauge!("rio_store_gc_refcount_drift_leaked").set(0.0);
-    metrics::gauge!("rio_store_gc_refcount_drift_undercount").set(0.0);
     metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(0.0);
     // Chunk-collect counters: pre-register at 0 so the staleness alert
     // (sum(increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h]))

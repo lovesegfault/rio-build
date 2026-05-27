@@ -33,31 +33,34 @@ impl From<sqlx::Error> for SweepAbort {
     }
 }
 
-/// Batch size for sweep transactions. Each batch is a single tx:
-/// N narinfo DELETEs + chunk refcount decrements + pending_s3_deletes
-/// INSERTs. Small enough that a batch-rollback on conflict doesn't
-/// waste much; large enough to amortize tx overhead.
+/// Batch size for sweep transactions. Each batch is a single tx of
+/// N narinfo DELETEs (CASCADE to manifests/manifest_data). Small
+/// enough that a batch-rollback on conflict doesn't waste much; large
+/// enough to amortize tx overhead.
 #[cfg(not(test))]
 const SWEEP_BATCH_SIZE: usize = 100;
 #[cfg(test)]
 const SWEEP_BATCH_SIZE: usize = 2;
 
-/// Grace period before a standalone chunk (refcount=0) becomes
-/// GC-eligible.
+/// Grace period before an unreferenced chunk becomes GC-eligible
+/// (the collect cycle's grace term).
 ///
 /// # Why a grace window exists
 ///
 /// `cas::put_chunked` upserts the `chunks` row BEFORE uploading to
-/// S3 (write-ahead). If the upload crashes, the row sits at
-/// refcount=0 with `uploaded_at IS NULL`. A retry of the same
-/// PutPath bumps refcount and clears `deleted`; the grace window
-/// gives that retry time to land before the orphan reaper fires.
+/// S3 (write-ahead). If the upload crashes, the row sits unreferenced
+/// once its placeholder is reaped, with `uploaded_at IS NULL`. A retry
+/// of the same PutPath re-references it (and clears `deleted` if a
+/// collect cycle got there first); the grace window gives that retry
+/// time to land before the collect cycle fires, and absorbs the
+/// mark-snapshot race together with the upsert's
+/// `last_referenced_at` touch.
 ///
 /// # Why 300s
 ///
 /// Long enough to cover a stalled-then-retried PutPath; short
 /// enough that a genuinely abandoned chunk leaks storage for only
-/// 5 minutes before the next sweep reaps it. Compare
+/// minutes beyond the next collect cycle. Compare
 /// `orphan::STALE_THRESHOLD` (15min) — that's for stale `uploading`
 /// manifests, whose false-positive reaping is costlier (a whole
 /// NAR re-upload).
@@ -1166,16 +1169,14 @@ mod tests {
         let path = test_store_path("chunked");
         let sp_hash = path_hash(&path);
 
-        // Seed two chunks at refcount=1, old enough to be outside the
-        // collect grace window once the path is swept.
+        // Seed two chunks, old enough to be outside the collect grace
+        // window once the path is swept.
         let chunk_h1 = ChunkSeed::new(0xAA)
-            .with_refcount(1)
             .with_size(1000)
             .age_secs(3600)
             .seed(&db.pool)
             .await;
         let chunk_h2 = ChunkSeed::new(0xBB)
-            .with_refcount(1)
             .with_size(2000)
             .age_secs(3600)
             .seed(&db.pool)
@@ -1227,14 +1228,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(narinfo_count, 0);
-        let rows: Vec<(i32, bool)> =
-            sqlx::query_as("SELECT refcount, deleted FROM chunks ORDER BY blake3_hash")
-                .fetch_all(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(rows.len(), 2);
-        for (refcount, deleted) in &rows {
-            assert_eq!(*refcount, 1, "the sweep no longer decrements");
+        let rows: Vec<(bool,)> = sqlx::query_as("SELECT deleted FROM chunks ORDER BY blake3_hash")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "the sweep leaves the chunk rows in place");
+        for (deleted,) in &rows {
             assert!(!deleted, "the sweep no longer soft-deletes chunks");
         }
         let enqueued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")

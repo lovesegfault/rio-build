@@ -42,9 +42,7 @@ advisory lock held --- a GC run or another replica's cycle in flight
 --- skips, so at most one cycle runs cluster-wide at a time and a
 replica skipping its tick is expected, not a stall. Each live cycle
 computes the live set, reports
-#(refs.metric)("rio_store_gc_chunks_live") and the refcount drift pair
-(#(refs.metric)("rio_store_gc_refcount_drift_leaked"),
-#(refs.metric)("rio_store_gc_refcount_drift_undercount")), then
+#(refs.metric)("rio_store_gc_chunks_live"), then
 soft-deletes and enqueues unreferenced chunks past grace --- at most
 `COLLECT_CYCLE_VICTIM_CAP` per cycle, with a keyset cursor carrying
 any remainder to the next cycle, so a backlog (the first enable's
@@ -62,11 +60,13 @@ shadow (report-only) cycles --- a dry-run GC's phase 3 --- which also
 re-anchor the backlog estimate; live cycles do not re-run that full
 anti-join count. A dry-run GC keeps phase 3 observation-only (nothing
 is soft-deleted or enqueued). The cycle's validation pass,
-mark, and report all run on one REPEATABLE READ snapshot, so the drift
-gauges measure real refcount drift --- uploads or rollbacks that commit
-while a cycle is running cannot show up as drift, and a nonzero
-under-count reading is a real stop signal, not cycle-concurrent
-traffic.
+mark, and report all run on one REPEATABLE READ snapshot, so uploads
+or rollbacks that commit while a cycle is running cannot skew its
+report --- every count is taken against the snapshot the verdict was
+computed on. (The Release-A-stage binaries additionally computed a
+refcount drift pair on that same snapshot; Release B retired the
+counter writers and the pair with them, so current binaries no longer
+emit it --- see the signal-lifetime note in the checklist below.)
 
 == Parse-failure abort: #(refs.alert)("RioStoreGcCollectParseFailure") (critical)
 
@@ -160,13 +160,15 @@ order; every FAIL is a stop-and-report to the rollout owner --- the
 lever column is the sanctioned response, never a silent retune.
 
 *Signal lifetime, up front:* the refcount drift pair
-(#(refs.metric)("rio_store_gc_refcount_drift_leaked"),
-#(refs.metric)("rio_store_gc_refcount_drift_undercount")) is valid
-from the first deployment of the collector through the pre-Release-B
-observation window and is retired at Release B (the release that
-deletes the counter writers); after that the counter is no longer
-maintained and the pair stops being emitted. Train dashboards and
-alert expectations on that lifetime from the start.
+(`rio_store_gc_refcount_drift_leaked`,
+`rio_store_gc_refcount_drift_undercount`) is emitted only by the
+additive/Release-A-stage binaries: it is valid from the first
+deployment of the collector through the pre-Release-B observation
+window and is retired at Release B (the release that deletes the
+counter writers --- the current tree). After that the counter is no
+longer maintained and the pair stops being emitted, so the gauge names
+above are deliberately not validated metric references here. Train
+dashboards and alert expectations on that lifetime from the start.
 
 *Unexplained drift (the stop-the-rollout definition):* any nonzero
 under-count reading (a chunk referenced by an existing manifest while
@@ -199,13 +201,15 @@ collector against real data, not against a fleet shape).
   backstop-only collect), exploit PostgreSQL parallel-query headroom;
   the junction-table fallback remains the named escalation. Owner
   adjudication, never silent.
-+ *D2 --- drift-gauge observation window.* Watch the drift pair from
-  the first collector deployment through the pre-Release-B window
-  (suggested: at least 14 days, covering at least one backstop run and
-  every GC invocation in it). Pass: zero unexplained drift per the
-  definition above. Lever: any under-count occurrence stops the staged
-  rollout before Release B (the writers must not be deleted);
-  unexplained leak growth is triaged before proceeding.
++ *D2 --- drift-gauge observation window.* Watch the drift pair
+  (emitted by the additive/Release-A-stage image; see the
+  signal-lifetime note) from the first collector deployment through
+  the pre-Release-B window (suggested: at least 14 days, covering at
+  least one backstop run and every GC invocation in it). Pass: zero
+  unexplained drift per the definition above. Lever: any under-count
+  occurrence stops the staged rollout before Release B (the writers
+  must not be deleted); unexplained leak growth is triaged before
+  proceeding.
 + *D3 --- alert quietness.*
   #(refs.alert)("RioStoreGcCollectParseFailure"),
   #(refs.alert)("RioStoreGcCollectStalled"), and
