@@ -731,7 +731,7 @@ The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BAC
 | No old-FUSE markers remain | `tracey query rule builder.fuse.*` returns empty |
 | No old-FUSE / device-plugin strings in code/helm | `grep -rn 'fuse_cache\|/var/rio/fuse-store\|fuseCacheSize\|NixStoreFs\|smarter-devices\|smarter-device-manager\|rio-builder-fuse\|fuseMaxDevices\|kvmMaxDevices' rio-*/ infra/ nix/` returns empty |
 | No stray cachefiles/boot-blob strings | `grep -rn 'cachefiles\|CACHEFILES\|boot_blob\|boot_size' rio-*/ infra/ nix/ docs/src/components/` returns empty |
-| Parity | full `/nixbuild --checks` re-run; `# r[verify builder.fs.parity]` on `lifecycle` |
+| Parity | full `/nixbuild --checks` re-run on the castore-FUSE store; `# r[verify builder.fs.parity]` carried at the `vm-lifecycle-gc-k3s` `refs-end-to-end` subtests entry in `nix/tests/default.nix` |
 
 **Exit:** all four checks pass; `/nixbuild --checks` green.
 
@@ -1008,7 +1008,7 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `builder.fs.passthrough-stack-depth` | decisions/022 §2.9 | castore_fuse/mod.rs init (P0559) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
 | `gw.substitute.dag-delta-sync` | components/gateway.md | rio-gateway/substitute/dag_sync.rs (P0574) | vm-dag-delta-sync (P0574) |
 | `sec.boundary.mountd` | security.md | bin/rio-mountd.rs (P0567) | vm-mountd `gid-gate`+`traversal-reject`+`uid-bound` (P0567) |
-| `builder.fs.parity` | components/builder.md | (verify-only) | lifecycle (P0562) |
+| `builder.fs.parity` | components/builder.md | (verify-only) | vm-lifecycle-gc-k3s `refs-end-to-end` subtests entry (P0562) |
 | `store.compat.runtime-toggle` | components/store.md | config.rs (P0579) | unit + vm-store-compat `compat-off-no-narinfo` (P0566+P0580) |
 | `store.compat.nar-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
 | `store.compat.narinfo-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |

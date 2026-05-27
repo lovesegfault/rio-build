@@ -1088,6 +1088,11 @@ in
       # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
+      # r[verify builder.fs.parity]
+      #   refs-end-to-end doubles as the cutover parity evidence: a real
+      #   dep+consumer build reads its inputs through the castore lower
+      #   and passes the same refscan/deriver/GC assertions it passed on
+      #   the replaced per-build FUSE store, unchanged.
       "refs-end-to-end"
     ];
   };

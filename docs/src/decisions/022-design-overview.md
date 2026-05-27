@@ -88,7 +88,7 @@ The synthetic root (`FUSE_ROOT_ID`) is `/nix/store` itself; its children are the
 
 r[builder.fs.parity]
 
-The post-cutover `/nix/store` MUST be behaviourally indistinguishable from the pre-ADR-022 FUSE for every input-path read the Nix sandbox issues — same bytes, same `st_mode`/`st_size`/`st_mtime`, same symlink targets, same ENOENT for paths outside the closure. The cutover gate is the `vm-castore-e2e` parity subtest passing on every existing protocol/scheduling scenario.
+The post-cutover `/nix/store` MUST be behaviourally indistinguishable from the pre-ADR-022 FUSE for every input-path read the Nix sandbox issues — same bytes, same `st_mode`/`st_size`/`st_mtime`, same symlink targets, same ENOENT for paths outside the closure. The cutover gate is the existing protocol/scheduling/lifecycle scenarios passing unchanged on the castore-FUSE store — behavioural parity with the replaced per-build FUSE store.
 
 ### Per-syscall resolution
 
