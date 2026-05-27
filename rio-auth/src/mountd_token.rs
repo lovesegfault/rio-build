@@ -1,7 +1,7 @@
 //! Scheduler-signed Ed25519 Mount-admission tokens (the `rmt2` envelope).
 //!
-//! ADR-022 "Mount-admission credentials" (
-//! `docs/src/decisions/022-mountd-admission-credentials.md`) replaces the
+//! The ADR-022 mount-admission credentials decision (the
+//! `022-mountd-admission-credentials` chapter of the design book) replaces the
 //! never-provisioned per-cluster symmetric `rio/mountd-hmac` scheme with an
 //! asymmetric one: the scheduler holds the only signing key and signs a
 //! small per-build claims blob at dispatch; every rio-mountd holds public
