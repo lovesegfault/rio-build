@@ -281,6 +281,25 @@ async fn main() -> anyhow::Result<()> {
         hmac_verifier_arc,
         chunk_cache.clone(),
     );
+    // Terminal-build revocation for assignment-token castore reads
+    // (r[store.castore.terminal-revocation]). Wired regardless of
+    // whether an HMAC verifier is configured — without one no
+    // assignment-token caller exists, so the probe is simply never
+    // consulted.
+    let directory_service = if cfg.assignment_revocation.enabled {
+        info!(
+            cache_ttl_secs = cfg.assignment_revocation.cache_ttl_secs,
+            "assignment-token terminal-build revocation enabled on castore reads"
+        );
+        directory_service.with_revocation(rio_store::revocation::BuildTerminalProbe::new(
+            std::time::Duration::from_secs(cfg.assignment_revocation.cache_ttl_secs),
+        ))
+    } else {
+        info!(
+            "assignment-token terminal-build revocation disabled (assignment_revocation.enabled = false)"
+        );
+        directory_service
+    };
 
     // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
     // + GetLoad. Gets the chunk backend directly (for key_for in

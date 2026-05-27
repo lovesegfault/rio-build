@@ -187,6 +187,7 @@
     "rio_scheduler_warm_prefetch_paths",
     "rio_scheduler_worker_disconnects_total",
     "rio_scheduler_workers_active",
+    "rio_store_castore_terminal_rejected_total",
     "rio_store_check_available_duration_seconds",
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
@@ -1198,6 +1199,11 @@
       }
     ],
     "store": [
+      {
+        "name": "rio_store_castore_terminal_rejected_total",
+        "kind": "counter",
+        "help": "Castore read RPCs (GetDirectory/Has*/ReadBlob/StatBlob) rejected because the presented assignment token's build has reached a terminal state (r[store.castore.terminal-revocation]). A sustained nonzero rate means a builder (or something replaying its token) keeps reading after its build finished."
+      },
       {
         "name": "rio_store_check_available_duration_seconds",
         "kind": "histogram",

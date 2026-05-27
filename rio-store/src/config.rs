@@ -352,6 +352,44 @@ impl Default for BinaryCacheCompat {
     }
 }
 
+/// Terminal-build revocation of assignment tokens on the castore read
+/// surface (`r[store.castore.terminal-revocation]`): once the token's
+/// build (`claims.drv_hash`) has a terminal `derivations.status` in the
+/// shared Postgres, `GetDirectory`/`HasDirectories`/`HasBlobs`/
+/// `ReadBlob`/`StatBlob` calls presenting that token are rejected with
+/// `PERMISSION_DENIED`. Bounds a leaked token's useful life to roughly
+/// its build's runtime regardless of `expiry_unix`. JWT-authenticated
+/// callers, the digest-keyed chunk RPCs, and uploads are never affected
+/// (the tolerated late-upload-after-redispatch behavior is unchanged).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct AssignmentRevocation {
+    /// Master switch. Default ON. Turn OFF only for a store whose
+    /// Postgres has no scheduler writing `derivations` rows at all
+    /// (then every probe is a guaranteed miss and the check is pure
+    /// overhead). With the scheduler present there is no reason to
+    /// disable it: the probe is cached and fails open on PG errors.
+    /// Set via `RIO_ASSIGNMENT_REVOCATION__ENABLED`.
+    pub enabled: bool,
+    /// Per-`drv_hash` verdict cache TTL in seconds. Upper bound on both
+    /// the revocation latency (a terminal build's token keeps working
+    /// for at most this long after the status flips) and the extra PG
+    /// load (≤ one indexed status lookup per active drv per TTL; both
+    /// the terminal and the non-terminal verdicts are cached). Default
+    /// 10 (the 5-15 s band keeps both negligible). Must be ≥ 1.
+    /// Set via `RIO_ASSIGNMENT_REVOCATION__CACHE_TTL_SECS`.
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for AssignmentRevocation {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_ttl_secs: crate::revocation::DEFAULT_CACHE_TTL_SECS,
+        }
+    }
+}
+
 // r[impl store.netpol.egress+2]
 // Egress targets are exactly what's configured here: postgres
 // (`database_url`) and the chunk backend (S3 or filesystem). The
@@ -419,6 +457,11 @@ pub struct Config {
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
     pub hmac_key_path: Option<PathBuf>,
+    /// Terminal-build revocation of assignment tokens on the castore
+    /// read RPCs — `r[store.castore.terminal-revocation]`. TOML
+    /// `[assignment_revocation]`, env `RIO_ASSIGNMENT_REVOCATION__*`.
+    /// See [`AssignmentRevocation`].
+    pub assignment_revocation: AssignmentRevocation,
     /// JWT verification. `key_path` → ConfigMap mount at
     /// `/etc/rio/jwt/ed25519_pubkey` (same mount as scheduler — one
     /// gateway signing key → one pubkey across all verifier services).
@@ -520,6 +563,7 @@ impl Default for Config {
             nar_buffer_budget_bytes: None,
             signing_key_path: None,
             hmac_key_path: None,
+            assignment_revocation: AssignmentRevocation::default(),
             jwt: rio_common::config::JwtConfig::default(),
             service_hmac_key_path: None,
             service_bypass_callers: vec!["rio-gateway".into(), "rio-scheduler".into()],
@@ -687,6 +731,17 @@ impl rio_common::config::ValidateConfig for Config {
                 express.evict_high_watermark
             );
         }
+        // assignment_revocation.cache_ttl_secs = 0 would disable the
+        // verdict cache entirely: every castore read by every builder
+        // pays an extra PG round-trip — a silent hot-path degradation,
+        // not "more aggressive revocation". Reject at boot. Only
+        // meaningful when the feature is enabled.
+        anyhow::ensure!(
+            !self.assignment_revocation.enabled || self.assignment_revocation.cache_ttl_secs >= 1,
+            "assignment_revocation.cache_ttl_secs must be >= 1 when revocation is enabled \
+             (0 removes the verdict cache and adds a PG probe to every castore read); \
+             set RIO_ASSIGNMENT_REVOCATION__CACHE_TTL_SECS or disable revocation"
+        );
         // binary_cache_compat.bucket: absent means "use the chunk
         // backend's S3-standard bucket"; present must be a real bucket
         // name. Some("") (e.g. a templating layer rendering an empty

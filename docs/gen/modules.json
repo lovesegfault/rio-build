@@ -1460,6 +1460,11 @@
       "doc": "CA derivation realisation storage."
     },
     {
+      "path": "revocation.rs",
+      "depth": 0,
+      "doc": "Terminal-build revocation for assignment-token castore reads"
+    },
+    {
       "path": "signing.rs",
       "depth": 0,
       "doc": "ed25519 narinfo signing."

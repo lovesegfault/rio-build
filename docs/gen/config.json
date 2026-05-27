@@ -414,6 +414,18 @@
         "description": "HMAC key file for verifying assignment tokens on PutPath."
       },
       {
+        "key": "assignment_revocation.enabled",
+        "type": "boolean",
+        "default": "true",
+        "description": "Master switch."
+      },
+      {
+        "key": "assignment_revocation.cache_ttl_secs",
+        "type": "uint64",
+        "default": "10",
+        "description": "Per-`drv_hash` verdict cache TTL in seconds."
+      },
+      {
         "key": "jwt.required",
         "type": "boolean",
         "default": "false",

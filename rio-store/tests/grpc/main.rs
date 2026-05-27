@@ -323,6 +323,7 @@ mod nar_index;
 mod put_path_chunked;
 mod realisations;
 mod reassembly;
+mod revocation;
 mod signing;
 mod tenancy;
 mod trailer;

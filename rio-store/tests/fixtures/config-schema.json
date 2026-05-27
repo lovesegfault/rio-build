@@ -91,6 +91,14 @@
         ],
         "default": null
       },
+      "assignment_revocation": {
+        "description": "Terminal-build revocation of assignment tokens on the castore\nread RPCs — `r[store.castore.terminal-revocation]`. TOML\n`[assignment_revocation]`, env `RIO_ASSIGNMENT_REVOCATION__*`.\nSee [`AssignmentRevocation`].",
+        "$ref": "#/$defs/AssignmentRevocation",
+        "default": {
+          "enabled": true,
+          "cache_ttl_secs": 10
+        }
+      },
       "jwt": {
         "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (same mount as scheduler — one\ngateway signing key → one pubkey across all verifier services).\nUnset = interceptor inert (dev mode). SIGHUP reloads from the\nsame path. Set via `RIO_JWT__KEY_PATH`.",
         "$ref": "#/$defs/JwtConfig",
@@ -382,6 +390,24 @@
           }
         ]
       },
+      "AssignmentRevocation": {
+        "description": "Terminal-build revocation of assignment tokens on the castore read\nsurface (`r[store.castore.terminal-revocation]`): once the token's\nbuild (`claims.drv_hash`) has a terminal `derivations.status` in the\nshared Postgres, `GetDirectory`/`HasDirectories`/`HasBlobs`/\n`ReadBlob`/`StatBlob` calls presenting that token are rejected with\n`PERMISSION_DENIED`. Bounds a leaked token's useful life to roughly\nits build's runtime regardless of `expiry_unix`. JWT-authenticated\ncallers, the digest-keyed chunk RPCs, and uploads are never affected\n(the tolerated late-upload-after-redispatch behavior is unchanged).",
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "description": "Master switch. Default ON. Turn OFF only for a store whose\nPostgres has no scheduler writing `derivations` rows at all\n(then every probe is a guaranteed miss and the check is pure\noverhead). With the scheduler present there is no reason to\ndisable it: the probe is cached and fails open on PG errors.\nSet via `RIO_ASSIGNMENT_REVOCATION__ENABLED`.",
+            "type": "boolean",
+            "default": true
+          },
+          "cache_ttl_secs": {
+            "description": "Per-`drv_hash` verdict cache TTL in seconds. Upper bound on both\nthe revocation latency (a terminal build's token keeps working\nfor at most this long after the status flips) and the extra PG\nload (≤ one indexed status lookup per active drv per TTL; both\nthe terminal and the non-terminal verdicts are cached). Default\n10 (the 5-15 s band keeps both negligible). Must be ≥ 1.\nSet via `RIO_ASSIGNMENT_REVOCATION__CACHE_TTL_SECS`.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 10
+          }
+        }
+      },
       "JwtConfig": {
         "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
         "type": "object",
@@ -421,6 +447,10 @@
     "nar_buffer_budget_bytes": null,
     "signing_key_path": null,
     "hmac_key_path": null,
+    "assignment_revocation": {
+      "enabled": true,
+      "cache_ttl_secs": 10
+    },
     "jwt": {
       "required": false,
       "key_path": null

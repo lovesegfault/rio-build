@@ -68,6 +68,8 @@ pub(crate) mod metadata;
 #[cfg(feature = "server")]
 pub mod nar_index;
 #[cfg(feature = "server")]
+pub mod revocation;
+#[cfg(feature = "server")]
 pub mod signing;
 #[cfg(feature = "server")]
 pub mod substitute;
@@ -240,6 +242,14 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_hmac_rejected_total",
         "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+    );
+    describe_counter!(
+        "rio_store_castore_terminal_rejected_total",
+        "Castore read RPCs (GetDirectory/Has*/ReadBlob/StatBlob) rejected because \
+         the presented assignment token's build has reached a terminal state \
+         (r[store.castore.terminal-revocation]). A sustained nonzero rate means a \
+         builder (or something replaying its token) keeps reading after its build \
+         finished."
     );
     describe_counter!(
         "rio_store_service_token_accepted_total",

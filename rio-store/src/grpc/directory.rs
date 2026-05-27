@@ -81,6 +81,11 @@ pub struct DirectoryServiceImpl {
     /// fetches file bytes through it. Always present: a chunk backend
     /// is a required part of store config.
     chunk_cache: Arc<ChunkCache>,
+    /// Terminal-build revocation probe for assignment-token callers
+    /// (`r[store.castore.terminal-revocation]`). `None` = revocation
+    /// disabled (`assignment_revocation.enabled = false`, or a test
+    /// fixture that doesn't wire it). JWT callers are never probed.
+    revocation: Option<crate::revocation::BuildTerminalProbe>,
 }
 
 impl DirectoryServiceImpl {
@@ -93,14 +98,27 @@ impl DirectoryServiceImpl {
             pool,
             hmac_verifier,
             chunk_cache,
+            revocation: None,
         }
+    }
+
+    /// Enable terminal-build revocation for assignment-token callers
+    /// (main.rs wires this from `[assignment_revocation]` config).
+    pub fn with_revocation(mut self, probe: crate::revocation::BuildTerminalProbe) -> Self {
+        self.revocation = Some(probe);
+        self
     }
 
     /// Resolve the caller's tenant: JWT extension (gateway path),
     /// else HMAC assignment-token `claims.tenant` (builder path). No
     /// tenant → `UNAUTHENTICATED`; never fall back to anonymous.
+    ///
+    /// Assignment-token callers additionally pass the terminal-build
+    /// revocation probe: a verified token whose build already reached a
+    /// terminal state is rejected with `PERMISSION_DENIED` before any
+    /// data-plane query runs.
     // r[impl store.castore.tenant-scope]
-    fn castore_tenant_id<T>(&self, request: &Request<T>) -> Result<uuid::Uuid, Status> {
+    async fn castore_tenant_id<T>(&self, request: &Request<T>) -> Result<uuid::Uuid, Status> {
         if let Some(jwt) = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
@@ -114,14 +132,34 @@ impl DirectoryServiceImpl {
             .and_then(|v| v.to_str().ok());
         if let (Some(verifier), Some(tok)) = (&self.hmac_verifier, tok) {
             return match verifier.verify::<rio_auth::hmac::AssignmentClaims>(tok) {
-                Ok(claims) => match claims.tenant.as_deref() {
-                    None => Err(Status::unauthenticated(
-                        "assignment token has no tenant claim",
-                    )),
-                    Some(t) => t.parse().map_err(|_| {
-                        Status::unauthenticated("assignment token tenant is not a UUID")
-                    }),
-                },
+                Ok(claims) => {
+                    // r[impl store.castore.terminal-revocation]
+                    // Signature + expiry already verified; now check the
+                    // build is still live. Terminal ⇒ the token's only
+                    // legitimate holder is gone — reject like any other
+                    // authorization failure, without saying why (the
+                    // legitimate caller no longer exists; an attacker
+                    // gets no oracle beyond "rejected").
+                    if let Some(probe) = &self.revocation
+                        && probe.is_terminal(&self.pool, &claims.drv_hash).await
+                    {
+                        metrics::counter!("rio_store_castore_terminal_rejected_total").increment(1);
+                        warn!(
+                            drv_hash = %claims.drv_hash,
+                            executor_id = %claims.executor_id,
+                            "castore read with an assignment token for a terminal build"
+                        );
+                        return Err(Status::permission_denied("assignment token rejected"));
+                    }
+                    match claims.tenant.as_deref() {
+                        None => Err(Status::unauthenticated(
+                            "assignment token has no tenant claim",
+                        )),
+                        Some(t) => t.parse().map_err(|_| {
+                            Status::unauthenticated("assignment token tenant is not a UUID")
+                        }),
+                    }
+                }
                 // Don't echo why the token failed — sig-vs-expiry is an
                 // oracle. The legitimate caller's fix is the same.
                 Err(_) => Err(Status::unauthenticated("assignment token rejected")),
@@ -181,7 +219,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<GetDirectoryRequest>,
     ) -> Result<Response<Self::GetDirectoryStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request)?;
+        let tenant = self.castore_tenant_id(&request).await?;
         let req = request.into_inner();
 
         let mut frontier: Vec<[u8; 32]> = Vec::new();
@@ -364,7 +402,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<HasDirectoriesRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request)?;
+        let tenant = self.castore_tenant_id(&request).await?;
         let digests = parse_digests(&request.into_inner().digests)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasDirectories")
             .record(digests.len() as f64);
@@ -384,7 +422,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<HasBlobsRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request)?;
+        let tenant = self.castore_tenant_id(&request).await?;
         let digests = parse_digests(&request.into_inner().digests)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasBlobs")
             .record(digests.len() as f64);
@@ -406,7 +444,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<ReadBlobRequest>,
     ) -> Result<Response<Self::ReadBlobStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request)?;
+        let tenant = self.castore_tenant_id(&request).await?;
         let digest = parse_digest(&request.into_inner().file_digest)?;
         let started = Instant::now();
 
@@ -490,7 +528,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<StatBlobRequest>,
     ) -> Result<Response<StatBlobResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant = self.castore_tenant_id(&request)?;
+        let tenant = self.castore_tenant_id(&request).await?;
         let req = request.into_inner();
         let digest = parse_digest(&req.file_digest)?;
 

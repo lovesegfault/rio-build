@@ -784,6 +784,31 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   JOIN would cost dedup-hot-path PG round-trips for no confidentiality gain.
 ]
 
+#r("store.castore.terminal-revocation")[
+  When the caller of `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/
+  `StatBlob` authenticates with an HMAC assignment token and revocation is
+  enabled (`assignment_revocation.enabled`, default on), the store MUST reject
+  the call with `PERMISSION_DENIED` (no reason detail in the message) if the
+  token's `drv_hash` references a derivation whose scheduler-owned
+  `derivations.status` is terminal (the shared
+  `rio_migrations::schema::DERIVATION_TERMINAL_STATUSES` set). The verdict MAY
+  be served from a per-`drv_hash` cache for at most
+  `assignment_revocation.cache_ttl_secs` (default 10 s); a `drv_hash` with no
+  `derivations` row MUST be treated as non-terminal (the check only narrows
+  access, never widens it). JWT-authenticated callers and the digest-keyed
+  `GetChunks` surface are not affected.
+]
+
+This bounds a leaked assignment token's useful life to roughly its build's own
+runtime regardless of `expiry_unix` (#rref("common.hmac.expiry-cap")): once the
+scheduler records a terminal status, the token stops working as a castore read
+credential within one cache TTL. The predicate is deliberately permissive
+(terminal-state only, no executor-match): a presumed-dead worker finishing an
+upload after re-dispatch is tolerated today and uploads are not gated here.
+The status lives in the shared Postgres the store already queries on every
+castore read, so the probe is one indexed lookup amortized by the cache;
+`GetChunks` stays digest-keyed and pays nothing.
+
 #r("store.castore.gc")[
   `directories` rows are refcounted (one increment per referencing manifest).
   `file_blobs` and `directory_paths` are `(digest, store_path_hash)` junctions
