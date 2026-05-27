@@ -1854,7 +1854,13 @@ decision packages and marked AWAITING OWNER; nothing in this section
 records a decision on the owner's behalf, and the go/no-go therefore
 closes conditionally (see the evaluation subsection). Contract
 references: executor-formal-design.md (DRAFT v2) §3.4, §4, §5, §6;
-plan tasks T-0e.1–T-0e.8.
+plan tasks T-0e.1–T-0e.8. (Update 2026-05-27: the campaign owner has
+since decided OA1, OA2, OA6 and signed the item-10 regime-coverage
+statement — the decisions are recorded inline in the per-row DECIDED
+blocks of the adjudication subsection, and the go/no-go is
+re-evaluated to its unconditional verdicts at the end of the
+evaluation subsection. The package texts themselves are left as
+written.)
 
 ### The Model J/N obligation table (T-0e.1)
 
@@ -2025,7 +2031,7 @@ the controller-campaign owner — the same person, but the signature is
 that campaign's to give). **CARRIED** — not 0e-blocking; carried into
 Phase 1 with a named owner and the pre-registered default standing.
 
-#### OA1 — establishment-window numbers and the AD5 latency budget: AWAITING OWNER
+#### OA1 — establishment-window numbers and the AD5 latency budget: DECIDED (2026-05-27)
 
 Where it stands at this cut: the 0a source audit showed interval (i)
 (Job/pod-terminal → report acked) has neither endpoint durably
@@ -2080,7 +2086,25 @@ viable only if the owner judges the schedule cost of waiting for
 data to outweigh gating the cutover on a measured baseline — the
 design's own no-go wording leans against it.
 
-#### OA2 — hung-node signal owner and shape: AWAITING OWNER
+**Decision (2026-05-27, campaign owner): Option A — AUTHORIZED.** The
+additive histogram pair
+(`rio_controller_job_terminal_report_seconds`,
+`rio_scheduler_attempt_requeue_seconds`) — the instrument the package
+recommends — is authorized now rather than at 1a, and lands in the
+same commit set that records this decision (per-reason / per-cause
+emission, registration in the owning components' metric registries,
+docs regeneration, and the metrics-registration tests, per the
+observability checklist). The interval-(i)/interval-(ii) baseline
+accumulates from instrument availability forward against the
+population statement recorded at 0a (the EKS deployment, all
+Builder/Fetcher pools; the controller-outage arm exercised in the VM
+suite). Consequences: no-go conditions 4 and 5 lose their conditional
+status (re-evaluated below); the AD5 numeric budget remains UNSIGNED
+at this cut — it is signed against the accumulating baseline and
+re-baselined from the same instrument at the 1b gate, which is the
+work item this decision deliberately leaves open.
+
+#### OA2 — hung-node signal owner and shape: DECIDED (2026-05-27)
 
 Where it stands: the ask was issued at 0a (decision-by 0e, target
 2026-06-06) with the four candidate shapes from design §5.2; no
@@ -2140,7 +2164,25 @@ fallback if the controller campaign refuses the scope — but it should
 be signed as what it is (a permanent regression for one failure
 class), not slid into.
 
-#### OA6 — the pod-arrives-before-Ready pull outcome: AWAITING OWNER
+**Decision (2026-05-27, campaign owner, signing jointly as the
+controller-campaign owner): Option A with option C as the explicit
+canary-window interim — the recommendation as written.** The
+controller-side aggregation (per-node clustering of attempt-deadline
+expiries / pull-latency failures over the ledger plus the spawn-ack
+node binding, feeding the same dead_nodes-shaped input
+`reap_unhealthy` consumes today) is committed with a landing slot no
+later than 1c, inside the controller campaign's Model N scope. The
+interim gap is SIGNED as limited to the 1b canary window (1b→1c,
+canary pool only), with option C's bound and compensating controls:
+per-build impact ≤ `activeDeadlineSeconds` + the establishment sweep;
+no automatic NodeClaim reap of wedged-but-Ready nodes during the gap;
+the AD2 node-keyed exclusion, the alert on per-node attempt-deadline
+clustering, the manual NodeClaim-reap runbook, and Karpenter
+NodeRepair for NotReady-surfacing wedges. Obligation-table row 5's
+successor is therefore the controller-side aggregation; no-go
+condition 9 is re-evaluated below.
+
+#### OA6 — the pod-arrives-before-Ready pull outcome: DECIDED (2026-05-27)
 
 Where it stands: the data query was issued at 0a (due before 0d
 closes, target 2026-06-03) and the results have not been recorded in
@@ -2194,6 +2236,28 @@ cold-start regression on exactly the pods that today mostly idle-exit
 at I-116. Option (a) is the right call only if the forecast-hit data
 contradicts that picture, which is precisely what the outstanding
 query measures.
+
+**Decision (2026-05-27, campaign owner, signing jointly as the
+controller-campaign owner): Option (a) — the `NotYetReady` third
+outcome.** The pull protocol gains a third response — "not yet ready —
+retry" (`NotYetReady{retry_after}`, or the bounded long-poll variant
+of the same shape): a pod whose drv is not yet Ready waits/retries up
+to an explicit idle bound and then exits 0 charge-free, preserving the
+§13b speculative pod warm-up (a forecast-warmed pod starts building
+the moment its drv goes Ready). The spawn-side ready-filter (option
+(b)) is NOT adopted. This is the package's non-recommended option and
+is recorded as the owner's call. Consequences, as the package already
+prices them: the unary signature carries the third protocol state,
+priced into §4.2 rows 13/B7 and the re-targeted Model S at 1c'; the
+pod side gains the bounded retry loop, whose idle bound (a named
+number or tied to `activeDeadlineSeconds`) becomes an owned number of
+the Phase-1 plan; Model J/N obligation-table row 6 resolves to the
+option-(a) leg — the as-built no-ready-filter publish stands and
+Model J is unchanged; and the Phase-1 spec-consequence queue carries
+the pull RPC's response-enum entry (the `NotYetReady` outcome) in
+place of the OA6(b) `ctrl.nodeclaim.placeable-gate+5` amendment. With
+this rider resolved the T-0e.6 unary signatures are frozen in full;
+no-go condition 8 is re-evaluated below.
 
 #### OA3 — fetcher pull cardinality: CARRIED
 
@@ -2531,13 +2595,13 @@ outcome.
 | 1 | A calibration family protected only by a deleted mechanism with no named successor and no by-construction argument | **Clear** | The finalized disposition table × the 0d calibration table: every "unnecessary" row names its carrier (frozen-invariant list + per-mechanism table above); the two rows the calibration sharpened (#9 economy-not-safety, #10 by-construction `confirmedPhantomIsDrained`) are cited in-row |
 | 2 | One pod death cannot be reduced to ≤1 charged attempt from post-replacement signals alone | **Clear** (paper re-derivation; mechanical re-check at 1b/1c') | The two-installment shape survives keyed by `exec_id` (durable, no TTL race); the no-attempt rule prevents charging never-pulled pods; `attemptsChargedOnce` stays the imported oracle; the §4.1 transaction fence closes the two-believer double-pull race; F4's calibration rows map onto the re-keyed lifecycle (frozen-invariant rows 13–14) |
 | 3 | AD2 re-keying cannot preserve `sched.retry.per-executor-budget`'s intent (incl. small-fleet and exhausted-universe clauses) | **Clear** | AD2's three-part contract is confirmed at the freeze (exhaustion survives re-keyed and relocated to the spawn gate; small-fleet clause min(threshold, |sources|); durable source attribution via migration ≥067); the 0d F5 re-dispositions name the placeable()/eligibility unit suite as the binding coverage for the eligibility content; the exhausted-universe verdict stays a structural poison, never deadline churn |
-| 4 | The OA1 latency model shows death→requeue or cancel latency past the signed budget | **Conditional on OA1** | No baseline and no signed budget exist at this cut, so the condition can be neither triggered nor discharged; the AD5 component structure shows no structural blowout (every component is tick-, propagation- or grace-bounded), but the design requires the measured baseline. Clears when OA1 resolves and the budget is signed against it |
-| 5 | The OA1 baseline cannot be obtained | **Conditional on OA1** | Today the interval-(i) baseline does not exist and cannot be reconstructed retroactively (the 0a source audit); it becomes obtainable the moment the owner authorizes the instrument (option A) or signs the weaker-population basis (option B). Stands as a no-go only if OA1 is left unresolved |
+| 4 | The OA1 latency model shows death→requeue or cancel latency past the signed budget | **Clear** (re-evaluated 2026-05-27) | No baseline and no signed budget exist at this cut, so the condition can be neither triggered nor discharged; the AD5 component structure shows no structural blowout (every component is tick-, propagation- or grace-bounded), but the design requires the measured baseline. Clears when OA1 resolves and the budget is signed against it. Re-evaluation 2026-05-27: OA1 is decided (option A authorized, instrument landed); no measured data shows a latency past a budget, the structural analysis stands, and the AD5 numeric budget is signed against the accumulating baseline and re-baselined from the same instrument at the 1b gate — the condition is not triggered |
+| 5 | The OA1 baseline cannot be obtained | **Clear** (re-evaluated 2026-05-27) | Today the interval-(i) baseline does not exist and cannot be reconstructed retroactively (the 0a source audit); it becomes obtainable the moment the owner authorizes the instrument (option A) or signs the weaker-population basis (option B). Stands as a no-go only if OA1 is left unresolved. Re-evaluation 2026-05-27: option A is authorized and the instrument is landed, so the baseline is obtainable from instrument availability forward against the 0a population statement — discharged |
 | 6 | The Model J/N obligation table marks any imported obligation unmeetable | **Clear** (no unmeetable row), with one row conditional | Obligation table above: 5 of 7 rows meetable with named successors; rows 5 (dead_nodes/OA2) and 6 (placeable input/OA6) are meetable under either prepared resolution of their owner rows; none is unmeetable under any prepared option |
 | 7 | The dual-belief residual has no checked successor / a lease guarantee becomes unconsumable | **Clear** | T-0e.2: the transaction-side fence + `StaleAuthorityWritesAreInert` (1c' re-target) + the `admit_pull` Kani contract are the named checked successors; all four leaderElection.qnt exports remain consumed; claim-before-advertise's successor (claim-before-serve) is named |
-| 8 | OA6 unadjudicated — no committed pull outcome for the not-yet-Ready case | **Conditional on OA6** | The decision package (both options, costs, decision rule, recommendation) is prepared and AWAITING OWNER; the unary signatures are frozen except for this rider. Clears with either option; stands only if unresolved |
-| 9 | OA2 unresolved — no signed-off node-health successor and no recorded accepted gap | **Conditional on OA2** | The decision package (three options incl. the signed-gap shape with bound and compensating controls) is prepared and AWAITING OWNER. Clears with any of the three; stands only if unresolved |
-| 10 | (plan addition) Regime-coverage input: families whose only exhaustive fault-regime coverage was demoted out of `checks.*` or dropped to representative-revert-only | **AWAITING OWNER signature** (prepared below) | More than two families are affected, so the plan requires the campaign owner's explicit signed acceptance naming the gap and its compensating coverage; absent that signature this item is treated as a no-go for Phase-1 planning |
+| 8 | OA6 unadjudicated — no committed pull outcome for the not-yet-Ready case | **Clear** (re-evaluated 2026-05-27) | The decision package (both options, costs, decision rule, recommendation) is prepared and AWAITING OWNER; the unary signatures are frozen except for this rider. Clears with either option; stands only if unresolved. Re-evaluation 2026-05-27: OA6 is adjudicated — option (a), so the committed pull outcome for the not-yet-Ready case is `NotYetReady{retry_after}` and the T-0e.6 signature freeze completes with it |
+| 9 | OA2 unresolved — no signed-off node-health successor and no recorded accepted gap | **Clear** (re-evaluated 2026-05-27) | The decision package (three options incl. the signed-gap shape with bound and compensating controls) is prepared and AWAITING OWNER. Clears with any of the three; stands only if unresolved. Re-evaluation 2026-05-27: OA2 is resolved — the controller-side clustering successor is committed with a landing slot ≤1c and the 1b-canary-window interim gap is signed with option C's bound and controls |
+| 10 | (plan addition) Regime-coverage input: families whose only exhaustive fault-regime coverage was demoted out of `checks.*` or dropped to representative-revert-only | **Signed — accepted** (2026-05-27) | More than two families are affected, so the plan requires the campaign owner's explicit signed acceptance naming the gap and its compensating coverage; absent that signature this item is treated as a no-go for Phase-1 planning. Signed 2026-05-27: the campaign owner accepts the statement prepared below exactly as written — the affected slices keep the manual exhaustive targets plus the wired witnesses / deep-simulation / calibration / VM coverage in the gate, with the exhaustive cfgs runnable on demand — and the same signature disposes of the still-open 0c budget stop-and-report it folds in |
 
 The item-10 statement prepared for the owner's signature (it is the
 same adjudication as the still-open 0c budget stop-and-report, not a
@@ -2573,6 +2637,18 @@ new one):
   the affected slices and sign exactly this statement as the item-10
   acceptance.
 
+**Item-10 signature (2026-05-27):** the campaign owner takes the
+fourth outcome and signs the statement above as the acceptance,
+exactly as prepared — the gap is accepted with the named compensating
+coverage standing in the gate (wired witnesses, deep-simulation
+record, calibration runs and their wired regression guards, the named
+VM scenarios, the lease-campaign checks), the fault-leader /
+fault-persist exhaustive cfgs stay documented manual targets runnable
+on demand, and no further per-fault-class split or re-encoding is
+commissioned for Phase 0. This signature is also the disposition of
+the still-open 0c budget stop-and-report (the same adjudication, as
+the statement notes).
+
 **Overall verdict at this cut: no condition is triggered — nothing in
 the 0a–0e record indicates the replacement design must be redrawn —
 but the gate cannot be signed "go" yet, because four owner items
@@ -2585,6 +2661,23 @@ with no signed alternative, OA2 left unresolved, OA6 left
 unadjudicated, or the item-10 acceptance withheld), the corresponding
 condition stands and the design is redrawn before Phase 1 per the
 design's own rule.**
+
+**Re-evaluation after the owner decisions (2026-05-27): the Phase-0
+exit gate is MET and Phase 0 is complete.** OA1 (option A authorized,
+instrument landed), OA2 (controller-side clustering ≤1c plus the
+signed 1b-canary-window interim), OA6 (option (a), the `NotYetReady`
+third outcome), and the item-10 regime-coverage acceptance are decided
+and recorded above, so conditions 4, 5, 8 and 9 read **Clear** and
+condition 10 reads **Signed — accepted**; with conditions 1–3 and 6–7
+already clear, no condition is conditional and none is triggered. The
+go signature this section was waiting on is constituted by those four
+recorded decisions, the contract above is the frozen Phase-1 input,
+and Phase-1 planning is unblocked. One AD5 work item deliberately
+remains open and is carried into Phase 1 without gating this closure:
+the AD5 numeric budget is signed against the OA1 instrument's
+accumulating baseline and re-baselined from that same instrument at
+the 1b gate (the AD5 row's "structure confirmed, number unsigned"
+status is unchanged until then).
 
 ### Phase-1 input list (T-0e.8)
 
@@ -2603,10 +2696,18 @@ the owner resolves the four open items above.
    revert-clean deletion-wave commits kept rebased to the Phase-2
    close-out, deletion-gate observable = stream-registration gauge at
    zero for the computed deadline horizon.
-2. **The owner-decision queue (Phase-1 blockers):** OA1, OA2, OA6
-   decision packages and the item-10 regime-coverage acceptance —
-   all AWAITING OWNER above; plus the still-open 0c budget
-   stop-and-report they fold into.
+2. **The owner-decision queue: resolved, decisions inline
+   (2026-05-27).** OA1 = option A (the histogram pair authorized and
+   landed; the AD5 numeric budget is signed against its accumulating
+   baseline and re-baselined at the 1b gate); OA2 = controller-side
+   deadline/pull-latency clustering landing no later than 1c, with the
+   signed interim gap limited to the 1b canary window under option
+   C's controls; OA6 = option (a), the `NotYetReady{retry_after}`
+   third pull outcome (spawn-side ready-filter not adopted); the
+   item-10 regime-coverage statement is signed as the acceptance,
+   which also disposes of the 0c budget stop-and-report it folds
+   into. The DECIDED blocks in the adjudication subsection above are
+   the record; nothing in this queue blocks Phase-1 planning.
 3. **The interface re-derivation plans:** the Model J/N obligation
    table with re-derivation work items (i)–(iii) (1c'/1d); the
    lease-seam note with `StaleAuthorityWritesAreInert` and
