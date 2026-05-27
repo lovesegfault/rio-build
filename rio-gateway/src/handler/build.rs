@@ -1330,6 +1330,11 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             } else {
                 // Wrong-success: the scheduler says Built but the store does
                 // not hold what the client is owed.
+                warn!(
+                    drv = %drv_path_str,
+                    missing = ?check.missing,
+                    "demoting successful wopBuildDerivation result: outputs not in store"
+                );
                 build_result = BuildResult::failure(
                     BuildStatus::MiscFailure,
                     format!(
@@ -1998,6 +2003,11 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 } else {
                     // Wrong-success: the aggregate says Built but this
                     // target's requested outputs are not in the store.
+                    warn!(
+                        drv = %demand.drv_path,
+                        missing = ?check.missing,
+                        "demoting successful wopBuildPathsWithResults entry: outputs not in store"
+                    );
                     results.push(BuildResult::failure(
                         BuildStatus::MiscFailure,
                         format!(
