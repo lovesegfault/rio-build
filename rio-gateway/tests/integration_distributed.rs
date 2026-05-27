@@ -165,9 +165,12 @@ async fn test_distributed_handshake_wire_sequence() -> anyhow::Result<()> {
         "version string should contain 'rio-gateway', got: {version_str}"
     );
 
-    // Read trusted status
+    // Read trusted status — the gateway reports NotTrusted (2): rio has
+    // no trusted-user concept, and reporting trusted would steer
+    // build-remote into inline input-addressed submissions the gateway
+    // refuses. r[verify gw.handshake.untrusted]
     let trusted = wire::read_u64(s).await?;
-    assert!(trusted <= 1, "trusted should be 0 or 1");
+    assert_eq!(trusted, 2, "the gateway must report NotTrusted (2)");
 
     // Phase 4: Initial STDERR_LAST
     let last = wire::read_u64(s).await?;

@@ -798,6 +798,76 @@ async fn test_build_derivation_squatted_path_rejected_and_cache_restored() -> an
     Ok(())
 }
 
+/// wopBuildDerivation (36) after the .drv was uploaded in-session
+/// (wopAddToStoreNar): the resolve-success shape — what a hook client that
+/// does upload its derivations gets — goes through the full-DAG pipeline,
+/// passes the binding gates and is submitted. Positive-path guard against
+/// over-rejection of the build-hook flow.
+#[tokio::test]
+async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000009-uploaded.drv";
+    let (nar, hash) = make_nar(TEST_DRV_ATERM.as_bytes());
+
+    // Upload the .drv exactly like `nix copy --derivation` does.
+    wire_send!(&mut h.stream;
+        u64: 39,                           // wopAddToStoreNar
+        string: drv_path,
+        string: "",                        // deriver
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,         // references
+        u64: 0,                            // registration_time
+        u64: nar.len() as u64,             // nar_size
+        bool: false,                       // ultimate
+        strings: wire::NO_STRINGS,         // sigs
+        string: "",                        // ca
+        bool: false, bool: true,           // repair, dont_check_sigs
+        framed: &nar,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    // Now build it: the gateway resolves the full derivation (store →
+    // drv_cache), reconstructs the DAG and submits.
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/zzz-output",
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/zzz-output",
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "uploaded-drv build must succeed (Built=0), got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(error_msg.is_empty(), "no error expected: {error_msg:?}");
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "the resolved full-DAG path must be submitted"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// wopBuildDerivation (36): an inline FIXED-OUTPUT derivation whose declared
 /// path is NOT the one its declared hash derives to is rejected before
 /// SubmitBuild — a junk outputHash cannot exempt a victim path from the

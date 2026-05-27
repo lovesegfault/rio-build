@@ -1297,14 +1297,22 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             // input-addressed output paths to the derivation, so
             // accepting them here would let a client squat any
             // not-yet-built store path by never uploading the .drv
-            // (the validate_dag path-binding gate only sees cached
-            // full derivations). Mirror that posture fail-closed: the
+            // (the path-binding gate only sees cached full
+            // derivations). Mirror that posture fail-closed: the
             // single-node fallback is acceptable only when every
             // statically-declared output is content-bound
             // (fixed-output / floating-CA — their paths are governed
             // by the content-hash rules). Declared paths that are not
             // store paths cannot alias a real store object and keep
             // failing later exactly as before.
+            //
+            // Conforming clients never hit this for IA derivations:
+            // the handshake reports NotTrusted (2), so build-remote in
+            // Nix >= 2.16 and Lix copies the .drv closure and drives
+            // wopBuildPathsWithResults instead. This branch remains
+            // reachable for pre-2.16 hook clients, hand-rolled
+            // clients, and replayed old flows — the error text tells
+            // them what to do.
             if let Some(out) = basic_drv
                 .outputs()
                 .iter()
@@ -1321,7 +1329,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     stderr,
                     "cannot build '{}': the full derivation is not in the store ({}) and \
                      inline input-addressed derivations cannot be validated — upload the \
-                     .drv first (output '{}' declares '{}')",
+                     .drv first (output '{}' declares '{}'). Nix >= 2.16 and Lix handle \
+                     this automatically because the gateway reports itself untrusted; \
+                     otherwise use --store ssh-ng:// or `nix copy --derivation` before \
+                     building",
                     drv_path_str,
                     e,
                     out.name(),

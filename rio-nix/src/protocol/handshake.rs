@@ -167,9 +167,21 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
     // Client sends obsolete reserveSpace
     let _reserve_space = wire::read_u64(reader).await?;
 
-    // Server sends ClientHandshakeInfo: version string + trusted status
+    // Server sends ClientHandshakeInfo: version string + trusted status.
+    //
+    // trusted = 2 (NotTrusted). rio is multi-tenant and has no CppNix
+    // trusted-user concept: a client must never be able to claim
+    // arbitrary input-addressed output paths, which is exactly what the
+    // "trusted" path of `buildDerivation` would allow. Reporting
+    // not-trusted steers stock build-remote (Nix >= 2.16, Lix) onto the
+    // copy-the-.drv-closure + wopBuildPathsWithResults flow, which the
+    // gateway fully supports and gates (DAG reconstruction + output-path
+    // binding); inline input-addressed `wopBuildDerivation` submissions
+    // whose .drv cannot be resolved are refused. 1 (Trusted) must never
+    // be sent — it would invite inline IA submissions whose declared
+    // output paths cannot be validated.
     wire::write_string(writer, version_string).await?;
-    wire::write_u64(writer, 1).await?; // trusted = 1
+    wire::write_u64(writer, 2).await?; // trusted = 2 (NotTrusted)
     writer.flush().await.map_err(wire::WireError::Io)?;
 
     // Phase 4: Client calls processStderrReturn — send STDERR_LAST
@@ -236,7 +248,7 @@ mod tests {
         let version_str = wire::read_string(&mut reader).await?;
         assert!(version_str.contains("rio-build"));
         let trusted = wire::read_u64(&mut reader).await?;
-        assert_eq!(trusted, 1);
+        assert_eq!(trusted, 2, "the gateway must report NotTrusted (2)");
         let stderr_last = wire::read_u64(&mut reader).await?;
         assert_eq!(stderr_last, crate::protocol::stderr::STDERR_LAST);
 

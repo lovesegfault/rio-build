@@ -38,6 +38,9 @@ let
   # Warm-path derivation: distinct marker so it doesn't DAG-dedup with
   # any other scenario's builds.
   trivialDrv = drvs.mkTrivial { marker = "proto-warm"; };
+  # Built ONLY via build-hook mode (--max-jobs 0 --builders), so the
+  # hook subtest exercises a real dispatch (not a scheduler cache hit).
+  hookDrv = drvs.mkTrivial { marker = "proto-hook"; };
 
   # Result-pipeline probes (run through the real builder → upload →
   # store path; the differential harness preps its own build dir and
@@ -274,6 +277,31 @@ let
             "rio_scheduler_cache_hits_total", 1.0,
             labels='{source="existing"}',
         )
+
+    # ── build-hook mode (untrusted handshake steers the .drv-upload flow) ──
+    with subtest("build-hook mode (--max-jobs 0 --builders ssh-ng://)"):
+        # The gateway reports itself NotTrusted, so build-remote
+        # (Nix >= 2.16 / Lix) copies the .drv closure and drives
+        # wopBuildPathsWithResults instead of sending an inline
+        # input-addressed BasicDerivation (which the gateway refuses).
+        # A successful hook-mode build of a fresh derivation therefore
+        # proves the untrusted handshake + .drv-upload + full-DAG
+        # pipeline end-to-end against a stock client.
+        out_hook = client.succeed(
+            "nix build --no-link --print-out-paths "
+            f"--max-jobs 0 --builders '{store_url} x86_64-linux' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "-f ${hookDrv} 2>&1 | tail -n1"
+        ).strip()
+        assert out_hook.startswith("/nix/store/"), (
+            f"hook-mode build did not produce a store path: {out_hook!r}"
+        )
+        assert "rio-test-proto-hook" in out_hook or "proto-hook" in out_hook, (
+            f"unexpected hook-mode output name: {out_hook!r}"
+        )
+        # The output is registered in the rio store — the build went
+        # through the gateway, not a local fallback builder.
+        client.succeed(f"nix path-info --store '{store_url}' {out_hook}")
 
     ${pkgs.lib.optionalString withNomExitTest nomExitScript}
 
