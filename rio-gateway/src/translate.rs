@@ -1163,6 +1163,32 @@ pub fn build_fallback_node(
     // mark them authoritative so the scheduler persists them with the
     // derivation row and a post-failover dispatch still carries them.
     node.drv_content_authoritative = true;
+    // r[impl gw.hook.fallback-built-outputs]
+    // A content-addressed fallback node must carry the modular hash of
+    // the inline derivation (CppNix `staticOutputHashes` over the
+    // received BasicDerivation = hashDerivationModulo with empty
+    // inputDrvs) so the scheduler registers the realisation under the
+    // exact id the client will register and look up, and merge-time
+    // cache hits apply to resubmissions. Deferred-IA-shaped inline
+    // submissions (algo and path both empty) keep no hash — there is
+    // no CppNix flow to mirror for them. Degrade like
+    // populate_ca_modular_hashes: never reject on hash failure.
+    if basic.is_content_addressed() {
+        let lifted = rio_nix::derivation::Derivation::from_basic(basic);
+        match rio_nix::derivation::hash_derivation_modulo(
+            &lifted,
+            drv_path,
+            &|_| None,
+            &mut HashMap::new(),
+        ) {
+            Ok(hash) => node.ca_modular_hash = hash.to_vec(),
+            Err(e) => warn!(
+                drv_path = %drv_path,
+                error = %e,
+                "failed to hash inline fallback derivation; builtOutputs enrichment degraded"
+            ),
+        }
+    }
     Ok(node)
 }
 
@@ -2080,6 +2106,45 @@ mod tests {
         assert!(
             !build_node(drv_path, &basic).drv_content_authoritative,
             "ordinary nodes are not authoritative (worker fetches the .drv from the store)"
+        );
+        // r[verify gw.hook.fallback-built-outputs]
+        // Content-addressed fallback nodes carry the modular hash of the
+        // inline derivation (staticOutputHashes parity: the lifted
+        // inputDrvs-less derivation), so the scheduler registers the
+        // realisation under the id the client will look up.
+        let lifted = rio_nix::derivation::Derivation::from_basic(&basic);
+        let expected_hash = rio_nix::derivation::hash_derivation_modulo(
+            &lifted,
+            drv_path,
+            &|_| None,
+            &mut HashMap::new(),
+        )
+        .expect("no-input derivation always hashes");
+        assert_eq!(
+            node.ca_modular_hash,
+            expected_hash.to_vec(),
+            "FOD fallback node carries the modular hash of the inline derivation"
+        );
+
+        // A deferred-IA-shaped inline derivation (no hash algo, empty
+        // path) is not content-bound: no hash is invented for it.
+        let ia_basic = BasicDerivation::new(
+            vec![rio_nix::derivation::DerivationOutput::new("out", "", "", "").unwrap()],
+            Default::default(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "echo hi".into()],
+            [("out".to_string(), String::new())].into_iter().collect(),
+        )
+        .expect("IA-shaped BasicDerivation constructs");
+        let ia_node = build_fallback_node(
+            "/nix/store/cccccccccccccccccccccccccccccccc-plain.drv",
+            &ia_basic,
+        )
+        .expect("under the cap");
+        assert!(
+            ia_node.ca_modular_hash.is_empty(),
+            "non-content-bound fallback nodes carry no modular hash"
         );
         assert_eq!(
             node.drv_content,

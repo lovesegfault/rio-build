@@ -273,6 +273,30 @@ impl Derivation {
         .expect("Derivation always has outputs")
     }
 
+    /// Lift a [`BasicDerivation`] into a full `Derivation` with empty
+    /// `input_drvs` — the inverse of [`Derivation::to_basic`] and the
+    /// Rust analog of CppNix's `Derivation(const BasicDerivation&)`
+    /// upcast constructor (derivations.hh).
+    ///
+    /// Used to compute `staticOutputHashes`-equivalent realisation keys
+    /// over a derivation received inline on the wire
+    /// (`wopBuildDerivation`): CppNix keys the returned `builtOutputs`
+    /// of `Store::buildDerivation` by `hashDerivationModulo` over
+    /// exactly this inputDrvs-less view of the received derivation, so
+    /// hashing the lifted value reproduces the id the client registers
+    /// and looks up.
+    pub fn from_basic(basic: &BasicDerivation) -> Self {
+        Self {
+            outputs: basic.outputs().to_vec(),
+            input_drvs: BTreeMap::new(),
+            input_srcs: basic.input_srcs().clone(),
+            platform: basic.platform().to_string(),
+            builder: basic.builder().to_string(),
+            args: basic.args().to_vec(),
+            env: basic.env().clone(),
+        }
+    }
+
     /// Parse a derivation from NAR bytes containing a single `.drv` file.
     ///
     /// Equivalent to: `extract_single_file(nar)` → UTF-8 decode → [`Derivation::parse`].
@@ -494,6 +518,31 @@ impl DerivationLike for BasicDerivation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_basic_round_trips_and_hashes_like_inputless_aterm() -> anyhow::Result<()> {
+        // A floating-CA derivation text with no inputDrvs: lifting its
+        // BasicDerivation back to a Derivation must preserve every
+        // field, and hashing the lifted value must equal hashing the
+        // parsed original (the staticOutputHashes parity the gateway
+        // relies on for inline hook fallbacks).
+        let aterm = r#"Derive([("out","","r:sha256","")],[],["/nix/store/cccccccccccccccccccccccccccccccc-src"],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out",""),("big","x")])"#;
+        let drv = Derivation::parse(aterm)?;
+        let lifted = Derivation::from_basic(&drv.to_basic());
+        assert_eq!(lifted, drv, "no-input derivation survives the round-trip");
+        assert!(lifted.input_drvs().is_empty());
+
+        let path = "/nix/store/dddddddddddddddddddddddddddddddd-lift.drv";
+        let mut cache_a = std::collections::HashMap::new();
+        let mut cache_b = std::collections::HashMap::new();
+        let h_orig = super::hash::hash_derivation_modulo(&drv, path, &|_| None, &mut cache_a)?;
+        let h_lift = super::hash::hash_derivation_modulo(&lifted, path, &|_| None, &mut cache_b)?;
+        assert_eq!(
+            h_orig, h_lift,
+            "modular hash is identical over the lifted view"
+        );
+        Ok(())
+    }
 
     #[test]
     fn to_basic_strips_input_drvs() -> anyhow::Result<()> {

@@ -350,6 +350,7 @@ in
   };
 
   # r[verify gw.hook.inline-drv-content+2]
+  # r[verify gw.hook.fallback-built-outputs]
   vm-protocol-cold-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {

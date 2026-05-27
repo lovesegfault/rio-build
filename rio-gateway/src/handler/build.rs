@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_nix::protocol::build::{
     BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
 };
@@ -1515,55 +1515,73 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // result_with_wanted_outputs — declared paths for IA/fixed-CA outputs,
     // registered realisations for floating-CA — and a missing or unrealized
     // output demotes the result to an honest failure instead of shipping an
-    // empty outPath the client asserts on (nix-build.cc:722). Needs the full
-    // Derivation (with inputDrvs) for hash_derivation_modulo; the inline
-    // BasicDerivation lacks inputDrvs so the modular hash would diverge from
-    // CppNix for non-leaf drvs. If full_drv resolve failed (single-node
-    // fallback above), there is nothing to verify against — leave
-    // builtOutputs empty, no worse than before, and IA output paths are
-    // still recoverable client-side from the BasicDerivation it sent.
-    // Store errors during verification abort via stderr_err! inside
+    // empty outPath the client asserts on (nix-build.cc:722). Store errors
+    // during verification abort via stderr_err! inside
     // check_targets_against_store, before stderr.finish().
+    //
+    // Which derivation to verify and enrich from:
+    // - Resolved full Derivation (with inputDrvs): use it — for
+    //   non-leaf drvs the modular hash needs the transitive closure.
+    // - Resolve failed (content-bound single-node fallback): lift the
+    //   inline BasicDerivation. CppNix keys buildDerivation's
+    //   builtOutputs by `staticOutputHashes` over exactly that
+    //   inputDrvs-less derivation (the hook delegates the *resolved*
+    //   drv), so `hash_derivation_modulo(Derivation::from_basic(..))`
+    //   reproduces the id build-remote registers and looks up; the
+    //   floating-CA realized path comes from the realisations row the
+    //   scheduler wrote under the same hash carried on the node.
+    // - Resolve failed and the inline derivation is not content-bound:
+    //   leave builtOutputs empty (no CppNix flow to mirror; IA output
+    //   paths are recoverable client-side from the BasicDerivation).
     // r[impl gw.opcode.build-results-honest+2]
-    if build_result.status.is_success()
-        && let Ok(drv) = &full_drv
-    {
-        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-        // wopBuildDerivation has no per-target output selection — every
-        // declared output is wanted.
-        let targets = HashMap::from([(
-            0usize,
-            TargetDemand {
-                drv_path: drv_path_str.clone(),
-                drv: drv.clone(),
-                spec: OutputSpec::All,
-            },
-        )]);
-        let checks = check_targets_against_store(stderr, ctx, &targets, &mut hash_cache).await?;
-        if let Some(check) = checks.get(&0) {
-            if check.missing.is_empty() {
-                build_result = result_with_wanted_outputs(
-                    build_result,
-                    &targets[&0],
-                    check,
-                    &ctx.drv_cache,
-                    &mut hash_cache,
-                );
-            } else {
-                // Wrong-success: the scheduler says Built but the store does
-                // not hold what the client is owed.
-                warn!(
-                    drv = %drv_path_str,
-                    missing = ?check.missing,
-                    "demoting successful wopBuildDerivation result: outputs not in store"
-                );
-                build_result = BuildResult::failure(
-                    BuildStatus::MiscFailure,
-                    format!(
-                        "build completed but requested outputs are not in the store: {}",
-                        check.missing.join("; ")
-                    ),
-                );
+    // r[impl gw.hook.fallback-built-outputs]
+    if build_result.status.is_success() {
+        let enrich_from: Option<Derivation> = match &full_drv {
+            Ok(drv) => Some(drv.clone()),
+            Err(_) if basic_drv.is_content_addressed() => {
+                Some(Derivation::from_basic(&basic_drv))
+            }
+            Err(_) => None,
+        };
+        if let Some(drv) = enrich_from {
+            let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+            // wopBuildDerivation has no per-target output selection — every
+            // declared output is wanted.
+            let targets = HashMap::from([(
+                0usize,
+                TargetDemand {
+                    drv_path: drv_path_str.clone(),
+                    drv,
+                    spec: OutputSpec::All,
+                },
+            )]);
+            let checks =
+                check_targets_against_store(stderr, ctx, &targets, &mut hash_cache).await?;
+            if let Some(check) = checks.get(&0) {
+                if check.missing.is_empty() {
+                    build_result = result_with_wanted_outputs(
+                        build_result,
+                        &targets[&0],
+                        check,
+                        &ctx.drv_cache,
+                        &mut hash_cache,
+                    );
+                } else {
+                    // Wrong-success: the scheduler says Built but the store does
+                    // not hold what the client is owed.
+                    warn!(
+                        drv = %drv_path_str,
+                        missing = ?check.missing,
+                        "demoting successful wopBuildDerivation result: outputs not in store"
+                    );
+                    build_result = BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!(
+                            "build completed but requested outputs are not in the store: {}",
+                            check.missing.join("; ")
+                        ),
+                    );
+                }
             }
         }
     }

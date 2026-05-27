@@ -1932,6 +1932,25 @@ node at `SubmitBuild` ingress (`MAX_DRV_CONTENT_BYTES` in
 #src("rio-common/src/limits.rs")), so a fallback submission the gateway
 accepts is never size-rejected downstream.
 
+#r("gw.hook.fallback-built-outputs")[
+  When a content-bound (fixed-output or floating-CA) inline fallback build
+  succeeds, the gateway MUST return `builtOutputs` for the derivation's
+  outputs keyed by the modular hash of the inline derivation --- CppNix
+  `staticOutputHashes` over the received `BasicDerivation`, i.e.
+  `hashDerivationModulo` with empty `inputDrvs` --- with floating-CA
+  outputs carrying the realized path from the realisations table, and it
+  MUST carry that hash on the submitted node (`ca_modular_hash`) so the
+  scheduler registers the realisation at completion.
+]
+Build-remote registers exactly that realisation locally and the client's
+resolved-derivation goal looks it up under the same key (the derivation
+delegated to the hook for CA builds is already resolved, so the
+inputDrvs-less hash is the canonical one). Without this the hook client
+receives an empty `builtOutputs`, cannot locate the CA output path, and
+fails after an otherwise successful build; repeat submissions of the same
+resolved derivation now also benefit from merge-time realisation cache
+hits.
+
 Pre-2.16 hook clients that send inline input-addressed derivations without
 uploading the `.drv` receive the rejection described in
 #rref("gw.reject.output-path-mismatch"); the documented client floor for

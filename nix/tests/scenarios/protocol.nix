@@ -60,6 +60,24 @@ let
     };
   };
 
+  # Floating-CA derivation built ONLY via build-hook mode: build-remote
+  # sends any CA derivation inline (wopBuildDerivation) and never copies
+  # the .drv, so this exercises the content-bound fallback end to end —
+  # including the consumable result: the gateway must return builtOutputs
+  # keyed by the modular hash of the inline derivation and the realized
+  # path must be registered (gw.hook.fallback-built-outputs).
+  hookCaDrv = drvs.mkCustom {
+    name = "rio-proto-hook-inline-ca";
+    script = ''
+      echo 'rio hook inline ca' > $out
+    '';
+    extraAttrs = {
+      __contentAddressed = true;
+      outputHashAlgo = "sha256";
+      outputHashMode = "recursive";
+    };
+  };
+
   # Result-pipeline probes (run through the real builder → upload →
   # store path; the differential harness preps its own build dir and
   # never uploads, so these two properties need a production-path
@@ -226,6 +244,34 @@ let
         # Registered in the rio store → the fetcher really executed the
         # inline derivation and uploaded the verified output.
         client.succeed(f"nix path-info --store '{store_url}' {out_fod}")
+
+    # ── hook-mode floating-CA: consumable result via inline fallback ───
+    with subtest("hook-mode floating-CA without .drv upload (consumable result)"):
+        # A floating-CA derivation in build-hook mode also takes the
+        # content-bound single-node fallback (build-remote sends any CA
+        # derivation inline and never copies the .drv). The build only
+        # helps the client if the result is consumable: the gateway must
+        # return builtOutputs keyed by the modular hash of the inline
+        # derivation so build-remote can register the realisation and
+        # print the realized path. The builders spec advertises the
+        # ca-derivations system feature — without it build-remote
+        # declines the machine for CA derivations.
+        out_ca = client.succeed(
+            "nix build --no-link --print-out-paths "
+            f"--max-jobs 0 --builders '{store_url} x86_64-linux - 1 1 ca-derivations' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "-f ${hookCaDrv} 2>&1 | tail -n1"
+        ).strip()
+        assert out_ca.startswith("/nix/store/"), (
+            f"hook-mode floating-CA build did not produce a store path: {out_ca!r}"
+        )
+        assert "hook-inline-ca" in out_ca, (
+            f"unexpected hook-mode floating-CA output name: {out_ca!r}"
+        )
+        # The realized path is registered in the rio store (uploaded by
+        # the worker, realisation written by the scheduler under the
+        # modular hash the gateway carried on the node).
+        client.succeed(f"nix path-info --store '{store_url}' {out_ca}")
   '';
 
   warmScript = ''

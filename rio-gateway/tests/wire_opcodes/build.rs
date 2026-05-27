@@ -794,8 +794,102 @@ async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
         let node = &submits[0].nodes[0];
         assert!(!node.drv_content.is_empty(), "drv_content inlined");
         assert!(node.needs_resolve, "floating-CA node needs resolution");
+        // r[verify gw.hook.fallback-built-outputs]
+        assert!(
+            !node.ca_modular_hash.is_empty(),
+            "content-bound fallback nodes carry the modular hash for realisation keying"
+        );
         rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
             .expect("inlined drv_content parses");
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): a floating-CA derivation built via the
+/// content-bound single-node fallback (the .drv exists in no store)
+/// returns consumable builtOutputs — keyed by the modular hash of the
+/// inline derivation, with the realized path from the realisations
+/// table — instead of an empty list the hook client cannot use.
+/// r[verify gw.hook.fallback-built-outputs]
+#[tokio::test]
+async fn test_build_derivation_inline_floating_ca_fallback_returns_built_outputs()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Store stays EMPTY — resolve_derivation fails, fallback path. The
+    // realisation key is the modular hash over the *inline* derivation
+    // (equal to hashing the same ATerm: it has no inputDrvs).
+    let drv_path = "/nix/store/0000000000000000000000000000000h-fallback-ca.drv";
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","")])"#;
+    let drv = rio_nix::derivation::Derivation::parse(aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/77777777777777777777777777777777-fallback-ca-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,                             // 1 output
+        string: "out", string: "",          // floating-CA: path empty
+        string: "r:sha256", string: "",     // hash_algo set, hash empty
+        strings: wire::NO_STRINGS,          // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "true"],
+        u64: 1, string: "out", string: "",  // env
+        u64: 0,                             // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(status, 0, "Built");
+    let _err = wire::read_string(&mut h.stream).await?;
+    let _tb = wire::read_u64(&mut h.stream).await?;
+    let _nd = wire::read_bool(&mut h.stream).await?;
+    let _st = wire::read_u64(&mut h.stream).await?;
+    let _sp = wire::read_u64(&mut h.stream).await?;
+    if wire::read_u64(&mut h.stream).await? == 1 {
+        let _ = wire::read_u64(&mut h.stream).await?;
+    }
+    if wire::read_u64(&mut h.stream).await? == 1 {
+        let _ = wire::read_u64(&mut h.stream).await?;
+    }
+    let outs = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(outs, 1, "fallback builtOutputs populated (was 0 pre-fix)");
+    let drv_output_id = wire::read_string(&mut h.stream).await?;
+    assert_eq!(drv_output_id, format!("sha256:{}!out", hex::encode(hash)));
+    let realisation_json = wire::read_string(&mut h.stream).await?;
+    assert!(
+        realisation_json.contains("77777777777777777777777777777777-fallback-ca-out"),
+        "outPath should be the realised path, got: {realisation_json}"
+    );
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 1);
+        let node = &submits[0].nodes[0];
+        assert_eq!(
+            node.ca_modular_hash,
+            hash.to_vec(),
+            "the node carried the same hash the realisation is keyed by"
+        );
     }
 
     h.finish().await;
