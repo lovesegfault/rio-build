@@ -1262,18 +1262,23 @@ impl NodeClaimPoolReconciler {
         debug!(created = cover.created.len(), "deficit cover");
         self.inflight_created.extend(cover.created.iter().cloned());
         // Kube-authoritative `intent_id → spec.nodeName` for the
-        // scheduler's hung-node detector. Full set every tick (one
-        // entry per bound builder pod) so the scheduler's
-        // `authoritative_binding` map stays current without delta
-        // tracking; cardinality is O(active builds).
+        // scheduler's hung-node detector, plus the bound pod's
+        // `metadata.name` so the scheduler can also key the binding by
+        // executor id for §P0590 node-scoped mountd tokens. Full set
+        // every tick (one entry per bound builder pod) so the
+        // scheduler's `authoritative_binding` map stays current without
+        // delta tracking; cardinality is O(active builds).
         let bound_intents = self
             .pod_requested
-            .bound_intents()
+            .bound_intent_pods()
             .into_iter()
-            .map(|(intent_id, node_name)| rio_proto::types::BoundIntent {
-                intent_id,
-                node_name,
-            })
+            .map(
+                |(intent_id, (pod_name, node_name))| rio_proto::types::BoundIntent {
+                    intent_id,
+                    node_name,
+                    pod_name,
+                },
+            )
             .collect();
         self.report_unfulfillable(&ice_cells, &registered_cells, observed_types, bound_intents)
             .await?;

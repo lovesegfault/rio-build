@@ -674,6 +674,20 @@ impl PodRequestedCache {
             .collect()
     }
 
+    /// `intent_id → (pod_name, node_name)` for the same bound pods as
+    /// [`bound_intents`](Self::bound_intents). The pod-name view feeds
+    /// the scheduler ack's `BoundIntent.pod_name` so the scheduler can
+    /// key the controller-attested node binding by executor id (= pod
+    /// `metadata.name`) for the §P0590 node-scoped mountd token.
+    pub fn bound_intent_pods(&self) -> HashMap<String, (String, String)> {
+        self.0
+            .read()
+            .bound_intent
+            .iter()
+            .map(|(id, (pod, node))| (id.clone(), (pod.clone(), node.clone())))
+            .collect()
+    }
+
     /// Upsert `pod`'s requests under its `spec.nodeName`. Pending pods
     /// (no `nodeName`) are ignored — they haven't reserved capacity on
     /// any node. Terminal-phase pods (`Succeeded`/`Failed`) are evicted
@@ -1707,9 +1721,17 @@ mod tests {
         p.metadata.annotations = Some([(INTENT_ID_ANNOTATION.into(), "abc".into())].into());
         cache.apply(&p);
         assert_eq!(cache.bound_intents().get("abc"), Some(&"n1".into()));
+        // The pod-name view (feeds BoundIntent.pod_name → the
+        // scheduler's executor-keyed binding for §P0590 node-scoped
+        // mountd tokens) carries the same entry with metadata.name.
+        assert_eq!(
+            cache.bound_intent_pods().get("abc"),
+            Some(&("rb-x".into(), "n1".into()))
+        );
         // Succeeded → evicted from index too.
         cache.apply(&pod_phase(p.clone(), "Succeeded"));
         assert!(cache.bound_intents().is_empty());
+        assert!(cache.bound_intent_pods().is_empty());
         // delete() also evicts.
         cache.apply(&p);
         cache.delete(&p);
