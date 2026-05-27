@@ -35,8 +35,14 @@ pub struct BatchOutcome {
     /// Last ~200 stderr lines, kept verbatim as raw evidence for
     /// batches.jsonl.
     pub stderr_tail: String,
-    /// True when the engine killed the child (batch timeout / abort) rather
-    /// than the child exiting on its own.
+    /// True when the engine killed the child (batch timeout, abort, or a
+    /// stderr read failure) rather than the child exiting on its own.
+    ///
+    /// Authoritative over `exit_code` when the two disagree: in the narrow
+    /// race where the child exits exactly as the engine's deadline fires,
+    /// `exit_code` can still be `Some(_)` — the outcome must be treated as
+    /// cancelled (the stderr stream was abandoned early, so the captured
+    /// evidence may be incomplete).
     pub engine_cancelled: bool,
 }
 
@@ -63,6 +69,15 @@ pub trait Submitter: Send + Sync {
 /// forwarded agent socket hangs the handshake before key exchange). Same
 /// option set as `xtask/src/k8s/shared.rs`'s `NIX_SSHOPTS_BASE`, which
 /// documents the incident history behind each flag.
+///
+/// Security tradeoff: `StrictHostKeyChecking=no` plus a null known-hosts
+/// file disables SSH host-key verification entirely. The gateway's host
+/// keys are ephemeral (regenerated on every pod restart), so there is no
+/// stable key to pin, and this mirrors the repo's existing xtask
+/// convention for the same endpoint. The hardening alternatives — a
+/// ConfigMap-provisioned `known_hosts` or SSH-CA-signed host keys — are an
+/// infrastructure/enablement decision outside this crate. Flagged by an
+/// automated security review and consciously accepted for now.
 pub const NIX_SSHOPTS: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
      -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
      -o ControlMaster=no -o ControlPath=none \
@@ -70,6 +85,18 @@ pub const NIX_SSHOPTS: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile
 
 /// How many trailing stderr lines to keep as raw evidence.
 const STDERR_TAIL_LINES: usize = 200;
+
+/// Decode one captured stderr line for evidence capture and the
+/// gateway-line regexes. Lossy on purpose: nix relays builder output
+/// verbatim, so a non-UTF-8 byte sequence must never abort the stream and
+/// discard the evidence captured so far. The replacement characters only
+/// ever land in the evidence tail / relayed reason text — this is log
+/// display, not a wire parse path (the case clippy.toml's
+/// `disallowed-methods` rationale carves out).
+fn lossy_stderr_line(buf: &[u8]) -> String {
+    #[allow(clippy::disallowed_methods)]
+    String::from_utf8_lossy(buf).into_owned()
+}
 
 /// Timeout for the pre-submission drv import. Generous on purpose: the
 /// import copies tiny `.drv` text files from a local on-disk archive, so
@@ -157,6 +184,13 @@ impl NixSubmitter {
 
     /// Run one child, streaming its stderr through the gateway-line parser
     /// and keeping the trailing lines as raw evidence; kill it at `timeout`.
+    ///
+    /// Stderr is read as raw bytes and decoded lossily: nix relays builder
+    /// output verbatim, so a non-UTF-8 byte sequence must never abort the
+    /// stream and discard the evidence captured so far. A genuine read
+    /// error likewise keeps the partial capture: the child is killed (so
+    /// the `wait` below cannot block forever on a full pipe nobody drains)
+    /// and the outcome is returned with `engine_cancelled` set.
     async fn run_child(&self, args: &[String], timeout: Duration) -> Result<BatchOutcome> {
         let mut child = self.command(args).spawn().with_context(|| {
             format!(
@@ -165,37 +199,67 @@ impl NixSubmitter {
                 args.first().cloned().unwrap_or_default()
             )
         })?;
+        let subcommand = args.first().cloned().unwrap_or_default();
         let stderr = child.stderr.take().expect("stderr piped");
-        let mut lines = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::new();
         let mut parsed = ParsedStderr::default();
         let mut tail: VecDeque<String> = VecDeque::new();
+        let push_tail = |tail: &mut VecDeque<String>, line: String| {
+            if tail.len() == STDERR_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        };
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut engine_cancelled = false;
         loop {
             tokio::select! {
-                line = lines.next_line() => {
-                    match line? {
-                        Some(line) => {
-                            parse_line(&mut parsed, &line);
-                            if tail.len() == STDERR_TAIL_LINES {
-                                tail.pop_front();
-                            }
-                            tail.push_back(line);
+                read = reader.read_until(b'\n', &mut buf) => {
+                    match read {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let line = lossy_stderr_line(&buf);
+                            let line = line.trim_end_matches(['\r', '\n']);
+                            parse_line(&mut parsed, line);
+                            push_tail(&mut tail, line.to_string());
+                            buf.clear();
                         }
-                        None => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                program = %self.nix_bin,
+                                subcommand = %subcommand,
+                                "stderr read error; killing the child and keeping the partial \
+                                 capture"
+                            );
+                            let _ = child.start_kill();
+                            engine_cancelled = true;
+                            break;
+                        }
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     tracing::warn!(
-                        "batch timeout reached; killing the nix child (in-flight builds are \
-                         cancelled by the gateway on disconnect and re-run on resume)"
+                        program = %self.nix_bin,
+                        subcommand = %subcommand,
+                        "child deadline reached; killing it (an interrupted `nix build` \
+                         submission is cancelled by the gateway on disconnect and re-offered \
+                         on resume; an interrupted `nix copy` import just leaves the batch \
+                         unsubmitted)"
                     );
                     let _ = child.start_kill();
                     engine_cancelled = true;
                     break;
                 }
             }
+        }
+        // A line in flight when the loop was cut short (deadline / read
+        // error) is still evidence — keep it in the tail, but don't feed a
+        // possibly-truncated line to the parser.
+        if !buf.is_empty() {
+            push_tail(&mut tail, lossy_stderr_line(&buf));
         }
         let status = child.wait().await.context("wait for nix child")?;
         Ok(BatchOutcome {
@@ -217,19 +281,28 @@ impl Submitter for NixSubmitter {
         timeout: Duration,
     ) -> Result<BatchOutcome> {
         // Import the batch's drv closures from the archive into the local
-        // store first (cheap; idempotent), then submit.
+        // store first (cheap; idempotent), then submit. `engine_cancelled`
+        // is checked alongside the exit code: a child killed at the import
+        // deadline counts as a failed import even if it managed to exit 0
+        // in the kill race.
         let import = self
             .run_child(&self.import_args(batch), IMPORT_TIMEOUT)
             .await?;
-        if import.exit_code != Some(0) {
+        if import.exit_code != Some(0) || import.engine_cancelled {
             // The import child's stderr is not persisted anywhere else, so
             // carry a clipped tail of it in the error.
             let last_lines: Vec<&str> = import.stderr_tail.lines().rev().take(5).collect();
             let last_lines: Vec<&str> = last_lines.into_iter().rev().collect();
+            let cancelled_note = if import.engine_cancelled {
+                " (killed at the engine's import deadline)"
+            } else {
+                ""
+            };
             anyhow::bail!(
-                "drv import from {} failed (exit {:?}): {}",
+                "drv import from {} failed (exit {:?}){}: {}",
                 self.drv_archive_dir.display(),
                 import.exit_code,
+                cancelled_note,
                 crate::body_snippet(&last_lines.join(" | "))
             );
         }
@@ -266,15 +339,17 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
 
     /// Scripted [`Submitter`] for stage-level tests: pops pre-programmed
-    /// outcomes and records every submitted batch.
+    /// results and records every submitted batch.
     #[derive(Default)]
     pub struct FakeSubmitter {
-        /// Outcomes are popped from the BACK, so when scripting several
-        /// batches push the LAST batch's outcome first. An exhausted script
-        /// yields `BatchOutcome::default()`.
-        pub outcomes: Mutex<Vec<BatchOutcome>>,
-        /// `(store_url, batch)` of every `submit_batch` call, in call order.
-        pub submitted: Mutex<Vec<(String, Batch)>>,
+        /// Scripted results, popped from the BACK, so when scripting several
+        /// batches push the LAST batch's result first. `Err` entries script
+        /// engine-side submission failures (spawn/import/ssh errors). An
+        /// exhausted script yields `Ok(BatchOutcome::default())`.
+        pub outcomes: Mutex<Vec<Result<BatchOutcome>>>,
+        /// `(store_url, batch, timeout)` of every `submit_batch` call, in
+        /// call order.
+        pub submitted: Mutex<Vec<(String, Batch, Duration)>>,
     }
 
     #[async_trait]
@@ -283,13 +358,17 @@ pub(crate) mod test_support {
             &self,
             store_url: &str,
             batch: &Batch,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<BatchOutcome> {
             self.submitted
                 .lock()
                 .unwrap()
-                .push((store_url.to_string(), batch.clone()));
-            Ok(self.outcomes.lock().unwrap().pop().unwrap_or_default())
+                .push((store_url.to_string(), batch.clone(), timeout));
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| Ok(BatchOutcome::default()))
         }
     }
 }
@@ -414,31 +493,74 @@ mod tests {
     }
 
     /// Pin the [`test_support::FakeSubmitter`] scripting contract that the
-    /// stage-level tests rely on: outcomes pop from the BACK, an exhausted
-    /// script yields a default outcome, and every submission is recorded in
-    /// call order.
+    /// stage-level tests rely on: results pop from the BACK (push the last
+    /// batch's result first), `Err` entries script engine-side submission
+    /// failures, an exhausted script yields a default outcome, and every
+    /// submission is recorded in call order together with the timeout it
+    /// was given.
     #[tokio::test]
     async fn fake_submitter_pops_outcomes_from_the_back() {
         use super::test_support::FakeSubmitter;
         let fake = FakeSubmitter::default();
+        fake.outcomes
+            .lock()
+            .unwrap()
+            .push(Err(anyhow::anyhow!("scripted submission failure")));
         for id in ["second", "first"] {
-            fake.outcomes.lock().unwrap().push(BatchOutcome {
+            fake.outcomes.lock().unwrap().push(Ok(BatchOutcome {
                 build_id: Some(id.to_string()),
                 ..BatchOutcome::default()
-            });
+            }));
         }
         let b = batch();
         let timeout = Duration::from_secs(1);
         let first = fake.submit_batch("ssh-ng://x", &b, timeout).await.unwrap();
         let second = fake.submit_batch("ssh-ng://x", &b, timeout).await.unwrap();
+        let err = fake
+            .submit_batch("ssh-ng://x", &b, timeout)
+            .await
+            .unwrap_err();
         let drained = fake.submit_batch("ssh-ng://x", &b, timeout).await.unwrap();
         assert_eq!(first.build_id.as_deref(), Some("first"));
         assert_eq!(second.build_id.as_deref(), Some("second"));
+        assert!(err.to_string().contains("scripted submission failure"));
         assert_eq!(drained, BatchOutcome::default());
         let submitted = fake.submitted.lock().unwrap();
-        assert_eq!(submitted.len(), 3);
+        assert_eq!(submitted.len(), 4);
         assert_eq!(submitted[0].0, "ssh-ng://x");
         assert_eq!(submitted[0].1, b);
+        assert!(submitted.iter().all(|(_, _, t)| *t == timeout));
+    }
+
+    /// Invalid UTF-8 on stderr must never abort the stream or discard the
+    /// evidence captured so far: bytes are decoded lossily and parsing
+    /// continues on the following lines.
+    #[tokio::test]
+    async fn run_child_keeps_evidence_across_invalid_utf8() {
+        let mut sub = NixSubmitter::new(PathBuf::from("/nonexistent"));
+        sub.nix_bin = "sh".to_string();
+        let script = concat!(
+            "printf 'garbage \\377\\376 bytes\\n' >&2\n",
+            "echo \"rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a\" >&2\n",
+            "echo \"derivation '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv' failed: builder failed with exit code 2\" >&2\n",
+        );
+        let out = sub
+            .run_child(
+                &["-c".to_string(), script.to_string()],
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(!out.engine_cancelled);
+        assert_eq!(
+            out.build_id.as_deref(),
+            Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+        assert_eq!(out.reasons.len(), 1);
+        // The undecodable bytes are kept (lossily replaced) in the tail.
+        assert!(out.stderr_tail.contains("garbage"), "{}", out.stderr_tail);
+        assert!(out.stderr_tail.contains('\u{FFFD}'), "{}", out.stderr_tail);
     }
 
     /// The engine deadline kills a child that outlives it and reports the

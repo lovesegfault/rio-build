@@ -296,13 +296,21 @@ pub struct WarmEntry {
     pub observed_at: String,
 }
 
+/// [`BatchRecord::kind`] value for build-stage submissions.
+pub const BATCH_KIND_SUBMIT: &str = "submit";
+
+/// [`BatchRecord::kind`] value for warm-stage submissions.
+pub const BATCH_KIND_WARM: &str = "warm";
+
 /// One line of batches.jsonl — engine-internal bookkeeping for resume and
 /// build_id recovery (not part of the per-job results schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRecord {
     pub batch_id: u64,
-    /// "submit" | "warm"
+    /// One of the `BATCH_KIND_*` constants in this module ("submit" |
+    /// "warm"); batches.jsonl writers must use the constants, never
+    /// hand-typed literals.
     pub kind: String,
     pub jobs: Vec<String>,
     pub root_drvs: Vec<String>,
@@ -407,6 +415,15 @@ mod tests {
         );
         let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len());
+    }
+
+    #[test]
+    fn batch_kind_vocabulary_is_fixed_and_distinct() {
+        // Frozen wire strings: batches.jsonl is append-only across resumes,
+        // so renaming a kind would orphan prior entries.
+        assert_eq!(BATCH_KIND_SUBMIT, "submit");
+        assert_eq!(BATCH_KIND_WARM, "warm");
+        assert_ne!(BATCH_KIND_SUBMIT, BATCH_KIND_WARM);
     }
 
     #[test]
