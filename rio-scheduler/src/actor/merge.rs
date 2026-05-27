@@ -1668,7 +1668,7 @@ impl DagActor {
             return HashSet::new();
         }
 
-        // r[impl sched.merge.stale-substitutable]
+        // r[impl sched.merge.stale-substitutable+2]
         // r[impl sched.substitute.detached+5]
         // Missing-but-substitutable: instead of awaiting eager-fetch
         // (which blocked the actor), reset Completed→Ready and spawn

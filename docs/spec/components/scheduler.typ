@@ -845,9 +845,8 @@ submitted after the failover record contributions as usual).
   actor's gRPC timeout, since the call blocks the single-threaded actor event
   loop. A fetch that fails or returns NotFound demotes that path from the
   substitutable set --- the derivation falls through to normal dispatch instead
-  of being marked completed against a phantom cache hit. Force-build
-  submission roots never enter this fetch path
-  (#rref("sched.merge.force-build-roots")).
+  of being marked completed against a phantom cache hit. Force-build submission
+  roots never enter this fetch path (#rref("sched.merge.force-build-roots")).
 ]
 
 #r("sched.merge.force-build-roots")[
@@ -861,17 +860,17 @@ submitted after the failover record contributions as usual).
   still short-circuit to Completed, and the submission's dependencies remain
   substitutable. The per-node decision is a sticky OR over the node's
   interested builds (any live interested build with `force_build_roots` that
-  names the node among its submission roots), so a later non-force
-  submission of the same derivation does not strip the protection while the
-  force-build build is live. The inputs to that decision are persisted via
-  `builds.force_build_roots` and `build_derivations.is_root` and re-derived
-  at recovery, so a leader failover cannot turn a force-build root that was
-  not yet terminal at failover into a substitution.
+  names the node among its submission roots), so a later non-force submission
+  of the same derivation does not strip the protection while the force-build
+  submission is live. The inputs to that decision are persisted via
+  `builds.force_build_roots` and `build_derivations.is_root` and re-derived at
+  recovery, so a leader failover cannot turn a force-build root that was not
+  yet terminal at failover into a substitution.
 ]
 
-The flag exists for validation campaigns (nixpkgs-parity leaf mode): without
-it every Hydra-green target submitted under a cache.nixos.org-backed tenant
-would come back `substituted` instead of exercising the build path.
+The flag exists for validation campaigns such as nixpkgs-parity: without it
+every Hydra-green target submitted under a cache.nixos.org-backed tenant would
+come back `Substituted` instead of exercising the build path.
 
 #r("sched.merge.ca-fod-substitute")[
   The path-based lane of `check_cached_outputs` MUST cover every probe-set node
@@ -932,8 +931,8 @@ would come back `substituted` instead of exercising the build path.
   dependency subgraph was dropped, so the worker cannot resolve `inputDrvs`
   --- and this MUST hold across leader failover.
   Submissions with `force_build_roots`
-  (#rref("sched.merge.force-build-roots")) are exempt: the top-down check MUST
-  NOT fire for them.
+  (#rref("sched.merge.force-build-roots")) are exempt: the top-down check
+  MUST NOT fire for them.
 ]
 The prune short-circuits the common case where a requested package is already
 cached upstream: instead of eager-fetching hundreds of dependency NARs (the
@@ -1008,9 +1007,10 @@ doomed dispatch.
   Substitutable paths MUST be fetched (`QueryPathInfo` with the same metadata)
   before the derivation is marked Completed --- builders' subsequent `GetPath`
   calls have no tenant context, so the lazy `try_substitute_on_miss` cannot
-  fire there. Force-build roots (#rref("sched.merge.force-build-roots")) MUST
-  be excluded from the substitute-spawn arm while remaining in the probe batch
-  (the probe-tenant selection and locally-present completion are unchanged).
+  fire there. Force-build submission roots MUST be excluded from the
+  substitute-spawn arm (#rref("sched.merge.force-build-roots")) while remaining
+  in the probe batch (the probe-tenant selection and locally-present completion
+  are unchanged).
 ]
 
 #r("sched.substitute.eager-probe")[
@@ -1422,7 +1422,7 @@ Queue-level preemption is fully supported:
   merge on store availability would be a worse regression).
 ]
 
-#r("sched.merge.stale-substitutable")[
+#r("sched.merge.stale-substitutable+2")[
   The stale-completed `FindMissingPaths` is sent with the build's tenant token
   so the store reports `substitutable_paths`. Outputs that are
   missing-but-substitutable are eagerly fetched (per
@@ -1430,7 +1430,9 @@ Queue-level preemption is fully supported:
   outputs that are missing AND not successfully substituted reset to `ready`.
   Without this, post-GC re-submissions re-dispatch the entire subtree ---
   including FOD sources whose origin URLs may be dead --- for paths
-  cache.nixos.org already has.
+  cache.nixos.org already has. Force-build submission roots are exempt: a
+  vanished force-build root resets to `ready` and dispatches to a builder, not
+  back into the substitute lane (#rref("sched.merge.force-build-roots")).
 ]
 
 = Build State Machine

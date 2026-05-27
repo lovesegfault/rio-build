@@ -417,6 +417,7 @@ message SubmitBuildRequest {
   string tenant_name = 9;          // Tenant name (from gateway's authorized_keys comment);
                                    //   scheduler resolves to UUID via tenants table.
                                    //   Empty string = single-tenant mode.
+  bool force_build_roots = 10;     // Build submission roots even when upstream-substitutable
 }
 
 message DerivationNode {

@@ -74,7 +74,7 @@ pub struct MockStoreCalls {
     /// Every PutPath metadata received (for assertions on upload count/contents).
     pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
     /// Records every `query_path_info` call's requested path. For
-    /// verifying r[sched.merge.substitute-fetch+2]'s eager-fetch loop.
+    /// verifying `r[sched.merge.substitute-fetch]`'s eager-fetch loop.
     pub qpi_calls: Arc<RwLock<Vec<String>>>,
     /// Per-path `query_path_info` attempt count, INCLUDING calls that
     /// fault-short-circuit (the early-return knobs above all skip
@@ -751,7 +751,7 @@ impl StoreService for MockStore {
         // Substitution side-effect simulation: if the path is seeded
         // as substitutable, materialize a minimal PathInfo on QPI —
         // mirrors the real store's try_substitute_on_miss. The
-        // scheduler's r[sched.merge.substitute-fetch+2] eager-fetch
+        // scheduler's `r[sched.merge.substitute-fetch]` eager-fetch
         // depends on this returning Some rather than NotFound.
         if self
             .state

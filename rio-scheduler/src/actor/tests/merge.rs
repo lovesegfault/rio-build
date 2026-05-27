@@ -6556,7 +6556,7 @@ enum GcState {
 }
 
 // r[verify sched.merge.stale-completed-verify+5]
-// r[verify sched.merge.stale-substitutable]
+// r[verify sched.merge.stale-substitutable+2]
 /// Pre-existing `Completed` node verification at merge time.
 ///
 /// Common setup: Build A merges `app-a → fod-dep`, fod-dep completes
@@ -7062,7 +7062,7 @@ async fn merge_cache_hit_classified_against_live_builds_effective_wanted(
     Ok(())
 }
 
-// r[verify sched.merge.stale-substitutable]
+// r[verify sched.merge.stale-substitutable+2]
 // r[verify sched.merge.wanted-outputs+2]
 /// `verify_preexisting_completed` ROUTING × wanted outputs: once the
 /// reset HAS fired (a wanted recorded output is missing), the choice
