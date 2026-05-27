@@ -18,7 +18,12 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Tenant JWT + assignment HMAC token sign/verify, and the gRPC"
+      "doc": "Tenant JWT + assignment HMAC token sign/verify, the Ed25519"
+    },
+    {
+      "path": "mountd_token.rs",
+      "depth": 0,
+      "doc": "Scheduler-signed Ed25519 Mount-admission tokens (the `rmt2` envelope)."
     }
   ],
   "rio-builder": [

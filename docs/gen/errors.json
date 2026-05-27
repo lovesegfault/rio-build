@@ -71,6 +71,90 @@
       "doc": "Signing key → PKCS#8 DER encoding. Only reachable from [`sign`] (verify uses raw pubkey bytes). Never fails for a valid ed25519 key — it's a fixed-format serialization — so this variant firing means the key itself is corrupt. Kept as a variant rather than `.expect()` because key material comes from outside (K8s Secret) and a corrupt mount should error cleanly, not panic the gateway."
     },
     {
+      "enum": "MountdKeyError",
+      "name": "BadKeyName",
+      "crate": "rio-auth",
+      "msg": "mountd key name {name:?} must start with \"rio-mountd-\"",
+      "doc": "The key name does not carry the required `rio-mountd-` prefix — most likely a narinfo (or other) keypair cross-wired into a mountd key path."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "Base64",
+      "crate": "rio-auth",
+      "msg": "mountd key base64 decode failed: {0}",
+      "doc": "The base64 payload of an entry does not decode."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "DuplicateTrustRoot",
+      "crate": "rio-auth",
+      "msg": "duplicate mountd trust root name {name:?}",
+      "doc": "Two trust-root entries share a name. Names identify keys in logs and the rotation runbook; duplicates would make \"which key verified\" ambiguous, so the loader rejects them."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "Empty",
+      "crate": "rio-auth",
+      "msg": "mountd key file is empty",
+      "doc": "The file was configured but contains no key entry (empty or only blank lines)."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "Io",
+      "crate": "rio-auth",
+      "msg": "mountd key file I/O ({path}): {source}",
+      "doc": "Reading the key file failed."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "MissingSeparator",
+      "crate": "rio-auth",
+      "msg": "mountd key entry format: expected 'name:base64', missing ':' separator",
+      "doc": "An entry is not `name:base64` shaped (no `:` separator)."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "SigningKeyLength",
+      "crate": "rio-auth",
+      "msg": "mountd signing key must decode to 32 (seed) or 64 (seed+pubkey) bytes, got {got}",
+      "doc": "The signing key decodes to neither a 64-byte keypair nor a 32-byte seed."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "SigningKeyMismatch",
+      "crate": "rio-auth",
+      "msg": "mountd signing key: embedded public key does not match the seed",
+      "doc": "The 64-byte form embeds a public key that does not match the one derived from the seed half — a corrupt or hand-spliced key file."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "SigningKeyMultipleEntries",
+      "crate": "rio-auth",
+      "msg": "mountd signing key file must contain exactly one 'rio-mountd-<n>:base64' entry",
+      "doc": "The signing-key file contains more than one entry. Unlike the trust-roots file (where multiple lines are the rotation-overlap state), the signer is exactly one key — rotation swaps the file content, it never appends. Most likely the trust-roots file (or a rotation overlap) was pointed at the signing-key path."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "TooManyTrustRoots",
+      "crate": "rio-auth",
+      "msg": "too many mountd trust roots: {count} (maximum {MOUNTD_TRUST_ROOT_MAX})",
+      "doc": "More than [`MOUNTD_TRUST_ROOT_MAX`] roots configured."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "TrustRootInvalid",
+      "crate": "rio-auth",
+      "msg": "mountd trust root {name:?} is not a valid ed25519 public key",
+      "doc": "A trust-root entry is 32 bytes but not a valid ed25519 point."
+    },
+    {
+      "enum": "MountdKeyError",
+      "name": "TrustRootLength",
+      "crate": "rio-auth",
+      "msg": "mountd trust root {name:?} must be a 32-byte ed25519 public key, got {got} bytes",
+      "doc": "A trust-root entry does not decode to exactly 32 bytes."
+    },
+    {
       "enum": "MountdTokenError",
       "name": "Audience",
       "crate": "rio-auth",
@@ -90,6 +174,104 @@
       "crate": "rio-auth",
       "msg": "mountd token invalid: {0}",
       "doc": "Signature, format, or expiry failure from the shared HMAC envelope (or a claims shape that is not `MountdClaims`)."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Audience",
+      "crate": "rio-auth",
+      "msg": "mountd token audience mismatch",
+      "doc": "The token verified but its audience is not [`MOUNTD_TOKEN_AUDIENCE`] — minted for some other consumer."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Base64",
+      "crate": "rio-auth",
+      "msg": "mountd token base64 decode failed: {0}",
+      "doc": "A base64url segment did not decode."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "BuildIdMismatch",
+      "crate": "rio-auth",
+      "msg": "mountd token build_id mismatch",
+      "doc": "The token verified but was minted for a different `build_id` than the one the Mount requests."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Clock",
+      "crate": "rio-auth",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": "The verifier's clock predates the unix epoch — expiry undecidable."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Expired",
+      "crate": "rio-auth",
+      "msg": "mountd token expired (expiry={expiry_unix}, now={now_unix})",
+      "doc": "The token is past its expiry."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Format",
+      "crate": "rio-auth",
+      "msg": "mountd token format invalid: expected 'rmt2.<claims>.<signature>', got {0} segments",
+      "doc": "Not an `rmt2.<claims>.<signature>` shape (wrong segment count or version tag). Carries the number of `.`-separated segments seen."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "InvalidSignature",
+      "crate": "rio-auth",
+      "msg": "mountd token signature verification failed",
+      "doc": "No configured trust root verifies the signature: tampered token, a key the verifier does not trust, or not an Ed25519 signature at all. Deliberately not distinguished further."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Json",
+      "crate": "rio-auth",
+      "msg": "mountd token claims decode failed: {0}",
+      "doc": "The (signature-verified) claims segment is not a valid [`MountdAdmissionClaims`] JSON body."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "Legacy",
+      "crate": "rio-auth",
+      "msg": "legacy mountd token rejected: {0}",
+      "doc": "A legacy two-segment token was presented and the configured HMAC key rejected it (signature/expiry/shape/audience/build_id — see [`MountdTokenError`])."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "LegacyNotConfigured",
+      "crate": "rio-auth",
+      "msg": "legacy HMAC mountd token presented but no HMAC key is configured",
+      "doc": "A legacy two-segment token was presented but this verifier has no HMAC key configured. Production never configures one, so this is the expected rejection for every pre-`rmt2` token."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "NodeMismatch",
+      "crate": "rio-auth",
+      "msg": "mountd token node claim does not match this node",
+      "doc": "The verifier was given an expected node and the token names a different one — the cross-node replay the node claim exists to stop."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "NodeMissing",
+      "crate": "rio-auth",
+      "msg": "mountd token carries no node claim but a node binding is required",
+      "doc": "The verifier was given an expected node but the token carries no node claim (minted unbound)."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "SignatureLength",
+      "crate": "rio-auth",
+      "msg": "mountd token signature must be 64 bytes, got {0}",
+      "doc": "The signature segment is not exactly 64 bytes."
+    },
+    {
+      "enum": "MountdVerifyError",
+      "name": "TrustRootsNotConfigured",
+      "crate": "rio-auth",
+      "msg": "rmt2 mountd token presented but no Ed25519 trust roots are configured",
+      "doc": "An `rmt2` token was presented but this verifier has no Ed25519 trust roots configured."
     },
     {
       "enum": "CastoreMountError",
@@ -1588,9 +1770,19 @@
       "doc": ""
     },
     {
+      "name": "MountdKeyError",
+      "crate": "rio-auth",
+      "doc": "Why mountd key material (signing key or trust roots) failed to load. Variants never carry key bytes — at most the offending key *name* and the file path, which is what an operator needs to fix the file. A configured-but-unreadable/empty/malformed file is a hard error by design (fail closed at startup); only an *unset* path means \"scheme not enabled\"."
+    },
+    {
       "name": "MountdTokenError",
       "crate": "rio-auth",
       "doc": "Why a presented mountd token does not authorize the requested `Mount{}`. Variants deliberately carry no token material; the daemon logs the variant and replies with a generic rejection."
+    },
+    {
+      "name": "MountdVerifyError",
+      "crate": "rio-auth",
+      "doc": "Why a presented Mount-admission token does not authorize the requested `Mount{}`. Variants carry no key material and no full token/claims content — at most a single offending byte/offset reported by the base64 decoder ([`Self::Base64`]) or a claim field name reported by serde ([`Self::Json`], reachable only after a trust root has verified the signature). Same discipline as the legacy [`MountdTokenError`]: the daemon logs the variant and replies with one opaque `Unauthorized` on the wire."
     },
     {
       "name": "CastoreMountError",
