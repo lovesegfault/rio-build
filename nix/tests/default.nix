@@ -774,9 +774,19 @@ in
       # heartbeat + build + exit). Subtest deletes the default x86-64
       # Pool first so it doesn't steal dispatch.
       "ephemeral-pool"
+      # r[verify sched.executor.pull-transaction]
+      # r[verify builder.pull.exit-codes]
+      # r[verify sched.attempt.no-attempt-no-op]
+      # r[verify sched.admin.list-open-attempts]
+      #   pull-mode: ~300s — never-pulled kill + respawned pull build
+      #   (30s sleep) + report + killed-mid-build arm (45s sleep +
+      #   15s observation) + cleanup, each behind a reconcile tick +
+      #   pod schedule + FUSE.
+      "pull-mode"
     ];
-    # ephemeral ~180s + ~240s k3s bring-up ≈ 420s expected.
-    globalTimeout = 700;
+    # ephemeral ~180s + pull-mode ~300s + ~240s k3s bring-up ≈ 720s
+    # expected; TCG tail headroom on top.
+    globalTimeout = 1100;
   };
 
   #

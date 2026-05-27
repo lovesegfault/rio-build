@@ -219,6 +219,21 @@ let
   ephemeralDrv1 = drvs.mkTrivial { marker = "lifecycle-ephemeral-1"; };
   ephemeralDrv2 = drvs.mkTrivial { marker = "lifecycle-ephemeral-2"; };
 
+  # pull-mode: the additive PullAssignment/ReportOutcome path.
+  # pullDrv1 (30s sleep): long enough that the open attempt is
+  # observable in ListOpenAttempts / the open-attempts gauge while the
+  # build runs, short enough to keep the subtest budget tight.
+  # pullDrv2 (45s sleep): the killed-mid-build arm — the window covers
+  # pod start + pull + the force-kill + a post-kill observation.
+  pullDrv1 = drvs.mkTrivial {
+    marker = "lifecycle-pull-mode-1";
+    sleepSecs = 30;
+  };
+  pullDrv2 = drvs.mkTrivial {
+    marker = "lifecycle-pull-mode-2";
+    sleepSecs = 45;
+  };
+
   # gc-sweep's path_tenants proof. Distinct marker so DAG-dedup doesn't
   # reuse pinDrv/gcVictimDrv (those were built with the empty-comment
   # key → tenant_id=None → completion hook's filter_map drops → upsert
@@ -621,6 +636,8 @@ let
       gcVictimDrv
       ephemeralDrv1
       ephemeralDrv2
+      pullDrv1
+      pullDrv2
       tenantDrv
       rolloutPreDrv
       rolloutPostDrv

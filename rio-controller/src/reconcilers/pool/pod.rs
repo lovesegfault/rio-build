@@ -45,6 +45,17 @@ pub(super) const KVM_FEATURE: &str = "kvm";
 /// keys the toleration set on it.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
+/// Pool-CR annotation selecting the executor dispatch mode for the
+/// additive pull slice: `rio.build/dispatch-mode: pull` makes every
+/// executor pod of that Pool spawn with `RIO_DISPATCH_MODE=pull` (the
+/// builder Config flag — `PullAssignment`/`ReportOutcome` instead of
+/// register/heartbeat/stream). Interim, test-fixture-facing seam: the
+/// first-class `PoolSpec.dispatchMode` field replaces it at the 1b
+/// slice; production Pools carry no such annotation, so the env is
+/// never injected outside explicitly opted-in pools. Any value other
+/// than `pull` (case-insensitive) is ignored.
+pub(super) const DISPATCH_MODE_ANNOTATION: &str = "rio.build/dispatch-mode";
+
 /// Pod label carrying the executor role. Scheduler routing, network
 /// policies, and `kubectl get pods -l rio.build/role=fetcher` all
 /// key on this.
@@ -913,6 +924,19 @@ fn build_executor_container(
                 // returns WrongKind without spawning).
                 env("RIO_EXECUTOR_KIND", pool.spec.kind.as_str()),
             ];
+            // Pull-mode opt-in (the additive slice's interim selector;
+            // see DISPATCH_MODE_ANNOTATION). Absent annotation — the
+            // production default — injects nothing and the builder
+            // stays on its `stream` Config default.
+            if pool
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(DISPATCH_MODE_ANNOTATION))
+                .is_some_and(|v| v.eq_ignore_ascii_case("pull"))
+            {
+                e.push(env("RIO_DISPATCH_MODE", "pull"));
+            }
             if let Some(host) = &scheduler.balance_host {
                 e.push(env("RIO_SCHEDULER__BALANCE_HOST", host));
                 e.push(env(
@@ -1135,6 +1159,50 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The `rio.build/dispatch-mode: pull` Pool annotation (the interim
+    /// pull-mode selector for the additive slice) injects
+    /// `RIO_DISPATCH_MODE=pull` into the executor container; an
+    /// unannotated Pool — the production default — injects nothing, so
+    /// the builder stays on its `stream` Config default.
+    #[test]
+    fn dispatch_mode_annotation_injects_env() {
+        let scheduler = crate::fixtures::test_sched_addrs();
+        let store = crate::fixtures::test_store_addrs();
+        let hw = crate::reconcilers::node_informer::HwClassConfig::default();
+        let dispatch_env = |pool: &Pool| {
+            build_executor_pod_spec(pool, &scheduler, &store, &hw).containers[0]
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|e| e.name == "RIO_DISPATCH_MODE")
+                .and_then(|e| e.value.clone())
+        };
+
+        // Default: no annotation → no env (stream stays the default).
+        let pool = crate::fixtures::test_pool("plain", rio_crds::pool::ExecutorKind::Builder);
+        assert_eq!(dispatch_env(&pool), None);
+
+        // Annotated pull → env injected.
+        let mut pull_pool =
+            crate::fixtures::test_pool("pull", rio_crds::pool::ExecutorKind::Builder);
+        pull_pool.metadata.annotations = Some(
+            [(DISPATCH_MODE_ANNOTATION.to_string(), "pull".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(dispatch_env(&pull_pool), Some("pull".into()));
+
+        // Any other value is ignored (defensive).
+        let mut other = crate::fixtures::test_pool("other", rio_crds::pool::ExecutorKind::Builder);
+        other.metadata.annotations = Some(
+            [(DISPATCH_MODE_ANNOTATION.to_string(), "stream".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(dispatch_env(&other), None);
     }
 
     #[test]
