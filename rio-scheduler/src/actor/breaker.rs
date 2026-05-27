@@ -4,8 +4,8 @@
 //! every derivation as a cache miss — an avalanche of unnecessary rebuilds
 //! once the store comes back (or workers thrash trying to fetch inputs).
 //!
-//! Pattern reference: `rio-builder/src/fuse/circuit.rs` has the same
-//! 3-state shape but uses `AtomicU32` (fuser's thread pool is
+//! Pattern reference: `rio-builder/src/castore_fuse/circuit.rs` has
+//! the same 3-state shape but uses `AtomicU32` (fuser's thread pool is
 //! multi-threaded). This one is actor-local — single-threaded `&mut self`
 //! access — so plain `u32` suffices.
 //!
@@ -21,7 +21,7 @@ use tracing::{info, warn};
 // `tokio::time::pause` does NOT work here — this is `std::time::Instant`,
 // not tokio's monotonic clock. Inject via trait so tests can advance a
 // MockClock instead of sleeping 30s. Same shape as
-// `rio-builder/src/fuse/circuit.rs`'s `Clock`.
+// `rio-builder/src/castore_fuse/circuit.rs`'s `Clock`.
 
 /// Time source for the breaker. Production uses [`SystemClock`]; tests
 /// inject a mock so the auto-close transition tests don't need real 30s
