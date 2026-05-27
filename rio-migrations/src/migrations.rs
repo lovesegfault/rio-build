@@ -1178,7 +1178,8 @@ pub const M_064: () = ();
 /// submission*.
 ///
 /// Both columns are written only on the insert path (insert_build /
-/// link_build_derivations); no backfill — pre-existing rows keep FALSE,
+/// batch_insert_build_derivations, plus the single-row
+/// insert_build_derivation); no backfill — pre-existing rows keep FALSE,
 /// which preserves their original (non-forced) semantics.
 pub const M_065: () = ();
 
