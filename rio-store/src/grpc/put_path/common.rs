@@ -240,6 +240,32 @@ pub(in crate::grpc) async fn read_first_metadata(
 ///
 /// Status messages contain the substrings "size mismatch" / "hash
 /// mismatch"; protocol tests assert on those.
+pub(in crate::grpc) fn verify_nar(
+    computed_hash: [u8; 32],
+    actual_size: u64,
+    info: &ValidatedPathInfo,
+    ctx_label: &str,
+) -> Result<(), Status> {
+    let fail = |e: String| {
+        warn!(store_path = %info.store_path, error = %e, "{ctx_label}: NAR validation failed");
+        Status::invalid_argument(format!("{ctx_label}: NAR validation failed: {e}"))
+    };
+    if actual_size != info.nar_size {
+        return Err(fail(format!(
+            "NAR size mismatch: declared {}, actual {actual_size}",
+            info.nar_size
+        )));
+    }
+    if computed_hash != info.nar_hash {
+        return Err(fail(format!(
+            "NAR hash mismatch: declared {}, computed {}",
+            hex::encode(info.nar_hash),
+            hex::encode(computed_hash)
+        )));
+    }
+    Ok(())
+}
+
 /// Verify that a `.drv` upload is the text content-address of its bytes.
 ///
 /// CppNix mints every derivation path as
@@ -301,32 +327,6 @@ pub(in crate::grpc) fn verify_drv_text_path(
             "{ctx_label}: .drv path {} is not the text content-address of the uploaded \
              bytes with the declared references (derived {})",
             info.store_path, expected
-        )));
-    }
-    Ok(())
-}
-
-pub(in crate::grpc) fn verify_nar(
-    computed_hash: [u8; 32],
-    actual_size: u64,
-    info: &ValidatedPathInfo,
-    ctx_label: &str,
-) -> Result<(), Status> {
-    let fail = |e: String| {
-        warn!(store_path = %info.store_path, error = %e, "{ctx_label}: NAR validation failed");
-        Status::invalid_argument(format!("{ctx_label}: NAR validation failed: {e}"))
-    };
-    if actual_size != info.nar_size {
-        return Err(fail(format!(
-            "NAR size mismatch: declared {}, actual {actual_size}",
-            info.nar_size
-        )));
-    }
-    if computed_hash != info.nar_hash {
-        return Err(fail(format!(
-            "NAR hash mismatch: declared {}, computed {}",
-            hex::encode(info.nar_hash),
-            hex::encode(computed_hash)
         )));
     }
     Ok(())

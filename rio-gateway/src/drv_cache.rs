@@ -127,9 +127,6 @@ fn parse_fetched_drv(
     })
 }
 
-/// Best-effort: if `path` is a `.drv`, parse the ATerm from NAR data and
-/// cache it. Logs and continues on parse error or cap hit — the upload
-/// itself still proceeds.
 /// Canonical text content-address of a `.drv` upload: CppNix mints
 /// every derivation path as `makeTextPath(name, sha256(text),
 /// inputSrcs ∪ inputDrvs)`, so recompute exactly that from the uploaded
@@ -151,6 +148,9 @@ fn drv_text_ca_path(
     Ok(StorePath::make_text(path.name(), &hash, &refs)?)
 }
 
+/// Best-effort: if `path` is a `.drv`, parse the ATerm from NAR data and
+/// cache it. Logs and continues on parse error or cap hit — the upload
+/// itself still proceeds.
 pub(crate) fn try_cache_drv(
     path: &StorePath,
     nar_data: &[u8],
