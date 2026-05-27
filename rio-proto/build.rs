@@ -30,6 +30,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rio.types.ExecutorMessage.msg",
         "#[allow(clippy::large_enum_variant)]",
     );
+    // Same shape for the pull outcome: WorkAssignment (~232B) dwarfs
+    // Gone (0B) / NotYetReady (4B). One response per pod lifetime —
+    // boxing the assignment arm would buy nothing.
+    b = b.type_attribute(
+        "rio.types.PullAssignmentResponse.outcome",
+        "#[allow(clippy::large_enum_variant)]",
+    );
 
     // Derive `serde::Serialize` on the admin-facing response types so
     // rio-cli can `serde_json::to_string_pretty(&resp)` directly instead
