@@ -8829,3 +8829,94 @@ async fn test_force_build_roots_persisted() -> TestResult {
     );
     Ok(())
 }
+
+/// All three force-build properties at merge time: no top-down prune, the
+/// upstream-substitutable root is NOT routed to the substitute lane (no
+/// QueryPathInfo fetch, not Substituting/Completed), and the build stays
+/// Active waiting for a builder.
+// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.substitute-topdown+5]
+#[tokio::test]
+async fn test_force_build_root_not_substituted_at_merge() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let root_out = test_store_path("force-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+
+    let mut root = make_node("force-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("force-dep");
+    dep.expected_output_paths = vec![test_store_path("force-dep-out")];
+    let edges = vec![make_test_edge("force-root", "force-dep")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag_force_roots(&handle, build_id, vec![root, dep], edges).await?;
+    barrier(&handle).await;
+
+    let st = handle
+        .debug_query_derivation("force-root")
+        .await?
+        .expect("root in DAG");
+    assert!(
+        !st.topdown_pruned,
+        "force-build submission must not top-down prune"
+    );
+    assert_ne!(st.status, crate::state::DerivationStatus::Substituting);
+    assert_ne!(st.status, crate::state::DerivationStatus::Completed);
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&root_out),
+            "force-build root must not be eager-fetched; qpi_calls={qpi:?}"
+        );
+    }
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build must wait for a builder, not complete via substitution"
+    );
+    Ok(())
+}
+
+/// Cross-build stickiness at merge time: build A (force_build_roots)
+/// roots drv X and is still live; a SECOND, non-force submission of the
+/// same X must NOT route X to the substitute lane at its own merge-time
+/// cache check, even though X's output is now upstream-substitutable.
+// r[verify sched.merge.force-build-roots]
+#[tokio::test]
+async fn test_non_force_merge_does_not_substitute_live_force_build_root() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("force-cross-out");
+
+    // Build A: force-build, single root "force-cross". Output not yet
+    // substitutable, so A's merge leaves it Ready (no builder connected).
+    let mut node_a = make_node("force-cross");
+    node_a.expected_output_paths = vec![out.clone()];
+    merge_dag_force_roots(&handle, Uuid::new_v4(), vec![node_a], vec![]).await?;
+    barrier(&handle).await;
+
+    // The output appears upstream AFTER A merged.
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    // Build B: plain submission (force_build_roots=false) of the SAME
+    // node — it lands in existing_reprobe → check_cached_outputs finds
+    // it substitutable → only the sticky-OR keeps it out of the lane.
+    let mut node_b = make_node("force-cross");
+    node_b.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![node_b], vec![], false).await?;
+    barrier(&handle).await;
+
+    let st = expect_drv(&handle, "force-cross").await;
+    assert_ne!(st.status, crate::state::DerivationStatus::Substituting);
+    assert_ne!(st.status, crate::state::DerivationStatus::Completed);
+    assert!(
+        !store.calls.qpi_calls.read().unwrap().contains(&out),
+        "a non-force re-submission must not eager-fetch a live force-build root"
+    );
+    Ok(())
+}

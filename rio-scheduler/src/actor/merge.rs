@@ -78,6 +78,25 @@ pub(super) struct MergeReconcile {
     pub other_builds: HashSet<Uuid>,
 }
 
+/// Submission roots: nodes that appear as no edge's child. Edges key by
+/// `drv_path` (proto-level), so collect child paths and filter.
+///
+/// THE single root definition — `validate_and_ingest` maps it to the
+/// `submission_roots` hash set (force-build gates +
+/// `build_derivations.is_root` persistence) and `check_roots_topdown`
+/// consumes the node refs for the top-down prune, so the gate logic and
+/// the persisted `is_root` can never drift apart.
+fn submission_root_nodes<'a>(
+    nodes: &'a [crate::domain::DerivationNode],
+    edges: &[crate::domain::DerivationEdge],
+) -> Vec<&'a crate::domain::DerivationNode> {
+    let children: HashSet<&str> = edges.iter().map(|e| e.child_drv_path.as_str()).collect();
+    nodes
+        .iter()
+        .filter(|n| !children.contains(n.drv_path.as_str()))
+        .collect()
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // MergeDag
@@ -342,6 +361,18 @@ impl DagActor {
         // unchanged; everything downstream of this line is wire-agnostic.
         let nodes = crate::domain::nodes_from_proto(nodes);
         let edges = crate::domain::edges_from_proto(edges);
+
+        // Submission roots ([`submission_root_nodes`] — same root
+        // definition check_roots_topdown consumes). Used by the
+        // force-build gates (r[sched.merge.force-build-roots]) and
+        // persisted as build_derivations.is_root. Computed BEFORE the
+        // top-down prune so gate 1 can consult it; pruning only drops
+        // deps, never roots, so the set is identical either way.
+        let submission_roots: HashSet<DrvHash> = submission_root_nodes(&nodes, &edges)
+            .into_iter()
+            .map(|n| DrvHash::from(n.drv_hash.as_str()))
+            .collect();
+
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
@@ -387,57 +418,57 @@ impl DagActor {
         // resubmit re-probes). The existing check_cached_outputs at
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.
-        let (nodes, edges, topdown_fired, pruned_closure_parents) = match self
-            .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
-            .await
-        {
-            Some(demanded) => {
-                debug!(
-                    original_nodes = nodes.len(),
-                    kept_nodes = demanded.len(),
-                    pruned = nodes.len() - demanded.len(),
-                    "top-down: all demanded nodes substitutable; pruning deps from submission"
-                );
-                metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
-                // Parents of the ORIGINAL submission's edges: the nodes
-                // whose dependency closure this prune is about to drop.
-                // Only these (∩ the kept set, and only when the closure
-                // classifier does not vouch for their existing children
-                // — see closure_vouched) get the topdown_pruned marker
-                // — a dep-less demanded leaf never had a closure to
-                // drop, a from-source dispatch of it would succeed, and
-                // marking it would only turn a routine substitute
-                // failure into a wrongful terminal fail-fast. Resolved
-                // path→hash via the original node list (edges carry
-                // drv_paths on the wire).
-                let path_to_hash: HashMap<&str, &str> = nodes
-                    .iter()
-                    .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
-                    .collect();
-                let parents: HashSet<String> = edges
-                    .iter()
-                    .filter_map(|e| path_to_hash.get(e.parent_drv_path.as_str()))
-                    .map(|h| (*h).to_string())
-                    .collect();
-                (demanded, Vec::new(), true, parents)
+        //
+        // r[impl sched.merge.force-build-roots]
+        // Sticky-OR at the top-down shortcut: skip it when THIS request
+        // is force-build, or when any of this submission's roots is a
+        // live force-build build's root already in the DAG (a later
+        // non-force submission must not substitute it out from under
+        // that build). Pruning deps would also guarantee a doomed
+        // dispatch (inputs never merged).
+        let topdown_blocked =
+            force_build_roots || submission_roots.iter().any(|h| self.is_force_build_root(h));
+        let (nodes, edges, topdown_fired, pruned_closure_parents) = if topdown_blocked {
+            (nodes, edges, false, HashSet::new())
+        } else {
+            match self
+                .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
+                .await
+            {
+                Some(demanded) => {
+                    debug!(
+                        original_nodes = nodes.len(),
+                        kept_nodes = demanded.len(),
+                        pruned = nodes.len() - demanded.len(),
+                        "top-down: all demanded nodes substitutable; pruning deps from submission"
+                    );
+                    metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
+                    // Parents of the ORIGINAL submission's edges: the nodes
+                    // whose dependency closure this prune is about to drop.
+                    // Only these (∩ the kept set, and only when the closure
+                    // classifier does not vouch for their existing children
+                    // — see closure_vouched) get the topdown_pruned marker
+                    // — a dep-less demanded leaf never had a closure to
+                    // drop, a from-source dispatch of it would succeed, and
+                    // marking it would only turn a routine substitute
+                    // failure into a wrongful terminal fail-fast. Resolved
+                    // path→hash via the original node list (edges carry
+                    // drv_paths on the wire).
+                    let path_to_hash: HashMap<&str, &str> = nodes
+                        .iter()
+                        .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
+                        .collect();
+                    let parents: HashSet<String> = edges
+                        .iter()
+                        .filter_map(|e| path_to_hash.get(e.parent_drv_path.as_str()))
+                        .map(|h| (*h).to_string())
+                        .collect();
+                    (demanded, Vec::new(), true, parents)
+                }
+                None => (nodes, edges, false, HashSet::new()),
             }
-            None => (nodes, edges, false, HashSet::new()),
         };
         phase!("0-topdown-roots");
-
-        // Submission roots: nodes no edge names as a child (same root
-        // definition as check_roots_topdown). Used by the force-build
-        // gates (r[sched.merge.force-build-roots]) and persisted as
-        // build_derivations.is_root. Computed on the (possibly pruned)
-        // node/edge set — pruning only drops deps, never roots, so the
-        // set is identical either way.
-        let root_children: HashSet<&str> =
-            edges.iter().map(|e| e.child_drv_path.as_str()).collect();
-        let submission_roots: HashSet<DrvHash> = nodes
-            .iter()
-            .filter(|n| !root_children.contains(n.drv_path.as_str()))
-            .map(|n| DrvHash::from(n.drv_hash.as_str()))
-            .collect();
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -552,6 +583,20 @@ impl DagActor {
                 return Err(e);
             }
         };
+        // r[impl sched.merge.force-build-roots]
+        // Sticky-OR at the cache check's upstream-substitutable arm:
+        // exclude (a) THIS submission's roots when it is force-build and
+        // (b) any node that is a live force-build build's root (a later
+        // non-force submission re-probing it must not substitute it).
+        // Locally-present roots still short-circuit to Completed via
+        // cached_hits.
+        let pending_substitute: Vec<(DrvHash, Vec<String>)> = pending_substitute
+            .into_iter()
+            .filter(|(h, _)| {
+                let this_submission = force_build_roots && submission_roots.contains(h);
+                !(this_submission || self.is_force_build_root(h))
+            })
+            .collect();
         phase!("4-check-cached-outputs");
 
         // === Step 5: PG persist + → Active ============================
@@ -1770,11 +1815,18 @@ impl DagActor {
             // re-substitution lane is skipped and only the
             // dispatch-time batch probe (cap-truncated, fail-open)
             // stands between the node and a from-source re-dispatch.
-            if output_paths.iter().all(|p| {
-                !missing.contains(p.as_str())
-                    || substitutable.contains(p.as_str())
-                    || unwanted.contains(p.as_str())
-            }) {
+            //
+            // r[impl sched.merge.force-build-roots]
+            // Force-build roots are never re-fetched from upstream even
+            // when their vanished output is substitutable — push to the
+            // ready queue and let dispatch (gate 3) route them to a builder.
+            if !self.is_force_build_root(&drv_hash_k)
+                && output_paths.iter().all(|p| {
+                    !missing.contains(p.as_str())
+                        || substitutable.contains(p.as_str())
+                        || unwanted.contains(p.as_str())
+                })
+            {
                 metrics::counter!("rio_scheduler_stale_completed_substituted_total").increment(1);
                 to_spawn.push((drv_hash_k, output_paths));
             } else {
@@ -2668,13 +2720,17 @@ impl DagActor {
         }
 
         // --- Compute the demand set ---------------------------------
-        // Structural roots (no edge names the node as a child; edges
-        // key by drv_path, proto-level) ∪ gateway-flagged explicitly
-        // requested nodes.
-        let children: HashSet<&str> = edges.iter().map(|e| e.child_drv_path.as_str()).collect();
+        // Structural roots ([`submission_root_nodes`] — the shared
+        // definition the force-build gates / is_root persistence use,
+        // so the gate logic and the persisted is_root can never drift)
+        // ∪ gateway-flagged explicitly requested nodes.
+        let structural_roots: HashSet<&str> = submission_root_nodes(nodes, edges)
+            .into_iter()
+            .map(|n| n.drv_path.as_str())
+            .collect();
         let demanded: Vec<&crate::domain::DerivationNode> = nodes
             .iter()
-            .filter(|n| !children.contains(n.drv_path.as_str()) || n.explicitly_requested)
+            .filter(|n| structural_roots.contains(n.drv_path.as_str()) || n.explicitly_requested)
             .collect();
 
         if demanded.is_empty() || demanded.len() == nodes.len() {

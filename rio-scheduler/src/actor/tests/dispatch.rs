@@ -1449,6 +1449,46 @@ async fn batch_probe_classifies_against_live_builds_effective_wanted(
     Ok(())
 }
 
+/// A Ready force-build root whose output is upstream-substitutable is
+/// dispatched to a builder (assignment sent), not routed to the
+/// substitute lane by the dispatch-time probe.
+// r[verify sched.merge.force-build-roots]
+// r[verify sched.dispatch.fod-substitute+3]
+#[tokio::test]
+async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("force-dispatch-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let mut node = make_node("force-dispatch");
+    node.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    merge_dag_force_roots(&handle, build_id, vec![node], vec![]).await?;
+
+    // Connect a builder; the next dispatch pass must ASSIGN the drv.
+    let mut rx = connect_executor(&handle, "exec-force", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("force-dispatch"),
+        "the dispatched assignment must be the force-build root"
+    );
+    let st = handle
+        .debug_query_derivation("force-dispatch")
+        .await?
+        .expect("drv exists");
+    assert_eq!(
+        st.status,
+        crate::state::DerivationStatus::Assigned,
+        "force-build root must be dispatched, not substituted"
+    );
+    assert!(
+        !store.calls.qpi_calls.read().unwrap().contains(&out),
+        "no substitute fetch for a force-build root"
+    );
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test

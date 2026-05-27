@@ -744,6 +744,7 @@ impl DagActor {
                     locally_present.push(drv_hash);
                 }
             } else if !substitute_tried
+                && !self.is_force_build_root(&drv_hash)
                 && wanted.iter().all(|p| {
                     !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
                 })
@@ -798,6 +799,22 @@ impl DagActor {
             .filter_map(|bid| self.builds.get(bid))
             .find_map(|b| b.tenant_id);
         self.substitute_auth_for_tenant(tid)
+    }
+
+    // r[impl sched.merge.force-build-roots]
+    /// Sticky-OR over interested builds: true iff any live interested
+    /// build has `force_build_roots` and names this node as one of its
+    /// submission roots. Such a node must never enter the substitute-
+    /// spawn arm (it may still complete from a locally-present output).
+    /// `pub(super)` so the merge-time gates (merge.rs) share it.
+    pub(super) fn is_force_build_root(&self, drv_hash: &DrvHash) -> bool {
+        self.dag.node(drv_hash).is_some_and(|s| {
+            s.interested_builds.iter().any(|bid| {
+                self.builds
+                    .get(bid)
+                    .is_some_and(|b| b.force_build_roots && b.root_hashes.contains(drv_hash))
+            })
+        })
     }
 
     /// Build a [`SubstituteAuth`] for a known `tenant_id`. `Service`
@@ -1732,6 +1749,7 @@ impl DagActor {
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
                 let ind: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
                 if !substitute_tried
+                    && !self.is_force_build_root(drv_hash)
                     && wanted
                         .iter()
                         .all(|p| !missing.contains(p) || sub.contains(p) || ind.contains(p))
