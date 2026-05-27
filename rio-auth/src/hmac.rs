@@ -105,9 +105,21 @@ pub struct AssignmentClaims {
     ///   to a not-yet-rolled store is rejected with
     ///   `unknown field 'is_fixed_output'` → `permission_denied`.
     ///
-    /// Deploy order therefore is **store fleet before scheduler**; the
-    /// skew blast radius is FOD uploads only, and the failure mode is a
-    /// loud build failure (PutPath rejection), never silent acceptance.
+    /// Because a `helm upgrade` rolls the scheduler (leader-elected
+    /// singleton, ~30s) before the multi-replica store fleet, the
+    /// scheduler does NOT emit this field by default: signing it is
+    /// gated behind the scheduler config knob `sign_fod_claims`
+    /// (Phase 1 default `false`, so every token keeps the pre-field
+    /// wire shape). Arming the knob (Phase 2) additionally requires
+    /// every builder/fetcher worker image — including warm Pool pods —
+    /// to record `fixed:` content-address descriptors, since the store
+    /// rejects descriptor-less uploads under a FOD-flagged token;
+    /// workers never parse claims, so the worker axis is about the
+    /// descriptor capability, not this struct. The skew blast radius
+    /// is FOD uploads only, and the failure mode is a loud build
+    /// failure (PutPath rejection), never silent acceptance. See
+    /// docs/spec/system/deployment.typ (Upgrades) for the rollout
+    /// procedure.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_fixed_output: bool,
     /// Unix timestamp (seconds). Token invalid after this. Scheduler
@@ -911,10 +923,11 @@ mod tests {
 
     /// Forward-skew direction for `is_fixed_output` (mirrors the tenant
     /// pin above): `true` emits the key — a pre-field store rejects it
-    /// (`deny_unknown_fields`), which is why the store fleet must roll
-    /// before the scheduler — while `false` omits the key entirely
-    /// (`skip_serializing_if`), keeping every non-FOD token
-    /// byte-identical to the pre-field shape.
+    /// (`deny_unknown_fields`), which is why the scheduler only signs it
+    /// once the `sign_fod_claims` rollout gate is armed — while `false`
+    /// omits the key entirely (`skip_serializing_if`), keeping every
+    /// token minted with the gate off byte-identical to the pre-field
+    /// shape.
     #[test]
     fn assignment_claims_fixed_output_forward_skew() {
         // Pre-field store struct (snapshot of `AssignmentClaims` before
@@ -942,7 +955,8 @@ mod tests {
         };
 
         // Half 1 — `is_fixed_output: true` is a wire break against a
-        // pre-field store: deploy the store fleet first.
+        // pre-field store: that is exactly why emission is gated behind
+        // `sign_fod_claims` until the store fleet has rolled.
         let mut fod = test_claims(3600);
         fod.is_fixed_output = true;
         let body = claims_body(&fod);

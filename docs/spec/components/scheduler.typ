@@ -120,8 +120,11 @@ any critical-path value).
       per pod)? system match? Candidates that fail are excluded entirely.
    c. Assign to the first eligible executor via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
-      executor_id, drv_hash, expected_outputs, is_ca, expiry_unix). The store verifies
-      the token on PutPath and rejects uploads for paths not in expected_outputs.
+      executor_id, drv_hash, expected_outputs, is_ca, is_fixed_output, tenant,
+      expiry_unix — the optional fields use serde defaults, and is_fixed_output
+      is emitted only when the scheduler's sign_fod_claims knob is armed). The
+      store verifies the token on PutPath and rejects uploads for paths not in
+      expected_outputs.
 8. As builds complete (reported via BuildExecution stream):
    a. Upload output to rio-store (executor does this before reporting)
    b. For CA derivations: check if output content matches any existing CAS entry

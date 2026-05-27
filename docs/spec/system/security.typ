@@ -176,6 +176,14 @@ must be assumed capable of compromising the worker process itself.
     enhancement could add tenant-scoped read tokens.
 ]
 
+The `is_fixed_output` claim is the one field whose emission is deliberately
+deferred: because a chart upgrade rolls the scheduler before the store fleet,
+the scheduler only signs it when its `sign_fod_claims` knob is armed (helm
+`scheduler.signFodClaims`, default off), which keeps every token in the
+pre-field wire shape until the fleet — stores and descriptor-recording worker
+images alike — can honor it. The two-phase procedure lives in
+#cross-link("/spec/system/deployment.typ")[Deployment: Upgrades].
+
 #r("sec.executor.identity-token+2")[
   The scheduler signs *executor-identity tokens* (`ExecutorClaims { intent_id,
   kind, expiry_unix }`, same HMAC envelope as `AssignmentClaims`, same key) per
