@@ -121,6 +121,7 @@
     "rio_scheduler_prefetch_paths_sent_total",
     "rio_scheduler_queue_backpressure",
     "rio_scheduler_queue_depth",
+    "rio_scheduler_reconcile_deferred_total",
     "rio_scheduler_reconcile_dropped_total",
     "rio_scheduler_recovery_duration_seconds",
     "rio_scheduler_recovery_total",
@@ -828,6 +829,11 @@
         "name": "rio_scheduler_queue_depth",
         "kind": "gauge",
         "help": "Deferred Ready derivations waiting for an executor of the matching kind (snapshot per dispatch pass; labeled by kind=builder|fetcher). Sustained nonzero → scale the matching pool."
+      },
+      {
+        "name": "rio_scheduler_reconcile_deferred_total",
+        "kind": "counter",
+        "help": "Assigned/Running derivations the post-recovery reconcile sweep deferred because their worker had a stream but no accepted heartbeat yet. Each deferral re-arms the sweep for another reconcile window; sustained growth means a worker keeps reconnecting its stream without ever heartbeating."
       },
       {
         "name": "rio_scheduler_reconcile_dropped_total",

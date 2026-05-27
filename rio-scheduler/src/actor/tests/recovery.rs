@@ -1271,6 +1271,150 @@ async fn test_reconcile_defers_stream_connected_unregistered_worker() -> TestRes
     Ok(())
 }
 
+/// Deferred-then-never-revisited Assigned claim (the executor-lifecycle
+/// campaign's Model S falsification of `unresolvedClaimHasRepairArmed`):
+/// a PG-Assigned derivation whose executor entry was recreated around a
+/// failover (stream reconnected, first heartbeat not yet accepted) is
+/// deferred by the post-recovery reconcile sweep. The fresh entry's
+/// `running_build` is `None`, so no later mechanism consults the
+/// DAG-side binding: the heartbeat reconcile and the two-strike phantom
+/// key off the entry, the reaper/disconnect requeue only the entry's
+/// own `running_build`, and the backstop scans Running only. Without a
+/// re-armed sweep the claim is silently stuck until the next leader
+/// transition.
+///
+/// Scenario (the falsification trace, deterministically staged):
+///   - PG holds two failover residues: `stuck-drv` Assigned to
+///     `stuck-w1` (which WILL reconnect), and `canary-drv` Assigned to
+///     a worker that never comes back. The canary's reset to Ready is
+///     the state-visible proof that the one-shot sweep has already run
+///     (the defer arm itself leaves no observable trace).
+///   - `stuck-w1` reconnects its stream BEFORE the sweep and heartbeats
+///     (running_build = None — it never received the assignment) only
+///     AFTER the sweep, so the sweep defers its claim.
+///   - One housekeeping tick: the backstop must NOT be the repair (it
+///     scans Running only).
+///   - The deferring sweep must have re-armed itself: the follow-up
+///     sweep finds the worker registered WITHOUT the build, resets the
+///     claim, and dispatch re-offers it to the same (idle) worker.
+///
+/// Red-first: without the re-arm nothing revisits the claim — no
+/// WorkAssignment ever reaches the worker and `recv_assignment` times
+/// out.
+// r[verify sched.executor.repair-precedence]
+#[tokio::test]
+async fn test_deferred_assigned_claim_revisited_by_rearmed_reconcile() -> TestResult {
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let stuck = make_node("stuck-drv");
+        // Different system so the canary can never occupy stuck-w1's
+        // single slot once it is reset to Ready (it stays Ready,
+        // unroutable — dispatch defers unroutable systems).
+        let canary = make_test_node("canary-drv", "aarch64-linux");
+        let _rx = merge_dag(&handle, Uuid::new_v4(), vec![stuck, canary], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        // The failover residue: PG says Assigned, but neither worker's
+        // in-memory entry will carry the binding after recovery.
+        sqlx::query(
+            "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'stuck-w1' \
+             WHERE drv_hash = 'stuck-drv'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'canary-gone-w' \
+             WHERE drv_hash = 'canary-drv'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let (sched_db, handle) = (f.db, f.handle);
+
+    // stuck-w1 reconnects its stream BEFORE the one-shot sweep fires —
+    // the entry is recreated fresh (running_build=None), no heartbeat
+    // yet. NOT connect_executor() (which heartbeats).
+    let (stream_tx, mut worker_rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "stuck-w1".into(),
+            stream_tx,
+            stream_epoch: next_stream_epoch_for("stuck-w1"),
+            auth_intent: None,
+            reply: noop_connect_reply(),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let pre = expect_drv(&handle, "stuck-drv").await;
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+    assert_eq!(pre.assigned_executor.as_deref(), Some("stuck-w1"));
+
+    // Wait for the one-shot RECONCILE_DELAY sweep (100ms under
+    // cfg(test)) to have run: it resets the canary (worker absent) and
+    // defers stuck-drv (worker stream-connected but not yet
+    // heartbeated).
+    wait_for_status(&handle, "canary-drv", DerivationStatus::Ready).await;
+    let deferred = expect_drv(&handle, "stuck-drv").await;
+    assert_eq!(
+        deferred.status,
+        DerivationStatus::Assigned,
+        "the sweep must defer (not reset) a stream-connected-but-unheartbeated worker's claim"
+    );
+
+    // First heartbeat lands AFTER the sweep and does NOT report the
+    // build (the WorkAssignment never reached the worker — it was lost
+    // around the failover). The worker registers idle; the warm-gate
+    // ACK keeps it dispatchable.
+    send_heartbeat_with(&handle, "stuck-w1", "x86_64-linux", |_| {}).await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "stuck-w1".into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    // One housekeeping tick: the backstop scans Running only, so it is
+    // not the repair for an Assigned claim.
+    tick(&handle).await?;
+
+    // THE KEY ASSERTION (red-first): the deferring sweep must have
+    // re-armed itself; the follow-up sweep finds the worker registered
+    // WITHOUT the build, resets the claim, and dispatch re-offers it to
+    // the same (now idle, registered) worker. Without the re-arm
+    // nothing ever revisits the claim — no WorkAssignment arrives and
+    // this recv times out.
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, test_drv_path("stuck-drv"));
+
+    // The repair is a reset/requeue, not a failure: nothing may be
+    // charged to the worker or the attempt ledger (same discipline as
+    // reset_orphan_to_ready / the phantom reconcile).
+    let post = expect_drv(&handle, "stuck-drv").await;
+    assert!(
+        post.retry.failed_builders.is_empty(),
+        "re-armed reconcile must NOT insert into failed_builders, got {:?}",
+        post.retry.failed_builders
+    );
+    assert_eq!(
+        post.retry.count, 0,
+        "re-armed reconcile must NOT bump retry.count"
+    );
+    let (retry_count, failed): (i32, Vec<String>) = sqlx::query_as(
+        "SELECT retry_count, failed_builders FROM derivations WHERE drv_hash = 'stuck-drv'",
+    )
+    .fetch_one(&sched_db.pool)
+    .await?;
+    assert_eq!(retry_count, 0, "PG retry_count must NOT be bumped");
+    assert!(failed.is_empty(), "PG failed_builders must NOT be appended");
+    assert!(
+        ledger_rows(&sched_db.pool, "stuck-drv").await.is_empty(),
+        "the re-armed reconcile must append no attempt-ledger rows"
+    );
+
+    Ok(())
+}
+
 /// Recovery must skip rows with unparseable drv_path (StorePath::parse
 /// fails) and continue loading valid rows. A corrupted/hand-edited PG
 /// row shouldn't block recovery of the entire DAG.

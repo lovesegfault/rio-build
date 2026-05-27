@@ -1951,7 +1951,29 @@ impl DagActor {
             debug!("reconcile: not leader, skipping");
             return;
         }
-        let orphaned = self.collect_orphaned_assignments();
+        let (orphaned, deferred) = self.collect_orphaned_assignments();
+
+        // r[impl sched.executor.repair-precedence]
+        // A deferred claim (its worker has a stream entry but no
+        // accepted heartbeat yet) is not resolved by this pass, and no
+        // other mechanism revisits a DAG/PG-Assigned binding that the
+        // worker's fresh entry doesn't carry: the heartbeat reconcile
+        // and the two-strike phantom key off the entry's running_build,
+        // the reaper/disconnect requeue only the entry's running_build,
+        // and the backstop scans Running only. Re-arm the sweep so the
+        // deferral is a delay, not a terminal state — the next pass
+        // sees the worker either registered (the cross-check resolves
+        // the claim) or gone (the orphan arm resolves it), or defers
+        // and re-arms again. Without this, a claim deferred once stayed
+        // Assigned until the next leader transition.
+        if deferred > 0 {
+            info!(
+                deferred,
+                "reconcile: deferred not-yet-heartbeated workers; re-arming the sweep"
+            );
+            metrics::counter!("rio_scheduler_reconcile_deferred_total").increment(deferred as u64);
+            self.schedule_reconcile_timer();
+        }
 
         if orphaned.is_empty() {
             debug!("reconcile: all assigned/running derivations have live workers");
@@ -2011,7 +2033,11 @@ impl DagActor {
     /// Collect an [`OrphanedAssignment`] for every Assigned/Running
     /// derivation whose worker is no longer live — the liveness-check
     /// input set for
-    /// [`handle_reconcile_assignments`](Self::handle_reconcile_assignments).
+    /// [`handle_reconcile_assignments`](Self::handle_reconcile_assignments)
+    /// — plus the count of claims it DEFERRED (worker stream-connected
+    /// but not yet heartbeated). The caller re-arms the sweep when any
+    /// deferral remains, so a deferred claim is revisited rather than
+    /// left Assigned until the next leader transition.
     ///
     /// Cloned out of the DAG before any mutation (the per-row
     /// reset/adopt path takes `node_mut`).
@@ -2022,7 +2048,7 @@ impl DagActor {
     /// We still reconcile it (check store for outputs → Completed,
     /// else Ready) rather than silently skipping and leaving it stuck
     /// forever.
-    fn collect_orphaned_assignments(&self) -> Vec<OrphanedAssignment> {
+    fn collect_orphaned_assignments(&self) -> (Vec<OrphanedAssignment>, usize) {
         let orphan = |h: &str, s: &DerivationState, w: Option<&ExecutorId>| OrphanedAssignment {
             drv_hash: h.into(),
             executor: w.cloned(),
@@ -2030,7 +2056,9 @@ impl DagActor {
             output_names: s.output_names.clone(),
             wanted_output_names: s.wanted_output_names.clone(),
         };
-        self.dag
+        let mut deferred = 0usize;
+        let orphans = self
+            .dag
             .iter_nodes()
             .filter(|(_, s)| {
                 matches!(
@@ -2066,16 +2094,21 @@ impl DagActor {
                 // Stream connected but no heartbeat yet — running_build
                 // is NOT authoritative (None until executor.rs writes it
                 // from the first accepted heartbeat; I-048b drops
-                // pre-stream heartbeats). Defer: the heartbeat path's
-                // two-strike confirmed_phantoms will reconcile real
-                // phantoms once heartbeats flow. A worker that stream-
-                // connects but never heartbeats has is_registered()=false
-                // → has_capacity()=false → never dispatched-to; if its
-                // stream later drops, handle_worker_disconnected
-                // reassigns. No worse than spurious failure_count++.
+                // pre-stream heartbeats), so neither the keep nor the
+                // phantom cross-check can run yet. Defer rather than
+                // reset (the worker may be about to report this very
+                // build), but COUNT the deferral so the caller re-arms
+                // the sweep: a fresh entry's running_build stays None
+                // even after the heartbeat lands when the worker never
+                // received the assignment (the post-failover shape),
+                // and neither the heartbeat path, the reaper, the
+                // disconnect requeue nor the backstop consults the
+                // DAG-side binding — without the follow-up sweep the
+                // claim would leak until the next leader transition.
                 Some(w) if self.executors.contains_key(w) => {
                     debug!(drv_hash = ?h, executor_id = %w,
                            "reconcile: worker stream-connected but not yet heartbeated — deferring");
+                    deferred += 1;
                     None
                 }
                 Some(w) => Some(orphan(h, s, Some(w))),
@@ -2085,7 +2118,8 @@ impl DagActor {
                     Some(orphan(h, s, None))
                 }
             })
-            .collect()
+            .collect();
+        (orphans, deferred)
     }
 
     /// One `FindMissingPaths` over the union of all orphans' expected
@@ -2265,6 +2299,12 @@ impl DagActor {
     /// slack) to reconnect after scheduler restart. Any
     /// Assigned/Running derivation whose worker DIDN'T reconnect by
     /// then gets reconciled (Completed if outputs in store, else reset).
+    ///
+    /// Two callers: the `LeaderAcquired` arm (the post-recovery
+    /// one-shot) and `handle_reconcile_assignments` itself when its
+    /// collection pass deferred at least one claim — each deferral
+    /// grants the worker one more full window to land its first
+    /// heartbeat before the claim is cross-checked or reset.
     pub(super) fn schedule_reconcile_timer(&self) {
         let Some(weak_tx) = self.self_tx.clone() else {
             return;
@@ -2311,7 +2351,9 @@ struct OrphanedAssignment {
 /// Delay before post-recovery worker reconciliation. Workers have
 /// this long to reconnect after scheduler restart; after that, any
 /// Assigned/Running derivation with an unknown worker is reconciled
-/// (Completed if outputs in store, else reset to Ready).
+/// (Completed if outputs in store, else reset to Ready). A sweep that
+/// deferred a stream-connected-but-not-yet-heartbeated worker re-arms
+/// itself for another window of the same length.
 ///
 /// 45s = 3× HEARTBEAT_INTERVAL (10s) + 15s slack. A worker that's
 /// alive should reconnect within one heartbeat; 3× covers network

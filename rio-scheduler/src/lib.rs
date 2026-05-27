@@ -300,6 +300,13 @@ pub fn describe_metrics() {
          is 1024 deep); alert if > 0."
     );
     describe_counter!(
+        "rio_scheduler_reconcile_deferred_total",
+        "Assigned/Running derivations the post-recovery reconcile sweep deferred \
+         because their worker had a stream but no accepted heartbeat yet. Each \
+         deferral re-arms the sweep for another reconcile window; sustained growth \
+         means a worker keeps reconnecting its stream without ever heartbeating."
+    );
+    describe_counter!(
         "rio_scheduler_transition_rejected_total",
         "State-machine transition rejections (labeled by target state); alert if rate > 0"
     );
