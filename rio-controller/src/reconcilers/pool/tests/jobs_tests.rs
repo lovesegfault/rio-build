@@ -19,8 +19,8 @@ use kube::api::{Api, ObjectList, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{
-    JobCensus, SpawnOutcome, is_active_job, job_census, orphan_reap_gate, reap_excess_pending,
-    spawn_for_each, try_spawn_job,
+    JobCensus, ORPHAN_REAP_GRACE, SpawnOutcome, is_active_job, job_census, orphan_reap_gate,
+    reap_excess_pending, spawn_for_each, try_spawn_job,
 };
 use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents};
 use rio_crds::pool::ExecutorKind;
@@ -839,11 +839,16 @@ fn orphan_reap_gate_failclosed_on_empty_and_err() {
         leader_for_secs: 600,
     };
     assert!(
-        orphan_reap_gate(Ok(resp(vec![])), "p").is_none(),
+        orphan_reap_gate(Ok(resp(vec![])), "p", ORPHAN_REAP_GRACE).is_none(),
         "Ok(empty) → None (new-leader pre-reconnect)"
     );
     assert!(
-        orphan_reap_gate(Err(tonic::Status::unavailable("standby")), "p").is_none(),
+        orphan_reap_gate(
+            Err(tonic::Status::unavailable("standby")),
+            "p",
+            ORPHAN_REAP_GRACE
+        )
+        .is_none(),
         "Err → None (unreachable)"
     );
     let exec = rio_proto::types::ExecutorInfo {
@@ -851,7 +856,7 @@ fn orphan_reap_gate_failclosed_on_empty_and_err() {
         ..Default::default()
     };
     assert!(
-        orphan_reap_gate(Ok(resp(vec![exec])), "p").is_some(),
+        orphan_reap_gate(Ok(resp(vec![exec])), "p", ORPHAN_REAP_GRACE).is_some(),
         "Ok(nonempty, old leader) → Some"
     );
 }
@@ -879,7 +884,8 @@ fn orphan_reap_gate_failclosed_on_young_leader() {
                 executors: one.clone(),
                 leader_for_secs: 10
             }),
-            "pool-b"
+            "pool-b",
+            ORPHAN_REAP_GRACE
         )
         .is_none(),
         "young leader (10s < 300s grace) → None even with non-empty list"
@@ -892,7 +898,8 @@ fn orphan_reap_gate_failclosed_on_young_leader() {
                 executors: one,
                 leader_for_secs: 301
             }),
-            "pool-b"
+            "pool-b",
+            ORPHAN_REAP_GRACE
         )
         .is_some(),
         "leader past grace (301s ≥ 300s) → Some"
@@ -904,7 +911,8 @@ fn orphan_reap_gate_failclosed_on_young_leader() {
                 executors: vec![],
                 leader_for_secs: 600
             }),
-            "pool-b"
+            "pool-b",
+            ORPHAN_REAP_GRACE
         )
         .is_none(),
         "empty still gates regardless of leader age"

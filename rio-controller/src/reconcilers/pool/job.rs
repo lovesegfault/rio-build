@@ -256,6 +256,67 @@ pub(super) fn is_running_job(j: &Job) -> bool {
 // r[impl sched.executor.liveness-window]
 pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 
+/// Effective orphan-reap grace: [`ORPHAN_REAP_GRACE`] unless the
+/// VM-fixture-only env override `RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS`
+/// is set. The pull-mode VM scenarios hold a build past the grace to
+/// prove the open-attempt busy bridge without waiting 5 real minutes;
+/// env-only by design — NOT a controller Config field, so production
+/// semantics (300 s) and the config schema are untouched. Unparsable
+/// values fall back to the default.
+pub(super) fn orphan_reap_grace() -> Duration {
+    std::env::var("RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(ORPHAN_REAP_GRACE, Duration::from_secs)
+}
+
+/// The intent id a Job was spawned for: the `rio.build/intent-id`
+/// pod-template annotation `build_job` stamps (the same value the pod
+/// reads via downward API as `RIO_INTENT_ID`). `None` for Jobs created
+/// before the annotation existed or outside the spawn path.
+fn job_intent_id(j: &Job) -> Option<&str> {
+    j.spec
+        .as_ref()?
+        .template
+        .metadata
+        .as_ref()?
+        .annotations
+        .as_ref()?
+        .get(super::jobs::INTENT_ID_ANNOTATION)
+        .map(String::as_str)
+}
+
+/// Is this Job covered by an open pull-mode attempt from the
+/// scheduler's ledger-backed view (`AdminService.ListOpenAttempts`,
+/// pull-filtered server-side)?
+///
+/// Match keys, either suffices:
+///   - the Job's `rio.build/intent-id` pod-template annotation equals
+///     the attempt's `intent_id` (the primary key — pull-mode attempts
+///     are bound to the HMAC-attested intent identity, not a pod name);
+///   - the attempt's `executor_id` starts with `{job_name}-` (the same
+///     dash-anchored prefix rule the stream-mode busy arm uses, kept so
+///     a future pod-named identity still matches).
+///
+/// A covered Job is busy: its build is in flight on the pull path even
+/// though no stream executor is registered for it.
+fn covered_by_open_pull_attempt(
+    job: &Job,
+    open_attempts: &[rio_proto::types::OpenAttempt],
+) -> bool {
+    if open_attempts.is_empty() {
+        return false;
+    }
+    let intent = job_intent_id(job);
+    let prefix = job.metadata.name.as_deref().map(|n| format!("{n}-"));
+    open_attempts.iter().any(|a| {
+        intent.is_some_and(|i| !i.is_empty() && a.intent_id == i)
+            || prefix
+                .as_deref()
+                .is_some_and(|p| a.executor_id.starts_with(p))
+    })
+}
+
 /// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
 /// set by the K8s Job controller AFTER it observes pod readiness — a
 /// container that just started may have already heartbeated and
@@ -471,17 +532,26 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
         .is_some_and(|t| t < &cutoff)
 }
 
-/// Running Jobs older than `min_age` whose executor is NOT busy in
-/// the scheduler's view — the reap set for
+/// Running Jobs older than `min_age` that are busy in NEITHER of the
+/// scheduler's two views — the reap set for
 /// `r[ctrl.ephemeral.reap-orphan-running+3]`.
+///
+/// During pull/stream coexistence "busy" has two carriers, and a Job
+/// covered by EITHER is excluded:
+///
+///   - the stream-mode signal: an `ExecutorInfo` whose `executor_id`
+///     starts with `{job_name}-` reports `busy == true` (the
+///     `RIO_EXECUTOR_ID=$(POD_NAME)` downward-API prefix rule);
+///   - an open pull-mode attempt from `ListOpenAttempts` covers the
+///     Job ([`covered_by_open_pull_attempt`] — pull-mode pods never
+///     register on the stream, so the raw not-in-list arm alone would
+///     foreground-delete every pull-mode build past the grace).
 ///
 /// "Not busy" = no `ExecutorInfo` whose `executor_id` starts with
 /// `{job_name}-` (pod never registered / already disconnected), OR
 /// such an executor exists with `busy == false` (registered but
 /// idle past the builder's own 120s idle-exit — process can't act,
-/// I-165 D-state). The `{job_name}-` prefix match relies on
-/// `RIO_EXECUTOR_ID=$(POD_NAME)` via downward API; Job pod is
-/// `{job_name}-{5char}`.
+/// I-165 D-state) — and no open pull-mode attempt either way.
 ///
 /// A Job whose executor reports `busy == true` is excluded —
 /// the scheduler believes a build is in progress; deleting it would
@@ -495,10 +565,12 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
 /// `reap_stale_for_intents`. The 5-min grace makes the same-tick race
 /// unlikely but the filter is structurally consistent with
 /// [`select_excess_pending`] and free.
+// r[impl ctrl.job.busy-from-open-attempts]
 pub(super) fn select_orphan_running<'a>(
     jobs: &'a [Job],
     reaped: &HashSet<String>,
     executors: &[rio_proto::types::ExecutorInfo],
+    open_attempts: &[rio_proto::types::OpenAttempt],
     min_age: Duration,
 ) -> Vec<&'a Job> {
     jobs.iter()
@@ -517,6 +589,13 @@ pub(super) fn select_orphan_running<'a>(
                 // executor by prefix. Skip (conservative).
                 return false;
             };
+            // Pull-mode busy arm: an open attempt is the ledger's word
+            // that a build is in flight on this Job's pod. Checked
+            // before the stream arm so a pull-mode pod (which never
+            // appears in `executors`) is never reaped mid-build.
+            if covered_by_open_pull_attempt(j, open_attempts) {
+                return false;
+            }
             let prefix = format!("{job_name}-");
             match executors
                 .iter()
@@ -538,7 +617,7 @@ pub(super) fn select_orphan_running<'a>(
 }
 
 /// Fail-closed gate for [`reap_orphan_running`]: `None` (skip the
-/// reap) for `Err`, `Ok` with `leader_for_secs < ORPHAN_REAP_GRACE`,
+/// reap) for `Err`, `Ok` with `leader_for_secs < grace`,
 /// AND `Ok(empty)`. On 2-replica scheduler failover the new leader's
 /// `self.executors` map fills INCREMENTALLY as workers reconnect over
 /// a 1-10s spread — `ListExecutors` passes `ensure_leader()` and
@@ -546,25 +625,31 @@ pub(super) fn select_orphan_running<'a>(
 /// reconnects. `select_orphan_running`'s `None => true` arm would
 /// mark every not-yet-reconnected worker's Running Job past the 5-min
 /// grace as orphan and foreground-delete it mid-build.
-/// `ORPHAN_REAP_GRACE` checks Job CREATION age, not time-since-
-/// failover, so any build >5min old is exposed.
+/// The grace checks Job CREATION age, not time-since-
+/// failover, so any build older than it is exposed.
 ///
 /// `leader_for_secs` is the scheduler's own leadership age
 /// (`LeaderState::leader_for()`); gating on it means the controller
 /// trusts absence-from-list only once the leader has held the lease
-/// long enough that every worker has had `ORPHAN_REAP_GRACE` to
+/// long enough that every worker has had the grace to
 /// reconnect. The empty-check is kept as belt-and-suspenders for the
 /// genuine zero-executors steady state (where there are no Running
 /// Jobs to reap anyway, so it costs nothing).
+///
+/// `grace` is [`orphan_reap_grace`] in production (== the constant
+/// unless the VM-fixture override is set); a parameter so the gate
+/// stays a pure function.
 pub(super) fn orphan_reap_gate(
     result: std::result::Result<rio_proto::types::ListExecutorsResponse, tonic::Status>,
     pool: &str,
+    grace: Duration,
 ) -> Option<Vec<rio_proto::types::ExecutorInfo>> {
     match result {
-        Ok(resp) if resp.leader_for_secs < ORPHAN_REAP_GRACE.as_secs() => {
+        Ok(resp) if resp.leader_for_secs < grace.as_secs() => {
             warn!(
                 pool,
                 leader_for_secs = resp.leader_for_secs,
+                grace_secs = grace.as_secs(),
                 "scheduler leader younger than orphan grace; skipping \
                  orphan-reap (fail-closed: workers may still be reconnecting)"
             );
@@ -590,16 +675,23 @@ pub(super) fn orphan_reap_gate(
 }
 
 // r[impl ctrl.ephemeral.reap-orphan-running+3]
+// r[impl ctrl.job.busy-from-open-attempts]
 /// Delete Running ephemeral Jobs the scheduler doesn't consider busy
-/// after [`ORPHAN_REAP_GRACE`]. Same I-165 stuck-process failure
+/// after [`orphan_reap_grace`]. Same I-165 stuck-process failure
 /// mode applies to both builder and fetcher pools.
 ///
-/// Lazy RPC: `ListExecutors` is only called if there are Running Jobs
-/// past the grace. The common case (all Jobs young or none Running)
-/// costs zero scheduler round-trips.
+/// Busy is consulted from BOTH sources during pull/stream coexistence:
+/// the stream-mode `ListExecutors.busy` arm (untouched) and the
+/// ledger-backed open pull-mode attempt view (`ListOpenAttempts`,
+/// pull-filtered server-side). A Job covered by either is never
+/// selected.
 ///
-/// Fail-closed: `ListExecutors` error → skip the reap entirely (can't
-/// prove orphaned → don't delete). Same posture as
+/// Lazy RPC: `ListExecutors`/`ListOpenAttempts` are only called if
+/// there are Running Jobs past the grace. The common case (all Jobs
+/// young or none Running) costs zero scheduler round-trips.
+///
+/// Fail-closed: an error on EITHER source → skip the reap entirely
+/// (can't prove orphaned → don't delete). Same posture as
 /// [`reap_excess_pending`]'s `queued = None` arm. A scheduler restart
 /// must not nuke every Running ephemeral Job.
 ///
@@ -611,13 +703,14 @@ pub(super) async fn reap_orphan_running(
     ctx: &Ctx,
     pool: &str,
 ) -> u32 {
+    let grace = orphan_reap_grace();
     // Cheap pre-filter: any candidates at all? Avoids the RPC on the
     // hot path (every 10s tick × every pool). Same `reaped` skip as
     // `select_orphan_running` so the lazy-RPC short-circuit is
     // consistent with the actual selection.
     if !jobs.iter().any(|j| {
         is_running_job(j)
-            && job_older_than(j, ORPHAN_REAP_GRACE)
+            && job_older_than(j, grace)
             && !j
                 .metadata
                 .name
@@ -633,10 +726,31 @@ pub(super) async fn reap_orphan_running(
     ))
     .await
     .map(|r| r.into_inner());
-    let Some(executors) = orphan_reap_gate(result, pool) else {
+    let Some(executors) = orphan_reap_gate(result, pool, grace) else {
         return 0;
     };
-    let orphans = select_orphan_running(jobs, reaped, &executors, ORPHAN_REAP_GRACE);
+    // Second busy source: the open pull-mode attempt view. Fail-closed
+    // exactly like the stream source — an error here means the ledger
+    // view is unavailable, so absence cannot be proven and nothing is
+    // reaped this tick. (No leader-age arm: the view is durable PG
+    // state, not an in-memory map that refills after failover.)
+    let open_attempts = match admin_call(
+        ctx.admin
+            .clone()
+            .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
+    )
+    .await
+    {
+        Ok(resp) => resp.into_inner().attempts,
+        Err(e) => {
+            warn!(
+                pool, error = %e,
+                "ListOpenAttempts failed; skipping orphan-reap this tick (fail-closed)"
+            );
+            return 0;
+        }
+    };
+    let orphans = select_orphan_running(jobs, reaped, &executors, &open_attempts, grace);
     if orphans.is_empty() {
         return 0;
     }
@@ -646,14 +760,14 @@ pub(super) async fn reap_orphan_running(
         // Foreground: same job-tracking-finalizer-orphan race as
         // reap_excess_pending (see its comment). Targets here are
         // ready>0 so foreground blocks until the pod actually
-        // terminates, but orphans are past ORPHAN_REAP_GRACE with no
+        // terminates, but orphans are past the grace with no
         // scheduler assignment — there's nothing to preempt. The wait
         // is per-reconcile-tick, not per-build.
         match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
             Ok(_) => {
                 info!(
                     pool, job = %job_name,
-                    grace_secs = ORPHAN_REAP_GRACE.as_secs(),
+                    grace_secs = grace.as_secs(),
                     "reaped orphan Running ephemeral Job (no scheduler assignment past grace)"
                 );
                 reaped += 1;
@@ -1757,11 +1871,11 @@ mod tests {
         let jobs = vec![job_with("rio-builder-p-stuck", Some(1), Some(0), 600)];
         let reaped: HashSet<String> = ["rio-builder-p-stuck".into()].into();
         assert!(
-            select_orphan_running(&jobs, &reaped, &[], ORPHAN_REAP_GRACE).is_empty(),
+            select_orphan_running(&jobs, &reaped, &[], &[], ORPHAN_REAP_GRACE).is_empty(),
             "reaped this tick → not re-selected"
         );
         assert_eq!(
-            select_orphan_running(&jobs, &HashSet::new(), &[], ORPHAN_REAP_GRACE).len(),
+            select_orphan_running(&jobs, &HashSet::new(), &[], &[], ORPHAN_REAP_GRACE).len(),
             1,
             "control: not in `reaped` → selected"
         );
@@ -1823,7 +1937,8 @@ mod tests {
             executor("rio-builder-x86-idle01-fghij", false),
             // ghost1 has no entry
         ];
-        let orphans = select_orphan_running(&jobs, &HashSet::new(), &executors, ORPHAN_REAP_GRACE);
+        let orphans =
+            select_orphan_running(&jobs, &HashSet::new(), &executors, &[], ORPHAN_REAP_GRACE);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -1861,7 +1976,7 @@ mod tests {
             },
         ];
         let none = HashSet::new();
-        let orphans = select_orphan_running(&jobs, &none, &[], ORPHAN_REAP_GRACE);
+        let orphans = select_orphan_running(&jobs, &none, &[], &[], ORPHAN_REAP_GRACE);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(names, vec!["rio-builder-x86-stuck1"]);
 
@@ -1869,7 +1984,7 @@ mod tests {
         let mut no_ts = job_with("rio-builder-x86-nots01", Some(1), Some(0), 600);
         no_ts.metadata.creation_timestamp = None;
         assert!(
-            select_orphan_running(&[no_ts], &none, &[], ORPHAN_REAP_GRACE).is_empty(),
+            select_orphan_running(&[no_ts], &none, &[], &[], ORPHAN_REAP_GRACE).is_empty(),
             "no creation_timestamp → not orphan-reapable (conservative)"
         );
     }
@@ -1882,12 +1997,164 @@ mod tests {
         let jobs = vec![job_with("rio-builder-x86-abc", Some(1), Some(0), 600)];
         // Executor for a DIFFERENT Job whose name shares the prefix.
         let executors = vec![executor("rio-builder-x86-abcdef-qwert", true)];
-        let orphans = select_orphan_running(&jobs, &HashSet::new(), &executors, ORPHAN_REAP_GRACE);
+        let orphans =
+            select_orphan_running(&jobs, &HashSet::new(), &executors, &[], ORPHAN_REAP_GRACE);
         assert_eq!(
             orphans.len(),
             1,
             "executor 'abcdef-…' must NOT match Job 'abc' (would have \
              skipped as busy without the trailing-dash anchor)"
         );
+    }
+
+    /// `job_with` plus the `rio.build/intent-id` pod-template
+    /// annotation `build_job` stamps — what a real spawned Job carries.
+    fn job_with_intent(
+        name: &str,
+        intent_id: &str,
+        ready: Option<i32>,
+        succeeded: Option<i32>,
+        age_s: i64,
+    ) -> Job {
+        let mut j = job_with(name, ready, succeeded, age_s);
+        j.spec = Some(JobSpec {
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    annotations: Some(
+                        [(
+                            super::super::jobs::INTENT_ID_ANNOTATION.to_string(),
+                            intent_id.to_string(),
+                        )]
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        j
+    }
+
+    /// Minimal `OpenAttempt` as `ListOpenAttempts` returns it for a
+    /// pull-mode attempt: `executor_id` is the HMAC-attested intent id
+    /// (NOT a pod name) and `intent_id` carries the same value.
+    fn open_attempt(intent_id: &str) -> rio_proto::types::OpenAttempt {
+        rio_proto::types::OpenAttempt {
+            intent_id: intent_id.into(),
+            executor_id: intent_id.into(),
+            exec_id: "0198c0de-0000-7000-8000-000000000001".into(),
+            ..Default::default()
+        }
+    }
+
+    // r[verify ctrl.job.busy-from-open-attempts]
+    /// The §4.5 option-(b) busy bridge, mixed fleet: a Running Job past
+    /// the grace that is backed ONLY by an open pull-mode attempt (no
+    /// stream registration — pull pods never register) is NOT selected;
+    /// the same Job with no open attempt still IS selected (the I-165
+    /// stuck-pod reap preserved); stream-busy and ghost arms unchanged.
+    #[test]
+    fn select_orphan_running_open_pull_attempt_is_busy() {
+        let pull_intent = "drvhash-pull-0001";
+        let jobs = vec![
+            // Stream-mode Job, registered + busy → skip (existing arm).
+            job_with("rio-builder-x86-busy01", Some(1), Some(0), 600),
+            // Pull-mode Job: never registers on the stream, so the
+            // executor list has no entry for it. Backed by an open
+            // pull-mode attempt → busy → NOT selected.
+            job_with_intent("rio-builder-x86-pull01", pull_intent, Some(1), Some(0), 600),
+            // Ghost: no executor entry, no open attempt → reaped.
+            job_with("rio-builder-x86-ghost1", Some(1), Some(0), 600),
+        ];
+        // Executor list non-empty (mixed fleet) — only the stream pod.
+        let executors = vec![executor("rio-builder-x86-busy01-abcde", true)];
+        let attempts = vec![open_attempt(pull_intent)];
+
+        let orphans = select_orphan_running(
+            &jobs,
+            &HashSet::new(),
+            &executors,
+            &attempts,
+            ORPHAN_REAP_GRACE,
+        );
+        let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
+        assert_eq!(
+            names,
+            vec!["rio-builder-x86-ghost1"],
+            "a Running Job past the grace backed only by an open pull-mode \
+             attempt must NOT be selected; the ghost still is"
+        );
+
+        // (b) The same Job with NO open attempt: the open-attempt arm
+        // must not weaken the I-165 reap — it IS selected again.
+        let orphans =
+            select_orphan_running(&jobs, &HashSet::new(), &executors, &[], ORPHAN_REAP_GRACE);
+        let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
+        assert_eq!(
+            names,
+            vec!["rio-builder-x86-pull01", "rio-builder-x86-ghost1"],
+            "with no open attempt the pull-mode Job is reapable again \
+             (I-165 preserved)"
+        );
+    }
+
+    // r[verify ctrl.job.busy-from-open-attempts]
+    /// Match keys for the open-attempt cover: the intent-id annotation
+    /// (primary) and the dash-anchored executor-id prefix (kept for a
+    /// future pod-named identity); neither → not covered.
+    #[test]
+    fn covered_by_open_pull_attempt_match_keys() {
+        // Annotation match (the executor_id is the intent, not a pod name).
+        let j = job_with_intent("rio-builder-x86-pull01", "drv-abc", Some(1), Some(0), 600);
+        assert!(covered_by_open_pull_attempt(&j, &[open_attempt("drv-abc")]));
+        assert!(!covered_by_open_pull_attempt(
+            &j,
+            &[open_attempt("drv-zzz")]
+        ));
+        assert!(!covered_by_open_pull_attempt(&j, &[]));
+
+        // Prefix match: an attempt whose executor_id is the pod name of
+        // THIS Job covers it; a longer Job name sharing the prefix does
+        // not (dash anchor).
+        let j = job_with("rio-builder-x86-abc", Some(1), Some(0), 600);
+        let pod_named = rio_proto::types::OpenAttempt {
+            executor_id: "rio-builder-x86-abc-qwert".into(),
+            ..Default::default()
+        };
+        assert!(covered_by_open_pull_attempt(
+            &j,
+            std::slice::from_ref(&pod_named)
+        ));
+        let other_job = job_with("rio-builder-x86-ab", Some(1), Some(0), 600);
+        assert!(
+            !covered_by_open_pull_attempt(&other_job, &[pod_named]),
+            "dash anchor: 'rio-builder-x86-abc-…' must not cover Job 'rio-builder-x86-ab'"
+        );
+
+        // A Job with no name and no annotation is never covered.
+        let unnamed = Job::default();
+        assert!(!covered_by_open_pull_attempt(
+            &unnamed,
+            &[open_attempt("x")]
+        ));
+    }
+
+    /// `RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS` (VM-fixture-only): honored
+    /// when set and parsable, [`ORPHAN_REAP_GRACE`] (300 s) otherwise.
+    #[test]
+    fn orphan_reap_grace_override_env() {
+        rio_test_support::Jail::expect_with(|jail| {
+            // Default: no env → the production constant.
+            assert_eq!(orphan_reap_grace(), ORPHAN_REAP_GRACE);
+            assert_eq!(ORPHAN_REAP_GRACE, Duration::from_secs(300));
+            // Override honored.
+            jail.set_env("RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS", "7");
+            assert_eq!(orphan_reap_grace(), Duration::from_secs(7));
+            // Unparsable → fall back to the constant.
+            jail.set_env("RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS", "not-a-number");
+            assert_eq!(orphan_reap_grace(), ORPHAN_REAP_GRACE);
+            Ok(())
+        });
     }
 }
