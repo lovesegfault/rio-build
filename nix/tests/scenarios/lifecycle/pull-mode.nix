@@ -31,11 +31,16 @@ scope: with scope; ''
   #     report lands (the pod exits 0, the client gets its store path,
   #     the assignment closes, and no drv_attempts charge row exists —
   #     the ledger records failures, not successes);
-  #   - a pod killed mid-build does NOT fabricate a completion or a
-  #     premature classification: its attempt stays open (the
-  #     establishment sweep — deadline + report slack, ~1 h with the
-  #     vmtest probe deadline — is the only closer and is exercised at
-  #     the unit level and in the 1b canary scenario, not here).
+  #   - a pod killed mid-build is neither lost nor charge-free (the
+  #     charge-free rule covers only never-pulled pods): with the 1b
+  #     slice (T-1b.3 C4/C5 unified pod-terminal reporting plus the
+  #     AD5 SIGTERM-abort report) the killed attempt is closed with a
+  #     non-success outcome instead of waiting for the establishment
+  #     sweep, the derivation requeues, a fresh attempt (new exec_id)
+  #     rebuilds it, and the same client build still gets its store
+  #     path. The successful re-run appends nothing to the ledger; the
+  #     establishment sweep (deadline + report slack) remains the
+  #     out-of-budget backstop for attempts no observer reports.
   with subtest("pull-mode: pull/report path builds a drv; no-attempt and killed-mid-build arms"):
       import time
 
@@ -90,6 +95,22 @@ scope: with scope; ''
               " WHERE t.exec_id = a.exec_id "
               " AND t.termination_reason IS NOT NULL)"
           ).strip() or "0")
+
+      def open_pull_exec(marker):
+          """exec_id of the currently-open pull attempt for marker
+          (empty string when none) — the same view open_pull_count
+          reads, narrowed to its exec_id column."""
+          return psql_k8s(k3s_server,
+              "SELECT a.exec_id FROM assignments a "
+              "JOIN drv_executions e ON e.exec_id = a.exec_id "
+              "JOIN derivations d ON d.derivation_id = a.derivation_id "
+              "WHERE a.status IN ('pending','acknowledged') "
+              "AND e.dispatch_mode = 'pull' "
+              f"AND d.drv_path LIKE '%{marker}%' "
+              "AND NOT EXISTS (SELECT 1 FROM drv_attempts t "
+              " WHERE t.exec_id = a.exec_id "
+              " AND t.termination_reason IS NOT NULL)"
+          ).strip()
 
       def attempt_rows(marker):
           """All drv_attempts rows ever recorded for the marker drv."""
@@ -238,7 +259,23 @@ scope: with scope; ''
       )
       print("pull-mode arm 2: build complete, report landed, assignment closed, no charges")
 
-      # ── Arm 3: a pod killed mid-build fabricates nothing ──────────
+      # ── Arm 3: a pod killed mid-build is charged once + requeued ──
+      # Wave 1a wrote this arm against the interim state (nothing
+      # reported pod-terminal outcomes for pull-mode pods, so a killed
+      # attempt stayed open under the same exec_id until the
+      # establishment sweep). The 1b slice changed the designed
+      # behavior: a pod that has PULLED is not charge-free when it
+      # dies — the kill is observed promptly (in this fixture by the
+      # AD5 SIGTERM-abort report the builder fires as the force-kill
+      # lands; the T-1b.3 C4/C5 unified controller report and the
+      # establishment sweep are the other observers of the same
+      # contract), the attempt is closed with a non-success outcome,
+      # the derivation requeues, and the Job re-pulls under a fresh
+      # exec_id. This arm asserts the strongest in-budget form of that
+      # contract: original exec closed and charged exactly once, never
+      # a fabricated success, a fresh attempt appears, and the SAME
+      # client build still completes with a store path (one extra 45 s
+      # rebuild, well inside the group budget).
       client.succeed(
           "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
           "--arg busybox '(builtins.storePath ${common.busybox})' "
@@ -251,6 +288,7 @@ scope: with scope; ''
           "derivation", ""
       ), f"expected the pull-mode-2 attempt mid-build, got: {rpc_attempts!r}"
       arm3_exec = rpc_attempts[0].get("execId", "")
+      assert arm3_exec, f"open attempt carries an exec_id, got: {rpc_attempts[0]!r}"
       builder = k3s_server.succeed(
           "k3s kubectl -n ${nsBuilders} get pods "
           "-l rio.build/pool=pull-pool "
@@ -258,31 +296,109 @@ scope: with scope; ''
           "-o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true"
       ).split()
       assert builder, "a Running pull-pool pod expected mid-build"
+      print(f"pull-mode arm 3: force-killing mid-build pod {builder[0]} (exec_id {arm3_exec})")
       k3s_server.succeed(
           f"k3s kubectl -n ${nsBuilders} delete pod {builder[0]} "
           "--force --grace-period=0 --wait=false"
       )
-      # The kill must not fabricate a completion or classification: the
-      # attempt stays open with the same exec_id (the establishment
-      # sweep, after deadline + slack, is the only closer — outside
-      # this subtest's budget) and no attempt row appears.
-      time.sleep(15)
+
+      # The killed attempt must be superseded: the original exec_id
+      # leaves the open view and a FRESH attempt (different exec_id)
+      # appears once the requeued drv is re-pulled. Poll structurally
+      # (no fixed sleep): the close-to-re-pull window is seconds on
+      # KVM, budgeted generously for TCG. The open view holds at most
+      # one attempt per derivation, so a fresh exec_id here also
+      # proves the killed one is no longer open.
+      deadline = time.time() + 120
+      arm3_exec2 = ""
+      while time.time() < deadline:
+          arm3_exec2 = open_pull_exec("lifecycle-pull-mode-2")
+          if arm3_exec2 and arm3_exec2 != arm3_exec:
+              break
+          time.sleep(3)
+      assert arm3_exec2 and arm3_exec2 != arm3_exec, (
+          f"killed-mid-build attempt {arm3_exec} should be closed and the "
+          f"requeued drv re-pulled under a fresh exec_id, open view shows "
+          f"{arm3_exec2!r}"
+      )
       rpc_attempts = open_attempts_rpc()
-      assert len(rpc_attempts) == 1 and rpc_attempts[0].get("execId", "") == arm3_exec, (
-          f"the killed-mid-build attempt must stay open with the same exec_id "
-          f"({arm3_exec}), got: {rpc_attempts!r}"
+      assert len(rpc_attempts) == 1 and rpc_attempts[0].get("execId", "") == arm3_exec2, (
+          f"ListOpenAttempts must show exactly the fresh attempt ({arm3_exec2}), "
+          f"got: {rpc_attempts!r}"
       )
-      assert attempt_rows("lifecycle-pull-mode-2") == 0, (
-          "no classification may exist right after the mid-build kill"
+      # The killed exec is charged exactly once with a non-success
+      # disruption class (the ledger has no success class at all, so a
+      # row here can never launder the kill into a completion). The
+      # in-budget closer today is the worker SIGTERM-abort report
+      # (classified infra); executor_crash is the establishment-sweep
+      # spelling and disconnected the stream-installment one — any of
+      # the three is the same contract: closed, charged, non-success.
+      orig_rows = int(psql_k8s(k3s_server,
+          f"SELECT count(*) FROM drv_attempts WHERE exec_id = '{arm3_exec}'"
+      ).strip() or "0")
+      orig_class = psql_k8s(k3s_server,
+          f"SELECT outcome_class FROM drv_attempts WHERE exec_id = '{arm3_exec}'"
+      ).strip()
+      assert orig_rows == 1 and orig_class in (
+          "infra",
+          "executor_crash",
+          "disconnected",
+      ), (
+          f"the killed attempt must be charged exactly once with a "
+          f"non-success disruption class, got {orig_rows} row(s), "
+          f"class {orig_class!r}"
       )
-      print("pull-mode arm 3: killed mid-build, attempt stays open, nothing fabricated")
+      # Never a fabricated success: a legitimate completion needs the
+      # fresh attempt to run its full 45 s build, so the client must
+      # still be waiting at this point.
+      still_running = client.execute("kill -0 $(cat /tmp/pull2.pid)")[0]
+      assert still_running == 0, (
+          f"the arm-3 client build finished suspiciously early (kill -0 rc "
+          f"{still_running}); only a fabricated completion could land before "
+          f"the re-attempt has built"
+      )
+      print(f"pull-mode arm 3: killed exec charged ({orig_class}), fresh attempt {arm3_exec2}")
+
+      # The derivation is not lost: the fresh attempt builds it, the
+      # report lands, and the same client nix-build exits with the
+      # store path.
+      client.wait_until_succeeds(
+          "! kill -0 $(cat /tmp/pull2.pid) 2>/dev/null",
+          timeout=300,
+      )
+      out2 = client.succeed("cat /tmp/pull2.out").strip()
+      assert "/nix/store/" in out2, (
+          f"the requeued pull-mode drv should still produce a store path, got: {out2!r}"
+      )
+      # … the fresh attempt closes on the successful report …
+      wait_open_pull("lifecycle-pull-mode-2", 0, timeout=120, ctx=" arm 3 close")
+      active2 = int(psql_k8s(k3s_server,
+          "SELECT count(*) FROM assignments a "
+          "JOIN derivations d ON d.derivation_id = a.derivation_id "
+          "WHERE d.drv_path LIKE '%lifecycle-pull-mode-2%' "
+          "AND a.status IN ('pending','acknowledged')"
+      ).strip() or "0")
+      assert active2 == 0, (
+          f"no active assignment may remain for the rebuilt drv, got: {active2}"
+      )
+      # … and at quiescence the ledger holds exactly the one
+      # disruption charge: the kill charged the killed exec once and
+      # the successful re-attempt appended nothing (the ledger records
+      # failures, never successes).
+      rows2 = attempt_rows("lifecycle-pull-mode-2")
+      new_rows = int(psql_k8s(k3s_server,
+          f"SELECT count(*) FROM drv_attempts WHERE exec_id = '{arm3_exec2}'"
+      ).strip() or "0")
+      assert rows2 == 1 and new_rows == 0, (
+          f"expected exactly one charge row (the killed attempt) and none for "
+          f"the successful re-attempt, got: drv-wide {rows2}, fresh-exec {new_rows}"
+      )
+      print("pull-mode arm 3: requeued drv rebuilt under the fresh exec_id, "
+            "store path delivered, single charge in the ledger")
 
       # ── Cleanup ───────────────────────────────────────────────────
-      # The arm-3 client is still waiting on a build that will only
-      # resolve via the establishment sweep — kill it; the drv's open
-      # attempt intentionally remains (documented above). Delete the
-      # pool; ownerRef GC removes its Jobs/pods.
-      client.succeed("kill $(cat /tmp/pull2.pid) 2>/dev/null || true")
+      # Both clients have exited and no open attempt remains. Delete
+      # the pool; ownerRef GC removes its Jobs/pods.
       kubectl("delete pool pull-pool --wait=false", ns="${nsBuilders}")
       k3s_server.wait_until_succeeds(
           "! k3s kubectl -n ${nsBuilders} get pool pull-pool 2>/dev/null",
@@ -295,5 +411,5 @@ scope: with scope; ''
           timeout=120,
       )
       print("pull-mode PASS: no-attempt death charge-free, pull build + report "
-            "end-to-end, killed-mid-build attempt stays open")
+            "end-to-end, killed-mid-build charged once and rebuilt to success")
 ''

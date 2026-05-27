@@ -778,15 +778,16 @@ in
       # r[verify builder.pull.exit-codes]
       # r[verify sched.attempt.no-attempt-no-op]
       # r[verify sched.admin.list-open-attempts]
-      #   pull-mode: ~300s — never-pulled kill + respawned pull build
+      #   pull-mode: ~360s — never-pulled kill + respawned pull build
       #   (30s sleep) + report + killed-mid-build arm (45s sleep +
-      #   15s observation) + cleanup, each behind a reconcile tick +
-      #   pod schedule + FUSE.
+      #   force-kill + requeue + 45s rebuild to a delivered store
+      #   path) + cleanup, each behind a reconcile tick + pod
+      #   schedule + FUSE.
       "pull-mode"
     ];
-    # ephemeral ~180s + pull-mode ~300s + ~240s k3s bring-up ≈ 720s
+    # ephemeral ~180s + pull-mode ~360s + ~240s k3s bring-up ≈ 780s
     # expected; TCG tail headroom on top.
-    globalTimeout = 1100;
+    globalTimeout = 1200;
   };
 
   #

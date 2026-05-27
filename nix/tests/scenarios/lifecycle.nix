@@ -224,7 +224,8 @@ let
   # observable in ListOpenAttempts / the open-attempts gauge while the
   # build runs, short enough to keep the subtest budget tight.
   # pullDrv2 (45s sleep): the killed-mid-build arm — the window covers
-  # pod start + pull + the force-kill + a post-kill observation.
+  # pod start + pull + the force-kill, and the requeued re-attempt
+  # pays the same sleep again before the client gets its store path.
   pullDrv1 = drvs.mkTrivial {
     marker = "lifecycle-pull-mode-1";
     sleepSecs = 30;
