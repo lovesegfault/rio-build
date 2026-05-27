@@ -1341,3 +1341,39 @@ are in the introducing commit's message and the check transcripts.
   wall-clocks fit the T-1a.5 step-6 budget with margin (largest regime
   ≈2 minutes of checker time on the campaign dev box, transcripts in
   the introducing commit).
+
+### Acceptance re-run against the replacement model (plan T-1a.6)
+
+The design §4.6 acceptance re-run, executed before Wave A2 starts: the
+G4a and G5 representatives plus the `937a9c928` completion-clobber
+member the Phase-1 input list added are re-pointed at `chunkCollect.qnt`
+as evidence modules under `docs/spec/models/calibration/` —
+`refcount-collect-g4a.qnt`, `refcount-collect-g5.qnt`,
+`refcount-collect-g1-completion.qnt` — committed, typechecked,
+re-runnable (commands in the module headers), not wired as CI checks
+(the wired `quint-refcount-calib-*` checks against the as-built model
+keep guarding these mechanisms until Phase 2 re-points them). All three
+falsify as predicted, so the replacement model is fine-grained enough
+to guard the surviving mechanisms and this half of the Wave A2
+precondition is met. Verdict format as in Stage C: invariant @ step
+(depth, generated/distinct at the stop point); wall-clocks are in the
+introducing commit's message.
+
+| Re-run member | Module (calibration/…) | Reverted mechanism | Verdict |
+|---|---|---|---|
+| G4a `aa738a5d7` (M_006) | `refcountCollectG4aDrainNoRecheck` | drain re-check / resurrect skip before DeleteObject (survives Release A as the `deleted`-only re-check) | **FALSIFIES** cr1NoLiveChunkCollected @ calibStep (depth 14, 217,701/8,316) — a collected-then-resurrected chunk loses its object to the stale outbox row. Baseline: contend-regime constants verbatim (`quint-chunk-collect-contend` exhaustive HOLDS) |
+| G5 `a1b49b4a3` | `refcountCollectG5NoHeartbeat` | the heartbeat (path-row janitor form) | **FALSIFIES** s5LiveOwnerNeverReaped @ calibStep (depth 11, 5,183/410) — a live, guard-armed owner is reaped mid-flight. Baseline over the same restricted alphabet: `refcountCollectG5Baseline` (heartbeat + contract, default step) HOLDS S5 exhaustively (51,729/3,101) |
+| G1 `937a9c928` (completion half; the input-list member) | `refcountCollectG1CompletionUnclaimGated` | claim gate on completion (path-row janitor form) | **FALSIFIES** the module-local `completionRequiresCurrentOwner` @ calibStep (depth 14, 69,379/2,984) and cr1NoLiveChunkCollected @ calibStep (depth 15, 131,534/5,645 — the foreign flip makes the successor's still-uploading manifest readable before its PUTs); the incident shape is pinned by `g1CompletionClobberRun`. Baseline (default claim-gated step over the same relaxed-clock alphabet): both invariants HOLD exhaustively (334,165,889/6,365,559) — a stronger control than Stage C's, whose as-built baseline could not hold CR-1 under the relaxed clock because of the late-mark window; the T-pre.1 deleted-guard carried by the replacement model closes exactly that window, so the falsification is attributable to the claim-gate revert alone |
+
+Acceptance-table dispositions for the remaining families (design §4.6),
+now recorded against the replacement:
+
+| Family | Acceptance disposition |
+|---|---|
+| G1 ownership/identity (other rows), G2 forgotten decrements | Cannot recur by construction once Release B lands — the counter, the token-gated rollback, and the decrement family are deleted; there is no aggregate left to clobber or forget. The completion-clobber row above is the surviving path-row content. The wired `quint-refcount-calib-g1-token-rollback` / `-g2-inline-reap` checks stay in CI guarding the as-built machinery until that machinery is deleted (retired with it per P12, Release B) |
+| G3 counter-as-presence | Checked by CR-4, which survives verbatim in the replacement model (exhaustive HOLDS in all four regimes) plus the upsert `RETURNING (uploaded_at IS NULL)` tests and the `store.cas.*` rules; the wired `quint-refcount-calib-g3-counter-presence` check is re-pointed at the model of record in Phase 2 |
+| G4a chunk-level collect-vs-re-reference | Re-falsified against the replacement model (this task, row above); mechanism survives, coverage transfers |
+| G4b path-level mark/sweep | Carried pre-registered NOT-ENCODED disposition unchanged — path unreachability stays an abstract environment choice; covered by the `store.gc.*` path rules and the mark/sweep tests, which the replacement does not touch |
+| G5 reaped live uploads | Re-falsified against the replacement model (this task, row above); I-207 stays latency-only per the Phase-1 input list (its hot-path-reclaim mechanism is a path-row janitor here, exercised by the `noHotpathReclaim` witness) |
+| G6 lock order | Carried pre-registered NOT-ENCODED disposition — below transaction granularity; `store.chunk.lock-order` survives with its site list narrowed (the collect batch's sorted `= ANY` is one of the surviving sites) |
+| G7 loop operability | Carried pre-registered NOT-ENCODED disposition — the collector inherits the obligation; carried by the runtime metrics/alerts (cycle counters, stalled alert, parse-failure alert) and the loop tests, not by the model |
