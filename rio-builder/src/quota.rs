@@ -113,10 +113,18 @@ pub fn current_bytes(dir: &Path) -> io::Result<Option<u64>> {
 /// daemon restart.
 pub fn project_id(dir: &Path) -> Option<u32> {
     let f = File::open(dir).ok()?;
+    project_id_of(&f)
+}
+
+/// [`project_id`] for an already-open directory fd — used by rio-mountd
+/// at `Mount` time to detect that a staging dir survived a daemon
+/// restart and re-use the project id it already carries (re-tagging it
+/// would hand the build a second, empty quota bucket).
+pub fn project_id_of(dirfd: &impl AsRawFd) -> Option<u32> {
     let mut x = Fsxattr::default();
     // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
     // the pointer. `x` is repr(C), Default-zeroed, lives on our stack.
-    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+    if unsafe { libc::ioctl(dirfd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
         return None;
     }
     (x.fsx_projid != 0).then_some(x.fsx_projid)

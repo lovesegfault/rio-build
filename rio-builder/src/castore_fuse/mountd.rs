@@ -1243,8 +1243,9 @@ fn mount_build(shared: &Arc<Shared>, state: &mut ConnState, build_id: &str) -> a
     // via its flock'd `.rio-live` sentinel) is re-adopted by the
     // builder's re-`Mount{build_id}` on its new connection — existing
     // staged content is left untouched, the dir is re-chowned to the
-    // same peer uid, and a fresh (survivor-disjoint) projid re-applies
-    // the quota. r[impl builder.fs.mountd-reconnect]
+    // same peer uid, and the staging quota is re-applied to the projid
+    // the dir already carries (see [`staging_projid`]).
+    // r[impl builder.fs.mountd-reconnect]
     match mkdirat(
         &shared.staging_base,
         build_id,
@@ -1293,10 +1294,15 @@ fn mount_build(shared: &Arc<Shared>, state: &mut ConnState, build_id: &str) -> a
 
     // ── Kernel-enforced staging quota. The projid is mountd-assigned
     // and monotonic — never derived from the adversary-chosen build_id,
-    // so a build cannot collide into a victim's quota bucket.
+    // so a build cannot collide into a victim's quota bucket. A
+    // re-adopted (surviving) staging dir keeps the projid the previous
+    // incarnation tagged it with — see [`staging_projid`].
     let mut applied_quota = 0;
     if cfg.staging_quota_bytes > 0 {
-        let projid = shared.next_projid.fetch_add(1, Ordering::Relaxed);
+        let projid = staging_projid(
+            crate::quota::project_id_of(&staging_dirfd),
+            &shared.next_projid,
+        );
         apply_project_quota(&staging_dirfd, projid, cfg.staging_quota_bytes)
             .context("apply staging project quota")?;
         state.projid = Some(projid);
@@ -1312,6 +1318,26 @@ fn mount_build(shared: &Arc<Shared>, state: &mut ConnState, build_id: &str) -> a
         "staging ready, builder's /dev/fuse fd kept for backing brokering"
     );
     Ok(applied_quota)
+}
+
+/// Which XFS project id a staging dir gets at `Mount` time.
+///
+/// A surviving (re-adopted) dir keeps the id the previous daemon
+/// incarnation tagged it with (`existing`): the files staged before the
+/// restart already carry that id, so re-tagging the directory with a
+/// fresh one would hand the build a second, empty quota bucket (≈ +1×
+/// `staging_quota_bytes` per restart), leave the old id's hard-limit
+/// record dangling past teardown (teardown only clears the id in
+/// `ConnState`), and hide the old id from the next incarnation's
+/// seed-above-survivors scan (which reads the directory's projid, not
+/// its files'). Only a genuinely untagged dir draws a fresh id from the
+/// monotonic counter — still never derived from the adversary-chosen
+/// `build_id`.
+fn staging_projid(existing: Option<u32>, next_projid: &AtomicU32) -> u32 {
+    match existing {
+        Some(id) => id,
+        None => next_projid.fetch_add(1, Ordering::Relaxed),
+    }
 }
 
 /// Best-effort removal of the per-build staging tree. Used by both the
@@ -1708,6 +1734,45 @@ mod tests {
             content,
             "the pre-restart staged bytes are what lands in the shared cache"
         );
+    }
+
+    /// Survivor re-adoption with quota ENABLED: the staging dir's
+    /// existing project id is reused (the limit is re-applied to it)
+    /// and the monotonic counter is untouched; only an untagged dir
+    /// draws a fresh id. The XFS ioctls themselves cannot run on the
+    /// test tmpdir (no prjquota — `quota.rs`'s
+    /// `apply_fails_loudly_without_prjquota` covers that side), so this
+    /// pins the decision logic those ioctls are fed: a second bucket
+    /// per restart, a dangling limit record, or a hidden survivor id
+    /// would all start from `staging_projid` picking a fresh id here.
+    /// Teardown then clears whichever id `ConnState` carries — the
+    /// reused one — so the record that exists is the record cleared.
+    // r[verify builder.fs.mountd-reconnect]
+    // r[verify builder.mountd.staging-quota]
+    #[test]
+    fn staging_projid_reuses_a_survivors_id() {
+        let next = AtomicU32::new(7);
+
+        // Re-adopted dir: keep its id, allocate nothing.
+        assert_eq!(staging_projid(Some(3), &next), 3);
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            7,
+            "reusing a survivor's projid must not consume a fresh one"
+        );
+
+        // Untagged (fresh) dir: allocate from the counter.
+        assert_eq!(staging_projid(None, &next), 7);
+        assert_eq!(staging_projid(None, &next), 8);
+        assert_eq!(next.load(Ordering::Relaxed), 9);
+
+        // The probe feeding `existing` reports None on a filesystem
+        // without project quotas (the unit-test tmpdir), so the fresh
+        // path is what mount_build exercises here; the reuse arm above
+        // is what a real XFS staging root takes after a daemon restart.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirfd = dirfd(tmp.path());
+        assert_eq!(crate::quota::project_id_of(&dirfd), None);
     }
 
     // r[verify builder.mountd.build-id-validated]
