@@ -666,7 +666,7 @@ pub async fn execute_build(
             // prefetch_manifests together are <100 ms (one HashMap extend +
             // one BatchGetManifest RPC).
             //
-            // r[impl builder.cancel.pre-cgroup-deferred]
+            // r[impl builder.cancel.pre-cgroup-deferred+2]
             // I-166: the cgroup doesn't exist yet (created post-spawn below),
             // so a Cancel that arrived during overlay/resolve/prepare landed
             // as ENOENT in `try_cancel_build` — which now LEAVES the flag

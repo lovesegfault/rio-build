@@ -973,6 +973,157 @@ pub(super) async fn reap_orphan_running(
     reaped
 }
 
+// r[impl ctrl.drain.disruption-target+2]
+/// The cancel arm's pure evidence fold (unit-tested exhaustively): for
+/// every active Job, a covering open pull-mode attempt records
+/// evidence in `seen_open`; a Job whose previously-recorded evidence
+/// is no longer backed by the (successful) view read is selected for
+/// cancellation — the closed→active edge — and its evidence consumed;
+/// a Job never recorded is never selected (bare absence, no age gate
+/// in either direction). Evidence for Jobs no longer active in `ns`
+/// is pruned so the map stays bounded.
+pub(super) fn select_closed_attempt_jobs<'a>(
+    active: &[&'a Job],
+    open_attempts: &[rio_proto::types::OpenAttempt],
+    seen_open: &mut HashMap<String, Instant>,
+    ns: &str,
+) -> Vec<&'a Job> {
+    let key_of = |name: &str| format!("{ns}/{name}");
+    let active_keys: HashSet<String> = active
+        .iter()
+        .filter_map(|j| j.metadata.name.as_deref().map(key_of))
+        .collect();
+    // Prune evidence for Jobs that are no longer active in this
+    // namespace (completed, deleted, or replaced).
+    seen_open.retain(|k, _| !k.starts_with(&format!("{ns}/")) || active_keys.contains(k));
+    let mut selected = Vec::new();
+    for job in active {
+        let Some(name) = job.metadata.name.as_deref() else {
+            continue;
+        };
+        let key = key_of(name);
+        if covered_by_open_pull_attempt(job, open_attempts) {
+            seen_open.insert(key, Instant::now());
+        } else if seen_open.remove(&key).is_some() {
+            // The closed→active edge: positive evidence the attempt
+            // ended while the Job (and its pod) lives on.
+            selected.push(*job);
+        }
+        // else: never observed open — bare absence, never touched.
+    }
+    selected
+}
+
+// r[impl ctrl.drain.disruption-target+2]
+/// AD5 cancel arm (pull-mode pools only — the caller gates on the Pool
+/// CR's `dispatchMode`): each tick, foreground-delete an active Job
+/// whose pull-mode attempt has CLOSED while the Job is still active,
+/// so a scheduler-side cancel verdict aborts the pod now (Job deletion
+/// → SIGTERM → builder cgroup-kill) instead of at
+/// `activeDeadlineSeconds`.
+///
+/// Evidence rule: a Job is cancelled only on the closed→active edge —
+/// the controller previously matched this Job to an open attempt in a
+/// successful `ListOpenAttempts` read (recorded in
+/// `Ctx::pull_attempt_seen_open`) and a later successful read no
+/// longer lists it while the Job is still active. There is no age gate
+/// on that pair. Bare absence is NEVER cancellation evidence: a
+/// pull-mode Job whose pod has not yet pulled (Pending, image pull,
+/// cold NodeClaim, pull-retry backoff) or is receiving `NotYetReady`
+/// has never had an attempt and is never touched by this arm — those
+/// Jobs remain covered only by the grace-gated orphan reap and
+/// `activeDeadlineSeconds`. The view read is fail-closed exactly like
+/// the orphan reap's: an error produces no cancel decisions and leaves
+/// the recorded evidence untouched. A closed edge missed because the
+/// controller restarted between the close and the next read falls back
+/// to the orphan-reap arm / `activeDeadlineSeconds` (accepted; see the
+/// composite-budget note at [`super::pod::PULL_MODE_TGPS_SECS`]).
+///
+/// Deletions route through [`delete_job_with_synthesized_report`]
+/// (reason `Cancelled`): the attempt is already closed, so the
+/// synthesize arm is structurally inert (the scheduler already holds
+/// the verdict — there is nothing left to report), but the shared
+/// helper keeps every controller Job-delete call site speaking the
+/// same way and covers the race where the view briefly still lists
+/// the attempt at delete time.
+///
+/// Returns the number of Jobs deleted this tick.
+pub(super) async fn cancel_closed_attempt_jobs(
+    jobs_api: &Api<Job>,
+    jobs: &[Job],
+    ctx: &Ctx,
+    ns: &str,
+    pool: &str,
+) -> u32 {
+    let active: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| is_active_job(j) && j.metadata.deletion_timestamp.is_none())
+        .collect();
+    if active.is_empty() {
+        // Nothing active: drop any leftover evidence for this pool's
+        // namespace prefix so the map stays bounded.
+        ctx.pull_attempt_seen_open
+            .lock()
+            .retain(|k, _| !k.starts_with(&format!("{ns}/")));
+        return 0;
+    }
+    // One view read per tick; fail-closed on error (no decisions, no
+    // evidence changes).
+    let open_attempts = match admin_call(
+        ctx.admin
+            .clone()
+            .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
+    )
+    .await
+    {
+        Ok(resp) => resp.into_inner().attempts,
+        Err(e) => {
+            warn!(
+                pool, error = %e,
+                "ListOpenAttempts failed; no cancel decisions this tick (fail-closed)"
+            );
+            return 0;
+        }
+    };
+    let to_cancel: Vec<&Job> = {
+        let mut seen_open = ctx.pull_attempt_seen_open.lock();
+        select_closed_attempt_jobs(&active, &open_attempts, &mut seen_open, ns)
+    };
+    let mut cancelled = 0u32;
+    for job in to_cancel {
+        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        match delete_job_with_synthesized_report(
+            jobs_api,
+            ctx,
+            job,
+            job_name,
+            &DeleteParams::foreground(),
+            rio_proto::types::AttemptTerminalReason::Cancelled,
+            &open_attempts,
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(
+                    pool, job = %job_name,
+                    "cancelled pull-mode Job whose attempt closed while the Job was still active"
+                );
+                cancelled += 1;
+            }
+            Err(e) if e.is_not_found() => {
+                debug!(pool, job = %job_name, "cancel-arm Job already gone");
+            }
+            Err(e) => {
+                warn!(
+                    pool, job = %job_name, error = %e,
+                    "failed to delete cancelled pull-mode Job; will retry next tick"
+                );
+            }
+        }
+    }
+    cancelled
+}
+
 /// Outcome of a single `jobs_api.create` attempt. Caller decides
 /// what to do on `Failed` — both ephemeral reconcilers warn+continue.
 ///

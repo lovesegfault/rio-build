@@ -820,7 +820,7 @@ fn executor_pod_has_downward_hwclass_volume() {
     );
 }
 
-// r[verify ctrl.drain.disruption-target]
+// r[verify ctrl.drain.disruption-target+2]
 /// DisruptionTarget filter: Pod with `conditions[DisruptionTarget]=
 /// True` → `Some(name)`. Anything else → `None`.
 ///
@@ -1054,4 +1054,72 @@ fn job_pod_image_pull_policy_passthrough() {
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
     assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
+}
+
+// ───────────────────────────────────────────────────────────────────
+// AD5: pull-mode preemption decision (DisruptionTarget watcher)
+// ───────────────────────────────────────────────────────────────────
+
+// r[verify ctrl.drain.disruption-target+2]
+/// A disruption-targeted pod of a pull-mode pool (its container
+/// carries `RIO_DISPATCH_MODE=pull` — the rendering of
+/// `dispatchMode: Pull`) takes the synthesize-preempted +
+/// foreground-delete-the-Job path: the decision carries the owning
+/// Job, the intent identity, and the node attribution, and the stream
+/// force-drain hop is NOT taken. A stream pod (no pull env) keeps the
+/// unchanged DrainExecutor path.
+#[test]
+fn disruption_pull_mode_pod_preempts_via_job_delete() {
+    use k8s_openapi::api::core::v1::{Container, EnvVar, PodSpec as K8sPodSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+    use std::collections::BTreeMap;
+
+    let mk_pod = |pull: bool| {
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("rio-builder-pull-7abcd".into());
+        pod.metadata.namespace = Some("rio".into());
+        pod.metadata.owner_references = Some(vec![OwnerReference {
+            kind: "Job".into(),
+            name: "rio-builder-pull-7".into(),
+            api_version: "batch/v1".into(),
+            ..Default::default()
+        }]);
+        pod.metadata.annotations = Some(BTreeMap::from([(
+            jobs::INTENT_ID_ANNOTATION.to_string(),
+            "drv-pull-7".to_string(),
+        )]));
+        pod.spec = Some(K8sPodSpec {
+            node_name: Some("node-3".into()),
+            containers: vec![Container {
+                name: "builder".into(),
+                env: pull.then(|| {
+                    vec![EnvVar {
+                        name: "RIO_DISPATCH_MODE".into(),
+                        value: Some("pull".into()),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        pod
+    };
+
+    // Pull-mode pod → the preemption decision, fully attributed.
+    let preempt = disruption::pull_mode_preemption(&mk_pod(true))
+        .expect("pull-mode pod takes the report+delete path");
+    assert_eq!(preempt.namespace, "rio");
+    assert_eq!(preempt.job_name.as_deref(), Some("rio-builder-pull-7"));
+    assert_eq!(preempt.intent_id, "drv-pull-7");
+    assert_eq!(preempt.node_name, "node-3");
+    assert_eq!(preempt.pod_name, "rio-builder-pull-7abcd");
+
+    // Stream pod (no RIO_DISPATCH_MODE=pull) → None: the unchanged
+    // force-drain hop handles it.
+    assert_eq!(
+        disruption::pull_mode_preemption(&mk_pod(false)),
+        None,
+        "stream pods keep the DrainExecutor force-drain path"
+    );
 }

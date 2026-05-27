@@ -137,8 +137,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_disruption_drains_total",
-        "DisruptionTarget watcher DrainExecutor calls. result=sent|timeout|rpc_error. \
-         Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
+        "DisruptionTarget watcher preemption actions. Stream pods: DrainExecutor calls \
+         (result=sent|timeout|rpc_error). Pull-mode pods: synthesized preempted report + \
+         foreground Job delete (result=preempted_pull|preempted_pull_report_failed). \
+         Zero rate with evictions happening = watcher dead, falling back to SIGTERM self-drain."
     );
     describe_gauge!(
         "rio_controller_component_scaler_learned_ratio",

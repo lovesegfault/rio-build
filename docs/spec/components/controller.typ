@@ -739,9 +739,14 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
 
 = Executor Lifecycle
 
-#r("ctrl.drain.sigterm")[
-  *Scale-down:* `terminationGracePeriodSeconds` is set to `7200` (2 hours) to
-  allow in-flight builds to complete.
+#r("ctrl.drain.sigterm+2")[
+  *Scale-down:* for stream-mode pools `terminationGracePeriodSeconds` is set
+  to `7200` (2 hours) to allow in-flight builds to complete. For pull-mode
+  pools there is no finish-if-you-can drain: pod termination (including
+  graceful node drain / scale-down) is an abort --- the pod template carries
+  the 45 s AD5 grace (#rref("ctrl.pod.tgps-default")), the builder
+  cgroup-kills the in-flight build and makes one bounded report attempt, and
+  the derivation requeues charge-free.
 ]
 
 *SIGTERM drain (no preStop hook needed):* the executor's main loop has a
@@ -758,10 +763,11 @@ A preStop hook doing the same is redundant: K8s sends SIGTERM on pod
 termination regardless of preStop, and the executor's signal handler implements
 the drain. The Job pod template does NOT define a preStop.
 
-#r("ctrl.drain.disruption-target")[
+#r("ctrl.drain.disruption-target+2")[
   *Eviction-triggered preemption:* the controller runs a Pod watcher filtered
   to `rio.build/pool`-labeled pods with
-  `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod
+  `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a
+  stream-mode pod
   for eviction (node drain, spot interrupt), the watcher calls
   `AdminService.DrainExecutor{force:true}` --- the scheduler sends
   `CancelSignal` for the in-flight build → executor `cgroup.kill()`s → the
@@ -769,7 +775,19 @@ the drain. The Job pod template does NOT define a preStop.
   evicting pod would self-drain with `force=false` and wait up to
   `terminationGracePeriodSeconds` (2h) for the in-flight build to complete
   naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above)
-  is the fallback if the watcher misses the window.
+  is the fallback if the watcher misses the window. For a pull-mode pod
+  (its container carries `RIO_DISPATCH_MODE=pull`, the rendering of
+  `dispatchMode: Pull`) the watcher MUST NOT call `DrainExecutor` (a
+  structural no-op for a pod with no executor entry or stream); the AD5/C6
+  successor is report-then-delete: synthesize the terminal
+  `ReportAttemptOutcome(preempted)` for the pod's attempt, then
+  foreground-delete the owning Job, so the pod's SIGTERM-abort fires within
+  the 45 s grace and the requeue happens at the report fold, never the
+  establishment sweep. The same closed-attempt evidence drives the cancel
+  successor: the reconcile foreground-deletes an active pull-mode Job only on
+  the closed→active edge of the open-attempt view (an attempt previously
+  observed open for that Job no longer listed by a later successful read),
+  never on bare absence, and the view read stays fail-closed.
 ]
 
 == Pull-mode attempt lifecycle (additive)

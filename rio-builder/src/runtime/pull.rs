@@ -24,14 +24,17 @@
 //! Every other termination exits nonzero so the Job goes Failed and
 //! classification arrives via the controller's pod-terminal path.
 //!
-//! SIGTERM at this slice: the in-flight build keeps the stream-mode
-//! semantics (no abort-on-SIGTERM yet); the pull/report retry loops
-//! stop waiting and take the bounded best-effort path. The AD5 abort
-//! semantics (cgroup-kill + one bounded `Cancelled` report inside the
-//! pull-mode `terminationGracePeriodSeconds`) land with the 1b slice —
-//! no pool template may flip to pull mode on a tree that predates
-//! that, which is a deployment-time staging note (every deployable
-//! image postdates the full workstream).
+//! SIGTERM in pull mode is an **abort**, not a drain (AD5): an
+//! in-flight build is cgroup-killed through the same cancel-honor path
+//! `CancelSignal` uses (`try_cancel_build`: slot cancel flag +
+//! cgroup.kill), the resulting `Cancelled` completion gets exactly one
+//! bounded best-effort `ReportOutcome` attempt, logs are finalized by
+//! teardown, and the process exits — all inside the pull-mode
+//! `terminationGracePeriodSeconds` (45 s). There is no
+//! finish-if-you-can mode for pull pods; any pod termination
+//! (including graceful node drain) aborts charge-free and the drv
+//! requeues. The pull/report retry loops keep their bounded
+//! best-effort SIGTERM arms.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -44,7 +47,7 @@ use rio_proto::types::{
     ReportOutcomeRequest, WorkAssignment, executor_message, pull_assignment_response,
 };
 
-use super::{BuilderRuntime, run_teardown, spawn_build_task};
+use super::{BuilderRuntime, run_teardown, spawn_build_task, try_cancel_build};
 
 /// Default re-pull delay when `NotYetReady.retry_after_seconds` is 0
 /// (defensive — the scheduler always suggests one; decision P4 = 5 s).
@@ -273,6 +276,36 @@ async fn wait_for_completion(
     None
 }
 
+// r[impl builder.cancel.cgroup-kill+2]
+// r[impl builder.shutdown.sigint+3]
+/// AD5 abort phase: wait for the single build's completion, aborting
+/// the build if SIGTERM arrives first. The abort is the same
+/// cancel-honor path `CancelSignal` uses (`try_cancel_build`: slot
+/// cancel flag + cgroup.kill); the killed build task then emits its
+/// `Cancelled` completion through the permanent sink exactly as a
+/// scheduler-cancelled build does, and the caller's report phase makes
+/// the one bounded best-effort attempt (the shutdown token is already
+/// cancelled by then). There is no finish-if-you-can mode in pull
+/// mode.
+async fn build_phase_with_abort(
+    slot: &std::sync::Arc<super::BuildSlot>,
+    drv_path: &str,
+    sink_rx: &mut mpsc::Receiver<ExecutorMessage>,
+    shutdown: &rio_common::signal::Token,
+) -> Option<CompletionReport> {
+    tokio::select! {
+        completion = wait_for_completion(sink_rx) => completion,
+        _ = shutdown.cancelled() => {
+            info!(
+                drv_path = %drv_path,
+                "SIGTERM during the build: aborting (cgroup-kill) and reporting Cancelled"
+            );
+            try_cancel_build(slot, drv_path);
+            wait_for_completion(sink_rx).await
+        }
+    }
+}
+
 /// The pull-mode lifecycle: pull → build (existing machinery) → report
 /// → exit. Replaces the `'reconnect` stream loop when
 /// `dispatch_mode = pull`.
@@ -327,6 +360,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     );
 
     let exec_id = assignment.exec_id.clone();
+    let drv_path = assignment.drv_path.clone();
     let Some(guard) = rt.slot.try_claim(&assignment.drv_path) else {
         // Unreachable in practice (one pull per process, fresh slot);
         // fail loudly rather than build twice.
@@ -338,7 +372,8 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         .pull_sink_rx
         .take()
         .expect("pull mode always carries the sink receiver");
-    let Some(completion) = wait_for_completion(&mut sink_rx).await else {
+    let completion = build_phase_with_abort(&rt.slot, &drv_path, &mut sink_rx, &rt.shutdown).await;
+    let Some(completion) = completion else {
         // Cannot happen while build_ctx holds a sender; treat as a
         // builder bug and let the pod-terminal path classify it.
         anyhow::bail!("completion channel closed before the build reported");
@@ -376,15 +411,16 @@ mod tests {
     /// Scripted transport: pops one scripted answer per call; repeats
     /// the last entry forever once the script is exhausted. Counts
     /// calls so the tests can assert retry/once-only behavior.
-    struct ScriptedTransport {
+    /// `pub(super)` so the AD5 abort battery (`abort_tests`) reuses it.
+    pub(super) struct ScriptedTransport {
         pulls: VecDeque<Result<PullAssignmentResponse, tonic::Status>>,
         reports: VecDeque<Result<(), tonic::Status>>,
-        pull_calls: u32,
-        report_calls: u32,
+        pub(super) pull_calls: u32,
+        pub(super) report_calls: u32,
     }
 
     impl ScriptedTransport {
-        fn new(
+        pub(super) fn new(
             pulls: Vec<Result<PullAssignmentResponse, tonic::Status>>,
             reports: Vec<Result<(), tonic::Status>>,
         ) -> Self {
@@ -621,5 +657,172 @@ mod tests {
             "the budget window must be spent retrying, saw {} calls",
             t.report_calls
         );
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    //! AD5 red-first battery (a): SIGTERM mid-build aborts via the
+    //! cancel-honor path, the cancelled completion is collected, and
+    //! the report phase makes exactly one bounded attempt under an
+    //! already-cancelled shutdown token.
+
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn completion_with_status(
+        drv_path: &str,
+        status: rio_proto::types::BuildResultStatus,
+    ) -> ExecutorMessage {
+        ExecutorMessage {
+            msg: Some(executor_message::Msg::Completion(CompletionReport {
+                drv_path: drv_path.into(),
+                result: Some(rio_proto::types::BuildResult {
+                    status: status.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
+    // r[verify builder.cancel.cgroup-kill+2]
+    // r[verify builder.shutdown.sigint+3]
+    /// SIGTERM with a build in flight: the abort fires through the
+    /// cancel-honor path (the slot's cancel flag is set — the same flag
+    /// the cgroup-kill path keys on), the build task's `Cancelled`
+    /// completion is collected, and nothing waited on the full report
+    /// budget or the stream drain machinery.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_mid_build_aborts_and_collects_cancelled_report() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv";
+        let slot = Arc::new(super::super::BuildSlot::default());
+        let guard = slot.try_claim(drv).expect("fresh slot claims");
+        let cancel_flag = guard.cancelled();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let shutdown = rio_common::signal::Token::new();
+
+        let slot_for_task = Arc::clone(&slot);
+        let shutdown_for_task = shutdown.clone();
+        let drv_owned = drv.to_string();
+        let phase = tokio::spawn(async move {
+            build_phase_with_abort(&slot_for_task, &drv_owned, &mut sink_rx, &shutdown_for_task)
+                .await
+        });
+
+        // Deliver SIGTERM. The phase must abort the in-flight build
+        // (set the cancel flag) rather than wait for it to finish.
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cancel_flag.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the abort sets the cancel-honor flag promptly");
+
+        // The killed build task emits its Cancelled completion exactly
+        // as a scheduler-cancelled build does; the phase returns it.
+        sink_tx
+            .send(completion_with_status(
+                drv,
+                rio_proto::types::BuildResultStatus::Cancelled,
+            ))
+            .await
+            .expect("sink open");
+        let completion = tokio::time::timeout(Duration::from_secs(5), phase)
+            .await
+            .expect("phase resolves within the grace, not the build budget")
+            .expect("phase task not panicked")
+            .expect("completion collected");
+        assert_eq!(
+            completion.result.map(|r| r.status),
+            Some(i32::from(rio_proto::types::BuildResultStatus::Cancelled)),
+            "the abort surfaces the cancel-honor completion"
+        );
+        drop(guard);
+    }
+
+    /// Without SIGTERM the phase is a plain wait: the completion passes
+    /// through untouched and the cancel flag is never set (no abort on
+    /// the happy path).
+    #[tokio::test(start_paused = true)]
+    async fn build_phase_without_sigterm_never_aborts() {
+        let drv = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y.drv";
+        let slot = Arc::new(super::super::BuildSlot::default());
+        let guard = slot.try_claim(drv).expect("fresh slot claims");
+        let cancel_flag = guard.cancelled();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let shutdown = rio_common::signal::Token::new();
+
+        sink_tx
+            .send(completion_with_status(
+                drv,
+                rio_proto::types::BuildResultStatus::Built,
+            ))
+            .await
+            .expect("sink open");
+        let completion = build_phase_with_abort(&slot, drv, &mut sink_rx, &shutdown)
+            .await
+            .expect("completion collected");
+        assert_eq!(
+            completion.result.map(|r| r.status),
+            Some(i32::from(rio_proto::types::BuildResultStatus::Built))
+        );
+        assert!(
+            !cancel_flag.load(Ordering::Acquire),
+            "no SIGTERM ⇒ no abort"
+        );
+        drop(guard);
+    }
+
+    // r[verify builder.cancel.cgroup-kill+2]
+    /// The post-abort report is exactly one bounded best-effort
+    /// attempt: with the shutdown token already cancelled, an unacked
+    /// report is tried once (within the 10 s SIGTERM timeout) and the
+    /// loop exits instead of burning the 600 s retry budget — the
+    /// process leaves within the pull-mode grace.
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_report_is_a_single_bounded_attempt() {
+        use super::tests::ScriptedTransport;
+        let mut t = ScriptedTransport::new(
+            vec![],
+            vec![Err(tonic::Status::unavailable("scheduler unreachable"))],
+        );
+        let shutdown = rio_common::signal::Token::new();
+        shutdown.cancel();
+        let started = tokio::time::Instant::now();
+        let acked = report_until_acked(
+            &mut t,
+            "exec-abort",
+            CompletionReport::default(),
+            REPORT_RETRY_BUDGET,
+            &shutdown,
+        )
+        .await;
+        assert!(!acked, "an unacked best-effort attempt reports failure");
+        assert_eq!(
+            t.report_calls, 1,
+            "exactly one report attempt after SIGTERM"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the bounded attempt returns well inside the pull-mode grace, \
+             never the full retry budget"
+        );
+
+        // And when the single attempt succeeds, the report is acked.
+        let mut ok = ScriptedTransport::new(vec![], vec![Ok(())]);
+        let acked = report_until_acked(
+            &mut ok,
+            "exec-abort-2",
+            CompletionReport::default(),
+            REPORT_RETRY_BUDGET,
+            &shutdown,
+        )
+        .await;
+        assert!(acked);
+        assert_eq!(ok.report_calls, 1);
     }
 }

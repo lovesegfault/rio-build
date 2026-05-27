@@ -82,7 +82,7 @@ pub(super) async fn wait_build_flushed(
 /// instrumentation the profraw atexit write delays exit by ~80s (GHA
 /// 24018216226) — `cov_factor` in `lifecycle.nix` band-aided that;
 /// this is the structural fix.
-// r[impl builder.shutdown.idle-no-reregister+2]
+// r[impl builder.shutdown.idle-no-reregister+3]
 pub(super) fn reconnect_drain_gate(
     shutdown: &rio_common::signal::Token,
     draining: &AtomicBool,

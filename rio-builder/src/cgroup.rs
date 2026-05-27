@@ -154,7 +154,7 @@ impl BuildCgroup {
         &self.path
     }
 
-    // r[impl builder.cancel.cgroup-kill]
+    // r[impl builder.cancel.cgroup-kill+2]
     /// SIGKILL every process in this cgroup tree (including
     /// descendants in sub-cgroups). The kernel's `cgroup.kill`
     /// pseudo-file: write "1" → kernel sends SIGKILL to every PID

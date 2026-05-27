@@ -954,7 +954,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             tokio::select! {
                 biased;
 
-                // r[impl builder.shutdown.sigint+2]
+                // r[impl builder.shutdown.sigint+3]
                 // First SIGTERM: continue to the top of 'reconnect for
                 // the drain transition (set flag, spawn watcher).
                 // `build_stream` is local to this loop body and DROPS
@@ -2029,7 +2029,7 @@ mod tests {
     ///
     /// `#[tokio::test]` for the watcher `tokio::spawn` inside the
     /// gate; the gate function itself is sync.
-    // r[verify builder.shutdown.idle-no-reregister+2]
+    // r[verify builder.shutdown.idle-no-reregister+3]
     #[tokio::test]
     async fn drain_gate_idle_slot_breaks_without_reregister() {
         use std::ops::ControlFlow;
@@ -2110,7 +2110,7 @@ mod tests {
     /// Pre-fix this returned `Break` with `pending=true` and
     /// `run_teardown` dropped the report → scheduler re-dispatch +
     /// missing `build_samples` row.
-    // r[verify builder.shutdown.idle-no-reregister+2]
+    // r[verify builder.shutdown.idle-no-reregister+3]
     #[tokio::test]
     async fn reconnect_drain_gate_pending_completion_continues() {
         use std::ops::ControlFlow;
@@ -2742,7 +2742,7 @@ mod tests {
     /// is the lesser evil — a build the scheduler already cancelled
     /// has no client waiting on its real outcome.
     ///
-    // r[verify builder.cancel.pre-cgroup-deferred]
+    // r[verify builder.cancel.pre-cgroup-deferred+2]
     #[test]
     fn cancel_build_cgroup_missing_keeps_flag() {
         // Path that definitely doesn't exist. tmpdir/nonexistent so

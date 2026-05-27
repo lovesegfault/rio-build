@@ -1268,3 +1268,148 @@ async fn gated_intent_reports_no_eligible_source_once() {
         "exactly one NoEligibleSource report per gated intent"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// AD5 cancel arm (pull-mode pools only)
+// ───────────────────────────────────────────────────────────────────
+
+// r[verify ctrl.drain.disruption-target+2]
+/// The cancel arm's evidence rule, exhaustively: only the
+/// closed→active edge selects a Job; an open attempt records evidence;
+/// bare absence (a pod that has not pulled yet, or one waiting on
+/// NotYetReady — neither has ever had an attempt) never selects, with
+/// no age gate in either direction; evidence for gone Jobs is pruned.
+#[test]
+fn cancel_arm_selects_only_closed_attempt_edges() {
+    use crate::reconcilers::pool::job::select_closed_attempt_jobs;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let mut seen_open: HashMap<String, Instant> = HashMap::new();
+    let building = running_job_for_intent("rio-builder-p-bld1", "drv-building");
+    // An OLD Job whose pod has never completed a pull (Pending /
+    // pre-pull / NotYetReady waiter): no attempt has ever existed.
+    let mut never_pulled = running_job_for_intent("rio-builder-p-wait1", "drv-waiting");
+    never_pulled.metadata.creation_timestamp =
+        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::now()
+                - k8s_openapi::jiff::SignedDuration::from_secs(3600),
+        ));
+    let active = [&building, &never_pulled];
+
+    // Tick 1: the building Job's attempt is open → evidence recorded,
+    // nothing selected; the never-pulled Job has no attempt → nothing
+    // recorded, nothing selected (bare absence, even at 1 h old).
+    let open = vec![pull_attempt("drv-building", "exec-b", "node-1")];
+    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio");
+    assert!(
+        selected.is_empty(),
+        "open attempts and bare absence never cancel"
+    );
+    assert!(seen_open.contains_key("rio/rio-builder-p-bld1"));
+    assert!(!seen_open.contains_key("rio/rio-builder-p-wait1"));
+
+    // Tick 2: same view → still nothing selected (no churn while open).
+    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio");
+    assert!(selected.is_empty());
+
+    // Tick 3: the attempt closed (a successful read no longer lists
+    // it) while both Jobs are still active → exactly the previously
+    // covered Job is selected, immediately (no age gate); the
+    // never-pulled one is still untouched.
+    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio");
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0].metadata.name.as_deref(),
+        Some("rio-builder-p-bld1"),
+        "only the closed→active edge cancels"
+    );
+    assert!(
+        !seen_open.contains_key("rio/rio-builder-p-bld1"),
+        "the consumed edge does not re-fire next tick"
+    );
+
+    // Tick 4: nothing further — the edge was consumed.
+    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio");
+    assert!(selected.is_empty());
+
+    // Pruning: evidence for a Job that is no longer active is dropped.
+    seen_open.insert("rio/rio-builder-p-gone1".into(), Instant::now());
+    let _ = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio");
+    assert!(!seen_open.contains_key("rio/rio-builder-p-gone1"));
+}
+
+// r[verify ctrl.drain.disruption-target+2]
+/// End-to-end over the wire mocks: a recorded closed→active edge gets
+/// its Job foreground-deleted (and only that Job); the synthesize arm
+/// is structurally inert because nothing is open any more.
+#[tokio::test]
+async fn cancel_arm_deletes_job_on_closed_edge() {
+    use crate::reconcilers::pool::job::cancel_closed_attempt_jobs;
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let job = running_job_for_intent("rio-builder-p-edge1", "drv-edge");
+    // Previously observed open (the recorded evidence half of the edge).
+    ctx.pull_attempt_seen_open
+        .lock()
+        .insert("rio/rio-builder-p-edge1".into(), std::time::Instant::now());
+
+    // The MockAdmin's ListOpenAttempts returns an empty view — the
+    // "subsequent successful read no longer lists it" half.
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-edge1")]);
+    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "rio", "test-pool").await;
+    guard.verified().await;
+    assert_eq!(cancelled, 1, "exactly the edge Job is deleted");
+}
+
+// r[verify ctrl.drain.disruption-target+2]
+/// Fail-closed: a failed `ListOpenAttempts` read produces no cancel
+/// decisions and leaves the recorded evidence untouched, exactly like
+/// the orphan reap's posture.
+#[tokio::test]
+async fn cancel_arm_fail_closed_on_view_error() {
+    use crate::reconcilers::pool::job::cancel_closed_attempt_jobs;
+
+    let (client, _verifier) = ApiServerVerifier::new();
+    // Dead admin channel: every RPC fails.
+    let ctx = super::test_ctx(client.clone());
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let job = running_job_for_intent("rio-builder-p-fc1", "drv-fc");
+    ctx.pull_attempt_seen_open
+        .lock()
+        .insert("rio/rio-builder-p-fc1".into(), std::time::Instant::now());
+
+    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "rio", "test-pool").await;
+    assert_eq!(cancelled, 0, "no decisions on a failed view read");
+    assert!(
+        ctx.pull_attempt_seen_open
+            .lock()
+            .contains_key("rio/rio-builder-p-fc1"),
+        "the evidence is retained for the next successful read"
+    );
+}
+
+/// Structural guard: the cancel arm is invoked ONLY for pull-mode
+/// pools — the reconcile call site is gated on the Pool CR's
+/// dispatchMode, so a stream-pool Job (idle, mid-build, or
+/// just-completed) can never be touched by this arm. Reintroducing an
+/// ungated call trips this.
+#[test]
+fn cancel_arm_call_site_is_pull_gated() {
+    let src = include_str!("../jobs.rs");
+    let call = src
+        .find("cancel_closed_attempt_jobs(")
+        .expect("the cancel arm is wired into the reconcile");
+    let gate = src[..call]
+        .rfind("if pod::is_pull_mode(pool)")
+        .expect("a dispatchMode gate exists before the call");
+    assert!(
+        call - gate < 600,
+        "the cancel-arm call must sit directly inside the is_pull_mode(pool) gate \
+         (stream pools must never reach it)"
+    );
+}

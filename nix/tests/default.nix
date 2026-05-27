@@ -576,7 +576,7 @@ in
           #   → worker-ACK → rio_scheduler_warm_prefetch_paths histogram
           #   has had many opportunities to fire. Passive check (~0s).
           "warm-gate"
-          # r[verify builder.shutdown.sigint+2]
+          # r[verify builder.shutdown.sigint+3]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
           # gentler sibling. Uses worker2 only — no cache-chain coupling.
@@ -715,7 +715,7 @@ in
       # r[verify ctrl.probe.named-service]
       # r[verify ctrl.health.ready-gates-connect]
       "health-shared"
-      # r[verify builder.cancel.cgroup-kill]
+      # r[verify builder.cancel.cgroup-kill+2]
       "cancel-cgroup-kill"
       # r[verify builder.cgroup.kill-on-teardown]
       # r[verify builder.timeout.no-reassign]

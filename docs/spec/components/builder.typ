@@ -1226,18 +1226,25 @@ is stable (post Phase 3).
 
 = Build Cancellation
 
-#r("builder.cancel.cgroup-kill")[
-  When the scheduler sends a `CancelSignal` on the BuildExecution stream, the
-  builder's `try_cancel_build` writes `1` to the target build's `cgroup.kill`
+#r("builder.cancel.cgroup-kill+2")[
+  When the build must be aborted, the builder's `try_cancel_build` writes `1`
+  to the target build's `cgroup.kill`
   (SIGKILLs the entire cgroup tree). The build's executor task detects the
   daemon exit, releases the semaphore permit, tears down the overlay, and
-  sends `CompletionReport{status: Cancelled}`. This is used for pod-preemption
-  handling: the scheduler cancels builds on an evicting node before the
-  SIGTERM grace period wastes `terminationGracePeriodSeconds`.
+  sends `CompletionReport{status: Cancelled}`. The abort trigger is
+  mode-specific: in stream mode it is the scheduler's `CancelSignal` on the
+  BuildExecution stream (pod-preemption handling --- the scheduler cancels
+  builds on an evicting node before the SIGTERM grace period wastes
+  `terminationGracePeriodSeconds`); in pull mode it is SIGTERM itself (AD5:
+  any pod termination aborts the in-flight build through this same path, the
+  resulting `Cancelled` completion gets one bounded best-effort
+  `ReportOutcome` attempt, and the process exits inside the pull-mode
+  45 s grace --- there is no finish-if-you-can mode for pull pods).
 ]
 
-#r("builder.cancel.pre-cgroup-deferred")[
-  A cancel that arrives before the per-build cgroup exists (`cgroup.kill` →
+#r("builder.cancel.pre-cgroup-deferred+2")[
+  A cancel --- a stream-mode `CancelSignal` or a pull-mode SIGTERM-abort ---
+  that arrives before the per-build cgroup exists (`cgroup.kill` →
   ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag
   before the prefetch/register phase and abort with `Cancelled` status without
   spawning nix-daemon. The pre-cgroup window is overlay setup → resolve →
@@ -1413,16 +1420,23 @@ Jobs.
   idling to `activeDeadlineSeconds`.
 ]
 
-#r("builder.shutdown.sigint+2")[
-  The builder handles both SIGTERM and SIGINT by breaking the BuildExecution
-  select loop, running teardown (heartbeat abort → FUSE abort), and returning
+#r("builder.shutdown.sigint+3")[
+  The builder handles both SIGTERM and SIGINT by leaving its dispatch loop,
+  running teardown (heartbeat abort → FUSE abort), and returning
   from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod
   deletion (kubelet → SIGTERM) share the same exit path. Returning from
   `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit
-  handlers fire (LLVM profraw flush).
+  handlers fire (LLVM profraw flush). In stream mode the signal breaks the
+  BuildExecution select loop after the drain semantics of
+  #rref("builder.shutdown.idle-no-reregister") run their course; in pull mode
+  the semantics invert --- the signal is an abort, not a drain: an in-flight
+  build is cgroup-killed (#rref("builder.cancel.cgroup-kill")), the
+  `Cancelled` completion gets exactly one bounded best-effort `ReportOutcome`
+  attempt, the pull/report retry loops stop waiting, and the process exits
+  within the pull-mode grace.
 ]
 
-#r("builder.shutdown.idle-no-reregister+2")[
+#r("builder.shutdown.idle-no-reregister+3")[
   On SIGTERM with an idle build slot AND no `CompletionReport` pending in the
   permanent sink, the builder MUST break the reconnect loop without sending a
   fresh `ExecutorRegister`. The reconnect-under-drain machinery exists so an
@@ -1437,7 +1451,11 @@ Jobs.
   --- under coverage instrumentation the profraw atexit write delays that by
   \~80s (I-195, GHA 24018216226). The same fast-path applies on any subsequent
   `'reconnect` iteration where `draining=true`, the slot has since gone idle,
-  and `completion_pending` is clear.
+  and `completion_pending` is clear. This rule's subject is the stream-mode
+  reconnect loop only: a pull-mode builder has no registration, heartbeat, or
+  reconnect machinery at all, so on SIGTERM there is nothing to suppress ---
+  it simply stops pulling (or aborts per
+  #rref("builder.shutdown.sigint")) and exits.
 ]
 
 #r("builder.ephemeral.exit-aborts-heartbeat+2")[
