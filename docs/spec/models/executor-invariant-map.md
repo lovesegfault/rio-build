@@ -1662,7 +1662,10 @@ seconds-class), no new exhaustive cfgs.
 Owner for every entry: B. Meurer (campaign owner; also the
 controller-campaign owner, so the cross-campaign asks below are
 recorded as self-issued and tracked here rather than negotiated).
-Status values: open / data-pending / decided-at-0e.
+Status values: open / data-pending / decided-at-0e. The entries below
+are the 0a record; the 0e dispositions (decision packages for the
+owner-blocking entries, carry records for the rest) are in the
+Stage-0e section's "Open adjudications at 0e" subsection below.
 
 ### OA1 — establishment-window instrument (decision recorded at 0a)
 
@@ -1838,3 +1841,177 @@ same way as the OA1 option-(b) instrument and committed alongside
 this map before 0d closes. Owner: campaign owner (joint sign-off
 with the controller campaign at 0e). Status: data-pending,
 0e-blocking.
+
+## Stage 0e — the frozen replacement contract and the go/no-go
+
+Written against the 0a–0d record above (the design's 0b/0c/0d gates
+are green; the one open 0c item — the budget stop-and-report on the
+fault-stream-conn / fault-process exhaustive cfgs — is carried into
+the no-go evaluation as plan item 10). Paper only: no production
+change, no model change, no proto change. The owner-decision items
+(OA1, OA2, OA6, the regime-coverage acceptance) are PREPARED here as
+decision packages and marked AWAITING OWNER; nothing in this section
+records a decision on the owner's behalf, and the go/no-go therefore
+closes conditionally (see the evaluation subsection). Contract
+references: executor-formal-design.md (DRAFT v2) §3.4, §4, §5, §6;
+plan tasks T-0e.1–T-0e.8.
+
+### The Model J/N obligation table (T-0e.1)
+
+One row per scheduler-side obligation Model J (`spawnCoherence.qnt`)
+and Model N (`nodeclaimLifecycle.qnt`) import from this subsystem,
+dispositioned **meetable-by-the-replacement** (successor signal named)
+or **unmeetable**. The "what the model actually does with it" column
+is written against the models' own headers and invariants as wired
+today, not against the design's wishes; the mechanical checklist
+re-derivations and check re-runs stay at 1c'/1d (design §6) — this
+table is what the 0e no-go condition 6 evaluates.
+
+| # | Obligation (imported by) | What the importing model actually does with it today | As-built provider | Replacement successor signal | Disposition |
+|---|---|---|---|---|---|
+| 1 | `ListExecutors` busy view consulted by the orphan-Running reap, including freshness and fail-closed semantics (Model J) | The executor list + leader age are environment inputs to the 3-arm `orphan_reap_gate` (RPC error / leader younger than grace / empty list ⇒ no reap); `reapSafety` checks no orphan-reap of a busy executor or outside a passed gate; the busy-but-never-registered residual is a documented bound of that invariant (controller map F1) | `executors` map → `ListExecutors` (busy = `running_build.is_some()`), `sched.admin.list-executors`, `sched.admin.list-executors-leader-age` | Busy = an open pull-mode attempt exists, served by the §4.5 bridge chosen below (the ledger-backed open-attempt view consulted by `reap_orphan_running`, stream view OR'd in during coexistence); RPC-error and unanswerable arms stay fail-closed; only the leader-age arm is a retirement candidate, and only once the busy source is durable (1c'/1d) | **Meetable.** Freshness improves (durable, survives failover); the gate's fail-closed posture is retained per re-derivation item (i) below |
+| 2 | Registration-edge ICE clear (Models J + N) | Model J arms `dispatched_cells` via the ack chain (`ackSoundness`/`ackCoversPending`) and treats the scheduler-side clear as environment; Model N's `iceMarkSoundness` covers the controller mark half and defers the clear ladder to `sched.sla.hw-class.ice-mask` | The ICE cell clears at the heartbeat registration edge (mechanism #22 half) | The ICE cell clears on first pull (or the controller's pod-Ready observation) — §4.2 row 22; same first-contact semantics, no heartbeat needed | **Meetable.** Equivalent edge (first contact of the pod), strictly later than Job creation, exactly what the mark/clear pairing needs |
+| 3 | `dispatched_cells` ack-arming semantics (Model J) | `ackSoundness`: an intent is acked spawned only with a Job behind it; `ackCoversPending`: a surviving Pending Job is re-acked — the ack is what arms the scheduler-side cell | Armed on `AckSpawnedIntents`, cleared at the registration edge, disconnect, and the DAG-state sweep (mechanism #22) | `AckSpawnedIntents` and the arming are untouched (Model J's subject survives); only the clear trigger renames per row 2; the DAG-state sweep (cancel/substitute before the pod ever pulls) is unchanged | **Meetable.** No semantic change on the arming side at all |
+| 4 | Termination-report idempotency (Model J) | Model J keeps termination reports OUT of its model on the strength of the scheduler-side dedup ("the scheduler-side dedup … makes the controller's re-report idempotent" — its header checklist); the obligation is that re-reports stay no-ops so that exclusion stays sound | In-memory first-report-wins (`recently_disconnected` consume) + the durable fill guard (`WHERE termination_reason IS NULL`, `drv_attempts_exec_id_uniq`) | The idempotent `ReportAttemptOutcome` column fill keyed by attempt identity; no-attempt rows are no-ops, never inserts (§4.1); the in-memory map goes, the durable guard stays | **Meetable.** Strictly stronger than today (no 60 s TTL race, survives failover); the no-attempt no-op rule is re-derivation input (iii) below |
+| 5 | `dead_nodes` hung-node signal (Model N) | Consumed input only and OUT of Model N's checked invariants (its header: the dead_nodes arm's protection is the controller campaign's gate tests, not the model); flows `hung_nodes` → `GetSpawnIntents` response → `reap_unhealthy`'s Dead arm | Scheduler hung-node detector (#20) aggregating heartbeat staleness per node | Per OA2: a k8s-side aggregation (deadline/pull-latency clustering, node conditions, L10 health reap) or the interim ledger sweep — owner and shape AWAITING OWNER (decision package below); or the signed accepted 1b→1d gap with its bound and compensating controls | **Meetable conditional on OA2.** Two viable successor shapes exist and the consuming arm is out-of-model (an accepted gap invalidates no Model N invariant); the row cannot be marked plain-meetable until OA2 names one, and is unmeetable only if OA2 is left unresolved |
+| 6 | Placeable-set input distribution: ready=false (forecast) intents reach the Job spawner today (Model J peer-behavior fact, OA6) | Model J's queue abstraction is a Ready-set; the as-built gate publishes with no ready filter (contradiction C1); the model's input distribution is therefore wider in production than in the model | `ctrl.nodeclaim.placeable-gate+5` publish, `pool/jobs.rs:353-397` | OA6(a): the pull gains a `NotYetReady{retry_after}` outcome priced into the re-targeted Model S and §4.2 rows 13/B7 — Model J unchanged; OA6(b): the gate/spawn pass re-gains the ready filter — Model J's abstraction becomes exact, `ctrl.nodeclaim.placeable-gate+5` amended (tracey bump) with the controller campaign's sign-off | **Meetable under either OA6 option** (decision package below, AWAITING OWNER); the re-derivation at 1c'/1d covers whichever side is taken |
+| 7 | Cancellation/preemption read: "attempt closed, Job still active" consulted every tick, no age gate (new Model J obligation the replacement introduces) | Not in Model J today — the as-built cancel path is scheduler-side (CancelSignal/force-drain); the replacement adds a controller reconcile action whose read feeds the AD5 deletion arm | n/a (new) | The same ledger-backed open-attempt view as row 1's successor, read every tick; its read latency is a named AD5 budget component; modeled as a new action in the Model J re-derivation at 1c'/1d | **Meetable.** Same view as row 1, no extra signal needed; the latency number is signed with AD5 (awaits the OA1 baseline) |
+
+Re-derivation work items recorded for 1c'/1d (design §3.4 item 3 — the
+mechanical re-runs are NOT 0e deliverables; listed here so the
+obligation table and the Phase-1 plan read the same scope):
+
+- (i) `reapSafety` is re-checked with the orphan-reap gate's
+  fail-closed posture on open-attempt-RPC error retained and only the
+  leader-age arm removed;
+- (ii) `ORPHAN_REAP_GRACE` (300 s, creation-age) is re-validated
+  against worst-case container-start → first-successful-pull under
+  leader failover + recovery gating + the §4.1 pull-retry backoff,
+  with the accepted miss consequence recorded as pod respawn/churn —
+  never a mid-build reap (those have open attempts) and never a
+  charge (the no-attempt rule);
+- (iii) the no-attempt no-op rule of §4.1 is an input the
+  reapSafety/degradedPolarity re-derivation may rely on.
+
+Summary for the no-go evaluation: 7 obligations; 5 meetable with
+named successors, 2 meetable conditional on an AWAITING-OWNER
+adjudication (row 5 on OA2, row 6 on OA6), 0 unmeetable.
+
+### The lease-seam and dual-belief successor note (T-0e.2)
+
+The §3.4 item-1 checklist re-stated against the replacement
+direction; the full re-derivation is Phase 1 (1c', alongside the
+Model J/N checklists). This note is the evidence for no-go
+condition 7.
+
+- **What the lease model actually exports** (verified in
+  `leaderElection.qnt`): `atMostOneCASWinner`, `boundedDualLeadership`,
+  `staleLeaderHasStaleGeneration`, and the regime-scoped `neverDual`
+  (not imported by the executor models' fault-leader regime — the
+  deposed-believer window stays reachable by design, pinned by the
+  wired `noDeposedBeliever` witness).
+- **The consumer that moves.** The as-built consumer of
+  `staleLeaderHasStaleGeneration` is the worker-side B5 latch
+  (heartbeat `fetch_max` + `is_stale_assignment`) plus the
+  `WorkAssignment.generation` field. The replacement deletes both with
+  the stream (1c'); the successor consumer is the §4.1
+  transaction-side fence: the pull and establishment transactions
+  carry the serving replica's generation, persist it on the row they
+  create, and commit only if it is not below the durable claims floor
+  (GREATEST over `leader_generation_claims` and `assignments` — the
+  existing max_known_generation arms). `ReportOutcome` needs no
+  independent check (it fills only the row whose `exec_id` a fenced
+  pull minted; row-already-terminal otherwise).
+- **Checked successor for the clock-pause/suspend dual-belief
+  residual.** Today the residual is bounded by
+  `boundedDualLeadership` and NOT closed by the executor-side fence
+  (the fence/steal asymmetry); Model S explicitly does not claim
+  deposed-but-unaware writes inert (its header prices this). The
+  replacement closes it at the authority-exercising transactions, and
+  the checked successor exists in the plan of record: the re-targeted
+  Model S at 1c' retains a fault-leader regime and checks
+  `StaleAuthorityWritesAreInert` (a pull/establishment transaction
+  whose serving generation is below the claims floor mutates nothing)
+  plus `AtMostOneOpenAttemptPerJob`, and the `admit_pull` Kani
+  contract carries the same below-floor rejection (design §4.4).
+  Verdict: a checked successor is named and scheduled — condition 7's
+  first clause is not triggered.
+- **No lease guarantee becomes unconsumable.**
+  `atMostOneCASWinner`: consumed unchanged (acquisition untouched).
+  `boundedDualLeadership`: still consumed — it is what bounds the
+  window the transaction fence must cover, exactly as it bounds the
+  B5 window today. `staleLeaderHasStaleGeneration`: still consumed —
+  generation-ordering of concurrent believers is what makes the
+  claims-floor comparison meaningful. `neverDual`: not consumed
+  today, not consumed by the replacement (no change).
+  `sched.lease.claim-before-advertise`: its successor is
+  claim-before-serve (pulls served only after the acquired
+  generation's claim row is durable — already recovery's ordering);
+  the heartbeat-distribution clause retires with the stream (AD4).
+  Verdict: condition 7's second clause is not triggered.
+- **Carried dependency from the 0d re-disposition.** The
+  `0ea9bd701` (advertise-only-post-recovery) row was re-dispositioned
+  to the rio-lease campaign's claim-before-advertise surface; the
+  replacement keeps that obligation with the lease campaign (the
+  serve gate above is its analogue), and the 1c' lease-checklist
+  re-derivation must restate it as claim-before-serve rather than
+  drop it.
+- **Acquire-epoch vs generation.** The replacement's fence compares
+  against the durable claims floor, never against "the generation
+  moved", so the imported distinction (a holder change need not move
+  the generation once the PG floor saturates) is preserved by
+  construction in the successor; the 1c' re-derivation keeps the log
+  campaign's record as the citation, exactly as Model D's header does
+  today.
+
+### The retryPolicy.qnt environment re-derivation plan (T-0e.3)
+
+The §3.4 item-2 named deliverable, written at 0e and executed at 1b
+(design §6 row 1b: the pull-mode environment regime lands and is
+wired into nix/quint.nix at 1b, not 1d). No retryPolicy.qnt edit
+happens in Phase 0.
+
+What changes in the retry model's environment, action by action:
+
+- **`dispatchTo` → pull.** The attempt opens at `PullAssignment`
+  (Ready→Running + `exec_id` mint + row insert in one transaction);
+  the dispatch-time eligibility/exclusion precondition moves to the
+  spawn-intent gate per AD2 (the intent carries excluded nodes; the
+  controller renders anti-affinity). The pull-mode regime encodes
+  "open attempt" as the post-pull state, not the post-push state.
+- **E6/E7 (controller channel) → `ReportAttemptOutcome`.** The two
+  controller report actions and their `recently_disconnected`
+  correlation/dedup preconditions are replaced by the single
+  idempotent column fill keyed by attempt identity; the
+  second-installment semantics (`WHERE termination_reason IS NULL`)
+  are unchanged; the no-attempt no-op rule replaces the no-entry
+  no-op arm.
+- **`establishUnreportedCrash` precondition.** Becomes "open attempt
+  past deadline + report-slack with no terminal row" (the OA1 number)
+  instead of "released attempt with no deliverable classifying
+  report"; the non-promoting-report-does-not-establish clause
+  carries over unchanged.
+- **E9 / fleet-exhaust and the exclusion set re-key per AD2.** The
+  exclusion set carries the attempt's source node
+  (controller-authoritative, migration ≥067 column); the
+  exhausted-universe verdict is evaluated at the spawn-intent gate
+  (excluded-sources ⊇ spawnable-sources → NoEligibleSource →
+  Poison(FleetExhausted)); the small-fleet clause (threshold
+  effectively min(threshold, |sources|)) is part of the re-keyed
+  encoding so the exhaustion verdict stays reachable on 1–2-node
+  fleets.
+- **Identity freshness becomes structural.** A fresh pod per attempt;
+  the crashed-identity-never-re-registers assumption stops being an
+  environment fact the executor map must provide and becomes the
+  shape of the protocol.
+- **What stays imported unchanged:** `attemptsChargedOnce`,
+  `verdictMatchesFold`, `failoverPreservesHistory`, and the atomic
+  appending transaction — the re-derivation changes the environment
+  actions that feed the fold, never the fold's own invariants.
+- **Coexistence.** The pull-mode encoding lands as an additional
+  regime cfg (`retryPolicy` pull-mode environment) wired at 1b while
+  the as-built-channel regimes stay authoritative for the stream path
+  until 1c'; the as-built regimes are retired with the stream path
+  (the `retryPolicyAsBuilt` freeze precedent), and the retirement is
+  recorded in retry-invariant-map.md by the campaign that performs
+  it.
