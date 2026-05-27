@@ -169,7 +169,6 @@
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
     "rio_store_chunk_upgrade_tx_seconds",
-    "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_chunks_collected_total",
     "rio_store_gc_chunks_live",
@@ -1085,11 +1084,6 @@
         "name": "rio_store_chunk_upgrade_tx_seconds",
         "kind": "histogram",
         "help": "upgrade_manifest_to_chunked transaction duration (begin to commit) — the single chunk-referencing write transaction. Monitors the chunk collector's collect-soundness assumption that no such transaction outlives the collect grace window (alerts at grace/2 and grace-60s)."
-      },
-      {
-        "name": "rio_store_gc_chunk_orphan_swept_total",
-        "kind": "counter",
-        "help": "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. Sustained nonzero = builder upload path is crashing repeatedly."
       },
       {
         "name": "rio_store_gc_chunk_resurrected_total",

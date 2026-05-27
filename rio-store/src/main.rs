@@ -285,9 +285,11 @@ async fn main() -> anyhow::Result<()> {
     // sweep's pending_s3_deletes enqueue + VerifyChunks HeadObject).
     // None for inline-only stores — sweep does CASCADE delete only.
     //
-    // Also spawn GC background tasks (orphan scanner + orphan-chunk
-    // sweep + chunk-collect backstop + drain). All periodic
-    // (15min / 1h / daily / 30s).
+    // Also spawn GC background tasks (orphan placeholder scanner +
+    // chunk-collect backstop + drain). All periodic
+    // (15min / daily / 30s). The hourly orphan-chunk sweep is gone:
+    // never-referenced chunks past grace are ordinary collect-cycle
+    // victims now (run_gc phase 3 / the daily backstop).
     // spawn_monitored: if one panics, logged; store keeps serving
     // (degraded GC, not down).
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
@@ -297,11 +299,6 @@ async fn main() -> anyhow::Result<()> {
         .with_service_verifier(service_verifier)
         .with_substitute_admission(substitute_admission);
     rio_store::gc::orphan::spawn_scanner(
-        pool.clone(),
-        chunk_backend_for_gc.clone(),
-        shutdown.clone(),
-    );
-    rio_store::gc::sweep::spawn_orphan_chunk_sweep(
         pool.clone(),
         chunk_backend_for_gc.clone(),
         shutdown.clone(),

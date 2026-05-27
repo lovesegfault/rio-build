@@ -1269,7 +1269,7 @@
     {
       "path": "gc/sweep.rs",
       "depth": 1,
-      "doc": "Sweep phase: delete unreachable paths + decrement chunks + enqueue S3."
+      "doc": "Sweep phase: delete unreachable paths (narinfo/manifests and their"
     },
     {
       "path": "gc/tenant.rs",

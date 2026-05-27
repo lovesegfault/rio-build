@@ -230,9 +230,9 @@ pub(crate) const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chu
 /// re-evaluated. The model's writer-bounded HOLDS verdict is stated
 /// against this predicate-re-checking shape — a hash-only or
 /// deleted-only WHERE re-opens the §4.6(i) mark-stale data-loss
-/// window. This mirrors `sweep_orphan_batch`, whose UPDATE re-checks
-/// its full liveness predicate; this statement is its
-/// predicate-swapped analog. The bind is the candidate scan's result,
+/// window. This is the predicate-swapped descendant of the retired
+/// orphan-chunk sweep's batch UPDATE, which re-checked its full
+/// liveness predicate the same way. The bind is the candidate scan's result,
 /// which is already in ascending hash order.
 ///
 /// Shared with `gc::mark_scan_bench` (gate (c) measurement runs and
@@ -876,8 +876,8 @@ pub(crate) async fn collect_backstop_once(
 }
 
 /// Spawn the daily collect backstop. Errors are logged and the next
-/// tick retries (`MissedTickBehavior::Skip`, like
-/// [`super::sweep::spawn_orphan_chunk_sweep`]).
+/// tick retries (`MissedTickBehavior::Skip`, like the other periodic
+/// GC tasks).
 ///
 /// Unlike `spawn_periodic` (whose first tick fires immediately), the
 /// ticker here is armed one full interval after spawn: the collect

@@ -1338,7 +1338,7 @@ async fn run_collect_phase(
     // ---- Collect (timed): keyset-batched soft-delete loop ----
     // Per batch, one transaction: candidate scan (already hash-ordered
     // by the keyset SELECT), then the sorted `= ANY` soft-delete — the
-    // sweep_orphan_batch shape with the predicate swapped; the
+    // retired orphan-chunk sweep's batch shape with the predicate swapped; the
     // soft-delete re-checks `deleted = FALSE` and the grace term in its
     // own WHERE per the T-1a.8 consequence (see
     // COLLECT_BATCH_UPDATE_SQL). The loop ends on the first short

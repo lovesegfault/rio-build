@@ -286,31 +286,36 @@ upsert's resurrect arm (`deleted = false`), the soft-delete clearing
 (#rref("store.gc.pending-deletes")). It survives unchanged if the counter is
 replaced by manifest-derived collection.
 
-#r("store.gc.bounded-garbage-retention")[
+#r("store.gc.bounded-garbage-retention+2")[
   No dead chunk is retained forever: an existing chunk row referenced by no
   existing manifest, and staying unreferenced, MUST eventually be
   soft-deleted and have its backend object deleted --- or have its
   `pending_s3_deletes` row parked at the attempts cap and surfaced by the
-  stuck-deletes alerting (#rref("store.gc.pending-deletes")) --- within one
-  full pass of the applicable reclamation path (the GC sweep for swept paths,
-  the stale-placeholder reclaim for crashed uploads, the orphan-chunk sweep
-  for never-referenced chunks) plus the grace TTL plus drain lag. Carve-out:
-  a chunk whose references-on-record were carried by a manifest whose
-  `chunk_list` cannot be deserialized MAY outlive this bound while that
-  condition persists; the suspension MUST be observable (logged or alerted),
-  never a silent exemption.
+  stuck-deletes alerting (#rref("store.gc.pending-deletes")) --- within
+  `ceil(eligible_backlog / COLLECT_CYCLE_VICTIM_CAP)` collect cycles
+  (#rref("store.gc.chunk-collect"); one cycle in the steady state where the
+  eligible backlog fits under the per-cycle cap), plus the grace window, plus
+  drain lag, with the worst-case interval between cycles bounded by the daily
+  collect backstop. Carve-out: while any existing manifest's `chunk_list`
+  fails validation, chunk collection is suspended fail-closed and every
+  otherwise-eligible chunk MAY outlive this bound; the suspension MUST be
+  alerted (the parse-failure abort), and the bound resumes within one cycle
+  of the offending manifest being repaired, deleted, or quarantined.
 ]
 
-As-built, the bound is conditional on the counter being correct: a refcount
-left above zero by a crash is repaired when the stale placeholder is
-reclaimed, but a refcount left above zero by a missed decrement (including
-the corrupt-`chunk_list` skip recorded under
-#rref("store.chunk.refcount-decrement")) never returns to zero and the chunk
-is retained indefinitely --- today the carve-out is a permanent,
-warning-level-only exemption. A manifest-derived collector replaces the
-conditionality: liveness is recomputed from the manifests each cycle, so a
-missed decrement cannot occur, and the carve-out narrows to a fail-closed,
-alerted pause of chunk collection while an unparseable `chunk_list` exists.
+The bound was previously one full pass of the applicable legacy reclamation
+path (the path sweep's chunk block, the stale-placeholder reclaim, the hourly
+orphan-chunk sweep) and was conditional on the hand-maintained refcount being
+correct: a counter left above zero by a missed decrement (including the
+corrupt-`chunk_list` skip recorded under
+#rref("store.chunk.refcount-decrement")) never returned to zero and the chunk
+was retained indefinitely --- the carve-out was a permanent,
+warning-level-only exemption. The collector replaces the conditionality:
+liveness is recomputed from the manifests each cycle, so a missed decrement
+cannot occur, historical leak shapes become ordinary collect-cycle victims,
+a backlog larger than the per-cycle cap drains across consecutive cycles
+(visible via the backlog gauge and capped-cycles counter), and the carve-out
+narrows to the fail-closed, alerted, remediation-bounded pause stated above.
 
 #r("store.chunk.liveness-derived")[
   Chunk GC-eligibility MUST be derived from the durable manifests at collect

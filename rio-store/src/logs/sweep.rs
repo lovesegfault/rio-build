@@ -149,7 +149,7 @@ pub async fn sweep_expired_logs(
 }
 
 /// Spawn the hourly sweep task. Mirrors
-/// [`crate::gc::sweep::spawn_orphan_chunk_sweep`]: a panic is logged and
+/// [`crate::gc::orphan::spawn_scanner`]: a panic is logged and
 /// the store keeps serving (degraded GC, not down); shutdown cancels the
 /// next tick.
 pub fn spawn_log_sweep(

@@ -483,7 +483,7 @@ pub(super) async fn enqueue_chunk_deletes(
     // order). The pending_s3_deletes INSERT below binds UNNEST() —
     // unsorted → circular-wait against a concurrent
     // enqueue_chunk_deletes or rollback. One sort here covers all
-    // callers (decrement_and_enqueue, sweep_orphan_batch). The
+    // callers (the collect batches and the legacy decrement paths). The
     // .to_vec() clone is cheap (~KB) relative to the PG roundtrip.
     let mut zeroed: Vec<_> = zeroed.to_vec();
     zeroed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
