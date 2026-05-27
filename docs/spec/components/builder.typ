@@ -492,8 +492,13 @@ parsed derivation and its resolved input closure into a build-system-agnostic
 `rio_exec::ExecutionRequest`, the rio-exec sandbox runs it, and the native
 result pipeline classifies the exit and processes the outputs. No Nix binary
 is present in the worker image and no external process is delegated to.
+Derivations whose builder is a `builtin:` program (today `builtin:fetchurl`)
+are no exception: the worker implements them natively by re-exec'ing its own
+binary in fetch mode inside the same rio-exec sandbox --- network reachable
+only because such derivations are fixed-output --- as specified in the
+fetcher component (#rref("fetcher.fetchurl.sandboxed")).
 
-#r("builder.exec.sandbox+2")[
+#r("builder.exec.sandbox+3")[
   Every build runs inside a rio-exec sandbox constructed from fresh Linux
   namespaces: mount, PID, IPC, UTS, and cgroup for every build, plus a fresh
   (loopback-only) network namespace for every build EXCEPT fixed-output
@@ -501,9 +506,12 @@ is present in the worker image and no external process is delegated to.
   access for their fetch. The input closure is bind-mounted read-only inside a
   writable per-build store view, a private `/proc`, `/dev` and `/etc`
   population, `pivot_root` into the per-build root, a multi-ABI seccomp
-  filter denying setuid/setgid mode bits and xattr writes, and a drop to the
-  unprivileged build user before `execve`. Sandbox construction failure MUST
-  fail the build attempt (never fall back to an unsandboxed build).
+  filter (covering the native, 32-bit sibling, and x32 syscall ABIs) that
+  denies setting setuid/setgid mode bits with `EPERM` and denies the
+  extended-attribute get/set families --- including their kernel ≥ 6.13
+  `*xattrat` forms --- with `ENOTSUP`, `PR_SET_NO_NEW_PRIVS`, and a drop to
+  the unprivileged build user before `execve`. Sandbox construction failure
+  MUST fail the build attempt (never fall back to an unsandboxed build).
 ]
 
 #r("builder.exec.structured-attrs")[

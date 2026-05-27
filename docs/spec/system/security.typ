@@ -436,7 +436,7 @@ tracey rule or phase deferral.
     [Every build runs inside the rio-exec sandbox (mount/PID/IPC/UTS/cgroup
       namespaces, plus a network namespace for everything except fixed-output builds),
       constructed unconditionally by the executor itself with no unsandboxed
-      fallback (#rref("builder.exec.sandbox+2")); the daemon-era
+      fallback (#rref("builder.exec.sandbox+3")); the daemon-era
       `sandbox = true` `nix.conf` knob is gone along with the daemon.],
 
     [@dag size limit],
